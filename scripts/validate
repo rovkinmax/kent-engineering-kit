@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+kent_root="${KENT_PERSISTENCE_ROOT:-$HOME/.kent}"
+
+bash -n "$repo_root/scripts/install"
+
+names_file="$(mktemp)"
+trap 'rm -f "$names_file"' EXIT
+
+for skill_file in "$repo_root"/skills/*/SKILL.md; do
+  name="$(sed -n 's/^name: //p' "$skill_file" | head -1)"
+  description="$(sed -n 's/^description: //p' "$skill_file" | head -1)"
+
+  [[ -n "$name" ]] || {
+    echo "missing skill name: $skill_file" >&2
+    exit 1
+  }
+  [[ -n "$description" ]] || {
+    echo "missing skill description: $skill_file" >&2
+    exit 1
+  }
+  if grep -Fqx "$name" "$names_file"; then
+    echo "duplicate skill name: $name" >&2
+    exit 1
+  fi
+  echo "$name" >>"$names_file"
+done
+
+for target in \
+  "$kent_root/AGENTS.md" \
+  "$kent_root/skills/kent-engineering-kit" \
+  "$kent_root/prompts/grill.md" \
+  "$kent_root/agents/spec-reviewer.md"; do
+  [[ -e "$target" ]] || {
+    echo "missing installed target: $target" >&2
+    exit 1
+  }
+done
+
+python3 - \
+  "$repo_root/config/subagents.toml" \
+  "$kent_root/config.toml" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+expected = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
+actual = tomllib.loads(pathlib.Path(sys.argv[2]).read_text())
+
+
+def compare(expected_value, actual_value, path):
+    if isinstance(expected_value, dict):
+        if not isinstance(actual_value, dict):
+            raise AssertionError(f"{path}: expected table")
+        for key, value in expected_value.items():
+            if key not in actual_value:
+                raise AssertionError(f"{path}.{key}: missing")
+            compare(value, actual_value[key], f"{path}.{key}")
+        return
+
+    if expected_value != actual_value:
+        raise AssertionError(
+            f"{path}: expected {expected_value!r}, got {actual_value!r}"
+        )
+
+
+compare(expected, actual, "config")
+PY
+
+echo "kent-engineering-kit validation passed"

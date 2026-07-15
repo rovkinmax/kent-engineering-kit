@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+kent_root="${KENT_PERSISTENCE_ROOT:-$HOME/.kent}"
+
+link_item() {
+  local source="$1"
+  local target="$2"
+
+  mkdir -p "$(dirname "$target")"
+
+  if [[ -L "$target" ]]; then
+    if [[ "$(readlink "$target")" == "$source" ]]; then
+      echo "already linked: $target"
+      return
+    fi
+    echo "refusing to replace foreign symlink: $target" >&2
+    return 1
+  fi
+
+  if [[ -e "$target" ]]; then
+    echo "refusing to replace existing path: $target" >&2
+    return 1
+  fi
+
+  ln -s "$source" "$target"
+  echo "linked: $target -> $source"
+}
+
+link_item "$repo_root/global/AGENTS.md" "$kent_root/AGENTS.md"
+
+for skill in "$repo_root"/skills/*; do
+  link_item "$skill" "$kent_root/skills/$(basename "$skill")"
+done
+
+for prompt in "$repo_root"/prompts/*.md; do
+  link_item "$prompt" "$kent_root/prompts/$(basename "$prompt")"
+done
+
+for agent in "$repo_root"/agents/*.md; do
+  link_item "$agent" "$kent_root/agents/$(basename "$agent")"
+done
+
+echo
+echo "Toolkit files installed. Global subagent config is managed separately."
+echo "Do not restart Kent while other sessions are running."

@@ -1,0 +1,54 @@
+[workflow]
+subagents = true
+
+[subagents.researcher]
+description = "Read-only primary-source research for technical and product questions."
+system_prompt_file = "agents/researcher.md"
+thinking_level = "high"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = true
+
+[subagents.researcher.tools]
+shell = true
+patch = false
+edit = false
+
+[subagents.standards-reviewer]
+description = "Read-only review against repository instructions, architecture, and engineering standards."
+system_prompt_file = "agents/standards-reviewer.md"
+thinking_level = "high"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = true
+
+[subagents.standards-reviewer.tools]
+shell = true
+patch = false
+edit = false
+
+[subagents.spec-reviewer]
+description = "Read-only review of a change against its specification and acceptance criteria."
+system_prompt_file = "agents/spec-reviewer.md"
+thinking_level = "high"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = true
+
+[subagents.spec-reviewer.tools]
+shell = true
+patch = false
+edit = false
+
+[subagents.architecture-designer]
+description = "Read-only design of alternative module interfaces, seams, and migration strategies."
+system_prompt_file = "agents/architecture-designer.md"
+thinking_level = "high"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = true
+
+[subagents.architecture-designer.tools]
+shell = true
+patch = false
+edit = false
