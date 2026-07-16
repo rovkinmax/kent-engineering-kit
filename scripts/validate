@@ -126,6 +126,7 @@ PY
 python3 -m compileall -q \
   "$repo_root/workflowkit" \
   "$repo_root/scripts/generate-workflow"
-python3 -m unittest discover -s "$repo_root/tests" -p 'test_*.py'
+PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -m unittest discover -s "$repo_root/tests" -p 'test_*.py'
 
 echo "kent-engineering-kit validation passed"
