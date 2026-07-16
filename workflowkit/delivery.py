@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .model import EdgeSpec, NodeSpec, ParameterSpec, WorkflowSpec
 from .profile import ProjectProfile
 
@@ -542,6 +544,49 @@ def build_delivery_workflow(
     return spec
 
 
+def build_canary_workflow(
+    profile: ProjectProfile,
+    version: int,
+) -> WorkflowSpec:
+    capabilities = dict(profile.capabilities)
+    capabilities.update(
+        {
+            "device_smoke": False,
+            "pull_requests": False,
+            "ci_monitoring": False,
+        }
+    )
+    procedures = dict(profile.procedures)
+    procedures.update(
+        {
+            "plan": "",
+            "implement": "",
+            "fix": "",
+            "smoke": "",
+            "ship": "",
+            "ci": "",
+            "waiting_pr": "",
+        }
+    )
+    canary_profile = replace(
+        profile,
+        capabilities=capabilities,
+        procedures=procedures,
+    )
+    delivery_spec = build_delivery_workflow(canary_profile, version)
+    spec = replace(
+        delivery_spec,
+        name=profile.workflow_name("canary", version),
+        description=(
+            "Exercise planning, implementation continuation, deterministic "
+            f"verification, fan-out, Join, and cleanup for {profile.project_name}."
+        ),
+        execution_target=profile.execution_target("canary"),
+    )
+    spec.validate()
+    return spec
+
+
 def agent_node(key: str, display_name: str, role: str) -> NodeSpec:
     return NodeSpec(
         key=key,
@@ -553,19 +598,29 @@ def agent_node(key: str, display_name: str, role: str) -> NodeSpec:
 
 
 def recovery_edge(node_key: str) -> EdgeSpec:
+    cancellation_contract = ""
+    if node_key in {"plan", "implement", "fix", "verification_gate"}:
+        cancellation_contract = (
+            "\nIf the latest user instruction explicitly cancels the task, choose "
+            "`wont_do` and provide `closure_reason`."
+        )
+    prompt = (
+        f"""Resume the `{node_key}` stage after user action.
+
+Previous blocker: {{{{.Params.blocker_reason}}}}
+
+Use the retained compacted context, re-read current task comments and project
+instructions, verify that the blocker is actually resolved, and continue the
+same stage. Do not infer approval for any broader or destructive action."""
+        + cancellation_contract
+    )
     return EdgeSpec(
         key=f"{node_key}_needs_user_action",
         source=node_key,
         transition="needs_user_action",
         target=node_key,
         context="compact_and_continue_session",
-        prompt=f"""Resume the `{node_key}` stage after user action.
-
-Previous blocker: {{{{.Params.blocker_reason}}}}
-
-Use the retained compacted context, re-read current task comments and project
-instructions, verify that the blocker is actually resolved, and continue the
-same stage. Do not infer approval for any broader or destructive action.""",
+        prompt=prompt,
         requires_approval=True,
         transition_description=(
             "Work is externally blocked; continue this stage only after approval."
@@ -612,7 +667,8 @@ Complete with `implement` only when the plan has no unresolved product, API, UX,
 or safety ambiguity. Provide `workspace_path` and `plan_path`; use an empty
 `plan_path` only when the project contract explicitly allows planless work.
 Complete with `needs_user_action` and `blocker_reason` for an external blocker.
-Choose `wont_do` only for an explicit cancellation decision."""
+Choose `wont_do` only for an explicit cancellation decision and provide
+`closure_reason`."""
 
 
 def implement_prompt(profile: ProjectProfile) -> str:
@@ -636,7 +692,8 @@ After marking that step complete, choose `continue_implementation` with
 `workspace_path` plus `review_context` summarizing plan/spec paths, the fixed
 comparison point, changed files, checks, and risks for the read-only branches.
 Use `needs_user_action` only for an external blocker and provide
-`blocker_reason`. Choose `wont_do` only for explicit cancellation."""
+`blocker_reason`. Choose `wont_do` only for explicit cancellation and provide
+`closure_reason`."""
 
 
 def fix_prompt(profile: ProjectProfile) -> str:
@@ -653,7 +710,8 @@ Remain the single writer. Fix root causes without broadening product scope.
 Complete with `verify` and provide `workspace_path` plus a refreshed
 `review_context` containing the findings, fixes, changed files, artifact paths,
 and focused checks. Use `needs_user_action` only for an external blocker and
-provide `blocker_reason`. Choose `wont_do` only for explicit cancellation."""
+provide `blocker_reason`. Choose `wont_do` only for explicit cancellation and
+provide `closure_reason`."""
 
 
 def standards_review_prompt() -> str:
@@ -717,7 +775,7 @@ Choose `needs_changes` for task-scoped failures and provide `workspace_path`
 plus `fix_context`. Choose `needs_user_action` for external or contradictory
 blockers and provide `workspace_path`, `review_context`, and `blocker_reason`;
 after approval every verification branch reruns. Choose `wont_do` only for an
-explicit cancellation decision."""
+explicit cancellation decision and provide `closure_reason`."""
 
 
 def smoke_prompt(profile: ProjectProfile) -> str:
@@ -851,7 +909,8 @@ The approval applies only to the exact reported PR/branch recovery. Never infer
 permission for a broader rebase or force-push. After resolving task-scoped code,
 complete with `verify` and provide `workspace_path` plus refreshed
 `review_context`. Use `needs_user_action` with `blocker_reason` if the approved
-recovery is still unsafe."""
+recovery is still unsafe. Choose `wont_do` only for an explicit cancellation
+decision and provide `closure_reason`."""
 
 
 def pr_feedback_fix_prompt(profile: ProjectProfile) -> str:
@@ -865,7 +924,9 @@ PR report: {{{{.Params.pr_report}}}}
 
 Remain the single writer. Do not merge or push protected branches. Complete
 with `verify` and provide `workspace_path` plus refreshed `review_context`.
-Use `needs_user_action` with `blocker_reason` for external or policy blockers."""
+Use `needs_user_action` with `blocker_reason` for external or policy blockers.
+Choose `wont_do` only for an explicit cancellation decision and provide
+`closure_reason`."""
 
 
 def post_verification_target(profile: ProjectProfile) -> str:

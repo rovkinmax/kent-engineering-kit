@@ -22,6 +22,10 @@ Implemented `Engineering Delivery` fragments:
 - PR creation, CI monitoring, waiting for merge, and cleanup;
 - recoverable blocker and cancellation transitions.
 
+`Engineering Canary` reuses the planning, single-writer continuation,
+verification fan-out/Join, fix, and cleanup core while intentionally omitting
+device smoke, PR creation, CI, and merge waiting.
+
 Planned fragments:
 
 - maintenance and dependency updates;
@@ -40,3 +44,8 @@ re-exported before a versioned generated replacement is linked.
 When a draft version contains stale graph elements that Kent cannot remove
 through the CLI, leave it taskless and unlinked, mark it superseded, and create
 the next clean version. Never repair it through direct database mutation.
+
+Before changing an existing workflow, the generator computes drift without
+mutation. Unsupported extra graph elements fail immediately. Reconciliation
+that would change graph semantics is refused when the workflow already has task
+records; create a new workflow version instead.

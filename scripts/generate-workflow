@@ -11,7 +11,12 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from workflowkit import KentClient, ProjectProfile, build_delivery_workflow
+from workflowkit import (
+    KentClient,
+    ProjectProfile,
+    build_canary_workflow,
+    build_delivery_workflow,
+)
 from workflowkit.kent import KentCommandError, spec_as_json
 from workflowkit.model import SpecError
 
@@ -28,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--kind",
-        choices=("delivery",),
+        choices=("delivery", "canary"),
         default="delivery",
         help="Workflow kind to generate.",
     )
@@ -57,7 +62,11 @@ def main() -> int:
         raise SpecError("--set-default requires --apply")
 
     profile = ProjectProfile.load(args.project)
-    spec = build_delivery_workflow(profile, args.version)
+    builders = {
+        "delivery": build_delivery_workflow,
+        "canary": build_canary_workflow,
+    }
+    spec = builders[args.kind](profile, args.version)
 
     if not args.apply:
         print(json.dumps(spec_as_json(spec), indent=2, ensure_ascii=False))
@@ -77,6 +86,7 @@ def main() -> int:
             {
                 "workflow_id": definition["workflow"]["id"],
                 "workflow_name": spec.name,
+                "workflow_kind": args.kind,
                 "execution_target": spec.execution_target,
                 "snapshot": str(snapshot_path),
                 "default_changed": args.set_default,

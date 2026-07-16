@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
-from workflowkit.delivery import build_delivery_workflow
+from workflowkit.delivery import build_canary_workflow, build_delivery_workflow
 from workflowkit.kent import (
     KentClient,
     context_source_string,
@@ -94,6 +94,24 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertEqual(implementation_edges["verify"].target, "verification_dispatch")
 
+    def test_canary_uses_core_flow_without_device_or_delivery_tail(self) -> None:
+        profile = self.load_profile()
+        spec = build_canary_workflow(profile, 1)
+        node_keys = {node.key for node in spec.nodes}
+
+        self.assertEqual(spec.name, "Example Engineering Canary v1")
+        self.assertEqual(spec.execution_target, "head")
+        self.assertNotIn("smoke", node_keys)
+        self.assertNotIn("prepare_pr", node_keys)
+        self.assertNotIn("ci_monitor", node_keys)
+        self.assertNotIn("waiting_pr", node_keys)
+        self.assertIn("verification_join", node_keys)
+        self.assertIn("cleanup", node_keys)
+        prompts = "\n".join(
+            edge.prompt for edge in spec.edges if edge.prompt is not None
+        )
+        self.assertNotIn(".kent/commands/feature-", prompts)
+
     def test_pull_request_tail_uses_canonical_project_contract(self) -> None:
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)
@@ -140,6 +158,33 @@ class WorkflowKitTest(unittest.TestCase):
                 tuple(parameter.key for parameter in edge.parameters),
                 ("closure_reason",),
             )
+
+    def test_every_cancellable_node_prompt_documents_closure_reason(self) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 1)
+        cancellable_nodes = {
+            edge.source for edge in spec.edges if edge.transition == "wont_do"
+        }
+
+        for node_key in cancellable_nodes:
+            incoming = [
+                edge
+                for edge in spec.edges
+                if edge.target == node_key and edge.prompt is not None
+            ]
+            self.assertGreater(len(incoming), 0, node_key)
+            for edge in incoming:
+                self.assertIn("closure_reason", edge.prompt, edge.key)
+
+    def test_generated_prompts_have_no_trailing_whitespace(self) -> None:
+        profile = self.load_profile()
+        for spec in (
+            build_delivery_workflow(profile, 1),
+            build_canary_workflow(profile, 1),
+        ):
+            for edge in spec.edges:
+                if edge.prompt is not None:
+                    self.assertEqual(edge.prompt, edge.prompt.rstrip(), edge.key)
 
     def test_lite_profile_can_disable_optional_review_and_delivery_tail(self) -> None:
         def transform(contents: str) -> str:
@@ -266,6 +311,128 @@ class WorkflowKitTest(unittest.TestCase):
         client = KentClient(Path(temporary.name))
         with self.assertRaisesRegex(SpecError, "semantic mismatch"):
             client.assert_exact_graph(spec, definition)
+
+    def test_apply_preflight_rejects_extra_edge_without_cli_mutation(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        spec = WorkflowSpec(
+            name="Minimal v1",
+            description="Minimal workflow.",
+            execution_target="head",
+            nodes=(
+                NodeSpec("backlog", "start", "Backlog"),
+                NodeSpec("done", "terminal", "Done"),
+            ),
+            edges=(),
+        )
+        definition = {
+            "workflow": {
+                "id": "workflow-minimal",
+                "name": "Minimal v1",
+                "description": "Old description.",
+                "execution_target_policy": {"mode": "head"},
+            },
+            "nodes": [
+                {
+                    "id": "node-backlog",
+                    "key": "backlog",
+                    "kind": "start",
+                    "display_name": "Backlog",
+                },
+                {
+                    "id": "node-done",
+                    "key": "done",
+                    "kind": "terminal",
+                    "display_name": "Done",
+                },
+            ],
+            "transition_groups": [
+                {
+                    "id": "group-extra",
+                    "source_node_id": "node-backlog",
+                    "transition_id": "finish",
+                    "description": "Extra.",
+                }
+            ],
+            "edges": [
+                {
+                    "id": "edge-extra",
+                    "key": "extra",
+                    "transition_group_id": "group-extra",
+                    "target_node_id": "node-done",
+                    "context_mode": "new_session",
+                    "context_source": {"kind": "immediate_source"},
+                    "requires_approval": False,
+                    "prompt_template": None,
+                }
+            ],
+            "derived_wiring": {
+                "edges": [
+                    {
+                        "edge_id": "edge-extra",
+                        "required_provision_fields": [],
+                    }
+                ]
+            },
+        }
+        commands: list[list[str]] = []
+        client = KentClient(Path(temporary.name))
+        client.require_version = lambda *version: None
+        client.inspect = lambda workflow: definition
+        client.run_json = lambda args: commands.append(args) or {}
+
+        with self.assertRaisesRegex(SpecError, "unexpected edges"):
+            client.apply(spec)
+        self.assertEqual(commands, [])
+
+    def test_apply_preflight_rejects_graph_mutation_when_tasks_exist(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        spec = WorkflowSpec(
+            name="Minimal v1",
+            description="New description.",
+            execution_target="head",
+            nodes=(
+                NodeSpec("backlog", "start", "Backlog"),
+                NodeSpec("done", "terminal", "Done"),
+            ),
+            edges=(),
+        )
+        definition = {
+            "workflow": {
+                "id": "workflow-minimal",
+                "name": "Minimal v1",
+                "description": "Old description.",
+                "execution_target_policy": {"mode": "head"},
+            },
+            "nodes": [
+                {
+                    "id": "node-backlog",
+                    "key": "backlog",
+                    "kind": "start",
+                    "display_name": "Backlog",
+                },
+                {
+                    "id": "node-done",
+                    "key": "done",
+                    "kind": "terminal",
+                    "display_name": "Done",
+                },
+            ],
+            "transition_groups": None,
+            "edges": None,
+            "derived_wiring": None,
+        }
+        commands: list[list[str]] = []
+        client = KentClient(Path(temporary.name))
+        client.require_version = lambda *version: None
+        client.inspect = lambda workflow: definition
+        client.workflow_has_tasks = lambda current: True
+        client.run_json = lambda args: commands.append(args) or {}
+
+        with self.assertRaisesRegex(SpecError, "has tasks and cannot be mutated"):
+            client.apply(spec)
+        self.assertEqual(commands, [])
 
     def test_edge_reconcile_clears_stale_prompt_and_context_source(self) -> None:
         temporary = tempfile.TemporaryDirectory()

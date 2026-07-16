@@ -44,6 +44,13 @@ class KentClient:
                 ]
             )
             definition = self.require_inspect(spec.name)
+        else:
+            mutation_required = self.preflight_reconcile(spec, definition)
+            if mutation_required and self.workflow_has_tasks(definition):
+                raise SpecError(
+                    f"workflow {spec.name!r} has tasks and cannot be mutated; "
+                    "create a new workflow version"
+                )
 
         self.ensure_workflow_metadata(spec, definition)
         definition = self.require_inspect(spec.name)
@@ -63,6 +70,92 @@ class KentClient:
         self.link(spec.name, set_default=set_default)
         self.validate(spec.name)
         return self.require_inspect(spec.name)
+
+    def preflight_reconcile(
+        self,
+        spec: WorkflowSpec,
+        definition: dict[str, Any],
+    ) -> bool:
+        self.assert_no_extra_nodes(spec, definition)
+
+        expected_edges = {edge.key for edge in spec.edges}
+        actual_edges = {
+            edge["key"]
+            for edge in (definition.get("edges") or [])
+        }
+        extra_edges = sorted(actual_edges - expected_edges)
+        if extra_edges:
+            raise SpecError(
+                f"workflow {spec.name!r} contains unexpected edges {extra_edges}; "
+                "create a new workflow version"
+            )
+
+        indexed_edges = edge_index(definition)
+        for edge in spec.edges:
+            existing = indexed_edges.get(edge.key)
+            if existing is None:
+                continue
+            if existing["source"] != edge.source:
+                raise SpecError(
+                    f"edge {edge.key!r} changed source from "
+                    f"{existing['source']!r} to {edge.source!r}; create a new "
+                    "workflow version"
+                )
+            if existing["requires_approval"] and not edge.requires_approval:
+                raise SpecError(
+                    f"edge {edge.key!r} would remove approval; create a new "
+                    "workflow version"
+                )
+
+        workflow = definition["workflow"]
+        metadata_matches = (
+            workflow.get("description") == spec.description
+            and execution_target_from_policy(
+                workflow.get("execution_target_policy") or {}
+            )
+            == spec.execution_target
+        )
+        node_index = {
+            node["key"]: node
+            for node in (definition.get("nodes") or [])
+        }
+        nodes_match = all(
+            node.key in node_index and node_matches(node_index[node.key], node)
+            for node in spec.nodes
+        )
+        edges_match = all(
+            edge.key in indexed_edges and edge_matches(indexed_edges[edge.key], edge)
+            for edge in spec.edges
+        )
+        return not (metadata_matches and nodes_match and edges_match)
+
+    def workflow_has_tasks(self, definition: dict[str, Any]) -> bool:
+        workflow_id = definition["workflow"]["id"]
+        workflow_ref = workflow_id.removeprefix("workflow-")
+        result = self.run(
+            [
+                "task",
+                "list",
+                "--project",
+                str(self.workspace),
+                "--workflow",
+                workflow_ref,
+                "--page-size",
+                "1",
+                "--json",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise SpecError(
+                f"cannot prove workflow {definition['workflow']['name']!r} is "
+                f"taskless before mutation: {command_error(result)}"
+            )
+        payload = decode_json(
+            result.stdout,
+            f"task list for workflow {definition['workflow']['name']!r}",
+        )
+        return bool(payload.get("tasks"))
 
     def inspect(self, workflow: str) -> dict[str, Any] | None:
         result = self.run(

@@ -12,7 +12,8 @@ Status: complete.
 
 ## Phase 2: Workflow generator
 
-Status: complete for the `Engineering Delivery v2` contract.
+Status: complete for the `Engineering Delivery v4` and
+`Engineering Canary v1` contracts.
 
 - Define a project profile schema.
 - Generate project-local workflow instances from shared fragments.
@@ -20,12 +21,15 @@ Status: complete for the `Engineering Delivery v2` contract.
 - Validate live workflows and export audit snapshots.
 - Encode Kent fan-out constraints in generation and validation.
 - Validate worktree setup hooks against the Kent 2.3 payload contract.
+- Reject unsupported graph drift before mutation and refuse graph mutation when
+  task records already exist.
 
 ## Phase 3: Delivery workflows
 
 Status: generated and linked non-default; managed-worktree canaries pending.
 
-- Generate `Engineering Delivery v2` for Appsome and Puber.
+- Generate `Engineering Delivery v4` and infrastructure-only
+  `Engineering Canary v1` for Appsome and Puber.
 - Re-export existing workflow snapshots and verify their preserved Source HEAD
   policies after upgrading Kent.
 - Run project canaries before changing defaults.

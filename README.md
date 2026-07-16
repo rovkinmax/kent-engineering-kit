@@ -74,5 +74,7 @@ use it before the generated workflow passes a managed-worktree canary.
 ## Current phase
 
 The global toolkit and Kent 2.3 workflow generator are implemented. Appsome and
-Puber have linked non-default `Engineering Delivery v2` instances. Managed
-worktree canaries remain required before either project changes its default.
+Puber have linked non-default `Engineering Delivery v4` and
+`Engineering Canary v1` instances. The canaries omit device and PR stages.
+Managed-worktree canary runs remain required before either project changes its
+default.

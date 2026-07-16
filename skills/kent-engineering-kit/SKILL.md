@@ -29,6 +29,10 @@ generated toolkit workflows.
 - Preview generated workflows without `--apply`.
 - Apply versioned workflows non-default first. Use `--set-default` only after a
   managed-worktree canary passes.
+- Use `Engineering Canary` for infrastructure-only validation. It intentionally
+  omits device smoke and PR/CI stages.
+- Never reconcile graph changes into a workflow that already has tasks. Create
+  the next version.
 
 ## Fan-out
 
