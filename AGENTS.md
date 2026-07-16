@@ -5,9 +5,11 @@
 - Global skills contain reusable engineering disciplines, not framework tutorials.
 - Explicit user-driven orchestration belongs in `prompts/`; model-triggered
   disciplines belong in `skills/`.
-- Review roles disable first-class edit tools. Kent 2.2 has no read-only shell
-  capability, so their role contracts restrict shell usage to inspection.
+- Review roles disable first-class edit tools. Kent shell access is not a
+  tool-enforced read-only boundary, so their role contracts restrict it to
+  inspection.
 - Workflow fragments must use canonical parameters from `contracts/workflow-contract.md`.
+- Generated workflows must declare an explicit Kent 2.3 execution-target policy.
 - Fan-out branches are read-only, transition directly to Join, and report failures
   as structured results.
 - Do not edit live Kent workflow database records directly.

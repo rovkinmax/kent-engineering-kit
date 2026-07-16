@@ -29,6 +29,9 @@ link_item() {
 }
 
 link_item "$repo_root/global/AGENTS.md" "$kent_root/AGENTS.md"
+link_item \
+  "$repo_root/adapters/gradle/shell-postprocess-hook" \
+  "$kent_root/hooks/gradle-worktree-warning"
 
 for skill in "$repo_root"/skills/*; do
   link_item "$skill" "$kent_root/skills/$(basename "$skill")"

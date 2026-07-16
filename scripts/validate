@@ -5,6 +5,26 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kent_root="${KENT_PERSISTENCE_ROOT:-$HOME/.kent}"
 
 bash -n "$repo_root/scripts/install"
+bash -n "$repo_root/adapters/gradle/shell-postprocess-hook"
+bash -n "$repo_root/templates/project/workflow-verification-dispatch"
+bash -n "$repo_root/templates/project/workflow-verify-report"
+
+[[ -x "$repo_root/adapters/gradle/shell-postprocess-hook" ]] || {
+  echo "Gradle shell postprocessor is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/workflow-verification-dispatch" ]] || {
+  echo "verification dispatch template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/workflow-verify-report" ]] || {
+  echo "verification report template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/scripts/generate-workflow" ]] || {
+  echo "workflow generator is not executable" >&2
+  exit 1
+}
 
 names_file="$(mktemp)"
 trap 'rm -f "$names_file"' EXIT
@@ -30,6 +50,7 @@ done
 
 for target in \
   "$kent_root/AGENTS.md" \
+  "$kent_root/hooks/gradle-worktree-warning" \
   "$kent_root/skills/kent-engineering-kit" \
   "$kent_root/prompts/grill.md" \
   "$kent_root/agents/spec-reviewer.md"; do
@@ -68,5 +89,43 @@ def compare(expected_value, actual_value, path):
 
 compare(expected, actual, "config")
 PY
+
+python3 - "$repo_root/contracts/project-profile.example.toml" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+profile = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
+allowed_targets = {
+    "ask-on-first-execution",
+    "none",
+    "head",
+    "default-branch",
+}
+
+if profile.get("schema_version") != 2:
+    raise AssertionError("profile.schema_version must be 2")
+if profile.get("minimum_kent_version") != "2.3.0":
+    raise AssertionError("profile.minimum_kent_version must be 2.3.0")
+
+targets = [profile["execution"]["default_target"]]
+targets.extend(profile["execution"].get("overrides", {}).values())
+for target in targets:
+    if target not in allowed_targets and not target.startswith("ref:"):
+        raise AssertionError(f"unsupported execution target: {target}")
+    if target.startswith("ref:"):
+        revision = target[4:]
+        if not revision:
+            raise AssertionError("custom execution target revision is empty")
+        if any(character.isspace() for character in revision):
+            raise AssertionError(
+                "custom execution target revision must not contain whitespace"
+            )
+PY
+
+python3 -m compileall -q \
+  "$repo_root/workflowkit" \
+  "$repo_root/scripts/generate-workflow"
+python3 -m unittest discover -s "$repo_root/tests" -p 'test_*.py'
 
 echo "kent-engineering-kit validation passed"

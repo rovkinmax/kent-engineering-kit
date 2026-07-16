@@ -4,6 +4,9 @@ The toolkit is original project infrastructure informed by:
 
 - Kent's official documentation for global skills, prompts, role configuration,
   workflow graphs, script nodes, fan-out, Join, and project links.
+- Kent 2.3 documentation and release notes for explicit workflow execution
+  targets, server-managed worktree commands, and structured setup-hook payloads:
+  https://github.com/respawn-llc/kent/releases/tag/v2.3.0
 - Matt Pocock's `mattpocock/skills` repository for the separation between
   explicit orchestration and reusable engineering disciplines.
 - Appsome and Puber Kent workflow experiments, including deterministic

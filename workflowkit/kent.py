@@ -1,0 +1,534 @@
+from __future__ import annotations
+
+from dataclasses import asdict
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+from typing import Any
+
+from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
+
+
+class KentCommandError(RuntimeError):
+    """Raised when the Kent CLI rejects a generator operation."""
+
+
+class KentClient:
+    def __init__(self, workspace: Path, binary: str = "kent") -> None:
+        self.workspace = workspace.expanduser().resolve()
+        self.binary = binary
+
+    def apply(
+        self,
+        spec: WorkflowSpec,
+        *,
+        minimum_version: tuple[int, int, int] = (2, 3, 0),
+        set_default: bool = False,
+    ) -> dict[str, Any]:
+        spec.validate()
+        self.require_version(*minimum_version)
+        self.preflight_scripts(spec)
+
+        definition = self.inspect(spec.name)
+        if definition is None:
+            self.run_json(
+                [
+                    "workflow",
+                    "create",
+                    "--description",
+                    spec.description,
+                    "--json",
+                    spec.name,
+                ]
+            )
+            definition = self.require_inspect(spec.name)
+
+        self.ensure_workflow_metadata(spec, definition)
+        definition = self.require_inspect(spec.name)
+
+        for node in spec.nodes:
+            self.ensure_node(spec.name, node, definition)
+            definition = self.require_inspect(spec.name)
+
+        self.assert_no_extra_nodes(spec, definition)
+
+        for edge in spec.edges:
+            self.ensure_edge(spec.name, edge, definition)
+            definition = self.require_inspect(spec.name)
+
+        self.assert_exact_graph(spec, definition)
+        self.validate(spec.name)
+        self.link(spec.name, set_default=set_default)
+        self.validate(spec.name)
+        return self.require_inspect(spec.name)
+
+    def inspect(self, workflow: str) -> dict[str, Any] | None:
+        result = self.run(
+            ["workflow", "inspect", workflow, "--json"],
+            check=False,
+        )
+        if result.returncode == 0:
+            return decode_json(result.stdout, f"workflow inspect {workflow!r}")
+        if "not found" in result.stderr.lower():
+            return None
+        raise KentCommandError(command_error(result))
+
+    def require_inspect(self, workflow: str) -> dict[str, Any]:
+        definition = self.inspect(workflow)
+        if definition is None:
+            raise KentCommandError(f"workflow {workflow!r} disappeared")
+        return definition
+
+    def validate(self, workflow: str) -> dict[str, Any]:
+        result = self.run_json(
+            [
+                "workflow",
+                "validate",
+                workflow,
+                "--mode",
+                "execution",
+                "--json",
+            ]
+        )
+        if result.get("valid") is not True:
+            raise KentCommandError(
+                "workflow execution validation failed:\n"
+                + json.dumps(result, indent=2, ensure_ascii=False)
+            )
+        return result
+
+    def link(self, workflow: str, *, set_default: bool) -> None:
+        args = [
+            "workflow",
+            "link",
+            str(self.workspace),
+            workflow,
+        ]
+        if set_default:
+            args.append("--default")
+        args.append("--json")
+        result = self.run(args, check=False)
+        if result.returncode == 0:
+            return
+        if "already linked" in result.stderr.lower():
+            if set_default:
+                self.run_json(
+                    [
+                        "workflow",
+                        "default",
+                        str(self.workspace),
+                        workflow,
+                        "--json",
+                    ]
+                )
+            return
+        raise KentCommandError(command_error(result))
+
+    def export_snapshot(
+        self,
+        definition: dict[str, Any],
+        destination: Path,
+    ) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(definition, indent=2, ensure_ascii=False) + "\n"
+        )
+
+    def ensure_workflow_metadata(
+        self,
+        spec: WorkflowSpec,
+        definition: dict[str, Any],
+    ) -> None:
+        workflow = definition["workflow"]
+        policy = workflow.get("execution_target_policy") or {}
+        current_target = execution_target_from_policy(policy)
+        if (
+            workflow.get("description") == spec.description
+            and current_target == spec.execution_target
+        ):
+            return
+        self.run_json(
+            [
+                "workflow",
+                "update",
+                spec.name,
+                "--description",
+                spec.description,
+                "--execution-target",
+                spec.execution_target,
+                "--json",
+            ]
+        )
+
+    def ensure_node(
+        self,
+        workflow: str,
+        spec: NodeSpec,
+        definition: dict[str, Any],
+    ) -> None:
+        existing = next(
+            (
+                node
+                for node in (definition.get("nodes") or [])
+                if node["key"] == spec.key
+            ),
+            None,
+        )
+        if existing is not None and node_matches(existing, spec):
+            return
+
+        if existing is None:
+            args = [
+                "workflow",
+                "node",
+                "add",
+                workflow,
+                "--key",
+                spec.key,
+                "--kind",
+                spec.kind,
+                "--display-name",
+                spec.display_name,
+            ]
+        else:
+            args = [
+                "workflow",
+                "node",
+                "update",
+                workflow,
+                spec.key,
+                "--kind",
+                spec.kind,
+                "--display-name",
+                spec.display_name,
+            ]
+
+        if spec.agent:
+            args.extend(["--agent", spec.agent])
+        if spec.completion_mode:
+            args.extend(["--completion-mode", spec.completion_mode])
+        if spec.script_path:
+            args.extend(["--script-path", spec.script_path])
+        args.append("--json")
+        self.run_json(args)
+
+    def ensure_edge(
+        self,
+        workflow: str,
+        spec: EdgeSpec,
+        definition: dict[str, Any],
+    ) -> None:
+        index = edge_index(definition)
+        existing = index.get(spec.key)
+        if existing is not None and edge_matches(existing, spec):
+            return
+
+        if existing is None:
+            args = [
+                "workflow",
+                "edge",
+                "add",
+                workflow,
+                "--from",
+                spec.source,
+                "--transition",
+                spec.transition,
+                "--edge-key",
+                spec.key,
+                "--to",
+                spec.target,
+                "--context",
+                spec.context,
+            ]
+        else:
+            if existing["source"] != spec.source:
+                raise SpecError(
+                    f"edge {spec.key!r} changed source from "
+                    f"{existing['source']!r} to {spec.source!r}; create a new "
+                    "workflow version"
+                )
+            if existing["requires_approval"] and not spec.requires_approval:
+                raise SpecError(
+                    f"edge {spec.key!r} would remove approval; create a new "
+                    "workflow version"
+                )
+            args = [
+                "workflow",
+                "edge",
+                "update",
+                workflow,
+                existing["id"],
+                "--transition",
+                spec.transition,
+                "--edge-key",
+                spec.key,
+                "--to",
+                spec.target,
+                "--context",
+                spec.context,
+            ]
+
+        args.extend(
+            [
+                "--transition-description",
+                spec.transition_description,
+            ]
+        )
+        args.extend(["--context-source", spec.context_source])
+        if existing is not None:
+            args.extend(["--prompt", spec.prompt or ""])
+        elif spec.prompt is not None:
+            args.extend(["--prompt", spec.prompt])
+        if spec.requires_approval:
+            args.append("--requires-approval")
+        if spec.parameters:
+            for parameter in spec.parameters:
+                args.extend(
+                    [
+                        "--param",
+                        f"{parameter.key}={parameter.description}",
+                    ]
+                )
+        elif existing is not None and existing["parameters"]:
+            args.append("--clear-params")
+        args.append("--json")
+        self.run_json(args)
+
+    def assert_no_extra_nodes(
+        self,
+        spec: WorkflowSpec,
+        definition: dict[str, Any],
+    ) -> None:
+        expected = {node.key for node in spec.nodes}
+        actual = {
+            node["key"]
+            for node in (definition.get("nodes") or [])
+        }
+        extra = sorted(actual - expected)
+        if extra:
+            raise SpecError(
+                f"workflow {spec.name!r} contains unexpected nodes {extra}; "
+                "create a new workflow version"
+            )
+
+    def assert_exact_graph(
+        self,
+        spec: WorkflowSpec,
+        definition: dict[str, Any],
+    ) -> None:
+        self.assert_no_extra_nodes(spec, definition)
+        workflow = definition["workflow"]
+        current_target = execution_target_from_policy(
+            workflow.get("execution_target_policy") or {}
+        )
+        if (
+            workflow.get("description") != spec.description
+            or current_target != spec.execution_target
+        ):
+            raise SpecError(
+                f"workflow {spec.name!r} metadata does not match the specification"
+            )
+
+        node_index = {
+            node["key"]: node
+            for node in (definition.get("nodes") or [])
+        }
+        missing_nodes = sorted(
+            node.key
+            for node in spec.nodes
+            if node.key not in node_index
+        )
+        mismatched_nodes = sorted(
+            node.key
+            for node in spec.nodes
+            if node.key in node_index and not node_matches(node_index[node.key], node)
+        )
+
+        expected_edges = {edge.key for edge in spec.edges}
+        actual_edges = {
+            edge["key"]
+            for edge in (definition.get("edges") or [])
+        }
+        extra_edges = sorted(actual_edges - expected_edges)
+        missing_edges = sorted(expected_edges - actual_edges)
+        indexed_edges = edge_index(definition)
+        mismatched_edges = sorted(
+            edge.key
+            for edge in spec.edges
+            if edge.key in indexed_edges
+            and not edge_matches(indexed_edges[edge.key], edge)
+        )
+        if (
+            missing_nodes
+            or mismatched_nodes
+            or extra_edges
+            or missing_edges
+            or mismatched_edges
+        ):
+            raise SpecError(
+                f"workflow {spec.name!r} semantic mismatch; "
+                f"missing_nodes={missing_nodes}, "
+                f"mismatched_nodes={mismatched_nodes}, "
+                f"extra_edges={extra_edges}, missing_edges={missing_edges}, "
+                f"mismatched_edges={mismatched_edges}. "
+                "Create a new workflow version if reconciliation cannot clear it."
+            )
+
+    def require_version(self, major: int, minor: int, patch: int) -> None:
+        result = self.run(["--version"])
+        match = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout)
+        if match is None:
+            raise KentCommandError(
+                f"cannot parse Kent version from {result.stdout!r}"
+            )
+        actual = tuple(int(part) for part in match.groups())
+        required = (major, minor, patch)
+        if actual < required:
+            raise KentCommandError(
+                f"Kent {major}.{minor}.{patch}+ is required; found "
+                f"{'.'.join(str(part) for part in actual)}"
+            )
+
+    def preflight_scripts(self, spec: WorkflowSpec) -> None:
+        for node in spec.nodes:
+            if node.kind != "script" or node.script_path is None:
+                continue
+            path = Path(node.script_path).expanduser()
+            if not path.is_absolute():
+                path = self.workspace / path
+            if not path.is_file():
+                raise SpecError(
+                    f"script node {node.key!r} path does not exist: {path}"
+                )
+            if not os.access(path, os.X_OK):
+                raise SpecError(
+                    f"script node {node.key!r} path is not executable: {path}"
+                )
+
+    def run_json(self, args: list[str]) -> dict[str, Any]:
+        result = self.run(args)
+        return decode_json(result.stdout, " ".join([self.binary, *args]))
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.pop("KENT_SESSION_ID", None)
+        result = subprocess.run(
+            [self.binary, *args],
+            cwd=self.workspace,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if check and result.returncode != 0:
+            raise KentCommandError(command_error(result))
+        return result
+
+
+def node_matches(existing: dict[str, Any], spec: NodeSpec) -> bool:
+    return (
+        existing.get("kind") == spec.kind
+        and existing.get("display_name") == spec.display_name
+        and existing.get("subagent_role") == spec.agent
+        and existing.get("completion_mode") == spec.completion_mode
+        and existing.get("script_path") == spec.script_path
+    )
+
+
+def edge_index(definition: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    nodes = {
+        node["id"]: node["key"]
+        for node in (definition.get("nodes") or [])
+    }
+    groups = {
+        group["id"]: group
+        for group in (definition.get("transition_groups") or [])
+    }
+    derived_wiring = definition.get("derived_wiring") or {}
+    contracts = {
+        item["edge_id"]: tuple(
+            ParameterSpec(field["name"], field["description"])
+            for field in item.get("required_provision_fields", [])
+        )
+        for item in (derived_wiring.get("edges") or [])
+    }
+    index: dict[str, dict[str, Any]] = {}
+    for edge in (definition.get("edges") or []):
+        group = groups[edge["transition_group_id"]]
+        index[edge["key"]] = {
+            "id": edge["id"],
+            "source": nodes[group["source_node_id"]],
+            "transition": group["transition_id"],
+            "target": nodes[edge["target_node_id"]],
+            "context": edge["context_mode"],
+            "context_source": context_source_string(edge["context_source"]),
+            "requires_approval": edge["requires_approval"],
+            "prompt": edge.get("prompt_template"),
+            "description": group.get("description") or "",
+            "parameters": contracts.get(edge["id"], ()),
+        }
+    return index
+
+
+def edge_matches(existing: dict[str, Any], spec: EdgeSpec) -> bool:
+    return (
+        existing["source"] == spec.source
+        and existing["transition"] == spec.transition
+        and existing["target"] == spec.target
+        and existing["context"] == spec.context
+        and existing["context_source"] == spec.context_source
+        and existing["requires_approval"] == spec.requires_approval
+        and (existing["prompt"] or None) == (spec.prompt or None)
+        and existing["description"] == spec.transition_description
+        and existing["parameters"] == spec.parameters
+    )
+
+
+def context_source_string(raw: dict[str, Any] | None) -> str:
+    if not raw:
+        return "immediate_source"
+    kind = raw.get("kind", "immediate_source")
+    if kind == "node":
+        return f"node:{raw['node_key']}"
+    return kind
+
+
+def execution_target_from_policy(raw: dict[str, Any]) -> str:
+    mode = raw.get("mode")
+    if mode == "ask_on_first_execution":
+        return "ask-on-first-execution"
+    if mode == "default_branch":
+        return "default-branch"
+    if mode == "custom_ref":
+        return f"ref:{raw.get('custom_ref', '')}"
+    if mode in {"none", "head"}:
+        return mode
+    return ""
+
+
+def decode_json(raw: str, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise KentCommandError(f"{label} returned invalid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise KentCommandError(f"{label} returned non-object JSON")
+    return value
+
+
+def command_error(result: subprocess.CompletedProcess[str]) -> str:
+    command = " ".join(str(part) for part in result.args)
+    detail = result.stderr.strip() or result.stdout.strip() or "no output"
+    return f"{command} failed with exit {result.returncode}: {detail}"
+
+
+def spec_as_json(spec: WorkflowSpec) -> dict[str, Any]:
+    return asdict(spec)

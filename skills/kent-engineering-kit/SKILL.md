@@ -17,6 +17,19 @@ generated toolkit workflows.
 - Use canonical role keys from the profile. Role implementations remain
   project-local unless the role is explicitly global.
 
+## Execution
+
+- Require Kent 2.3 or newer before creating generated workflows.
+- Apply the profile's explicit execution-target policy to each workflow.
+- Use a workflow-kind override when present.
+- Treat Kent's selected execution root and resolved commit as authoritative.
+- Use `kent worktree` for operations on Kent-managed worktrees.
+- Follow `contracts/worktree-contract.md` when a project needs setup hooks or
+  untracked machine configuration.
+- Preview generated workflows without `--apply`.
+- Apply versioned workflows non-default first. Use `--set-default` only after a
+  managed-worktree canary passes.
+
 ## Fan-out
 
 - Parallel branches are read-only.
@@ -32,3 +45,5 @@ generated toolkit workflows.
 - Treat project JSON exports as audit snapshots.
 - Use versioned workflow instances when changing a graph linked to more than one
   project.
+- Keep project-local operational roles behind the `default` orchestrator.
+  Assign only globally registered roles directly to custom workflow nodes.

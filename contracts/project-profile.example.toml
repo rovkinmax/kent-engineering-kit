@@ -1,4 +1,5 @@
-schema_version = 1
+schema_version = 2
+minimum_kent_version = "2.3.0"
 project_name = "example"
 workflow_prefix = "Example"
 delivery_profile = "standard"
@@ -7,22 +8,43 @@ source_control = "github"
 issue_tracker = "none"
 release_topology = "none"
 
+[execution]
+default_target = "ask-on-first-execution"
+
+[execution.overrides]
+canary = "head"
+maintenance = "default-branch"
+
 [capabilities]
 managed_worktrees = true
 pull_requests = true
 ci_monitoring = true
 device_smoke = false
 compliance_review = true
+spec_review = true
 
 [commands]
+dispatch = ".kent/scripts/workflow-verification-dispatch"
 verify = ".kent/scripts/workflow-verify"
 smoke = ""
 
+[procedures]
+plan = ""
+implement = ""
+fix = ""
+smoke = ""
+ship = ""
+ci = ""
+waiting_pr = ""
+cleanup = ""
+
 [roles]
+orchestrator = "default"
 researcher = "project-researcher"
 implementation = "implementation-worker"
 build_doctor = "build-doctor"
-quality_review = "quality-reviewer"
+standards_review = "standards-reviewer"
+spec_review = "spec-reviewer"
 qa = "qa-runner"
 release = "release-manager"
 ci = "ci-monitor"
