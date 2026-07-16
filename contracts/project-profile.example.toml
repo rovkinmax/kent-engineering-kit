@@ -4,6 +4,7 @@ project_name = "example"
 workflow_prefix = "Example"
 delivery_profile = "standard"
 platforms = ["generic"]
+required_adapters = []
 source_control = "github"
 issue_tracker = "none"
 release_topology = "none"
@@ -40,6 +41,11 @@ ship = ""
 ci = ""
 waiting_pr = ""
 cleanup = ""
+
+# Android projects with conditional or required Smoke use:
+# required_adapters = ["mobile_resource_lock"]
+# [adapters]
+# mobile_resource_lock = ".kent/adapters/mobile/emulator-resource-lock.sh"
 
 [roles]
 orchestrator = "default"

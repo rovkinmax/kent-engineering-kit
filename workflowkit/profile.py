@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import re
 from typing import Any
 import tomllib
@@ -23,6 +24,7 @@ class ProjectProfile:
     workflow_prefix: str
     delivery_profile: str
     platforms: tuple[str, ...]
+    required_adapters: tuple[str, ...]
     source_control: str
     issue_tracker: str
     release_topology: str
@@ -32,6 +34,7 @@ class ProjectProfile:
     capabilities: dict[str, bool]
     commands: dict[str, str]
     procedures: dict[str, str]
+    adapters: dict[str, str]
     roles: dict[str, str]
 
     @classmethod
@@ -60,6 +63,9 @@ class ProjectProfile:
             workflow_prefix=require_string(raw, "workflow_prefix"),
             delivery_profile=require_string(raw, "delivery_profile"),
             platforms=tuple(require_string_list(raw, "platforms")),
+            required_adapters=tuple(
+                require_string_list(raw, "required_adapters")
+            ),
             source_control=require_string(raw, "source_control"),
             issue_tracker=require_string(raw, "issue_tracker"),
             release_topology=require_string(raw, "release_topology"),
@@ -72,6 +78,7 @@ class ProjectProfile:
             capabilities=bool_table(require_table(raw, "capabilities"), "capabilities"),
             commands=string_table(require_table(raw, "commands"), "commands"),
             procedures=string_table(raw.get("procedures", {}), "procedures"),
+            adapters=string_table(raw.get("adapters", {}), "adapters"),
             roles=string_table(require_table(raw, "roles"), "roles"),
         )
         profile.validate()
@@ -108,6 +115,27 @@ class ProjectProfile:
                 "capabilities.device_smoke was removed in profile schema 3; "
                 "use policies.smoke"
             )
+        if len(set(self.required_adapters)) != len(self.required_adapters):
+            raise SpecError("required_adapters must not contain duplicates")
+        for adapter_key in self.required_adapters:
+            configured_path = self.adapter(adapter_key)
+            if not configured_path:
+                raise SpecError(
+                    f"required adapter {adapter_key!r} is missing from adapters"
+                )
+            adapter_path = self.resolve_project_path(
+                configured_path,
+                f"adapters.{adapter_key}",
+            )
+            if not adapter_path.is_file():
+                raise SpecError(
+                    f"required adapter not found: {adapter_path}"
+                )
+            if not os.access(adapter_path, os.X_OK):
+                raise SpecError(
+                    f"required adapter is not executable by the current user: "
+                    f"{adapter_path}"
+                )
 
         for capability in (
             "managed_worktrees",
@@ -165,6 +193,27 @@ class ProjectProfile:
 
     def procedure(self, key: str) -> str:
         return self.procedures.get(key, "").strip()
+
+    def adapter(self, key: str) -> str:
+        return self.adapters.get(key, "").strip()
+
+    def resolve_project_path(self, configured_path: str, label: str) -> Path:
+        relative = Path(configured_path)
+        if relative.is_absolute():
+            raise SpecError(f"{label} must be project-relative")
+
+        lexical = self.project_root
+        for part in relative.parts:
+            if part in ("", "."):
+                continue
+            lexical /= part
+            if lexical.is_symlink():
+                raise SpecError(f"{label} must not contain symlinks")
+
+        resolved = lexical.resolve()
+        if not resolved.is_relative_to(self.project_root):
+            raise SpecError(f"{label} escapes the project root")
+        return resolved
 
     def role(self, key: str) -> str:
         role = self.roles.get(key, "").strip()

@@ -85,6 +85,16 @@ deterministic hash suffix so distinct labels cannot overwrite each other.
 Changing the project default requires the separate `--set-default` flag. Do not
 use it before the generated workflow passes a managed-worktree canary.
 
+Project-local adapters declared by the profile are synchronized separately:
+
+```bash
+./scripts/sync-project-adapters --project /path/to/project
+```
+
+Android projects with runtime Smoke use the shared emulator resource-lock
+template while keeping package names, activities, build variants, accounts,
+and tested flows in project-owned procedures.
+
 ## Current phase
 
 The global toolkit and Kent 2.3 workflow generator are implemented. Appsome and
@@ -96,4 +106,6 @@ in place only when the Kent CLI can express the change without deleting
 nodes/edges, changing an edge source, or removing an approval. Unsupported
 structural drift uses another free-form lab label. A workflow becomes
 mutation-protected after tasks reference it in any linked project. Defaults
-remain unchanged.
+remain unchanged. Puber has exercised both conditional Smoke branches
+end-to-end in managed worktrees. Appsome branch canaries are pending after
+aligning its mobile resource-lock and explicit-device procedure.

@@ -6,6 +6,7 @@ kent_root="${KENT_PERSISTENCE_ROOT:-$HOME/.kent}"
 
 bash -n "$repo_root/scripts/install"
 bash -n "$repo_root/adapters/gradle/shell-postprocess-hook"
+bash -n "$repo_root/templates/project/emulator-resource-lock.sh"
 bash -n "$repo_root/templates/project/workflow-verification-dispatch"
 bash -n "$repo_root/templates/project/workflow-verify-report"
 
@@ -21,8 +22,16 @@ bash -n "$repo_root/templates/project/workflow-verify-report"
   echo "verification report template is not executable" >&2
   exit 1
 }
+[[ -x "$repo_root/templates/project/emulator-resource-lock.sh" ]] || {
+  echo "mobile resource-lock template is not executable" >&2
+  exit 1
+}
 [[ -x "$repo_root/scripts/generate-workflow" ]] || {
   echo "workflow generator is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/scripts/sync-project-adapters" ]] || {
+  echo "project adapter synchronizer is not executable" >&2
   exit 1
 }
 
@@ -107,6 +116,11 @@ if profile.get("schema_version") != 3:
     raise AssertionError("profile.schema_version must be 3")
 if profile.get("minimum_kent_version") != "2.3.0":
     raise AssertionError("profile.minimum_kent_version must be 2.3.0")
+required_adapters = profile.get("required_adapters")
+if not isinstance(required_adapters, list) or not all(
+    isinstance(value, str) and value for value in required_adapters
+):
+    raise AssertionError("profile.required_adapters must be a string array")
 if profile.get("policies", {}).get("smoke") not in {
     "disabled",
     "conditional",
@@ -131,8 +145,10 @@ PY
 
 python3 -m compileall -q \
   "$repo_root/workflowkit" \
-  "$repo_root/scripts/generate-workflow"
+  "$repo_root/scripts/generate-workflow" \
+  "$repo_root/scripts/sync-project-adapters"
 PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
   python3 -m unittest discover -s "$repo_root/tests" -p 'test_*.py'
+"$repo_root/tests/test_emulator_resource_lock.sh"
 
 echo "kent-engineering-kit validation passed"

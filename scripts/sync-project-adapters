@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+import tempfile
+import tomllib
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+TEMPLATES = {
+    "mobile_resource_lock": (
+        REPO_ROOT / "templates" / "project" / "emulator-resource-lock.sh"
+    ),
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Synchronize declared Kent Engineering Kit project adapters."
+    )
+    parser.add_argument(
+        "--project",
+        required=True,
+        type=Path,
+        help="Project root containing .kent/workflow-profile.toml.",
+    )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Replace a differing managed adapter with the toolkit template.",
+    )
+    return parser.parse_args()
+
+
+def project_target(project_root: Path, configured_path: str) -> Path:
+    relative = Path(configured_path)
+    if relative.is_absolute():
+        raise ValueError(f"adapter path must be project-relative: {configured_path}")
+
+    target = project_root
+    for part in relative.parts:
+        if part in ("", "."):
+            continue
+        target /= part
+        if target.is_symlink():
+            raise ValueError(
+                f"adapter path must not contain symlinks: {configured_path}"
+            )
+
+    resolved = target.resolve()
+    if not resolved.is_relative_to(project_root):
+        raise ValueError(f"adapter path escapes project root: {configured_path}")
+    return target
+
+
+def synchronize(source: Path, target: Path, *, update: bool) -> str:
+    source_bytes = source.read_bytes()
+    if target.is_symlink():
+        raise ValueError(f"adapter target must not be a symlink: {target}")
+    if target.exists():
+        target_mode = target.lstat().st_mode
+        if not stat.S_ISREG(target_mode):
+            raise ValueError(f"adapter target is not a file: {target}")
+        if target.read_bytes() != source_bytes:
+            if not update:
+                raise ValueError(
+                    f"adapter differs from toolkit template: {target}; "
+                    "rerun with --update after reviewing the diff"
+                )
+            status_label = "updated"
+        else:
+            status_label = "unchanged"
+    else:
+        status_label = "created"
+
+    if status_label != "unchanged":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        try:
+            shutil.copyfile(source, temporary_path)
+            temporary_path.chmod(0o755)
+            os.replace(temporary_path, target)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    else:
+        target.chmod(0o755)
+    return status_label
+
+
+def main() -> int:
+    args = parse_args()
+    project_root = args.project.expanduser().resolve()
+    profile_path = project_root / ".kent" / "workflow-profile.toml"
+    if not profile_path.is_file():
+        raise ValueError(f"project profile not found: {profile_path}")
+
+    profile = tomllib.loads(profile_path.read_text())
+    adapters = profile.get("adapters", {})
+    if not isinstance(adapters, dict):
+        raise ValueError("profile adapters must be a TOML table")
+
+    results = []
+    for key, configured_path in sorted(adapters.items()):
+        if key not in TEMPLATES:
+            raise ValueError(f"unsupported managed adapter: {key}")
+        if not isinstance(configured_path, str) or not configured_path.strip():
+            raise ValueError(f"adapters.{key} must be a non-empty string")
+        source = TEMPLATES[key]
+        target = project_target(project_root, configured_path.strip())
+        status_label = synchronize(source, target, update=args.update)
+        results.append(
+            {
+                "adapter": key,
+                "status": status_label,
+                "target": str(target),
+            }
+        )
+
+    print(json.dumps({"project": str(project_root), "adapters": results}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
+        print(f"sync-project-adapters: {error}", file=sys.stderr)
+        raise SystemExit(1)

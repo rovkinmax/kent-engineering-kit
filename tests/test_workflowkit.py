@@ -389,6 +389,159 @@ class WorkflowKitTest(unittest.TestCase):
                 )
             )
 
+    def test_profile_requires_declared_adapter_keys(self) -> None:
+        with self.assertRaisesRegex(
+            SpecError,
+            "required adapter 'mobile_resource_lock'",
+        ):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    "required_adapters = []",
+                    'required_adapters = ["mobile_resource_lock"]',
+                )
+            )
+
+    def test_required_adapter_must_exist_and_be_user_executable(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        profile_directory = root / ".kent"
+        profile_directory.mkdir()
+        contents = EXAMPLE_PROFILE.read_text().replace(
+            "required_adapters = []",
+            'required_adapters = ["mobile_resource_lock"]',
+        )
+        contents += (
+            "\n[adapters]\n"
+            'mobile_resource_lock = '
+            '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
+        )
+        (profile_directory / "workflow-profile.toml").write_text(contents)
+
+        with self.assertRaisesRegex(SpecError, "required adapter not found"):
+            ProjectProfile.load(root)
+
+        adapter = (
+            root / ".kent" / "adapters" / "mobile" / "emulator-resource-lock.sh"
+        )
+        adapter.parent.mkdir(parents=True)
+        adapter.write_text("#!/usr/bin/env bash\n")
+        adapter.chmod(0o001)
+        with self.assertRaisesRegex(
+            SpecError,
+            "not executable by the current user",
+        ):
+            ProjectProfile.load(root)
+
+        adapter.chmod(0o755)
+        profile = ProjectProfile.load(root)
+        self.assertEqual(
+            profile.adapter("mobile_resource_lock"),
+            ".kent/adapters/mobile/emulator-resource-lock.sh",
+        )
+
+    def test_required_adapter_rejects_symlink_path_components(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        profile_directory = root / ".kent"
+        profile_directory.mkdir()
+        contents = EXAMPLE_PROFILE.read_text().replace(
+            "required_adapters = []",
+            'required_adapters = ["mobile_resource_lock"]',
+        )
+        contents += (
+            "\n[adapters]\n"
+            'mobile_resource_lock = '
+            '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
+        )
+        (profile_directory / "workflow-profile.toml").write_text(contents)
+
+        unrelated = root / "unrelated.sh"
+        unrelated.write_text("#!/usr/bin/env bash\n")
+        unrelated.chmod(0o755)
+        adapter = (
+            root / ".kent" / "adapters" / "mobile" / "emulator-resource-lock.sh"
+        )
+        adapter.parent.mkdir(parents=True)
+        adapter.symlink_to(unrelated)
+
+        with self.assertRaisesRegex(SpecError, "must not contain symlinks"):
+            ProjectProfile.load(root)
+
+    def test_sync_project_adapters_installs_and_updates_declared_adapter(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        profile_directory = root / ".kent"
+        profile_directory.mkdir()
+        contents = EXAMPLE_PROFILE.read_text() + (
+            "\n[adapters]\n"
+            'mobile_resource_lock = '
+            '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
+        )
+        (profile_directory / "workflow-profile.toml").write_text(contents)
+        script = REPO_ROOT / "scripts" / "sync-project-adapters"
+        target = (
+            root / ".kent" / "adapters" / "mobile" / "emulator-resource-lock.sh"
+        )
+
+        created = subprocess.run(
+            [str(script), "--project", str(root)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        self.assertTrue(target.is_file())
+        self.assertTrue(target.stat().st_mode & 0o111)
+
+        target.write_text("#!/usr/bin/env bash\necho foreign\n")
+        refused = subprocess.run(
+            [str(script), "--project", str(root)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("rerun with --update", refused.stderr)
+
+        updated = subprocess.run(
+            [str(script), "--project", str(root), "--update"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertEqual(
+            target.read_bytes(),
+            (
+                REPO_ROOT
+                / "templates"
+                / "project"
+                / "emulator-resource-lock.sh"
+            ).read_bytes(),
+        )
+
+        unrelated = root / "unrelated.sh"
+        unrelated.write_text("#!/usr/bin/env bash\necho keep\n")
+        unrelated_before = unrelated.read_bytes()
+        target.unlink()
+        target.symlink_to(unrelated)
+        refused_symlink = subprocess.run(
+            [str(script), "--project", str(root), "--update"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(refused_symlink.returncode, 1)
+        self.assertIn("symlink", refused_symlink.stderr)
+        self.assertEqual(unrelated.read_bytes(), unrelated_before)
+
     def test_profile_accepts_newer_minimum_kent_version(self) -> None:
         profile = self.load_profile(
             lambda contents: contents.replace(

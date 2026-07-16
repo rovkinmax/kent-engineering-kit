@@ -45,6 +45,11 @@ After approval, create:
 - optional smoke, resource-lock, PR, and release adapters;
 - project-local role implementations using the canonical role keys.
 
+For Android projects with conditional or required Smoke, declare
+`mobile_resource_lock` in `required_adapters` and `[adapters]`, synchronize it with
+`scripts/sync-project-adapters`, and keep device selection plus APK/package
+details in the project procedure.
+
 Do not create or link live workflows until the project profile validates.
 Preview with `scripts/generate-workflow` before applying a versioned non-default
 instance. Require a managed-worktree canary before changing the project default.

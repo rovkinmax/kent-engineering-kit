@@ -26,6 +26,10 @@ generated toolkit workflows.
 - Use `kent worktree` for operations on Kent-managed worktrees.
 - Follow `contracts/worktree-contract.md` when a project needs setup hooks or
   untracked machine configuration.
+- For Android runtime Smoke, require the declared project-local
+  `mobile_resource_lock` adapter before any install, launch, input, or log
+  action. Use an explicit serial for every direct adb and target-specific
+  Mobile MCP call.
 - Preview generated workflows without `--apply`.
 - Apply versioned workflows non-default first. Use `--set-default` only after a
   managed-worktree canary passes.

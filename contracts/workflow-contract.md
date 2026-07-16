@@ -104,3 +104,11 @@ Each project provides:
 - canonical project-local role keys;
 - optional Smoke-decision, Smoke-execution, resource-lock, PR, CI, and release
   adapters.
+
+Profiles list indispensable executable adapter keys in `required_adapters`.
+The platform-neutral profile loader validates only that declared contract and
+does not infer policy from platform names. Android projects with conditional or
+required runtime Smoke list `mobile_resource_lock`; the shared adapter owns
+machine-wide lock mechanics while the project still owns emulator startup
+policy, physical-device permission, build/install targets, credentials, and
+runtime acceptance evidence.
