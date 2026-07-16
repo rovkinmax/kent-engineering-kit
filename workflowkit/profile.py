@@ -10,6 +10,7 @@ from .model import SpecError, validate_execution_target
 
 
 DELIVERY_PROFILES = {"lite", "standard", "team", "release"}
+SMOKE_POLICIES = {"disabled", "conditional", "required"}
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -27,6 +28,7 @@ class ProjectProfile:
     release_topology: str
     execution_default: str
     execution_overrides: dict[str, str]
+    policies: dict[str, str]
     capabilities: dict[str, bool]
     commands: dict[str, str]
     procedures: dict[str, str]
@@ -44,10 +46,15 @@ class ProjectProfile:
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise SpecError(f"cannot load project profile {profile_path}: {error}") from error
 
+        schema_version = require_int(raw, "schema_version")
+        if schema_version != 3:
+            raise SpecError(
+                f"unsupported profile schema {schema_version}; expected 3"
+            )
         execution = require_table(raw, "execution")
         profile = cls(
             project_root=root,
-            schema_version=require_int(raw, "schema_version"),
+            schema_version=schema_version,
             minimum_kent_version=require_string(raw, "minimum_kent_version"),
             project_name=require_string(raw, "project_name"),
             workflow_prefix=require_string(raw, "workflow_prefix"),
@@ -57,7 +64,11 @@ class ProjectProfile:
             issue_tracker=require_string(raw, "issue_tracker"),
             release_topology=require_string(raw, "release_topology"),
             execution_default=require_string(execution, "default_target"),
-            execution_overrides=string_table(execution.get("overrides", {}), "execution.overrides"),
+            execution_overrides=string_table(
+                execution.get("overrides", {}),
+                "execution.overrides",
+            ),
+            policies=string_table(require_table(raw, "policies"), "policies"),
             capabilities=bool_table(require_table(raw, "capabilities"), "capabilities"),
             commands=string_table(require_table(raw, "commands"), "commands"),
             procedures=string_table(raw.get("procedures", {}), "procedures"),
@@ -67,9 +78,9 @@ class ProjectProfile:
         return profile
 
     def validate(self) -> None:
-        if self.schema_version != 2:
+        if self.schema_version != 3:
             raise SpecError(
-                f"unsupported profile schema {self.schema_version}; expected 2"
+                f"unsupported profile schema {self.schema_version}; expected 3"
             )
         minimum_version = self.minimum_version_tuple()
         if minimum_version < (2, 3, 0):
@@ -86,11 +97,22 @@ class ProjectProfile:
         for target in self.execution_overrides.values():
             validate_execution_target(target)
 
+        smoke_policy = self.smoke_policy()
+        if smoke_policy not in SMOKE_POLICIES:
+            raise SpecError(
+                f"unsupported policies.smoke {smoke_policy!r}; expected one of "
+                f"{sorted(SMOKE_POLICIES)}"
+            )
+        if "device_smoke" in self.capabilities:
+            raise SpecError(
+                "capabilities.device_smoke was removed in profile schema 3; "
+                "use policies.smoke"
+            )
+
         for capability in (
             "managed_worktrees",
             "pull_requests",
             "ci_monitoring",
-            "device_smoke",
             "compliance_review",
             "spec_review",
         ):
@@ -132,6 +154,12 @@ class ProjectProfile:
         except KeyError as error:
             raise SpecError(f"unknown capability {key!r}") from error
 
+    def smoke_policy(self) -> str:
+        policy = self.policies.get("smoke", "").strip()
+        if not policy:
+            raise SpecError("profile policy 'smoke' is required")
+        return policy
+
     def command(self, key: str) -> str:
         return self.commands.get(key, "").strip()
 
@@ -147,8 +175,21 @@ class ProjectProfile:
     def optional_role(self, key: str) -> str:
         return self.roles.get(key, "").strip()
 
-    def workflow_name(self, workflow_kind: str, version: int) -> str:
-        if version <= 0:
+    def workflow_name(
+        self,
+        workflow_kind: str,
+        version: int | None = None,
+        label: str = "",
+    ) -> str:
+        if workflow_kind == "smoke-lab":
+            if version is not None:
+                raise SpecError("smoke-lab workflow names are not versioned")
+            normalized_label = " ".join(label.split())
+            suffix = f" {normalized_label}" if normalized_label else ""
+            return f"{self.workflow_prefix} Engineering Smoke Lab{suffix}"
+        if label.strip():
+            raise SpecError("labels are supported only for smoke-lab workflows")
+        if version is None or version <= 0:
             raise SpecError("workflow version must be positive")
         display = {
             "delivery": "Engineering Delivery",

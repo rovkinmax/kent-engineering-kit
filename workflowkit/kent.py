@@ -49,11 +49,8 @@ class KentClient:
             if mutation_required and self.workflow_has_tasks(definition):
                 raise SpecError(
                     f"workflow {spec.name!r} has tasks and cannot be mutated; "
-                    "create a new workflow version"
+                    "use another experimental label"
                 )
-
-        self.ensure_workflow_metadata(spec, definition)
-        definition = self.require_inspect(spec.name)
 
         for node in spec.nodes:
             self.ensure_node(spec.name, node, definition)
@@ -64,6 +61,9 @@ class KentClient:
         for edge in spec.edges:
             self.ensure_edge(spec.name, edge, definition)
             definition = self.require_inspect(spec.name)
+
+        self.ensure_workflow_metadata(spec, definition)
+        definition = self.require_inspect(spec.name)
 
         self.assert_exact_graph(spec, definition)
         self.validate(spec.name)
@@ -87,7 +87,7 @@ class KentClient:
         if extra_edges:
             raise SpecError(
                 f"workflow {spec.name!r} contains unexpected edges {extra_edges}; "
-                "create a new workflow version"
+                "use another experimental label"
             )
 
         indexed_edges = edge_index(definition)
@@ -98,13 +98,13 @@ class KentClient:
             if existing["source"] != edge.source:
                 raise SpecError(
                     f"edge {edge.key!r} changed source from "
-                    f"{existing['source']!r} to {edge.source!r}; create a new "
-                    "workflow version"
+                    f"{existing['source']!r} to {edge.source!r}; use another "
+                    "experimental label"
                 )
             if existing["requires_approval"] and not edge.requires_approval:
                 raise SpecError(
-                    f"edge {edge.key!r} would remove approval; create a new "
-                    "workflow version"
+                    f"edge {edge.key!r} would remove approval; use another "
+                    "experimental label"
                 )
 
         workflow = definition["workflow"]
@@ -132,30 +132,59 @@ class KentClient:
     def workflow_has_tasks(self, definition: dict[str, Any]) -> bool:
         workflow_id = definition["workflow"]["id"]
         workflow_ref = workflow_id.removeprefix("workflow-")
-        result = self.run(
-            [
-                "task",
-                "list",
-                "--project",
-                str(self.workspace),
-                "--workflow",
-                workflow_ref,
-                "--page-size",
-                "1",
-                "--json",
-            ],
-            check=False,
-        )
+        for project_id in self.project_ids():
+            result = self.run(
+                [
+                    "task",
+                    "list",
+                    "--project",
+                    project_id,
+                    "--workflow",
+                    workflow_ref,
+                    "--page-size",
+                    "1",
+                    "--json",
+                ],
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = f"{result.stderr}\n{result.stdout}".lower()
+                if "no active project/workflow link" in detail:
+                    continue
+                raise SpecError(
+                    f"cannot prove workflow "
+                    f"{definition['workflow']['name']!r} is taskless in "
+                    f"project {project_id!r}: {command_error(result)}"
+                )
+            payload = decode_json(
+                result.stdout,
+                (
+                    f"task list for workflow "
+                    f"{definition['workflow']['name']!r} in {project_id}"
+                ),
+            )
+            if payload.get("tasks"):
+                return True
+        return False
+
+    def project_ids(self) -> tuple[str, ...]:
+        result = self.run(["project", "list"], check=False)
         if result.returncode != 0:
             raise SpecError(
-                f"cannot prove workflow {definition['workflow']['name']!r} is "
-                f"taskless before mutation: {command_error(result)}"
+                "cannot enumerate Kent projects before workflow mutation: "
+                + command_error(result)
             )
-        payload = decode_json(
-            result.stdout,
-            f"task list for workflow {definition['workflow']['name']!r}",
+        project_ids = tuple(
+            line.split("\t", 1)[0].strip()
+            for line in result.stdout.splitlines()
+            if line.split("\t", 1)[0].strip().startswith("project-")
         )
-        return bool(payload.get("tasks"))
+        if not project_ids:
+            raise SpecError(
+                "cannot enumerate Kent projects before workflow mutation: "
+                "project list was empty or unrecognized"
+            )
+        return project_ids
 
     def inspect(self, workflow: str) -> dict[str, Any] | None:
         result = self.run(
@@ -339,13 +368,13 @@ class KentClient:
             if existing["source"] != spec.source:
                 raise SpecError(
                     f"edge {spec.key!r} changed source from "
-                    f"{existing['source']!r} to {spec.source!r}; create a new "
-                    "workflow version"
+                    f"{existing['source']!r} to {spec.source!r}; use another "
+                    "experimental label"
                 )
             if existing["requires_approval"] and not spec.requires_approval:
                 raise SpecError(
-                    f"edge {spec.key!r} would remove approval; create a new "
-                    "workflow version"
+                    f"edge {spec.key!r} would remove approval; use another "
+                    "experimental label"
                 )
             args = [
                 "workflow",
@@ -403,7 +432,7 @@ class KentClient:
         if extra:
             raise SpecError(
                 f"workflow {spec.name!r} contains unexpected nodes {extra}; "
-                "create a new workflow version"
+                "use another experimental label"
             )
 
     def assert_exact_graph(
@@ -466,7 +495,7 @@ class KentClient:
                 f"mismatched_nodes={mismatched_nodes}, "
                 f"extra_edges={extra_edges}, missing_edges={missing_edges}, "
                 f"mismatched_edges={mismatched_edges}. "
-                "Create a new workflow version if reconciliation cannot clear it."
+                "Use another experimental label if reconciliation cannot clear it."
             )
 
     def require_version(self, major: int, minor: int, patch: int) -> None:

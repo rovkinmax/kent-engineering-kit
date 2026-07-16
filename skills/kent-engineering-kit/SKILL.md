@@ -30,9 +30,17 @@ generated toolkit workflows.
 - Apply versioned workflows non-default first. Use `--set-default` only after a
   managed-worktree canary passes.
 - Use `Engineering Canary` for infrastructure-only validation. It intentionally
-  omits device smoke and PR/CI stages.
-- Never reconcile graph changes into a workflow that already has tasks. Create
-  the next version.
+  disables Smoke and omits PR/CI stages.
+- Use `Engineering Smoke Lab` to test `smoke_required` and `delivery_ready`
+  without committing, pushing, or creating a pull request. Use a free-form lab
+  label only after the current graph has tasks or needs unsupported structural
+  rewiring.
+- During lab iteration, reconcile a generated workflow in place only while it
+  has no task records in any linked project and the Kent CLI can express the
+  change without deleting nodes/edges, changing edge sources, or removing an
+  approval.
+- Once tasks reference a workflow, treat its graph as frozen and create another
+  free-form experimental label for semantic changes.
 
 ## Fan-out
 

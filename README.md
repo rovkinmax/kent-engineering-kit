@@ -17,7 +17,7 @@ device details, release policy, and integration credentials.
 ## Compatibility
 
 - Global prompts, skills, and role definitions remain usable with Kent 2.2.
-- Project profile schema 2 and generated workflows target Kent 2.3 or newer.
+- Project profile schema 3 and generated workflows target Kent 2.3 or newer.
 - Kent CLI/TUI, service, and Desktop must be upgraded together when crossing
   the 2.2/2.3 protocol boundary.
 - Existing workflows retain their Source HEAD behavior after a 2.3 upgrade.
@@ -68,13 +68,32 @@ Apply, link as non-default, validate, and export its audit snapshot:
   --apply
 ```
 
+Create or update the unversioned conditional-Smoke lab without a PR/CI tail:
+
+```bash
+./scripts/generate-workflow \
+  --project /path/to/project \
+  --kind smoke-lab \
+  --apply
+```
+
+If the current Smoke Lab already has tasks and a structural experiment needs a
+new graph, add a free-form suffix such as `--label "iteration beta"`. Labels are
+temporary experiment names, not semantic versions. Labeled snapshots include a
+deterministic hash suffix so distinct labels cannot overwrite each other.
+
 Changing the project default requires the separate `--set-default` flag. Do not
 use it before the generated workflow passes a managed-worktree canary.
 
 ## Current phase
 
 The global toolkit and Kent 2.3 workflow generator are implemented. Appsome and
-Puber have linked non-default `Engineering Delivery v4` and
-`Engineering Canary v1` instances. The canaries omit device and PR stages.
-Managed-worktree canary runs remain required before either project changes its
-default.
+Puber have linked non-default experimental `Engineering Delivery v5`,
+`Engineering Canary v2`, and unversioned `Engineering Smoke Lab` instances
+generated from the current profile-schema-3 hypothesis. Numeric suffixes are
+lab labels, not frozen releases. Taskless generated workflows may be reconciled
+in place only when the Kent CLI can express the change without deleting
+nodes/edges, changing an edge source, or removing an approval. Unsupported
+structural drift uses another free-form lab label. A workflow becomes
+mutation-protected after tasks reference it in any linked project. Defaults
+remain unchanged.

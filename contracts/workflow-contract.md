@@ -34,6 +34,8 @@ device, source-control, issue-tracker, and release adapters.
 - `standards_status`
 - `spec_status`
 - `smoke_report`
+- `smoke_rationale`
+- `smoke_scope`
 - `blocker_reason`
 - `pr_url`
 - `branch_name`
@@ -65,6 +67,22 @@ device, source-control, issue-tracker, and release adapters.
 - A branch emits one stable parameter contract on every completion.
 - Only the post-Join gate chooses Fix, QA, Ship, or Needs User Action.
 
+## Smoke policy
+
+- Project profile schema 3 declares one Smoke policy: `disabled`,
+  `conditional`, or `required`.
+- `conditional` keeps the decision in the post-Join gate.
+- Runtime or user-observable impact, explicit acceptance criteria, and
+  uncertainty force Smoke.
+- A bypass requires positive evidence that the change cannot affect a runtime
+  artifact or user-observable behavior.
+- Resource unavailability never downgrades a Smoke requirement; the Smoke node
+  routes it to `needs_user_action`.
+- Platform-specific classification and execution rules remain project adapters.
+- `Engineering Smoke Lab` preserves the project Smoke policy while disabling
+  PR and CI stages, so both Gate branches can be tested cheaply.
+- Smoke Lab rollover uses free-form experimental labels, not semantic versions.
+
 ## Role resolution
 
 - Operational nodes use a `default` orchestrator role.
@@ -84,4 +102,5 @@ Each project provides:
 - an optional idempotent `.kent/worktrees/setup.sh` conforming to
   `worktree-contract.md`;
 - canonical project-local role keys;
-- optional smoke, resource-lock, PR, CI, and release adapters.
+- optional Smoke-decision, Smoke-execution, resource-lock, PR, CI, and release
+  adapters.

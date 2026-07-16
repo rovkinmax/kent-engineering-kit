@@ -8,7 +8,11 @@ import subprocess
 import tempfile
 import unittest
 
-from workflowkit.delivery import build_canary_workflow, build_delivery_workflow
+from workflowkit.delivery import (
+    build_canary_workflow,
+    build_delivery_workflow,
+    build_smoke_lab_workflow,
+)
 from workflowkit.kent import (
     KentClient,
     context_source_string,
@@ -22,6 +26,7 @@ from workflowkit.model import (
     WorkflowSpec,
     validate_execution_target,
 )
+from workflowkit.naming import snapshot_filename
 from workflowkit.profile import ProjectProfile
 
 
@@ -98,6 +103,7 @@ class WorkflowKitTest(unittest.TestCase):
         profile = self.load_profile()
         spec = build_canary_workflow(profile, 1)
         node_keys = {node.key for node in spec.nodes}
+        by_key = {edge.key: edge for edge in spec.edges}
 
         self.assertEqual(spec.name, "Example Engineering Canary v1")
         self.assertEqual(spec.execution_target, "head")
@@ -111,6 +117,8 @@ class WorkflowKitTest(unittest.TestCase):
             edge.prompt for edge in spec.edges if edge.prompt is not None
         )
         self.assertNotIn(".kent/commands/feature-", prompts)
+        self.assertNotIn("gate_smoke_required", by_key)
+        self.assertEqual(by_key["gate_delivery_ready"].target, "cleanup")
 
     def test_pull_request_tail_uses_canonical_project_contract(self) -> None:
         profile = self.load_profile()
@@ -143,6 +151,143 @@ class WorkflowKitTest(unittest.TestCase):
                 for parameter in by_key["waiting_pr_close_without_merge"].parameters
             ),
             ("workspace_path", "pr_report", "closure_reason"),
+        )
+
+    def test_conditional_smoke_splits_gate_with_explicit_decision_data(self) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        self.assertIn("smoke", {node.key for node in spec.nodes})
+        self.assertEqual(
+            by_key["gate_smoke_required"].transition,
+            "smoke_required",
+        )
+        self.assertEqual(by_key["gate_smoke_required"].target, "smoke")
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["gate_smoke_required"].parameters
+            ),
+            (
+                "workspace_path",
+                "review_context",
+                "smoke_rationale",
+                "smoke_scope",
+            ),
+        )
+        self.assertEqual(
+            by_key["gate_delivery_ready"].transition,
+            "delivery_ready",
+        )
+        self.assertEqual(by_key["gate_delivery_ready"].target, "prepare_pr")
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["gate_delivery_ready"].parameters
+            ),
+            ("workspace_path", "review_context", "smoke_rationale"),
+        )
+        self.assertIn(
+            "Uncertainty must route to `smoke_required`",
+            by_key["verification_join_gate"].prompt,
+        )
+
+    def test_required_smoke_has_no_gate_bypass(self) -> None:
+        profile = self.load_profile(
+            lambda contents: contents.replace(
+                'smoke = "conditional"',
+                'smoke = "required"',
+            )
+        )
+        spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        self.assertIn("gate_smoke_required", by_key)
+        self.assertNotIn("gate_delivery_ready", by_key)
+
+    def test_disabled_smoke_has_no_smoke_node(self) -> None:
+        profile = self.load_profile(
+            lambda contents: contents.replace(
+                'smoke = "conditional"',
+                'smoke = "disabled"',
+            )
+        )
+        spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        self.assertNotIn("smoke", {node.key for node in spec.nodes})
+        self.assertNotIn("gate_smoke_required", by_key)
+        self.assertEqual(by_key["gate_delivery_ready"].target, "prepare_pr")
+
+    def test_smoke_lab_exercises_both_gate_paths_without_delivery_tail(self) -> None:
+        profile = self.load_profile()
+        spec = build_smoke_lab_workflow(profile)
+        node_keys = {node.key for node in spec.nodes}
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        self.assertEqual(spec.name, "Example Engineering Smoke Lab")
+        self.assertEqual(spec.execution_target, "head")
+        self.assertIn("smoke", node_keys)
+        self.assertNotIn("prepare_pr", node_keys)
+        self.assertNotIn("ci_monitor", node_keys)
+        self.assertNotIn("waiting_pr", node_keys)
+        self.assertEqual(by_key["gate_smoke_required"].target, "smoke")
+        self.assertEqual(by_key["gate_delivery_ready"].target, "cleanup")
+        self.assertEqual(by_key["smoke_cleanup"].target, "cleanup")
+
+    def test_smoke_lab_supports_free_form_rollover_label(self) -> None:
+        profile = self.load_profile()
+        spec = build_smoke_lab_workflow(profile, label="iteration beta")
+        self.assertEqual(
+            spec.name,
+            "Example Engineering Smoke Lab iteration beta",
+        )
+
+    def test_smoke_lab_rejects_nonconditional_policy(self) -> None:
+        for policy in ("disabled", "required"):
+            with self.subTest(policy=policy):
+                profile = self.load_profile(
+                    lambda contents, policy=policy: contents.replace(
+                        'smoke = "conditional"',
+                        f'smoke = "{policy}"',
+                    )
+                )
+                with self.assertRaisesRegex(
+                    SpecError,
+                    "requires conditional Smoke policy",
+                ):
+                    build_smoke_lab_workflow(profile)
+
+    def test_smoke_lab_label_is_rejected_for_other_workflow_kinds(self) -> None:
+        profile = self.load_profile()
+        with self.assertRaisesRegex(SpecError, "only for smoke-lab"):
+            profile.workflow_name(
+                "delivery",
+                version=1,
+                label="iteration beta",
+            )
+
+    def test_labeled_snapshot_names_do_not_collide_after_slugging(self) -> None:
+        first = snapshot_filename(
+            "Example Engineering Smoke Lab iteration beta",
+            disambiguate=True,
+        )
+        second = snapshot_filename(
+            "Example Engineering Smoke Lab iteration-beta",
+            disambiguate=True,
+        )
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.endswith(".json"))
+        self.assertTrue(second.endswith(".json"))
+
+    def test_unlabelled_snapshot_name_remains_readable(self) -> None:
+        self.assertEqual(
+            snapshot_filename(
+                "Example Engineering Smoke Lab",
+                disambiguate=False,
+            ),
+            "example-engineering-smoke-lab.json",
         )
 
     def test_cancellation_edges_require_closure_reason(self) -> None:
@@ -211,6 +356,38 @@ class WorkflowKitTest(unittest.TestCase):
 
         with self.assertRaisesRegex(SpecError, "ci_monitoring requires pull_requests"):
             self.load_profile(transform)
+
+    def test_profile_rejects_schema_two(self) -> None:
+        with self.assertRaisesRegex(SpecError, "expected 3"):
+            self.load_profile(
+                lambda contents: (
+                    contents.replace(
+                        "schema_version = 3",
+                        "schema_version = 2",
+                    ).replace(
+                        '[policies]\nsmoke = "conditional"\n\n',
+                        "",
+                    )
+                )
+            )
+
+    def test_profile_rejects_legacy_device_smoke_capability(self) -> None:
+        with self.assertRaisesRegex(SpecError, "device_smoke was removed"):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    "managed_worktrees = true",
+                    "managed_worktrees = true\ndevice_smoke = true",
+                )
+            )
+
+    def test_profile_rejects_unknown_smoke_policy(self) -> None:
+        with self.assertRaisesRegex(SpecError, "unsupported policies.smoke"):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    'smoke = "conditional"',
+                    'smoke = "sometimes"',
+                )
+            )
 
     def test_profile_accepts_newer_minimum_kent_version(self) -> None:
         profile = self.load_profile(
@@ -433,6 +610,53 @@ class WorkflowKitTest(unittest.TestCase):
         with self.assertRaisesRegex(SpecError, "has tasks and cannot be mutated"):
             client.apply(spec)
         self.assertEqual(commands, [])
+
+    def test_workflow_task_check_scans_every_linked_project(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        definition = {
+            "workflow": {
+                "id": "workflow-shared",
+                "name": "Shared Lab",
+            }
+        }
+        calls: list[list[str]] = []
+        client = KentClient(Path(temporary.name))
+
+        def run(
+            args: list[str],
+            *,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            if args == ["project", "list"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=(
+                        "project-one\tOne\t/repo/one\n"
+                        "project-two\tTwo\t/repo/two\n"
+                    ),
+                    stderr="",
+                )
+            project_id = args[args.index("--project") + 1]
+            tasks = [] if project_id == "project-one" else [{}]
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps({"tasks": tasks}),
+                stderr="",
+            )
+
+        client.run = run
+
+        self.assertTrue(client.workflow_has_tasks(definition))
+        task_projects = [
+            args[args.index("--project") + 1]
+            for args in calls
+            if args[:2] == ["task", "list"]
+        ]
+        self.assertEqual(task_projects, ["project-one", "project-two"])
 
     def test_edge_reconcile_clears_stale_prompt_and_context_source(self) -> None:
         temporary = tempfile.TemporaryDirectory()

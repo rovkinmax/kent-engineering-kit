@@ -103,10 +103,16 @@ allowed_targets = {
     "default-branch",
 }
 
-if profile.get("schema_version") != 2:
-    raise AssertionError("profile.schema_version must be 2")
+if profile.get("schema_version") != 3:
+    raise AssertionError("profile.schema_version must be 3")
 if profile.get("minimum_kent_version") != "2.3.0":
     raise AssertionError("profile.minimum_kent_version must be 2.3.0")
+if profile.get("policies", {}).get("smoke") not in {
+    "disabled",
+    "conditional",
+    "required",
+}:
+    raise AssertionError("profile.policies.smoke is invalid")
 
 targets = [profile["execution"]["default_target"]]
 targets.extend(profile["execution"].get("overrides", {}).values())

@@ -1,4 +1,4 @@
-schema_version = 2
+schema_version = 3
 minimum_kent_version = "2.3.0"
 project_name = "example"
 workflow_prefix = "Example"
@@ -13,13 +13,16 @@ default_target = "ask-on-first-execution"
 
 [execution.overrides]
 canary = "head"
+smoke-lab = "head"
 maintenance = "default-branch"
+
+[policies]
+smoke = "conditional"
 
 [capabilities]
 managed_worktrees = true
 pull_requests = true
 ci_monitoring = true
-device_smoke = false
 compliance_review = true
 spec_review = true
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import re
 import sys
 
 
@@ -16,9 +15,11 @@ from workflowkit import (
     ProjectProfile,
     build_canary_workflow,
     build_delivery_workflow,
+    build_smoke_lab_workflow,
 )
 from workflowkit.kent import KentCommandError, spec_as_json
 from workflowkit.model import SpecError
+from workflowkit.naming import snapshot_filename
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,15 +34,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--kind",
-        choices=("delivery", "canary"),
+        choices=("delivery", "canary", "smoke-lab"),
         default="delivery",
         help="Workflow kind to generate.",
     )
     parser.add_argument(
         "--version",
-        required=True,
         type=int,
-        help="Positive generated workflow version.",
+        help="Positive generated workflow version; omitted for smoke-lab.",
+    )
+    parser.add_argument(
+        "--label",
+        default="",
+        help="Free-form experimental suffix for smoke-lab rollover.",
     )
     parser.add_argument(
         "--apply",
@@ -60,13 +65,23 @@ def main() -> int:
     args = parse_args()
     if args.set_default and not args.apply:
         raise SpecError("--set-default requires --apply")
+    if args.kind == "smoke-lab":
+        if args.version is not None:
+            raise SpecError("--version is not used with smoke-lab")
+    elif args.version is None:
+        raise SpecError(f"--version is required with {args.kind}")
+    elif args.label.strip():
+        raise SpecError("--label is supported only with smoke-lab")
 
     profile = ProjectProfile.load(args.project)
-    builders = {
-        "delivery": build_delivery_workflow,
-        "canary": build_canary_workflow,
-    }
-    spec = builders[args.kind](profile, args.version)
+    if args.kind == "smoke-lab":
+        spec = build_smoke_lab_workflow(profile, label=args.label)
+    else:
+        builders = {
+            "delivery": build_delivery_workflow,
+            "canary": build_canary_workflow,
+        }
+        spec = builders[args.kind](profile, args.version)
 
     if not args.apply:
         print(json.dumps(spec_as_json(spec), indent=2, ensure_ascii=False))
@@ -78,7 +93,10 @@ def main() -> int:
         minimum_version=profile.minimum_version_tuple(),
         set_default=args.set_default,
     )
-    snapshot_name = slugify(spec.name) + ".json"
+    snapshot_name = snapshot_filename(
+        spec.name,
+        disambiguate=bool(args.label.strip()),
+    )
     snapshot_path = profile.project_root / ".kent" / "workflows" / snapshot_name
     client.export_snapshot(definition, snapshot_path)
     print(
@@ -98,13 +116,6 @@ def main() -> int:
         )
     )
     return 0
-
-
-def slugify(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    if not slug:
-        raise SpecError(f"cannot derive snapshot name from {value!r}")
-    return slug
 
 
 if __name__ == "__main__":

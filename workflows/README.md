@@ -3,7 +3,7 @@
 Live Kent workflow definitions are stored in Kent's database. Project JSON files
 are audit snapshots.
 
-The generator creates versioned project-local instances from common
+The generator creates project-local experimental instances from common
 fragments rather than sharing one mutable workflow ID across projects.
 
 Every generated workflow:
@@ -24,14 +24,19 @@ Implemented `Engineering Delivery` fragments:
 
 `Engineering Canary` reuses the planning, single-writer continuation,
 verification fan-out/Join, fix, and cleanup core while intentionally omitting
-device smoke, PR creation, CI, and merge waiting.
+runtime Smoke, PR creation, CI, and merge waiting.
+
+`Engineering Smoke Lab` keeps conditional Smoke routing while omitting PR, CI,
+and merge waiting. Its default name is unversioned; free-form labels create a
+new experiment after the current graph has tasks or needs unsupported
+structural rewiring.
 
 Planned fragments:
 
 - maintenance and dependency updates;
 - intake and diagnosis;
 - single and split release lifecycles;
-- standalone smoke and rebase flows.
+- standalone rebase flows.
 
 Appsome and Puber are the initial conformance projects. Their generated
 instances are linked non-default pending managed-worktree canaries. Web, iOS,
@@ -39,13 +44,14 @@ embedded, and generic shell profiles follow after the core contracts stabilize.
 
 Existing pre-2.3 workflows are not rewritten in place. After the coordinated
 upgrade, their preserved Source HEAD policies are inspected and snapshots are
-re-exported before a versioned generated replacement is linked.
+re-exported before an experimental generated replacement is linked.
 
-When a draft version contains stale graph elements that Kent cannot remove
+When an experiment contains stale graph elements that Kent cannot remove
 through the CLI, leave it taskless and unlinked, mark it superseded, and create
-the next clean version. Never repair it through direct database mutation.
+another free-form lab label. Never repair it through direct database mutation.
 
 Before changing an existing workflow, the generator computes drift without
 mutation. Unsupported extra graph elements fail immediately. Reconciliation
 that would change graph semantics is refused when the workflow already has task
-records; create a new workflow version instead.
+records. Compatible taskless changes may reconcile in place; unsupported
+structural changes use another experimental label.

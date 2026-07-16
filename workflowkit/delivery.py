@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from .model import EdgeSpec, NodeSpec, ParameterSpec, WorkflowSpec
+from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
 from .profile import ProjectProfile
 
 
@@ -17,6 +17,14 @@ PLAN = ParameterSpec(
 REVIEW_CONTEXT = ParameterSpec(
     "review_context",
     "Implementation, fix, report, and artifact context required by verification.",
+)
+SMOKE_RATIONALE = ParameterSpec(
+    "smoke_rationale",
+    "Evidence-based reason that runtime smoke is required or may be skipped.",
+)
+SMOKE_SCOPE = ParameterSpec(
+    "smoke_scope",
+    "Focused runtime scenarios and surfaces that smoke testing must exercise.",
 )
 BLOCKER = ParameterSpec(
     "blocker_reason",
@@ -119,7 +127,7 @@ def build_delivery_workflow(
     if len(review_branches) > 1:
         nodes.append(NodeSpec("verification_join", "join", "Verification Join"))
 
-    if profile.capability("device_smoke"):
+    if profile.smoke_policy() != "disabled":
         nodes.append(agent_node("smoke", "Smoke Test", orchestrator))
     if profile.capability("pull_requests"):
         nodes.extend(
@@ -331,31 +339,52 @@ def build_delivery_workflow(
         ]
     )
 
-    accepted_target = post_verification_target(profile)
-    edges.append(
-        EdgeSpec(
-            key=f"gate_{accepted_target}",
-            source="verification_gate",
-            transition="accepted",
-            target=accepted_target,
-            prompt=post_verification_prompt(profile, accepted_target),
-            transition_description=(
-                "All enabled verification branches passed and delivery may continue."
-            ),
-            parameters=(WORKSPACE, REVIEW_CONTEXT),
+    smoke_policy = profile.smoke_policy()
+    delivery_target = post_smoke_target(profile)
+    if smoke_policy in {"conditional", "required"}:
+        edges.append(
+            EdgeSpec(
+                key="gate_smoke_required",
+                source="verification_gate",
+                transition="smoke_required",
+                target="smoke",
+                prompt=smoke_prompt(profile),
+                transition_description=(
+                    "All verification passed and runtime smoke is required."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                    SMOKE_RATIONALE,
+                    SMOKE_SCOPE,
+                ),
+            )
         )
-    )
+    if smoke_policy in {"conditional", "disabled"}:
+        edges.append(
+            EdgeSpec(
+                key="gate_delivery_ready",
+                source="verification_gate",
+                transition="delivery_ready",
+                target=delivery_target,
+                prompt=delivery_prompt(profile, delivery_target),
+                transition_description=(
+                    "All verification passed and delivery may continue without "
+                    "runtime smoke."
+                ),
+                parameters=(WORKSPACE, REVIEW_CONTEXT, SMOKE_RATIONALE),
+            )
+        )
 
-    if profile.capability("device_smoke"):
-        smoke_target = "prepare_pr" if profile.capability("pull_requests") else "cleanup"
+    if smoke_policy != "disabled":
         edges.extend(
             [
                 EdgeSpec(
-                    key=f"smoke_{smoke_target}",
+                    key=f"smoke_{delivery_target}",
                     source="smoke",
                     transition="passed",
-                    target=smoke_target,
-                    prompt=post_verification_prompt(profile, smoke_target),
+                    target=delivery_target,
+                    prompt=delivery_prompt(profile, delivery_target),
                     transition_description=(
                         "Focused smoke testing passed and delivery may continue."
                     ),
@@ -551,11 +580,12 @@ def build_canary_workflow(
     capabilities = dict(profile.capabilities)
     capabilities.update(
         {
-            "device_smoke": False,
             "pull_requests": False,
             "ci_monitoring": False,
         }
     )
+    policies = dict(profile.policies)
+    policies["smoke"] = "disabled"
     procedures = dict(profile.procedures)
     procedures.update(
         {
@@ -571,6 +601,7 @@ def build_canary_workflow(
     canary_profile = replace(
         profile,
         capabilities=capabilities,
+        policies=policies,
         procedures=procedures,
     )
     delivery_spec = build_delivery_workflow(canary_profile, version)
@@ -582,6 +613,50 @@ def build_canary_workflow(
             f"verification, fan-out, Join, and cleanup for {profile.project_name}."
         ),
         execution_target=profile.execution_target("canary"),
+    )
+    spec.validate()
+    return spec
+
+
+def build_smoke_lab_workflow(
+    profile: ProjectProfile,
+    label: str = "",
+) -> WorkflowSpec:
+    if profile.smoke_policy() != "conditional":
+        raise SpecError("smoke-lab requires conditional Smoke policy")
+
+    capabilities = dict(profile.capabilities)
+    capabilities.update(
+        {
+            "pull_requests": False,
+            "ci_monitoring": False,
+        }
+    )
+    procedures = dict(profile.procedures)
+    procedures.update(
+        {
+            "plan": "",
+            "implement": "",
+            "fix": "",
+            "ship": "",
+            "ci": "",
+            "waiting_pr": "",
+        }
+    )
+    lab_profile = replace(
+        profile,
+        capabilities=capabilities,
+        procedures=procedures,
+    )
+    delivery_spec = build_delivery_workflow(lab_profile, 1)
+    spec = replace(
+        delivery_spec,
+        name=profile.workflow_name("smoke-lab", label=label),
+        description=(
+            "Exercise conditional runtime Smoke routing without PR or CI "
+            f"delivery stages for {profile.project_name}."
+        ),
+        execution_target=profile.execution_target("smoke-lab"),
     )
     spec.validate()
     return spec
@@ -760,6 +835,7 @@ def verification_gate_prompt(profile: ProjectProfile) -> str:
         if profile.capability("spec_review")
         else "Specification review: not enabled by the project profile."
     )
+    smoke_decision = smoke_decision_instruction(profile)
     return f"""Evaluate the joined verification reports without editing files.
 
 Workspace: {{{{.Params.fanout_verify.workspace_path}}}}
@@ -769,8 +845,14 @@ Verification report: {{{{.Params.verification_report}}}}
 {standards}
 {spec}
 
-Choose `accepted` only when every enabled status is `passed`. Provide
-`workspace_path` and a refreshed `review_context` summarizing all reports.
+Choose a delivery transition only when every enabled status is `passed`.
+Provide `workspace_path`, a refreshed `review_context` summarizing all reports,
+and the required Smoke decision fields. The refreshed `review_context` must
+record the profile Smoke policy, selected transition, rationale, and required
+scope or concrete evidence for bypassing Smoke.
+
+{smoke_decision}
+
 Choose `needs_changes` for task-scoped failures and provide `workspace_path`
 plus `fix_context`. Choose `needs_user_action` for external or contradictory
 blockers and provide `workspace_path`, `review_context`, and `blocker_reason`;
@@ -784,15 +866,19 @@ def smoke_prompt(profile: ProjectProfile) -> str:
 Read .kent/project-contract.md and repository instructions first. Workspace:
 {{{{.Params.workspace_path}}}}. Review context:
 {{{{.Params.review_context}}}}
+Smoke rationale: {{{{.Params.smoke_rationale}}}}
+Required scope: {{{{.Params.smoke_scope}}}}
 
 {procedure_instruction(profile, "smoke")}
 
-Follow all device, emulator, hardware-lock, install, and serial-selection rules.
-Do not edit production files; route implementation findings to the single
-writer. Complete with `passed` and provide `workspace_path` plus an updated
-`review_context` containing the smoke report. Use `needs_changes` with
-`workspace_path` and `fix_context` for task code issues. Use
-`needs_user_action` with `blocker_reason` for external blockers."""
+Follow the project-specific browser, device, simulator, hardware, resource-lock,
+build, deploy, install, launch, account, and isolation rules that apply. Do not
+edit production files; route implementation findings to the single writer.
+Complete with `passed` and provide `workspace_path` plus an updated
+`review_context` containing the decision, rationale, tested scope, evidence,
+artifacts, and untested areas. Use `needs_changes` with `workspace_path` and
+`fix_context` for task code issues. Use `needs_user_action` with
+`blocker_reason` for external blockers."""
 
 
 def prepare_pr_prompt(profile: ProjectProfile) -> str:
@@ -929,9 +1015,7 @@ Choose `wont_do` only for an explicit cancellation decision and provide
 `closure_reason`."""
 
 
-def post_verification_target(profile: ProjectProfile) -> str:
-    if profile.capability("device_smoke"):
-        return "smoke"
+def post_smoke_target(profile: ProjectProfile) -> str:
     if profile.capability("pull_requests"):
         return "prepare_pr"
     return "cleanup"
@@ -951,11 +1035,38 @@ def delegation_instruction(
     )
 
 
-def post_verification_prompt(profile: ProjectProfile, target: str) -> str:
-    if target == "smoke":
-        return smoke_prompt(profile)
+def delivery_prompt(profile: ProjectProfile, target: str) -> str:
     if target == "prepare_pr":
         return prepare_pr_prompt(profile)
     if target == "cleanup":
         return cleanup_prompt(profile)
-    raise ValueError(f"unsupported post-verification target {target!r}")
+    raise ValueError(f"unsupported delivery target {target!r}")
+
+
+def smoke_decision_instruction(profile: ProjectProfile) -> str:
+    procedure = procedure_instruction(profile, "smoke_decision")
+    policy = profile.smoke_policy()
+    if policy == "required":
+        return f"""Project policy requires runtime Smoke after verification.
+{procedure}
+Choose `smoke_required` and provide `smoke_rationale` plus a focused
+`smoke_scope`. Device, browser, simulator, or hardware unavailability is not a
+reason to bypass Smoke; the Smoke node must report `needs_user_action`."""
+    if policy == "disabled":
+        return """Project policy disables runtime Smoke for this workflow.
+Choose `delivery_ready` and set `smoke_rationale` to the profile policy. Do not
+invent a Smoke requirement that the project cannot execute."""
+    if policy == "conditional":
+        return f"""Project policy makes runtime Smoke conditional.
+{procedure}
+Choose `smoke_required` for user-visible or runtime behavior, navigation, state
+or data flow, permissions or security, storage or migrations, external
+integration, browser/device/hardware interaction, explicit acceptance criteria,
+or uncertain runtime impact. Provide `smoke_rationale` and a focused
+`smoke_scope`.
+
+Choose `delivery_ready` only for changes proven not to affect a runtime
+artifact or user-observable behavior, and provide an evidence-based
+`smoke_rationale`. Uncertainty must route to `smoke_required`. Resource
+unavailability must never downgrade the decision."""
+    raise ValueError(f"unsupported smoke policy {policy!r}")
