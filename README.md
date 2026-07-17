@@ -106,8 +106,12 @@ in place only when the Kent CLI can express the change without deleting
 nodes/edges, changing an edge source, or removing an approval. Unsupported
 structural drift uses another free-form lab label. A workflow becomes
 mutation-protected after tasks reference it in any linked project. Defaults
-remain unchanged. Puber and Appsome have exercised both conditional Smoke
-branches end-to-end in managed worktrees. Appsome also exercised the
+remain unchanged. Puber and Appsome have exercised the current two-step
+`Engineering Canary` continuation, verification fan-out/Join, no-Smoke Gate,
+and conservative cleanup end-to-end in managed worktrees. Appsome additionally
+resumed a Verification Gate after a transient provider interruption without
+losing the locked target or completed Join context. Both projects have also
+exercised both conditional Smoke branches. Appsome additionally exercised the
 `smoke_required` blocker path before completing an audited passing rerun against
 an already-authenticated safe static shell. Exact-device targeting,
 package-scoped runtime signals, deterministic evidence auditing, and lock

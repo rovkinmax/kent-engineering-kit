@@ -24,6 +24,10 @@ generated toolkit workflows.
 - Use a workflow-kind override when present.
 - Treat Kent's selected execution root and resolved commit as authoritative.
 - Use `kent worktree` for operations on Kent-managed worktrees.
+- Diagnose `interrupted` task runs before changing workflow state. A transient
+  provider or transport error should be recovered with the user-only
+  `kent task resume` command, preserving the locked target and completed
+  upstream transitions. Do not replace it with a manual move or a new task.
 - Follow `contracts/worktree-contract.md` when a project needs setup hooks or
   untracked machine configuration.
 - For Android runtime Smoke, require the declared project-local

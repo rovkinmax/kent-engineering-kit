@@ -12,6 +12,10 @@ device, source-control, issue-tracker, and release adapters.
 - Recoverable blockers use approval-gated `needs_user_action` self-loops.
 - A post-Join blocker may approval-loop through verification dispatch so every
   read-only branch reruns with fresh state.
+- An interrupted node run is runtime state, not a workflow decision. Inspect
+  the interruption reason before changing task state. For a transient provider
+  or transport failure, resume the interrupted node on its locked execution
+  target; do not move the task or rerun completed upstream branches.
 - `wont_do` is terminal, requires an explicit cancellation decision, and emits
   `closure_reason`.
 - Parallel verification branches are read-only.

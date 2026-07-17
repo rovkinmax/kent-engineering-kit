@@ -26,13 +26,17 @@ Status: complete for the `Engineering Delivery v4` and
 
 ## Phase 3: Delivery workflows
 
-Status: generated and linked non-default; Smoke Lab canaries complete, delivery
-migration pending.
+Status: generated and linked non-default; current Canary and Smoke Lab canaries
+complete, delivery-tail migration pending.
 
 - Generate the current `Engineering Delivery` and infrastructure-only
   `Engineering Canary` lab instances for Appsome and Puber.
 - Re-export existing workflow snapshots and verify their preserved Source HEAD
   policies after upgrading Kent.
+- Validate two-step implementation continuation, verification fan-out/Join,
+  and report-only cleanup in both Android projects.
+- Validate interrupted-node recovery without losing the locked target or
+  completed Join context in Appsome.
 - Keep defaults unchanged until delivery-tail canaries and migration decisions
   are complete.
 - Migrate feature/refactor/bugfix flows.
