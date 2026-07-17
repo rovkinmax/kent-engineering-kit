@@ -66,10 +66,17 @@ for target in \
   "$kent_root/AGENTS.md" \
   "$kent_root/hooks/gradle-worktree-warning" \
   "$kent_root/skills/kent-engineering-kit" \
-  "$kent_root/prompts/grill.md" \
-  "$kent_root/agents/spec-reviewer.md"; do
+  "$kent_root/prompts/grill.md"; do
   [[ -e "$target" ]] || {
     echo "missing installed target: $target" >&2
+    exit 1
+  }
+done
+
+for agent_file in "$repo_root"/agents/*.md; do
+  target="$kent_root/agents/$(basename "$agent_file")"
+  [[ -e "$target" ]] || {
+    echo "missing installed agent: $target" >&2
     exit 1
   }
 done

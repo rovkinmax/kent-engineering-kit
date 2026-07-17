@@ -115,4 +115,7 @@ exercised both conditional Smoke branches. Appsome additionally exercised the
 `smoke_required` blocker path before completing an audited passing rerun against
 an already-authenticated safe static shell. Exact-device targeting,
 package-scoped runtime signals, deterministic evidence auditing, and lock
-release passed without requiring a clean emulator.
+release passed without requiring a clean emulator. Delivery keeps early
+Standards and Spec reviews separate from a final read-only Compliance Review
+after Gate and any required Smoke; the final attestation must pass before PR
+preparation.

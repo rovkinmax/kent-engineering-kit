@@ -46,9 +46,13 @@ STANDARDS_STATUS = ParameterSpec(
     "standards_status",
     "Repository standards status: passed, needs_changes, or blocked.",
 )
+STANDARDS_REPORT = ParameterSpec(
+    "standards_report",
+    "Read-only repository standards, architecture, and engineering report.",
+)
 COMPLIANCE_REPORT = ParameterSpec(
     "compliance_report",
-    "Read-only repository standards and architecture compliance report.",
+    "Final delivery compliance attestation and any blocking findings.",
 )
 SPEC_STATUS = ParameterSpec(
     "spec_status",
@@ -82,6 +86,10 @@ def build_delivery_workflow(
     version: int,
 ) -> WorkflowSpec:
     orchestrator = profile.role("orchestrator")
+    final_compliance = (
+        profile.capability("pull_requests")
+        and profile.capability("compliance_review")
+    )
     nodes: list[NodeSpec] = [
         NodeSpec("backlog", "start", "Backlog"),
         agent_node("plan", "Plan", orchestrator),
@@ -106,7 +114,7 @@ def build_delivery_workflow(
     ]
 
     review_branches = ["deterministic_verify"]
-    if profile.capability("compliance_review"):
+    if profile.capability("standards_review"):
         nodes.append(
             agent_node(
                 "standards_review",
@@ -130,6 +138,14 @@ def build_delivery_workflow(
     if profile.smoke_policy() != "disabled":
         nodes.append(agent_node("smoke", "Smoke Test", orchestrator))
     if profile.capability("pull_requests"):
+        if final_compliance:
+            nodes.append(
+                agent_node(
+                    "compliance",
+                    "Compliance Review",
+                    profile.role("compliance"),
+                )
+            )
         nodes.extend(
             [
                 agent_node("prepare_pr", "Prepare PR", orchestrator),
@@ -278,7 +294,7 @@ def build_delivery_workflow(
                     transition_description=(
                         "Repository standards review completed and reported its status."
                     ),
-                    parameters=(STANDARDS_STATUS, COMPLIANCE_REPORT),
+                    parameters=(STANDARDS_STATUS, STANDARDS_REPORT),
                 )
             )
         if "spec_review" in review_branches:
@@ -377,10 +393,17 @@ def build_delivery_workflow(
         )
 
     if smoke_policy != "disabled":
+        smoke_delivery_edge_key = (
+            "smoke_prepare_pr"
+            if profile.capability("pull_requests")
+            else f"smoke_{delivery_target}"
+        )
         edges.extend(
             [
                 EdgeSpec(
-                    key=f"smoke_{delivery_target}",
+                    # Keep the historical key stable while taskless Delivery
+                    # workflows are reconciled from Prepare PR to Compliance.
+                    key=smoke_delivery_edge_key,
                     source="smoke",
                     transition="passed",
                     target=delivery_target,
@@ -404,6 +427,50 @@ def build_delivery_workflow(
                     parameters=(WORKSPACE, FIX_CONTEXT),
                 ),
                 recovery_edge("smoke"),
+            ]
+        )
+
+    if final_compliance:
+        edges.extend(
+            [
+                EdgeSpec(
+                    key="compliance_prepare_pr",
+                    source="compliance",
+                    transition="ship_pr",
+                    target="prepare_pr",
+                    prompt=prepare_pr_prompt(profile),
+                    transition_description=(
+                        "Final compliance passed; prepare or update the task pull request."
+                    ),
+                    parameters=(WORKSPACE, REVIEW_CONTEXT, COMPLIANCE_REPORT),
+                ),
+                EdgeSpec(
+                    key="compliance_fix",
+                    source="compliance",
+                    transition="needs_changes",
+                    target="fix",
+                    context="compact_and_continue_session",
+                    context_source="previous_target_or_new",
+                    prompt=fix_prompt(profile),
+                    transition_description=(
+                        "Final compliance found task-scoped issues that require fixes."
+                    ),
+                    parameters=(WORKSPACE, FIX_CONTEXT),
+                ),
+                EdgeSpec(
+                    key="compliance_needs_user_action",
+                    source="compliance",
+                    transition="needs_user_action",
+                    target="compliance",
+                    context="compact_and_continue_session",
+                    prompt=compliance_recovery_prompt(profile),
+                    requires_approval=True,
+                    transition_description=(
+                        "Final compliance is externally blocked; recheck after approval."
+                    ),
+                    parameters=(WORKSPACE, REVIEW_CONTEXT, BLOCKER),
+                ),
+                cancellation_edge("compliance"),
             ]
         )
 
@@ -801,7 +868,7 @@ and maintainability constraints. Do not edit files and do not run destructive
 commands. Findings are data for Join, not a routing decision.
 
 Complete only with `reported`. Provide `standards_status` as exactly `passed`,
-`needs_changes`, or `blocked`, plus `compliance_report` with evidence and
+`needs_changes`, or `blocked`, plus `standards_report` with evidence and
 path-specific findings."""
 
 
@@ -825,8 +892,8 @@ gaps."""
 def verification_gate_prompt(profile: ProjectProfile) -> str:
     standards = (
         "Standards status: {{.Params.standards_status}}\n"
-        "Standards report: {{.Params.compliance_report}}"
-        if profile.capability("compliance_review")
+        "Standards report: {{.Params.standards_report}}"
+        if profile.capability("standards_review")
         else "Standards review: not enabled by the project profile."
     )
     spec = (
@@ -881,12 +948,76 @@ artifacts, and untested areas. Use `needs_changes` with `workspace_path` and
 `blocker_reason` for external blockers."""
 
 
+def compliance_prompt(profile: ProjectProfile) -> str:
+    completed_reviews = ["deterministic verification"]
+    if profile.capability("standards_review"):
+        completed_reviews.append("Standards Review")
+    if profile.capability("spec_review"):
+        completed_reviews.append("Spec Review")
+    evidence_chain = ", ".join(completed_reviews)
+    return f"""Run the final read-only delivery compliance review for {{{{.TaskShortId}}}}.
+
+Read all applicable AGENTS.md files, .kent/project-contract.md, the task body,
+human-authored task comments, and the plan/spec sources named in the review
+context. Workspace: {{{{.Params.workspace_path}}}}. Final review context:
+{{{{.Params.review_context}}}}
+
+{procedure_instruction(profile, "compliance")}
+
+This is a thin final attestation, not another general code, architecture,
+specification, or runtime review. Verify the authority hierarchy and final
+worktree diff; confirm that {evidence_chain}, Gate, and any required Smoke
+completed with adequate evidence; confirm that a Smoke bypass has a concrete
+rationale; and check that no unresolved blocker, approval, unauthorized
+rule/spec change, or workflow obligation remains. Do not edit files or perform
+state-changing actions.
+
+Choose `ship_pr` only when the final work product is compliant. Provide
+`workspace_path`, a complete `review_context`, and `compliance_report`. Choose
+`needs_changes` for task-scoped violations and provide `workspace_path` plus
+`fix_context`; fixes must rerun the full verification flow. Choose
+`needs_user_action` for missing or contradictory authority, evidence, or
+external decisions and provide `workspace_path`, `review_context`, and
+`blocker_reason`. Choose `wont_do` only for explicit cancellation and provide
+`closure_reason`."""
+
+
+def compliance_recovery_prompt(profile: ProjectProfile) -> str:
+    return f"""Resume the final read-only delivery compliance review.
+
+Workspace: {{{{.Params.workspace_path}}}}
+Final review context: {{{{.Params.review_context}}}}
+Previous blocker: {{{{.Params.blocker_reason}}}}
+
+Re-read current task comments and applicable authority sources, then verify
+that the exact blocker is resolved. Do not infer approval for broader scope or
+destructive actions.
+
+{procedure_instruction(profile, "compliance")}
+
+Choose `ship_pr` only when the final work product is compliant. Provide
+`workspace_path`, a complete `review_context`, and `compliance_report`. Choose
+`needs_changes` with `workspace_path` and `fix_context` for task-scoped
+violations. Choose `needs_user_action` with `workspace_path`, `review_context`,
+and `blocker_reason` if the blocker remains. Choose `wont_do` only for explicit
+cancellation and provide `closure_reason`."""
+
+
 def prepare_pr_prompt(profile: ProjectProfile) -> str:
+    compliance_context = (
+        "Final Compliance Review: {{.Params.compliance_report}}"
+        if (
+            profile.capability("pull_requests")
+            and profile.capability("compliance_review")
+        )
+        else "Final Compliance Review is disabled by the project profile."
+    )
     return f"""Prepare delivery for {{{{.TaskShortId}}}}.
 
 Read .kent/project-contract.md and repository instructions first. Workspace:
 {{{{.Params.workspace_path}}}}. Review context:
 {{{{.Params.review_context}}}}
+{compliance_context}
 
 {procedure_instruction(profile, "ship")}
 {delegation_instruction(profile, "release", "bounded delivery checks")}
@@ -1017,6 +1148,8 @@ Choose `wont_do` only for an explicit cancellation decision and provide
 
 def post_smoke_target(profile: ProjectProfile) -> str:
     if profile.capability("pull_requests"):
+        if profile.capability("compliance_review"):
+            return "compliance"
         return "prepare_pr"
     return "cleanup"
 
@@ -1036,6 +1169,8 @@ def delegation_instruction(
 
 
 def delivery_prompt(profile: ProjectProfile, target: str) -> str:
+    if target == "compliance":
+        return compliance_prompt(profile)
     if target == "prepare_pr":
         return prepare_pr_prompt(profile)
     if target == "cleanup":

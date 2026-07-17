@@ -65,6 +65,13 @@ class WorkflowKitTest(unittest.TestCase):
             outgoing = [edge for edge in spec.edges if edge.source == branch.target]
             self.assertEqual(len(outgoing), 1)
             self.assertEqual(outgoing[0].target, "verification_join")
+        standards_report = next(
+            edge for edge in spec.edges if edge.key == "standards_report_join"
+        )
+        self.assertEqual(
+            tuple(parameter.key for parameter in standards_report.parameters),
+            ("standards_status", "standards_report"),
+        )
 
     def test_delivery_is_versioned_and_asks_for_execution_target(self) -> None:
         profile = self.load_profile()
@@ -80,6 +87,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(roles["verification_gate"], "default")
         self.assertEqual(roles["standards_review"], "standards-reviewer")
         self.assertEqual(roles["spec_review"], "spec-reviewer")
+        self.assertEqual(roles["compliance"], "compliance_reviewer")
 
     def test_delivery_continues_one_plan_step_until_verification(self) -> None:
         profile = self.load_profile()
@@ -111,6 +119,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertNotIn("prepare_pr", node_keys)
         self.assertNotIn("ci_monitor", node_keys)
         self.assertNotIn("waiting_pr", node_keys)
+        self.assertNotIn("compliance", node_keys)
         self.assertIn("verification_join", node_keys)
         self.assertIn("cleanup", node_keys)
         prompts = "\n".join(
@@ -153,6 +162,99 @@ class WorkflowKitTest(unittest.TestCase):
             ("workspace_path", "pr_report", "closure_reason"),
         )
 
+    def test_final_compliance_separates_attestation_from_early_reviews(self) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        self.assertEqual(by_key["gate_delivery_ready"].target, "compliance")
+        self.assertEqual(by_key["smoke_prepare_pr"].target, "compliance")
+        self.assertEqual(by_key["compliance_prepare_pr"].target, "prepare_pr")
+        self.assertEqual(by_key["compliance_prepare_pr"].transition, "ship_pr")
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["compliance_prepare_pr"].parameters
+            ),
+            ("workspace_path", "review_context", "compliance_report"),
+        )
+        self.assertEqual(by_key["compliance_fix"].target, "fix")
+        self.assertEqual(
+            tuple(parameter.key for parameter in by_key["compliance_fix"].parameters),
+            ("workspace_path", "fix_context"),
+        )
+        self.assertTrue(by_key["compliance_needs_user_action"].requires_approval)
+        self.assertEqual(
+            by_key["compliance_needs_user_action"].target,
+            "compliance",
+        )
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["compliance_needs_user_action"].parameters
+            ),
+            ("workspace_path", "review_context", "blocker_reason"),
+        )
+        self.assertTrue(by_key["compliance_wont_do"].requires_approval)
+        self.assertIn(
+            "thin final attestation",
+            by_key["gate_delivery_ready"].prompt,
+        )
+        self.assertIn(
+            "Final Compliance Review: {{.Params.compliance_report}}",
+            by_key["compliance_prepare_pr"].prompt,
+        )
+
+    def test_standards_and_final_compliance_capabilities_are_independent(self) -> None:
+        no_standards = self.load_profile(
+            lambda contents: contents.replace(
+                "standards_review = true",
+                "standards_review = false",
+            )
+        )
+        no_standards_spec = build_delivery_workflow(no_standards, 1)
+        no_standards_nodes = {node.key for node in no_standards_spec.nodes}
+        no_standards_edges = {
+            edge.key: edge for edge in no_standards_spec.edges
+        }
+        self.assertNotIn("standards_review", no_standards_nodes)
+        self.assertIn("compliance", no_standards_nodes)
+        self.assertNotIn(
+            "Standards Review",
+            no_standards_edges["gate_delivery_ready"].prompt,
+        )
+
+        no_compliance = self.load_profile(
+            lambda contents: contents.replace(
+                "compliance_review = true",
+                "compliance_review = false",
+            )
+        )
+        no_compliance_spec = build_delivery_workflow(no_compliance, 1)
+        no_compliance_nodes = {node.key for node in no_compliance_spec.nodes}
+        no_compliance_edges = {
+            edge.key: edge for edge in no_compliance_spec.edges
+        }
+        self.assertIn("standards_review", no_compliance_nodes)
+        self.assertNotIn("compliance", no_compliance_nodes)
+        self.assertEqual(
+            no_compliance_edges["gate_delivery_ready"].target,
+            "prepare_pr",
+        )
+
+        no_pr_no_compliance_role = self.load_profile(
+            lambda contents: (
+                contents.replace("pull_requests = true", "pull_requests = false")
+                .replace("ci_monitoring = true", "ci_monitoring = false")
+                .replace('compliance = "compliance_reviewer"\n', "")
+            )
+        )
+        no_pr_spec = build_delivery_workflow(no_pr_no_compliance_role, 1)
+        self.assertNotIn(
+            "compliance",
+            {node.key for node in no_pr_spec.nodes},
+        )
+
     def test_conditional_smoke_splits_gate_with_explicit_decision_data(self) -> None:
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)
@@ -180,7 +282,7 @@ class WorkflowKitTest(unittest.TestCase):
             by_key["gate_delivery_ready"].transition,
             "delivery_ready",
         )
-        self.assertEqual(by_key["gate_delivery_ready"].target, "prepare_pr")
+        self.assertEqual(by_key["gate_delivery_ready"].target, "compliance")
         self.assertEqual(
             tuple(
                 parameter.key
@@ -218,7 +320,7 @@ class WorkflowKitTest(unittest.TestCase):
 
         self.assertNotIn("smoke", {node.key for node in spec.nodes})
         self.assertNotIn("gate_smoke_required", by_key)
-        self.assertEqual(by_key["gate_delivery_ready"].target, "prepare_pr")
+        self.assertEqual(by_key["gate_delivery_ready"].target, "compliance")
 
     def test_smoke_lab_exercises_both_gate_paths_without_delivery_tail(self) -> None:
         profile = self.load_profile()
@@ -232,6 +334,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertNotIn("prepare_pr", node_keys)
         self.assertNotIn("ci_monitor", node_keys)
         self.assertNotIn("waiting_pr", node_keys)
+        self.assertNotIn("compliance", node_keys)
         self.assertEqual(by_key["gate_smoke_required"].target, "smoke")
         self.assertEqual(by_key["gate_delivery_ready"].target, "cleanup")
         self.assertEqual(by_key["smoke_cleanup"].target, "cleanup")
@@ -337,6 +440,7 @@ class WorkflowKitTest(unittest.TestCase):
                 contents.replace('delivery_profile = "standard"', 'delivery_profile = "lite"')
                 .replace("pull_requests = true", "pull_requests = false")
                 .replace("ci_monitoring = true", "ci_monitoring = false")
+                .replace("standards_review = true", "standards_review = false")
                 .replace("compliance_review = true", "compliance_review = false")
                 .replace("spec_review = true", "spec_review = false")
             )
@@ -349,6 +453,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertNotIn("ci_monitor", node_keys)
         self.assertNotIn("standards_review", node_keys)
         self.assertNotIn("spec_review", node_keys)
+        self.assertNotIn("compliance", node_keys)
 
     def test_profile_rejects_ci_without_pull_requests(self) -> None:
         def transform(contents: str) -> str:
@@ -356,6 +461,23 @@ class WorkflowKitTest(unittest.TestCase):
 
         with self.assertRaisesRegex(SpecError, "ci_monitoring requires pull_requests"):
             self.load_profile(transform)
+
+    def test_schema_three_preserves_legacy_review_capability_semantics(self) -> None:
+        profile = self.load_profile(
+            lambda contents: (
+                contents.replace("standards_review = true\n", "")
+                .replace('compliance = "compliance_reviewer"\n', "")
+            )
+        )
+        spec = build_delivery_workflow(profile, 1)
+        node_keys = {node.key for node in spec.nodes}
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        self.assertTrue(profile.capability("standards_review"))
+        self.assertFalse(profile.capability("compliance_review"))
+        self.assertIn("standards_review", node_keys)
+        self.assertNotIn("compliance", node_keys)
+        self.assertEqual(by_key["gate_delivery_ready"].target, "prepare_pr")
 
     def test_profile_rejects_schema_two(self) -> None:
         with self.assertRaisesRegex(SpecError, "expected 3"):

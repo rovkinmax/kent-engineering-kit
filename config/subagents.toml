@@ -1,6 +1,22 @@
 [workflow]
 subagents = true
 
+[subagents.compliance_reviewer]
+description = "Agent for reviewing code, plans, documents, diffs, or other scopes only for compliance with applicable specifications and AGENTS.md rules. Cannot edit files."
+system_prompt_file = "agents/compliance_reviewer.md"
+thinking_level = "high"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = true
+
+[subagents.compliance_reviewer.tools]
+shell = true
+patch = false
+edit = false
+
+[subagents.compliance_reviewer.skills]
+planning = false
+
 [subagents.researcher]
 description = "Read-only primary-source research for technical and product questions."
 system_prompt_file = "agents/researcher.md"

@@ -55,6 +55,19 @@ class ProjectProfile:
                 f"unsupported profile schema {schema_version}; expected 3"
             )
         execution = require_table(raw, "execution")
+        capabilities = bool_table(
+            require_table(raw, "capabilities"),
+            "capabilities",
+        )
+        if (
+            "standards_review" not in capabilities
+            and "compliance_review" in capabilities
+        ):
+            # Early schema-3 profiles used compliance_review for the Standards
+            # branch. Preserve that graph and require an explicit split before
+            # enabling final delivery Compliance.
+            capabilities["standards_review"] = capabilities["compliance_review"]
+            capabilities["compliance_review"] = False
         profile = cls(
             project_root=root,
             schema_version=schema_version,
@@ -75,7 +88,7 @@ class ProjectProfile:
                 "execution.overrides",
             ),
             policies=string_table(require_table(raw, "policies"), "policies"),
-            capabilities=bool_table(require_table(raw, "capabilities"), "capabilities"),
+            capabilities=capabilities,
             commands=string_table(require_table(raw, "commands"), "commands"),
             procedures=string_table(raw.get("procedures", {}), "procedures"),
             adapters=string_table(raw.get("adapters", {}), "adapters"),
@@ -141,6 +154,7 @@ class ProjectProfile:
             "managed_worktrees",
             "pull_requests",
             "ci_monitoring",
+            "standards_review",
             "compliance_review",
             "spec_review",
         ):
@@ -155,8 +169,13 @@ class ProjectProfile:
         required_roles = {
             "orchestrator",
         }
-        if self.capability("compliance_review"):
+        if self.capability("standards_review"):
             required_roles.add("standards_review")
+        if (
+            self.capability("pull_requests")
+            and self.capability("compliance_review")
+        ):
+            required_roles.add("compliance")
         if self.capability("spec_review"):
             required_roles.add("spec_review")
         for role in sorted(required_roles):

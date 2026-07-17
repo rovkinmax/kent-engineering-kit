@@ -31,6 +31,7 @@ device, source-control, issue-tracker, and release adapters.
 - `changed_files`
 - `verification_report`
 - `review_report`
+- `standards_report`
 - `compliance_report`
 - `review_context`
 - `fix_context`
@@ -70,6 +71,30 @@ device, source-control, issue-tracker, and release adapters.
 - Branch failures are reported to the Join as data.
 - A branch emits one stable parameter contract on every completion.
 - Only the post-Join gate chooses Fix, QA, Ship, or Needs User Action.
+- Early Standards Review emits `standards_status` and `standards_report`.
+  `compliance_report` is reserved for the final delivery attestation.
+- This output split applies to current and future generated graphs. Frozen
+  schema-3 Canary/Smoke graphs created before the split may retain
+  `compliance_report` as their historical early-Standards output.
+
+## Final compliance
+
+- A PR-producing Delivery workflow with `compliance_review` enabled routes both
+  Gate `delivery_ready` and Smoke `passed` through a distinct final Compliance
+  Review before PR preparation.
+- Compliance is a thin read-only attestation over the final diff, authority
+  sources, enabled verification reports, Gate decision, and Smoke evidence or
+  bypass rationale. It does not repeat general standards, specification, code,
+  architecture, or runtime review.
+- `ship_pr` advances to PR preparation with `compliance_report`.
+- `needs_changes` returns to the single-writer Fix stage and then reruns the
+  full verification fan-out.
+- `needs_user_action` is an approval-gated Compliance self-loop. `wont_do`
+  remains approval-gated terminal cancellation.
+- During the schema-3 experiment, a profile that omits `standards_review`
+  retains the legacy meaning: its old `compliance_review` value controls the
+  early Standards branch and final Compliance remains disabled. Projects opt
+  into the split by declaring both capabilities explicitly.
 
 ## Smoke policy
 
@@ -113,6 +138,9 @@ device, source-control, issue-tracker, and release adapters.
 - Direct custom node assignees are limited to globally registered roles that
   Kent 2.3 execution validation can resolve.
 - Independent standards and specification reviews use global read-only roles.
+- Final PR-producing delivery uses a distinct global read-only compliance role
+  after Gate and any required Smoke. It attests the final evidence and
+  authority chain rather than repeating the earlier standards/spec reviews.
 
 ## Project adapter boundary
 
