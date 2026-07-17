@@ -27,15 +27,16 @@ Kent 2.3 resolves relative postprocessor paths from the service process working
 directory. Use the stable home-relative installed path rather than a
 project-relative path.
 
-## Android emulator resource lock
+## Mobile runtime safety adapters
 
 Android projects with conditional or required runtime Smoke declare:
 
 ```toml
-required_adapters = ["mobile_resource_lock"]
+required_adapters = ["mobile_resource_lock", "mobile_evidence_audit"]
 
 [adapters]
 mobile_resource_lock = ".kent/adapters/mobile/emulator-resource-lock.sh"
+mobile_evidence_audit = ".kent/adapters/mobile/mobile-evidence-audit.sh"
 ```
 
 Synchronize the committed project-local adapter:
@@ -51,7 +52,12 @@ therefore carries the executable while still coordinating with every other
 Kent session on the machine.
 
 `required_adapters` is platform-neutral: profiles list the executable adapters
-their workflow contract cannot operate without. The adapter does not choose a
+their workflow contract cannot operate without. These adapters do not choose a
 device policy for the project. Project procedures still define whether an
 emulator may be started, whether a physical device is allowed, the
 APK/application target, and the runtime evidence required.
+
+`mobile_evidence_audit` fails closed when evidence contains broad-log
+artifacts, common authentication/account payload markers, or symlinks. It
+reports filenames and reasons without echoing matched content. Project
+procedures pass the tested package name and run it before completing Smoke.

@@ -78,6 +78,15 @@ device, source-control, issue-tracker, and release adapters.
   artifact or user-observable behavior.
 - Resource unavailability never downgrades a Smoke requirement; the Smoke node
   routes it to `needs_user_action`.
+- Runtime evidence is least-privilege. Do not persist unfiltered device or
+  system logs, network payloads, authentication headers, or full UI dumps from
+  an unexpected authenticated or otherwise sensitive state.
+- Project procedures retain only the scoped liveness, crash, ANR, and
+  acceptance evidence required for the decision. Unexpected sensitive state
+  produces a redacted blocker and `needs_user_action`.
+- A deterministic project-local evidence audit must pass before Smoke reports
+  success or a blocker. Unsafe raw files are removed or redacted while the
+  non-sensitive summary and lock-release evidence remain.
 - Platform-specific classification and execution rules remain project adapters.
 - `Engineering Smoke Lab` preserves the project Smoke policy while disabling
   PR and CI stages, so both Gate branches can be tested cheaply.
@@ -102,13 +111,14 @@ Each project provides:
 - an optional idempotent `.kent/worktrees/setup.sh` conforming to
   `worktree-contract.md`;
 - canonical project-local role keys;
-- optional Smoke-decision, Smoke-execution, resource-lock, PR, CI, and release
-  adapters.
+- optional Smoke-decision, Smoke-execution, resource-lock, evidence-audit, PR,
+  CI, and release adapters.
 
 Profiles list indispensable executable adapter keys in `required_adapters`.
 The platform-neutral profile loader validates only that declared contract and
 does not infer policy from platform names. Android projects with conditional or
-required runtime Smoke list `mobile_resource_lock`; the shared adapter owns
-machine-wide lock mechanics while the project still owns emulator startup
-policy, physical-device permission, build/install targets, credentials, and
-runtime acceptance evidence.
+required runtime Smoke list `mobile_resource_lock` and
+`mobile_evidence_audit`. The shared adapters own machine-wide lock mechanics
+and deterministic evidence hygiene while the project still owns emulator
+startup policy, physical-device permission, build/install targets,
+credentials, and runtime acceptance evidence.

@@ -91,9 +91,9 @@ Project-local adapters declared by the profile are synchronized separately:
 ./scripts/sync-project-adapters --project /path/to/project
 ```
 
-Android projects with runtime Smoke use the shared emulator resource-lock
-template while keeping package names, activities, build variants, accounts,
-and tested flows in project-owned procedures.
+Android projects with runtime Smoke use shared emulator resource-lock and
+evidence-audit templates while keeping package names, activities, build
+variants, accounts, and tested flows in project-owned procedures.
 
 ## Current phase
 
@@ -107,5 +107,7 @@ nodes/edges, changing an edge source, or removing an approval. Unsupported
 structural drift uses another free-form lab label. A workflow becomes
 mutation-protected after tasks reference it in any linked project. Defaults
 remain unchanged. Puber has exercised both conditional Smoke branches
-end-to-end in managed worktrees. Appsome branch canaries are pending after
-aligning its mobile resource-lock and explicit-device procedure.
+end-to-end in managed worktrees. Appsome has exercised the `delivery_ready`
+branch and the `smoke_required` blocker path, including exact-device targeting
+and lock release. Its clean-emulator passing Smoke rerun remains pending after
+adding deterministic runtime-evidence auditing.

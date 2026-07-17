@@ -14,6 +14,9 @@ import tomllib
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = {
+    "mobile_evidence_audit": (
+        REPO_ROOT / "templates" / "project" / "mobile-evidence-audit.sh"
+    ),
     "mobile_resource_lock": (
         REPO_ROOT / "templates" / "project" / "emulator-resource-lock.sh"
     ),

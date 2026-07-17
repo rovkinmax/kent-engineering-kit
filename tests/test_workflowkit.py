@@ -477,6 +477,8 @@ class WorkflowKitTest(unittest.TestCase):
         profile_directory.mkdir()
         contents = EXAMPLE_PROFILE.read_text() + (
             "\n[adapters]\n"
+            'mobile_evidence_audit = '
+            '".kent/adapters/mobile/mobile-evidence-audit.sh"\n'
             'mobile_resource_lock = '
             '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
         )
@@ -484,6 +486,9 @@ class WorkflowKitTest(unittest.TestCase):
         script = REPO_ROOT / "scripts" / "sync-project-adapters"
         target = (
             root / ".kent" / "adapters" / "mobile" / "emulator-resource-lock.sh"
+        )
+        evidence_target = (
+            root / ".kent" / "adapters" / "mobile" / "mobile-evidence-audit.sh"
         )
 
         created = subprocess.run(
@@ -496,6 +501,17 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(created.returncode, 0, created.stderr)
         self.assertTrue(target.is_file())
         self.assertTrue(target.stat().st_mode & 0o111)
+        self.assertTrue(evidence_target.is_file())
+        self.assertTrue(evidence_target.stat().st_mode & 0o111)
+        self.assertEqual(
+            evidence_target.read_bytes(),
+            (
+                REPO_ROOT
+                / "templates"
+                / "project"
+                / "mobile-evidence-audit.sh"
+            ).read_bytes(),
+        )
 
         target.write_text("#!/usr/bin/env bash\necho foreign\n")
         refused = subprocess.run(

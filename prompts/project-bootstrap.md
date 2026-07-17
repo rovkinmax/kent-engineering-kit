@@ -12,6 +12,7 @@ Inspect:
 - Git default-branch metadata, non-Git workspace needs, and desired workflow
   execution-target policies;
 - device or hardware resources that require locking;
+- runtime evidence privacy, redaction, and retention requirements;
 - untracked machine configuration required by a fresh worktree;
 - existing feature/spec/plan artifact conventions;
 - current Kent workflows and roles.
@@ -42,13 +43,14 @@ After approval, create:
 - deterministic `.kent/scripts/workflow-verify-report`;
 - optional idempotent `.kent/worktrees/setup.sh` using the Kent 2.3 payload
   contract;
-- optional smoke, resource-lock, PR, and release adapters;
+- optional smoke, resource-lock, evidence-audit, PR, and release adapters;
 - project-local role implementations using the canonical role keys.
 
 For Android projects with conditional or required Smoke, declare
-`mobile_resource_lock` in `required_adapters` and `[adapters]`, synchronize it with
-`scripts/sync-project-adapters`, and keep device selection plus APK/package
-details in the project procedure.
+`mobile_resource_lock` and `mobile_evidence_audit` in `required_adapters` and
+`[adapters]`, synchronize them with `scripts/sync-project-adapters`, and keep
+device selection plus APK/package details in the project procedure. The
+procedure must reject unfiltered logs and unexpected sensitive UI evidence.
 
 Do not create or link live workflows until the project profile validates.
 Preview with `scripts/generate-workflow` before applying a versioned non-default

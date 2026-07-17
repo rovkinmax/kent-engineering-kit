@@ -43,9 +43,10 @@ waiting_pr = ""
 cleanup = ""
 
 # Android projects with conditional or required Smoke use:
-# required_adapters = ["mobile_resource_lock"]
+# required_adapters = ["mobile_resource_lock", "mobile_evidence_audit"]
 # [adapters]
 # mobile_resource_lock = ".kent/adapters/mobile/emulator-resource-lock.sh"
+# mobile_evidence_audit = ".kent/adapters/mobile/mobile-evidence-audit.sh"
 
 [roles]
 orchestrator = "default"

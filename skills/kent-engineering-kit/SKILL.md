@@ -30,6 +30,9 @@ generated toolkit workflows.
   `mobile_resource_lock` adapter before any install, launch, input, or log
   action. Use an explicit serial for every direct adb and target-specific
   Mobile MCP call.
+- Require the project-local `mobile_evidence_audit` before completing runtime
+  Smoke. Persist only scoped, sanitized evidence; unexpected authenticated or
+  sensitive state becomes a redacted blocker.
 - Preview generated workflows without `--apply`.
 - Apply versioned workflows non-default first. Use `--set-default` only after a
   managed-worktree canary passes.
