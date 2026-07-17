@@ -30,6 +30,11 @@ generated toolkit workflows.
   `mobile_resource_lock` adapter before any install, launch, input, or log
   action. Use an explicit serial for every direct adb and target-specific
   Mobile MCP call.
+- Confirm Mobile MCP targeting through documented serial presence, explicit
+  selection acknowledgement, and a target query when available. Do not depend
+  on an undocumented `ACTIVE` label. Treat device-side timestamp syntax as
+  adapter-specific and validate it before using it as a runtime evidence
+  boundary.
 - Require the project-local `mobile_evidence_audit` before completing runtime
   Smoke. Persist only scoped, sanitized evidence; unexpected authenticated or
   sensitive state becomes a redacted blocker.

@@ -106,8 +106,9 @@ in place only when the Kent CLI can express the change without deleting
 nodes/edges, changing an edge source, or removing an approval. Unsupported
 structural drift uses another free-form lab label. A workflow becomes
 mutation-protected after tasks reference it in any linked project. Defaults
-remain unchanged. Puber has exercised both conditional Smoke branches
-end-to-end in managed worktrees. Appsome has exercised the `delivery_ready`
-branch and the `smoke_required` blocker path, including exact-device targeting
-and lock release. Its clean-emulator passing Smoke rerun remains pending after
-adding deterministic runtime-evidence auditing.
+remain unchanged. Puber and Appsome have exercised both conditional Smoke
+branches end-to-end in managed worktrees. Appsome also exercised the
+`smoke_required` blocker path before completing an audited passing rerun against
+an already-authenticated safe static shell. Exact-device targeting,
+package-scoped runtime signals, deterministic evidence auditing, and lock
+release passed without requiring a clean emulator.

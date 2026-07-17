@@ -87,6 +87,15 @@ device, source-control, issue-tracker, and release adapters.
 - A deterministic project-local evidence audit must pass before Smoke reports
   success or a blocker. Unsafe raw files are removed or redacted while the
   non-sensitive summary and lock-release evidence remain.
+- Mobile target confirmation uses documented response fields: the locked serial
+  is present, explicit selection acknowledges that serial, a target query
+  confirms it when the current schema exposes one, and every target-specific
+  call carries the same explicit device ID. Do not require undocumented
+  display labels such as `ACTIVE`.
+- Device-side timestamp and log-boundary syntax is platform-adapter behavior,
+  not a portable workflow contract. Validate the exact command before treating
+  it as an evidence gate; command or parsing failure is a Smoke blocker, never
+  an empty passing signal report.
 - Platform-specific classification and execution rules remain project adapters.
 - `Engineering Smoke Lab` preserves the project Smoke policy while disabling
   PR and CI stages, so both Gate branches can be tested cheaply.

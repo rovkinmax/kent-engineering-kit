@@ -26,13 +26,15 @@ Status: complete for the `Engineering Delivery v4` and
 
 ## Phase 3: Delivery workflows
 
-Status: generated and linked non-default; managed-worktree canaries pending.
+Status: generated and linked non-default; Smoke Lab canaries complete, delivery
+migration pending.
 
-- Generate `Engineering Delivery v4` and infrastructure-only
-  `Engineering Canary v1` for Appsome and Puber.
+- Generate the current `Engineering Delivery` and infrastructure-only
+  `Engineering Canary` lab instances for Appsome and Puber.
 - Re-export existing workflow snapshots and verify their preserved Source HEAD
   policies after upgrading Kent.
-- Run project canaries before changing defaults.
+- Keep defaults unchanged until delivery-tail canaries and migration decisions
+  are complete.
 - Migrate feature/refactor/bugfix flows.
 
 ## Phase 4: Auxiliary workflows
