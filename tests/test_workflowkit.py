@@ -72,6 +72,13 @@ class WorkflowKitTest(unittest.TestCase):
             tuple(parameter.key for parameter in standards_report.parameters),
             ("standards_status", "standards_report"),
         )
+        standards_dispatch = next(
+            edge for edge in spec.edges if edge.key == "dispatch_standards_review"
+        )
+        self.assertIn(
+            "{{.Params.workspace_path}}",
+            standards_dispatch.prompt,
+        )
 
     def test_delivery_is_versioned_and_asks_for_execution_target(self) -> None:
         profile = self.load_profile()
@@ -106,6 +113,46 @@ class WorkflowKitTest(unittest.TestCase):
             ("workspace_path", "plan_path"),
         )
         self.assertEqual(implementation_edges["verify"].target, "verification_dispatch")
+
+    def test_install_adopts_byte_identical_managed_agent_file(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        kent_root = Path(temporary.name)
+        source = REPO_ROOT / "agents" / "compliance_reviewer.md"
+        target = kent_root / "agents" / source.name
+        target.parent.mkdir(parents=True)
+        target.write_bytes(source.read_bytes())
+
+        environment = dict(os.environ)
+        environment["KENT_PERSISTENCE_ROOT"] = str(kent_root)
+        script = REPO_ROOT / "scripts" / "install"
+        first = subprocess.run(
+            [str(script)],
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(target.resolve(), source.resolve())
+
+        backup = target.with_name(
+            target.name + ".pre-kent-engineering-kit"
+        )
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.read_bytes(), source.read_bytes())
+
+        repeated = subprocess.run(
+            [str(script)],
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
 
     def test_canary_uses_core_flow_without_device_or_delivery_tail(self) -> None:
         profile = self.load_profile()
@@ -475,9 +522,39 @@ class WorkflowKitTest(unittest.TestCase):
 
         self.assertTrue(profile.capability("standards_review"))
         self.assertFalse(profile.capability("compliance_review"))
+        self.assertTrue(profile.legacy_review_contract)
         self.assertIn("standards_review", node_keys)
         self.assertNotIn("compliance", node_keys)
         self.assertEqual(by_key["gate_delivery_ready"].target, "prepare_pr")
+        standards_edge = by_key["standards_report_join"]
+        self.assertEqual(
+            tuple(
+                (parameter.key, parameter.description)
+                for parameter in standards_edge.parameters
+            ),
+            (
+                (
+                    "standards_status",
+                    "Repository standards status: passed, needs_changes, or blocked.",
+                ),
+                (
+                    "compliance_report",
+                    "Read-only repository standards and architecture compliance report.",
+                ),
+            ),
+        )
+        self.assertIn(
+            "plus `compliance_report`",
+            by_key["dispatch_standards_review"].prompt,
+        )
+        self.assertIn(
+            "Standards report: {{.Params.compliance_report}}",
+            by_key["verification_join_gate"].prompt,
+        )
+        self.assertNotIn(
+            "{{.Params.standards_report}}",
+            by_key["verification_join_gate"].prompt,
+        )
 
     def test_profile_rejects_schema_two(self) -> None:
         with self.assertRaisesRegex(SpecError, "expected 3"):

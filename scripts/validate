@@ -75,8 +75,12 @@ done
 
 for agent_file in "$repo_root"/agents/*.md; do
   target="$kent_root/agents/$(basename "$agent_file")"
-  [[ -e "$target" ]] || {
-    echo "missing installed agent: $target" >&2
+  [[ -L "$target" ]] || {
+    echo "installed agent is not a managed symlink: $target" >&2
+    exit 1
+  }
+  [[ "$(readlink "$target")" == "$agent_file" ]] || {
+    echo "installed agent points outside this toolkit: $target" >&2
     exit 1
   }
 done

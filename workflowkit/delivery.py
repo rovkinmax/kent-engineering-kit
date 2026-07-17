@@ -50,6 +50,10 @@ STANDARDS_REPORT = ParameterSpec(
     "standards_report",
     "Read-only repository standards, architecture, and engineering report.",
 )
+LEGACY_STANDARDS_REPORT = ParameterSpec(
+    "compliance_report",
+    "Read-only repository standards and architecture compliance report.",
+)
 COMPLIANCE_REPORT = ParameterSpec(
     "compliance_report",
     "Final delivery compliance attestation and any blocking findings.",
@@ -236,7 +240,7 @@ def build_delivery_workflow(
                 source="verification_dispatch",
                 transition="fanout_verify",
                 target="standards_review",
-                prompt=standards_review_prompt(),
+                prompt=standards_review_prompt(profile),
                 transition_description=(
                     "Run deterministic verification and independent read-only reviews."
                 ),
@@ -294,7 +298,10 @@ def build_delivery_workflow(
                     transition_description=(
                         "Repository standards review completed and reported its status."
                     ),
-                    parameters=(STANDARDS_STATUS, STANDARDS_REPORT),
+                    parameters=(
+                        STANDARDS_STATUS,
+                        standards_report_parameter(profile),
+                    ),
                 )
             )
         if "spec_review" in review_branches:
@@ -856,8 +863,13 @@ provide `blocker_reason`. Choose `wont_do` only for explicit cancellation and
 provide `closure_reason`."""
 
 
-def standards_review_prompt() -> str:
-    return """Run an independent read-only repository standards review.
+def standards_review_prompt(profile: ProjectProfile) -> str:
+    report_key = (
+        "compliance_report"
+        if profile.legacy_review_contract
+        else "standards_report"
+    )
+    prompt = """Run an independent read-only repository standards review.
 
 Read AGENTS.md and .kent/project-contract.md first. Workspace:
 {{.Params.workspace_path}}. Review context:
@@ -868,8 +880,9 @@ and maintainability constraints. Do not edit files and do not run destructive
 commands. Findings are data for Join, not a routing decision.
 
 Complete only with `reported`. Provide `standards_status` as exactly `passed`,
-`needs_changes`, or `blocked`, plus `standards_report` with evidence and
+`needs_changes`, or `blocked`, plus `__REPORT_KEY__` with evidence and
 path-specific findings."""
+    return prompt.replace("__REPORT_KEY__", report_key)
 
 
 def spec_review_prompt() -> str:
@@ -890,12 +903,18 @@ gaps."""
 
 
 def verification_gate_prompt(profile: ProjectProfile) -> str:
-    standards = (
-        "Standards status: {{.Params.standards_status}}\n"
-        "Standards report: {{.Params.standards_report}}"
-        if profile.capability("standards_review")
-        else "Standards review: not enabled by the project profile."
-    )
+    if profile.capability("standards_review"):
+        standards_report = (
+            "Standards report: {{.Params.compliance_report}}"
+            if profile.legacy_review_contract
+            else "Standards report: {{.Params.standards_report}}"
+        )
+        standards = (
+            "Standards status: {{.Params.standards_status}}\n"
+            + standards_report
+        )
+    else:
+        standards = "Standards review: not enabled by the project profile."
     spec = (
         "Spec status: {{.Params.spec_status}}\n"
         "Spec report: {{.Params.review_report}}"
@@ -1152,6 +1171,12 @@ def post_smoke_target(profile: ProjectProfile) -> str:
             return "compliance"
         return "prepare_pr"
     return "cleanup"
+
+
+def standards_report_parameter(profile: ProjectProfile) -> ParameterSpec:
+    if profile.legacy_review_contract:
+        return LEGACY_STANDARDS_REPORT
+    return STANDARDS_REPORT
 
 
 def delegation_instruction(

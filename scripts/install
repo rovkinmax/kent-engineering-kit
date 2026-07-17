@@ -20,6 +20,18 @@ link_item() {
   fi
 
   if [[ -e "$target" ]]; then
+    if [[ -f "$target" ]] && cmp -s "$source" "$target"; then
+      local backup="${target}.pre-kent-engineering-kit"
+      if [[ -e "$backup" || -L "$backup" ]]; then
+        echo "refusing to overwrite adoption backup: $backup" >&2
+        return 1
+      fi
+      mv "$target" "$backup"
+      ln -s "$source" "$target"
+      echo "adopted identical file: $target -> $source"
+      echo "legacy backup retained: $backup"
+      return
+    fi
     echo "refusing to replace existing path: $target" >&2
     return 1
   fi

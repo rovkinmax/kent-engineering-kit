@@ -33,7 +33,9 @@ Run:
 ```
 
 The installer creates additive symlinks under `~/.kent`. It refuses to replace
-existing non-symlink files.
+non-matching files. A byte-identical legacy file is adopted safely: the
+original is retained with a `.pre-kent-engineering-kit` suffix and the managed
+path becomes a symlink to the kit.
 
 Platform adapters are installed under `~/.kent/hooks` but remain inactive until
 a project explicitly selects them.
