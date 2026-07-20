@@ -40,6 +40,10 @@ path becomes a symlink to the kit.
 Platform adapters are installed under `~/.kent/hooks` but remain inactive until
 a project explicitly selects them.
 
+Cross-session managed-worktree operations use
+`~/.kent/bin/kent-worktree <command> --session <id> ...`. The installed wrapper
+removes inherited Kent execution context before delegating to the native CLI.
+
 `config/subagents.toml` is the authoritative managed config fragment. Merge it
 into `~/.kent/config.toml` before restarting Kent. `scripts/validate` compares
 every managed field against the effective global config. The installer

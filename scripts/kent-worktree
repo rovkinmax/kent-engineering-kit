@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+unset KENT_SESSION_ID KENT_RUN_ID KENT_STEP_ID
+
+exec kent worktree "$@"

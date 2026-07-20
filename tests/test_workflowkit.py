@@ -154,6 +154,60 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
 
+    def test_worktree_wrapper_clears_inherited_kent_context(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        fake_bin = Path(temporary.name)
+        fake_kent = fake_bin / "kent"
+        fake_kent.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'printf "session=%s\\n" "${KENT_SESSION_ID-unset}"\n'
+            'printf "run=%s\\n" "${KENT_RUN_ID-unset}"\n'
+            'printf "step=%s\\n" "${KENT_STEP_ID-unset}"\n'
+            'printf "args=%s\\n" "$*"\n'
+        )
+        fake_kent.chmod(0o755)
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "PATH": f"{fake_bin}:{environment['PATH']}",
+                "KENT_SESSION_ID": "session-appsome",
+                "KENT_RUN_ID": "run-appsome",
+                "KENT_STEP_ID": "step-appsome",
+            }
+        )
+
+        result = subprocess.run(
+            [
+                str(REPO_ROOT / "scripts" / "kent-worktree"),
+                "delete",
+                "--session",
+                "session-puber",
+                "--json",
+                "PUB-25",
+            ],
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "session=unset",
+                "run=unset",
+                "step=unset",
+                (
+                    "args=worktree delete --session session-puber "
+                    "--json PUB-25"
+                ),
+            ],
+        )
+
     def test_canary_uses_core_flow_without_device_or_delivery_tail(self) -> None:
         profile = self.load_profile()
         spec = build_canary_workflow(profile, 1)

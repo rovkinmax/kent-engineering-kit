@@ -24,6 +24,9 @@ generated toolkit workflows.
 - Use a workflow-kind override when present.
 - Treat Kent's selected execution root and resolved commit as authoritative.
 - Use `kent worktree` for operations on Kent-managed worktrees.
+- For a cross-session operation, invoke `~/.kent/bin/kent-worktree` with an
+  explicit `--session`. The wrapper prevents inherited task/session variables
+  from overriding the requested workspace.
 - Diagnose `interrupted` task runs before changing workflow state. A transient
   provider or transport error should be recovered with the user-only
   `kent task resume` command, preserving the locked target and completed

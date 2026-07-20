@@ -540,7 +540,8 @@ class KentClient:
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
-        environment.pop("KENT_SESSION_ID", None)
+        for key in ("KENT_SESSION_ID", "KENT_RUN_ID", "KENT_STEP_ID"):
+            environment.pop(key, None)
         result = subprocess.run(
             [self.binary, *args],
             cwd=self.workspace,

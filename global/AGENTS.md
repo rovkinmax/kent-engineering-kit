@@ -17,6 +17,10 @@
 - When `kent worktree` is available in Kent 2.3 or newer, use it for
   Kent-managed worktrees. On older Kent versions, do not manipulate managed
   worktrees directly; follow the project's documented worktree procedure.
+- When targeting another session with `kent worktree <command> --session`, use
+  `~/.kent/bin/kent-worktree <command> --session <id> ...`. It clears inherited
+  Kent execution context so the explicit session selects the authoritative
+  workspace.
 - Treat a workflow task's execution target, execution root, and resolved commit
   as Kent-owned facts rather than duplicating them in project metadata.
 - Prefer independently verifiable vertical slices. Treat broad mechanical

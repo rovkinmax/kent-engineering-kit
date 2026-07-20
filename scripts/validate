@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kent_root="${KENT_PERSISTENCE_ROOT:-$HOME/.kent}"
 
 bash -n "$repo_root/scripts/install"
+bash -n "$repo_root/scripts/kent-worktree"
 bash -n "$repo_root/adapters/gradle/shell-postprocess-hook"
 bash -n "$repo_root/templates/project/emulator-resource-lock.sh"
 bash -n "$repo_root/templates/project/mobile-evidence-audit.sh"
@@ -39,6 +40,10 @@ bash -n "$repo_root/templates/project/workflow-verify-report"
   echo "project adapter synchronizer is not executable" >&2
   exit 1
 }
+[[ -x "$repo_root/scripts/kent-worktree" ]] || {
+  echo "Kent worktree wrapper is not executable" >&2
+  exit 1
+}
 
 names_file="$(mktemp)"
 trap 'rm -f "$names_file"' EXIT
@@ -64,6 +69,7 @@ done
 
 for target in \
   "$kent_root/AGENTS.md" \
+  "$kent_root/bin/kent-worktree" \
   "$kent_root/hooks/gradle-worktree-warning" \
   "$kent_root/skills/kent-engineering-kit" \
   "$kent_root/prompts/grill.md"; do
@@ -72,6 +78,16 @@ for target in \
     exit 1
   }
 done
+
+[[ -L "$kent_root/bin/kent-worktree" ]] || {
+  echo "installed Kent worktree wrapper is not a managed symlink" >&2
+  exit 1
+}
+[[ "$(readlink "$kent_root/bin/kent-worktree")" == \
+  "$repo_root/scripts/kent-worktree" ]] || {
+  echo "installed Kent worktree wrapper points outside this toolkit" >&2
+  exit 1
+}
 
 for agent_file in "$repo_root"/agents/*.md; do
   target="$kent_root/agents/$(basename "$agent_file")"

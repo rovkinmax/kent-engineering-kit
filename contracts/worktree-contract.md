@@ -6,6 +6,10 @@ making a fresh checkout usable without silently copying unrelated local state.
 ## Operations
 
 - Use `kent worktree` commands for Kent-managed worktrees.
+- Use `~/.kent/bin/kent-worktree <command> --session <id> ...` when targeting a
+  session other than the caller. The wrapper removes inherited
+  `KENT_SESSION_ID`, `KENT_RUN_ID`, and `KENT_STEP_ID` before invoking the Kent
+  CLI.
 - Direct Git worktree commands are allowed only for project-local worktrees that
   Kent does not manage.
 - Never move or rename a Kent-managed worktree behind the service.
