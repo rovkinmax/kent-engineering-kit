@@ -12,8 +12,8 @@ Status: complete.
 
 ## Phase 2: Workflow generator
 
-Status: complete for the `Engineering Delivery v4` and
-`Engineering Canary v1` contracts.
+Status: complete. The generator has been exercised through the current
+profile-schema-3 `Engineering Delivery v5` contract.
 
 - Define a project profile schema.
 - Generate project-local workflow instances from shared fragments.
@@ -26,12 +26,13 @@ Status: complete for the `Engineering Delivery v4` and
 
 ## Phase 3: Delivery workflows
 
-Status: current Canary, Smoke Lab, and full Delivery canaries complete.
-Engineering Delivery v5 is the project default in Appsome and Puber; legacy
-Feature Delivery remains linked for rollback.
+Status: full Delivery v5 canaries complete. Engineering Delivery v5 is the
+project default in Appsome and Puber. Obsolete infrastructure experiments were
+removed after promotion; legacy Feature Delivery remains linked because it
+owns real task history and provides rollback.
 
-- Generate the current `Engineering Delivery` and infrastructure-only
-  `Engineering Canary` lab instances for Appsome and Puber.
+- Keep `Engineering Canary` and `Engineering Smoke Lab` generation available
+  for bounded future validation without permanent project links.
 - Re-export existing workflow snapshots and verify their preserved Source HEAD
   policies after upgrading Kent.
 - Validate two-step implementation continuation, verification fan-out/Join,

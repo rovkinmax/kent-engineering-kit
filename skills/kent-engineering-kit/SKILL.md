@@ -68,6 +68,12 @@ generated toolkit workflows.
   approval.
 - Once tasks reference a workflow, treat its graph as frozen and create another
   free-form experimental label for semantic changes.
+- After promoting a replacement, remove obsolete Canary or Smoke Lab instances
+  through Kent Desktop's workflow editor. Kent 2.3 has no CLI workflow-delete
+  command. Desktop deletion removes the workflow definition, project links, and
+  task database rows, but intentionally retains repository files and managed
+  worktrees. Inspect and clean retained worktrees separately; never edit the
+  Kent database directly.
 
 ## Fan-out
 

@@ -39,16 +39,21 @@ Planned fragments:
 - standalone rebase flows.
 
 Appsome and Puber are the initial conformance projects. Their generated
-instances are linked non-default pending managed-worktree canaries. Web, iOS,
-embedded, and generic shell profiles follow after the core contracts stabilize.
+Delivery v5 instances passed managed-worktree canaries and are now project
+defaults. Temporary Canary and Smoke Lab instances were removed after
+promotion. Web, iOS, embedded, and generic shell profiles follow after the core
+contracts stabilize.
 
 Existing pre-2.3 workflows are not rewritten in place. After the coordinated
 upgrade, their preserved Source HEAD policies are inspected and snapshots are
 re-exported before an experimental generated replacement is linked.
 
-When an experiment contains stale graph elements that Kent cannot remove
-through the CLI, leave it taskless and unlinked, mark it superseded, and create
-another free-form lab label. Never repair it through direct database mutation.
+Kent 2.3 has no CLI workflow-delete command. Retire superseded experiments
+through Kent Desktop after incorporating their evidence and finishing or
+canceling active work. Desktop deletion removes the workflow definition,
+project links, and task database rows but retains repositories and managed
+worktrees for separate inspection and cleanup. Never repair workflow state
+through direct database mutation.
 
 Before changing an existing workflow, the generator computes drift without
 mutation. Unsupported extra graph elements fail immediately. Reconciliation
