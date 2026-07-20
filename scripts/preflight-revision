@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_path="${BASH_SOURCE[0]}"
+while [[ -L "$source_path" ]]; do
+  source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+  link_target="$(readlink "$source_path")"
+  if [[ "$link_target" == /* ]]; then
+    source_path="$link_target"
+  else
+    source_path="$source_dir/$link_target"
+  fi
+done
+
+repo_root="$(cd -P "$(dirname "$source_path")/.." && pwd)"
+
+select_python() {
+  local candidate
+  if [[ -n "${KENT_ENGINEERING_KIT_PYTHON:-}" ]]; then
+    candidate="$KENT_ENGINEERING_KIT_PYTHON"
+    if [[ ! -x "$candidate" ]]; then
+      echo "KENT_ENGINEERING_KIT_PYTHON is not executable: $candidate" >&2
+      return 1
+    fi
+    if ! "$candidate" -I -S -c \
+      'import sys; raise SystemExit(sys.version_info < (3, 11))' \
+      >/dev/null 2>&1; then
+      echo "KENT_ENGINEERING_KIT_PYTHON must be Python 3.11 or newer" >&2
+      return 1
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  for candidate in \
+    "$(command -v python3.14 2>/dev/null || true)" \
+    "$(command -v python3.13 2>/dev/null || true)" \
+    "$(command -v python3.12 2>/dev/null || true)" \
+    "$(command -v python3.11 2>/dev/null || true)" \
+    "$(command -v python3 2>/dev/null || true)" \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3 \
+    /usr/bin/python3; do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    if "$candidate" -I -S -c \
+      'import sys; raise SystemExit(sys.version_info < (3, 11))' \
+      >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+python_runtime="$(select_python)" || {
+  if [[ -z "${KENT_ENGINEERING_KIT_PYTHON:-}" ]]; then
+    echo "kent-preflight-revision requires Python 3.11 or newer" >&2
+    echo "set KENT_ENGINEERING_KIT_PYTHON to a compatible interpreter" >&2
+  fi
+  exit 1
+}
+
+exec "$python_runtime" -I -S -c '
+import runpy
+import sys
+
+toolkit_root = sys.argv.pop(1)
+sys.argv[0] = "kent-preflight-revision"
+sys.path.insert(0, toolkit_root)
+runpy.run_module("workflowkit.revision_cli", run_name="__main__")
+' "$repo_root" "$@"

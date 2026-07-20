@@ -26,8 +26,9 @@ Status: complete for the `Engineering Delivery v4` and
 
 ## Phase 3: Delivery workflows
 
-Status: generated and linked non-default; current Canary and Smoke Lab canaries
-complete, delivery-tail migration pending.
+Status: current Canary, Smoke Lab, and full Delivery canaries complete.
+Engineering Delivery v5 is the project default in Appsome and Puber; legacy
+Feature Delivery remains linked for rollback.
 
 - Generate the current `Engineering Delivery` and infrastructure-only
   `Engineering Canary` lab instances for Appsome and Puber.
@@ -37,9 +38,14 @@ complete, delivery-tail migration pending.
   and report-only cleanup in both Android projects.
 - Validate interrupted-node recovery without losing the locked target or
   completed Join context in Appsome.
-- Keep defaults unchanged until delivery-tail canaries and migration decisions
-  are complete.
-- Migrate feature/refactor/bugfix flows.
+- Preflight each selected execution revision against its profile-owned scripts,
+  procedures, and adapters.
+- Observe ordinary default tasks across delivery-ready, Smoke, Fix, CI, and PR
+  feedback paths.
+- Move the Appsome project adapter from `release/4.29.0` into `master`; until
+  then, start generated Appsome workflows only from audited adapter commit
+  `b6fd03e1f15dc49bbe9431955062699f8bf6bfb0` or its descendants.
+- Design work-kind dispatch before migrating refactor and bugfix flows.
 
 ## Phase 4: Auxiliary workflows
 

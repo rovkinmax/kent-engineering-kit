@@ -7,6 +7,7 @@ from .delivery import (
 )
 from .kent import KentClient
 from .profile import ProjectProfile
+from .revision import preflight_project_revision
 
 __all__ = [
     "KentClient",
@@ -14,4 +15,5 @@ __all__ = [
     "build_canary_workflow",
     "build_delivery_workflow",
     "build_smoke_lab_workflow",
+    "preflight_project_revision",
 ]

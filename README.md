@@ -43,6 +43,11 @@ a project explicitly selects them.
 Cross-session managed-worktree operations use
 `~/.kent/bin/kent-worktree <command> --session <id> ...`. The installed wrapper
 removes inherited Kent execution context before delegating to the native CLI.
+Revision checks are available from any project through
+`~/.kent/bin/kent-preflight-revision`.
+The launcher selects Python 3.11 or newer even when Kent's inherited `PATH`
+points at an older interpreter. Set `KENT_ENGINEERING_KIT_PYTHON` to override
+the selected runtime explicitly; invalid or incompatible overrides fail fast.
 
 `config/subagents.toml` is the authoritative managed config fragment. Merge it
 into `~/.kent/config.toml` before restarting Kent. `scripts/validate` compares
@@ -91,6 +96,23 @@ deterministic hash suffix so distinct labels cannot overwrite each other.
 Changing the project default requires the separate `--set-default` flag. Do not
 use it before the generated workflow passes a managed-worktree canary.
 
+Before starting a generated workflow at a concrete branch, tag, or commit,
+validate that the selected revision contains its complete project adapter:
+
+```bash
+./scripts/preflight-revision \
+  --project /path/to/project \
+  --ref feature/my-change \
+  --baseline-ref origin/main
+```
+
+The preflight requires the audited baseline to be an ancestor of the selected
+revision, rejects project-profile drift, and checks required files directly
+from Git objects. It does not switch branches or create a worktree. This catches
+branch-topology gaps where a live Kent workflow exists but the selected revision
+does not yet contain its procedures, executable verification scripts, or
+required adapters.
+
 Project-local adapters declared by the profile are synchronized separately:
 
 ```bash
@@ -103,25 +125,12 @@ variants, accounts, and tested flows in project-owned procedures.
 
 ## Current phase
 
-The global toolkit and Kent 2.3 workflow generator are implemented. Appsome and
-Puber have linked non-default experimental `Engineering Delivery v5`,
-`Engineering Canary v2`, and unversioned `Engineering Smoke Lab` instances
-generated from the current profile-schema-3 hypothesis. Numeric suffixes are
-lab labels, not frozen releases. Taskless generated workflows may be reconciled
-in place only when the Kent CLI can express the change without deleting
-nodes/edges, changing an edge source, or removing an approval. Unsupported
-structural drift uses another free-form lab label. A workflow becomes
-mutation-protected after tasks reference it in any linked project. Defaults
-remain unchanged. Puber and Appsome have exercised the current two-step
-`Engineering Canary` continuation, verification fan-out/Join, no-Smoke Gate,
-and conservative cleanup end-to-end in managed worktrees. Appsome additionally
-resumed a Verification Gate after a transient provider interruption without
-losing the locked target or completed Join context. Both projects have also
-exercised both conditional Smoke branches. Appsome additionally exercised the
-`smoke_required` blocker path before completing an audited passing rerun against
-an already-authenticated safe static shell. Exact-device targeting,
-package-scoped runtime signals, deterministic evidence auditing, and lock
-release passed without requiring a clean emulator. Delivery keeps early
-Standards and Spec reviews separate from a final read-only Compliance Review
-after Gate and any required Smoke; the final attestation must pass before PR
-preparation.
+The global toolkit and Kent 2.3 workflow generator are implemented. Generated
+workflows use a shared fan-out/Join/Gate lifecycle with project-owned profiles,
+procedures, verification, Smoke, and delivery adapters. Taskless generated
+workflows may be reconciled in place only when the Kent CLI can express the
+change without deleting nodes or edges, changing an edge source, or removing an
+approval. A workflow becomes mutation-protected after tasks reference it.
+
+Current rollout state, audited revision boundaries, and remaining migration work
+are tracked in `docs/ROADMAP.md`.

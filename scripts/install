@@ -47,6 +47,9 @@ link_item \
 link_item \
   "$repo_root/scripts/kent-worktree" \
   "$kent_root/bin/kent-worktree"
+link_item \
+  "$repo_root/scripts/preflight-revision" \
+  "$kent_root/bin/kent-preflight-revision"
 
 for skill in "$repo_root"/skills/*; do
   link_item "$skill" "$kent_root/skills/$(basename "$skill")"

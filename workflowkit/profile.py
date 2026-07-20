@@ -46,10 +46,25 @@ class ProjectProfile:
             raise SpecError(f"project profile not found: {profile_path}")
 
         try:
-            raw = tomllib.loads(profile_path.read_text())
-        except (OSError, tomllib.TOMLDecodeError) as error:
+            contents = profile_path.read_text()
+        except OSError as error:
             raise SpecError(f"cannot load project profile {profile_path}: {error}") from error
+        return cls.from_toml(root, contents, source=str(profile_path))
 
+    @classmethod
+    def from_toml(
+        cls,
+        project_root: Path,
+        contents: str,
+        *,
+        source: str = "project profile",
+        check_files: bool = True,
+    ) -> "ProjectProfile":
+        root = project_root.expanduser().resolve()
+        try:
+            raw = tomllib.loads(contents)
+        except tomllib.TOMLDecodeError as error:
+            raise SpecError(f"cannot load project profile {source}: {error}") from error
         schema_version = require_int(raw, "schema_version")
         if schema_version != 3:
             raise SpecError(
@@ -100,10 +115,10 @@ class ProjectProfile:
             adapters=string_table(raw.get("adapters", {}), "adapters"),
             roles=string_table(require_table(raw, "roles"), "roles"),
         )
-        profile.validate()
+        profile.validate(check_files=check_files)
         return profile
 
-    def validate(self) -> None:
+    def validate(self, *, check_files: bool = True) -> None:
         if self.schema_version != 3:
             raise SpecError(
                 f"unsupported profile schema {self.schema_version}; expected 3"
@@ -142,6 +157,8 @@ class ProjectProfile:
                 raise SpecError(
                     f"required adapter {adapter_key!r} is missing from adapters"
                 )
+            if not check_files:
+                continue
             adapter_path = self.resolve_project_path(
                 configured_path,
                 f"adapters.{adapter_key}",

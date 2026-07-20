@@ -22,6 +22,12 @@ generated toolkit workflows.
 - Require Kent 2.3 or newer before creating generated workflows.
 - Apply the profile's explicit execution-target policy to each workflow.
 - Use a workflow-kind override when present.
+- Before starting a generated workflow from a branch, tag, or commit, run
+  `~/.kent/bin/kent-preflight-revision` with `--project`, `--ref`, and
+  `--baseline-ref`. It requires the audited adapter revision to be an ancestor,
+  rejects profile-contract drift, and checks the project contract, procedures,
+  executable commands, and required adapters directly from Git objects without
+  checking them out.
 - Treat Kent's selected execution root and resolved commit as authoritative.
 - Use `kent worktree` for operations on Kent-managed worktrees.
 - For a cross-session operation, invoke `~/.kent/bin/kent-worktree` with an
@@ -48,6 +54,8 @@ generated toolkit workflows.
 - Preview generated workflows without `--apply`.
 - Apply versioned workflows non-default first. Use `--set-default` only after a
   managed-worktree canary passes.
+- Changing a project default affects only new tasks. Keep the previous workflow
+  linked for rollback; never move existing tasks between incompatible graphs.
 - Use `Engineering Canary` for infrastructure-only validation. It intentionally
   disables Smoke and omits PR/CI stages.
 - Use `Engineering Smoke Lab` to test `smoke_required` and `delivery_ready`
