@@ -5,8 +5,13 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kent_root="${KENT_PERSISTENCE_ROOT:-$HOME/.kent}"
 
 bash -n "$repo_root/scripts/install"
+bash -n "$repo_root/scripts/audit-mobile-schema"
+bash -n "$repo_root/scripts/configure-mcporter"
 bash -n "$repo_root/scripts/kent-worktree"
 bash -n "$repo_root/scripts/preflight-revision"
+bash -n "$repo_root/adapters/mcp/kent-mcp-call"
+bash -n "$repo_root/adapters/mcp/kent-mcp-list"
+bash -n "$repo_root/adapters/mcp/mcp-common.sh"
 bash -n "$repo_root/adapters/gradle/shell-postprocess-hook"
 bash -n "$repo_root/templates/project/emulator-resource-lock.sh"
 bash -n "$repo_root/templates/project/mobile-evidence-audit.sh"
@@ -45,10 +50,43 @@ bash -n "$repo_root/templates/project/workflow-verify-report"
   echo "revision preflight is not executable" >&2
   exit 1
 }
+[[ -x "$repo_root/scripts/configure-mcporter" ]] || {
+  echo "mcporter configurator is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/scripts/audit-mobile-schema" ]] || {
+  echo "mobile schema auditor is not executable" >&2
+  exit 1
+}
 [[ -x "$repo_root/scripts/kent-worktree" ]] || {
   echo "Kent worktree wrapper is not executable" >&2
   exit 1
 }
+[[ -x "$repo_root/adapters/mcp/kent-mcp-call" ]] || {
+  echo "MCP call adapter is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/adapters/mcp/kent-mcp-list" ]] || {
+  echo "MCP list adapter is not executable" >&2
+  exit 1
+}
+
+if grep -R -n -E '^[[:space:]]*(model|tools)[[:space:]]*:' \
+  "$repo_root/agents"/*.md; then
+  echo "global role prompts must not declare model or tools" >&2
+  exit 1
+fi
+
+leaf_guard="Do not call \`kent run\`"
+for leaf_role in \
+  "$repo_root/agents/standards-reviewer.md" \
+  "$repo_root/agents/spec-reviewer.md" \
+  "$repo_root/agents/compliance_reviewer.md"; do
+  grep -F "$leaf_guard" "$leaf_role" >/dev/null || {
+    echo "workflow leaf role must prohibit child-agent creation: $leaf_role" >&2
+    exit 1
+  }
+done
 
 names_file="$(mktemp)"
 trap 'rm -f "$names_file"' EXIT
@@ -74,6 +112,8 @@ done
 
 for target in \
   "$kent_root/AGENTS.md" \
+  "$kent_root/bin/kent-mcp-call" \
+  "$kent_root/bin/kent-mcp-list" \
   "$kent_root/bin/kent-preflight-revision" \
   "$kent_root/bin/kent-worktree" \
   "$kent_root/hooks/gradle-worktree-warning" \
@@ -93,6 +133,14 @@ done
   echo "installed revision preflight is not a managed symlink" >&2
   exit 1
 }
+[[ -L "$kent_root/bin/kent-mcp-call" ]] || {
+  echo "installed MCP call adapter is not a managed symlink" >&2
+  exit 1
+}
+[[ -L "$kent_root/bin/kent-mcp-list" ]] || {
+  echo "installed MCP list adapter is not a managed symlink" >&2
+  exit 1
+}
 [[ "$(readlink "$kent_root/bin/kent-preflight-revision")" == \
   "$repo_root/scripts/preflight-revision" ]] || {
   echo "installed revision preflight points outside this toolkit" >&2
@@ -101,6 +149,16 @@ done
 [[ "$(readlink "$kent_root/bin/kent-worktree")" == \
   "$repo_root/scripts/kent-worktree" ]] || {
   echo "installed Kent worktree wrapper points outside this toolkit" >&2
+  exit 1
+}
+[[ "$(readlink "$kent_root/bin/kent-mcp-call")" == \
+  "$repo_root/adapters/mcp/kent-mcp-call" ]] || {
+  echo "installed MCP call adapter points outside this toolkit" >&2
+  exit 1
+}
+[[ "$(readlink "$kent_root/bin/kent-mcp-list")" == \
+  "$repo_root/adapters/mcp/kent-mcp-list" ]] || {
+  echo "installed MCP list adapter points outside this toolkit" >&2
   exit 1
 }
 
@@ -194,8 +252,10 @@ python3 -m compileall -q \
   "$repo_root/workflowkit" \
   "$repo_root/scripts/generate-workflow" \
   "$repo_root/scripts/sync-project-adapters"
+"$repo_root/scripts/configure-mcporter"
 PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
   python3 -m unittest discover -s "$repo_root/tests" -p 'test_*.py'
+"$repo_root/tests/test_mcp_adapter.sh"
 "$repo_root/tests/test_emulator_resource_lock.sh"
 "$repo_root/tests/test_mobile_evidence_audit.sh"
 

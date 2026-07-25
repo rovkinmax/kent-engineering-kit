@@ -15,6 +15,7 @@ from workflowkit.delivery import (
 )
 from workflowkit.kent import (
     KentClient,
+    canonical_workflow_selector,
     context_source_string,
     edge_index,
     execution_target_from_policy,
@@ -99,6 +100,7 @@ class WorkflowKitTest(unittest.TestCase):
     def test_delivery_continues_one_plan_step_until_verification(self) -> None:
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
         implementation_edges = {
             edge.transition: edge
             for edge in spec.edges
@@ -107,12 +109,105 @@ class WorkflowKitTest(unittest.TestCase):
 
         continuation = implementation_edges["continue_implementation"]
         self.assertEqual(continuation.target, "implement")
-        self.assertEqual(continuation.context, "continue_session")
+        self.assertEqual(continuation.context, "new_session")
         self.assertEqual(
             tuple(parameter.key for parameter in continuation.parameters),
             ("workspace_path", "plan_path"),
         )
         self.assertEqual(implementation_edges["verify"].target, "verification_dispatch")
+        self.assertEqual(by_key["plan_implement"].context, "new_session")
+        self.assertEqual(by_key["gate_fix"].context, "new_session")
+        self.assertEqual(by_key["gate_fix"].context_source, "immediate_source")
+        self.assertEqual(by_key["fix_continue"].context, "new_session")
+        self.assertEqual(
+            tuple(parameter.key for parameter in by_key["fix_continue"].parameters),
+            ("workspace_path", "fix_context"),
+        )
+        for key in ("implement_needs_user_action", "fix_needs_user_action"):
+            self.assertEqual(by_key[key].context, "new_session")
+            self.assertIn("fresh bounded session", by_key[key].prompt)
+        for key in (
+            "plan_needs_user_action",
+            "smoke_needs_user_action",
+            "compliance_needs_user_action",
+            "prepare_pr_needs_user_action",
+            "ci_monitor_needs_user_action",
+            "waiting_pr_needs_user_action",
+            "cleanup_needs_user_action",
+        ):
+            self.assertEqual(
+                by_key[key].context,
+                "compact_and_continue_session",
+            )
+        self.assertIn(
+            "must stop for confirmation",
+            by_key["start_plan"].prompt,
+        )
+
+    def test_delivery_preserves_continuous_writer_compatibility(self) -> None:
+        profile = self.load_profile(
+            lambda contents: contents.replace(
+                'writer_sessions = "fresh_per_slice"\n',
+                "",
+            )
+        )
+        spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        self.assertEqual(profile.writer_session_policy(), "continuous")
+        self.assertEqual(
+            by_key["plan_implement"].context,
+            "compact_and_continue_session",
+        )
+        self.assertEqual(
+            by_key["implement_continue"].context,
+            "continue_session",
+        )
+        self.assertEqual(
+            by_key["gate_fix"].context,
+            "compact_and_continue_session",
+        )
+        self.assertEqual(
+            by_key["gate_fix"].context_source,
+            "previous_target_or_new",
+        )
+        self.assertNotIn("fix_continue", by_key)
+        self.assertEqual(
+            by_key["fix_needs_user_action"].context,
+            "compact_and_continue_session",
+        )
+
+    def test_delivery_writer_prompts_reserve_final_review_for_graph(self) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 1)
+        prompts = {edge.key: edge.prompt or "" for edge in spec.edges}
+
+        self.assertIn(
+            "generated verification graph owns those",
+            prompts["plan_implement"],
+        )
+        self.assertIn(
+            "return to the generated verification graph",
+            prompts["gate_fix"],
+        )
+        self.assertIn("checkpoint ref", prompts["start_plan"])
+        self.assertIn("exact referenced comments", prompts["start_plan"])
+        self.assertIn("fresh writer session", prompts["plan_implement"])
+        self.assertIn(
+            "exactly one independently verifiable fix slice",
+            prompts["gate_fix"],
+        )
+        self.assertIn("`continue_fix`", prompts["gate_fix"])
+        self.assertIn(
+            "exactly one independently verifiable PR or branch recovery slice",
+            prompts["prepare_pr_fix"],
+        )
+        self.assertIn("`continue_fix`", prompts["prepare_pr_fix"])
+        self.assertIn(
+            "exactly one independently verifiable PR-feedback slice",
+            prompts["waiting_pr_fix"],
+        )
+        self.assertIn("`continue_fix`", prompts["waiting_pr_fix"])
 
     def test_install_adopts_byte_identical_managed_agent_file(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -642,6 +737,68 @@ class WorkflowKitTest(unittest.TestCase):
                 )
             )
 
+    def test_profile_rejects_unknown_writer_session_policy(self) -> None:
+        with self.assertRaisesRegex(
+            SpecError,
+            "unsupported policies.writer_sessions",
+        ):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    'writer_sessions = "fresh_per_slice"',
+                    'writer_sessions = "sometimes"',
+                )
+            )
+
+    def test_profile_rejects_execution_policy_in_role_prompt_frontmatter(
+        self,
+    ) -> None:
+        for field in ("model: sonnet", "tools: Read, Grep"):
+            with self.subTest(field=field):
+                temporary = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary.cleanup)
+                root = Path(temporary.name)
+                profile_directory = root / ".kent"
+                profile_directory.mkdir()
+                (profile_directory / "workflow-profile.toml").write_text(
+                    EXAMPLE_PROFILE.read_text()
+                )
+                role_directory = profile_directory / "subagents"
+                role_directory.mkdir()
+                (role_directory / "reviewer.md").write_text(
+                    "---\n"
+                    "name: reviewer\n"
+                    f"{field}\n"
+                    "---\n"
+                    "\n"
+                    "# Role\n"
+                )
+
+                with self.assertRaisesRegex(
+                    SpecError,
+                    "role prompts must not declare model or tools",
+                ):
+                    ProjectProfile.load(root)
+
+    def test_profile_allows_model_text_outside_role_prompt_frontmatter(
+        self,
+    ) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        profile_directory = root / ".kent"
+        profile_directory.mkdir()
+        (profile_directory / "workflow-profile.toml").write_text(
+            EXAMPLE_PROFILE.read_text()
+        )
+        role_directory = profile_directory / "subagents"
+        role_directory.mkdir()
+        (role_directory / "researcher.md").write_text(
+            "# Role\n\n"
+            "Inspect the domain model: one bounded area at a time.\n"
+        )
+
+        ProjectProfile.load(root)
+
     def test_profile_requires_declared_adapter_keys(self) -> None:
         with self.assertRaisesRegex(
             SpecError,
@@ -926,7 +1083,7 @@ class WorkflowKitTest(unittest.TestCase):
         )
         definition = {
             "workflow": {
-                "id": "workflow-minimal",
+                "id": "workflow-11111111-1111-4111-8111-111111111111",
                 "name": "Minimal v1",
                 "description": "Old description.",
                 "execution_target_policy": {"mode": "head"},
@@ -999,7 +1156,7 @@ class WorkflowKitTest(unittest.TestCase):
         )
         definition = {
             "workflow": {
-                "id": "workflow-minimal",
+                "id": "workflow-11111111-1111-4111-8111-111111111111",
                 "name": "Minimal v1",
                 "description": "Old description.",
                 "execution_target_policy": {"mode": "head"},
@@ -1036,49 +1193,130 @@ class WorkflowKitTest(unittest.TestCase):
     def test_workflow_task_check_scans_every_linked_project(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        definition = {
-            "workflow": {
-                "id": "workflow-shared",
-                "name": "Shared Lab",
-            }
-        }
-        calls: list[list[str]] = []
-        client = KentClient(Path(temporary.name))
+        bare_id = "22222222-2222-4222-8222-222222222222"
+        for workflow_id in (bare_id, f"workflow-{bare_id}"):
+            with self.subTest(workflow_id=workflow_id):
+                definition = {
+                    "workflow": {
+                        "id": workflow_id,
+                        "name": "Shared Lab",
+                    }
+                }
+                calls: list[list[str]] = []
+                client = KentClient(Path(temporary.name))
 
-        def run(
-            args: list[str],
-            *,
-            check: bool = True,
-        ) -> subprocess.CompletedProcess[str]:
-            calls.append(args)
-            if args == ["project", "list"]:
-                return subprocess.CompletedProcess(
-                    args,
-                    0,
-                    stdout=(
-                        "project-one\tOne\t/repo/one\n"
-                        "project-two\tTwo\t/repo/two\n"
-                    ),
-                    stderr="",
+                def run(
+                    args: list[str],
+                    *,
+                    check: bool = True,
+                ) -> subprocess.CompletedProcess[str]:
+                    calls.append(args)
+                    if args == ["project", "list"]:
+                        return subprocess.CompletedProcess(
+                            args,
+                            0,
+                            stdout=(
+                                "project-one\tOne\t/repo/one\n"
+                                "project-two\tTwo\t/repo/two\n"
+                            ),
+                            stderr="",
+                        )
+                    project_id = args[args.index("--project") + 1]
+                    tasks = [] if project_id == "project-one" else [{}]
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        stdout=json.dumps({"tasks": tasks}),
+                        stderr="",
+                    )
+
+                client.run = run
+
+                self.assertTrue(client.workflow_has_tasks(definition))
+                task_calls = [
+                    args for args in calls if args[:2] == ["task", "list"]
+                ]
+                self.assertEqual(
+                    [
+                        args[args.index("--project") + 1]
+                        for args in task_calls
+                    ],
+                    ["project-one", "project-two"],
                 )
-            project_id = args[args.index("--project") + 1]
-            tasks = [] if project_id == "project-one" else [{}]
-            return subprocess.CompletedProcess(
-                args,
-                0,
-                stdout=json.dumps({"tasks": tasks}),
-                stderr="",
-            )
+                self.assertEqual(
+                    {
+                        args[args.index("--workflow") + 1]
+                        for args in task_calls
+                    },
+                    {bare_id},
+                )
 
-        client.run = run
+    def test_workflow_name_resolution_uses_bare_uuid_selector(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        bare_id = "33333333-3333-4333-8333-333333333333"
+        for listed_id in (bare_id, f"workflow-{bare_id}"):
+            with self.subTest(listed_id=listed_id):
+                calls: list[list[str]] = []
+                client = KentClient(Path(temporary.name))
 
-        self.assertTrue(client.workflow_has_tasks(definition))
-        task_projects = [
-            args[args.index("--project") + 1]
-            for args in calls
-            if args[:2] == ["task", "list"]
-        ]
-        self.assertEqual(task_projects, ["project-one", "project-two"])
+                def run(
+                    args: list[str],
+                    *,
+                    check: bool = True,
+                ) -> subprocess.CompletedProcess[str]:
+                    calls.append(args)
+                    if args[:2] == ["workflow", "list"]:
+                        return subprocess.CompletedProcess(
+                            args,
+                            0,
+                            stdout=json.dumps(
+                                {
+                                    "workflows": [
+                                        {
+                                            "id": listed_id,
+                                            "name": "Shared Lab",
+                                        }
+                                    ],
+                                    "next_page_token": None,
+                                }
+                            ),
+                            stderr="",
+                        )
+                    if args[:2] == ["workflow", "inspect"]:
+                        return subprocess.CompletedProcess(
+                            args,
+                            0,
+                            stdout=json.dumps(
+                                {
+                                    "workflow": {
+                                        "id": listed_id,
+                                        "name": "Shared Lab",
+                                    }
+                                }
+                            ),
+                            stderr="",
+                        )
+                    raise AssertionError(args)
+
+                client.run = run
+
+                definition = client.inspect("Shared Lab")
+
+                self.assertEqual(definition["workflow"]["id"], listed_id)
+                self.assertIn(
+                    ["workflow", "inspect", listed_id, "--json"],
+                    calls,
+                )
+
+    def test_canonical_workflow_selector_accepts_old_and_new_ids(self) -> None:
+        bare_id = "44444444-4444-4444-8444-444444444444"
+        self.assertEqual(canonical_workflow_selector(bare_id), bare_id)
+        self.assertEqual(
+            canonical_workflow_selector(f"workflow-{bare_id}"),
+            bare_id,
+        )
+        self.assertIsNone(canonical_workflow_selector("Shared Lab"))
 
     def test_edge_reconcile_clears_stale_prompt_and_context_source(self) -> None:
         temporary = tempfile.TemporaryDirectory()

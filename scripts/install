@@ -50,6 +50,12 @@ link_item \
 link_item \
   "$repo_root/scripts/preflight-revision" \
   "$kent_root/bin/kent-preflight-revision"
+link_item \
+  "$repo_root/adapters/mcp/kent-mcp-call" \
+  "$kent_root/bin/kent-mcp-call"
+link_item \
+  "$repo_root/adapters/mcp/kent-mcp-list" \
+  "$kent_root/bin/kent-mcp-list"
 
 for skill in "$repo_root"/skills/*; do
   link_item "$skill" "$kent_root/skills/$(basename "$skill")"
@@ -65,4 +71,6 @@ done
 
 echo
 echo "Toolkit files installed. Global subagent config is managed separately."
+echo "Run ./scripts/configure-mcporter --apply to add portable MCP servers."
+echo "Run ./scripts/audit-mobile-schema before the first Mobile workflow canary."
 echo "Do not restart Kent while other sessions are running."

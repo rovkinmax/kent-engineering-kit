@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import uuid
 from typing import Any
 
 from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
@@ -19,6 +20,7 @@ class KentClient:
     def __init__(self, workspace: Path, binary: str = "kent") -> None:
         self.workspace = workspace.expanduser().resolve()
         self.binary = binary
+        self._workflow_selector_cache: dict[str, str] = {}
 
     def apply(
         self,
@@ -52,24 +54,25 @@ class KentClient:
                     "use another experimental label"
                 )
 
+        workflow_ref = workflow_selector_from_definition(definition)
         for node in spec.nodes:
-            self.ensure_node(spec.name, node, definition)
-            definition = self.require_inspect(spec.name)
+            self.ensure_node(workflow_ref, node, definition)
+            definition = self.require_inspect(workflow_ref)
 
         self.assert_no_extra_nodes(spec, definition)
 
         for edge in spec.edges:
-            self.ensure_edge(spec.name, edge, definition)
-            definition = self.require_inspect(spec.name)
+            self.ensure_edge(workflow_ref, edge, definition)
+            definition = self.require_inspect(workflow_ref)
 
-        self.ensure_workflow_metadata(spec, definition)
-        definition = self.require_inspect(spec.name)
+        self.ensure_workflow_metadata(workflow_ref, spec, definition)
+        definition = self.require_inspect(workflow_ref)
 
         self.assert_exact_graph(spec, definition)
-        self.validate(spec.name)
-        self.link(spec.name, set_default=set_default)
-        self.validate(spec.name)
-        return self.require_inspect(spec.name)
+        self.validate(workflow_ref)
+        self.link(workflow_ref, set_default=set_default)
+        self.validate(workflow_ref)
+        return self.require_inspect(workflow_ref)
 
     def preflight_reconcile(
         self,
@@ -130,8 +133,12 @@ class KentClient:
         return not (metadata_matches and nodes_match and edges_match)
 
     def workflow_has_tasks(self, definition: dict[str, Any]) -> bool:
-        workflow_id = definition["workflow"]["id"]
-        workflow_ref = workflow_id.removeprefix("workflow-")
+        workflow_id = definition.get("workflow", {}).get("id")
+        workflow_ref = canonical_workflow_selector(workflow_id)
+        if workflow_ref is None:
+            raise KentCommandError(
+                f"workflow definition returned invalid id {workflow_id!r}"
+            )
         for project_id in self.project_ids():
             result = self.run(
                 [
@@ -187,8 +194,11 @@ class KentClient:
         return project_ids
 
     def inspect(self, workflow: str) -> dict[str, Any] | None:
+        workflow_ref = self.resolve_workflow_selector(workflow)
+        if workflow_ref is None:
+            return None
         result = self.run(
-            ["workflow", "inspect", workflow, "--json"],
+            ["workflow", "inspect", workflow_ref, "--json"],
             check=False,
         )
         if result.returncode == 0:
@@ -196,6 +206,83 @@ class KentClient:
         if "not found" in result.stderr.lower():
             return None
         raise KentCommandError(command_error(result))
+
+    def resolve_workflow_selector(self, workflow: str) -> str | None:
+        cached = self._workflow_selector_cache.get(workflow)
+        if cached is not None:
+            return cached
+
+        canonical = canonical_workflow_selector(workflow)
+        records = self.workflow_records()
+        for record in records:
+            workflow_id = record.get("id")
+            record_canonical = canonical_workflow_selector(workflow_id)
+            workflow_name = record.get("name")
+            if record_canonical is None or not isinstance(workflow_name, str):
+                continue
+            self._workflow_selector_cache[workflow_id] = workflow_id
+            self._workflow_selector_cache[record_canonical] = workflow_id
+            self._workflow_selector_cache[
+                f"workflow-{record_canonical}"
+            ] = workflow_id
+
+        if canonical is not None:
+            matches = [
+                record
+                for record in records
+                if canonical_workflow_selector(record.get("id")) == canonical
+            ]
+        else:
+            matches = [
+                record for record in records if record.get("name") == workflow
+            ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise KentCommandError(
+                f"workflow name {workflow!r} is ambiguous; use a bare UUID"
+            )
+        workflow_id = matches[0].get("id")
+        if canonical_workflow_selector(workflow_id) is None:
+            raise KentCommandError(
+                f"workflow {workflow!r} returned invalid id {workflow_id!r}"
+            )
+        self._workflow_selector_cache[workflow] = workflow_id
+        workflow_name = matches[0].get("name")
+        if isinstance(workflow_name, str):
+            self._workflow_selector_cache[workflow_name] = workflow_id
+        return workflow_id
+
+    def workflow_records(self) -> tuple[dict[str, Any], ...]:
+        records: list[dict[str, Any]] = []
+        page_token = ""
+        while True:
+            args = [
+                "workflow",
+                "list",
+                "--page-size",
+                "100",
+                "--json",
+            ]
+            if page_token:
+                args.extend(["--page-token", page_token])
+            payload = self.run_json(args)
+            page = payload.get("workflows")
+            if not isinstance(page, list) or not all(
+                isinstance(record, dict) for record in page
+            ):
+                raise KentCommandError(
+                    "workflow list returned an invalid workflows collection"
+                )
+            records.extend(page)
+            next_page_token = payload.get("next_page_token") or ""
+            if not isinstance(next_page_token, str):
+                raise KentCommandError(
+                    "workflow list returned an invalid next_page_token"
+                )
+            if not next_page_token:
+                return tuple(records)
+            page_token = next_page_token
 
     def require_inspect(self, workflow: str) -> dict[str, Any]:
         definition = self.inspect(workflow)
@@ -260,6 +347,7 @@ class KentClient:
 
     def ensure_workflow_metadata(
         self,
+        workflow_ref: str,
         spec: WorkflowSpec,
         definition: dict[str, Any],
     ) -> None:
@@ -275,7 +363,7 @@ class KentClient:
             [
                 "workflow",
                 "update",
-                spec.name,
+                workflow_ref,
                 "--description",
                 spec.description,
                 "--execution-target",
@@ -635,6 +723,28 @@ def execution_target_from_policy(raw: dict[str, Any]) -> str:
     if mode in {"none", "head"}:
         return mode
     return ""
+
+
+def canonical_workflow_selector(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    candidate = raw.removeprefix("workflow-")
+    try:
+        parsed = uuid.UUID(candidate)
+    except (ValueError, AttributeError):
+        return None
+    if parsed.version != 4 or str(parsed) != candidate.lower():
+        return None
+    return str(parsed)
+
+
+def workflow_selector_from_definition(definition: dict[str, Any]) -> str:
+    workflow_id = definition.get("workflow", {}).get("id")
+    if canonical_workflow_selector(workflow_id) is None:
+        raise KentCommandError(
+            f"workflow definition returned invalid id {workflow_id!r}"
+        )
+    return workflow_id
 
 
 def decode_json(raw: str, label: str) -> dict[str, Any]:

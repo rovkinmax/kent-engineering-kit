@@ -35,10 +35,78 @@ owns real task history and provides rollback.
   for bounded future validation without permanent project links.
 - Re-export existing workflow snapshots and verify their preserved Source HEAD
   policies after upgrading Kent.
+- Keep generated workflow tooling compatible with canonical bare UUID selectors
+  and both historical prefixed and current bare IDs in audit snapshots.
+- Enforce the shared role/model ownership contract in every project profile;
+  migrate projects independently so active workflow worktrees are not touched.
+- Canary the kit-owned global mcporter adapter with PUB-26, then migrate Puber
+  and Appsome references from duplicated project wrappers. Keep task-backed
+  revisions on their frozen local adapters until their work completes.
+- Puber role-prompt cleanup and the Puber/Appsome project model overrides are
+  staged. Appsome role prompts already omit model selection. Re-export its
+  audit snapshots and add any missing project-contract wording only after its
+  active sessions finish.
+- Delivery v5 is task-backed and does not inherit new generated writer prompts.
+  Puber Delivery v6 validated recovery-aware Plan against a local checkpoint
+  and exact source-comment IDs, then stopped before implementation because
+  fresh sessions also affected non-writer approval recovery. Its corrected
+  replacement limits `fresh_per_slice` to Implement/Fix, preserves compacted
+  continuity for Plan/Smoke/Compliance/PR/CI/Cleanup recovery, and uses
+  `continue_fix` for bounded continuation. Validate the replacement before
+  considering default promotion or an Appsome rollout.
 - Validate two-step implementation continuation, verification fan-out/Join,
   and report-only cleanup in both Android projects.
 - Validate interrupted-node recovery without losing the locked target or
   completed Join context in Appsome.
+- Standardize active user-feedback delivery. Task comments are durable but are
+  not injected into an active run; use session steering so the node can release
+  resources and return through `needs_changes`. Add a canary proving that
+  manual task movement is unnecessary for writer and Smoke feedback.
+- PUB-26 dogfooding showed provider-failure gaps in writer, reviewer, and Smoke
+  nodes. A resumed writer can preserve the worktree yet reopen its scope and
+  repeat checks. A read-only reviewer can finish all inspections but lose the
+  result during final response synthesis. Smoke can finish lock, build,
+  install, launch, and target-selection attempts but fail before reporting
+  whether destructive acceptance actions began. Prototype task-local resumable
+  checkpoints for long agent nodes. Writer checkpoints record the pinned
+  baseline, completed scope, fresh green commands, and the single next
+  permitted action. Reviewer checkpoints record inspected authority, evidence,
+  and structured findings before final transition synthesis. Smoke checkpoints
+  additionally record the exact device lock, target-confirmation state, and a
+  destructive-action ledger for disposable test data. Validate that resume
+  reconciles the checkpoint instead of repeating completed work, graph-owned
+  review axes, or user-data mutations.
+- PUB-26 validated state preservation and in-place compaction for an
+  interrupted Fix node: a manual move through its approval-gated
+  `compact_and_continue_session` self-loop preserved the worktree, injected the
+  exact authoritative task-comment ID, refreshed the session lock, and emitted
+  a completed compaction over 24 prior model turns. Kent retained the same
+  session ID and cumulative request count. The recovered broad Fix later grew
+  to about 229k estimated provider tokens and still failed on an OpenAI server
+  error before persisting its transition. Therefore this validates recovery
+  mechanics, not execution reliability. The next canary must combine compaction
+  with durable checkpoints, authoritative artifact updates, and bounded
+  remaining work. Still validate a no-mutation ledger before using recovery
+  for destructive Smoke work.
+- Preserve the PUB-26 checkpoint on local branch
+  `recovery/pub-26-history` at commit
+  `09c6dd332d214f358d5dbe564e44dc980457789b`. Keep PUB-26 retained until its
+  v6 successor has locked that revision and imported the exact authority
+  comments into a refreshed artifact set.
+- Add supported effective-policy observability for workflow sessions. Current
+  task and session inspection proves the model family but does not expose the
+  effective reasoning level, so Sol alone must not be reported as proof of
+  Sol/medium. Also canary `reviewer.frequency`, callability, and workflow
+  subagent eligibility after the next restart.
+- Re-canary Kent worktree hooks independently from project correctness.
+  `setup_script` and `postprocess_hook` remain advisory integrations; project
+  build entrypoints must retain their idempotent SDK/bootstrap fallback and
+  must not depend on hook invocation.
+- Validate the updated Standards calibration in a newly created session.
+  Ordinary technical identifiers are not secrets or PII by default, and
+  security severity requires an applicable rule or concrete threat model.
+  Resumed sessions retain their old locked prompt and are not evidence that the
+  new calibration was consumed.
 - Preflight each selected execution revision against its profile-owned scripts,
   procedures, and adapters.
 - Observe ordinary default tasks across delivery-ready, Smoke, Fix, CI, and PR

@@ -1,0 +1,553 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_path="${BASH_SOURCE[0]}"
+while [[ -L "$source_path" ]]; do
+  source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+  link_target="$(readlink "$source_path")"
+  if [[ "$link_target" == /* ]]; then
+    source_path="$link_target"
+  else
+    source_path="$source_dir/$link_target"
+  fi
+done
+adapter_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+# shellcheck disable=SC1091
+source "$adapter_dir/mcp-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: kent-mcp-call <server.tool> [arguments] [safe-output-mode] [--save-raw] [--raw-dir <dir>] [--no-save-raw] [--allow-mutate]
+       kent-mcp-call --self-test
+
+Safe output modes:
+  --quiet
+  --digest-output
+  --assert-contains <literal>
+  --assert-not-contains <literal>
+  --hash-matches <extended-regex>
+  --marker-present <literal>
+
+Raw responses are not written to a separate artifact by default, but normal
+stdout is still retained by the Kent shell transcript. Mobile tools other than
+device therefore require a safe output mode.
+EOF
+}
+
+if [[ "${1-}" == "--help" || $# -lt 1 ]]; then
+  usage
+  [[ $# -lt 1 ]] && exit 2 || exit 0
+fi
+
+self_test=false
+[[ "${1-}" == "--self-test" ]] && self_test=true
+
+target="$1"
+shift
+
+allow_mutate=false
+save_raw=false
+raw_save_requested=false
+raw_dir=""
+output_mode="text"
+safe_output_mode="raw"
+assert_contains=()
+assert_not_contains=()
+hash_matches_regex=""
+marker_literals=()
+args=()
+
+set_safe_output_mode() {
+  local requested="$1"
+  if [[ "$safe_output_mode" != "raw" && "$safe_output_mode" != "$requested" ]]; then
+    printf 'conflicting_safe_output_modes: %s and %s\n' \
+      "$safe_output_mode" "$requested" >&2
+    exit 2
+  fi
+  safe_output_mode="$requested"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --allow-mutate)
+      allow_mutate=true
+      shift
+      ;;
+    --quiet)
+      set_safe_output_mode quiet
+      shift
+      ;;
+    --digest-output)
+      set_safe_output_mode digest
+      shift
+      ;;
+    --assert-contains)
+      set_safe_output_mode assertion
+      value="${2-}"
+      [[ -n "$value" ]] || {
+        printf 'missing_value: --assert-contains requires a literal\n' >&2
+        exit 2
+      }
+      assert_contains+=("$value")
+      shift 2
+      ;;
+    --assert-not-contains)
+      set_safe_output_mode assertion
+      value="${2-}"
+      [[ -n "$value" ]] || {
+        printf 'missing_value: --assert-not-contains requires a literal\n' >&2
+        exit 2
+      }
+      assert_not_contains+=("$value")
+      shift 2
+      ;;
+    --hash-matches)
+      set_safe_output_mode extract
+      value="${2-}"
+      [[ -n "$value" ]] || {
+        printf 'missing_value: --hash-matches requires an extended regex\n' >&2
+        exit 2
+      }
+      [[ -z "$hash_matches_regex" ]] || {
+        printf 'duplicate_safe_output_option: --hash-matches\n' >&2
+        exit 2
+      }
+      hash_matches_regex="$value"
+      shift 2
+      ;;
+    --marker-present)
+      set_safe_output_mode extract
+      value="${2-}"
+      [[ -n "$value" ]] || {
+        printf 'missing_value: --marker-present requires a literal\n' >&2
+        exit 2
+      }
+      marker_literals+=("$value")
+      shift 2
+      ;;
+    --save-raw)
+      save_raw=true
+      raw_save_requested=true
+      shift
+      ;;
+    --no-save-raw)
+      save_raw=false
+      raw_save_requested=false
+      shift
+      ;;
+    --raw-dir)
+      raw_dir="${2-}"
+      [[ -n "$raw_dir" ]] || {
+        printf 'missing_value: --raw-dir requires a value\n' >&2
+        exit 2
+      }
+      save_raw=true
+      raw_save_requested=true
+      shift 2
+      ;;
+    --output)
+      output_mode="${2-}"
+      [[ -n "$output_mode" ]] || {
+        printf 'missing_value: --output requires a value\n' >&2
+        exit 2
+      }
+      args+=("$1" "$2")
+      shift 2
+      ;;
+    --output=*)
+      output_mode="${1#--output=}"
+      args+=("$1")
+      shift
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+server="${target%%.*}"
+tool="${target#*.}"
+if [[ "$self_test" != true && ( "$server" == "$target" || -z "$server" || -z "$tool" ) ]]; then
+  printf 'invalid_target: expected <server.tool>, got %s\n' "$target" >&2
+  exit 2
+fi
+
+arg_value() {
+  local key="$1"
+  local arg
+  for arg in "${args[@]}"; do
+    if [[ "$arg" == "$key="* ]]; then
+      printf '%s\n' "${arg#*=}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+action_is_one_of() {
+  local action="$1"
+  shift
+  local allowed
+  for allowed in "$@"; do
+    [[ "$action" == "$allowed" ]] && return 0
+  done
+  return 1
+}
+
+is_mobile_server() {
+  [[ "$1" == "mobile" || "$1" == mobile-* ]]
+}
+
+mobile_tool_mutates() {
+  local tool_name="$1"
+  local action_name="$2"
+
+  case "$tool_name" in
+    device)
+      ! action_is_one_of "$action_name" list get_target list_modules
+      ;;
+    screen)
+      ! action_is_one_of "$action_name" capture annotate
+      ;;
+    input|flow)
+      return 0
+      ;;
+    ui)
+      ! action_is_one_of "$action_name" tree find analyze wait assert_visible assert_gone
+      ;;
+    app)
+      ! action_is_one_of "$action_name" list
+      ;;
+    system)
+      ! action_is_one_of "$action_name" wait logs info webview clipboard_get metrics
+      ;;
+    browser)
+      ! action_is_one_of "$action_name" list_sessions snapshot screenshot wait_for_selector
+      ;;
+    desktop)
+      ! action_is_one_of "$action_name" windows clipboard_get performance monitors get_target_pid
+      ;;
+    store)
+      ! action_is_one_of "$action_name" get_releases get_versions
+      ;;
+    visual)
+      ! action_is_one_of "$action_name" list
+      ;;
+    recorder)
+      ! action_is_one_of "$action_name" status list show
+      ;;
+    sync)
+      ! action_is_one_of "$action_name" status list
+      ;;
+    accessibility)
+      ! action_is_one_of "$action_name" audit check summary rules
+      ;;
+    performance)
+      ! action_is_one_of "$action_name" snapshot compare crashes framestats
+      ;;
+    autopilot)
+      ! action_is_one_of "$action_name" status
+      ;;
+    sandbox)
+      ! action_is_one_of "$action_name" prefs_read file_list file_read
+      ;;
+    intent)
+      ! action_is_one_of "$action_name" services
+      ;;
+    sensor)
+      ! action_is_one_of "$action_name" notifications
+      ;;
+    network)
+      ! action_is_one_of "$action_name" traffic connectivity
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+target_requires_mutation_approval() {
+  local target_name="$1"
+  local action_name="$2"
+  local target_server="${target_name%%.*}"
+  local target_tool="${target_name#*.}"
+  local policy_hook policy_result policy_exit
+
+  if policy_hook="$(resolve_project_policy_hook "$(workspace_root)")"; then
+    set +e
+    policy_result="$("$policy_hook" "$target_name" "$action_name")"
+    policy_exit=$?
+    set -e
+    if [[ $policy_exit -ne 0 ]]; then
+      printf 'mcp_policy_hook_failed: %s exited %s\n' \
+        "$policy_hook" "$policy_exit" >&2
+      exit 2
+    fi
+    case "$policy_result" in
+      read-only) return 1 ;;
+      mutating) return 0 ;;
+      blocked)
+        printf 'mcp_policy_blocked: %s\n' "$target_name" >&2
+        exit 2
+        ;;
+      ""|inherit) ;;
+      *)
+        printf 'mcp_policy_invalid: %s returned %s\n' \
+          "$policy_hook" "$policy_result" >&2
+        exit 2
+        ;;
+    esac
+  fi
+
+  if is_mobile_server "$target_server"; then
+    mobile_tool_mutates "$target_tool" "$action_name"
+    return
+  fi
+
+  case "$target_name" in
+    jetbrains.rename_refactoring|jetbrains.reformat_file|jetbrains.execute_run_configuration)
+      return 0
+      ;;
+    jetbrains.get_*|jetbrains.search_*|jetbrains.find_*|jetbrains.list_*)
+      return 1
+      ;;
+    jetbrains.build_project)
+      printf 'unsupported_mcp_tool: jetbrains.build_project is intentionally not used; run the project build tool directly\n' >&2
+      exit 2
+      ;;
+    firebase.firebase_login|firebase.firebase_logout|firebase.firebase_create_project|firebase.firebase_create_app|firebase.firebase_create_android_sha|firebase.firebase_update_environment|firebase.firebase_init|firebase.firebase_deploy|firebase.dataconnect_execute|firebase.auth_update_user|firebase.auth_set_sms_region_policy|firebase.messaging_send_message|firebase.remoteconfig_update_template|firebase.crashlytics_create_note|firebase.crashlytics_delete_note|firebase.crashlytics_update_issue|firebase.realtimedatabase_set_data|firebase.firestore_add_document|firebase.firestore_update_document|firebase.firestore_delete_document|firebase.firestore_create_database|firebase.firestore_update_database|firebase.firestore_delete_database|firebase.firestore_create_index|firebase.firestore_delete_index)
+      return 0
+      ;;
+    firebase.firebase_get_*|firebase.firebase_list_*|firebase.crashlytics_get_*|firebase.crashlytics_list_*)
+      return 1
+      ;;
+    serena.get_symbols_overview|serena.find_symbol|serena.find_referencing_symbols|serena.search_for_pattern|serena.list_dir|serena.find_file|serena.read_memory|serena.list_memories|serena.get_current_config|serena.check_onboarding_performed)
+      return 1
+      ;;
+    figma.get_*|figma.list_*|notion.notion-fetch|notion.notion-search|package-version-check.*)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+assert_policy() {
+  local test_target="$1"
+  local action="$2"
+  local expected="$3"
+  local actual="read-only"
+  target_requires_mutation_approval "$test_target" "$action" && actual="mutating"
+  [[ "$actual" == "$expected" ]] || {
+    printf 'self_test_failed: %s action=%s expected %s, got %s\n' \
+      "$test_target" "$action" "$expected" "$actual" >&2
+    return 1
+  }
+}
+
+run_self_test() {
+  assert_policy mobile.device list read-only
+  assert_policy mobile.device enable_module mutating
+  assert_policy mobile.input tap mutating
+  assert_policy mobile.ui assert_visible read-only
+  assert_policy mobile.ui tap_text mutating
+  assert_policy mobile.future inspect mutating
+  assert_policy firebase.firebase_get_environment "" read-only
+  assert_policy firebase.firebase_deploy "" mutating
+  assert_policy unknown.inspect "" mutating
+}
+
+if [[ "$self_test" == true ]]; then
+  run_self_test
+  exit 0
+fi
+
+if [[ "$safe_output_mode" != "raw" && "$raw_save_requested" == true ]]; then
+  printf 'safe_output_cannot_save_raw: remove --save-raw/--raw-dir\n' >&2
+  exit 2
+fi
+
+action="$(arg_value action || true)"
+if [[ "$server" == "mobile" && "$tool" == "device" ]] &&
+  action_is_one_of "$action" set set_target get_target; then
+  printf 'unsupported_mobile_target_state: default mobile is stateless; use action=list and pass platform plus deviceId to every target-specific call\n' >&2
+  exit 2
+fi
+
+if is_mobile_server "$server" && [[ "$tool" != "device" ]] &&
+  [[ "$safe_output_mode" == "raw" ]]; then
+  printf 'sensitive_mobile_output_requires_safe_mode: use --quiet, --digest-output, or --assert-contains/--assert-not-contains\n' >&2
+  exit 2
+fi
+
+if target_requires_mutation_approval "$target" "$action" &&
+  [[ "$allow_mutate" != true ]]; then
+  printf 'mutating_mcp_requires_allow: %s requires --allow-mutate\n' "$target" >&2
+  exit 2
+fi
+
+root="$(workspace_root)"
+require_mcporter
+if [[ "$server" == "mobile" ]]; then
+  config="$(mcporter_home_config_path)"
+  [[ -f "$config" ]] || {
+    printf 'mcporter_global_mobile_missing: run configure-mcporter --apply; expected %s\n' \
+      "$config" >&2
+    exit 2
+  }
+  config_display="mcporter-global-mobile"
+else
+  config="$(resolve_mcp_config)"
+  config_display="${config:-mcporter-default}"
+fi
+
+tmp_out="$(mktemp)"
+tmp_err="$(mktemp)"
+tmp_safe_out="$(mktemp)"
+tmp_safe_err="$(mktemp)"
+trap 'rm -f "$tmp_out" "$tmp_err" "$tmp_safe_out" "$tmp_safe_err"' EXIT
+
+cmd=(mcporter)
+if [[ "$server" == "serena" ]]; then
+  serena_cmd="$(resolve_serena_command "$config")"
+  serena_args=()
+  while IFS= read -r -d '' arg; do
+    serena_args+=("$arg")
+  done < <(serena_stdio_args "$root")
+  cmd+=(call --stdio "$serena_cmd" "${serena_args[@]}" "$tool" "${args[@]}")
+elif [[ "$server" == "mobile" ]]; then
+  cmd+=(--config "$config" --root "$root" call "$target" "${args[@]}")
+elif project_server_cmd="$(resolve_project_server_command "$root" "$server")"; then
+  project_server_args=()
+  while IFS= read -r -d '' arg; do
+    project_server_args+=("$arg")
+  done < <(project_server_stdio_args "$root" "$server")
+  config_display="project-stdio:$project_server_cmd"
+  cmd+=(call --stdio "$project_server_cmd" "${project_server_args[@]}" "$tool" "${args[@]}")
+else
+  [[ -z "$config" ]] || cmd+=(--config "$config")
+  cmd+=(--root "$root" call "$target" "${args[@]}")
+fi
+
+set +e
+with_server_lock_if_needed "$server" "$root" "${cmd[@]}" >"$tmp_out" 2>"$tmp_err"
+exit_code=$?
+set -e
+
+effective_exit_code="$exit_code"
+error_code=""
+
+if [[ $exit_code -ne 0 ]]; then
+  if [[ "$safe_output_mode" == "raw" ]]; then
+    cat "$tmp_out"
+    [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
+  else
+    printf 'mcp_call_failed: %s exited %s; raw output suppressed\n' \
+      "$target" "$exit_code" >&2
+  fi
+  error_code="mcporter_call_failed"
+else
+  case "$safe_output_mode" in
+    raw)
+      cat "$tmp_out"
+      [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
+      ;;
+    quiet)
+      ;;
+    digest)
+      if command -v sha256sum >/dev/null 2>&1; then
+        digest="$(sha256sum "$tmp_out" | awk '{print $1}')"
+      elif command -v shasum >/dev/null 2>&1; then
+        digest="$(shasum -a 256 "$tmp_out" | awk '{print $1}')"
+      else
+        digest="$(openssl dgst -sha256 -r "$tmp_out" | awk '{print $1}')"
+      fi
+      bytes="$(wc -c <"$tmp_out" | tr -d '[:space:]')"
+      lines="$(wc -l <"$tmp_out" | tr -d '[:space:]')"
+      printf '{"status":"passed","sha256":"%s","bytes":%s,"lines":%s}\n' \
+        "$digest" "$bytes" "$lines"
+      ;;
+    assertion)
+      failed_contains=0
+      failed_not_contains=0
+      for value in "${assert_contains[@]}"; do
+        grep -Fq -- "$value" "$tmp_out" || ((failed_contains += 1))
+      done
+      for value in "${assert_not_contains[@]}"; do
+        grep -Fq -- "$value" "$tmp_out" && ((failed_not_contains += 1))
+      done
+      if ((failed_contains == 0 && failed_not_contains == 0)); then
+        assertion_status="passed"
+      else
+        assertion_status="failed"
+        effective_exit_code=3
+        error_code="mcp_output_assertion_failed"
+      fi
+      printf '{"status":"%s","contains":%d,"notContains":%d,"failedContains":%d,"failedNotContains":%d}\n' \
+        "$assertion_status" "${#assert_contains[@]}" \
+        "${#assert_not_contains[@]}" "$failed_contains" \
+        "$failed_not_contains"
+      ;;
+    extract)
+      if python3 - "$tmp_out" "$hash_matches_regex" \
+        "${marker_literals[@]}" >"$tmp_safe_out" 2>"$tmp_safe_err" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+path, pattern, *markers = sys.argv[1:]
+text = Path(path).read_text(encoding="utf-8", errors="replace")
+matches = list(re.finditer(pattern, text)) if pattern else []
+hashes = []
+seen = set()
+for match in matches:
+    value = match.group(0)
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    if digest not in seen:
+        seen.add(digest)
+        hashes.append(digest)
+
+print(
+    json.dumps(
+        {
+            "status": "passed",
+            "occurrenceCount": len(matches),
+            "uniqueCount": len(hashes),
+            "hashes": hashes,
+            "markerCount": len(markers),
+            "markersPresent": [marker in text for marker in markers],
+        },
+        separators=(",", ":"),
+    )
+)
+PY
+      then
+        cat "$tmp_safe_out"
+      else
+        printf 'mcp_safe_extract_failed: raw output suppressed\n' >&2
+        effective_exit_code=3
+        error_code="mcp_safe_extract_failed"
+      fi
+      ;;
+  esac
+fi
+
+raw_path=""
+if [[ "$save_raw" == true ]]; then
+  if [[ -z "$raw_dir" ]]; then
+    raw_dir="$(artifact_root "$root")/_mcp-raw"
+  fi
+  server_dir="$raw_dir/$(safe_name "$server")"
+  mkdir -p "$server_dir"
+  raw_path="$server_dir/$(safe_name "$tool")-$(timestamp_utc).$(output_ext "$output_mode")"
+  cp "$tmp_out" "$raw_path"
+fi
+
+append_call_log "$root" "$server" "$tool" "$config_display" "$output_mode" \
+  "$raw_path" "$effective_exit_code" "$error_code" "$safe_output_mode"
+
+exit "$effective_exit_code"

@@ -4,6 +4,70 @@ Adapters contain opt-in behavior for a build system, platform, or toolchain.
 Projects select them explicitly; the platform-neutral toolkit core does not
 assume that every repository uses them.
 
+## Global MCP adapter
+
+The installer exposes:
+
+```text
+~/.kent/bin/kent-mcp-call
+~/.kent/bin/kent-mcp-list
+```
+
+The adapter uses the current worktree as the execution and artifact root while
+resolving project identity from the primary Git worktree. Machine config files
+such as `~/.kent/mcp.Puber.env` therefore remain valid inside task-named Kent
+worktrees. Process `MCP_CONFIG_PATH` remains the highest-priority override.
+
+Call metadata is logged, and no separate raw artifact is created by default.
+Normal stdout is still part of the Kent shell transcript. Sensitive calls must
+therefore select one safe output mode:
+
+```text
+--quiet
+--digest-output
+--assert-contains <literal>
+--assert-not-contains <literal>
+--hash-matches <extended-regex>
+--marker-present <literal>
+```
+
+Safe modes suppress the raw response and are incompatible with `--save-raw` or
+`--raw-dir`. Mobile tools other than `device` fail closed without a safe mode.
+Use output assertions for known acceptance facts and digests for before/after
+equivalence without disclosing content. `--hash-matches` emits only unique
+SHA-256 values for matched semantic tokens; combine it with one or more
+`--marker-present` checks for bounded pagination proof. Neither matched values
+nor marker literals are copied from the response to stdout. Never opt in to raw
+output for an unexpected authenticated UI tree, credentials, headers, broad
+device logs, or unredacted network payloads.
+
+Portable servers are added separately:
+
+```bash
+./scripts/configure-mcporter --apply
+./scripts/audit-mobile-schema
+```
+
+The managed `mobile` server uses mcporter's default ephemeral lifecycle. Mobile workflows must
+list devices, acquire the project resource lock, and pass `platform` plus the
+exact locked `deviceId` to every target-specific call. Process-local
+`device set` / `get_target` state is not a valid cross-call target guarantee.
+The current schema exposes explicit device addressing for `screen`, `input`,
+`ui`, and `app`. If a target-specific tool such as `system` lacks `deviceId`,
+use the project's exact platform adapter (`adb -s`, simulator UDID, or
+equivalent) instead of an implicit MCP target.
+
+Project-specific stdio servers may remain executable at
+`.kent/adapters/mcp/servers/<server>` or the legacy
+`.kent/adapters/mcp/<server>-server.sh` path. Credentials and server-specific
+policy remain project-owned.
+
+Unknown non-mobile tools require `--allow-mutate` by default. A project may
+classify its own tools with executable `.kent/adapters/mcp/policy`; it receives
+`<server.tool>` and `action` and prints exactly `read-only`, `mutating`,
+`blocked`, or `inherit`. The adapter resolves this hook from the primary Git
+worktree so managed worktrees share one policy.
+
 ## Gradle shell postprocessor
 
 The Gradle adapter warns when an agent runs `./gradlew` directly inside a Git

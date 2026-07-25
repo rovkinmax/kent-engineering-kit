@@ -17,8 +17,10 @@ Every generated workflow:
 Implemented `Engineering Delivery` fragments:
 
 - planning and plan review;
-- implementation continuation;
+- implementation continuation with selectable continuous or fresh-per-slice
+  writer sessions;
 - verification dispatch, read-only branches, Join, and gate;
+- bounded Fix continuation through `continue_fix` in fresh-per-slice mode;
 - PR creation, CI monitoring, waiting for merge, and cleanup;
 - recoverable blocker and cancellation transitions.
 
@@ -48,15 +50,33 @@ Existing pre-2.3 workflows are not rewritten in place. After the coordinated
 upgrade, their preserved Source HEAD policies are inspected and snapshots are
 re-exported before an experimental generated replacement is linked.
 
-Kent 2.3 has no CLI workflow-delete command. Retire superseded experiments
-through Kent Desktop after incorporating their evidence and finishing or
-canceling active work. Desktop deletion removes the workflow definition,
-project links, and task database rows but retains repositories and managed
-worktrees for separate inspection and cleanup. Never repair workflow state
-through direct database mutation.
+Kent 2.4 adds `kent workflow delete <bare-workflow-uuid>`. Without `--confirm`
+it returns a non-destructive impact preview. After incorporating evidence and
+finishing or canceling active work, the user may confirm deletion explicitly.
+Kent 2.3 still requires Kent Desktop for retirement. Deletion removes the
+workflow definition, project links, and task database rows but retains
+repositories and managed worktrees for separate inspection and cleanup. Never
+repair workflow state through direct database mutation.
+
+Kent 2.3.0 workflow edit commands use persisted `workflow-...` IDs. Kent 2.3.1
+and newer accept bare canonical workflow UUIDs instead. The generator resolves
+an exact name through `workflow list` only when discovering an existing graph,
+then preserves the ID representation returned by the installed Kent version.
 
 Before changing an existing workflow, the generator computes drift without
 mutation. Unsupported extra graph elements fail immediately. Reconciliation
 that would change graph semantics is refused when the workflow already has task
 records. Compatible taskless changes may reconcile in place; unsupported
 structural changes use another experimental label.
+
+Generator prompt changes do not rewrite task-backed live graphs. Delivery v5
+remains frozen with its recorded task history. New review-ownership or model
+experiments must use a separately validated non-default workflow instance,
+then become default only after a managed-worktree canary passes.
+
+Puber Engineering Delivery v6 proved the checkpoint-aware Plan handoff but
+over-applied fresh sessions to non-writer approval recovery. It was stopped
+after Plan. The corrected replacement keeps fresh sessions only for
+Implement/Fix slices and preserves compact-and-continue recovery for Plan,
+Smoke, Compliance, PR/CI, and Cleanup. Delivery v5 stays linked and default
+until the corrected managed-worktree canary completes.

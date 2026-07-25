@@ -12,8 +12,17 @@ generated toolkit workflows.
   portable transition parameters.
 - The project owns build commands, architecture rules, device details, source
   integrations, release policy, and credentials.
+- Role prompts own behavior, while Kent configuration owns model, reasoning,
+  verbosity, tools, and delegation eligibility. Reject `model:` and `tools:`
+  frontmatter in project role prompts.
 - Run deterministic project verification through the executable declared by the
   profile, normally `.kent/scripts/workflow-verify`.
+- Use `~/.kent/bin/kent-mcp-call` and `~/.kent/bin/kent-mcp-list` for MCP
+  access. Projects own credentials and project-specific server wrappers.
+- MCP call logs retain metadata, while ordinary stdout remains in Kent's shell
+  transcript. Use `--quiet`, `--digest-output`, or output assertions for
+  sensitive calls. Use `--save-raw` or `--raw-dir` only for known-safe
+  evidence; never emit or retain an unexpected authenticated UI tree.
 - Use canonical role keys from the profile. Role implementations remain
   project-local unless the role is explicitly global.
 
@@ -43,17 +52,34 @@ generated toolkit workflows.
   `mobile_resource_lock` adapter before any install, launch, input, or log
   action. Use an explicit serial for every direct adb and target-specific
   Mobile MCP call.
-- Confirm Mobile MCP targeting through documented serial presence, explicit
-  selection acknowledgement, and a target query when available. Do not depend
-  on an undocumented `ACTIVE` label. Treat device-side timestamp syntax as
-  adapter-specific and validate it before using it as a runtime evidence
-  boundary.
+- With the default global `mobile` server, use stateless targeting: list the
+  exact locked serial and pass `platform` plus `deviceId` to every
+  target-specific call. Do not use process-local `set` / `get_target` as a
+  cross-call gate. If the current MCP schema lacks `deviceId` for a required
+  action, use the exact project platform adapter instead of an implicit target.
+  Treat device-side timestamp syntax as adapter-specific and validate it before
+  using it as a runtime evidence boundary.
+- Every Mobile call other than device discovery uses a safe output mode.
+  Prefer `--quiet` for actions, assertions for known UI facts, and
+  `--digest-output` for before/after equivalence. Use `--hash-matches` plus
+  `--marker-present` for opaque semantic-key inventories and final-page proof.
+  Do not request a full authenticated UI tree through raw stdout.
 - Require the project-local `mobile_evidence_audit` before completing runtime
   Smoke. Persist only scoped, sanitized evidence; unexpected authenticated or
   sensitive state becomes a redacted blocker.
 - Preview generated workflows without `--apply`.
 - Apply versioned workflows non-default first. Use `--set-default` only after a
   managed-worktree canary passes.
+- Read `policies.writer_sessions` before interpreting writer continuity.
+  `continuous` reuses or compacts sessions. `fresh_per_slice` starts one fresh
+  Implement/Fix session per independently verifiable slice; the worktree,
+  authoritative artifacts, exact task-comment IDs, evidence, and structured
+  transition parameters are the handoff. Use `continue_fix` only with the
+  remaining findings. Non-writer approval-recovery loops compact and continue
+  their existing sessions.
+- A recovery task may start from an explicit checkpoint commit and source task.
+  Its Plan session verifies the checkpoint and updates authoritative artifacts
+  before any production edit; it never resets preserved implementation.
 - Changing a project default affects only new tasks. Keep the previous workflow
   linked for rollback; never move existing tasks between incompatible graphs.
 - Use `Engineering Canary` for infrastructure-only validation. It intentionally
@@ -68,11 +94,13 @@ generated toolkit workflows.
   approval.
 - Once tasks reference a workflow, treat its graph as frozen and create another
   free-form experimental label for semantic changes.
-- After promoting a replacement, remove obsolete Canary or Smoke Lab instances
-  through Kent Desktop's workflow editor. Kent 2.3 has no CLI workflow-delete
-  command. Desktop deletion removes the workflow definition, project links, and
-  task database rows, but intentionally retains repository files and managed
-  worktrees. Inspect and clean retained worktrees separately; never edit the
+- On Kent 2.4 or newer, preview retirement with
+  `kent workflow delete <bare-workflow-uuid> --json`. The preview is
+  non-destructive. Only the user may repeat it with `--confirm`; deletion
+  removes the workflow definition, project links, and task database rows but
+  intentionally retains repository files and managed worktrees.
+- On Kent 2.3, retire obsolete workflows through Kent Desktop. In every
+  version, inspect and clean retained worktrees separately and never edit the
   Kent database directly.
 
 ## Fan-out
@@ -82,6 +110,10 @@ generated toolkit workflows.
 - Failures are returned to Join as structured results.
 - Each branch emits one stable output contract.
 - Only the post-Join gate selects Fix, QA, Ship, or Needs User Action.
+- Generated Standards, Specification, and Compliance stages own final review.
+  Implement and Fix must not duplicate them through nested final reviewers.
+- Standards, Specification, and Compliance are leaf sessions. They must not
+  call `kent run` or delegate their review to child agents.
 
 ## Safety
 

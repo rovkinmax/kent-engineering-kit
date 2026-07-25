@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_path="${BASH_SOURCE[0]}"
+while [[ -L "$source_path" ]]; do
+  source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+  link_target="$(readlink "$source_path")"
+  if [[ "$link_target" == /* ]]; then
+    source_path="$link_target"
+  else
+    source_path="$source_dir/$link_target"
+  fi
+done
+repo_root="$(cd -P "$(dirname "$source_path")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$repo_root/adapters/mcp/mcp-common.sh"
+
+apply=false
+config_override=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)
+      apply=true
+      shift
+      ;;
+    --config)
+      config_override="${2-}"
+      [[ -n "$config_override" ]] || {
+        echo "configure-mcporter: --config requires a value" >&2
+        exit 2
+      }
+      shift 2
+      ;;
+    --help)
+      echo "Usage: configure-mcporter [--apply] [--config <path>]"
+      exit 0
+      ;;
+    *)
+      echo "configure-mcporter: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+require_mcporter
+
+if [[ -n "$config_override" ]]; then
+  config="$(
+    python3 - "$config_override" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(os.path.expanduser(sys.argv[1])))
+PY
+  )"
+else
+  config="$(mcporter_home_config_path)"
+fi
+
+existing=""
+set +e
+existing="$(mcporter --config "$config" config get mobile --json 2>/dev/null)"
+get_exit=$?
+set -e
+
+if [[ $get_exit -eq 0 && -n "$existing" ]]; then
+  classification="$(
+    python3 - "$config" "$existing" <<'PY'
+import json
+import os
+import sys
+
+config = os.path.realpath(sys.argv[1])
+entry = json.loads(sys.argv[2])
+source = entry.get("source") or {}
+source_path = source.get("path")
+is_local = bool(source_path) and os.path.realpath(source_path) == config
+matches = (
+    entry.get("command") == "npx"
+    and entry.get("args") == ["-y", "claude-in-mobile@latest"]
+)
+if is_local and matches:
+    print("configured")
+elif is_local:
+    print("conflict")
+else:
+    print("missing")
+PY
+  )"
+else
+  classification="missing"
+fi
+
+case "$classification" in
+  configured)
+    printf '{\n  "config": "%s",\n  "status": "configured",\n  "added": [],\n  "unchanged": ["mobile"]\n}\n' "$config"
+    exit 0
+    ;;
+  conflict)
+    printf '{\n  "config": "%s",\n  "status": "conflict",\n  "conflicts": ["mobile"]\n}\n' "$config"
+    exit 1
+    ;;
+  missing)
+    if [[ "$apply" != true ]]; then
+      printf '{\n  "config": "%s",\n  "status": "changes_required",\n  "missing": ["mobile"]\n}\n' "$config"
+      exit 1
+    fi
+    mkdir -p "$(dirname "$config")"
+    mcporter --config "$config" config add mobile --command npx -- \
+      -y claude-in-mobile@latest >&2
+    printf '{\n  "config": "%s",\n  "status": "configured",\n  "added": ["mobile"],\n  "unchanged": []\n}\n' "$config"
+    ;;
+  *)
+    echo "configure-mcporter: invalid classification: $classification" >&2
+    exit 1
+    ;;
+esac

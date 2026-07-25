@@ -12,7 +12,16 @@ from .model import SpecError, validate_execution_target
 
 DELIVERY_PROFILES = {"lite", "standard", "team", "release"}
 SMOKE_POLICIES = {"disabled", "conditional", "required"}
+WRITER_SESSION_POLICIES = {"continuous", "fresh_per_slice"}
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+ROLE_PROMPT_DIRECTORIES = (
+    Path(".kent/subagents"),
+    Path(".kent/agents"),
+)
+ROLE_EXECUTION_FIELD_PATTERN = re.compile(
+    r"^\s*(model|tools)\s*:",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -144,6 +153,13 @@ class ProjectProfile:
                 f"unsupported policies.smoke {smoke_policy!r}; expected one of "
                 f"{sorted(SMOKE_POLICIES)}"
             )
+        writer_session_policy = self.writer_session_policy()
+        if writer_session_policy not in WRITER_SESSION_POLICIES:
+            raise SpecError(
+                "unsupported policies.writer_sessions "
+                f"{writer_session_policy!r}; expected one of "
+                f"{sorted(WRITER_SESSION_POLICIES)}"
+            )
         if "device_smoke" in self.capabilities:
             raise SpecError(
                 "capabilities.device_smoke was removed in profile schema 3; "
@@ -206,6 +222,8 @@ class ProjectProfile:
 
         if self.capability("ci_monitoring") and not self.capability("pull_requests"):
             raise SpecError("ci_monitoring requires pull_requests")
+        if check_files:
+            validate_project_role_prompts(self.project_root)
 
     def execution_target(self, workflow_kind: str) -> str:
         return self.execution_overrides.get(workflow_kind, self.execution_default)
@@ -229,6 +247,9 @@ class ProjectProfile:
         if not policy:
             raise SpecError("profile policy 'smoke' is required")
         return policy
+
+    def writer_session_policy(self) -> str:
+        return self.policies.get("writer_sessions", "continuous").strip()
 
     def command(self, key: str) -> str:
         return self.commands.get(key, "").strip()
@@ -341,3 +362,30 @@ def bool_table(raw: Any, label: str) -> dict[str, bool]:
             raise SpecError(f"{label}.{key} must be a boolean")
         result[key] = value
     return result
+
+
+def validate_project_role_prompts(project_root: Path) -> None:
+    root = project_root.expanduser().resolve()
+    for relative_directory in ROLE_PROMPT_DIRECTORIES:
+        directory = root / relative_directory
+        if not directory.is_dir():
+            continue
+        for prompt_path in sorted(directory.rglob("*.md")):
+            try:
+                lines = prompt_path.read_text().splitlines()
+            except (OSError, UnicodeError) as error:
+                raise SpecError(
+                    f"cannot read role prompt {prompt_path}: {error}"
+                ) from error
+            if not lines or lines[0].strip() != "---":
+                continue
+            for line_number, line in enumerate(lines[1:], start=2):
+                if line.strip() == "---":
+                    break
+                if ROLE_EXECUTION_FIELD_PATTERN.match(line):
+                    relative_path = prompt_path.relative_to(root)
+                    raise SpecError(
+                        f"{relative_path}:{line_number}: role prompts must not "
+                        "declare model or tools; configure execution policy in "
+                        ".kent/config.toml or the global Kent config"
+                    )

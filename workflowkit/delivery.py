@@ -90,6 +90,23 @@ def build_delivery_workflow(
     version: int,
 ) -> WorkflowSpec:
     orchestrator = profile.role("orchestrator")
+    fresh_writers = profile.writer_session_policy() == "fresh_per_slice"
+    writer_handoff_context = (
+        "new_session" if fresh_writers else "compact_and_continue_session"
+    )
+    implementation_continuation_context = (
+        "new_session" if fresh_writers else "continue_session"
+    )
+    fix_context = (
+        "new_session" if fresh_writers else "compact_and_continue_session"
+    )
+    fix_context_source = (
+        "immediate_source" if fresh_writers else "previous_target_or_new"
+    )
+    writer_recovery_context = (
+        "new_session" if fresh_writers else "compact_and_continue_session"
+    )
+    non_writer_recovery_context = "compact_and_continue_session"
     final_compliance = (
         profile.capability("pull_requests")
         and profile.capability("compliance_review")
@@ -165,7 +182,7 @@ def build_delivery_workflow(
             source="backlog",
             transition="start",
             target="plan",
-            prompt=plan_prompt(profile),
+            prompt=plan_prompt(profile, recovery_aware=fresh_writers),
             transition_description="Start one planning session for this task.",
         ),
         EdgeSpec(
@@ -173,22 +190,25 @@ def build_delivery_workflow(
             source="plan",
             transition="implement",
             target="implement",
-            context="compact_and_continue_session",
-            prompt=implement_prompt(profile),
+            context=writer_handoff_context,
+            prompt=implement_prompt(profile, fresh_session=fresh_writers),
             transition_description=(
                 "Planning is complete and implementation can start without ambiguity."
             ),
             parameters=(WORKSPACE, PLAN),
         ),
-        recovery_edge("plan"),
+        recovery_edge(
+            "plan",
+            context=non_writer_recovery_context,
+        ),
         cancellation_edge("plan"),
         EdgeSpec(
             key="implement_continue",
             source="implement",
             transition="continue_implementation",
             target="implement",
-            context="continue_session",
-            prompt=implement_prompt(profile),
+            context=implementation_continuation_context,
+            prompt=implement_prompt(profile, fresh_session=fresh_writers),
             transition_description=(
                 "One plan step is complete; continue with the next ready step."
             ),
@@ -204,7 +224,11 @@ def build_delivery_workflow(
             ),
             parameters=(WORKSPACE, REVIEW_CONTEXT),
         ),
-        recovery_edge("implement"),
+        recovery_edge(
+            "implement",
+            context=writer_recovery_context,
+            fresh_session=fresh_writers,
+        ),
         cancellation_edge("implement"),
         EdgeSpec(
             key="fix_verify",
@@ -216,9 +240,30 @@ def build_delivery_workflow(
             ),
             parameters=(WORKSPACE, REVIEW_CONTEXT),
         ),
-        recovery_edge("fix"),
+        recovery_edge(
+            "fix",
+            context=writer_recovery_context,
+            fresh_session=fresh_writers,
+        ),
         cancellation_edge("fix"),
     ]
+
+    if fresh_writers:
+        edges.append(
+            EdgeSpec(
+                key="fix_continue",
+                source="fix",
+                transition="continue_fix",
+                target="fix",
+                context="new_session",
+                prompt=fix_prompt(profile, bounded=True),
+                transition_description=(
+                    "One bounded fix slice is complete; continue with only the "
+                    "remaining task-scoped findings."
+                ),
+                parameters=(WORKSPACE, FIX_CONTEXT),
+            )
+        )
 
     fanout_parameters = (WORKSPACE, REVIEW_CONTEXT)
     edges.append(
@@ -339,9 +384,9 @@ def build_delivery_workflow(
                 source="verification_gate",
                 transition="needs_changes",
                 target="fix",
-                context="compact_and_continue_session",
-                context_source="previous_target_or_new",
-                prompt=fix_prompt(profile),
+                context=fix_context,
+                context_source=fix_context_source,
+                prompt=fix_prompt(profile, bounded=fresh_writers),
                 transition_description=(
                     "Verification found task-scoped issues for the single writer to fix."
                 ),
@@ -425,15 +470,18 @@ def build_delivery_workflow(
                     source="smoke",
                     transition="needs_changes",
                     target="fix",
-                    context="compact_and_continue_session",
-                    context_source="previous_target_or_new",
-                    prompt=fix_prompt(profile),
+                    context=fix_context,
+                    context_source=fix_context_source,
+                    prompt=fix_prompt(profile, bounded=fresh_writers),
                     transition_description=(
                         "Smoke testing found task-scoped implementation issues."
                     ),
                     parameters=(WORKSPACE, FIX_CONTEXT),
                 ),
-                recovery_edge("smoke"),
+                recovery_edge(
+                    "smoke",
+                    context=non_writer_recovery_context,
+                ),
             ]
         )
 
@@ -456,9 +504,9 @@ def build_delivery_workflow(
                     source="compliance",
                     transition="needs_changes",
                     target="fix",
-                    context="compact_and_continue_session",
-                    context_source="previous_target_or_new",
-                    prompt=fix_prompt(profile),
+                    context=fix_context,
+                    context_source=fix_context_source,
+                    prompt=fix_prompt(profile, bounded=fresh_writers),
                     transition_description=(
                         "Final compliance found task-scoped issues that require fixes."
                     ),
@@ -469,7 +517,7 @@ def build_delivery_workflow(
                     source="compliance",
                     transition="needs_user_action",
                     target="compliance",
-                    context="compact_and_continue_session",
+                    context=non_writer_recovery_context,
                     prompt=compliance_recovery_prompt(profile),
                     requires_approval=True,
                     transition_description=(
@@ -519,16 +567,22 @@ def build_delivery_workflow(
                     source="prepare_pr",
                     transition="needs_changes",
                     target="fix",
-                    context="compact_and_continue_session",
-                    context_source="previous_target_or_new",
-                    prompt=pr_recovery_fix_prompt(profile),
+                    context=fix_context,
+                    context_source=fix_context_source,
+                    prompt=pr_recovery_fix_prompt(
+                        profile,
+                        bounded=fresh_writers,
+                    ),
                     requires_approval=True,
                     transition_description=(
                         "PR preparation found task-scoped changes that must be fixed."
                     ),
                     parameters=(WORKSPACE, BLOCKER),
                 ),
-                recovery_edge("prepare_pr"),
+                recovery_edge(
+                    "prepare_pr",
+                    context=non_writer_recovery_context,
+                ),
             ]
         )
 
@@ -551,15 +605,18 @@ def build_delivery_workflow(
                         source="ci_monitor",
                         transition="needs_changes",
                         target="fix",
-                        context="compact_and_continue_session",
-                        context_source="previous_target_or_new",
-                        prompt=fix_prompt(profile),
+                        context=fix_context,
+                        context_source=fix_context_source,
+                        prompt=fix_prompt(profile, bounded=fresh_writers),
                         transition_description=(
                             "CI found task-scoped failures that require fixes."
                         ),
                         parameters=(WORKSPACE, FIX_CONTEXT),
                     ),
-                    recovery_edge("ci_monitor"),
+                    recovery_edge(
+                        "ci_monitor",
+                        context=non_writer_recovery_context,
+                    ),
                 ]
             )
 
@@ -581,7 +638,7 @@ def build_delivery_workflow(
                     source="waiting_pr",
                     transition="needs_user_action",
                     target="waiting_pr",
-                    context="compact_and_continue_session",
+                    context=non_writer_recovery_context,
                     prompt=waiting_pr_prompt(profile),
                     requires_approval=True,
                     transition_description=(
@@ -594,9 +651,12 @@ def build_delivery_workflow(
                     source="waiting_pr",
                     transition="needs_changes",
                     target="fix",
-                    context="compact_and_continue_session",
-                    context_source="previous_target_or_new",
-                    prompt=pr_feedback_fix_prompt(profile),
+                    context=fix_context,
+                    context_source=fix_context_source,
+                    prompt=pr_feedback_fix_prompt(
+                        profile,
+                        bounded=fresh_writers,
+                    ),
                     transition_description=(
                         "The PR state requires task-scoped changes before merge."
                     ),
@@ -629,7 +689,10 @@ def build_delivery_workflow(
                 ),
                 parameters=(CLEANUP_REPORT,),
             ),
-            recovery_edge("cleanup"),
+            recovery_edge(
+                "cleanup",
+                context=non_writer_recovery_context,
+            ),
         ]
     )
 
@@ -746,29 +809,65 @@ def agent_node(key: str, display_name: str, role: str) -> NodeSpec:
     )
 
 
-def recovery_edge(node_key: str) -> EdgeSpec:
+def recovery_edge(
+    node_key: str,
+    *,
+    context: str = "compact_and_continue_session",
+    fresh_session: bool = False,
+) -> EdgeSpec:
     cancellation_contract = ""
     if node_key in {"plan", "implement", "fix", "verification_gate"}:
         cancellation_contract = (
             "\nIf the latest user instruction explicitly cancels the task, choose "
             "`wont_do` and provide `closure_reason`."
         )
-    prompt = (
-        f"""Resume the `{node_key}` stage after user action.
+    if fresh_session:
+        stage_contract = {
+            "plan": """
+Reconcile any declared checkpoint and source task into authoritative
+design/specification/plan artifacts before selecting implementation work.""",
+            "implement": """
+Implement exactly one unchecked ready plan step. Update the plan before
+choosing `continue_implementation` for another fresh writer session.""",
+            "fix": """
+Apply exactly one independently verifiable remaining fix slice. Update the
+authoritative fix checklist. Choose `continue_fix` with `workspace_path` and a
+refreshed `fix_context` containing only the remaining findings, or choose
+`verify` with the complete `review_context` when no fix slice remains.""",
+        }.get(node_key, "")
+        prompt = (
+            f"""Restart the `{node_key}` stage in a fresh bounded session after user action.
+
+Previous blocker: {{{{.Params.blocker_reason}}}}
+
+Read the task body, current task comments, project instructions, authoritative
+task artifacts, preserved worktree diff, and existing evidence before editing
+or repeating checks. If user feedback changed a product decision or acceptance
+criterion, update the authoritative design/specification/plan first and
+reference the exact task-comment ID. Do not restart completed work.
+{stage_contract}
+
+Verify that the exact blocker is resolved. Do not infer approval for any broader
+or destructive action."""
+            + cancellation_contract
+        )
+    else:
+        prompt = (
+            f"""Resume the `{node_key}` stage after user action.
 
 Previous blocker: {{{{.Params.blocker_reason}}}}
 
 Use the retained compacted context, re-read current task comments and project
 instructions, verify that the blocker is actually resolved, and continue the
 same stage. Do not infer approval for any broader or destructive action."""
-        + cancellation_contract
-    )
+            + cancellation_contract
+        )
     return EdgeSpec(
         key=f"{node_key}_needs_user_action",
         source=node_key,
         transition="needs_user_action",
         target=node_key,
-        context="compact_and_continue_session",
+        context=context,
         prompt=prompt,
         requires_approval=True,
         transition_description=(
@@ -799,7 +898,35 @@ def procedure_instruction(profile: ProjectProfile, key: str) -> str:
     return "Follow the project contract and repository instructions."
 
 
-def plan_prompt(profile: ProjectProfile) -> str:
+def plan_prompt(
+    profile: ProjectProfile,
+    *,
+    recovery_aware: bool = False,
+) -> str:
+    recovery_contract = ""
+    if recovery_aware:
+        recovery_contract = """
+
+If the task body declares a checkpoint ref, source task, or exact task-comment
+IDs, treat the current checkout as preserved implementation rather than a blank
+feature:
+
+- verify that HEAD matches the declared checkpoint;
+- read the source task body and exact referenced comments without modifying or
+  canceling the source task;
+- update one authoritative design/specification/plan set and reference comment
+  IDs instead of duplicating decisions;
+- explicitly supersede conflicting earlier decisions;
+- inspect the checkpoint diff and existing tests/evidence;
+- plan only remaining independently verifiable work.
+
+Do not reset, revert, or reimplement preserved code during Plan."""
+        recovery_contract += """
+
+If the task body says the recovery Plan must stop for confirmation, complete
+through `needs_user_action` with a concise artifact/remaining-work summary and
+an explicit confirmation request. Do not choose `implement` in that Plan run."""
+
     return f"""Plan {{{{.TaskShortId}}}}: {{{{.TaskTitle}}}}
 
 Read .kent/project-contract.md, .kent/workflow-profile.toml, and repository
@@ -811,6 +938,7 @@ Task body:
 Keep discovery, design/spec ingestion, decisions, and implementation planning in
 this one Plan session. Ask questions when a product decision is required. Do not
 invoke nested prompt flows and do not implement production changes.
+{recovery_contract}
 
 Complete with `implement` only when the plan has no unresolved product, API, UX,
 or safety ambiguity. Provide `workspace_path` and `plan_path`; use an empty
@@ -820,7 +948,22 @@ Choose `wont_do` only for an explicit cancellation decision and provide
 `closure_reason`."""
 
 
-def implement_prompt(profile: ProjectProfile) -> str:
+def implement_prompt(
+    profile: ProjectProfile,
+    *,
+    fresh_session: bool = False,
+) -> str:
+    fresh_contract = ""
+    if fresh_session:
+        fresh_contract = """
+
+This is a fresh writer session. Treat the current worktree, task comments, and
+authoritative plan as the complete handoff. Inspect existing changes and
+evidence before editing; do not repeat checked work. If a comment changes a
+product decision, update the authoritative design/specification/plan with the
+exact comment ID before implementation. Keep the step independently
+verifiable; the next step runs in another fresh writer session."""
+
     return f"""Implement {{{{.TaskShortId}}}}: {{{{.TaskTitle}}}}
 
 Read .kent/project-contract.md, .kent/workflow-profile.toml, repository
@@ -833,8 +976,13 @@ instructions, and the plan at {{{{.Params.plan_path}}}}. Workspace:
 Use the project procedure for step selection, recipes, editing, focused checks,
 and plan progress. This generated workflow's completion contract overrides any
 legacy procedure transition names such as `audit`.
+{fresh_contract}
 
 Act as the single writer and implement exactly one ready plan step per node run.
+Do not launch nested final Standards, Specification, Compliance, or
+project-specialized review passes; the generated verification graph owns those
+independent reviews. Bounded implementation, research, and diagnosis
+delegation remains allowed.
 After marking that step complete, choose `continue_implementation` with
 `workspace_path` and `plan_path` when unchecked ready steps remain. Choose
 `verify` only when every required plan step is complete; provide
@@ -845,7 +993,34 @@ Use `needs_user_action` only for an external blocker and provide
 `closure_reason`."""
 
 
-def fix_prompt(profile: ProjectProfile) -> str:
+def fix_prompt(
+    profile: ProjectProfile,
+    *,
+    bounded: bool = False,
+) -> str:
+    bounded_contract = ""
+    completion_contract = """
+Complete with `verify` and provide `workspace_path` plus a refreshed
+`review_context` containing the findings, fixes, changed files, artifact paths,
+and focused checks."""
+    if bounded:
+        bounded_contract = """
+
+This is a fresh bounded writer session. Read exact task-comment IDs referenced
+by the findings and inspect the preserved diff, authoritative artifacts, and
+existing evidence before editing. If feedback changes a product decision or
+acceptance criterion, update the authoritative design/specification/plan first
+and reference the comment ID. Do not redo completed work.
+
+Apply exactly one independently verifiable fix slice and update the
+authoritative fix checklist."""
+        completion_contract = """
+After one slice, choose `continue_fix` with `workspace_path` and a refreshed
+`fix_context` containing only the remaining findings. Choose `verify` only when
+no fix slice remains, and provide `workspace_path` plus a refreshed
+`review_context` containing the findings, fixes, changed files, artifact paths,
+and focused checks."""
+
     return f"""Apply task-scoped fixes for {{{{.TaskShortId}}}}.
 
 Read .kent/project-contract.md and repository instructions first. Workspace:
@@ -854,13 +1029,16 @@ Read .kent/project-contract.md and repository instructions first. Workspace:
 
 {procedure_instruction(profile, "fix")}
 {delegation_instruction(profile, "implementation", "bounded fixes")}
+{bounded_contract}
 
 Remain the single writer. Fix root causes without broadening product scope.
-Complete with `verify` and provide `workspace_path` plus a refreshed
-`review_context` containing the findings, fixes, changed files, artifact paths,
-and focused checks. Use `needs_user_action` only for an external blocker and
-provide `blocker_reason`. Choose `wont_do` only for explicit cancellation and
-provide `closure_reason`."""
+Do not launch nested final Standards, Specification, Compliance, or
+project-specialized review passes; return to the generated verification graph
+after fixing the supplied findings.
+{completion_contract}
+Use `needs_user_action` only for an external blocker and provide
+`blocker_reason`. Choose `wont_do` only for explicit cancellation and provide
+`closure_reason`."""
 
 
 def standards_review_prompt(profile: ProjectProfile) -> str:
@@ -1132,7 +1310,25 @@ skipped actions. Use `needs_user_action` with `blocker_reason` when safe cleanup
 requires a human decision."""
 
 
-def pr_recovery_fix_prompt(profile: ProjectProfile) -> str:
+def pr_recovery_fix_prompt(
+    profile: ProjectProfile,
+    *,
+    bounded: bool = False,
+) -> str:
+    fresh_contract = ""
+    completion_contract = """After resolving task-scoped code, complete with
+`verify` and provide `workspace_path` plus refreshed `review_context`."""
+    if bounded:
+        fresh_contract = """
+
+This is a fresh bounded writer session. Inspect the preserved diff, task
+comments, authoritative artifacts, and existing evidence before editing.
+Resolve exactly one independently verifiable PR or branch recovery slice."""
+        completion_contract = """After one slice, choose `continue_fix` with
+`workspace_path` and `fix_context` containing only the remaining task-scoped
+issues. Choose `verify` only when no recovery slice remains, and provide
+`workspace_path` plus refreshed `review_context`."""
+
     return f"""Resolve an approved PR or branch recovery issue.
 
 Read .kent/project-contract.md, repository instructions, and latest task
@@ -1140,16 +1336,34 @@ comments first. Workspace: {{{{.Params.workspace_path}}}}.
 Recovery issue: {{{{.Params.blocker_reason}}}}
 
 {procedure_instruction(profile, "fix")}
+{fresh_contract}
 
 The approval applies only to the exact reported PR/branch recovery. Never infer
-permission for a broader rebase or force-push. After resolving task-scoped code,
-complete with `verify` and provide `workspace_path` plus refreshed
-`review_context`. Use `needs_user_action` with `blocker_reason` if the approved
-recovery is still unsafe. Choose `wont_do` only for an explicit cancellation
-decision and provide `closure_reason`."""
+permission for a broader rebase or force-push. {completion_contract}
+Use `needs_user_action` with `blocker_reason` if the approved recovery is still
+unsafe. Choose `wont_do` only for an explicit cancellation decision and
+provide `closure_reason`."""
 
 
-def pr_feedback_fix_prompt(profile: ProjectProfile) -> str:
+def pr_feedback_fix_prompt(
+    profile: ProjectProfile,
+    *,
+    bounded: bool = False,
+) -> str:
+    fresh_contract = ""
+    completion_contract = """Complete with `verify` and provide
+`workspace_path` plus refreshed `review_context`."""
+    if bounded:
+        fresh_contract = """
+
+This is a fresh bounded writer session. Inspect the preserved diff, task
+comments, authoritative artifacts, and existing evidence before editing.
+Resolve exactly one independently verifiable PR-feedback slice."""
+        completion_contract = """After one slice, choose `continue_fix` with
+`workspace_path` and `fix_context` containing only the remaining task-scoped
+issues. Choose `verify` only when no PR-feedback slice remains, and provide
+`workspace_path` plus refreshed `review_context`."""
+
     return f"""Fix task-scoped PR feedback.
 
 Read .kent/project-contract.md, repository instructions, and latest task
@@ -1157,9 +1371,10 @@ comments first. Workspace: {{{{.Params.workspace_path}}}}.
 PR report: {{{{.Params.pr_report}}}}
 
 {procedure_instruction(profile, "fix")}
+{fresh_contract}
 
-Remain the single writer. Do not merge or push protected branches. Complete
-with `verify` and provide `workspace_path` plus refreshed `review_context`.
+Remain the single writer. Do not merge or push protected branches.
+{completion_contract}
 Use `needs_user_action` with `blocker_reason` for external or policy blockers.
 Choose `wont_do` only for an explicit cancellation decision and provide
 `closure_reason`."""

@@ -8,6 +8,9 @@
 - Review roles disable first-class edit tools. Kent shell access is not a
   tool-enforced read-only boundary, so their role contracts restrict it to
   inspection.
+- Role prompts own behavior only. Model, reasoning, verbosity, tools, and
+  delegation eligibility belong in Kent configuration; role-prompt
+  frontmatter must not declare `model` or `tools`.
 - Workflow fragments must use canonical parameters from `contracts/workflow-contract.md`.
 - Generated workflows must declare an explicit Kent 2.3 execution-target policy.
 - Fan-out branches are read-only, transition directly to Join, and report failures

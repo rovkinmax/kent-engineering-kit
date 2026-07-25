@@ -1,13 +1,33 @@
+model = "gpt-5.6-sol"
+thinking_level = "medium"
+model_verbosity = "low"
+max_subagent_depth = 1
+
 [workflow]
 subagents = true
+concurrency = 2
+
+[reviewer]
+frequency = "off"
+model = "gpt-5.6-terra"
+thinking_level = "medium"
+model_verbosity = "low"
+
+[subagents.fast]
+model = "gpt-5.6-luna"
+thinking_level = "low"
+model_verbosity = "low"
+priority_request_mode = false
+model_context_window = 372000
 
 [subagents.compliance_reviewer]
 description = "Agent for reviewing code, plans, documents, diffs, or other scopes only for compliance with applicable specifications and AGENTS.md rules. Cannot edit files."
+model = "gpt-5.6-terra"
 system_prompt_file = "agents/compliance_reviewer.md"
-thinking_level = "high"
+thinking_level = "medium"
 model_verbosity = "low"
-agent_callable = true
-workflow_subagent = true
+agent_callable = false
+workflow_subagent = false
 
 [subagents.compliance_reviewer.tools]
 shell = true
@@ -19,8 +39,9 @@ planning = false
 
 [subagents.researcher]
 description = "Read-only primary-source research for technical and product questions."
+model = "gpt-5.6-terra"
 system_prompt_file = "agents/researcher.md"
-thinking_level = "high"
+thinking_level = "medium"
 model_verbosity = "low"
 agent_callable = true
 workflow_subagent = true
@@ -32,11 +53,12 @@ edit = false
 
 [subagents.standards-reviewer]
 description = "Read-only review against repository instructions, architecture, and engineering standards."
+model = "gpt-5.6-sol"
 system_prompt_file = "agents/standards-reviewer.md"
-thinking_level = "high"
+thinking_level = "medium"
 model_verbosity = "low"
-agent_callable = true
-workflow_subagent = true
+agent_callable = false
+workflow_subagent = false
 
 [subagents.standards-reviewer.tools]
 shell = true
@@ -45,11 +67,12 @@ edit = false
 
 [subagents.spec-reviewer]
 description = "Read-only review of a change against its specification and acceptance criteria."
+model = "gpt-5.6-sol"
 system_prompt_file = "agents/spec-reviewer.md"
-thinking_level = "high"
+thinking_level = "medium"
 model_verbosity = "low"
-agent_callable = true
-workflow_subagent = true
+agent_callable = false
+workflow_subagent = false
 
 [subagents.spec-reviewer.tools]
 shell = true
@@ -58,6 +81,7 @@ edit = false
 
 [subagents.architecture-designer]
 description = "Read-only design of alternative module interfaces, seams, and migration strategies."
+model = "gpt-5.6-sol"
 system_prompt_file = "agents/architecture-designer.md"
 thinking_level = "high"
 model_verbosity = "low"

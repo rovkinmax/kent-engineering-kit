@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_path="${BASH_SOURCE[0]}"
+while [[ -L "$source_path" ]]; do
+  source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+  link_target="$(readlink "$source_path")"
+  if [[ "$link_target" == /* ]]; then
+    source_path="$link_target"
+  else
+    source_path="$source_dir/$link_target"
+  fi
+done
+repo_root="$(cd -P "$(dirname "$source_path")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$repo_root/adapters/mcp/mcp-common.sh"
+
+adapter="${KENT_MCP_LIST_ADAPTER:-$HOME/.kent/bin/kent-mcp-list}"
+[[ -x "$adapter" ]] || {
+  echo "audit-mobile-schema: global MCP list adapter is not installed" >&2
+  exit 1
+}
+
+config="$(mcporter_home_config_path)"
+[[ -f "$config" ]] || {
+  echo "audit-mobile-schema: managed home mcporter config is missing: $config" >&2
+  exit 1
+}
+
+tmp="$(mktemp -d)"
+trap 'rm -r "$tmp"' EXIT
+
+(
+  cd "$tmp"
+  KENT_MCP_ARTIFACT_ROOT="$tmp/artifacts" \
+    "$adapter" mobile --schema --refresh --timeout 30000 >"$tmp/schema.json"
+)
+
+python3 - "$config" "$tmp/schema.json" <<'PY'
+import json
+import os
+import sys
+
+config_path = os.path.realpath(sys.argv[1])
+with open(sys.argv[2], "r", encoding="utf-8") as handle:
+    schema = json.load(handle)
+
+if schema.get("name") != "mobile" or schema.get("status") != "ok":
+    raise SystemExit("mobile schema did not report status=ok")
+
+source = schema.get("source") or {}
+source_path = source.get("path")
+if not source_path or os.path.realpath(source_path) != config_path:
+    raise SystemExit(
+        f"mobile resolved from {source_path!r}, expected managed config {config_path!r}"
+    )
+
+tools = {tool["name"]: tool for tool in schema.get("tools", [])}
+missing_tools = sorted({"screen", "input", "ui", "app", "system"} - tools.keys())
+if missing_tools:
+    raise SystemExit(f"mobile schema is missing tools: {missing_tools}")
+
+contracts = {}
+for name in ("screen", "input", "ui", "app", "system"):
+    properties = tools[name].get("inputSchema", {}).get("properties", {})
+    contracts[name] = {
+        "deviceId": "deviceId" in properties,
+        "platform": "platform" in properties,
+    }
+
+for name in ("screen", "input", "ui", "app"):
+    if contracts[name] != {"deviceId": True, "platform": True}:
+        raise SystemExit(f"{name} does not expose deviceId+platform")
+
+if not contracts["system"]["platform"]:
+    raise SystemExit("system does not expose platform")
+
+print(
+    json.dumps(
+        {
+            "config": config_path,
+            "source": os.path.realpath(source_path),
+            "server": schema["name"],
+            "status": schema["status"],
+            "tool_count": len(schema.get("tools", [])),
+            "contracts": contracts,
+            "system_policy": (
+                "explicit_device_supported"
+                if contracts["system"]["deviceId"]
+                else "use_exact_platform_adapter"
+            ),
+        },
+        indent=2,
+    )
+)
+PY

@@ -33,3 +33,10 @@ project verification entrypoint must either bootstrap the minimum non-secret
 configuration itself or fail with an actionable diagnostic. The setup hook may
 call the same bootstrap helper, but verification must not rely on the hook being
 the only path to a usable checkout.
+
+## MCP project identity
+
+The global MCP adapter separates the current execution root from the primary
+project root. Calls run in the current worktree and store artifacts there, while
+machine config lookup uses the primary Git worktree identity. Task-specific
+worktree names must not become MCP config identities.

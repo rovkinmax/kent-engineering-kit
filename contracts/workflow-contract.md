@@ -22,6 +22,31 @@ device, source-control, issue-tracker, and release adapters.
 - One writer owns fixes and integration.
 - `done` means delivered or explicitly approved report-only completion.
 
+## Writer session policy
+
+- `policies.writer_sessions = "continuous"` preserves the historical behavior:
+  writer transitions reuse or compact an existing session.
+- `policies.writer_sessions = "fresh_per_slice"` starts a fresh session for
+  every Implement step and every Fix slice, including CI, Smoke, Compliance,
+  PR-feedback, and PR-recovery fixes.
+- The policy does not alter approval-recovery continuity for Plan, Smoke,
+  Compliance, PR preparation/monitoring, CI monitoring, or Cleanup. Those
+  non-writer loops compact and continue their current session.
+- A fresh writer treats the preserved worktree, authoritative
+  design/specification/plan, exact task-comment IDs, existing evidence, and
+  structured transition parameters as its complete handoff.
+- Each fresh Implement session completes one ready plan step. Each fresh Fix
+  session completes one independently verifiable fix slice and uses
+  `continue_fix` with only the remaining findings when more work remains.
+- Recovery-aware Plan may adopt an explicit checkpoint commit and source task.
+  It verifies the checkout, updates one authoritative artifact set, records
+  which newer comments supersede earlier decisions, and plans only remaining
+  work without resetting preserved implementation.
+- When a recovery task explicitly requests a Plan-only confirmation gate, Plan
+  completes through `needs_user_action` instead of selecting Implement.
+- Existing task-backed workflows retain their recorded writer policy. Changing
+  this policy requires a new non-default workflow and managed-worktree canary.
+
 ## Portable parameters
 
 - `workspace_path`
@@ -77,6 +102,37 @@ device, source-control, issue-tracker, and release adapters.
   schema-3 Canary/Smoke graphs created before the split may retain
   `compliance_report` as their historical early-Standards output.
 
+## Active feedback and recovery
+
+- Task comments are durable records but do not interrupt or update the context
+  of an already running node.
+- User feedback for an active run is delivered through `kent run steer` or the
+  equivalent interactive session message. The node then exits through its
+  declared transition with refreshed structured context.
+- When feedback changes a product decision or acceptance criterion, the next
+  writer updates the authoritative task design/specification/plan first and
+  references the exact task-comment ID. Code, review context, and checkpoints
+  refer to that artifact instead of creating independent copies of the
+  decision.
+- Resource-owning nodes such as Smoke must release locks, preserve required
+  authentication and app data, record whether any destructive action began,
+  and finish evidence hygiene before returning `needs_changes`.
+- Do not use a manual task move merely to inject feedback into an active node;
+  it can bypass node-owned cleanup and evidence reporting.
+- Resuming an interrupted run may reuse the same session and therefore retains
+  its locked prompt and execution settings. Prompt-policy fixes apply only to a
+  newly created session. Repeated provider failures require checkpoint-aware
+  recovery rather than assuming Resume creates a clean runtime.
+- An approval-gated `compact_and_continue_session` recovery may compact in
+  place under the same session ID. Treat `context_compaction_completed` plus a
+  refreshed session lock as the recovery evidence. The lifetime
+  `model_request_count` remains cumulative and is not evidence that the
+  compacted context is still large.
+- Compaction proves context reduction and worktree continuity, not provider
+  reliability. A broad recovered node can grow large again and fail before its
+  transition persists. Pair compaction with durable checkpoints, authoritative
+  artifact updates, and bounded remaining work.
+
 ## Final compliance
 
 - A PR-producing Delivery workflow with `compliance_review` enabled routes both
@@ -110,17 +166,32 @@ device, source-control, issue-tracker, and release adapters.
 - Runtime evidence is least-privilege. Do not persist unfiltered device or
   system logs, network payloads, authentication headers, or full UI dumps from
   an unexpected authenticated or otherwise sensitive state.
+- The global MCP adapter logs call metadata and creates no separate raw
+  artifact by default, but normal stdout remains in the Kent shell transcript.
+  Sensitive calls use quiet, digest, or assertion output modes. Raw stdout or
+  artifact retention requires explicit confirmation that the response is both
+  necessary and non-sensitive.
+- When runtime proof needs identity-set comparison without disclosure, hash
+  only an allowlisted semantic-token pattern inside the adapter and emit opaque
+  hashes plus explicit pagination-marker booleans.
 - Project procedures retain only the scoped liveness, crash, ANR, and
   acceptance evidence required for the decision. Unexpected sensitive state
   produces a redacted blocker and `needs_user_action`.
 - A deterministic project-local evidence audit must pass before Smoke reports
   success or a blocker. Unsafe raw files are removed or redacted while the
   non-sensitive summary and lock-release evidence remain.
-- Mobile target confirmation uses documented response fields: the locked serial
-  is present, explicit selection acknowledges that serial, a target query
-  confirms it when the current schema exposes one, and every target-specific
-  call carries the same explicit device ID. Do not require undocumented
-  display labels such as `ACTIVE`.
+- Mobile target confirmation is transport-aware. The default global mcporter
+  adapter is stateless: the locked serial must be present in device discovery,
+  and every target-specific call carries the same explicit platform and device
+  ID. Process-local selection and target-query state must not be compared
+  across separate ephemeral calls. A persistent transport may additionally use
+  documented selection acknowledgement and target queries, but never replaces
+  explicit per-call device addressing. Do not require undocumented display
+  labels such as `ACTIVE`.
+- If the selected MCP schema does not expose an explicit device ID for a
+  target-specific action, that action must use the exact project platform
+  adapter instead. For Android this means `adb -s <locked-serial>`; an implicit
+  Mobile MCP `system` target cannot satisfy the contract.
 - Device-side timestamp and log-boundary syntax is platform-adapter behavior,
   not a portable workflow contract. Validate the exact command before treating
   it as an evidence gate; command or parsing failure is a Smoke blocker, never
@@ -135,12 +206,20 @@ device, source-control, issue-tracker, and release adapters.
 - Operational nodes use a `default` orchestrator role.
 - Project-local implementation, build, QA, release, and CI roles are delegated
   from the orchestrator when useful.
+- Role prompts define behavior; Kent configuration owns model, reasoning,
+  verbosity, tools, and delegation eligibility. See `role-contract.md`.
 - Direct custom node assignees are limited to globally registered roles that
   Kent 2.3 execution validation can resolve.
 - Independent standards and specification reviews use global read-only roles.
 - Final PR-producing delivery uses a distinct global read-only compliance role
   after Gate and any required Smoke. It attests the final evidence and
   authority chain rather than repeating the earlier standards/spec reviews.
+- Standards, Specification, and Compliance nodes are leaf sessions and must
+  perform their bounded pass directly without starting child agents.
+- Implement and Fix must not launch nested final reviewers that duplicate the
+  generated graph's Standards, Specification, or Compliance stages.
+  Standalone review commands may use project-specialized reviewers when no
+  Delivery graph owns the same pass.
 
 ## Project adapter boundary
 
@@ -154,6 +233,10 @@ Each project provides:
 - canonical project-local role keys;
 - optional Smoke-decision, Smoke-execution, resource-lock, evidence-audit, PR,
   CI, and release adapters.
+
+The kit provides the global mcporter call/list adapter. Projects provide only
+credentials, server definitions, and optional project-specific stdio wrappers
+or policy.
 
 Profiles list indispensable executable adapter keys in `required_adapters`.
 The platform-neutral profile loader validates only that declared contract and

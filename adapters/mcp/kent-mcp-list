@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_path="${BASH_SOURCE[0]}"
+while [[ -L "$source_path" ]]; do
+  source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+  link_target="$(readlink "$source_path")"
+  if [[ "$link_target" == /* ]]; then
+    source_path="$link_target"
+  else
+    source_path="$source_dir/$link_target"
+  fi
+done
+adapter_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+# shellcheck disable=SC1091
+source "$adapter_dir/mcp-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: kent-mcp-list [server] [--schema] [--refresh] [mcporter list options]
+EOF
+}
+
+if [[ "${1-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+server=""
+if [[ $# -gt 0 && "$1" != --* ]]; then
+  server="$1"
+  shift
+fi
+
+schema=false
+refresh=false
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --schema)
+      schema=true
+      args+=("$1" "--json")
+      shift
+      ;;
+    --refresh)
+      refresh=true
+      shift
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+root="$(workspace_root)"
+require_mcporter
+if [[ "$server" == "mobile" ]]; then
+  config="$(mcporter_home_config_path)"
+  [[ -f "$config" ]] || {
+    printf 'mcporter_global_mobile_missing: run configure-mcporter --apply; expected %s\n' \
+      "$config" >&2
+    exit 2
+  }
+  config_display="mcporter-global-mobile"
+else
+  config="$(resolve_mcp_config)"
+  config_display="${config:-mcporter-default}"
+fi
+
+cache_path=""
+if [[ "$schema" == true && -n "$server" ]]; then
+  mkdir -p "$root/build/mcp-cache"
+  cache_path="$root/build/mcp-cache/$(safe_name "$server")-schema.json"
+  if [[ "$refresh" != true && -s "$cache_path" ]]; then
+    cat "$cache_path"
+    append_call_log "$root" "$server" "list-schema-cache" "$config_display" \
+      "json" "$cache_path" 0 ""
+    exit 0
+  fi
+fi
+
+tmp_out="$(mktemp)"
+tmp_err="$(mktemp)"
+trap 'rm -f "$tmp_out" "$tmp_err"' EXIT
+
+cmd=(mcporter)
+if [[ "$server" == "serena" ]]; then
+  serena_cmd="$(resolve_serena_command "$config")"
+  serena_args=()
+  while IFS= read -r -d '' arg; do
+    serena_args+=("$arg")
+  done < <(serena_stdio_args "$root")
+  cmd+=(list --stdio "$serena_cmd" "${serena_args[@]}")
+elif [[ "$server" == "mobile" ]]; then
+  cmd+=(--config "$config" --root "$root" list "$server")
+elif [[ -n "$server" ]] &&
+  project_server_cmd="$(resolve_project_server_command "$root" "$server")"; then
+  project_server_args=()
+  while IFS= read -r -d '' arg; do
+    project_server_args+=("$arg")
+  done < <(project_server_stdio_args "$root" "$server")
+  config_display="project-stdio:$project_server_cmd"
+  cmd+=(list --stdio "$project_server_cmd" "${project_server_args[@]}")
+else
+  [[ -z "$config" ]] || cmd+=(--config "$config")
+  cmd+=(--root "$root" list)
+  [[ -z "$server" ]] || cmd+=("$server")
+fi
+cmd+=("${args[@]}")
+
+set +e
+with_server_lock_if_needed "$server" "$root" "${cmd[@]}" >"$tmp_out" 2>"$tmp_err"
+exit_code=$?
+set -e
+
+cat "$tmp_out"
+[[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
+
+raw_log_path=""
+if [[ $exit_code -eq 0 && -n "$cache_path" ]]; then
+  if ! grep -Eqi \
+    'tools unavailable|Tools: <unavailable>|Next: run .*auth|Non-200 status code' \
+    "$tmp_out"; then
+    cp "$tmp_out" "$cache_path"
+    raw_log_path="$cache_path"
+  fi
+fi
+
+error_code=""
+[[ $exit_code -eq 0 ]] || error_code="mcporter_list_failed"
+append_call_log "$root" "${server:-all}" "list" "$config_display" "json" \
+  "$raw_log_path" "$exit_code" "$error_code"
+
+exit "$exit_code"
