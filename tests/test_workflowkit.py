@@ -34,6 +34,9 @@ from workflowkit.profile import ProjectProfile
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_PROFILE = REPO_ROOT / "contracts" / "project-profile.example.toml"
 VERIFY_REPORT = REPO_ROOT / "templates" / "project" / "workflow-verify-report"
+VERIFY_DISPATCH = (
+    REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch"
+)
 
 
 class WorkflowKitTest(unittest.TestCase):
@@ -118,6 +121,15 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(by_key["plan_implement"].context, "new_session")
         self.assertEqual(by_key["gate_fix"].context, "new_session")
         self.assertEqual(by_key["gate_fix"].context_source, "immediate_source")
+        self.assertEqual(by_key["dispatch_invalid_workspace"].target, "fix")
+        self.assertEqual(by_key["dispatch_invalid_workspace"].context, "new_session")
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["dispatch_invalid_workspace"].parameters
+            ),
+            ("reported_workspace_path", "fix_context"),
+        )
         self.assertEqual(by_key["fix_continue"].context, "new_session")
         self.assertEqual(
             tuple(parameter.key for parameter in by_key["fix_continue"].parameters),
@@ -208,6 +220,32 @@ class WorkflowKitTest(unittest.TestCase):
             prompts["waiting_pr_fix"],
         )
         self.assertIn("`continue_fix`", prompts["waiting_pr_fix"])
+        self.assertIn("unproven differential", prompts["gate_fix"])
+
+    def test_standards_and_gate_require_task_scoped_differential_evidence(
+        self,
+    ) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        standards_prompt = by_key["dispatch_standards_review"].prompt or ""
+        gate_prompt = by_key["verification_join_gate"].prompt or ""
+        for expected in (
+            "whole-repository analyzer",
+            "task-introduced or task-worsened",
+            "changed file or touched method",
+            "baseline debt",
+            "repository-policy contradiction",
+        ):
+            self.assertIn(expected, standards_prompt)
+        for expected in (
+            "task-introduced or task-worsened",
+            "whole-repository analyzer failure",
+            "unproven differential",
+            "route to `needs_user_action`, not Fix",
+        ):
+            self.assertIn(expected, gate_prompt)
 
     def test_install_adopts_byte_identical_managed_agent_file(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -332,6 +370,13 @@ class WorkflowKitTest(unittest.TestCase):
 
         self.assertEqual(by_key["prepare_pr_ci_monitor"].transition, "monitor_ci")
         self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["prepare_pr_ci_monitor"].parameters
+            ),
+            ("workspace_path", "pr_url", "branch_name", "merge_strategy"),
+        )
+        self.assertEqual(
             tuple(parameter.key for parameter in by_key["prepare_pr_no_pr"].parameters),
             ("pr_report",),
         )
@@ -341,13 +386,36 @@ class WorkflowKitTest(unittest.TestCase):
             ("workspace_path", "blocker_reason"),
         )
         self.assertEqual(by_key["ci_monitor_waiting_pr"].transition, "waiting_pr")
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["ci_monitor_waiting_pr"].parameters
+            ),
+            (
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "ci_report",
+            ),
+        )
         self.assertTrue(by_key["waiting_pr_needs_user_action"].requires_approval)
         self.assertEqual(
             tuple(
                 parameter.key
                 for parameter in by_key["waiting_pr_needs_user_action"].parameters
             ),
-            ("workspace_path", "pr_url", "branch_name", "blocker_reason"),
+            (
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "blocker_reason",
+            ),
+        )
+        self.assertEqual(
+            tuple(parameter.key for parameter in by_key["waiting_pr_fix"].parameters),
+            ("workspace_path", "merge_strategy", "pr_report"),
         )
         self.assertTrue(by_key["waiting_pr_close_without_merge"].requires_approval)
         self.assertEqual(
@@ -357,6 +425,82 @@ class WorkflowKitTest(unittest.TestCase):
             ),
             ("workspace_path", "pr_report", "closure_reason"),
         )
+        prompts = "\n".join(
+            by_key[key].prompt or ""
+            for key in (
+                "compliance_prepare_pr",
+                "prepare_pr_ci_monitor",
+                "ci_monitor_waiting_pr",
+                "waiting_pr_needs_user_action",
+                "waiting_pr_fix",
+            )
+        )
+        for expected in (
+            "canBeRebased",
+            "required_linear_history",
+            "mergeable=MERGEABLE",
+            "forced replay",
+            "isolated temporary clone or branch",
+            "force-with-lease",
+            "outcome=needs_user_action",
+            "kent-resolve-github-merge-strategy",
+        ):
+            self.assertIn(expected, prompts)
+
+    def test_dispatch_accepts_exact_git_execution_root(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+
+        result = subprocess.run(
+            [str(VERIFY_DISPATCH)],
+            cwd=root,
+            input=json.dumps(
+                {
+                    "workspace_path": str(root),
+                    "review_context": "ready",
+                }
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["transition"], "fanout_verify")
+        self.assertEqual(payload["workspace_path"], str(root.resolve()))
+
+    def test_dispatch_rejects_todo_artifact_as_workspace(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        artifact = root / ".todo" / "feature"
+        artifact.mkdir(parents=True)
+
+        result = subprocess.run(
+            [str(VERIFY_DISPATCH)],
+            cwd=root,
+            input=json.dumps(
+                {
+                    "workspace_path": str(artifact),
+                    "review_context": "ready",
+                }
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["transition"], "invalid_workspace")
+        self.assertEqual(payload["reported_workspace_path"], str(artifact))
+        self.assertIn(str(root.resolve()), payload["fix_context"])
 
     def test_final_compliance_separates_attestation_from_early_reviews(self) -> None:
         profile = self.load_profile()
@@ -746,6 +890,38 @@ class WorkflowKitTest(unittest.TestCase):
                 lambda contents: contents.replace(
                     'writer_sessions = "fresh_per_slice"',
                     'writer_sessions = "sometimes"',
+                )
+            )
+
+    def test_profile_defaults_pr_merge_strategy_to_auto(self) -> None:
+        profile = self.load_profile(
+            lambda contents: contents.replace(
+                'pr_merge_strategy = "auto"\n',
+                "",
+            )
+        )
+        self.assertEqual(profile.pr_merge_strategy(), "auto")
+
+    def test_profile_accepts_every_pr_merge_strategy(self) -> None:
+        for strategy in ("auto", "merge", "squash", "rebase"):
+            with self.subTest(strategy=strategy):
+                profile = self.load_profile(
+                    lambda contents, strategy=strategy: contents.replace(
+                        'pr_merge_strategy = "auto"',
+                        f'pr_merge_strategy = "{strategy}"',
+                    )
+                )
+                self.assertEqual(profile.pr_merge_strategy(), strategy)
+
+    def test_profile_rejects_unknown_pr_merge_strategy(self) -> None:
+        with self.assertRaisesRegex(
+            SpecError,
+            "unsupported policies.pr_merge_strategy",
+        ):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    'pr_merge_strategy = "auto"',
+                    'pr_merge_strategy = "fast-forward"',
                 )
             )
 

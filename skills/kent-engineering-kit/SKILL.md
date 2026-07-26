@@ -77,9 +77,24 @@ generated toolkit workflows.
   transition parameters are the handoff. Use `continue_fix` only with the
   remaining findings. Non-writer approval-recovery loops compact and continue
   their existing sessions.
+- Read `policies.pr_merge_strategy` before PR preparation. `auto` must resolve
+  to exactly one method from repository capabilities, target-branch rules, and
+  merge-queue policy; otherwise return `needs_user_action`. Carry the resolved
+  `merge_strategy` through CI and Waiting PR. For GitHub rebase delivery,
+  require `canBeRebased=true`; `MERGEABLE/CLEAN` alone is insufficient.
+- Feed GitHub repository capabilities, target-branch protection, applicable
+  rulesets, and merge-queue evidence to
+  `~/.kent/bin/kent-resolve-github-merge-strategy`. Honor its structured
+  `resolved` or `needs_user_action` result; never choose manually.
+- Diagnose disputed rebase feasibility only in an isolated temporary clone or
+  branch. Rewriting task history requires exact user authorization, a backup,
+  final-tree proof, and force-with-lease pinned to the expected remote head.
 - A recovery task may start from an explicit checkpoint commit and source task.
   Its Plan session verifies the checkpoint and updates authoritative artifacts
   before any production edit; it never resets preserved implementation.
+- Treat `workspace_path` as the canonical task execution root. Verification
+  dispatch rejects `.todo` directories, nested paths, and foreign repositories
+  before fan-out; a metadata-only Fix re-emits the canonical root.
 - Changing a project default affects only new tasks. Keep the previous workflow
   linked for rollback; never move existing tasks between incompatible graphs.
 - Use `Engineering Canary` for infrastructure-only validation. It intentionally
@@ -114,6 +129,11 @@ generated toolkit workflows.
   Implement and Fix must not duplicate them through nested final reviewers.
 - Standards, Specification, and Compliance are leaf sessions. They must not
   call `kent run` or delegate their review to child agents.
+- Standards review pins the comparison baseline. A repository-wide analyzer
+  failure is task-scoped only when a new or worsened violation is proven;
+  changed paths alone are insufficient. Pre-existing debt stays non-blocking,
+  while an absolute-clean policy contradicted by the baseline routes to
+  `needs_user_action` instead of broad Fix work.
 
 ## Safety
 

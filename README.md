@@ -75,6 +75,13 @@ credentials and project-specific stdio wrappers.
 `configure-mcporter` adds the portable `mobile` server to the user's mcporter
 catalog without replacing unrelated entries.
 
+GitHub merge policy is resolved deterministically through
+`~/.kent/bin/kent-resolve-github-merge-strategy`. It consumes repository merge
+capabilities, target-branch protection, applicable rulesets, and merge-queue
+policy, then returns either one resolved method or a structured
+`needs_user_action` result. Workflow agents do not guess between remaining
+methods.
+
 `config/subagents.toml` is the authoritative managed config fragment. Merge it
 into `~/.kent/config.toml` before restarting Kent. `scripts/validate` compares
 every managed field against the effective global config. The installer
@@ -130,6 +137,18 @@ authoritative artifacts, exact task-comment IDs, and structured transition
 parameters. Non-writer approval-recovery loops retain compact-and-continue
 continuity. Use a new non-default workflow instance to canary this policy;
 task-backed live graphs are never rewritten to adopt it.
+
+The optional `policies.pr_merge_strategy` accepts `auto`, `merge`, `squash`,
+or `rebase` and defaults to `auto`. `auto` resolves from source-control
+capabilities, target-branch protection/rulesets, and merge-queue policy. It
+continues only when those constraints leave exactly one method. The resolved
+strategy is carried through PR creation, CI, and merge waiting; generic
+mergeability never substitutes for method-specific feasibility.
+
+Verification dispatch validates `workspace_path` before fan-out. The value must
+be the canonical current task repository or execution root; `.todo` artifact
+directories and foreign repositories are rejected into a metadata-only Fix
+slice before any review or build branch starts.
 
 Before starting a generated workflow at a concrete branch, tag, or commit,
 validate that the selected revision contains its complete project adapter:

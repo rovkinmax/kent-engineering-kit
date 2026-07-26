@@ -49,7 +49,8 @@ device, source-control, issue-tracker, and release adapters.
 
 ## Portable parameters
 
-- `workspace_path`
+- `workspace_path` — repository or managed-worktree root, never a `.todo`
+  feature directory or another artifact path
 - `plan_path`
 - `spec_path`
 - `fixed_point`
@@ -69,6 +70,7 @@ device, source-control, issue-tracker, and release adapters.
 - `blocker_reason`
 - `pr_url`
 - `branch_name`
+- `merge_strategy`
 - `pr_report`
 - `ci_report`
 - `merge_report`
@@ -89,6 +91,10 @@ device, source-control, issue-tracker, and release adapters.
   non-Git workspaces and small local jobs that do not need isolation.
 - A task-level start, approval, or move override may select a concrete target
   without mutating the workflow policy.
+- Verification dispatch deterministically compares `workspace_path` with the
+  canonical current execution root. Artifact subdirectories, nested paths, and
+  foreign repositories are rejected before fan-out and routed through a
+  metadata-only Fix slice.
 
 ## Fan-out constraints
 
@@ -101,6 +107,12 @@ device, source-control, issue-tracker, and release adapters.
 - This output split applies to current and future generated graphs. Frozen
   schema-3 Canary/Smoke graphs created before the split may retain
   `compliance_report` as their historical early-Standards output.
+- Standards findings are differential to the pinned comparison baseline.
+  Whole-repository analyzer failures become `needs_changes` only when a new or
+  worsened task violation is proven. Pre-existing debt is non-blocking for the
+  task. An explicit absolute-clean policy that the baseline itself violates is
+  a `blocked` policy contradiction and routes to user resolution, never broad
+  Fix work.
 
 ## Active feedback and recovery
 
@@ -152,6 +164,38 @@ device, source-control, issue-tracker, and release adapters.
   early Standards branch and final Compliance remains disabled. Projects opt
   into the split by declaring both capabilities explicitly.
 
+## Pull-request merge strategy
+
+- `policies.pr_merge_strategy` accepts `auto`, `merge`, `squash`, or `rebase`
+  and defaults to `auto`.
+- Prepare PR resolves the strategy once and carries the resolved
+  `merge_strategy` through CI and Waiting PR.
+- `auto` intersects repository-enabled methods, target-branch protection and
+  rulesets, and any required merge-queue method. Exactly one method must
+  remain. Zero or multiple candidates require `needs_user_action`; agents never
+  infer the user's preferred button or guess a repository default.
+- GitHub resolution is performed by the kit-owned
+  `kent-resolve-github-merge-strategy` adapter over captured API evidence. Its
+  structured result, not an agent's interpretation, selects or blocks the
+  strategy.
+- An explicit method is still validated against repository capabilities and
+  target-branch policy.
+- Generic final-tree mergeability is not method feasibility. Merge requires
+  merge commits to be allowed; squash requires squash merging to be allowed;
+  rebase requires the PR commits to replay cleanly onto the current target.
+  On GitHub, `canBeRebased=true` is required for rebase delivery.
+  `MERGEABLE/CLEAN`, a clean merge-tree, or target-ancestor proof cannot
+  override `canBeRebased=false`.
+- Conflicting rebase signals are reproduced in an isolated temporary clone or
+  branch with a forced replay. Diagnosis never mutates the task branch.
+- A history rewrite or force-push requires exact user authorization. Preserve
+  the old remote head in a local backup, pin the expected remote head, prove
+  the authorized final-tree invariant, and update only the task branch with
+  force-with-lease. Any lease, tree, target-tip, or authorization mismatch
+  returns `needs_user_action`.
+- Task-backed workflows keep their recorded PR prompts. Apply this contract in
+  a new non-default workflow and canary it before promotion.
+
 ## Smoke policy
 
 - Project profile schema 3 declares one Smoke policy: `disabled`,
@@ -177,6 +221,12 @@ device, source-control, issue-tracker, and release adapters.
 - Project procedures retain only the scoped liveness, crash, ANR, and
   acceptance evidence required for the decision. Unexpected sensitive state
   produces a redacted blocker and `needs_user_action`.
+- Smoke runs are bounded acceptance checks, not open-ended exploration. Split
+  broad runtime scopes into explicit stages or request focused manual evidence.
+  If a durable user comment already supplies the only missing observation,
+  consume it without rebuilding, reinstalling, or repeating navigation.
+- Persist a concise checkpoint before a long Smoke continuation so resume does
+  not repeat completed lock, build, install, targeting, or evidence work.
 - A deterministic project-local evidence audit must pass before Smoke reports
   success or a blocker. Unsafe raw files are removed or redacted while the
   non-sensitive summary and lock-release evidence remain.

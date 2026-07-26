@@ -76,6 +76,31 @@ owns real task history and provides rollback.
   destructive-action ledger for disposable test data. Validate that resume
   reconciles the checkpoint instead of repeating completed work, graph-owned
   review axes, or user-data mutations.
+- PUB-31 showed that a single broad Smoke request can grow to roughly 80k
+  estimated provider tokens, with a compacted continuation consuming roughly
+  43k more despite only one missing manual observation. Future Smoke prompts
+  must use bounded acceptance stages, durable checkpoints, and direct
+  manual-evidence handoff instead of exploratory continuation.
+- PUB-31 also proved that GitHub `MERGEABLE/CLEAN` does not imply
+  rebase-and-merge feasibility. Its PR reported `canBeRebased=false`; an
+  isolated forced replay reproduced conflicts hidden by the already-merged
+  final tree. Add explicit merge strategy resolution and method-specific
+  checks, then canary them in a future non-default Puber workflow. Keep
+  task-backed Delivery v7 frozen.
+- PUB-31's post-repair Standards pass exposed another calibration defect:
+  full-project Detekt failed with 118 issues, the reviewer admitted the issues
+  might predate the task, but Gate still created broad Fix work and the writer
+  began refactoring a shared UI component. Standards and Gate must require
+  baseline-differential proof before `needs_changes`; baseline debt or an
+  absolute-policy contradiction must never authorize repository-wide cleanup.
+  Machine-readable baseline/candidate reports later proved three actual
+  worsened metrics despite the total improving from 127 to 118, so differential
+  policy must compare declaration-level measurements rather than approximate
+  line counts.
+- Add deterministic guards before the next Puber canary: a GitHub merge-policy
+  resolver that cannot guess ambiguous methods, and verification-dispatch
+  validation that rejects `.todo` or foreign `workspace_path` values before
+  fan-out.
 - PUB-26 validated state preservation and in-place compaction for an
   interrupted Fix node: a manual move through its approval-gated
   `compact_and_continue_session` self-loop preserved the worktree, injected the

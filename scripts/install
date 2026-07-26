@@ -51,6 +51,9 @@ link_item \
   "$repo_root/scripts/preflight-revision" \
   "$kent_root/bin/kent-preflight-revision"
 link_item \
+  "$repo_root/scripts/resolve-github-merge-strategy" \
+  "$kent_root/bin/kent-resolve-github-merge-strategy"
+link_item \
   "$repo_root/adapters/mcp/kent-mcp-call" \
   "$kent_root/bin/kent-mcp-call"
 link_item \

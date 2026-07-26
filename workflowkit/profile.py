@@ -13,6 +13,7 @@ from .model import SpecError, validate_execution_target
 DELIVERY_PROFILES = {"lite", "standard", "team", "release"}
 SMOKE_POLICIES = {"disabled", "conditional", "required"}
 WRITER_SESSION_POLICIES = {"continuous", "fresh_per_slice"}
+PR_MERGE_STRATEGIES = {"auto", "merge", "squash", "rebase"}
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 ROLE_PROMPT_DIRECTORIES = (
     Path(".kent/subagents"),
@@ -160,6 +161,13 @@ class ProjectProfile:
                 f"{writer_session_policy!r}; expected one of "
                 f"{sorted(WRITER_SESSION_POLICIES)}"
             )
+        pr_merge_strategy = self.pr_merge_strategy()
+        if pr_merge_strategy not in PR_MERGE_STRATEGIES:
+            raise SpecError(
+                "unsupported policies.pr_merge_strategy "
+                f"{pr_merge_strategy!r}; expected one of "
+                f"{sorted(PR_MERGE_STRATEGIES)}"
+            )
         if "device_smoke" in self.capabilities:
             raise SpecError(
                 "capabilities.device_smoke was removed in profile schema 3; "
@@ -250,6 +258,9 @@ class ProjectProfile:
 
     def writer_session_policy(self) -> str:
         return self.policies.get("writer_sessions", "continuous").strip()
+
+    def pr_merge_strategy(self) -> str:
+        return self.policies.get("pr_merge_strategy", "auto").strip()
 
     def command(self, key: str) -> str:
         return self.commands.get(key, "").strip()

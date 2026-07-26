@@ -50,6 +50,13 @@ the data as sensitive or a concrete threat model with access prerequisites and
 meaningful impact. Least-data exposure and backend-decoupling concerns without
 that evidence remain data-minimization or maintainability judgements.
 
+Standards reviewers also classify repository-wide analyzer failures
+differentially. A candidate failure becomes task-scoped only when comparison
+with the pinned baseline proves a new or worsened violation. Pre-existing debt
+is reported but not assigned to the task writer. If an explicit absolute-clean
+policy contradicts the baseline repository state, the review reports a policy
+blocker for user resolution instead of manufacturing a broad Fix scope.
+
 Changing this contract or generator prompt does not mutate a task-backed live
 workflow. Existing graph definitions remain frozen. A project revision may
 enforce the rule through its project contract for new tasks that select that

@@ -8,7 +8,11 @@ from .profile import ProjectProfile
 
 WORKSPACE = ParameterSpec(
     "workspace_path",
-    "Path to the task workspace or managed worktree.",
+    "Repository or managed-worktree root; never an artifact directory.",
+)
+REPORTED_WORKSPACE = ParameterSpec(
+    "reported_workspace_path",
+    "Rejected workspace value emitted by an upstream writer.",
 )
 PLAN = ParameterSpec(
     "plan_path",
@@ -68,6 +72,10 @@ REVIEW_REPORT = ParameterSpec(
 )
 PR_URL = ParameterSpec("pr_url", "Canonical pull request URL.")
 BRANCH_NAME = ParameterSpec("branch_name", "Task branch name.")
+MERGE_STRATEGY = ParameterSpec(
+    "merge_strategy",
+    "Resolved pull-request merge strategy: merge, squash, or rebase.",
+)
 PR_REPORT = ParameterSpec(
     "pr_report",
     "Pull request creation, review, conflict, or post-CI status report.",
@@ -276,6 +284,21 @@ def build_delivery_workflow(
                 "Run deterministic verification and independent read-only reviews."
             ),
             parameters=fanout_parameters,
+        )
+    )
+    edges.append(
+        EdgeSpec(
+            key="dispatch_invalid_workspace",
+            source="verification_dispatch",
+            transition="invalid_workspace",
+            target="fix",
+            context="new_session",
+            context_source="immediate_source",
+            prompt=workspace_path_fix_prompt(),
+            transition_description=(
+                "Reject an artifact or foreign workspace path before verification."
+            ),
+            parameters=(REPORTED_WORKSPACE, FIX_CONTEXT),
         )
     )
     if "standards_review" in review_branches:
@@ -548,7 +571,7 @@ def build_delivery_workflow(
                     transition_description=(
                         "The pull request exists and its delivery state must be checked."
                     ),
-                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME),
+                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_STRATEGY),
                 ),
                 EdgeSpec(
                     key="prepare_pr_no_pr",
@@ -598,7 +621,13 @@ def build_delivery_workflow(
                         transition_description=(
                             "Required CI checks passed; wait for an actual merge."
                         ),
-                        parameters=(WORKSPACE, PR_URL, BRANCH_NAME, CI_REPORT),
+                        parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_STRATEGY,
+                            CI_REPORT,
+                        ),
                     ),
                     EdgeSpec(
                         key="ci_monitor_fix",
@@ -644,7 +673,13 @@ def build_delivery_workflow(
                     transition_description=(
                         "The pull request is still open; recheck only after user approval."
                     ),
-                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME, BLOCKER),
+                    parameters=(
+                        WORKSPACE,
+                        PR_URL,
+                        BRANCH_NAME,
+                        MERGE_STRATEGY,
+                        BLOCKER,
+                    ),
                 ),
                 EdgeSpec(
                     key="waiting_pr_fix",
@@ -660,7 +695,7 @@ def build_delivery_workflow(
                     transition_description=(
                         "The PR state requires task-scoped changes before merge."
                     ),
-                    parameters=(WORKSPACE, PR_REPORT),
+                    parameters=(WORKSPACE, MERGE_STRATEGY, PR_REPORT),
                 ),
                 EdgeSpec(
                     key="waiting_pr_close_without_merge",
@@ -941,8 +976,10 @@ invoke nested prompt flows and do not implement production changes.
 {recovery_contract}
 
 Complete with `implement` only when the plan has no unresolved product, API, UX,
-or safety ambiguity. Provide `workspace_path` and `plan_path`; use an empty
-`plan_path` only when the project contract explicitly allows planless work.
+or safety ambiguity. `workspace_path` is the repository or managed-worktree
+root; it is never `.todo/<feature>` or another artifact directory. Provide that
+root plus `plan_path`; use an empty `plan_path` only when the project contract
+explicitly allows planless work.
 Complete with `needs_user_action` and `blocker_reason` for an external blocker.
 Choose `wont_do` only for an explicit cancellation decision and provide
 `closure_reason`."""
@@ -1032,6 +1069,12 @@ Read .kent/project-contract.md and repository instructions first. Workspace:
 {bounded_contract}
 
 Remain the single writer. Fix root causes without broadening product scope.
+Before editing, require each supplied finding to identify a concrete
+task-introduced or task-worsened violation. A whole-repository analyzer failure,
+a finding that also exists on the pinned baseline, or an unproven differential
+is not authorization for cleanup. If the finding requires baseline-wide work
+or only exposes contradictory repository policy, do not edit; choose
+`needs_user_action` with the exact policy/evidence blocker.
 Do not launch nested final Standards, Specification, Compliance, or
 project-specialized review passes; return to the generated verification graph
 after fixing the supplied findings.
@@ -1039,6 +1082,24 @@ after fixing the supplied findings.
 Use `needs_user_action` only for an external blocker and provide
 `blocker_reason`. Choose `wont_do` only for explicit cancellation and provide
 `closure_reason`."""
+
+
+def workspace_path_fix_prompt() -> str:
+    return """Correct invalid workflow metadata without editing production files.
+
+Verification dispatch rejected the reported workspace:
+{{.Params.reported_workspace_path}}
+Reason: {{.Params.fix_context}}
+
+Treat Kent's current task execution root as authoritative. Resolve its canonical
+repository root with `git rev-parse --show-toplevel`, or canonical current
+directory for an intentional non-Git workspace. Do not move the worktree,
+change task artifacts, or edit code.
+
+Complete with `verify` and provide the canonical root as `workspace_path` plus
+the preserved `review_context`. Use `needs_user_action` only if Kent's execution
+root itself is unavailable or ambiguous. Choose `wont_do` only for explicit
+cancellation and provide `closure_reason`."""
 
 
 def standards_review_prompt(profile: ProjectProfile) -> str:
@@ -1056,6 +1117,24 @@ Read AGENTS.md and .kent/project-contract.md first. Workspace:
 Inspect the change against repository architecture, engineering rules, security,
 and maintainability constraints. Do not edit files and do not run destructive
 commands. Findings are data for Join, not a routing decision.
+
+Pin the comparison baseline named by the review context or repository contract.
+For a whole-repository analyzer or quality gate that fails on the candidate,
+establish whether the same command or equivalent machine-readable findings fail
+on that baseline. A changed file or touched method is not proof that an analyzer
+finding is new.
+
+Use `needs_changes` only for concrete task-introduced or task-worsened
+violations, with the rule, path, and differential evidence. For metric findings,
+`worsened` means the same rule/path/declaration has a larger measured value.
+For non-metric findings, it means a new normalized declaration signature or a
+larger occurrence count. Line shifts do not count, and an improved total does
+not waive an individual worsened finding. If the baseline has the same failure
+and no task delta is proven, report the baseline debt as non-blocking and use
+`passed` for the task-scoped standards result. If an explicit project rule
+requires an absolutely clean repository independent of baseline but the
+baseline itself violates that rule, use `blocked` and identify the
+repository-policy contradiction; never route baseline-wide cleanup to Fix.
 
 Complete only with `reported`. Provide `standards_status` as exactly `passed`,
 `needs_changes`, or `blocked`, plus `__REPORT_KEY__` with evidence and
@@ -1110,6 +1189,11 @@ Verification report: {{{{.Params.verification_report}}}}
 {spec}
 
 Choose a delivery transition only when every enabled status is `passed`.
+Choose `needs_changes` only when a report proves concrete task-introduced or task-worsened findings.
+Do not convert a whole-repository analyzer failure,
+pre-existing baseline debt, or an unproven differential into writer work.
+Repository-policy contradictions and unavailable mandatory baseline evidence
+route to `needs_user_action`, not Fix.
 Provide `workspace_path`, a refreshed `review_context` summarizing all reports,
 and the required Smoke decision fields. The refreshed `review_context` must
 record the profile Smoke policy, selected transition, rationale, and required
@@ -1209,6 +1293,7 @@ def prepare_pr_prompt(profile: ProjectProfile) -> str:
         )
         else "Final Compliance Review is disabled by the project profile."
     )
+    merge_policy = profile.pr_merge_strategy()
     return f"""Prepare delivery for {{{{.TaskShortId}}}}.
 
 Read .kent/project-contract.md and repository instructions first. Workspace:
@@ -1223,17 +1308,54 @@ This workflow explicitly authorizes committing the task changes, pushing only
 the current task branch, and creating or updating its pull request. It never
 authorizes merging, pushing protected branches, or broadening scope.
 
+Configured PR merge policy: `{merge_policy}`.
+
+Resolve the merge strategy once before publishing. Supported resolved values
+are `merge`, `squash`, and `rebase`. For `auto`, query the source-control
+system's repository capabilities, target-branch protection/rulesets, and any
+required merge-queue method. On GitHub this includes the allowed merge methods,
+`required_linear_history`, merge-queue configuration when applicable, and the
+target PR's method-specific state. Serialize the GitHub evidence as
+`repository`, `branch_protection`, applicable `rulesets`, and `merge_queue`,
+then run:
+
+`~/.kent/bin/kent-resolve-github-merge-strategy --policy {merge_policy}`
+
+The adapter's structured result is authoritative for strategy selection.
+Continue only when it returns `outcome=resolved`; for
+`outcome=needs_user_action`, preserve its code, candidates, and reason instead
+of manually choosing. An explicit policy still must be enabled and compatible
+with target-branch rules.
+
+Validate the selected method, not merely generic mergeability:
+
+- `merge` requires merge commits to be enabled, permitted by branch rules, and
+  a clean final-tree merge;
+- `squash` requires squash merging to be enabled and a clean final-tree merge;
+- `rebase` requires rebase merging to be enabled and the exact branch commits
+  to replay cleanly onto the current target branch. On GitHub, query
+  `canBeRebased`; `mergeable=MERGEABLE` or `mergeStateStatus=CLEAN` alone does
+  not prove rebase feasibility.
+
+Before an initial rebase-strategy push, test the prospective history in an
+isolated temporary clone or branch with a forced replay onto the fresh target
+tip. Do not mutate the task branch while diagnosing. A clean merge-tree or
+target-ancestor check is not a substitute for replaying the commits. After
+creating or updating the PR, requery method-specific feasibility. Route a
+task-history conflict to `needs_changes`; never dismiss a user's rebase-conflict
+report using generic mergeability.
+
 Before committing, prove that the checkout is on a task-owned branch permitted
 by the project contract. A source workspace, detached checkout, protected
 branch, or ambiguous branch owner must route to `needs_user_action`; never push
 through that ambiguity.
 
 Complete through `monitor_ci` and provide `workspace_path`, `pr_url`, and
-`branch_name`. If no PR is genuinely
-applicable, choose `no_pr` and provide `pr_report`; this path requires approval.
-Use `needs_changes` with `workspace_path` and `blocker_reason` for recoverable
-PR/branch issues; this path also requires approval. Use `needs_user_action` with
-`blocker_reason` for external blockers."""
+`branch_name`, plus the resolved `merge_strategy`. If no PR is genuinely
+applicable, choose `no_pr` and provide `pr_report`; this path requires
+approval. Use `needs_changes` with `workspace_path` and `blocker_reason` for
+recoverable PR/branch issues; this path also requires approval. Use
+`needs_user_action` with `blocker_reason` for external blockers."""
 
 
 def ci_prompt(profile: ProjectProfile) -> str:
@@ -1241,17 +1363,22 @@ def ci_prompt(profile: ProjectProfile) -> str:
 
 PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
+Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
 
 {procedure_instruction(profile, "ci")}
 {delegation_instruction(profile, "ci", "bounded CI inspection")}
 
 Use bounded polling and the project source-control adapter. Never merge or push.
+Revalidate the resolved method against current repository capabilities, target
+branch rules, merge queue, and PR state. For GitHub rebase delivery,
+`canBeRebased=true` is required; generic `MERGEABLE/CLEAN` is insufficient.
 Complete with `waiting_pr` only when all required checks are conclusively green
-and provide `workspace_path`, `pr_url`, `branch_name`, and `ci_report`. Use
-`needs_changes` with `workspace_path` and `fix_context` for task-code failures.
-Use `needs_user_action` with `blocker_reason` for external failures or access
-problems."""
+and the selected method remains feasible. Provide `workspace_path`, `pr_url`,
+`branch_name`, `merge_strategy`, and `ci_report`. Use `needs_changes` with
+`workspace_path` and `fix_context` for task-code or task-history failures. Use
+`needs_user_action` with `blocker_reason` for external failures, policy
+ambiguity, or access problems."""
 
 
 def waiting_pr_prompt(profile: ProjectProfile) -> str:
@@ -1259,17 +1386,32 @@ def waiting_pr_prompt(profile: ProjectProfile) -> str:
 
 PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
+Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
 
 {procedure_instruction(profile, "waiting_pr")}
 
-Do not merge or push. Choose `pr_merged` only when the source-control system
-conclusively reports the PR as merged; provide `workspace_path`, `pr_url`,
-`branch_name`, and `merge_report`. If it remains open, write a task comment with
-the current state, choose `needs_user_action`, and provide `workspace_path`,
-`pr_url`, `branch_name`, and `blocker_reason`; the workflow pauses for approval
-before rechecking. Use `needs_changes` with `workspace_path` and `pr_report`
-when task changes are required. Choose `close_without_merge` only when the
+Do not merge or push. Revalidate the resolved method independently from generic
+mergeability. For GitHub `rebase`, require `canBeRebased=true`;
+`mergeable=MERGEABLE`, `mergeStateStatus=CLEAN`, a clean merge-tree, or proof
+that the target branch is already an ancestor does not establish replay
+feasibility. For `merge` and `squash`, verify that the selected method remains
+enabled, allowed by branch rules or the merge queue, and final-tree mergeable.
+
+Treat a user report that the selected merge method is blocked as evidence to
+investigate, not as a claim to dismiss. If source-control signals disagree,
+reproduce a rebase failure only in an isolated temporary clone or branch using
+a forced replay onto the fresh target tip. Do not mutate the task branch during
+diagnosis.
+
+Choose `pr_merged` only when the source-control system conclusively reports the
+PR as merged; provide `workspace_path`, `pr_url`, `branch_name`, and
+`merge_report`. If it remains open and the selected method is feasible, write a
+task comment with the current state, choose `needs_user_action`, and provide
+`workspace_path`, `pr_url`, `branch_name`, `merge_strategy`, and
+`blocker_reason`; the workflow pauses for approval before rechecking. Use
+`needs_changes` with `workspace_path`, `merge_strategy`, and `pr_report` when
+task code or history must change. Choose `close_without_merge` only when the
 latest user comment explicitly approves closing or canceling this PR; provide
 `workspace_path`, `pr_report`, and `closure_reason`."""
 
@@ -1368,12 +1510,20 @@ issues. Choose `verify` only when no PR-feedback slice remains, and provide
 
 Read .kent/project-contract.md, repository instructions, and latest task
 comments first. Workspace: {{{{.Params.workspace_path}}}}.
+Resolved merge strategy: {{{{.Params.merge_strategy}}}}.
 PR report: {{{{.Params.pr_report}}}}
 
 {procedure_instruction(profile, "fix")}
 {fresh_contract}
 
-Remain the single writer. Do not merge or push protected branches.
+Remain the single writer. Do not merge or push protected branches. A history
+rewrite or force-push requires an exact latest user authorization naming the
+branch and permitted repair. Preserve the old remote head in a local backup,
+pin the expected remote head, prove the repaired final tree is byte-for-byte
+identical unless the authorization explicitly permits code changes, and update
+only the task branch with force-with-lease. Stop with `needs_user_action` on a
+lease, tree, target-tip, or authorization mismatch; never fall back to an
+unconditional force push.
 {completion_contract}
 Use `needs_user_action` with `blocker_reason` for external or policy blockers.
 Choose `wont_do` only for an explicit cancellation decision and provide

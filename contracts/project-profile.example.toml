@@ -20,6 +20,7 @@ maintenance = "default-branch"
 [policies]
 smoke = "conditional"
 writer_sessions = "fresh_per_slice"
+pr_merge_strategy = "auto"
 
 [capabilities]
 managed_worktrees = true

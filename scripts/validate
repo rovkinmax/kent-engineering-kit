@@ -9,6 +9,7 @@ bash -n "$repo_root/scripts/audit-mobile-schema"
 bash -n "$repo_root/scripts/configure-mcporter"
 bash -n "$repo_root/scripts/kent-worktree"
 bash -n "$repo_root/scripts/preflight-revision"
+bash -n "$repo_root/scripts/resolve-github-merge-strategy"
 bash -n "$repo_root/adapters/mcp/kent-mcp-call"
 bash -n "$repo_root/adapters/mcp/kent-mcp-list"
 bash -n "$repo_root/adapters/mcp/mcp-common.sh"
@@ -48,6 +49,10 @@ bash -n "$repo_root/templates/project/workflow-verify-report"
 }
 [[ -x "$repo_root/scripts/preflight-revision" ]] || {
   echo "revision preflight is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/scripts/resolve-github-merge-strategy" ]] || {
+  echo "GitHub merge-strategy resolver is not executable" >&2
   exit 1
 }
 [[ -x "$repo_root/scripts/configure-mcporter" ]] || {
@@ -115,6 +120,7 @@ for target in \
   "$kent_root/bin/kent-mcp-call" \
   "$kent_root/bin/kent-mcp-list" \
   "$kent_root/bin/kent-preflight-revision" \
+  "$kent_root/bin/kent-resolve-github-merge-strategy" \
   "$kent_root/bin/kent-worktree" \
   "$kent_root/hooks/gradle-worktree-warning" \
   "$kent_root/skills/kent-engineering-kit" \
@@ -133,6 +139,10 @@ done
   echo "installed revision preflight is not a managed symlink" >&2
   exit 1
 }
+[[ -L "$kent_root/bin/kent-resolve-github-merge-strategy" ]] || {
+  echo "installed merge-strategy resolver is not a managed symlink" >&2
+  exit 1
+}
 [[ -L "$kent_root/bin/kent-mcp-call" ]] || {
   echo "installed MCP call adapter is not a managed symlink" >&2
   exit 1
@@ -144,6 +154,11 @@ done
 [[ "$(readlink "$kent_root/bin/kent-preflight-revision")" == \
   "$repo_root/scripts/preflight-revision" ]] || {
   echo "installed revision preflight points outside this toolkit" >&2
+  exit 1
+}
+[[ "$(readlink "$kent_root/bin/kent-resolve-github-merge-strategy")" == \
+  "$repo_root/scripts/resolve-github-merge-strategy" ]] || {
+  echo "installed merge-strategy resolver points outside this toolkit" >&2
   exit 1
 }
 [[ "$(readlink "$kent_root/bin/kent-worktree")" == \
