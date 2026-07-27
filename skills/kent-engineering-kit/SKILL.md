@@ -149,5 +149,7 @@ generated toolkit workflows.
 - Assign operational workflow nodes directly from the profile's optional
   `gate` and required `implementation`, `qa`, `release`, and `ci` roles. Keep
   `default` orchestration for Plan instead of wrapping every specialist in
-  another session. Global kit roles are fallbacks; higher-precedence workspace
-  config may specialize the same role name.
+  another session. Global kit roles are contract-complete. Workspace config
+  may specialize the same role name, but workflow correctness must not depend
+  on that override because Kent 2.4 canaries observed scheduler-created direct
+  roles selecting the global definition.

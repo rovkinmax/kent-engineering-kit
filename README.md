@@ -89,8 +89,12 @@ intentionally does not rewrite user configuration.
 
 The global baseline includes bounded implementation, build diagnosis, evidence
 gating, runtime Smoke, PR/cleanup delivery, CI monitoring, research,
-architecture, and independent review roles. Workspace config has higher
-precedence and may override a matching role with platform-specific behavior.
+architecture, and independent review roles. These canonical roles are
+contract-complete without project overrides. Kent documents workspace config
+as higher precedence, but Kent 2.4 canaries observed scheduler-created direct
+workflow roles selecting the global definition for a same-named role.
+Workspace specialization remains optional and workflow correctness must not
+depend on it until that behavior is clarified upstream.
 
 After changing global subagent configuration, restart Kent and reopen Kent
 Desktop. Skills, prompts, and `AGENTS.md` are consumed by new sessions.

@@ -19,9 +19,12 @@ Global or project `config.toml` owns:
 - `agent_callable` and `workflow_subagent`;
 - workflow concurrency and subagent depth.
 
-The kit supplies global fallback implementations for canonical operational
-roles. Workspace config has higher precedence and may override the same role
-name with platform or repository-specific instructions and execution settings.
+The kit supplies contract-complete global implementations for canonical
+operational roles. Kent documents workspace config as higher precedence and it
+may specialize the same role name with platform or repository-specific
+instructions and execution settings. Generated workflow correctness must not
+depend on that override: Kent 2.4 canaries observed scheduler-created direct
+workflow roles selecting the global same-named definition.
 
 Do not add `model:` or `tools:` fields to role-prompt frontmatter. This includes
 legacy provider aliases such as `sonnet`, `opus`, and `haiku`, current Kent

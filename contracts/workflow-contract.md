@@ -265,8 +265,10 @@ device, source-control, issue-tracker, and release adapters.
   verbosity, tools, and delegation eligibility. See `role-contract.md`.
 - Project profiles must map every enabled operational node to a role available
   from the effective project or global Kent configuration.
-- The kit provides global fallback roles; workspace config may override the same
-  role names with higher-precedence platform or repository behavior.
+- The kit provides contract-complete global roles. Workspace config may
+  specialize the same role names, but workflow correctness must not depend on
+  that override because Kent 2.4 canaries observed scheduler-created direct
+  roles selecting the global definition.
 - Independent standards and specification reviews use global read-only roles.
 - Final PR-producing delivery uses a distinct global read-only compliance role
   after Gate and any required Smoke. It attests the final evidence and
