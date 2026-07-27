@@ -1492,6 +1492,18 @@ class WorkflowKitTest(unittest.TestCase):
                             stderr="",
                         )
                     project_id = args[args.index("--project") + 1]
+                    if args[:2] == ["workflow", "list"]:
+                        return subprocess.CompletedProcess(
+                            args,
+                            0,
+                            stdout=json.dumps(
+                                {
+                                    "workflows": [{"id": bare_id}],
+                                    "next_page_token": "",
+                                }
+                            ),
+                            stderr="",
+                        )
                     tasks = [] if project_id == "project-one" else [{}]
                     return subprocess.CompletedProcess(
                         args,
@@ -1520,6 +1532,72 @@ class WorkflowKitTest(unittest.TestCase):
                     },
                     {bare_id},
                 )
+
+    def test_workflow_task_check_skips_unlinked_projects(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        workflow_id = "33333333-3333-4333-8333-333333333333"
+        definition = {
+            "workflow": {
+                "id": workflow_id,
+                "name": "Unlinked Lab",
+            }
+        }
+        calls: list[list[str]] = []
+        client = KentClient(Path(temporary.name))
+
+        def run(
+            args: list[str],
+            *,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            if args == ["project", "list"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=(
+                        "project-one\tOne\t/repo/one\n"
+                        "project-two\tTwo\t/repo/two\n"
+                    ),
+                    stderr="",
+                )
+            project_id = args[args.index("--project") + 1]
+            if args[:2] == ["workflow", "list"]:
+                workflows = (
+                    [{"id": workflow_id}]
+                    if project_id == "project-one"
+                    else []
+                )
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "workflows": workflows,
+                            "next_page_token": "",
+                        }
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps({"tasks": []}),
+                stderr="",
+            )
+
+        client.run = run
+
+        self.assertFalse(client.workflow_has_tasks(definition))
+        task_calls = [
+            args for args in calls if args[:2] == ["task", "list"]
+        ]
+        self.assertEqual(len(task_calls), 1)
+        self.assertEqual(
+            task_calls[0][task_calls[0].index("--project") + 1],
+            "project-one",
+        )
 
     def test_link_targets_explicit_project_workspace(self) -> None:
         temporary = tempfile.TemporaryDirectory()

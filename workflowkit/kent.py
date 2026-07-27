@@ -150,6 +150,12 @@ class KentClient:
                 f"workflow definition returned invalid id {workflow_id!r}"
             )
         for project_id in self.project_ids():
+            linked_workflows = {
+                canonical_workflow_selector(record.get("id"))
+                for record in self.workflow_records(project_id=project_id)
+            }
+            if workflow_ref not in linked_workflows:
+                continue
             result = self.run(
                 [
                     "task",
@@ -165,9 +171,6 @@ class KentClient:
                 check=False,
             )
             if result.returncode != 0:
-                detail = f"{result.stderr}\n{result.stdout}".lower()
-                if "no active project/workflow link" in detail:
-                    continue
                 raise SpecError(
                     f"cannot prove workflow "
                     f"{definition['workflow']['name']!r} is taskless in "
@@ -263,17 +266,21 @@ class KentClient:
             self._workflow_selector_cache[workflow_name] = workflow_id
         return workflow_id
 
-    def workflow_records(self) -> tuple[dict[str, Any], ...]:
+    def workflow_records(
+        self,
+        *,
+        project_id: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
         records: list[dict[str, Any]] = []
         page_token = ""
         while True:
             args = [
                 "workflow",
                 "list",
-                "--page-size",
-                "100",
-                "--json",
             ]
+            if project_id is not None:
+                args.extend(["--project", project_id])
+            args.extend(["--page-size", "100", "--json"])
             if page_token:
                 args.extend(["--page-token", page_token])
             payload = self.run_json(args)
