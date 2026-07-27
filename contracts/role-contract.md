@@ -19,6 +19,10 @@ Global or project `config.toml` owns:
 - `agent_callable` and `workflow_subagent`;
 - workflow concurrency and subagent depth.
 
+The kit supplies global fallback implementations for canonical operational
+roles. Workspace config has higher precedence and may override the same role
+name with platform or repository-specific instructions and execution settings.
+
 Do not add `model:` or `tools:` fields to role-prompt frontmatter. This includes
 legacy provider aliases such as `sonnet`, `opus`, and `haiku`, current Kent
 model names, and Claude-era tool lists. Describe behavioral restrictions in
@@ -27,10 +31,17 @@ availability.
 
 ## Review Ownership
 
-Generated Delivery workflows own independent final Standards, Specification,
-and Compliance review stages. Implementation and Fix procedures may delegate
-bounded research, diagnostics, or implementation slices, but must not launch
-another copy of those final review responsibilities before the graph fan-out.
+Generated Delivery workflows assign operational ownership directly from the
+project profile: `implementation` owns Implement/Fix, `qa` owns Smoke,
+`release` owns PR preparation/Cleanup, and `ci` owns CI/Waiting PR. The
+`orchestrator` role owns Plan; optional `gate` owns Gate and otherwise falls
+back to `orchestrator`. Operational nodes must not launch a second copy of
+their own profile role; bounded research and diagnosis delegation remains
+allowed.
+
+Generated workflows also own independent final Standards, Specification, and
+Compliance review stages. Implementation and Fix must not launch another copy
+of those final review responsibilities before the graph fan-out.
 
 Standards, Specification, and Compliance are direct workflow leaf roles. Their
 config sets `agent_callable = false` and `workflow_subagent = false` so other

@@ -94,11 +94,31 @@ class WorkflowKitTest(unittest.TestCase):
             for node in spec.nodes
             if node.kind == "agent"
         }
-        self.assertEqual(roles["implement"], "default")
-        self.assertEqual(roles["verification_gate"], "default")
+        self.assertEqual(roles["plan"], "default")
+        self.assertEqual(roles["implement"], "implementation-worker")
+        self.assertEqual(roles["verification_gate"], "workflow-gate")
+        self.assertEqual(roles["fix"], "implementation-worker")
+        self.assertEqual(roles["smoke"], "runtime-smoke-tester")
         self.assertEqual(roles["standards_review"], "standards-reviewer")
         self.assertEqual(roles["spec_review"], "spec-reviewer")
         self.assertEqual(roles["compliance"], "compliance_reviewer")
+        self.assertEqual(roles["prepare_pr"], "delivery-operator")
+        self.assertEqual(roles["ci_monitor"], "ci-monitor")
+        self.assertEqual(roles["waiting_pr"], "ci-monitor")
+        self.assertEqual(roles["cleanup"], "delivery-operator")
+
+    def test_gate_role_falls_back_to_orchestrator(self) -> None:
+        profile = self.load_profile(
+            lambda contents: contents.replace('gate = "workflow-gate"\n', "")
+        )
+        spec = build_delivery_workflow(profile, 1)
+        roles = {
+            node.key: node.agent
+            for node in spec.nodes
+            if node.kind == "agent"
+        }
+
+        self.assertEqual(roles["verification_gate"], "default")
 
     def test_delivery_continues_one_plan_step_until_verification(self) -> None:
         profile = self.load_profile()
@@ -502,6 +522,34 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(payload["reported_workspace_path"], str(artifact))
         self.assertIn(str(root.resolve()), payload["fix_context"])
 
+    def test_dispatch_rejects_missing_workspace(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        missing = root / "missing-workspace"
+
+        result = subprocess.run(
+            [str(VERIFY_DISPATCH)],
+            cwd=root,
+            input=json.dumps(
+                {
+                    "workspace_path": str(missing),
+                    "review_context": "ready",
+                }
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["transition"], "invalid_workspace")
+        self.assertEqual(payload["reported_workspace_path"], str(missing))
+        self.assertIn(str(root.resolve()), payload["fix_context"])
+
     def test_final_compliance_separates_attestation_from_early_reviews(self) -> None:
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)
@@ -587,6 +635,7 @@ class WorkflowKitTest(unittest.TestCase):
                 contents.replace("pull_requests = true", "pull_requests = false")
                 .replace("ci_monitoring = true", "ci_monitoring = false")
                 .replace('compliance = "compliance_reviewer"\n', "")
+                .replace('ci = "ci-monitor"\n', "")
             )
         )
         no_pr_spec = build_delivery_workflow(no_pr_no_compliance_role, 1)
@@ -650,9 +699,14 @@ class WorkflowKitTest(unittest.TestCase):
 
     def test_disabled_smoke_has_no_smoke_node(self) -> None:
         profile = self.load_profile(
-            lambda contents: contents.replace(
-                'smoke = "conditional"',
-                'smoke = "disabled"',
+            lambda contents: (
+                contents.replace(
+                    'smoke = "conditional"',
+                    'smoke = "disabled"',
+                ).replace(
+                    'qa = "runtime-smoke-tester"\n',
+                    "",
+                )
             )
         )
         spec = build_delivery_workflow(profile, 1)
@@ -1143,6 +1197,46 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(refused_symlink.returncode, 1)
         self.assertIn("symlink", refused_symlink.stderr)
         self.assertEqual(unrelated.read_bytes(), unrelated_before)
+
+    def test_sync_project_adapters_preserves_project_owned_adapter(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        profile_directory = root / ".kent"
+        profile_directory.mkdir()
+        policy = root / ".kent" / "adapters" / "mcp" / "policy"
+        policy.parent.mkdir(parents=True)
+        policy.write_text("#!/usr/bin/env bash\necho inherit\n")
+        policy.chmod(0o755)
+        before = policy.read_bytes()
+        contents = EXAMPLE_PROFILE.read_text() + (
+            "\n[adapters]\n"
+            'mcp_policy = ".kent/adapters/mcp/policy"\n'
+        )
+        (profile_directory / "workflow-profile.toml").write_text(contents)
+        script = REPO_ROOT / "scripts" / "sync-project-adapters"
+
+        result = subprocess.run(
+            [str(script), "--project", str(root), "--update"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            payload["adapters"],
+            [
+                {
+                    "adapter": "mcp_policy",
+                    "status": "project-owned",
+                    "target": str(policy.resolve()),
+                }
+            ],
+        )
+        self.assertEqual(policy.read_bytes(), before)
 
     def test_profile_accepts_newer_minimum_kent_version(self) -> None:
         profile = self.load_profile(

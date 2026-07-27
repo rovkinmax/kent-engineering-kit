@@ -46,20 +46,22 @@ ci = ""
 waiting_pr = ""
 cleanup = ""
 
-# Android projects with conditional or required Smoke use:
-# required_adapters = ["mobile_resource_lock", "mobile_evidence_audit"]
+# Projects with MCP policy and Android runtime Smoke use:
+# required_adapters = ["mcp_policy", "mobile_resource_lock", "mobile_evidence_audit"]
 # [adapters]
+# mcp_policy = ".kent/adapters/mcp/policy"
 # mobile_resource_lock = ".kent/adapters/mobile/emulator-resource-lock.sh"
 # mobile_evidence_audit = ".kent/adapters/mobile/mobile-evidence-audit.sh"
 
 [roles]
 orchestrator = "default"
-researcher = "project-researcher"
+gate = "workflow-gate"
+researcher = "researcher"
 implementation = "implementation-worker"
 build_doctor = "build-doctor"
 standards_review = "standards-reviewer"
 spec_review = "spec-reviewer"
 compliance = "compliance_reviewer"
-qa = "qa-runner"
-release = "release-manager"
+qa = "runtime-smoke-tester"
+release = "delivery-operator"
 ci = "ci-monitor"

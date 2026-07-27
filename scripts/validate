@@ -19,6 +19,15 @@ bash -n "$repo_root/templates/project/mobile-evidence-audit.sh"
 bash -n "$repo_root/templates/project/workflow-verification-dispatch"
 bash -n "$repo_root/templates/project/workflow-verify-report"
 
+install_help_root="$(mktemp -d)"
+KENT_PERSISTENCE_ROOT="$install_help_root" \
+  "$repo_root/scripts/install" --help >/dev/null
+if find "$install_help_root" -mindepth 1 -print -quit | grep -q .; then
+  echo "install --help must not mutate the target root" >&2
+  exit 1
+fi
+rmdir "$install_help_root"
+
 [[ -x "$repo_root/adapters/gradle/shell-postprocess-hook" ]] || {
   echo "Gradle shell postprocessor is not executable" >&2
   exit 1
@@ -81,6 +90,37 @@ if grep -R -n -E '^[[:space:]]*(model|tools)[[:space:]]*:' \
   echo "global role prompts must not declare model or tools" >&2
   exit 1
 fi
+
+python3 - \
+  "$repo_root/config/subagents.toml" \
+  "$repo_root" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+config = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
+repo_root = pathlib.Path(sys.argv[2])
+configured = set()
+
+for role, values in config.get("subagents", {}).items():
+    if not isinstance(values, dict):
+        continue
+    prompt = values.get("system_prompt_file")
+    if prompt is None:
+        continue
+    path = repo_root / prompt
+    if not path.is_file():
+        raise AssertionError(f"{role}: missing system prompt {path}")
+    configured.add(path.resolve())
+
+available = {path.resolve() for path in (repo_root / "agents").glob("*.md")}
+if configured != available:
+    missing = sorted(str(path) for path in available - configured)
+    foreign = sorted(str(path) for path in configured - available)
+    raise AssertionError(
+        f"agent/config mismatch: unconfigured={missing}, foreign={foreign}"
+    )
+PY
 
 leaf_guard="Do not call \`kent run\`"
 for leaf_role in \

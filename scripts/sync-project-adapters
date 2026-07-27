@@ -115,13 +115,22 @@ def main() -> int:
 
     results = []
     for key, configured_path in sorted(adapters.items()):
-        if key not in TEMPLATES:
-            raise ValueError(f"unsupported managed adapter: {key}")
         if not isinstance(configured_path, str) or not configured_path.strip():
             raise ValueError(f"adapters.{key} must be a non-empty string")
-        source = TEMPLATES[key]
         target = project_target(project_root, configured_path.strip())
-        status_label = synchronize(source, target, update=args.update)
+        if key in TEMPLATES:
+            source = TEMPLATES[key]
+            status_label = synchronize(source, target, update=args.update)
+        else:
+            if not target.is_file():
+                raise ValueError(
+                    f"project-owned adapter not found: {target}"
+                )
+            if not os.access(target, os.X_OK):
+                raise ValueError(
+                    f"project-owned adapter is not executable: {target}"
+                )
+            status_label = "project-owned"
         results.append(
             {
                 "adapter": key,

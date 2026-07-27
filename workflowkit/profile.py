@@ -214,8 +214,14 @@ class ProjectProfile:
             raise SpecError("profile command 'verify' is required")
 
         required_roles = {
+            "implementation",
             "orchestrator",
+            "release",
         }
+        if smoke_policy != "disabled":
+            required_roles.add("qa")
+        if self.capability("pull_requests"):
+            required_roles.add("ci")
         if self.capability("standards_review"):
             required_roles.add("standards_review")
         if (

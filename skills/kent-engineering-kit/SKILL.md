@@ -114,6 +114,10 @@ generated toolkit workflows.
   non-destructive. Only the user may repeat it with `--confirm`; deletion
   removes the workflow definition, project links, and task database rows but
   intentionally retains repository files and managed worktrees.
+- Before confirmation, recreate every Backlog task in the replacement workflow
+  with its title, body, source URL, labels, relevant comments, and old short ID.
+  Do not move records between incompatible graphs. Completed/canceled history
+  may be discarded when the user accepts it.
 - On Kent 2.3, retire obsolete workflows through Kent Desktop. In every
   version, inspect and clean retained worktrees separately and never edit the
   Kent database directly.
@@ -142,5 +146,8 @@ generated toolkit workflows.
 - Treat project JSON exports as audit snapshots.
 - Use versioned workflow instances when changing a graph linked to more than one
   project.
-- Keep project-local operational roles behind the `default` orchestrator.
-  Assign only globally registered roles directly to custom workflow nodes.
+- Assign operational workflow nodes directly from the profile's optional
+  `gate` and required `implementation`, `qa`, `release`, and `ci` roles. Keep
+  `default` orchestration for Plan instead of wrapping every specialist in
+  another session. Global kit roles are fallbacks; higher-precedence workspace
+  config may specialize the same role name.

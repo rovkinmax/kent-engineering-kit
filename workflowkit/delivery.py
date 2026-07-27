@@ -98,6 +98,13 @@ def build_delivery_workflow(
     version: int,
 ) -> WorkflowSpec:
     orchestrator = profile.role("orchestrator")
+    gate = profile.optional_role("gate") or orchestrator
+    implementation = profile.role("implementation")
+    release = profile.role("release")
+    smoke_enabled = profile.smoke_policy() != "disabled"
+    pull_requests = profile.capability("pull_requests")
+    qa = profile.role("qa") if smoke_enabled else ""
+    ci = profile.role("ci") if pull_requests else ""
     fresh_writers = profile.writer_session_policy() == "fresh_per_slice"
     writer_handoff_context = (
         "new_session" if fresh_writers else "compact_and_continue_session"
@@ -116,13 +123,13 @@ def build_delivery_workflow(
     )
     non_writer_recovery_context = "compact_and_continue_session"
     final_compliance = (
-        profile.capability("pull_requests")
+        pull_requests
         and profile.capability("compliance_review")
     )
     nodes: list[NodeSpec] = [
         NodeSpec("backlog", "start", "Backlog"),
         agent_node("plan", "Plan", orchestrator),
-        agent_node("implement", "Implement", orchestrator),
+        agent_node("implement", "Implement", implementation),
         NodeSpec(
             "verification_dispatch",
             "script",
@@ -135,9 +142,9 @@ def build_delivery_workflow(
             "Deterministic Verify",
             script_path=profile.command("verify"),
         ),
-        agent_node("verification_gate", "Verification Gate", orchestrator),
-        agent_node("fix", "Fix", orchestrator),
-        agent_node("cleanup", "Cleanup", orchestrator),
+        agent_node("verification_gate", "Verification Gate", gate),
+        agent_node("fix", "Fix", implementation),
+        agent_node("cleanup", "Cleanup", release),
         NodeSpec("wont_do", "terminal", "Won't Do"),
         NodeSpec("done", "terminal", "Done"),
     ]
@@ -164,9 +171,9 @@ def build_delivery_workflow(
     if len(review_branches) > 1:
         nodes.append(NodeSpec("verification_join", "join", "Verification Join"))
 
-    if profile.smoke_policy() != "disabled":
-        nodes.append(agent_node("smoke", "Smoke Test", orchestrator))
-    if profile.capability("pull_requests"):
+    if smoke_enabled:
+        nodes.append(agent_node("smoke", "Smoke Test", qa))
+    if pull_requests:
         if final_compliance:
             nodes.append(
                 agent_node(
@@ -177,12 +184,12 @@ def build_delivery_workflow(
             )
         nodes.extend(
             [
-                agent_node("prepare_pr", "Prepare PR", orchestrator),
-                agent_node("waiting_pr", "Waiting PR", orchestrator),
+                agent_node("prepare_pr", "Prepare PR", release),
+                agent_node("waiting_pr", "Waiting PR", ci),
             ]
         )
     if profile.capability("ci_monitoring"):
-        nodes.append(agent_node("ci_monitor", "Monitor CI", orchestrator))
+        nodes.append(agent_node("ci_monitor", "Monitor CI", ci))
 
     edges: list[EdgeSpec] = [
         EdgeSpec(
@@ -1008,7 +1015,6 @@ instructions, and the plan at {{{{.Params.plan_path}}}}. Workspace:
 {{{{.Params.workspace_path}}}}.
 
 {procedure_instruction(profile, "implement")}
-{delegation_instruction(profile, "implementation", "bounded write slices")}
 
 Use the project procedure for step selection, recipes, editing, focused checks,
 and plan progress. This generated workflow's completion contract overrides any
@@ -1065,7 +1071,6 @@ Read .kent/project-contract.md and repository instructions first. Workspace:
 {{{{.Params.fix_context}}}}
 
 {procedure_instruction(profile, "fix")}
-{delegation_instruction(profile, "implementation", "bounded fixes")}
 {bounded_contract}
 
 Remain the single writer. Fix root causes without broadening product scope.
@@ -1302,7 +1307,6 @@ Read .kent/project-contract.md and repository instructions first. Workspace:
 {compliance_context}
 
 {procedure_instruction(profile, "ship")}
-{delegation_instruction(profile, "release", "bounded delivery checks")}
 
 This workflow explicitly authorizes committing the task changes, pushing only
 the current task branch, and creating or updating its pull request. It never
@@ -1367,7 +1371,6 @@ Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
 
 {procedure_instruction(profile, "ci")}
-{delegation_instruction(profile, "ci", "bounded CI inspection")}
 
 Use bounded polling and the project source-control adapter. Never merge or push.
 Revalidate the resolved method against current repository capabilities, target
@@ -1542,20 +1545,6 @@ def standards_report_parameter(profile: ProjectProfile) -> ParameterSpec:
     if profile.legacy_review_contract:
         return LEGACY_STANDARDS_REPORT
     return STANDARDS_REPORT
-
-
-def delegation_instruction(
-    profile: ProjectProfile,
-    role_key: str,
-    scope: str,
-) -> str:
-    role = profile.optional_role(role_key)
-    if not role or role == "default":
-        return ""
-    return (
-        f"When useful, delegate {scope} to `{role}`. Keep orchestration, "
-        "integration, and transition selection in this node session."
-    )
 
 
 def delivery_prompt(profile: ProjectProfile, target: str) -> str:

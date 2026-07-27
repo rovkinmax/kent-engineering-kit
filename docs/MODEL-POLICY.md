@@ -3,13 +3,14 @@
 This is an iterative operating policy, not a versioned compatibility promise.
 The first-rollout values were staged and activated by a Kent restart on July
 24, 2026. July 25 live sessions confirmed that the global role grid was active.
+The leaf-review callability, medium final-review reasoning, and
+`reviewer.frequency = "off"` settings are active after the July 27 restart.
 Existing sessions still retain the settings with which they were created.
 
-A second quota-relief change is now staged: leaf-review callability metadata,
-medium reasoning for final reviewers, and `reviewer.frequency = "off"`. The
-leaf prompts are already consumed by new sessions. The model, callability, and
-built-in reviewer settings require the next Kent restart after active work
-finishes.
+A third quota-relief experiment is prepared but not installed: operational
+workflow nodes select direct profile roles, and the kit supplies global
+fallback implementations for those roles. It requires a later global-config
+merge and Kent restart plus separately canaried replacement workflow graphs.
 
 ## Optimization Target
 
@@ -53,13 +54,14 @@ stop.
 
 | Capability | Candidate |
 | --- | --- |
-| Default orchestrator and implementation | `gpt-5.6-sol`, medium |
+| Default Plan orchestrator | `gpt-5.6-sol`, medium |
+| Direct implementation and Fix | `gpt-5.6-sol`, medium |
 | Standards and specification review | `gpt-5.6-sol`, medium |
 | Architecture design | `gpt-5.6-sol`, high |
 | Compliance review | `gpt-5.6-terra`, medium |
-| Research, platform reference, build diagnosis | `gpt-5.6-terra`, medium |
+| Gate, research, platform reference, build diagnosis | `gpt-5.6-terra`, medium |
 | Specialized UI, domain, and quality review | `gpt-5.6-terra`, high |
-| Release and focused Smoke helpers | `gpt-5.6-terra`, medium |
+| Delivery and focused runtime Smoke | `gpt-5.6-terra`, medium |
 | CI monitoring and fast mechanical work | `gpt-5.6-luna`, low |
 | Built-in Kent reviewer/supervisor | disabled; `gpt-5.6-terra`, medium reserved for a separate canary |
 
@@ -68,12 +70,14 @@ Initial shared settings:
 - default reasoning: medium;
 - model verbosity: low;
 - workflow concurrency: 2;
-- maximum subagent depth: 1.
+- maximum subagent depth: 1;
 - built-in reviewer frequency: off.
 
-Keep the default orchestrator on Sol during the first rollout because it owns
-writing, Fix, Gate, Smoke, PR, CI, and cleanup decisions. Do not combine the
-first model rollout with a compaction-threshold experiment.
+Keep Plan on the default Sol orchestrator. The prepared replacement workflow
+assigns Implement/Fix, Gate, Smoke, PR/Cleanup, and CI/Waiting PR directly to
+their profile roles instead of paying for a default wrapper plus an optional
+child session. Do not combine this routing canary with a compaction-threshold
+experiment.
 
 The first rollout targets the two largest observed sources of quota pressure:
 
@@ -145,13 +149,27 @@ agent_callable = false
 workflow_subagent = false
 ```
 
-Project role overrides then make execution intent explicit:
+## Prepared Direct-Role Routing
 
-- implementation writers use Sol/medium;
-- project research, platform reference, build diagnosis, release, and focused
-  Smoke use Terra/medium;
-- standalone UI, domain, and quality reviewers use Terra/high;
-- CI monitoring uses Luna/low.
+The kit now defines global fallbacks for:
+
+- `implementation-worker`: Sol/medium;
+- `build-doctor`: Terra/medium;
+- `workflow-gate`: Terra/medium;
+- `runtime-smoke-tester`: Terra/medium;
+- `delivery-operator`: Terra/medium;
+- `ci-monitor`: Luna/low.
+
+Generated workflows use the profile's `implementation`, `qa`, `release`, and
+`ci` roles directly. Optional `gate` replaces the default Gate role when
+declared. Workspace config has higher precedence than global config, so a
+project can override the same role name with Android, iOS, web, IoT, or
+repository-specific behavior.
+
+This routing is not active in existing workflows. Do not install the expanded
+global fragment while sessions are running, and do not mutate a task-backed
+graph. Install after the maintenance window, restart Kent, generate a new
+non-default workflow, and canary its exact node-role assignments.
 
 Keep the built-in reviewer explicitly off during this rollout. Kent 2.4
 defaults it to `edits`; leaving the key unset can add hidden model calls after

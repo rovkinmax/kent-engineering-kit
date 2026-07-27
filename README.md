@@ -6,7 +6,7 @@ The kit separates:
 
 - global engineering disciplines in `skills/`;
 - explicit user-driven flows in `prompts/`;
-- reusable read-only roles in `agents/`;
+- reusable operational and read-only role fallbacks in `agents/`;
 - opt-in platform and toolchain behavior in `adapters/`;
 - workflow and project adapter contracts in `contracts/`;
 - workflow generation in `workflowkit/` and `scripts/generate-workflow`.
@@ -86,6 +86,11 @@ methods.
 into `~/.kent/config.toml` before restarting Kent. `scripts/validate` compares
 every managed field against the effective global config. The installer
 intentionally does not rewrite user configuration.
+
+The global baseline includes bounded implementation, build diagnosis, evidence
+gating, runtime Smoke, PR/cleanup delivery, CI monitoring, research,
+architecture, and independent review roles. Workspace config has higher
+precedence and may override a matching role with platform-specific behavior.
 
 After changing global subagent configuration, restart Kent and reopen Kent
 Desktop. Skills, prompts, and `AGENTS.md` are consumed by new sessions.
@@ -170,14 +175,16 @@ branch-topology gaps where a live Kent workflow exists but the selected revision
 does not yet contain its procedures, executable verification scripts, or
 required adapters.
 
-Project-local adapters declared by the profile are synchronized separately:
+Adapters declared by the profile are checked separately:
 
 ```bash
 ./scripts/sync-project-adapters --project /path/to/project
 ```
 
-Android projects with runtime Smoke use shared emulator resource-lock and
-evidence-audit templates while keeping package names, activities, build
+Kit-managed adapters such as the emulator resource lock and evidence audit are
+created or updated from templates. Project-owned adapters such as MCP policy or
+service wrappers are validated for an executable project-relative path and are
+never overwritten. Android projects keep package names, activities, build
 variants, accounts, and tested flows in project-owned procedures.
 
 ## Current phase

@@ -253,13 +253,20 @@ device, source-control, issue-tracker, and release adapters.
 
 ## Role resolution
 
-- Operational nodes use a `default` orchestrator role.
-- Project-local implementation, build, QA, release, and CI roles are delegated
-  from the orchestrator when useful.
+- Plan uses `orchestrator`; Gate uses optional `gate` and otherwise
+  `orchestrator`.
+- Implement and Fix use `implementation`.
+- Smoke uses `qa`.
+- PR preparation and Cleanup use `release`.
+- CI monitoring and Waiting PR use `ci`.
+- A node assigned to a profile role owns its transition directly and does not
+  start a duplicate child session for that same role.
 - Role prompts define behavior; Kent configuration owns model, reasoning,
   verbosity, tools, and delegation eligibility. See `role-contract.md`.
-- Direct custom node assignees are limited to globally registered roles that
-  Kent 2.3 execution validation can resolve.
+- Project profiles must map every enabled operational node to a role available
+  from the effective project or global Kent configuration.
+- The kit provides global fallback roles; workspace config may override the same
+  role names with higher-precedence platform or repository behavior.
 - Independent standards and specification reviews use global read-only roles.
 - Final PR-producing delivery uses a distinct global read-only compliance role
   after Gate and any required Smoke. It attests the final evidence and
@@ -270,6 +277,19 @@ device, source-control, issue-tracker, and release adapters.
   generated graph's Standards, Specification, or Compliance stages.
   Standalone review commands may use project-specialized reviewers when no
   Delivery graph owns the same pass.
+
+## Workflow retirement
+
+- Preview deletion before confirmation and classify every attached task.
+- Running, approval-waiting, or otherwise active tasks must finish or be
+  explicitly canceled before retirement.
+- Recreate every Backlog task in the replacement workflow before deleting the
+  source workflow. Preserve title, body, source URL, labels, and relevant
+  comments, and record the old-to-new short-ID mapping.
+- Do not move tasks between incompatible workflow graphs. Recreate the Backlog
+  record under the replacement graph instead.
+- Completed and canceled task history may be discarded when the user accepts
+  that consequence; it is not by itself a retirement blocker.
 
 ## Project adapter boundary
 
