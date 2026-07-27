@@ -1427,6 +1427,85 @@ class WorkflowKitTest(unittest.TestCase):
                     {bare_id},
                 )
 
+    def test_link_targets_explicit_project_workspace(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        candidate = root / "candidate"
+        primary = root / "primary"
+        candidate.mkdir()
+        primary.mkdir()
+        calls: list[list[str]] = []
+        client = KentClient(candidate, project_workspace=primary)
+        client.run = lambda args, check=True: (
+            calls.append(args)
+            or subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
+        )
+
+        client.link(
+            "33333333-3333-4333-8333-333333333333",
+            set_default=False,
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                [
+                    "workflow",
+                    "link",
+                    str(primary.resolve()),
+                    "33333333-3333-4333-8333-333333333333",
+                    "--json",
+                ]
+            ],
+        )
+
+    def test_client_resolves_primary_git_worktree_for_project_link(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        primary = Path(temporary.name) / "primary"
+        candidate = Path(temporary.name) / "candidate"
+        subprocess.run(["git", "init", "-q", str(primary)], check=True)
+        subprocess.run(
+            ["git", "-C", str(primary), "config", "user.name", "Kent Test"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(primary),
+                "config",
+                "user.email",
+                "kent@example.invalid",
+            ],
+            check=True,
+        )
+        (primary / "tracked").write_text("tracked\n")
+        subprocess.run(["git", "-C", str(primary), "add", "tracked"], check=True)
+        subprocess.run(
+            ["git", "-C", str(primary), "commit", "-qm", "Initial"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(primary),
+                "worktree",
+                "add",
+                "-qb",
+                "candidate",
+                str(candidate),
+            ],
+            check=True,
+        )
+
+        client = KentClient(candidate)
+
+        self.assertEqual(client.workspace, candidate.resolve())
+        self.assertEqual(client.project_workspace, primary.resolve())
+
     def test_workflow_name_resolution_uses_bare_uuid_selector(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

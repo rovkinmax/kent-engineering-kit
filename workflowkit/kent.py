@@ -17,8 +17,18 @@ class KentCommandError(RuntimeError):
 
 
 class KentClient:
-    def __init__(self, workspace: Path, binary: str = "kent") -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        binary: str = "kent",
+        project_workspace: Path | None = None,
+    ) -> None:
         self.workspace = workspace.expanduser().resolve()
+        self.project_workspace = (
+            project_workspace.expanduser().resolve()
+            if project_workspace is not None
+            else primary_worktree_root(self.workspace)
+        )
         self.binary = binary
         self._workflow_selector_cache: dict[str, str] = {}
 
@@ -312,7 +322,7 @@ class KentClient:
         args = [
             "workflow",
             "link",
-            str(self.workspace),
+            str(self.project_workspace),
             workflow,
         ]
         if set_default:
@@ -327,7 +337,7 @@ class KentClient:
                     [
                         "workflow",
                         "default",
-                        str(self.workspace),
+                        str(self.project_workspace),
                         workflow,
                         "--json",
                     ]
@@ -642,6 +652,22 @@ class KentClient:
         if check and result.returncode != 0:
             raise KentCommandError(command_error(result))
         return result
+
+
+def primary_worktree_root(workspace: Path) -> Path:
+    result = subprocess.run(
+        ["git", "-C", str(workspace), "worktree", "list", "--porcelain"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        return workspace
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            return Path(line.removeprefix("worktree ")).expanduser().resolve()
+    return workspace
 
 
 def node_matches(existing: dict[str, Any], spec: NodeSpec) -> bool:

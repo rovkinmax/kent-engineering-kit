@@ -107,6 +107,7 @@ def main() -> int:
                 "workflow_kind": args.kind,
                 "execution_target": spec.execution_target,
                 "snapshot": str(snapshot_path),
+                "project_workspace": str(client.project_workspace),
                 "default_changed": args.set_default,
                 "static_validation": "passed",
                 "managed_worktree_canary_required": True,

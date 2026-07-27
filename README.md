@@ -128,6 +128,9 @@ deterministic hash suffix so distinct labels cannot overwrite each other.
 
 Changing the project default requires the separate `--set-default` flag. Do not
 use it before the generated workflow passes a managed-worktree canary.
+Generation may run from a project-local Git worktree. The profile, scripts, and
+snapshot stay rooted in that worktree while Kent project linking targets the
+repository's primary worktree automatically.
 
 The optional profile policy `policies.writer_sessions` controls writer
 continuity. The backward-compatible `continuous` mode reuses or compacts
