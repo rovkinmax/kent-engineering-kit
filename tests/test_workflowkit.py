@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 from workflowkit.delivery import (
@@ -49,6 +50,23 @@ class WorkflowKitTest(unittest.TestCase):
         contents = transform(EXAMPLE_PROFILE.read_text())
         (profile_directory / "workflow-profile.toml").write_text(contents)
         return ProjectProfile.load(root)
+
+    def test_global_role_tools_are_mutually_exclusive(self) -> None:
+        config = tomllib.loads(
+            (REPO_ROOT / "config" / "subagents.toml").read_text()
+        )
+        conflicts = []
+        for name, role in config.get("subagents", {}).items():
+            if not isinstance(role, dict):
+                continue
+            tools = role.get("tools", {})
+            if (
+                isinstance(tools, dict)
+                and tools.get("patch") is True
+                and tools.get("edit") is True
+            ):
+                conflicts.append(name)
+        self.assertEqual(conflicts, [])
 
     def test_team_delivery_has_direct_fanout_join(self) -> None:
         profile = self.load_profile()

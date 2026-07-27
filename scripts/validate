@@ -105,6 +105,15 @@ configured = set()
 for role, values in config.get("subagents", {}).items():
     if not isinstance(values, dict):
         continue
+    tools = values.get("tools", {})
+    if (
+        isinstance(tools, dict)
+        and tools.get("patch") is True
+        and tools.get("edit") is True
+    ):
+        raise AssertionError(
+            f"{role}: tools.patch and tools.edit cannot both be enabled"
+        )
     prompt = values.get("system_prompt_file")
     if prompt is None:
         continue
