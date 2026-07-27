@@ -7,10 +7,9 @@ The leaf-review callability, medium final-review reasoning, and
 `reviewer.frequency = "off"` settings are active after the July 27 restart.
 Existing sessions still retain the settings with which they were created.
 
-A third quota-relief experiment is prepared but not installed: operational
-workflow nodes select direct profile roles, and the kit supplies global
-fallback implementations for those roles. It requires a later global-config
-merge and Kent restart plus separately canaried replacement workflow graphs.
+The direct-role quota-relief experiment was activated by the July 27 restart.
+Puber and Appsome managed-worktree canaries then verified the role routing,
+verification fan-out, Gate, Compliance, delivery, CI, and Waiting PR paths.
 
 ## Optimization Target
 
@@ -149,7 +148,7 @@ agent_callable = false
 workflow_subagent = false
 ```
 
-## Prepared Direct-Role Routing
+## Active Direct-Role Routing
 
 The kit now defines global fallbacks for:
 
@@ -162,14 +161,30 @@ The kit now defines global fallbacks for:
 
 Generated workflows use the profile's `implementation`, `qa`, `release`, and
 `ci` roles directly. Optional `gate` replaces the default Gate role when
-declared. Workspace config has higher precedence than global config, so a
-project can override the same role name with Android, iOS, web, IoT, or
-repository-specific behavior.
+declared.
 
-This routing is not active in existing workflows. Do not install the expanded
-global fragment while sessions are running, and do not mutate a task-backed
-graph. Install after the maintenance window, restart Kent, generate a new
-non-default workflow, and canary its exact node-role assignments.
+The July 27 canaries observed:
+
+- Implement on Sol/medium;
+- independent Standards and Specification leaf sessions on Sol/medium with no
+  child agents;
+- Gate, Compliance, and delivery on Terra/medium;
+- CI and Waiting PR on Luna/low;
+- documentation-only changes skipping runtime Smoke;
+- three verification branches scheduled correctly with workflow concurrency
+  limited to two simultaneous runs.
+
+Kent documents workspace config as higher precedence, but scheduler-created
+direct-role sessions selected the global same-named role definitions during
+both canaries. Global canonical roles are therefore contract-complete and
+project-specific behavior is carried through the node prompt, project
+contract, procedures, and adapters. Workspace same-name overrides remain an
+optional specialization until the observed behavior is clarified upstream.
+
+The next isolated quota experiment is to move Standards and Specification
+review from Sol/medium to Terra/medium. It is not applied yet. Keep Plan and
+Implement on Sol while comparing review findings, Fix-loop count, escaped
+defects, and provider pressure before making that change permanent.
 
 Keep the built-in reviewer explicitly off during this rollout. Kent 2.4
 defaults it to `edits`; leaving the key unset can add hidden model calls after
