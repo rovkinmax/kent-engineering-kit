@@ -36,8 +36,6 @@ verify = ".kent/scripts/workflow-verify"
 smoke = ""
 
 [procedures]
-plan = ""
-implement = ""
 fix = ""
 compliance = ""
 smoke = ""
@@ -45,6 +43,36 @@ ship = ""
 ci = ""
 waiting_pr = ""
 cleanup = ""
+
+[work_kinds.feature]
+description = "User-facing behavior, screens, flows, or business capabilities."
+plan = ".kent/commands/feature-start.md"
+implement = ".kent/commands/feature-implement.md"
+
+[work_kinds.bugfix]
+description = "Restore intended behavior for a reproducible defect."
+plan = ".kent/commands/bugfix-start.md"
+implement = ".kent/commands/bugfix-implement.md"
+
+[work_kinds.refactor]
+description = "Improve code structure without intended behavior changes."
+plan = ".kent/commands/refactor-start.md"
+implement = ".kent/commands/refactor-start.md"
+
+[work_kinds.migration]
+description = "Move contracts, frameworks, modules, or data in dependency order."
+plan = ".kent/commands/migration-start.md"
+implement = ".kent/commands/migration-start.md"
+
+[work_kinds.dependency]
+description = "Audit or update dependency versions and build-tool artifacts."
+plan = ".kent/commands/dependency-update.md"
+implement = ".kent/commands/dependency-update.md"
+
+[work_kinds.test]
+description = "Add or improve automated test coverage without product scope."
+plan = ".kent/commands/test-coverage.md"
+implement = ".kent/commands/test-coverage.md"
 
 # Projects with MCP policy and Android runtime Smoke use:
 # required_adapters = ["mcp_policy", "mobile_resource_lock", "mobile_evidence_audit"]

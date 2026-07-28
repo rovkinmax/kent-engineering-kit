@@ -14,6 +14,7 @@ DELIVERY_PROFILES = {"lite", "standard", "team", "release"}
 SMOKE_POLICIES = {"disabled", "conditional", "required"}
 WRITER_SESSION_POLICIES = {"continuous", "fresh_per_slice"}
 PR_MERGE_STRATEGIES = {"auto", "merge", "squash", "rebase"}
+WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 ROLE_PROMPT_DIRECTORIES = (
     Path(".kent/subagents"),
@@ -23,6 +24,14 @@ ROLE_EXECUTION_FIELD_PATTERN = re.compile(
     r"^\s*(model|tools)\s*:",
     re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True)
+class WorkKind:
+    key: str
+    description: str
+    plan: str
+    implement: str
 
 
 @dataclass(frozen=True)
@@ -45,6 +54,7 @@ class ProjectProfile:
     legacy_review_contract: bool
     commands: dict[str, str]
     procedures: dict[str, str]
+    work_kinds: dict[str, WorkKind]
     adapters: dict[str, str]
     roles: dict[str, str]
 
@@ -122,6 +132,7 @@ class ProjectProfile:
             legacy_review_contract=legacy_review_contract,
             commands=string_table(require_table(raw, "commands"), "commands"),
             procedures=string_table(raw.get("procedures", {}), "procedures"),
+            work_kinds=work_kind_table(require_table(raw, "work_kinds")),
             adapters=string_table(raw.get("adapters", {}), "adapters"),
             roles=string_table(require_table(raw, "roles"), "roles"),
         )
@@ -213,6 +224,29 @@ class ProjectProfile:
         if not self.command("verify"):
             raise SpecError("profile command 'verify' is required")
 
+        if not self.work_kinds:
+            raise SpecError("profile must declare at least one work kind")
+        for key, work_kind in self.work_kinds.items():
+            if key != work_kind.key:
+                raise SpecError(
+                    f"work kind mapping key {key!r} does not match "
+                    f"{work_kind.key!r}"
+                )
+            if not check_files:
+                continue
+            for stage, configured_path in (
+                ("plan", work_kind.plan),
+                ("implement", work_kind.implement),
+            ):
+                procedure_path = self.resolve_project_path(
+                    configured_path,
+                    f"work_kinds.{key}.{stage}",
+                )
+                if not procedure_path.is_file():
+                    raise SpecError(
+                        f"work kind procedure not found: {procedure_path}"
+                    )
+
         required_roles = {
             "implementation",
             "orchestrator",
@@ -273,6 +307,12 @@ class ProjectProfile:
 
     def procedure(self, key: str) -> str:
         return self.procedures.get(key, "").strip()
+
+    def work_kind(self, key: str) -> WorkKind:
+        try:
+            return self.work_kinds[key]
+        except KeyError as error:
+            raise SpecError(f"unsupported work kind {key!r}") from error
 
     def adapter(self, key: str) -> str:
         return self.adapters.get(key, "").strip()
@@ -378,6 +418,35 @@ def bool_table(raw: Any, label: str) -> dict[str, bool]:
         if not isinstance(value, bool):
             raise SpecError(f"{label}.{key} must be a boolean")
         result[key] = value
+    return result
+
+
+def work_kind_table(raw: Any) -> dict[str, WorkKind]:
+    if not isinstance(raw, dict):
+        raise SpecError("work_kinds must be a TOML table")
+    result: dict[str, WorkKind] = {}
+    for key, value in raw.items():
+        if not WORK_KIND_KEY_PATTERN.fullmatch(key):
+            raise SpecError(
+                f"work kind key {key!r} is not a stable model key"
+            )
+        if not isinstance(value, dict):
+            raise SpecError(f"work_kinds.{key} must be a TOML table")
+        unknown_fields = set(value) - {"description", "plan", "implement"}
+        if unknown_fields:
+            raise SpecError(
+                f"work_kinds.{key} has unsupported fields "
+                f"{sorted(unknown_fields)}"
+            )
+        result[key] = WorkKind(
+            key=key,
+            description=require_string(
+                value,
+                "description",
+            ),
+            plan=require_string(value, "plan"),
+            implement=require_string(value, "implement"),
+        )
     return result
 
 

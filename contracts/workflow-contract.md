@@ -52,6 +52,8 @@ device, source-control, issue-tracker, and release adapters.
 - `workspace_path` — repository or managed-worktree root, never a `.todo`
   feature directory or another artifact path
 - `plan_path`
+- `work_kind` — stable project-profile key selected once during Plan and
+  preserved through every Implement slice
 - `spec_path`
 - `fixed_point`
 - `changed_files`
@@ -95,6 +97,19 @@ device, source-control, issue-tracker, and release adapters.
   canonical current execution root. Artifact subdirectories, nested paths, and
   foreign repositories are rejected before fan-out and routed through a
   metadata-only Fix slice.
+
+## Work-kind routing
+
+- Every generated Engineering Delivery profile declares at least one
+  `[work_kinds.<key>]` entry with a description and project-relative Plan and
+  Implement procedures.
+- A task-body `work_kind: <key>` declaration is authoritative when supported.
+  Otherwise Plan classifies conservatively and blocks on ambiguity.
+- Plan uses only planning sections of a combined procedure. Implement uses the
+  selected procedure for exactly one approved plan step and never repeats
+  discovery or planning.
+- `work_kind` is required on Plan-to-Implement, Implement continuation, and
+  Implement recovery transitions. Fix remains findings-driven and generic.
 
 ## Fan-out constraints
 

@@ -16,6 +16,16 @@ from workflowkit.revision import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_PROFILE = REPO_ROOT / "contracts" / "project-profile.example.toml"
+WORK_KIND_PROCEDURES = (
+    ".kent/commands/feature-start.md",
+    ".kent/commands/feature-implement.md",
+    ".kent/commands/bugfix-start.md",
+    ".kent/commands/bugfix-implement.md",
+    ".kent/commands/refactor-start.md",
+    ".kent/commands/migration-start.md",
+    ".kent/commands/dependency-update.md",
+    ".kent/commands/test-coverage.md",
+)
 
 
 class RevisionPreflightTest(unittest.TestCase):
@@ -33,6 +43,10 @@ class RevisionPreflightTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         (kent / "workflow-profile.toml").write_text(EXAMPLE_PROFILE.read_text())
         (kent / "project-contract.md").write_text("# Project contract\n")
+        for configured_path in WORK_KIND_PROCEDURES:
+            path = root / configured_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# Test procedure\n")
         for name in ("workflow-verification-dispatch", "workflow-verify"):
             path = scripts / name
             path.write_text("#!/usr/bin/env bash\nexit 0\n")
@@ -53,6 +67,7 @@ class RevisionPreflightTest(unittest.TestCase):
                 ".kent/scripts/workflow-verification-dispatch",
                 ".kent/scripts/workflow-verify",
                 ".kent/workflow-profile.toml",
+                *WORK_KIND_PROCEDURES,
             },
         )
 

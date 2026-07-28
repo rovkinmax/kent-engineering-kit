@@ -148,6 +148,9 @@ def profile_requirements(
     for key, path in profile.procedures.items():
         if path:
             require(path, f"procedures.{key}")
+    for key, work_kind in profile.work_kinds.items():
+        require(work_kind.plan, f"work_kinds.{key}.plan")
+        require(work_kind.implement, f"work_kinds.{key}.implement")
     for key in profile.required_adapters:
         require(
             profile.adapter(key),

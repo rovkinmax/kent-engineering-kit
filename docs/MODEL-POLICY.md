@@ -55,7 +55,8 @@ stop.
 | --- | --- |
 | Default Plan orchestrator | `gpt-5.6-sol`, medium |
 | Direct implementation and Fix | `gpt-5.6-sol`, medium |
-| Standards and specification review | `gpt-5.6-sol`, medium |
+| Standards review | `gpt-5.6-terra`, medium |
+| Specification review | `gpt-5.6-sol`, medium |
 | Architecture design | `gpt-5.6-sol`, high |
 | Compliance review | `gpt-5.6-terra`, medium |
 | Gate, research, platform reference, build diagnosis | `gpt-5.6-terra`, medium |
@@ -122,7 +123,7 @@ thinking_level = "medium"
 model_verbosity = "low"
 
 [subagents.standards-reviewer]
-model = "gpt-5.6-sol"
+model = "gpt-5.6-terra"
 thinking_level = "medium"
 model_verbosity = "low"
 agent_callable = false
@@ -181,10 +182,11 @@ project-specific behavior is carried through the node prompt, project
 contract, procedures, and adapters. Workspace same-name overrides remain an
 optional specialization until the observed behavior is clarified upstream.
 
-The next isolated quota experiment is to move Standards and Specification
-review from Sol/medium to Terra/medium. It is not applied yet. Keep Plan and
-Implement on Sol while comparing review findings, Fix-loop count, escaped
-defects, and provider pressure before making that change permanent.
+The next isolated quota experiment moves Standards Review to Terra/medium while
+keeping Specification Review on Sol/medium. The configuration is staged but
+requires a Kent restart before new sessions use it. Keep Plan and Implement on
+Sol while comparing review findings, Fix-loop count, escaped defects, and
+provider pressure.
 
 Keep the built-in reviewer explicitly off during this rollout. Kent 2.4
 defaults it to `edits`; leaving the key unset can add hidden model calls after

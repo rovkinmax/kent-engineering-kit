@@ -38,6 +38,23 @@ VERIFY_REPORT = REPO_ROOT / "templates" / "project" / "workflow-verify-report"
 VERIFY_DISPATCH = (
     REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch"
 )
+WORK_KIND_PROCEDURES = (
+    ".kent/commands/feature-start.md",
+    ".kent/commands/feature-implement.md",
+    ".kent/commands/bugfix-start.md",
+    ".kent/commands/bugfix-implement.md",
+    ".kent/commands/refactor-start.md",
+    ".kent/commands/migration-start.md",
+    ".kent/commands/dependency-update.md",
+    ".kent/commands/test-coverage.md",
+)
+
+
+def create_work_kind_procedures(root: Path) -> None:
+    for configured_path in WORK_KIND_PROCEDURES:
+        path = root / configured_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Test procedure\n")
 
 
 class WorkflowKitTest(unittest.TestCase):
@@ -49,6 +66,7 @@ class WorkflowKitTest(unittest.TestCase):
         profile_directory.mkdir()
         contents = transform(EXAMPLE_PROFILE.read_text())
         (profile_directory / "workflow-profile.toml").write_text(contents)
+        create_work_kind_procedures(root)
         return ProjectProfile.load(root)
 
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
@@ -153,7 +171,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(continuation.context, "new_session")
         self.assertEqual(
             tuple(parameter.key for parameter in continuation.parameters),
-            ("workspace_path", "plan_path"),
+            ("workspace_path", "plan_path", "work_kind"),
         )
         self.assertEqual(implementation_edges["verify"].target, "verification_dispatch")
         self.assertEqual(by_key["plan_implement"].context, "new_session")
@@ -397,7 +415,8 @@ class WorkflowKitTest(unittest.TestCase):
         prompts = "\n".join(
             edge.prompt for edge in spec.edges if edge.prompt is not None
         )
-        self.assertNotIn(".kent/commands/feature-", prompts)
+        self.assertIn("work_kind", prompts)
+        self.assertIn(".kent/commands/feature-start.md", prompts)
         self.assertNotIn("gate_smoke_required", by_key)
         self.assertEqual(by_key["gate_delivery_ready"].target, "cleanup")
 
@@ -1010,6 +1029,7 @@ class WorkflowKitTest(unittest.TestCase):
                 (profile_directory / "workflow-profile.toml").write_text(
                     EXAMPLE_PROFILE.read_text()
                 )
+                create_work_kind_procedures(root)
                 role_directory = profile_directory / "subagents"
                 role_directory.mkdir()
                 (role_directory / "reviewer.md").write_text(
@@ -1038,6 +1058,7 @@ class WorkflowKitTest(unittest.TestCase):
         (profile_directory / "workflow-profile.toml").write_text(
             EXAMPLE_PROFILE.read_text()
         )
+        create_work_kind_procedures(root)
         role_directory = profile_directory / "subagents"
         role_directory.mkdir()
         (role_directory / "researcher.md").write_text(
@@ -1075,6 +1096,7 @@ class WorkflowKitTest(unittest.TestCase):
             '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
         )
         (profile_directory / "workflow-profile.toml").write_text(contents)
+        create_work_kind_procedures(root)
 
         with self.assertRaisesRegex(SpecError, "required adapter not found"):
             ProjectProfile.load(root)
@@ -1114,6 +1136,7 @@ class WorkflowKitTest(unittest.TestCase):
             '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
         )
         (profile_directory / "workflow-profile.toml").write_text(contents)
+        create_work_kind_procedures(root)
 
         unrelated = root / "unrelated.sh"
         unrelated.write_text("#!/usr/bin/env bash\n")
@@ -1141,6 +1164,7 @@ class WorkflowKitTest(unittest.TestCase):
             '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
         )
         (profile_directory / "workflow-profile.toml").write_text(contents)
+        create_work_kind_procedures(root)
         script = REPO_ROOT / "scripts" / "sync-project-adapters"
         target = (
             root / ".kent" / "adapters" / "mobile" / "emulator-resource-lock.sh"
@@ -1232,6 +1256,7 @@ class WorkflowKitTest(unittest.TestCase):
             'mcp_policy = ".kent/adapters/mcp/policy"\n'
         )
         (profile_directory / "workflow-profile.toml").write_text(contents)
+        create_work_kind_procedures(root)
         script = REPO_ROOT / "scripts" / "sync-project-adapters"
 
         result = subprocess.run(

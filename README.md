@@ -111,6 +111,11 @@ verification scripts, and project procedures. Preview a versioned workflow:
   --version 1
 ```
 
+Every generated Engineering Delivery profile declares `[work_kinds.<key>]`
+entries. Plan selects one supported key from an explicit task-body
+`work_kind: <key>` declaration or conservative classification, then carries it
+through each Implement slice.
+
 Apply, link as non-default, validate, and export its audit snapshot:
 
 ```bash
@@ -203,6 +208,13 @@ mutation-protected after tasks reference it.
 Changes to generator prompts or shared contracts do not mutate task-backed live
 workflows. They require a new non-default experiment and canary before any
 default promotion.
+
+Kent Desktop may display
+`workflow.validation.script_path_relative_check_skipped` for a relative script
+node while no task worktree exists. This diagnostic is non-blocking when
+execution validation is otherwise valid. Keep relative paths for portability;
+revision preflight and the managed task worktree provide the real file and
+executable checks.
 
 Current rollout state, audited revision boundaries, and remaining migration work
 are tracked in `docs/ROADMAP.md`.

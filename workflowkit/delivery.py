@@ -18,6 +18,10 @@ PLAN = ParameterSpec(
     "plan_path",
     "Path to the approved implementation plan, or an empty string when not applicable.",
 )
+WORK_KIND = ParameterSpec(
+    "work_kind",
+    "Stable project-profile work kind selected during Plan.",
+)
 REVIEW_CONTEXT = ParameterSpec(
     "review_context",
     "Implementation, fix, report, and artifact context required by verification.",
@@ -126,6 +130,7 @@ def build_delivery_workflow(
         pull_requests
         and profile.capability("compliance_review")
     )
+    implementation_parameters = (WORKSPACE, PLAN, WORK_KIND)
     nodes: list[NodeSpec] = [
         NodeSpec("backlog", "start", "Backlog"),
         agent_node("plan", "Plan", orchestrator),
@@ -210,7 +215,7 @@ def build_delivery_workflow(
             transition_description=(
                 "Planning is complete and implementation can start without ambiguity."
             ),
-            parameters=(WORKSPACE, PLAN),
+            parameters=implementation_parameters,
         ),
         recovery_edge(
             "plan",
@@ -227,7 +232,7 @@ def build_delivery_workflow(
             transition_description=(
                 "One plan step is complete; continue with the next ready step."
             ),
-            parameters=(WORKSPACE, PLAN),
+            parameters=implementation_parameters,
         ),
         EdgeSpec(
             key="implement_verify",
@@ -243,6 +248,8 @@ def build_delivery_workflow(
             "implement",
             context=writer_recovery_context,
             fresh_session=fresh_writers,
+            extra_parameters=(WORK_KIND,),
+            extra_prompt=work_kind_recovery_instruction(profile),
         ),
         cancellation_edge("implement"),
         EdgeSpec(
@@ -856,7 +863,10 @@ def recovery_edge(
     *,
     context: str = "compact_and_continue_session",
     fresh_session: bool = False,
+    extra_parameters: tuple[ParameterSpec, ...] = (),
+    extra_prompt: str = "",
 ) -> EdgeSpec:
+    extra_contract = f"\n{extra_prompt}" if extra_prompt else ""
     cancellation_contract = ""
     if node_key in {"plan", "implement", "fix", "verification_gate"}:
         cancellation_contract = (
@@ -890,7 +900,7 @@ reference the exact task-comment ID. Do not restart completed work.
 {stage_contract}
 
 Verify that the exact blocker is resolved. Do not infer approval for any broader
-or destructive action."""
+or destructive action.{extra_contract}"""
             + cancellation_contract
         )
     else:
@@ -901,7 +911,8 @@ Previous blocker: {{{{.Params.blocker_reason}}}}
 
 Use the retained compacted context, re-read current task comments and project
 instructions, verify that the blocker is actually resolved, and continue the
-same stage. Do not infer approval for any broader or destructive action."""
+same stage. Do not infer approval for any broader or destructive
+action.{extra_contract}"""
             + cancellation_contract
         )
     return EdgeSpec(
@@ -915,7 +926,7 @@ same stage. Do not infer approval for any broader or destructive action."""
         transition_description=(
             "Work is externally blocked; continue this stage only after approval."
         ),
-        parameters=(BLOCKER,),
+        parameters=(BLOCKER,) + extra_parameters,
     )
 
 
@@ -938,6 +949,57 @@ def procedure_instruction(profile: ProjectProfile, key: str) -> str:
     if path:
         return f"Use {path} as the project procedure."
     return "Follow the project contract and repository instructions."
+
+
+def work_kind_catalog(profile: ProjectProfile) -> str:
+    return "\n".join(
+        (
+            f"- `{key}` — {work_kind.description.rstrip('.')}; "
+            f"Plan: `{work_kind.plan}`; Implement: `{work_kind.implement}`."
+        )
+        for key, work_kind in profile.work_kinds.items()
+    )
+
+
+def work_kind_plan_instruction(profile: ProjectProfile) -> str:
+    return f"""Select exactly one supported `work_kind` before detailed planning:
+
+{work_kind_catalog(profile)}
+
+A standalone `work_kind: <key>` declaration in the task body is an explicit
+human routing decision and wins when the key is supported. Otherwise classify
+conservatively from the requested outcome and source context. Do not use the
+Jira issue type alone as proof. If the kind is unsupported, multiple kinds are
+materially coupled, or the classification remains ambiguous, complete with
+`needs_user_action` and ask for one supported key.
+
+After selection, load the mapped Plan procedure as a procedure module. Some
+project procedures also document execution; this Plan node must use only their
+bootstrap, discovery, design/specification, analysis, planning, and plan-review
+sections. The generated stage contract overrides any instruction to edit
+production files, execute plan steps, invoke nested prompt flows, or launch a
+separate delivery workflow."""
+
+
+def work_kind_implement_instruction(profile: ProjectProfile) -> str:
+    return f"""Selected work kind: `{{{{.Params.work_kind}}}}`.
+
+Use the matching Implement procedure from this profile catalog:
+
+{work_kind_catalog(profile)}
+
+The selected key must exist in the catalog and match the authoritative plan. If
+it does not, stop with `needs_user_action`; do not silently reclassify it. Load
+only the mapped Implement procedure. When that file combines planning and
+execution, skip its discovery, planning, audit-launch, and scope-confirmation
+stages: execute exactly one already-approved unchecked plan step."""
+
+
+def work_kind_recovery_instruction(profile: ProjectProfile) -> str:
+    return """Preserve the selected `{{.Params.work_kind}}` routing key. Use its
+mapped Implement procedure from `.kent/workflow-profile.toml`; do not
+reclassify the task during recovery. Re-emit `work_kind` on
+`continue_implementation` or another `needs_user_action` transition."""
 
 
 def plan_prompt(
@@ -972,7 +1034,9 @@ an explicit confirmation request. Do not choose `implement` in that Plan run."""
     return f"""Plan {{{{.TaskShortId}}}}: {{{{.TaskTitle}}}}
 
 Read .kent/project-contract.md, .kent/workflow-profile.toml, and repository
-instructions first. {procedure_instruction(profile, "plan")}
+instructions first.
+
+{work_kind_plan_instruction(profile)}
 
 Task body:
 {{{{.TaskBody}}}}
@@ -985,8 +1049,8 @@ invoke nested prompt flows and do not implement production changes.
 Complete with `implement` only when the plan has no unresolved product, API, UX,
 or safety ambiguity. `workspace_path` is the repository or managed-worktree
 root; it is never `.todo/<feature>` or another artifact directory. Provide that
-root plus `plan_path`; use an empty `plan_path` only when the project contract
-explicitly allows planless work.
+root plus `plan_path` and the selected `work_kind`; use an empty `plan_path`
+only when the project contract explicitly allows planless work.
 Complete with `needs_user_action` and `blocker_reason` for an external blocker.
 Choose `wont_do` only for an explicit cancellation decision and provide
 `closure_reason`."""
@@ -1014,7 +1078,7 @@ Read .kent/project-contract.md, .kent/workflow-profile.toml, repository
 instructions, and the plan at {{{{.Params.plan_path}}}}. Workspace:
 {{{{.Params.workspace_path}}}}.
 
-{procedure_instruction(profile, "implement")}
+{work_kind_implement_instruction(profile)}
 
 Use the project procedure for step selection, recipes, editing, focused checks,
 and plan progress. This generated workflow's completion contract overrides any
@@ -1027,13 +1091,14 @@ project-specialized review passes; the generated verification graph owns those
 independent reviews. Bounded implementation, research, and diagnosis
 delegation remains allowed.
 After marking that step complete, choose `continue_implementation` with
-`workspace_path` and `plan_path` when unchecked ready steps remain. Choose
+`workspace_path`, `plan_path`, and the unchanged `work_kind` when unchecked
+ready steps remain. Choose
 `verify` only when every required plan step is complete; provide
 `workspace_path` plus `review_context` summarizing plan/spec paths, the fixed
 comparison point, changed files, checks, and risks for the read-only branches.
 Use `needs_user_action` only for an external blocker and provide
-`blocker_reason`. Choose `wont_do` only for explicit cancellation and provide
-`closure_reason`."""
+`blocker_reason` plus the unchanged `work_kind`. Choose `wont_do` only for
+explicit cancellation and provide `closure_reason`."""
 
 
 def fix_prompt(

@@ -139,7 +139,8 @@ owns real task history and provides rollback.
 - Move the Appsome project adapter from `release/4.29.0` into `master`; until
   then, start generated Appsome workflows only from audited adapter commit
   `b6fd03e1f15dc49bbe9431955062699f8bf6bfb0` or its descendants.
-- Design work-kind dispatch before migrating refactor and bugfix flows.
+- Roll out required work-kind dispatch, migrate remaining backlog tasks, and
+  retire the covered feature/refactor/bugfix/dependency/test workflows.
 
 ## Phase 4: Auxiliary workflows
 
@@ -148,3 +149,19 @@ Status: planned.
 - Generate maintenance, smoke, intake, release, and rebase flows.
 - Support single and split release topologies.
 - Add Web, iOS, embedded, and generic project profiles.
+
+## Post-adoption backlog
+
+Do not block the first real `work_kind` rollout on these items. Revisit them
+after Puber and Appsome have exercised the generalized Delivery workflow:
+
+- normalize experimental workflow names and remove temporary duplicate assets;
+- extract cleaner cross-stack procedure templates only from repeated real use;
+- evaluate absorbing Appsome SDK Update as `work_kind = "sdk_update"`;
+- extend project adapters for Web, iOS, and IoT from actual repositories rather
+  than speculative platform abstractions;
+- make `kent-engineering-kit` itself a generated Engineering Delivery consumer
+  with the common work kinds, `scripts/validate` as deterministic verification,
+  no runtime Smoke, and a normal GitHub PR/CI tail;
+- version the profile and compatibility contract only after the working
+  composition and migration policy are stable.
