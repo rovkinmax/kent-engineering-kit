@@ -32,11 +32,11 @@ generated toolkit workflows.
 - Apply the profile's explicit execution-target policy to each workflow.
 - Use a workflow-kind override when present.
 - Before starting a generated workflow from a branch, tag, or commit, run
-  `~/.kent/bin/kent-preflight-revision` with `--project`, `--ref`, and
-  `--baseline-ref`. It requires the audited adapter revision to be an ancestor,
-  rejects profile-contract drift, and checks the project contract, procedures,
-  executable commands, and required adapters directly from Git objects without
-  checking them out.
+  `~/.kent/bin/kent-preflight-revision` with `--project` and `--ref`. It checks
+  the selected revision's project contract, procedures, executable commands,
+  and required adapters directly from Git objects without checking them out.
+- Treat canary revisions as rollout evidence, not a commit-ancestry gate, until
+  the shared profile and workflow compatibility contract is versioned.
 - Treat Kent's selected execution root and resolved commit as authoritative.
 - Use `kent worktree` for operations on Kent-managed worktrees.
 - For a cross-session operation, invoke `~/.kent/bin/kent-worktree` with an

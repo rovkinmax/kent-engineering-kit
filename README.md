@@ -168,16 +168,15 @@ validate that the selected revision contains its complete project adapter:
 ```bash
 ./scripts/preflight-revision \
   --project /path/to/project \
-  --ref feature/my-change \
-  --baseline-ref origin/main
+  --ref feature/my-change
 ```
 
-The preflight requires the audited baseline to be an ancestor of the selected
-revision, rejects project-profile drift, and checks required files directly
-from Git objects. It does not switch branches or create a worktree. This catches
+The preflight validates the profile and checks required files directly from Git
+objects. It does not switch branches or create a worktree. This catches
 branch-topology gaps where a live Kent workflow exists but the selected revision
 does not yet contain its procedures, executable verification scripts, or
-required adapters.
+required adapters. During the iterative rollout, canary revisions remain
+informational rather than an ancestry gate.
 
 Adapters declared by the profile are checked separately:
 

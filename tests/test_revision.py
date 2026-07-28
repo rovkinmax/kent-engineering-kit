@@ -42,7 +42,7 @@ class RevisionPreflightTest(unittest.TestCase):
 
     def test_preflight_accepts_ready_revision(self) -> None:
         root = self.create_project()
-        result = preflight_project_revision(root, "HEAD", "HEAD")
+        result = preflight_project_revision(root, "HEAD")
 
         self.assertEqual(result.project_name, "example")
         self.assertEqual(result.workflow_prefix, "Example")
@@ -58,7 +58,6 @@ class RevisionPreflightTest(unittest.TestCase):
 
     def test_preflight_rejects_revision_without_profile(self) -> None:
         root = self.create_project()
-        baseline = self.rev_parse(root, "HEAD")
         self.run_git(root, "rm", "-q", ".kent/workflow-profile.toml")
         self.commit_all(root, "Remove profile")
 
@@ -66,11 +65,10 @@ class RevisionPreflightTest(unittest.TestCase):
             RevisionPreflightError,
             "project profile not found",
         ):
-            preflight_project_revision(root, "HEAD", baseline)
+            preflight_project_revision(root, "HEAD")
 
     def test_preflight_rejects_missing_command(self) -> None:
         root = self.create_project()
-        baseline = self.rev_parse(root, "HEAD")
         self.run_git(root, "rm", "-q", ".kent/scripts/workflow-verify")
         self.commit_all(root, "Remove verifier")
 
@@ -78,11 +76,10 @@ class RevisionPreflightTest(unittest.TestCase):
             RevisionPreflightError,
             "required path not found.*workflow-verify",
         ):
-            preflight_project_revision(root, "HEAD", baseline)
+            preflight_project_revision(root, "HEAD")
 
     def test_preflight_rejects_non_executable_command(self) -> None:
         root = self.create_project()
-        baseline = self.rev_parse(root, "HEAD")
         verifier = root / ".kent" / "scripts" / "workflow-verify"
         verifier.chmod(0o644)
         self.commit_all(root, "Drop executable mode")
@@ -91,38 +88,29 @@ class RevisionPreflightTest(unittest.TestCase):
             RevisionPreflightError,
             "not executable.*100644",
         ):
-            preflight_project_revision(root, "HEAD", baseline)
+            preflight_project_revision(root, "HEAD")
 
-    def test_preflight_rejects_revision_before_audited_baseline(self) -> None:
+    def test_preflight_uses_selected_profile_adapter_requirements(self) -> None:
         root = self.create_project()
-        older_revision = self.rev_parse(root, "HEAD")
-        self.add_required_adapter(root)
-        baseline = self.rev_parse(root, "HEAD")
-
-        with self.assertRaisesRegex(
-            RevisionPreflightError,
-            "is not an ancestor",
-        ):
-            preflight_project_revision(root, older_revision, baseline)
-
-    def test_preflight_rejects_profile_weakening_after_baseline(self) -> None:
-        root = self.create_project()
-        self.add_required_adapter(root)
-        baseline = self.rev_parse(root, "HEAD")
         profile = root / ".kent" / "workflow-profile.toml"
         profile.write_text(
             profile.read_text().replace(
-                'required_adapters = ["mobile_resource_lock"]',
                 "required_adapters = []",
+                'required_adapters = ["mobile_resource_lock"]',
+            )
+            + (
+                "\n[adapters]\n"
+                "mobile_resource_lock = "
+                '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
             )
         )
-        self.commit_all(root, "Weaken adapter contract")
+        self.commit_all(root, "Require mobile resource lock")
 
         with self.assertRaisesRegex(
             RevisionPreflightError,
-            "differs from audited baseline.*required_adapters",
+            "required path not found.*emulator-resource-lock",
         ):
-            preflight_project_revision(root, "HEAD", baseline)
+            preflight_project_revision(root, "HEAD")
 
     def test_cli_reports_ready_revision_as_json(self) -> None:
         root = self.create_project()
@@ -135,8 +123,6 @@ class RevisionPreflightTest(unittest.TestCase):
                 "--project",
                 str(root),
                 "--ref",
-                "HEAD",
-                "--baseline-ref",
                 "HEAD",
             ],
             text=True,
@@ -153,7 +139,6 @@ class RevisionPreflightTest(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertTrue(payload["ready"])
         self.assertEqual(payload["requested_ref"], "HEAD")
-        self.assertEqual(payload["baseline_ref"], "HEAD")
 
     def test_cli_rejects_invalid_explicit_python_override(self) -> None:
         root = self.create_project()
@@ -166,8 +151,6 @@ class RevisionPreflightTest(unittest.TestCase):
                 "--project",
                 str(root),
                 "--ref",
-                "HEAD",
-                "--baseline-ref",
                 "HEAD",
             ],
             text=True,
@@ -207,8 +190,6 @@ class RevisionPreflightTest(unittest.TestCase):
                 str(root),
                 "--ref",
                 "HEAD",
-                "--baseline-ref",
-                "HEAD",
             ],
             cwd=root,
             text=True,
@@ -244,41 +225,7 @@ class RevisionPreflightTest(unittest.TestCase):
             result.stdout.startswith("usage: kent-preflight-revision"),
             result.stdout,
         )
-
-    def add_required_adapter(self, root: Path) -> None:
-        profile = root / ".kent" / "workflow-profile.toml"
-        profile.write_text(
-            profile.read_text().replace(
-                "required_adapters = []",
-                'required_adapters = ["mobile_resource_lock"]',
-            )
-            + (
-                "\n[adapters]\n"
-                "mobile_resource_lock = "
-                '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
-            )
-        )
-        adapter = (
-            root
-            / ".kent"
-            / "adapters"
-            / "mobile"
-            / "emulator-resource-lock.sh"
-        )
-        adapter.parent.mkdir(parents=True)
-        adapter.write_text("#!/usr/bin/env bash\nexit 0\n")
-        adapter.chmod(0o755)
-        self.commit_all(root, "Add audited adapter contract")
-
-    def rev_parse(self, root: Path, revision: str) -> str:
-        result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", revision],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
-        return result.stdout.strip()
+        self.assertNotIn("--baseline-ref", result.stdout)
 
     def commit_all(self, root: Path, message: str) -> None:
         self.run_git(root, "add", "-A")

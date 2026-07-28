@@ -27,14 +27,6 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Local Git revision or exact commit selected for task execution.",
     )
-    parser.add_argument(
-        "--baseline-ref",
-        required=True,
-        help=(
-            "Audited Git revision whose profile and ancestry define the "
-            "minimum compatible project adapter."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -43,7 +35,6 @@ def main() -> int:
     result = preflight_project_revision(
         args.project,
         args.ref,
-        args.baseline_ref,
     )
     print(json.dumps(result.as_json(), indent=2, ensure_ascii=False))
     return 0

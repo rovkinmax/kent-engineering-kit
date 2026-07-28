@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 import subprocess
 from typing import Any
@@ -30,8 +30,6 @@ class RevisionPreflightResult:
     project: str
     requested_ref: str
     commit_oid: str
-    baseline_ref: str
-    baseline_commit_oid: str
     project_name: str
     workflow_prefix: str
     checked_paths: tuple[CheckedRevisionPath, ...]
@@ -45,11 +43,9 @@ class RevisionPreflightResult:
 def preflight_project_revision(
     project_root: Path,
     revision: str,
-    baseline_revision: str,
 ) -> RevisionPreflightResult:
     root = project_root.expanduser().resolve()
     requested_ref = normalize_revision(revision, "revision")
-    baseline_ref = normalize_revision(baseline_revision, "baseline revision")
 
     git_root = Path(
         run_git(root, "rev-parse", "--show-toplevel").stdout.strip()
@@ -65,37 +61,6 @@ def preflight_project_revision(
         "--verify",
         f"{requested_ref}^{{commit}}",
     ).stdout.strip()
-    baseline_commit_oid = run_git(
-        root,
-        "rev-parse",
-        "--verify",
-        f"{baseline_ref}^{{commit}}",
-    ).stdout.strip()
-    ancestry = run_git(
-        root,
-        "merge-base",
-        "--is-ancestor",
-        baseline_commit_oid,
-        commit_oid,
-        check=False,
-    )
-    if ancestry.returncode == 1:
-        raise RevisionPreflightError(
-            f"baseline {baseline_ref} ({baseline_commit_oid}) is not an "
-            f"ancestor of {requested_ref} ({commit_oid})"
-        )
-    if ancestry.returncode != 0:
-        detail = ancestry.stderr.strip() or ancestry.stdout.strip() or "no output"
-        raise RevisionPreflightError(
-            f"cannot compare baseline ancestry: {detail}"
-        )
-
-    baseline_profile_contents = read_blob(
-        root,
-        baseline_commit_oid,
-        PROFILE_PATH,
-        label="baseline project profile",
-    )
     profile_contents = read_blob(
         root,
         commit_oid,
@@ -103,12 +68,6 @@ def preflight_project_revision(
         label="project profile",
     )
     try:
-        baseline_profile = ProjectProfile.from_toml(
-            root,
-            baseline_profile_contents,
-            source=f"{baseline_ref}:{PROFILE_PATH}",
-            check_files=False,
-        )
         profile = ProjectProfile.from_toml(
             root,
             profile_contents,
@@ -118,38 +77,7 @@ def preflight_project_revision(
     except SpecError as error:
         raise RevisionPreflightError(str(error)) from error
 
-    differing_fields = profile_differences(baseline_profile, profile)
-    if differing_fields:
-        raise RevisionPreflightError(
-            f"project profile at {requested_ref} differs from audited baseline "
-            f"{baseline_ref}: {', '.join(differing_fields)}"
-        )
-
-    requirements: dict[str, dict[str, Any]] = {}
-
-    def require(path: str, label: str, *, executable: bool = False) -> None:
-        normalized = normalize_project_path(path, label)
-        entry = requirements.setdefault(
-            normalized,
-            {"labels": set(), "executable": False},
-        )
-        entry["labels"].add(label)
-        entry["executable"] = entry["executable"] or executable
-
-    require(PROFILE_PATH, "profile")
-    require(PROJECT_CONTRACT_PATH, "project_contract")
-    for key, path in baseline_profile.commands.items():
-        if path:
-            require(path, f"commands.{key}", executable=True)
-    for key, path in baseline_profile.procedures.items():
-        if path:
-            require(path, f"procedures.{key}")
-    for key in baseline_profile.required_adapters:
-        require(
-            baseline_profile.adapter(key),
-            f"adapters.{key}",
-            executable=True,
-        )
+    requirements = profile_requirements(profile)
 
     checked_paths = []
     for path, requirement in sorted(requirements.items()):
@@ -179,8 +107,6 @@ def preflight_project_revision(
         project=str(root),
         requested_ref=requested_ref,
         commit_oid=commit_oid,
-        baseline_ref=baseline_ref,
-        baseline_commit_oid=baseline_commit_oid,
         project_name=profile.project_name,
         workflow_prefix=profile.workflow_prefix,
         checked_paths=tuple(checked_paths),
@@ -200,16 +126,35 @@ def normalize_revision(revision: str, label: str) -> str:
     return normalized
 
 
-def profile_differences(
-    baseline: ProjectProfile,
-    selected: ProjectProfile,
-) -> tuple[str, ...]:
-    return tuple(
-        field.name
-        for field in fields(ProjectProfile)
-        if field.name != "project_root"
-        and getattr(baseline, field.name) != getattr(selected, field.name)
-    )
+def profile_requirements(
+    profile: ProjectProfile,
+) -> dict[str, dict[str, Any]]:
+    requirements: dict[str, dict[str, Any]] = {}
+
+    def require(path: str, label: str, *, executable: bool = False) -> None:
+        normalized = normalize_project_path(path, label)
+        entry = requirements.setdefault(
+            normalized,
+            {"labels": set(), "executable": False},
+        )
+        entry["labels"].add(label)
+        entry["executable"] = entry["executable"] or executable
+
+    require(PROFILE_PATH, "profile")
+    require(PROJECT_CONTRACT_PATH, "project_contract")
+    for key, path in profile.commands.items():
+        if path:
+            require(path, f"commands.{key}", executable=True)
+    for key, path in profile.procedures.items():
+        if path:
+            require(path, f"procedures.{key}")
+    for key in profile.required_adapters:
+        require(
+            profile.adapter(key),
+            f"adapters.{key}",
+            executable=True,
+        )
+    return requirements
 
 
 def normalize_project_path(path: str, label: str) -> str:
