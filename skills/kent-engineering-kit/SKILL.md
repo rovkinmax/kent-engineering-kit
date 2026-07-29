@@ -167,6 +167,11 @@ generated toolkit workflows.
 - Only the post-Join gate selects Fix, QA, Ship, or Needs User Action.
 - Generated Standards, Specification, and Compliance stages own final review.
   Implement and Fix must not duplicate them through nested final reviewers.
+- Plan checkboxes contain only writer-owned implementation slices and their
+  deterministic checks. Record runtime Smoke and other graph-owned stages in a
+  separate workflow-verification section without implementation checkboxes.
+  Existing legacy checkboxes for those stages are handoff scope and do not
+  prevent Implement from advancing to verification.
 - Standards, Specification, and Compliance are leaf sessions. They must not
   call `kent run` or delegate their review to child agents.
 - Standards review pins the comparison baseline. A repository-wide analyzer

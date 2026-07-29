@@ -174,6 +174,18 @@ class WorkflowKitTest(unittest.TestCase):
             ("workspace_path", "plan_path", "work_kind"),
         )
         self.assertEqual(implementation_edges["verify"].target, "verification_dispatch")
+        self.assertIn(
+            "exactly one ready writer-owned plan step",
+            continuation.prompt,
+        )
+        self.assertIn(
+            "acquire a device",
+            continuation.prompt,
+        )
+        self.assertIn(
+            "when every writer-owned plan step is complete",
+            continuation.prompt,
+        )
         self.assertEqual(by_key["plan_implement"].context, "new_session")
         self.assertEqual(by_key["gate_fix"].context, "new_session")
         self.assertEqual(by_key["gate_fix"].context_source, "immediate_source")
@@ -194,6 +206,10 @@ class WorkflowKitTest(unittest.TestCase):
         for key in ("implement_needs_user_action", "fix_needs_user_action"):
             self.assertEqual(by_key[key].context, "new_session")
             self.assertIn("fresh bounded session", by_key[key].prompt)
+        self.assertIn(
+            "legacy plan renders them as unchecked entries",
+            by_key["implement_needs_user_action"].prompt,
+        )
         for key in (
             "plan_needs_user_action",
             "smoke_needs_user_action",

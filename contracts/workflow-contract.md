@@ -8,7 +8,9 @@ device, source-control, issue-tracker, and release adapters.
 - Kent task state owns workflow lifecycle.
 - Kent owns the selected execution target, execution root, and resolved Git
   commit. Project metadata must not mirror those facts.
-- A project artifact may own implementation-step progress.
+- A project artifact may own writer-owned implementation-step progress.
+  Workflow-owned Standards, Specification, Gate, Smoke, Compliance, PR, CI,
+  and Cleanup work is never an implementation checkbox prerequisite.
 - Recoverable blockers use approval-gated `needs_user_action` self-loops.
 - A post-Join blocker may approval-loop through verification dispatch so every
   read-only branch reruns with fresh state.
@@ -35,8 +37,11 @@ device, source-control, issue-tracker, and release adapters.
 - A fresh writer treats the preserved worktree, authoritative
   design/specification/plan, exact task-comment IDs, existing evidence, and
   structured transition parameters as its complete handoff.
-- Each fresh Implement session completes one ready plan step. Each fresh Fix
-  session completes one independently verifiable fix slice and uses
+- Each fresh Implement session completes one ready writer-owned plan step.
+  Unchecked workflow-owned verification or delivery items in a legacy plan are
+  handoff scope, not writer work; when no writer-owned step remains, Implement
+  transitions to verification. Each fresh Fix session completes one
+  independently verifiable fix slice and uses
   `continue_fix` with only the remaining findings when more work remains.
 - Recovery-aware Plan may adopt an explicit checkpoint commit and source task.
   It verifies the checkout, updates one authoritative artifact set, records

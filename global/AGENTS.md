@@ -85,6 +85,11 @@
 - Workflow-owned Standards, Specification, and Compliance reviewers are leaf
   sessions. They complete their bounded pass directly and never start child
   agents.
+- Plan checkboxes track writer-owned implementation only. Runtime Smoke and
+  other workflow-owned review/delivery stages are recorded as downstream scope,
+  not unchecked implementation prerequisites. A writer encountering such a
+  legacy checkbox carries it into verification context instead of executing or
+  marking it complete.
 - Prefer independently verifiable vertical slices. Treat broad mechanical
   refactors as expand-migrate-contract work when slices cannot stay green.
 - Do not commit, push, publish, flash hardware, or perform other irreversible

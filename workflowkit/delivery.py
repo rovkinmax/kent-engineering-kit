@@ -879,8 +879,12 @@ def recovery_edge(
 Reconcile any declared checkpoint and source task into authoritative
 design/specification/plan artifacts before selecting implementation work.""",
             "implement": """
-Implement exactly one unchecked ready plan step. Update the plan before
-choosing `continue_implementation` for another fresh writer session.""",
+Implement exactly one unchecked ready writer-owned plan step. Runtime Smoke and
+other workflow-owned review or delivery items are downstream scope even when a
+legacy plan renders them as unchecked entries. Do not execute or mark those
+items complete. Update the plan before choosing `continue_implementation` for
+another fresh writer session; choose `verify` when no writer-owned step
+remains.""",
             "fix": """
 Apply exactly one independently verifiable remaining fix slice. Update the
 authoritative fix checklist. Choose `continue_fix` with `workspace_path` and a
@@ -1085,17 +1089,24 @@ and plan progress. This generated workflow's completion contract overrides any
 legacy procedure transition names such as `audit`.
 {fresh_contract}
 
-Act as the single writer and implement exactly one ready plan step per node run.
+Act as the single writer and implement exactly one ready writer-owned plan step
+per node run. Writer-owned steps change code, tests, configuration,
+documentation, or run their deterministic checks. Runtime Smoke and other
+workflow-owned review or delivery items are downstream scope, even when a
+legacy plan accidentally renders them as unchecked checklist entries. Do not
+acquire a device, build/install for Smoke, execute those stages, or mark their
+items complete.
 Do not launch nested final Standards, Specification, Compliance, or
 project-specialized review passes; the generated verification graph owns those
 independent reviews. Bounded implementation, research, and diagnosis
 delegation remains allowed.
 After marking that step complete, choose `continue_implementation` with
 `workspace_path`, `plan_path`, and the unchanged `work_kind` when unchecked
-ready steps remain. Choose
-`verify` only when every required plan step is complete; provide
+writer-owned ready steps remain. Choose
+`verify` when every writer-owned plan step is complete; provide
 `workspace_path` plus `review_context` summarizing plan/spec paths, the fixed
-comparison point, changed files, checks, and risks for the read-only branches.
+comparison point, changed files, checks, risks, and any downstream runtime
+acceptance scope for the read-only branches and Gate.
 Use `needs_user_action` only for an external blocker and provide
 `blocker_reason` plus the unchanged `work_kind`. Choose `wont_do` only for
 explicit cancellation and provide `closure_reason`."""
