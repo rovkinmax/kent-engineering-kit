@@ -33,6 +33,36 @@ safe_output="$("$adapter" "$safe_dir" "$package_name")"
 [[ "$safe_output" == *"evidence_audit_status=passed"* ]]
 [[ "$safe_output" == *"files_scanned=2"* ]]
 
+image_dir="$temporary/image"
+mkdir -p "$image_dir"
+image_base64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXJgAAAABJRU5ErkJggg=='
+if printf '%s' "$image_base64" | base64 --decode \
+  >"$image_dir/settings-toggle.png" 2>/dev/null; then
+  :
+else
+  printf '%s' "$image_base64" | base64 -D \
+    >"$image_dir/settings-toggle.png"
+fi
+image_output="$("$adapter" "$image_dir" "$package_name")"
+[[ "$image_output" == *"evidence_audit_status=passed"* ]]
+[[ "$image_output" == *"files_scanned=1"* ]]
+
+invalid_image_dir="$temporary/invalid-image"
+mkdir -p "$invalid_image_dir"
+printf 'not a screenshot\n' >"$invalid_image_dir/settings-toggle.png"
+expect_unsafe "$invalid_image_dir" "invalid_image_content" >/dev/null
+
+empty_summary_dir="$temporary/empty-summary"
+mkdir -p "$empty_summary_dir"
+: >"$empty_summary_dir/smoke-summary.txt"
+expect_unsafe "$empty_summary_dir" "empty_required_evidence" >/dev/null
+
+empty_signal_dir="$temporary/empty-signal"
+mkdir -p "$empty_signal_dir"
+: >"$empty_signal_dir/fatal-anr-summary.txt"
+empty_signal_output="$("$adapter" "$empty_signal_dir" "$package_name")"
+[[ "$empty_signal_output" == *"evidence_audit_status=passed"* ]]
+
 logcat_dir="$temporary/logcat"
 mkdir -p "$logcat_dir"
 printf 'Harmless content still represents a forbidden broad-log artifact.\n' \

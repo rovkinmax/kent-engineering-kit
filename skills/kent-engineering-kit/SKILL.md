@@ -22,7 +22,7 @@ generated toolkit workflows.
 - MCP call logs retain metadata, while ordinary stdout remains in Kent's shell
   transcript. Use `--quiet`, `--digest-output`, or output assertions for
   sensitive calls. Use `--save-raw` or `--raw-dir` only for known-safe
-  evidence; never emit or retain an unexpected authenticated UI tree.
+  evidence; never emit or retain a broad authenticated UI tree.
 - Use canonical role keys from the profile. Role implementations remain
   project-local unless the role is explicitly global.
 
@@ -48,6 +48,8 @@ generated toolkit workflows.
   upstream transitions. Do not replace it with a manual move or a new task.
 - Follow `contracts/worktree-contract.md` when a project needs setup hooks or
   untracked machine configuration.
+- Follow `contracts/mobile-smoke-contract.md` for runtime inspection,
+  side-effect authorization, evidence retention, and durable recovery context.
 - For Android runtime Smoke, require the declared project-local
   `mobile_resource_lock` adapter before any install, launch, input, or log
   action. Use an explicit serial for every direct adb and target-specific
@@ -63,10 +65,44 @@ generated toolkit workflows.
   Prefer `--quiet` for actions, assertions for known UI facts, and
   `--digest-output` for before/after equivalence. Use `--hash-matches` plus
   `--marker-present` for opaque semantic-key inventories and final-page proof.
-  Do not request a full authenticated UI tree through raw stdout.
+  Do not request a broad authenticated UI tree through raw stdout.
+- On an acquired test emulator, bounded inspection and safe navigation of an
+  already-authenticated app UI are allowed without another user question.
+  Authentication alone is not a blocker. Local focus movement, scrolling,
+  Back, and opening or closing screens, dialogs, drawers, and menus do not
+  count as external side effects.
+- Directional UI navigation is target-aware: establish runtime focus, inspect
+  UI source or semantic ordering, compute an exact bounded route when possible,
+  execute it in one call, and verify the destination once. Replan on mismatch;
+  otherwise use adaptive bursts and single-step only near the target. Never
+  spend a model turn per key or send an ungrounded fixed loop. Prefer semantic
+  control interaction and test directional focus separately when required.
+- For mutable controls, prove identity and focus, state before and after
+  activation, the intended local effect, and restoration. Visibility alone
+  cannot support a Smoke pass. If semantics omit state, use bounded screenshots
+  or visual inspection without asking the user. On a project-declared
+  non-production stage/test environment with synthetic data, scoped screenshots
+  may be retained in the ignored evidence directory and audited without
+  approval.
+- Allocate evidence before device work. Runtime proves rendering,
+  focus/navigation, integration, restoration, and liveness; deterministic tests
+  prove non-observable defaults, classification, filtering, paging, and state
+  transitions. Use mixed evidence unless explicit end-to-end acceptance says
+  otherwise. Do not clear profiles, require fixtures, or add test-only product
+  semantics merely to duplicate deterministic proof.
+- Required summary, report, and checklist artifacts must be non-empty before
+  evidence audit and completion.
+- Unless the task body or a durable task comment explicitly authorizes an
+  exception, do not retain broad/raw UI dumps, screenshots from production or
+  unknown environments, physical devices, foreign apps, credentials, or
+  secrets. Do not enter credentials, use a physical device, or perform
+  account-, server-, or otherwise externally observable state changes. Persist
+  any user-granted exception as a scoped task comment before recovery or
+  compaction.
 - Require the project-local `mobile_evidence_audit` before completing runtime
-  Smoke. Persist only scoped, sanitized evidence; unexpected authenticated or
-  sensitive state becomes a redacted blocker.
+  Smoke. Persist only scoped, sanitized evidence. Sensitive state becomes a
+  redacted blocker only when the required test cannot remain within the default
+  inspection boundary.
 - Preview generated workflows without `--apply`.
 - Apply versioned workflows non-default first. Use `--set-default` only after a
   managed-worktree canary passes.

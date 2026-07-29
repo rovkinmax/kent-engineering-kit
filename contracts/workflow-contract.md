@@ -240,6 +240,24 @@ device, source-control, issue-tracker, and release adapters.
   broad runtime scopes into explicit stages or request focused manual evidence.
   If a durable user comment already supplies the only missing observation,
   consume it without rebuilding, reinstalling, or repeating navigation.
+- Runtime interaction evidence follows `mobile-smoke-contract.md`.
+  Source-derived exact focus routes and target-aware adaptive bursts are valid;
+  ungrounded fixed loops, one model turn per key, and visibility-only
+  assertions are not. A user-reported contradiction must be resolved by
+  focused evidence before Compliance can advance delivery.
+- Focused screenshots are normal Smoke inspection and require no approval.
+  Scoped screenshots from a project-declared non-production stage/test
+  environment with synthetic data may be retained as audited workflow evidence.
+  Other retention and external publication follow `mobile-smoke-contract.md`.
+- Gate and Smoke allocate evidence by modality. Runtime covers rendering,
+  focus/navigation, integration, restoration, and liveness. Passing
+  deterministic evidence may cover non-observable defaults, classification,
+  filtering, paging, and state transitions unless explicit end-to-end
+  acceptance requires runtime proof. The workflow never demands profile reset,
+  special fixtures, or test-only product semantics merely to duplicate that
+  evidence.
+- Required summary, report, and checklist artifacts are non-empty before
+  Compliance accepts them.
 - Persist a concise checkpoint before a long Smoke continuation so resume does
   not repeat completed lock, build, install, targeting, or evidence work.
 - A deterministic project-local evidence audit must pass before Smoke reports

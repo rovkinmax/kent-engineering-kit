@@ -136,6 +136,12 @@ owns real task history and provides rollback.
   procedures, and adapters.
 - Observe ordinary default tasks across delivery-ready, Smoke, Fix, CI, and PR
   feedback paths.
+- Add an evidence-repair lane for packaging-only Compliance failures. When the
+  source diff and substantive verification are already green, Fix should repair
+  only missing, empty, or contradictory reports/checklists, rerun the evidence
+  audit, and return directly to final Compliance. It must not repeat source
+  verification, rebuild/reinstall the app, or reacquire an emulator unless the
+  repaired artifact changes the underlying acceptance result.
 - Move the Appsome project adapter from `release/4.29.0` into `master`; until
   then, start generated Appsome workflows only from audited adapter commit
   `b6fd03e1f15dc49bbe9431955062699f8bf6bfb0` or its descendants.

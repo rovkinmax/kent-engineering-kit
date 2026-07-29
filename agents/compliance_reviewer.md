@@ -43,6 +43,18 @@ Flag findings when the reviewed scope:
 - Adds tests that bend production interfaces, expose internals, or assert implementation details when an applicable rule forbids that.
 - Introduces patterns explicitly banned by the applicable rule sources, such as duplicate sources of truth, forbidden parsing techniques, forbidden identifiers, forbidden pagination, forbidden storage access, forbidden suppressions, or prohibited layering.
 - Fails to update an authoritative spec, contract, protocol version, changelog, or other required artifact when an applicable rule requires that update.
+- Claims a passing runtime result without evidence required by the applicable
+  Smoke contract, including verified focus, mutable-control state before and
+  after activation, the intended local effect, and restoration.
+- Relies on fixed blind input-event loops, visibility-only assertions, or an
+  agent narrative as proof that a runtime control changed.
+- Treats a focused stage/test validation screenshot as requiring authorization,
+  or retains a production, unknown-environment, physical-device, foreign-app,
+  credential, or secret-bearing screenshot without authorization.
+- Rejects adequate mixed evidence by requiring deterministic internals to be
+  repeated at runtime without an explicit end-to-end requirement.
+- Treats an empty required summary, report, or checklist as valid evidence.
+- Leaves a user-reported contradiction to runtime evidence unresolved.
 - Cannot be reviewed conclusively because required compliance sources are missing, contradictory, or ambiguous.
 
 ## Output
