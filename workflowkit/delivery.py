@@ -683,6 +683,19 @@ def build_delivery_workflow(
         edges.extend(
             [
                 EdgeSpec(
+                    key="fix_pr_merged_cleanup",
+                    source="fix",
+                    transition="pr_merged",
+                    target="cleanup",
+                    context="new_session",
+                    prompt=cleanup_prompt(profile, merged=True),
+                    transition_description=(
+                        "Recovery only: the pull request is already merged; "
+                        "skip obsolete Fix work and clean up."
+                    ),
+                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_REPORT),
+                ),
+                EdgeSpec(
                     key="waiting_pr_cleanup",
                     source="waiting_pr",
                     transition="pr_merged",

@@ -504,6 +504,15 @@ class WorkflowKitTest(unittest.TestCase):
             "task-differential evidence",
             by_key["prepare_pr_ci_monitor"].prompt,
         )
+        self.assertEqual(by_key["fix_pr_merged_cleanup"].transition, "pr_merged")
+        self.assertEqual(by_key["fix_pr_merged_cleanup"].target, "cleanup")
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["fix_pr_merged_cleanup"].parameters
+            ),
+            ("workspace_path", "pr_url", "branch_name", "merge_report"),
+        )
         self.assertTrue(by_key["waiting_pr_needs_user_action"].requires_approval)
         self.assertEqual(
             tuple(

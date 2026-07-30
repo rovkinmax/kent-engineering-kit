@@ -233,6 +233,10 @@ device, source-control, issue-tracker, and release adapters.
   regression is tracked as a separate follow-up task. While a PR remains open,
   `needs_changes` requires task-differential evidence. Baseline, flaky,
   unrelated, or unattributed failures use `needs_user_action`.
+- Fix exposes a `pr_merged` recovery edge to Cleanup for a task that was
+  already delivered before stale or late workflow routing reached the writer.
+  The edge requires authoritative PR URL, branch, and merge proof; it never
+  resumes implementation or repeats verification on the merged task branch.
 - Task-backed workflows keep their recorded PR prompts. Apply this contract in
   a new non-default workflow and canary it before promotion.
 
