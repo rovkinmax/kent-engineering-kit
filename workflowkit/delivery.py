@@ -644,6 +644,23 @@ def build_delivery_workflow(
                         ),
                     ),
                     EdgeSpec(
+                        key="ci_monitor_merged",
+                        source="ci_monitor",
+                        transition="pr_merged",
+                        target="cleanup",
+                        prompt=cleanup_prompt(profile, merged=True),
+                        transition_description=(
+                            "The pull request merged before CI observation "
+                            "completed; preserve late check state and clean up."
+                        ),
+                        parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_REPORT,
+                        ),
+                    ),
+                    EdgeSpec(
                         key="ci_monitor_fix",
                         source="ci_monitor",
                         transition="needs_changes",
@@ -1048,6 +1065,12 @@ Task body:
 Keep discovery, design/spec ingestion, decisions, and implementation planning in
 this one Plan session. Ask questions when a product decision is required. Do not
 invoke nested prompt flows and do not implement production changes.
+Any design, specification, or plan that narrows, replaces, or claims to
+supersede the task body must cite the exact human-authored task-comment ID or
+another explicit authoritative source. Agent-authored comments, implementation
+inference, and unsupported claims that "the user clarified" are not product
+authority. Use `needs_user_action` before implementation when that provenance
+is absent.
 {recovery_contract}
 
 Complete with `implement` only when the plan has no unresolved product, API, UX,
@@ -1199,7 +1222,13 @@ Inspect the change against repository architecture, engineering rules, security,
 and maintainability constraints. Do not edit files and do not run destructive
 commands. Findings are data for Join, not a routing decision.
 
-Pin the comparison baseline named by the review context or repository contract.
+Pin the immutable task baseline named by the review context or repository
+contract. Use the task fixed point or Kent-resolved execution commit for
+task-delta review; do not substitute a newer merge-target tip. Target-only
+commits added after task start are integration inputs, not task regressions.
+Classify them only when a three-way merge or method-specific replay proves a
+conflict or delivered-tree loss. Never request copying unrelated target files
+into the task diff merely because the task checkout predates them.
 For a whole-repository analyzer or quality gate that fails on the candidate,
 establish whether the same command or equivalent machine-readable findings fail
 on that baseline. A changed file or touched method is not proof that an analyzer
@@ -1234,6 +1263,18 @@ Read the task body, plan/spec artifacts named in the review context, and
 Check acceptance criteria, product behavior, edge cases, and scope fidelity
 independently from repository standards. Do not edit files. Findings are data
 for Join, not a routing decision.
+
+A design, specification, or plan may narrow or supersede the task body only
+when it cites the exact human-authored task-comment ID or another explicit
+authoritative source. Agent-authored summaries and unsupported claims that
+"the user clarified" are not authority. Report missing provenance as
+`blocked`; do not accept the narrowed scope or route it to writer Fix.
+
+Use the task fixed point or Kent-resolved execution commit for task-delta scope,
+not a newer merge-target tip. Missing target-only commits in an older task
+checkout are not specification regressions unless a three-way merge or
+method-specific replay proves delivered-tree loss. Do not request copying
+unrelated target files into the task diff.
 
 Complete only with `reported`. Provide `spec_status` as exactly `passed`,
 `needs_changes`, or `blocked`, plus `review_report` with evidence and concrete
@@ -1273,6 +1314,8 @@ Choose a delivery transition only when every enabled status is `passed`.
 Choose `needs_changes` only when a report proves concrete task-introduced or task-worsened findings.
 Do not convert a whole-repository analyzer failure,
 pre-existing baseline debt, or an unproven differential into writer work.
+Do not convert target-only commits missing from an older task checkout into
+writer work without a proven merge/replay conflict or delivered-tree loss.
 Repository-policy contradictions and unavailable mandatory baseline evidence
 route to `needs_user_action`, not Fix.
 Provide `workspace_path`, a refreshed `review_context` summarizing all reports,
@@ -1333,6 +1376,11 @@ completed with adequate evidence; confirm that a Smoke bypass has a concrete
 rationale; and check that no unresolved blocker, approval, unauthorized
 rule/spec change, or workflow obligation remains. Do not edit files or perform
 state-changing actions.
+
+A specification or plan may narrow or supersede the task body only with an
+exact human-authored task-comment ID or another explicit authoritative source.
+Agent-authored summaries and unsupported claims that "the user clarified" are
+not product authority.
 
 Choose `ship_pr` only when the final work product is compliant. Provide
 `workspace_path`, a complete `review_context`, and `compliance_report`. Choose
@@ -1449,15 +1497,24 @@ Workspace: {{{{.Params.workspace_path}}}}
 {procedure_instruction(profile, "ci")}
 
 Use bounded polling and the project source-control adapter. Never merge or push.
-Revalidate the resolved method against current repository capabilities, target
-branch rules, merge queue, and PR state. For GitHub rebase delivery,
+Query authoritative PR merge state before classifying any failed or late check.
+If the PR is already merged, never route the merged task branch to Fix. Complete
+with `pr_merged` and provide `workspace_path`, `pr_url`, `branch_name`, and a
+`merge_report` that includes merge proof plus the late CI state. Any actionable
+post-merge regression belongs in a separate follow-up task.
+
+While the PR remains open, revalidate the resolved method against current
+repository capabilities, target branch rules, merge queue, and PR state. For
+GitHub rebase delivery,
 `canBeRebased=true` is required; generic `MERGEABLE/CLEAN` is insufficient.
 Complete with `waiting_pr` only when all required checks are conclusively green
 and the selected method remains feasible. Provide `workspace_path`, `pr_url`,
 `branch_name`, `merge_strategy`, and `ci_report`. Use `needs_changes` with
-`workspace_path` and `fix_context` for task-code or task-history failures. Use
-`needs_user_action` with `blocker_reason` for external failures, policy
-ambiguity, or access problems."""
+`workspace_path` and `fix_context` only when task-differential evidence proves
+the task introduced or worsened a code or history failure. Baseline, flaky,
+unrelated, or unattributed failures use `needs_user_action` with
+`blocker_reason`, as do external failures, policy ambiguity, or access
+problems."""
 
 
 def waiting_pr_prompt(profile: ProjectProfile) -> str:

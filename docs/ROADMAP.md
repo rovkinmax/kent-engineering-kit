@@ -142,6 +142,30 @@ owns real task history and provides rollback.
   audit, and return directly to final Compliance. It must not repeat source
   verification, rebuild/reinstall the app, or reacquire an emulator unless the
   repaired artifact changes the underlying acceptance result.
+- PUB-37 showed that Plan can invent product authority by writing "the user
+  clarified" into a specification without an exact human-authored comment.
+  Enforce authority provenance in Plan, Specification Review, and Compliance:
+  task-body narrowing requires an exact human comment ID or another explicit
+  authoritative source and otherwise blocks before implementation.
+- Waiting PR currently has no external merge wake-up signal. A merged PR still
+  needs one user-approved recheck before Cleanup, while approving before merge
+  merely loops back to Waiting PR. Keep the current explicit gate for safety,
+  but prototype a low-cost deterministic poll or Kent/GitHub event integration
+  that wakes only on changed PR state and does not burn an agent session.
+- PUB-37 proved that report-only Cleanup does not match the desired operating
+  model: the task reached Done after merge while its managed worktree and local
+  task branch remained. Add a two-phase task-owned janitor that runs only after
+  the resource-owning session exits. It must prove the PR is merged, the remote
+  task branch is absent or safely deletable, and every dirty/untracked path is
+  either ignored evidence or byte-equivalent to the current merged target
+  before removing the managed worktree and local task branch. Preserve and
+  report any unique unmerged content instead of deleting it.
+- OSM-33 showed a late-CI routing failure: GitHub merged PR #1537, then the
+  existing CI node observed an unrelated UI-test failure and returned the
+  already delivered task to Fix. CI must query merge state first, must not
+  mutate a merged delivery, and needs task-differential evidence before
+  labeling any open-PR failure task-scoped. Track actionable post-merge
+  failures as separate follow-up tasks.
 - Move the Appsome project adapter from `release/4.29.0` into `master`; until
   then, start generated Appsome workflows only from audited adapter commit
   `b6fd03e1f15dc49bbe9431955062699f8bf6bfb0` or its descendants.

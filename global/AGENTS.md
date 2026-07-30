@@ -6,14 +6,21 @@
   recommendation and keep final authority with the user.
 - For hard bugs, establish a deterministic command that reproduces the exact
   symptom before changing production code.
-- Before reviewing changes, pin the comparison baseline and identify the
-  specification or acceptance criteria.
+- Before reviewing changes, pin the immutable task baseline and identify the
+  specification or acceptance criteria. Keep that task baseline distinct from
+  a moving PR merge target. Target-only commits added after task start are
+  integration inputs, not task regressions, unless merge/replay evidence proves
+  conflict or delivered-tree loss.
 - Review repository standards and specification fidelity independently so one
   axis cannot hide failures in the other.
 - Treat reviewer shell access as inspection-only. Kent's shell is not a
   sandbox or a tool-enforced read-only boundary.
 - Store each durable decision in one authoritative artifact. Reference it
   elsewhere instead of copying it.
+- A specification or plan may narrow, replace, or claim to supersede the task
+  body only when it cites the exact human-authored task-comment ID or another
+  explicit authoritative source. Agent-authored summaries and unsupported
+  phrases such as "the user clarified" do not create product authority.
 - When `kent worktree` is available in Kent 2.3 or newer, use it for
   Kent-managed worktrees. On older Kent versions, do not manipulate managed
   worktrees directly; follow the project's documented worktree procedure.
@@ -82,6 +89,11 @@
   Required summary, report, and checklist artifacts must be non-empty.
   Smoke must not mark its checklist item complete or claim a pass when it
   returns a blocker or findings transition; Kent task state is authoritative.
+- Runtime target selection enforces the declared form factor before acquisition.
+  Never pass an unfiltered mixed phone/TV/watch/automotive list to
+  `acquire-any`; acquire an eligible exact serial and verify its identity.
+  Evidence setup fails fast, and agents use the patch tool instead of invoking a
+  shell `apply_patch`.
 - Workflow-owned Standards, Specification, and Compliance reviewers are leaf
   sessions. They complete their bounded pass directly and never start child
   agents.

@@ -71,6 +71,12 @@ is reported but not assigned to the task writer. If an explicit absolute-clean
 policy contradicts the baseline repository state, the review reports a policy
 blocker for user resolution instead of manufacturing a broad Fix scope.
 
+The pinned task baseline is the task fixed point or Kent-resolved execution
+commit, not a newer merge-target tip. Standards and Specification reviewers
+assess target drift separately through three-way merge or method-specific replay
+evidence. Missing target-only commits in an older checkout never authorize Fix
+by themselves.
+
 Changing this contract or generator prompt does not mutate a task-backed live
 workflow. Existing graph definitions remain frozen. A project revision may
 enforce the rule through its project contract for new tasks that select that

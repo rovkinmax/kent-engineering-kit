@@ -11,11 +11,30 @@ mkdir -p "$temporary/bin"
 
 cat >"$temporary/bin/adb" <<'ADB'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-s" ]]; then
+  serial="$2"
+  shift 2
+  if [[ "${1:-}" == "shell" && "${2:-}" == "getprop" ]]; then
+    property="${3:-}"
+    cat >/dev/null
+    case "$serial:$property" in
+      emulator-5554:ro.build.characteristics) printf 'emulator\n' ;;
+      emulator-5554:ro.product.model) printf 'sdk_google_atv64_amati_arm64\n' ;;
+      emulator-5554:ro.product.name) printf 'sdk_google_atv64_amati_arm64\n' ;;
+      emulator-5556:ro.build.characteristics) printf 'emulator\n' ;;
+      emulator-5556:ro.product.model) printf 'sdk_gphone64_arm64\n' ;;
+      emulator-5556:ro.product.name) printf 'sdk_gphone64_arm64\n' ;;
+      *) exit 1 ;;
+    esac
+    exit 0
+  fi
+fi
 cat <<'DEVICES'
 List of devices attached
 emulator-5554	device product:sdk model:sdk transport_id:1
 physical-123	device product:phone model:phone transport_id:2
-emulator-5556	offline product:sdk model:sdk transport_id:3
+emulator-5556	device product:sdk model:sdk transport_id:3
+emulator-5558	offline product:sdk model:sdk transport_id:4
 
 DEVICES
 ADB
@@ -72,7 +91,14 @@ winner="${winner_status##*-}"
 winner_token="$(cat "$contention_dir/token-$winner")"
 "$adapter" release emulator-5560 "$winner_token"
 
-[[ "$("$adapter" adb-emulators)" == "emulator-5554" ]]
+[[ "$("$adapter" adb-emulators)" == $'emulator-5554\nemulator-5556' ]]
+[[ "$("$adapter" adb-emulators tv)" == "emulator-5554" ]]
+[[ "$("$adapter" adb-emulators phone)" == "emulator-5556" ]]
+set +e
+"$adapter" adb-emulators toaster >/dev/null 2>&1
+invalid_form_factor_status=$?
+set -e
+[[ "$invalid_form_factor_status" -eq 64 ]]
 [[ "$("$adapter" adb-physical-devices)" == "physical-123" ]]
 
 stale_token="$("$adapter" acquire emulator-5554 0 7200)"

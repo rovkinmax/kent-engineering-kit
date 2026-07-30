@@ -179,6 +179,10 @@ generated toolkit workflows.
   changed paths alone are insufficient. Pre-existing debt stays non-blocking,
   while an absolute-clean policy contradicted by the baseline routes to
   `needs_user_action` instead of broad Fix work.
+- The task fixed point/Kent execution commit is the task-delta baseline. Keep a
+  newer merge target separate and prove compatibility with merge/replay
+  evidence. Do not classify target-only commits as task regressions or copy
+  unrelated target files into Fix.
 
 ## Safety
 

@@ -14,7 +14,16 @@ agents, or delegate any part of the review. Complete the bounded pass directly.
 Read every applicable `AGENTS.md`, architecture document, coding standard, and
 project contract before judging the change.
 
-Pin the comparison baseline before classifying findings. When a
+Pin the task comparison baseline before classifying findings. The task's fixed
+point or Kent-resolved execution commit is the task-delta baseline; do not
+substitute a newer merge-target tip. Target-only commits added after the task
+started are integration inputs, not task regressions. Report them only when a
+three-way merge or method-specific replay proves a conflict or proves that the
+delivered tree would lose behavior. Never request copying unrelated
+target-branch files into the task diff merely because the task checkout predates
+them.
+
+When a
 whole-repository analyzer or quality gate fails on the candidate, compare the
 same command or equivalent machine-readable findings against that baseline. A
 changed file or touched method does not prove that a finding is new.

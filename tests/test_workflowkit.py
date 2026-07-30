@@ -186,6 +186,10 @@ class WorkflowKitTest(unittest.TestCase):
             "when every writer-owned plan step is complete",
             continuation.prompt,
         )
+        self.assertIn(
+            "exact human-authored task-comment ID",
+            by_key["start_plan"].prompt,
+        )
         self.assertEqual(by_key["plan_implement"].context, "new_session")
         self.assertEqual(by_key["gate_fix"].context, "new_session")
         self.assertEqual(by_key["gate_fix"].context_source, "immediate_source")
@@ -309,13 +313,24 @@ class WorkflowKitTest(unittest.TestCase):
             "changed file or touched method",
             "baseline debt",
             "repository-policy contradiction",
+            "do not substitute a newer merge-target tip",
+            "Target-only\ncommits",
         ):
             self.assertIn(expected, standards_prompt)
+        spec_prompt = by_key["dispatch_spec_review"].prompt or ""
+        for expected in (
+            "task fixed point",
+            "Missing target-only commits",
+            "Do not request copying",
+        ):
+            self.assertIn(expected, spec_prompt)
         for expected in (
             "task-introduced or task-worsened",
             "whole-repository analyzer failure",
             "unproven differential",
             "route to `needs_user_action`, not Fix",
+            "target-only commits",
+            "merge/replay conflict",
         ):
             self.assertIn(expected, gate_prompt)
 
@@ -471,6 +486,23 @@ class WorkflowKitTest(unittest.TestCase):
                 "merge_strategy",
                 "ci_report",
             ),
+        )
+        self.assertEqual(by_key["ci_monitor_merged"].transition, "pr_merged")
+        self.assertEqual(by_key["ci_monitor_merged"].target, "cleanup")
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["ci_monitor_merged"].parameters
+            ),
+            ("workspace_path", "pr_url", "branch_name", "merge_report"),
+        )
+        self.assertIn(
+            "never route the merged task branch to Fix",
+            by_key["prepare_pr_ci_monitor"].prompt,
+        )
+        self.assertIn(
+            "task-differential evidence",
+            by_key["prepare_pr_ci_monitor"].prompt,
         )
         self.assertTrue(by_key["waiting_pr_needs_user_action"].requires_approval)
         self.assertEqual(
@@ -639,6 +671,14 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertTrue(by_key["compliance_wont_do"].requires_approval)
         self.assertIn(
             "thin final attestation",
+            by_key["gate_delivery_ready"].prompt,
+        )
+        self.assertIn(
+            "exact human-authored task-comment ID",
+            by_key["dispatch_spec_review"].prompt,
+        )
+        self.assertIn(
+            "exact human-authored task-comment ID",
             by_key["gate_delivery_ready"].prompt,
         )
         self.assertIn(

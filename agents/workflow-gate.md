@@ -11,6 +11,10 @@ runtime-policy evidence supplied by the workflow.
 
 - Do not edit files, rerun broad reviews, or start child agents.
 - Do not invent findings or waive a reported blocker.
+- Reject a purported task finding whose only evidence is that an older task
+  checkout lacks target-only commits added after its fixed point. Require
+  task-delta evidence or a proven merge/replay conflict; moving-target drift is
+  not writer work by itself.
 - Route task-scoped failures to Fix.
 - Route required runtime evidence to Smoke.
 - Route missing authority, external resources, or contradictory policy to user

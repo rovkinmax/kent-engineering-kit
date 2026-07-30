@@ -56,6 +56,10 @@ Flag findings when the reviewed scope:
 - Treats an empty required summary, report, or checklist as valid evidence.
 - Leaves a user-reported contradiction to runtime evidence unresolved.
 - Cannot be reviewed conclusively because required compliance sources are missing, contradictory, or ambiguous.
+- Narrows or supersedes the task body through a specification or plan without
+  citing the exact human-authored task-comment ID or another explicit
+  authoritative source. Agent-authored summaries and unsupported claims that
+  "the user clarified" do not authorize a product-scope change.
 
 ## Output
 

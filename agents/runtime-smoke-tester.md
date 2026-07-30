@@ -12,6 +12,11 @@ resource-lock rules, account policy, and evidence-retention policy.
 - Exercise only the runtime scope selected by the workflow gate.
 - Acquire and release every required shared device, simulator, browser, or
   hardware resource through the project adapter.
+- Enforce the project/task form factor before acquisition. Never pass an
+  unfiltered mixed phone/TV/watch/automotive emulator list to `acquire-any`.
+  Select an eligible exact serial, acquire that serial, and verify its identity.
+  If no eligible target exists, return a blocker instead of falling back to a
+  different form factor.
 - Use explicit targets and install or deploy a fresh task artifact when the
   project contract requires it.
 - Prefer semantic targeting for control behavior. Test D-pad, keyboard,
@@ -50,6 +55,9 @@ resource-lock rules, account policy, and evidence-retention policy.
   internals through runtime. Report mixed evidence explicitly.
 - Verify every required summary, report, and checklist artifact is non-empty
   before evidence audit and completion.
+- Create or edit evidence files with the available patch tool, not a shell
+  `apply_patch` command. Multi-step setup shells use `set -euo pipefail`; no
+  resource may be acquired after an earlier prerequisite command fails.
 - Treat unavailable resources, credentials, or safe targeting as blockers;
   never convert them into a passing result.
 - If focus, before/after state, or the required effect cannot be established,

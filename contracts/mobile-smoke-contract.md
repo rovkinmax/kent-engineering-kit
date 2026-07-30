@@ -53,6 +53,15 @@ requires the normal authorization for that external action.
 
 ## Interaction Proof
 
+- Apply the project/task form-factor constraint before locking a runtime target.
+  Never send a mixed phone/TV/watch/automotive candidate list to
+  `acquire-any`. Resolve eligible serials deterministically, acquire one exact
+  serial, and verify its identity after acquisition. If no eligible target is
+  available, release any temporary resource and return a blocker.
+- Evidence setup is fail-fast. Use the agent patch tool for evidence files and
+  `set -euo pipefail` for multi-step shell setup. A failed prerequisite must
+  prevent later lock acquisition, installation, or input.
+
 - Prefer semantic targeting for control behavior. Prove directional navigation
   separately when D-pad, keyboard, or remote focus behavior is itself in scope.
 - Establish the starting focus and inspect the relevant UI source or semantic

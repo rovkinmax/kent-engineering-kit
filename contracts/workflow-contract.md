@@ -60,7 +60,8 @@ device, source-control, issue-tracker, and release adapters.
 - `work_kind` — stable project-profile key selected once during Plan and
   preserved through every Implement slice
 - `spec_path`
-- `fixed_point`
+- `fixed_point` — immutable task-delta baseline, normally Kent's resolved
+  execution commit; it is distinct from the moving PR merge target
 - `changed_files`
 - `verification_report`
 - `review_report`
@@ -133,6 +134,13 @@ device, source-control, issue-tracker, and release adapters.
   task. An explicit absolute-clean policy that the baseline itself violates is
   a `blocked` policy contradiction and routes to user resolution, never broad
   Fix work.
+- Standards and Specification use `fixed_point` or the Kent-resolved execution
+  commit for task-delta review. The current merge-target tip is checked
+  separately for integration compatibility. Target-only commits added after the
+  fixed point are not task regressions unless a three-way merge or
+  method-specific replay proves a conflict or loss in the delivered tree.
+  Reviewers and Fix must not copy unrelated target files merely to make an old
+  task checkout resemble the moving target.
 
 ## Active feedback and recovery
 
@@ -146,6 +154,12 @@ device, source-control, issue-tracker, and release adapters.
   references the exact task-comment ID. Code, review context, and checkpoints
   refer to that artifact instead of creating independent copies of the
   decision.
+- A design, specification, or plan may narrow or supersede the task body only
+  with an exact human-authored task-comment ID or another explicit
+  authoritative source. Agent-authored comments, implementation inference, and
+  unsupported prose such as "the user clarified" are not authority. Plan or
+  Specification Review returns `needs_user_action` before implementation when
+  that provenance is missing.
 - Resource-owning nodes such as Smoke must release locks, preserve required
   authentication and app data, record whether any destructive action began,
   and finish evidence hygiene before returning `needs_changes`.
@@ -213,6 +227,12 @@ device, source-control, issue-tracker, and release adapters.
   the authorized final-tree invariant, and update only the task branch with
   force-with-lease. Any lease, tree, target-tip, or authorization mismatch
   returns `needs_user_action`.
+- CI checks authoritative PR state before classifying failures. If the PR is
+  already merged, a late failed check never returns the merged task to Fix;
+  Cleanup receives the merge proof and late-CI report, while any actionable
+  regression is tracked as a separate follow-up task. While a PR remains open,
+  `needs_changes` requires task-differential evidence. Baseline, flaky,
+  unrelated, or unattributed failures use `needs_user_action`.
 - Task-backed workflows keep their recorded PR prompts. Apply this contract in
   a new non-default workflow and canary it before promotion.
 
