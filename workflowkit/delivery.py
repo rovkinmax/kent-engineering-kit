@@ -1510,7 +1510,16 @@ Workspace: {{{{.Params.workspace_path}}}}
 
 {procedure_instruction(profile, "ci")}
 
-Use bounded polling and the project source-control adapter. Never merge or push.
+Use the project source-control adapter. Never merge or push. Pending, queued, or
+in-progress checks are not workflow outcomes and must not produce
+`needs_user_action`. Resolve the exact PR/run identity, then use one blocking
+first-party watcher instead of one model turn per poll. On GitHub prefer
+`gh pr checks <pr> --watch --interval 30`; when monitoring an exact Actions run,
+use `gh run watch <run-id> --exit-status --interval 30`. After the watcher exits,
+re-read authoritative PR, check, and run state before choosing a transition.
+"Bounded" monitoring means bounded identity, interval, and log scope, not an
+arbitrary wall-clock cutoff while CI is still running.
+
 Query authoritative PR merge state before classifying any failed or late check.
 If the PR is already merged, never route the merged task branch to Fix. Complete
 with `pr_merged` and provide `workspace_path`, `pr_url`, `branch_name`, and a
@@ -1528,7 +1537,7 @@ and the selected method remains feasible. Provide `workspace_path`, `pr_url`,
 the task introduced or worsened a code or history failure. Baseline, flaky,
 unrelated, or unattributed failures use `needs_user_action` with
 `blocker_reason`, as do external failures, policy ambiguity, or access
-problems."""
+problems. Never use `needs_user_action` merely because CI is still running."""
 
 
 def waiting_pr_prompt(profile: ProjectProfile) -> str:

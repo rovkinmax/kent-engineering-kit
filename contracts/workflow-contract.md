@@ -233,6 +233,11 @@ device, source-control, issue-tracker, and release adapters.
   regression is tracked as a separate follow-up task. While a PR remains open,
   `needs_changes` requires task-differential evidence. Baseline, flaky,
   unrelated, or unattributed failures use `needs_user_action`.
+- Pending, queued, and in-progress CI are not blockers or transitions. CI uses
+  one blocking first-party watcher for the exact PR/run and waits for terminal
+  green/red/canceled state without spending a model turn per poll.
+  `needs_user_action` is reserved for authentication, access, ambiguous
+  identity, contradictory policy, or another actual human decision.
 - Fix exposes a `pr_merged` recovery edge to Cleanup for a task that was
   already delivered before stale or late workflow routing reached the writer.
   The edge requires authoritative PR URL, branch, and merge proof; it never

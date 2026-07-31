@@ -504,6 +504,14 @@ class WorkflowKitTest(unittest.TestCase):
             "task-differential evidence",
             by_key["prepare_pr_ci_monitor"].prompt,
         )
+        self.assertIn(
+            "gh pr checks <pr> --watch --interval 30",
+            by_key["prepare_pr_ci_monitor"].prompt,
+        )
+        self.assertIn(
+            "Never use `needs_user_action` merely because CI is still running",
+            by_key["prepare_pr_ci_monitor"].prompt,
+        )
         self.assertEqual(by_key["fix_pr_merged_cleanup"].transition, "pr_merged")
         self.assertEqual(by_key["fix_pr_merged_cleanup"].target, "cleanup")
         self.assertEqual(
