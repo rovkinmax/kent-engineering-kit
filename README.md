@@ -88,8 +88,8 @@ every managed field against the effective global config. The installer
 intentionally does not rewrite user configuration.
 
 The global baseline includes bounded implementation, build diagnosis, evidence
-gating, runtime Smoke, PR/cleanup delivery, CI monitoring, research,
-architecture, and independent review roles. These canonical roles are
+gating, runtime Smoke, release lifecycle operations, PR/cleanup delivery, CI
+monitoring, research, architecture, and independent review roles. These canonical roles are
 contract-complete without project overrides. Kent documents workspace config
 as higher precedence, but Kent 2.4 canaries observed scheduler-created direct
 workflow roles selecting the global definition for a same-named role.

@@ -189,6 +189,7 @@ The kit now defines global fallbacks for:
 - `build-doctor`: Terra/medium;
 - `workflow-gate`: Luna/high;
 - `runtime-smoke-tester`: Terra/medium;
+- `release-manager`: Terra/medium;
 - `delivery-operator`: Luna/high;
 - `ci-monitor`: Luna/low.
 

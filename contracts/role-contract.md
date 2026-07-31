@@ -42,6 +42,17 @@ back to `orchestrator`. Operational nodes must not launch a second copy of
 their own profile role; bounded research and diagnosis delegation remains
 allowed.
 
+Auxiliary release workflows separate lifecycle ownership:
+
+- `release-manager` owns version changes, release preparation, tags, and
+  external release records;
+- `delivery-operator` owns PR delivery, branch operations, and conservative
+  cleanup;
+- `ci-monitor` owns bounded CI, merge-state, and release-automation monitoring.
+
+Assign these roles directly. A release node must not wrap the same specialist
+in a generic `default` session.
+
 Generated workflows also own independent final Standards, Specification, and
 Compliance review stages. Implementation and Fix must not launch another copy
 of those final review responsibilities before the graph fan-out.

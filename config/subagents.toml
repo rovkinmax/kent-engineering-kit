@@ -163,6 +163,20 @@ shell = true
 patch = false
 edit = false
 
+[subagents.release-manager]
+description = "Conservative release preparation, publication, tagging, and external release-state management."
+model = "gpt-5.6-terra"
+system_prompt_file = "agents/release-manager.md"
+thinking_level = "medium"
+model_verbosity = "low"
+agent_callable = false
+workflow_subagent = false
+
+[subagents.release-manager.tools]
+shell = true
+patch = true
+edit = false
+
 [subagents.delivery-operator]
 description = "Conservative PR preparation, branch delivery, and recoverability-aware cleanup."
 model = "gpt-5.6-luna"
@@ -178,7 +192,7 @@ patch = false
 edit = false
 
 [subagents.ci-monitor]
-description = "Bounded CI and pull-request state monitoring without repository edits."
+description = "Bounded CI, pull-request, and release-automation monitoring without mutations."
 model = "gpt-5.6-luna"
 system_prompt_file = "agents/ci-monitor.md"
 thinking_level = "low"

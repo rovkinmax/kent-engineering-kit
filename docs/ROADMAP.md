@@ -174,10 +174,18 @@ owns real task history and provides rollback.
 
 ## Phase 4: Auxiliary workflows
 
-Status: planned.
+Status: in progress.
 
 - Generate maintenance, smoke, intake, release, and rebase flows.
 - Support single and split release topologies.
+- Roll out the canonical `release-manager` role and direct specialist routing
+  for existing Puber/Appsome release, SDK update, and branch-rebase workflows.
+  Validate the staged candidates after the next Kent restart, then retire the
+  generic-`default` predecessors.
+- OSDK-1 validated the generic Delivery topology in a Kotlin SDK generator:
+  managed-worktree bootstrap, writer handoff, deterministic/reviewer fan-out,
+  Join, Gate, Fix feedback, human clarification, and report-only Cleanup all
+  completed successfully.
 - Add Web, iOS, embedded, and generic project profiles.
 
 ## Post-adoption backlog
@@ -195,3 +203,10 @@ after Puber and Appsome have exercised the generalized Delivery workflow:
   no runtime Smoke, and a normal GitHub PR/CI tail;
 - version the profile and compatibility contract only after the working
   composition and migration policy are stable.
+- Add a supported structured task-comment listing path that exposes canonical
+  comment IDs. Kent 2.4 `kent task comment list` omits them, while exact human
+  authority provenance currently requires a read-only metadata lookup and
+  active-session steer.
+- Clarify or wrap `kent run wait` for workflow-owned `shell_command` sessions:
+  Kent 2.4 reports `session runtime live run completed without a final answer`
+  even after the node has successfully applied its workflow transition.
