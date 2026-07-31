@@ -248,6 +248,7 @@ class ProjectProfile:
                     )
 
         required_roles = {
+            "fix",
             "implementation",
             "orchestrator",
             "release",

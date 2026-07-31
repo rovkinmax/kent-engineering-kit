@@ -15,16 +15,16 @@ model_verbosity = "low"
 
 [subagents.fast]
 model = "gpt-5.6-luna"
-thinking_level = "low"
+thinking_level = "high"
 model_verbosity = "low"
 priority_request_mode = false
 model_context_window = 372000
 
 [subagents.compliance_reviewer]
 description = "Agent for reviewing code, plans, documents, diffs, or other scopes only for compliance with applicable specifications and AGENTS.md rules. Cannot edit files."
-model = "gpt-5.6-terra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/compliance_reviewer.md"
-thinking_level = "medium"
+thinking_level = "high"
 model_verbosity = "low"
 agent_callable = false
 workflow_subagent = false
@@ -53,9 +53,9 @@ edit = false
 
 [subagents.standards-reviewer]
 description = "Read-only review against repository instructions, architecture, and engineering standards."
-model = "gpt-5.6-terra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/standards-reviewer.md"
-thinking_level = "medium"
+thinking_level = "high"
 model_verbosity = "low"
 agent_callable = false
 workflow_subagent = false
@@ -94,15 +94,29 @@ patch = false
 edit = false
 
 [subagents.implementation-worker]
-description = "Single-writer implementation and fix slices governed by the project procedure."
-model = "gpt-5.6-sol"
+description = "Single-writer implementation slices governed by the approved project plan."
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/implementation-worker.md"
-thinking_level = "medium"
+thinking_level = "high"
 model_verbosity = "low"
 agent_callable = true
 workflow_subagent = true
 
 [subagents.implementation-worker.tools]
+shell = true
+patch = true
+edit = false
+
+[subagents.fix-worker]
+description = "Single-writer repair of verified task-scoped findings and failed implementation slices."
+model = "gpt-5.6-sol"
+system_prompt_file = "agents/fix-worker.md"
+thinking_level = "medium"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = true
+
+[subagents.fix-worker.tools]
 shell = true
 patch = true
 edit = false
@@ -123,9 +137,9 @@ edit = false
 
 [subagents.workflow-gate]
 description = "Low-noise synthesis of structured verification evidence into workflow routing."
-model = "gpt-5.6-terra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/workflow-gate.md"
-thinking_level = "medium"
+thinking_level = "high"
 model_verbosity = "low"
 agent_callable = false
 workflow_subagent = false
@@ -151,9 +165,9 @@ edit = false
 
 [subagents.delivery-operator]
 description = "Conservative PR preparation, branch delivery, and recoverability-aware cleanup."
-model = "gpt-5.6-terra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/delivery-operator.md"
-thinking_level = "medium"
+thinking_level = "high"
 model_verbosity = "low"
 agent_callable = false
 workflow_subagent = false

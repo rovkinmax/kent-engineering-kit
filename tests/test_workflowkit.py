@@ -133,7 +133,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(roles["plan"], "default")
         self.assertEqual(roles["implement"], "implementation-worker")
         self.assertEqual(roles["verification_gate"], "workflow-gate")
-        self.assertEqual(roles["fix"], "implementation-worker")
+        self.assertEqual(roles["fix"], "fix-worker")
         self.assertEqual(roles["smoke"], "runtime-smoke-tester")
         self.assertEqual(roles["standards_review"], "standards-reviewer")
         self.assertEqual(roles["spec_review"], "spec-reviewer")

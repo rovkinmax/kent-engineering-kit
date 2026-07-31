@@ -104,6 +104,7 @@ def build_delivery_workflow(
     orchestrator = profile.role("orchestrator")
     gate = profile.optional_role("gate") or orchestrator
     implementation = profile.role("implementation")
+    fix = profile.role("fix")
     release = profile.role("release")
     smoke_enabled = profile.smoke_policy() != "disabled"
     pull_requests = profile.capability("pull_requests")
@@ -148,7 +149,7 @@ def build_delivery_workflow(
             script_path=profile.command("verify"),
         ),
         agent_node("verification_gate", "Verification Gate", gate),
-        agent_node("fix", "Fix", implementation),
+        agent_node("fix", "Fix", fix),
         agent_node("cleanup", "Cleanup", release),
         NodeSpec("wont_do", "terminal", "Won't Do"),
         NodeSpec("done", "terminal", "Done"),

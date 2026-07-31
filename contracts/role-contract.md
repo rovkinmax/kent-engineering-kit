@@ -35,8 +35,8 @@ availability.
 ## Review Ownership
 
 Generated Delivery workflows assign operational ownership directly from the
-project profile: `implementation` owns Implement/Fix, `qa` owns Smoke,
-`release` owns PR preparation/Cleanup, and `ci` owns CI/Waiting PR. The
+project profile: `implementation` owns Implement, `fix` owns Fix, `qa` owns
+Smoke, `release` owns PR preparation/Cleanup, and `ci` owns CI/Waiting PR. The
 `orchestrator` role owns Plan; optional `gate` owns Gate and otherwise falls
 back to `orchestrator`. Operational nodes must not launch a second copy of
 their own profile role; bounded research and diagnosis delegation remains

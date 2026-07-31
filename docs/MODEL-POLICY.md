@@ -1,15 +1,11 @@
 # Model Policy Experiment
 
 This is an iterative operating policy, not a versioned compatibility promise.
-The first-rollout values were staged and activated by a Kent restart on July
-24, 2026. July 25 live sessions confirmed that the global role grid was active.
-The leaf-review callability, medium final-review reasoning, and
-`reviewer.frequency = "off"` settings are active after the July 27 restart.
-Existing sessions still retain the settings with which they were created.
-
-The direct-role quota-relief experiment was activated by the July 27 restart.
-Puber and Appsome managed-worktree canaries then verified the role routing,
-verification fan-out, Gate, Compliance, delivery, CI, and Waiting PR paths.
+The July 31 candidate routes well-specified implementation and bounded
+operational work to Luna/high while retaining Sol for Plan, architecture,
+specification fidelity, and verified Fix work. Existing sessions retain the
+settings with which they were created. The candidate requires a Kent restart
+and newly created sessions before it is considered active.
 
 ## Optimization Target
 
@@ -54,15 +50,19 @@ stop.
 | Capability | Candidate |
 | --- | --- |
 | Default Plan orchestrator | `gpt-5.6-sol`, medium |
-| Direct implementation and Fix | `gpt-5.6-sol`, medium |
-| Standards review | `gpt-5.6-terra`, medium |
+| Direct implementation | `gpt-5.6-luna`, high |
+| Fix | `gpt-5.6-sol`, medium |
+| Standards review | `gpt-5.6-luna`, high |
 | Specification review | `gpt-5.6-sol`, medium |
 | Architecture design | `gpt-5.6-sol`, high |
-| Compliance review | `gpt-5.6-terra`, medium |
-| Gate, research, platform reference, build diagnosis | `gpt-5.6-terra`, medium |
+| Compliance review | `gpt-5.6-luna`, high |
+| Gate | `gpt-5.6-luna`, high |
+| Research, platform reference, build diagnosis | `gpt-5.6-terra`, medium |
 | Specialized UI, domain, and quality review | `gpt-5.6-terra`, high |
-| Delivery and focused runtime Smoke | `gpt-5.6-terra`, medium |
-| CI monitoring and fast mechanical work | `gpt-5.6-luna`, low |
+| Delivery | `gpt-5.6-luna`, high |
+| Focused runtime Smoke | `gpt-5.6-terra`, medium |
+| CI monitoring | `gpt-5.6-luna`, low |
+| Fast mechanical work | `gpt-5.6-luna`, high |
 | Built-in Kent reviewer/supervisor | disabled; `gpt-5.6-terra`, medium reserved for a separate canary |
 
 Initial shared settings:
@@ -73,16 +73,16 @@ Initial shared settings:
 - maximum subagent depth: 1;
 - built-in reviewer frequency: off.
 
-Keep Plan on the default Sol orchestrator. The prepared replacement workflow
-assigns Implement/Fix, Gate, Smoke, PR/Cleanup, and CI/Waiting PR directly to
-their profile roles instead of paying for a default wrapper plus an optional
-child session. Do not combine this routing canary with a compaction-threshold
+Keep Plan on the default Sol orchestrator. Generated workflows assign
+Implement, Fix, Gate, Smoke, PR/Cleanup, and CI/Waiting PR directly to separate
+profile roles instead of paying for a default wrapper plus an optional child
+session. Do not combine this routing canary with a compaction-threshold
 experiment.
 
-The first rollout targets the two largest observed sources of quota pressure:
+The candidate targets the largest observed sources of quota pressure:
 
-- the global `high` default currently applies to ordinary workflow
-  orchestration, Fix, Gate, Smoke, PR, CI, and cleanup;
+- Sol is currently used for bounded implementation even after Plan has removed
+  product and architecture uncertainty;
 - nested review delegation repeats work already owned by graph-level
   Standards, Specification, and Compliance nodes.
 
@@ -113,7 +113,7 @@ model_verbosity = "low"
 
 [subagents.fast]
 model = "gpt-5.6-luna"
-thinking_level = "low"
+thinking_level = "high"
 model_verbosity = "low"
 priority_request_mode = false
 
@@ -123,8 +123,8 @@ thinking_level = "medium"
 model_verbosity = "low"
 
 [subagents.standards-reviewer]
-model = "gpt-5.6-terra"
-thinking_level = "medium"
+model = "gpt-5.6-luna"
+thinking_level = "high"
 model_verbosity = "low"
 agent_callable = false
 workflow_subagent = false
@@ -141,39 +141,64 @@ model = "gpt-5.6-sol"
 thinking_level = "high"
 model_verbosity = "low"
 
-[subagents.compliance_reviewer]
-model = "gpt-5.6-terra"
+[subagents.implementation-worker]
+model = "gpt-5.6-luna"
+thinking_level = "high"
+model_verbosity = "low"
+
+[subagents.fix-worker]
+model = "gpt-5.6-sol"
 thinking_level = "medium"
+model_verbosity = "low"
+
+[subagents.compliance_reviewer]
+model = "gpt-5.6-luna"
+thinking_level = "high"
 model_verbosity = "low"
 agent_callable = false
 workflow_subagent = false
+
+[subagents.workflow-gate]
+model = "gpt-5.6-luna"
+thinking_level = "high"
+model_verbosity = "low"
+
+[subagents.runtime-smoke-tester]
+model = "gpt-5.6-terra"
+thinking_level = "medium"
+model_verbosity = "low"
+
+[subagents.delivery-operator]
+model = "gpt-5.6-luna"
+thinking_level = "high"
+model_verbosity = "low"
+
+[subagents.ci-monitor]
+model = "gpt-5.6-luna"
+thinking_level = "low"
+model_verbosity = "low"
+priority_request_mode = false
 ```
 
 ## Active Direct-Role Routing
 
 The kit now defines global fallbacks for:
 
-- `implementation-worker`: Sol/medium;
+- `implementation-worker`: Luna/high;
+- `fix-worker`: Sol/medium;
 - `build-doctor`: Terra/medium;
-- `workflow-gate`: Terra/medium;
+- `workflow-gate`: Luna/high;
 - `runtime-smoke-tester`: Terra/medium;
-- `delivery-operator`: Terra/medium;
+- `delivery-operator`: Luna/high;
 - `ci-monitor`: Luna/low.
 
-Generated workflows use the profile's `implementation`, `qa`, `release`, and
-`ci` roles directly. Optional `gate` replaces the default Gate role when
-declared.
+Generated workflows use the profile's `implementation`, `fix`, `qa`,
+`release`, and `ci` roles directly. Optional `gate` replaces the default Gate
+role when declared.
 
-The July 27 canaries observed:
-
-- Implement on Sol/medium;
-- independent Standards and Specification leaf sessions on Sol/medium with no
-  child agents;
-- Gate, Compliance, and delivery on Terra/medium;
-- CI and Waiting PR on Luna/low;
-- documentation-only changes skipping runtime Smoke;
-- three verification branches scheduled correctly with workflow concurrency
-  limited to two simultaneous runs.
+The July 31 candidate changes only model ownership and the distinct Fix role.
+It preserves the proven direct fan-out/Join topology, documentation-only Smoke
+skip, and workflow concurrency limit.
 
 Kent documents workspace config as higher precedence, but scheduler-created
 direct-role sessions selected the global same-named role definitions during
@@ -182,11 +207,11 @@ project-specific behavior is carried through the node prompt, project
 contract, procedures, and adapters. Workspace same-name overrides remain an
 optional specialization until the observed behavior is clarified upstream.
 
-The next isolated quota experiment moves Standards Review to Terra/medium while
-keeping Specification Review on Sol/medium. The configuration is staged but
-requires a Kent restart before new sessions use it. Keep Plan and Implement on
-Sol while comparing review findings, Fix-loop count, escaped defects, and
-provider pressure.
+The next isolated quota experiment compares Luna/high implementation and formal
+review against the previous Sol/medium and Terra/medium runs. Keep Plan,
+Specification Review, and Fix on Sol while comparing first-pass success,
+Fix-loop count, escaped defects, user intervention, latency, and provider
+pressure.
 
 Keep the built-in reviewer explicitly off during this rollout. Kent 2.4
 defaults it to `edits`; leaving the key unset can add hidden model calls after
