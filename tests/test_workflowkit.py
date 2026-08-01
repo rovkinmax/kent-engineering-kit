@@ -428,6 +428,56 @@ class WorkflowKitTest(unittest.TestCase):
             ],
         )
 
+    def test_worktree_wrapper_uses_explicit_binary_with_restricted_path(
+        self,
+    ) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        fake_kent = Path(temporary.name) / "kent-cli"
+        fake_kent.write_text(
+            "#!/bin/sh\n"
+            'printf "args=%s\\n" "$*"\n'
+        )
+        fake_kent.chmod(0o755)
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "PATH": "/usr/bin:/bin",
+                "KENT_BIN": str(fake_kent),
+                "KENT_SESSION_ID": "session-appsome",
+                "KENT_RUN_ID": "run-appsome",
+                "KENT_STEP_ID": "step-appsome",
+            }
+        )
+
+        result = subprocess.run(
+            [
+                str(REPO_ROOT / "scripts" / "kent-worktree"),
+                "delete",
+                "--session",
+                "session-sdk",
+                "--delete-branch",
+                "--json",
+                "OSDK-2",
+            ],
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                (
+                    "args=worktree delete --session session-sdk "
+                    "--delete-branch --json OSDK-2"
+                ),
+            ],
+        )
+
     def test_canary_uses_core_flow_without_device_or_delivery_tail(self) -> None:
         profile = self.load_profile()
         spec = build_canary_workflow(profile, 1)

@@ -3,4 +3,41 @@ set -euo pipefail
 
 unset KENT_SESSION_ID KENT_RUN_ID KENT_STEP_ID
 
-exec kent worktree "$@"
+select_kent() {
+  local candidate
+
+  if [[ -n "${KENT_BIN:-}" ]]; then
+    if [[ ! -x "$KENT_BIN" ]]; then
+      echo "KENT_BIN is not executable: $KENT_BIN" >&2
+      return 1
+    fi
+    printf '%s\n' "$KENT_BIN"
+    return 0
+  fi
+
+  candidate="$(command -v kent 2>/dev/null || true)"
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  for candidate in \
+    /opt/homebrew/bin/kent \
+    /usr/local/bin/kent \
+    /home/linuxbrew/.linuxbrew/bin/kent \
+    "$HOME/.local/bin/kent" \
+    "$HOME/bin/kent" \
+    /usr/bin/kent; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  echo "kent-worktree could not locate an executable Kent CLI" >&2
+  echo "set KENT_BIN to the absolute Kent executable path" >&2
+  return 1
+}
+
+kent_bin="$(select_kent)"
+exec "$kent_bin" worktree "$@"
