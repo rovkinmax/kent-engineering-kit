@@ -97,6 +97,32 @@ CLEANUP_REPORT = ParameterSpec(
     "cleanup_report",
     "Report of cleanup performed, skipped, or blocked.",
 )
+EVIDENCE_CONTEXT = ParameterSpec(
+    "evidence_context",
+    "Packaging-only evidence findings and exact artifacts permitted for repair.",
+)
+PR_HEAD_OID = ParameterSpec(
+    "pr_head_oid",
+    "Pull-request head commit observed after green CI.",
+)
+PR_BASE_OID = ParameterSpec(
+    "pr_base_oid",
+    "Pull-request base commit observed after green CI.",
+)
+CLEANUP_MODE = ParameterSpec(
+    "cleanup_mode",
+    "Cleanup proof mode: merged, no_pr, closed_without_merge, or report_only.",
+)
+CLEANUP_SESSION_ID = ParameterSpec(
+    "cleanup_session_id",
+    "Kent session ID of the completed resource-owning Cleanup node.",
+)
+TASK_SHORT_ID = ParameterSpec(
+    "task_short_id",
+    "Stable human-readable Kent task short ID.",
+)
+
+
 def build_delivery_workflow(
     profile: ProjectProfile,
     version: int,
@@ -188,14 +214,36 @@ def build_delivery_workflow(
                     profile.role("compliance"),
                 )
             )
+            nodes.append(
+                agent_node(
+                    "evidence_repair",
+                    "Evidence Repair",
+                    fix,
+                )
+            )
         nodes.extend(
             [
                 agent_node("prepare_pr", "Prepare PR", release),
                 agent_node("waiting_pr", "Waiting PR", ci),
+                NodeSpec(
+                    "merge_watch",
+                    "script",
+                    "Wait For PR Merge",
+                    script_path=profile.command("wait_pr"),
+                ),
             ]
         )
     if profile.capability("ci_monitoring"):
         nodes.append(agent_node("ci_monitor", "Monitor CI", ci))
+    if profile.capability("managed_worktrees"):
+        nodes.append(
+            NodeSpec(
+                "task_janitor",
+                "script",
+                "Task Janitor",
+                script_path=profile.command("janitor"),
+            )
+        )
 
     edges: list[EdgeSpec] = [
         EdgeSpec(
@@ -551,6 +599,19 @@ def build_delivery_workflow(
                     parameters=(WORKSPACE, FIX_CONTEXT),
                 ),
                 EdgeSpec(
+                    key="compliance_evidence_repair",
+                    source="compliance",
+                    transition="repair_evidence",
+                    target="evidence_repair",
+                    context="new_session",
+                    prompt=evidence_repair_prompt(profile),
+                    transition_description=(
+                        "Only packaging evidence is incomplete; repair those "
+                        "artifacts without repeating source or runtime work."
+                    ),
+                    parameters=(WORKSPACE, REVIEW_CONTEXT, EVIDENCE_CONTEXT),
+                ),
+                EdgeSpec(
                     key="compliance_needs_user_action",
                     source="compliance",
                     transition="needs_user_action",
@@ -564,6 +625,49 @@ def build_delivery_workflow(
                     parameters=(WORKSPACE, REVIEW_CONTEXT, BLOCKER),
                 ),
                 cancellation_edge("compliance"),
+                EdgeSpec(
+                    key="evidence_repair_compliance",
+                    source="evidence_repair",
+                    transition="recheck_compliance",
+                    target="compliance",
+                    context="compact_and_continue_session",
+                    context_source="previous_target",
+                    prompt=compliance_recheck_prompt(profile),
+                    transition_description=(
+                        "Packaging evidence was repaired; rerun only final "
+                        "Compliance Review."
+                    ),
+                    parameters=(WORKSPACE, REVIEW_CONTEXT),
+                ),
+                EdgeSpec(
+                    key="evidence_repair_fix",
+                    source="evidence_repair",
+                    transition="needs_source_fix",
+                    target="fix",
+                    context=fix_context,
+                    context_source=fix_context_source,
+                    prompt=fix_prompt(profile, bounded=fresh_writers),
+                    transition_description=(
+                        "Evidence repair proved that substantive source work "
+                        "is still required."
+                    ),
+                    parameters=(WORKSPACE, FIX_CONTEXT),
+                ),
+                recovery_edge(
+                    "evidence_repair",
+                    context=writer_recovery_context,
+                    fresh_session=fresh_writers,
+                    extra_parameters=(
+                        WORKSPACE,
+                        REVIEW_CONTEXT,
+                        EVIDENCE_CONTEXT,
+                    ),
+                    extra_prompt=(
+                        "Preserve the exact workspace, review context, and "
+                        "packaging-only evidence scope. Do not broaden repair."
+                    ),
+                ),
+                cancellation_edge("evidence_repair"),
             ]
         )
 
@@ -708,6 +812,73 @@ def build_delivery_workflow(
                     parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_REPORT),
                 ),
                 EdgeSpec(
+                    key="waiting_pr_watch_merge",
+                    source="waiting_pr",
+                    transition="watch_merge",
+                    target="merge_watch",
+                    transition_description=(
+                        "The pull request is open and feasible; wait "
+                        "deterministically for a meaningful state change."
+                    ),
+                    parameters=(
+                        WORKSPACE,
+                        PR_URL,
+                        BRANCH_NAME,
+                        MERGE_STRATEGY,
+                        PR_HEAD_OID,
+                        PR_BASE_OID,
+                    ),
+                ),
+                EdgeSpec(
+                    key="merge_watch_still_waiting",
+                    source="merge_watch",
+                    transition="still_waiting",
+                    target="merge_watch",
+                    transition_description=(
+                        "No meaningful PR state changed during a bounded watch "
+                        "window; continue without an agent turn."
+                    ),
+                    parameters=(
+                        WORKSPACE,
+                        PR_URL,
+                        BRANCH_NAME,
+                        MERGE_STRATEGY,
+                        PR_HEAD_OID,
+                        PR_BASE_OID,
+                    ),
+                ),
+                EdgeSpec(
+                    key="merge_watch_state_changed",
+                    source="merge_watch",
+                    transition="state_changed",
+                    target="waiting_pr",
+                    context="compact_and_continue_session",
+                    context_source="previous_target",
+                    prompt=waiting_pr_changed_prompt(profile),
+                    transition_description=(
+                        "PR state changed materially; let the retained Waiting "
+                        "PR session classify it once."
+                    ),
+                    parameters=(
+                        WORKSPACE,
+                        PR_URL,
+                        BRANCH_NAME,
+                        MERGE_STRATEGY,
+                        PR_REPORT,
+                    ),
+                ),
+                EdgeSpec(
+                    key="merge_watch_cleanup",
+                    source="merge_watch",
+                    transition="pr_merged",
+                    target="cleanup",
+                    prompt=cleanup_prompt(profile, merged=True),
+                    transition_description=(
+                        "The deterministic watcher confirmed the PR merged."
+                    ),
+                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_REPORT),
+                ),
+                EdgeSpec(
                     key="waiting_pr_needs_user_action",
                     source="waiting_pr",
                     transition="needs_user_action",
@@ -716,15 +887,10 @@ def build_delivery_workflow(
                     prompt=waiting_pr_prompt(profile),
                     requires_approval=True,
                     transition_description=(
-                        "The pull request is still open; recheck only after user approval."
+                        "Waiting PR requires an actual human decision or "
+                        "external access recovery."
                     ),
-                    parameters=(
-                        WORKSPACE,
-                        PR_URL,
-                        BRANCH_NAME,
-                        MERGE_STRATEGY,
-                        BLOCKER,
-                    ),
+                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_STRATEGY, BLOCKER),
                 ),
                 EdgeSpec(
                     key="waiting_pr_fix",
@@ -756,25 +922,96 @@ def build_delivery_workflow(
                 ),
             ]
         )
+        if profile.capability("ci_monitoring"):
+            edges.append(
+                EdgeSpec(
+                    key="waiting_pr_ci_monitor",
+                    source="waiting_pr",
+                    transition="ci_required",
+                    target="ci_monitor",
+                    context="new_session",
+                    prompt=ci_prompt(profile),
+                    transition_description=(
+                        "The PR head changed or required checks restarted; "
+                        "monitor the new exact CI state."
+                    ),
+                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_STRATEGY),
+                )
+            )
 
-    edges.extend(
-        [
-            EdgeSpec(
-                key="cleanup_done",
-                source="cleanup",
-                transition="done",
-                target="done",
-                transition_description=(
-                    "Delivery and conservative cleanup are complete."
+    if profile.capability("managed_worktrees"):
+        edges.extend(
+            [
+                EdgeSpec(
+                    key="cleanup_task_janitor",
+                    source="cleanup",
+                    transition="run_janitor",
+                    target="task_janitor",
+                    transition_description=(
+                        "Cleanup reporting is complete; remove only "
+                        "deterministically safe task-owned resources."
+                    ),
+                    parameters=(
+                        WORKSPACE,
+                        TASK_SHORT_ID,
+                        PR_URL,
+                        BRANCH_NAME,
+                        MERGE_REPORT,
+                        CLEANUP_MODE,
+                        CLEANUP_SESSION_ID,
+                        CLEANUP_REPORT,
+                    ),
                 ),
-                parameters=(CLEANUP_REPORT,),
-            ),
-            recovery_edge(
-                "cleanup",
-                context=non_writer_recovery_context,
-            ),
-        ]
-    )
+                EdgeSpec(
+                    key="task_janitor_done",
+                    source="task_janitor",
+                    transition="done",
+                    target="done",
+                    transition_description=(
+                        "The janitor removed safe resources or preserved them "
+                        "with an explicit cleanup report."
+                    ),
+                    parameters=(CLEANUP_REPORT,),
+                ),
+                EdgeSpec(
+                    key="task_janitor_blocked",
+                    source="task_janitor",
+                    transition="blocked",
+                    target="cleanup",
+                    context="compact_and_continue_session",
+                    context_source="previous_target",
+                    prompt=janitor_recovery_prompt(profile),
+                    transition_description=(
+                        "Janitor infrastructure failed after safety checks; "
+                        "return to Cleanup without losing its context."
+                    ),
+                    parameters=(CLEANUP_REPORT, BLOCKER),
+                ),
+                recovery_edge(
+                    "cleanup",
+                    context=non_writer_recovery_context,
+                ),
+            ]
+        )
+    else:
+        edges.extend(
+            [
+                EdgeSpec(
+                    key="cleanup_done",
+                    source="cleanup",
+                    transition="done",
+                    target="done",
+                    transition_description=(
+                        "Delivery and conservative cleanup are complete."
+                    ),
+                    parameters=(CLEANUP_REPORT,),
+                ),
+                recovery_edge(
+                    "cleanup",
+                    context=non_writer_recovery_context,
+                ),
+            ]
+        )
 
     spec = WorkflowSpec(
         name=profile.workflow_name("delivery", version),
@@ -899,7 +1136,13 @@ def recovery_edge(
 ) -> EdgeSpec:
     extra_contract = f"\n{extra_prompt}" if extra_prompt else ""
     cancellation_contract = ""
-    if node_key in {"plan", "implement", "fix", "verification_gate"}:
+    if node_key in {
+        "plan",
+        "implement",
+        "fix",
+        "verification_gate",
+        "evidence_repair",
+    }:
         cancellation_contract = (
             "\nIf the latest user instruction explicitly cancels the task, choose "
             "`wont_do` and provide `closure_reason`."
@@ -984,6 +1227,43 @@ def procedure_instruction(profile: ProjectProfile, key: str) -> str:
     if path:
         return f"Use {path} as the project procedure."
     return "Follow the project contract and repository instructions."
+
+
+def checkpoint_instruction(profile: ProjectProfile, stage: str) -> str:
+    stage_details = {
+        "fix": (
+            "Record the pinned baseline, supplied findings, completed fix "
+            "slices, fresh green checks, remaining findings, mutation ledger, "
+            "and one next permitted action."
+        ),
+        "smoke": (
+            "Record acceptance stages, lock resource/token state, exact "
+            "runtime target, completed build/install/launch work, sanitized "
+            "evidence paths, remaining scenarios, external-side-effect "
+            "ledger, restoration state, and one next permitted action."
+        ),
+    }[stage]
+    return f"""Use `{profile.command("checkpoint")}` for a durable ignored
+`{stage}` checkpoint at
+`.kent/runtime/{{{{.TaskShortId}}}}/{stage}-checkpoint.json`.
+
+Before repeating work, run its `validate` and `read` commands when the file
+exists, reconcile the checkpoint with current Git/task/device state, and resume
+only its `next_action`. Before the first expensive or mutating action and after
+every completed bounded stage, pipe one JSON object to its `write` command.
+Every checkpoint contains arrays named `completed`, `remaining`, and
+`mutation_ledger`, plus a non-empty `next_action`; the helper supplies task,
+stage, workspace, schema, and timestamp fields. {stage_details}
+
+Persist the latest checkpoint before every workflow transition, including a
+blocker or finding. Never put credentials, authenticated UI content, raw logs,
+or broad device data in it. Use these exact command forms:
+
+`{profile.command("checkpoint")} validate --stage {stage} --task {{{{.TaskShortId}}}} --workspace <workspace>`
+
+`{profile.command("checkpoint")} read --stage {stage} --task {{{{.TaskShortId}}}} --workspace <workspace>`
+
+`{profile.command("checkpoint")} write --stage {stage} --task {{{{.TaskShortId}}}} --workspace <workspace>`"""
 
 
 def work_kind_catalog(profile: ProjectProfile) -> str:
@@ -1176,6 +1456,7 @@ After one slice, choose `continue_fix` with `workspace_path` and a refreshed
 no fix slice remains, and provide `workspace_path` plus a refreshed
 `review_context` containing the findings, fixes, changed files, artifact paths,
 and focused checks."""
+    checkpoint = checkpoint_instruction(profile, "fix")
 
     return f"""Apply task-scoped fixes for {{{{.TaskShortId}}}}.
 
@@ -1185,6 +1466,8 @@ Read .kent/project-contract.md and repository instructions first. Workspace:
 
 {procedure_instruction(profile, "fix")}
 {bounded_contract}
+
+{checkpoint}
 
 Remain the single writer. Fix root causes without broadening product scope.
 Before editing, require each supplied finding to identify a concrete
@@ -1347,6 +1630,7 @@ explicit cancellation decision and provide `closure_reason`."""
 
 
 def smoke_prompt(profile: ProjectProfile) -> str:
+    checkpoint = checkpoint_instruction(profile, "smoke")
     return f"""Run focused smoke testing for {{{{.TaskShortId}}}}.
 
 Read .kent/project-contract.md and repository instructions first. Workspace:
@@ -1356,6 +1640,8 @@ Smoke rationale: {{{{.Params.smoke_rationale}}}}
 Required scope: {{{{.Params.smoke_scope}}}}
 
 {procedure_instruction(profile, "smoke")}
+
+{checkpoint}
 
 Follow the project-specific browser, device, simulator, hardware, resource-lock,
 build, deploy, install, launch, account, and isolation rules that apply. Do not
@@ -1398,8 +1684,14 @@ not product authority.
 
 Choose `ship_pr` only when the final work product is compliant. Provide
 `workspace_path`, a complete `review_context`, and `compliance_report`. Choose
-`needs_changes` for task-scoped violations and provide `workspace_path` plus
-`fix_context`; fixes must rerun the full verification flow. Choose
+`repair_evidence` only when the source diff and substantive deterministic,
+Standards, Specification, Gate, and Smoke decisions are already valid and the
+only defect is a missing, empty, stale, or internally contradictory
+report/checklist/evidence package. Provide `workspace_path`, `review_context`,
+and `evidence_context` naming the exact permitted artifacts and required
+correction. Choose `needs_changes` for substantive task-scoped violations and
+provide `workspace_path` plus `fix_context`; source fixes must rerun the full
+verification flow. Choose
 `needs_user_action` for missing or contradictory authority, evidence, or
 external decisions and provide `workspace_path`, `review_context`, and
 `blocker_reason`. Choose `wont_do` only for explicit cancellation and provide
@@ -1421,10 +1713,71 @@ destructive actions.
 
 Choose `ship_pr` only when the final work product is compliant. Provide
 `workspace_path`, a complete `review_context`, and `compliance_report`. Choose
-`needs_changes` with `workspace_path` and `fix_context` for task-scoped
-violations. Choose `needs_user_action` with `workspace_path`, `review_context`,
-and `blocker_reason` if the blocker remains. Choose `wont_do` only for explicit
-cancellation and provide `closure_reason`."""
+`repair_evidence` only for packaging-only evidence defects and provide
+`workspace_path`, `review_context`, and `evidence_context`. Choose
+`needs_changes` with `workspace_path` and `fix_context` for substantive
+task-scoped violations. Choose `needs_user_action` with `workspace_path`,
+`review_context`, and `blocker_reason` if the blocker remains. Choose `wont_do`
+only for explicit cancellation and provide `closure_reason`."""
+
+
+def evidence_repair_prompt(profile: ProjectProfile) -> str:
+    return f"""Repair packaging-only workflow evidence for {{{{.TaskShortId}}}}.
+
+Read .kent/project-contract.md and repository instructions first. Workspace:
+{{{{.Params.workspace_path}}}}. Final review context:
+{{{{.Params.review_context}}}}
+Allowed evidence repair:
+{{{{.Params.evidence_context}}}}
+
+{procedure_instruction(profile, "compliance")}
+
+This is not a source-code Fix or another verification pass. Confirm first that
+the supplied context proves the source diff and substantive deterministic,
+Standards, Specification, Gate, and required Smoke decisions already passed.
+Edit only the exact ignored reports, summaries, checklists, or evidence indexes
+named in `evidence_context`. Do not edit production source, tests, build files,
+specifications, or plans; do not build, install, launch, reacquire a device, or
+repeat runtime navigation.
+This node's narrow write contract overrides a compliance procedure's general
+read-only clause only for the exact artifacts named in `evidence_context`. Do
+not create or update the Fix checkpoint from this node.
+
+Repair missing or empty required text, reconcile contradictory status wording
+with Kent's authoritative task state, and rerun only the project evidence audit
+or deterministic artifact validation needed for those files.
+
+Choose `recheck_compliance` with `workspace_path` and a refreshed
+`review_context` when packaging is valid. Choose `needs_source_fix` with
+`workspace_path` and `fix_context` if the supplied defect is actually
+substantive and cannot be repaired inside the named evidence artifacts. Use
+`needs_user_action` only for an external blocker and provide `blocker_reason`.
+Also preserve `workspace_path`, `review_context`, and `evidence_context` for
+recovery. Choose `wont_do` only for explicit cancellation and provide
+`closure_reason`."""
+
+
+def compliance_recheck_prompt(profile: ProjectProfile) -> str:
+    return f"""Recheck final Compliance after packaging-only evidence repair.
+
+Workspace: {{{{.Params.workspace_path}}}}
+Updated review context: {{{{.Params.review_context}}}}
+
+{procedure_instruction(profile, "compliance")}
+
+Use the retained Compliance context. Inspect only the repaired evidence
+artifacts and confirm they now agree with the already-passed substantive
+results. Do not repeat code, architecture, specification, build, or runtime
+review.
+
+Choose `ship_pr` with `workspace_path`, `review_context`, and
+`compliance_report` when the package is complete. Choose `repair_evidence`
+again only for another packaging-only defect and provide `evidence_context`.
+Choose `needs_changes` with `workspace_path` and `fix_context` only when the
+repair exposed a substantive task defect. Use `needs_user_action` with
+`workspace_path`, `review_context`, and `blocker_reason` for an external or
+authority blocker. Choose `wont_do` only for explicit cancellation and provide
+`closure_reason`."""
 
 
 def prepare_pr_prompt(profile: ProjectProfile) -> str:
@@ -1541,6 +1894,14 @@ problems. Never use `needs_user_action` merely because CI is still running."""
 
 
 def waiting_pr_prompt(profile: ProjectProfile) -> str:
+    ci_recheck = (
+        """If the PR head changed or required checks restarted, choose
+`ci_required` and provide `workspace_path`, `pr_url`, `branch_name`, and
+`merge_strategy`; the CI node will watch the new exact run."""
+        if profile.capability("ci_monitoring")
+        else """If the PR head changed, revalidate the available checks and
+method in this node before starting another deterministic merge watch."""
+    )
     return f"""Check delivery state for {{{{.TaskShortId}}}}.
 
 PR: {{{{.Params.pr_url}}}}
@@ -1563,16 +1924,38 @@ reproduce a rebase failure only in an isolated temporary clone or branch using
 a forced replay onto the fresh target tip. Do not mutate the task branch during
 diagnosis.
 
+{ci_recheck}
+
 Choose `pr_merged` only when the source-control system conclusively reports the
 PR as merged; provide `workspace_path`, `pr_url`, `branch_name`, and
-`merge_report`. If it remains open and the selected method is feasible, write a
-task comment with the current state, choose `needs_user_action`, and provide
-`workspace_path`, `pr_url`, `branch_name`, `merge_strategy`, and
-`blocker_reason`; the workflow pauses for approval before rechecking. Use
+`merge_report`. If it remains open, required checks are green, no changes are
+requested, and the selected method is feasible, choose `watch_merge` and
+provide `workspace_path`, `pr_url`, `branch_name`, `merge_strategy`, and the
+exact current head and base commits as `pr_head_oid` and `pr_base_oid`. The
+deterministic watcher waits without an approval or model turn and wakes this
+node only after meaningful state changes. A base OID change wakes this node so
+method-specific feasibility can be revalidated through the normal merge-policy
+contract.
+
+Use `needs_user_action` only for authentication/access failure, ambiguous or
+contradictory merge policy, or another actual human decision.
+Merely waiting for review or merge is not a blocker. Use
 `needs_changes` with `workspace_path`, `merge_strategy`, and `pr_report` when
 task code or history must change. Choose `close_without_merge` only when the
 latest user comment explicitly approves closing or canceling this PR; provide
 `workspace_path`, `pr_report`, and `closure_reason`."""
+
+
+def waiting_pr_changed_prompt(profile: ProjectProfile) -> str:
+    return (
+        waiting_pr_prompt(profile)
+        + """
+
+The deterministic watcher stopped because PR state changed:
+{{.Params.pr_report}}
+
+Classify only that fresh state. Do not repeat passive polling in the agent."""
+    )
 
 
 def cleanup_prompt(
@@ -1584,17 +1967,45 @@ def cleanup_prompt(
 ) -> str:
     workspace = "Workspace: {{.Params.workspace_path}}"
     if merged:
+        cleanup_mode = "merged"
         context = """PR: {{.Params.pr_url}}
 Branch: {{.Params.branch_name}}
 Merge proof: {{.Params.merge_report}}"""
     elif no_pr:
+        cleanup_mode = "no_pr"
         workspace = "Use the current task execution root as the workspace."
         context = "PR not applicable: {{.Params.pr_report}}"
     elif closed:
+        cleanup_mode = "closed_without_merge"
         context = """PR closure report: {{.Params.pr_report}}
 Closure reason: {{.Params.closure_reason}}"""
     else:
+        cleanup_mode = "report_only"
         context = "Delivery context: {{.Params.review_context}}"
+    if profile.capability("managed_worktrees"):
+        completion = f"""Do not remove the managed worktree or local branch
+inside this agent session. The following deterministic Task Janitor runs only
+after this resource-owning Cleanup session exits. It may remove an exact
+task-owned clean managed worktree and local branch when recoverability is
+proven. For `merged`, it may also delete the same-repository remote task branch
+only when GitHub reports the exact branch head in the merged PR and the remote
+head has not changed.
+
+Complete with `run_janitor` and provide:
+
+- canonical `workspace_path`;
+- `task_short_id` as `{{{{.TaskShortId}}}}`;
+- `pr_url`, `branch_name`, and `merge_report`, using empty strings when absent;
+- `cleanup_mode` as `{cleanup_mode}`;
+- `cleanup_session_id` from the current `KENT_SESSION_ID`;
+- a non-empty `cleanup_report` describing preflight and preserved resources.
+
+Use `needs_user_action` only when even conservative preservation requires a
+human decision."""
+    else:
+        completion = """Complete with `done` and provide `cleanup_report`
+describing performed and skipped actions. Use `needs_user_action` with
+`blocker_reason` when safe cleanup requires a human decision."""
     return f"""Perform conservative cleanup for {{{{.TaskShortId}}}}.
 
 {workspace}
@@ -1602,13 +2013,27 @@ Closure reason: {{.Params.closure_reason}}"""
 
 {procedure_instruction(profile, "cleanup")}
 
-Treat cleanup as report-first. Do not move, rename, or directly delete
-Kent-managed worktrees. Remove a checkout or branch only when the project
-procedure and user authorization make recovery safety conclusive.
+Treat cleanup as report-first. Never delete the primary checkout, dirty or
+ambiguous state, or content not proven recoverable.
 
-Complete with `done` and provide `cleanup_report` describing performed and
-skipped actions. Use `needs_user_action` with `blocker_reason` when safe cleanup
-requires a human decision."""
+{completion}"""
+
+
+def janitor_recovery_prompt(profile: ProjectProfile) -> str:
+    return f"""Recover the task cleanup after deterministic Janitor failure.
+
+Previous cleanup report:
+{{{{.Params.cleanup_report}}}}
+Blocker:
+{{{{.Params.blocker_reason}}}}
+
+{procedure_instruction(profile, "cleanup")}
+
+Use the retained Cleanup context. Do not directly remove a Kent-managed
+worktree from this agent session. If the infrastructure failure is transient
+and the same safety proofs still hold, choose `run_janitor` again with the
+complete canonical parameter contract. Otherwise choose `needs_user_action`
+with the exact blocker. Preserve every ambiguous or unique resource."""
 
 
 def pr_recovery_fix_prompt(

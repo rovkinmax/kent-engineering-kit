@@ -18,6 +18,10 @@ bash -n "$repo_root/templates/project/emulator-resource-lock.sh"
 bash -n "$repo_root/templates/project/mobile-evidence-audit.sh"
 bash -n "$repo_root/templates/project/workflow-verification-dispatch"
 bash -n "$repo_root/templates/project/workflow-verify-report"
+python3 -m py_compile \
+  "$repo_root/templates/project/workflow-checkpoint" \
+  "$repo_root/templates/project/workflow-wait-github-pr" \
+  "$repo_root/templates/project/workflow-task-janitor"
 
 install_help_root="$(mktemp -d)"
 KENT_PERSISTENCE_ROOT="$install_help_root" \
@@ -38,6 +42,18 @@ rmdir "$install_help_root"
 }
 [[ -x "$repo_root/templates/project/workflow-verify-report" ]] || {
   echo "verification report template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/workflow-checkpoint" ]] || {
+  echo "workflow checkpoint template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/workflow-wait-github-pr" ]] || {
+  echo "GitHub PR watcher template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/workflow-task-janitor" ]] || {
+  echo "task janitor template is not executable" >&2
   exit 1
 }
 [[ -x "$repo_root/templates/project/emulator-resource-lock.sh" ]] || {

@@ -84,6 +84,11 @@ device, source-control, issue-tracker, and release adapters.
 - `merge_report`
 - `closure_reason`
 - `cleanup_report`
+- `evidence_context`
+- `pr_head_oid`
+- `pr_base_oid`
+- `cleanup_mode`
+- `cleanup_session_id`
 
 ## Execution targets
 
@@ -178,6 +183,15 @@ device, source-control, issue-tracker, and release adapters.
   reliability. A broad recovered node can grow large again and fail before its
   transition persists. Pair compaction with durable checkpoints, authoritative
   artifact updates, and bounded remaining work.
+- Fix and Smoke checkpoints live under the ignored
+  `.kent/runtime/<task-short-id>/` directory and are written atomically through
+  the profile-owned checkpoint command. They contain one next action plus
+  completed, remaining, and mutation-ledger arrays. Checkpoints never contain
+  credentials, authenticated UI payloads, broad logs, or raw evidence.
+- A resumed Fix or Smoke stage validates and reconciles its checkpoint against
+  current Git, task, device, lock, and evidence state before skipping any work.
+  A mismatch invalidates the skip decision; it does not authorize repetition of
+  a recorded external mutation.
 
 ## Final compliance
 
@@ -197,6 +211,13 @@ device, source-control, issue-tracker, and release adapters.
   retains the legacy meaning: its old `compliance_review` value controls the
   early Standards branch and final Compliance remains disabled. Projects opt
   into the split by declaring both capabilities explicitly.
+- Packaging-only Compliance defects use `repair_evidence`, not normal Fix,
+  when substantive source, verification, Gate, and Smoke decisions are already
+  valid. Evidence Repair may edit only named ignored reports, summaries,
+  checklists, or indexes and rerun their audit. It never rebuilds, reinstalls,
+  reacquires a device, or changes the underlying acceptance result. It returns
+  directly to final Compliance. Any substantive defect routes to normal Fix and
+  the full verification flow.
 
 ## Pull-request merge strategy
 
@@ -238,6 +259,12 @@ device, source-control, issue-tracker, and release adapters.
   green/red/canceled state without spending a model turn per poll.
   `needs_user_action` is reserved for authentication, access, ambiguous
   identity, contradictory policy, or another actual human decision.
+- An open, green, method-feasible pull request transitions from Waiting PR to
+  a deterministic merge watcher. The watcher performs no model turns or user
+  approvals while relevant state is unchanged. It wakes Waiting PR only for a
+  changed head, requested changes, merge conflict, lost method feasibility,
+  closure, access failure, or another material event. A confirmed merge goes
+  directly to Cleanup.
 - Fix exposes a `pr_merged` recovery edge to Cleanup for a task that was
   already delivered before stale or late workflow routing reached the writer.
   The edge requires authoritative PR URL, branch, and merge proof; it never
@@ -294,6 +321,9 @@ device, source-control, issue-tracker, and release adapters.
   Compliance accepts them.
 - Persist a concise checkpoint before a long Smoke continuation so resume does
   not repeat completed lock, build, install, targeting, or evidence work.
+- The checkpoint is reconciled before reuse and records bounded acceptance
+  stages, exact resource ownership, sanitized evidence, restoration state, and
+  an external-action ledger. Secrets and broad authenticated state are excluded.
 - A deterministic project-local evidence audit must pass before Smoke reports
   success or a blocker. Unsafe raw files are removed or redacted while the
   non-sensitive summary and lock-release evidence remain.
@@ -359,6 +389,26 @@ device, source-control, issue-tracker, and release adapters.
   record under the replacement graph instead.
 - Completed and canceled task history may be discarded when the user accepts
   that consequence; it is not by itself a retirement blocker.
+
+## Task-owned cleanup
+
+- Cleanup is a report-first resource-owning agent stage. It never removes its
+  own Kent-managed worktree.
+- For managed-worktree profiles, Cleanup emits canonical workspace, task,
+  branch, PR, merge, mode, session, and preflight data to a deterministic Task
+  Janitor script after the Cleanup session exits.
+- The Janitor never deletes the primary checkout, dirty or ambiguous state, or
+  content not proven recoverable. A merged-PR cleanup re-queries GitHub and
+  requires the exact branch head recorded by that merged PR.
+- The same-repository remote task branch may be deleted only when its current
+  OID still equals the merged PR head. Local worktree and branch deletion uses
+  Kent's supported worktree command; a squash/rebase branch retained by Kent
+  may be deleted only under the same exact merged-PR proof.
+- No-PR/report-only cleanup requires the clean HEAD to remain reachable from a
+  remote ref. Closed-without-merge work is preserved.
+- Safety preservation is a successful cleanup result and must be explicit in
+  `cleanup_report`. Infrastructure failure returns to Cleanup with the resource
+  untouched.
 
 ## Project adapter boundary
 

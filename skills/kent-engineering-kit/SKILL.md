@@ -46,6 +46,9 @@ generated toolkit workflows.
   provider or transport error should be recovered with the user-only
   `kent task resume` command, preserving the locked target and completed
   upstream transitions. Do not replace it with a manual move or a new task.
+- Generated Fix and Smoke stages use the profile `checkpoint` command and
+  canonical ignored `.kent/runtime/<task-short-id>/` files. Reconcile before
+  repeating work and persist before every transition.
 - Follow `contracts/worktree-contract.md` when a project needs setup hooks or
   untracked machine configuration.
 - Follow `contracts/mobile-smoke-contract.md` for runtime inspection,
@@ -122,6 +125,8 @@ generated toolkit workflows.
   rulesets, and merge-queue evidence to
   `~/.kent/bin/kent-resolve-github-merge-strategy`. Honor its structured
   `resolved` or `needs_user_action` result; never choose manually.
+- After green CI, an open feasible PR belongs in the deterministic `wait_pr`
+  script node. Unchanged open state never becomes approval or a model turn.
 - Diagnose disputed rebase feasibility only in an isolated temporary clone or
   branch. Rewriting task history requires exact user authorization, a backup,
   final-tree proof, and force-with-lease pinned to the expected remote head.
@@ -150,6 +155,9 @@ generated toolkit workflows.
   non-destructive. Only the user may repeat it with `--confirm`; deletion
   removes the workflow definition, project links, and task database rows but
   intentionally retains repository files and managed worktrees.
+- Generated managed-worktree Cleanup hands deletion to the post-session Task
+  Janitor. Never replace it with direct `git worktree remove`; inspect its
+  report when safety preservation leaves a resource in place.
 - Before confirmation, recreate every Backlog task in the replacement workflow
   with its title, body, source URL, labels, relevant comments, and old short ID.
   Do not move records between incompatible graphs. Completed/canceled history

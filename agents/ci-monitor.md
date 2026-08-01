@@ -38,6 +38,10 @@ state monitor.
   such as missing authentication, denied access, ambiguous run identity, or
   contradictory policy. The passage of time and a running CI job are not user
   actions.
+- After green CI, hand an open feasible PR to the workflow's deterministic
+  merge watcher with the exact head OID. Do not spend model turns or request
+  approvals merely to observe unchanged open state. Re-enter only when the
+  watcher reports a material change.
 
 Return concise check or release-automation states, failure evidence,
 merge-method feasibility when applicable, and the next workflow transition.

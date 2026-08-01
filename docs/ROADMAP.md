@@ -67,15 +67,16 @@ owns real task history and provides rollback.
   repeat checks. A read-only reviewer can finish all inspections but lose the
   result during final response synthesis. Smoke can finish lock, build,
   install, launch, and target-selection attempts but fail before reporting
-  whether destructive acceptance actions began. Prototype task-local resumable
-  checkpoints for long agent nodes. Writer checkpoints record the pinned
+  whether destructive acceptance actions began. Task-local resumable Fix and
+  Smoke checkpoints are now implemented through the profile-owned atomic
+  checkpoint command. Writer checkpoints record the pinned
   baseline, completed scope, fresh green commands, and the single next
   permitted action. Reviewer checkpoints record inspected authority, evidence,
   and structured findings before final transition synthesis. Smoke checkpoints
   additionally record the exact device lock, target-confirmation state, and a
   destructive-action ledger for disposable test data. Validate that resume
   reconciles the checkpoint instead of repeating completed work, graph-owned
-  review axes, or user-data mutations.
+  review axes, or user-data mutations. Managed-worktree canaries remain.
 - PUB-31 showed that a single broad Smoke request can grow to roughly 80k
   estimated provider tokens, with a compacted continuation consuming roughly
   43k more despite only one missing manual observation. Future Smoke prompts
@@ -136,30 +137,34 @@ owns real task history and provides rollback.
   procedures, and adapters.
 - Observe ordinary default tasks across delivery-ready, Smoke, Fix, CI, and PR
   feedback paths.
-- Add an evidence-repair lane for packaging-only Compliance failures. When the
+- The generated evidence-repair lane now handles packaging-only Compliance
+  failures. When the
   source diff and substantive verification are already green, Fix should repair
   only missing, empty, or contradictory reports/checklists, rerun the evidence
   audit, and return directly to final Compliance. It must not repeat source
   verification, rebuild/reinstall the app, or reacquire an emulator unless the
-  repaired artifact changes the underlying acceptance result.
+  repaired artifact changes the underlying acceptance result. Canary direct
+  Compliance re-entry before default promotion.
 - PUB-37 showed that Plan can invent product authority by writing "the user
   clarified" into a specification without an exact human-authored comment.
   Enforce authority provenance in Plan, Specification Review, and Compliance:
   task-body narrowing requires an exact human comment ID or another explicit
   authoritative source and otherwise blocks before implementation.
-- Waiting PR currently has no external merge wake-up signal. A merged PR still
-  needs one user-approved recheck before Cleanup, while approving before merge
-  merely loops back to Waiting PR. Keep the current explicit gate for safety,
-  but prototype a low-cost deterministic poll or Kent/GitHub event integration
-  that wakes only on changed PR state and does not burn an agent session.
+- Waiting PR now hands an open feasible GitHub PR to a deterministic script
+  watcher. Unchanged state consumes no approval or model turn; material state
+  changes wake the retained evaluator, and merge goes directly to Cleanup.
+  Canary interruption/restart behavior before default promotion.
 - PUB-37 proved that report-only Cleanup does not match the desired operating
   model: the task reached Done after merge while its managed worktree and local
-  task branch remained. Add a two-phase task-owned janitor that runs only after
-  the resource-owning session exits. It must prove the PR is merged, the remote
+  task branch remained. A two-phase task-owned Janitor is now generated after
+  the resource-owning Cleanup session exits. It proves the PR is merged, the
+  remote
   task branch is absent or safely deletable, and every dirty/untracked path is
   either ignored evidence or byte-equivalent to the current merged target
   before removing the managed worktree and local task branch. Preserve and
-  report any unique unmerged content instead of deleting it.
+  reports any unique unmerged content instead of deleting it. Destructive
+  promotion remains blocked on a disposable managed-worktree canary proving
+  Kent permits deletion from the following script node.
 - OSM-33 showed a late-CI routing failure: GitHub merged PR #1537, then the
   existing CI node observed an unrelated UI-test failure and returned the
   already delivered task to Fix. CI must query merge state first, must not

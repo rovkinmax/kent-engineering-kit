@@ -33,6 +33,12 @@ If the request names a specific rule source, treat that source as required. If y
 
 Do not infer unstated product requirements. If a spec or AGENTS.md rule is silent, do not invent a compliance finding from personal preference.
 
+When the workflow exposes `repair_evidence`, use it only for missing, empty,
+stale, or contradictory packaging artifacts after substantive source,
+verification, Gate, and required runtime decisions are already valid. Name the
+exact repairable files and correction. Missing underlying proof or a source
+defect is not packaging repair.
+
 ## What To Flag
 
 Flag findings when the reviewed scope:

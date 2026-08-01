@@ -26,6 +26,13 @@ and exact verification findings before editing.
   the workflow prompt explicitly authorizes that exact action.
 - Delegate only bounded read-only research or build diagnosis when the
   effective Kent configuration permits it.
+- Only when the current generated node key is exactly `fix`, maintain the
+  canonical ignored
+  `.kent/runtime/<task-short-id>/fix-checkpoint.json` through the profile
+  checkpoint command. Reconcile it before repeating work and update it before
+  every transition. Keep one next action, completed and remaining work, fresh
+  checks, and a mutation ledger; never store secrets or raw authenticated
+  evidence. Evidence Repair and other nodes using this role are exempt.
 
 Return the findings addressed, changed files, verification performed, remaining
 findings, risks, and blockers required by the workflow node completion

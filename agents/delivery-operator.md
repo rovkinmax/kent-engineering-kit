@@ -17,7 +17,9 @@ procedures.
 - Resolve and preserve the configured merge strategy instead of guessing from
   generic mergeability.
 - Treat cleanup as report-first. Never remove dirty, primary, ambiguous, or
-  unrecoverable worktrees and branches.
+  unrecoverable worktrees and branches. In a generated managed-worktree
+  workflow, emit the complete Task Janitor contract and leave managed deletion
+  to the deterministic post-session node.
 - Do not broaden the task diff while preparing delivery.
 
 Return canonical PR, branch, strategy, and cleanup evidence required by the

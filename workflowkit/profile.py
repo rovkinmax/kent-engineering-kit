@@ -223,6 +223,22 @@ class ProjectProfile:
             raise SpecError("profile command 'dispatch' is required")
         if not self.command("verify"):
             raise SpecError("profile command 'verify' is required")
+        if not self.command("checkpoint"):
+            raise SpecError("profile command 'checkpoint' is required")
+        if self.capability("managed_worktrees") and not self.command("janitor"):
+            raise SpecError(
+                "profile command 'janitor' is required for managed worktrees"
+            )
+        if self.capability("pull_requests"):
+            if self.source_control != "github":
+                raise SpecError(
+                    "generated pull-request waiting currently requires "
+                    "source_control = 'github'"
+                )
+            if not self.command("wait_pr"):
+                raise SpecError(
+                    "profile command 'wait_pr' is required for pull requests"
+                )
 
         if not self.work_kinds:
             raise SpecError("profile must declare at least one work kind")

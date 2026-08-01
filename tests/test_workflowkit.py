@@ -539,6 +539,42 @@ class WorkflowKitTest(unittest.TestCase):
             tuple(parameter.key for parameter in by_key["waiting_pr_fix"].parameters),
             ("workspace_path", "merge_strategy", "pr_report"),
         )
+        self.assertEqual(by_key["waiting_pr_watch_merge"].target, "merge_watch")
+        self.assertFalse(by_key["waiting_pr_watch_merge"].requires_approval)
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["waiting_pr_watch_merge"].parameters
+            ),
+            (
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "pr_head_oid",
+                "pr_base_oid",
+            ),
+        )
+        self.assertEqual(
+            by_key["merge_watch_still_waiting"].target,
+            "merge_watch",
+        )
+        self.assertEqual(
+            by_key["merge_watch_state_changed"].target,
+            "waiting_pr",
+        )
+        self.assertEqual(
+            by_key["merge_watch_cleanup"].target,
+            "cleanup",
+        )
+        self.assertEqual(
+            by_key["waiting_pr_ci_monitor"].target,
+            "ci_monitor",
+        )
+        self.assertIn(
+            "Merely waiting for review or merge is not a blocker",
+            by_key["ci_monitor_waiting_pr"].prompt,
+        )
         self.assertTrue(by_key["waiting_pr_close_without_merge"].requires_approval)
         self.assertEqual(
             tuple(
@@ -701,6 +737,89 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn(
             "Final Compliance Review: {{.Params.compliance_report}}",
             by_key["compliance_prepare_pr"].prompt,
+        )
+        self.assertEqual(
+            by_key["compliance_evidence_repair"].target,
+            "evidence_repair",
+        )
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["compliance_evidence_repair"].parameters
+            ),
+            ("workspace_path", "review_context", "evidence_context"),
+        )
+        self.assertEqual(
+            by_key["evidence_repair_compliance"].target,
+            "compliance",
+        )
+        self.assertEqual(
+            by_key["evidence_repair_fix"].target,
+            "fix",
+        )
+        self.assertIn(
+            "do not build, install, launch, reacquire a device",
+            by_key["compliance_evidence_repair"].prompt,
+        )
+
+    def test_managed_worktree_cleanup_uses_task_janitor(self) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 1)
+        nodes = {node.key: node for node in spec.nodes}
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        self.assertEqual(nodes["task_janitor"].kind, "script")
+        self.assertEqual(
+            nodes["task_janitor"].script_path,
+            ".kent/scripts/workflow-task-janitor",
+        )
+        self.assertEqual(by_key["cleanup_task_janitor"].target, "task_janitor")
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["cleanup_task_janitor"].parameters
+            ),
+            (
+                "workspace_path",
+                "task_short_id",
+                "pr_url",
+                "branch_name",
+                "merge_report",
+                "cleanup_mode",
+                "cleanup_session_id",
+                "cleanup_report",
+            ),
+        )
+        self.assertEqual(by_key["task_janitor_done"].target, "done")
+        self.assertEqual(by_key["task_janitor_blocked"].target, "cleanup")
+        self.assertIn(
+            "after this resource-owning Cleanup session exits",
+            by_key["waiting_pr_cleanup"].prompt,
+        )
+
+    def test_fix_and_smoke_prompts_require_durable_checkpoints(self) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 1)
+        prompts = {
+            edge.key: edge.prompt or ""
+            for edge in spec.edges
+        }
+
+        self.assertIn(
+            ".kent/runtime/{{.TaskShortId}}/fix-checkpoint.json",
+            prompts["gate_fix"],
+        )
+        self.assertIn(
+            ".kent/scripts/workflow-checkpoint",
+            prompts["gate_fix"],
+        )
+        self.assertIn(
+            ".kent/runtime/{{.TaskShortId}}/smoke-checkpoint.json",
+            prompts["gate_smoke_required"],
+        )
+        self.assertIn(
+            "Persist the latest checkpoint before every workflow transition",
+            prompts["gate_smoke_required"],
         )
 
     def test_standards_and_final_compliance_capabilities_are_independent(self) -> None:

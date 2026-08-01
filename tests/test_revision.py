@@ -47,7 +47,13 @@ class RevisionPreflightTest(unittest.TestCase):
             path = root / configured_path
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# Test procedure\n")
-        for name in ("workflow-verification-dispatch", "workflow-verify"):
+        for name in (
+            "workflow-checkpoint",
+            "workflow-task-janitor",
+            "workflow-verification-dispatch",
+            "workflow-verify",
+            "workflow-wait-github-pr",
+        ):
             path = scripts / name
             path.write_text("#!/usr/bin/env bash\nexit 0\n")
             path.chmod(0o755)
@@ -64,8 +70,11 @@ class RevisionPreflightTest(unittest.TestCase):
             {path.path for path in result.checked_paths},
             {
                 ".kent/project-contract.md",
+                ".kent/scripts/workflow-checkpoint",
+                ".kent/scripts/workflow-task-janitor",
                 ".kent/scripts/workflow-verification-dispatch",
                 ".kent/scripts/workflow-verify",
+                ".kent/scripts/workflow-wait-github-pr",
                 ".kent/workflow-profile.toml",
                 *WORK_KIND_PROCEDURES,
             },

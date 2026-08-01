@@ -13,12 +13,19 @@ import tomllib
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TEMPLATES = {
+ADAPTER_TEMPLATES = {
     "mobile_evidence_audit": (
         REPO_ROOT / "templates" / "project" / "mobile-evidence-audit.sh"
     ),
     "mobile_resource_lock": (
         REPO_ROOT / "templates" / "project" / "emulator-resource-lock.sh"
+    ),
+}
+COMMAND_TEMPLATES = {
+    "checkpoint": REPO_ROOT / "templates" / "project" / "workflow-checkpoint",
+    "janitor": REPO_ROOT / "templates" / "project" / "workflow-task-janitor",
+    "wait_pr": (
+        REPO_ROOT / "templates" / "project" / "workflow-wait-github-pr"
     ),
 }
 
@@ -109,37 +116,55 @@ def main() -> int:
         raise ValueError(f"project profile not found: {profile_path}")
 
     profile = tomllib.loads(profile_path.read_text())
-    adapters = profile.get("adapters", {})
-    if not isinstance(adapters, dict):
-        raise ValueError("profile adapters must be a TOML table")
+    results = {"adapters": [], "commands": []}
+    for table_name, templates in (
+        ("adapters", ADAPTER_TEMPLATES),
+        ("commands", COMMAND_TEMPLATES),
+    ):
+        configured = profile.get(table_name, {})
+        if not isinstance(configured, dict):
+            raise ValueError(f"profile {table_name} must be a TOML table")
+        for key, configured_path in sorted(configured.items()):
+            if not isinstance(configured_path, str):
+                raise ValueError(
+                    f"{table_name}.{key} must be a string"
+                )
+            if not configured_path.strip():
+                continue
+            target = project_target(project_root, configured_path.strip())
+            if key in templates:
+                source = templates[key]
+                status_label = synchronize(source, target, update=args.update)
+            elif table_name == "commands":
+                continue
+            else:
+                if not target.is_file():
+                    raise ValueError(
+                        f"project-owned {table_name[:-1]} not found: {target}"
+                    )
+                if table_name == "adapters" and not os.access(target, os.X_OK):
+                    raise ValueError(
+                        f"project-owned adapter is not executable: {target}"
+                    )
+                status_label = "project-owned"
+            results[table_name].append(
+                {
+                    table_name[:-1]: key,
+                    "status": status_label,
+                    "target": str(target),
+                }
+            )
 
-    results = []
-    for key, configured_path in sorted(adapters.items()):
-        if not isinstance(configured_path, str) or not configured_path.strip():
-            raise ValueError(f"adapters.{key} must be a non-empty string")
-        target = project_target(project_root, configured_path.strip())
-        if key in TEMPLATES:
-            source = TEMPLATES[key]
-            status_label = synchronize(source, target, update=args.update)
-        else:
-            if not target.is_file():
-                raise ValueError(
-                    f"project-owned adapter not found: {target}"
-                )
-            if not os.access(target, os.X_OK):
-                raise ValueError(
-                    f"project-owned adapter is not executable: {target}"
-                )
-            status_label = "project-owned"
-        results.append(
+    print(
+        json.dumps(
             {
-                "adapter": key,
-                "status": status_label,
-                "target": str(target),
-            }
+                "project": str(project_root),
+                "adapters": results["adapters"],
+                "commands": results["commands"],
+            },
+            indent=2,
         )
-
-    print(json.dumps({"project": str(project_root), "adapters": results}, indent=2))
+    )
     return 0
 
 

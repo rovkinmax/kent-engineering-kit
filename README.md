@@ -102,7 +102,13 @@ Desktop. Skills, prompts, and `AGENTS.md` are consumed by new sessions.
 ## Workflow generation
 
 Project repositories provide `.kent/workflow-profile.toml`, deterministic
-verification scripts, and project procedures. Preview a versioned workflow:
+verification scripts, project procedures, and these kit-managed commands:
+
+- `checkpoint` — atomic ignored Fix/Smoke state under `.kent/runtime/`;
+- `wait_pr` — zero-model GitHub merge watching;
+- `janitor` — post-Cleanup safe managed-worktree and branch cleanup.
+
+Projects add `/.kent/runtime/` to `.gitignore`. Preview a versioned workflow:
 
 ```bash
 ./scripts/generate-workflow \
@@ -161,6 +167,21 @@ capabilities, target-branch protection/rulesets, and merge-queue policy. It
 continues only when those constraints leave exactly one method. The resolved
 strategy is carried through PR creation, CI, and merge waiting; generic
 mergeability never substitutes for method-specific feasibility.
+
+After green CI, an open feasible PR moves to a deterministic script watcher.
+Unchanged state consumes no model turn and requires no approval. Material
+changes wake the retained Waiting PR session; a confirmed merge goes directly
+to Cleanup.
+
+Long Fix and Smoke stages atomically checkpoint one next action plus completed,
+remaining, and mutation-ledger state. Final Compliance may route
+packaging-only report/checklist defects through Evidence Repair and directly
+back to Compliance without rebuilding or reacquiring runtime resources.
+
+Managed-worktree Cleanup is two-phase: the Cleanup agent emits a report and
+session-scoped request, then a deterministic Task Janitor runs after that agent
+exits. It deletes only exact clean task-owned resources proven recoverable and
+preserves every dirty, primary, ambiguous, or unique resource.
 
 Verification dispatch validates `workspace_path` before fan-out. The value must
 be the canonical current task repository or execution root; `.todo` artifact

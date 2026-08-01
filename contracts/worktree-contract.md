@@ -34,6 +34,15 @@ configuration itself or fail with an actionable diagnostic. The setup hook may
 call the same bootstrap helper, but verification must not rely on the hook being
 the only path to a usable checkout.
 
+## Task runtime state
+
+- Generated Fix and Smoke stages store resumable state only under the ignored
+  `.kent/runtime/<task-short-id>/` directory.
+- The project adds `/.kent/runtime/` to `.gitignore`.
+- The checkpoint helper refuses to write when Git does not prove that path is
+  ignored, and writes atomically inside the current repository root.
+- Task Janitor removes this runtime state only as part of safe task cleanup.
+
 ## MCP project identity
 
 The global MCP adapter separates the current execution root from the primary

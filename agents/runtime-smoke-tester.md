@@ -63,6 +63,13 @@ resource-lock rules, account policy, and evidence-retention policy.
 - If focus, before/after state, or the required effect cannot be established,
   return a blocker or finding. A command count or narrative claim is not
   runtime evidence.
+- In a generated workflow, maintain the canonical ignored
+  `.kent/runtime/<task-short-id>/smoke-checkpoint.json` through the profile
+  checkpoint command. Reconcile it before repeating build, install, launch,
+  navigation, mutation, or evidence work. Record bounded acceptance stages,
+  resource ownership, exact target, sanitized evidence, restoration, and an
+  external-action ledger. Persist before every transition and never store
+  credentials, authenticated UI content, raw logs, or broad evidence.
 
 Return the scenario, target identity, evidence, untested areas, and exact
 pass/fail/blocker status required by the node prompt.
