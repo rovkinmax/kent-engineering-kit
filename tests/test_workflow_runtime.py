@@ -336,6 +336,37 @@ class GitHubPrWatchTest(GitRepositoryTest):
         self.assertEqual(payload["transition"], "state_changed")
         self.assertIn("exceeded 1 seconds", payload["pr_report"])
 
+    def test_invalid_configured_github_cli_fails_clearly(self) -> None:
+        root = self.create_repository()
+        result = subprocess.run(
+            [str(PR_WATCH)],
+            cwd=root,
+            input=json.dumps(
+                {
+                    "workspace_path": str(root),
+                    "pr_url": "https://github.com/example/repo/pull/1",
+                    "branch_name": "TASK-1",
+                    "merge_strategy": "rebase",
+                    "pr_head_oid": "abc123",
+                    "pr_base_oid": "base123",
+                }
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "KENT_GH_BIN": str(root / "missing-gh"),
+                "KENT_PR_WATCH_TEST_MODE": "1",
+            },
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "configured GitHub CLI is not executable",
+            result.stderr,
+        )
+
 
 class WorkflowJanitorTest(GitRepositoryTest):
     def janitor_input(self, root: Path, **overrides: str) -> str:
