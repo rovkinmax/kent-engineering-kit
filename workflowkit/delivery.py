@@ -1684,6 +1684,15 @@ Do not convert target-only commits missing from an older task checkout into
 writer work without a proven merge/replay conflict or delivered-tree loss.
 Repository-policy contradictions and unavailable mandatory baseline evidence
 route to `needs_user_action`, not Fix.
+Follow the user-facing workflow communication contract from AGENTS.md.
+Keep full technical reports in `review_context`. Transition commentary and
+`blocker_reason` must be concise, use the user's preferred conversation
+language, and name only decisions or external actions the user can actually
+perform. Number independent decisions and state what happens after approval.
+Do not paste raw review reports or present task-scoped code fixes as user
+actions; preserve those findings for the normal Fix route after authority is
+resolved. An external dependency blocks only the stage whose acceptance
+contract actually requires it.
 Provide `workspace_path`, a refreshed `review_context` summarizing all reports,
 and the required Smoke decision fields. The refreshed `review_context` must
 record the profile Smoke policy, selected transition, rationale, and required

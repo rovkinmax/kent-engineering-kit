@@ -24,6 +24,23 @@ device, source-control, issue-tracker, and release adapters.
 - One writer owns fixes and integration.
 - `done` means delivered or explicitly approved report-only completion.
 
+## User-facing workflow communication
+
+- Direct questions, transition commentary, `blocker_reason`, `closure_reason`,
+  approval summaries, and Needs User Action text use the user's preferred
+  conversation language. The installed global contract defaults these surfaces
+  to Russian for this user.
+- Code, commands, identifiers, structured parameter keys, and repository
+  artifacts retain their project-defined language.
+- Approval text is concise and decision-oriented. It states what the user must
+  decide or do, why it is needed, and what happens after confirmation.
+- Number independent decisions. Keep full verification reports in their
+  structured report/context parameters rather than pasting them into the
+  approval summary.
+- Task-scoped source fixes belong in `fix_context`; they are not described as
+  actions the user must perform. External dependencies only block the stage
+  whose acceptance contract actually requires them.
+
 ## Writer session policy
 
 - `policies.writer_sessions = "continuous"` preserves the historical behavior:

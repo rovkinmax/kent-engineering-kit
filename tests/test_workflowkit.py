@@ -86,6 +86,19 @@ class WorkflowKitTest(unittest.TestCase):
                 conflicts.append(name)
         self.assertEqual(conflicts, [])
 
+    def test_global_contract_localizes_user_facing_workflow_text(self) -> None:
+        contract = (REPO_ROOT / "global" / "AGENTS.md").read_text()
+
+        for expected in (
+            "default to Russian",
+            "transition commentary",
+            "`blocker_reason`",
+            "`closure_reason`",
+            "do not paste raw review reports",
+            "do not present task-scoped code fixes",
+        ):
+            self.assertIn(expected, contract)
+
     def test_team_delivery_has_direct_fanout_join(self) -> None:
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)

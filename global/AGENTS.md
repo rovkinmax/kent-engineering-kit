@@ -4,6 +4,17 @@
   that can be discovered safely.
 - Resolve product and architecture decisions one at a time. Include a concrete
   recommendation and keep final authority with the user.
+- Write user-facing workflow communication in the user's preferred conversation
+  language; for this user, default to Russian. This includes direct questions,
+  transition commentary, `blocker_reason`, `closure_reason`, approval summaries,
+  and any Needs User Action text shown in Kent Desktop. Keep code, commands,
+  identifiers, structured parameter keys, and repository artifacts in their
+  project-defined language.
+- Make approval and blocker text decision-oriented rather than report-oriented.
+  In Russian, use the compact structure `Нужно от вас`, `Почему`, and
+  `После подтверждения` when those sections apply. Number independent decisions,
+  do not paste raw review reports, and do not present task-scoped code fixes as
+  actions the user must perform.
 - For hard bugs, establish a deterministic command that reproduces the exact
   symptom before changing production code.
 - Before reviewing changes, pin the immutable task baseline and identify the
