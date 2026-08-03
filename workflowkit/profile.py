@@ -14,6 +14,7 @@ DELIVERY_PROFILES = {"lite", "standard", "team", "release"}
 SMOKE_POLICIES = {"disabled", "conditional", "required"}
 WRITER_SESSION_POLICIES = {"continuous", "fresh_per_slice"}
 PR_MERGE_STRATEGIES = {"auto", "merge", "squash", "rebase"}
+PACKAGE_PUBLISH_TOPOLOGY = "manual-package-publish-after-main"
 WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 ROLE_PROMPT_DIRECTORIES = (
@@ -239,6 +240,26 @@ class ProjectProfile:
                 raise SpecError(
                     "profile command 'wait_pr' is required for pull requests"
                 )
+        if self.package_publish_after_main():
+            if not self.capability("pull_requests"):
+                raise SpecError(
+                    f"release_topology {PACKAGE_PUBLISH_TOPOLOGY!r} "
+                    "requires pull_requests"
+                )
+            if not self.procedure("publish"):
+                raise SpecError(
+                    f"release_topology {PACKAGE_PUBLISH_TOPOLOGY!r} "
+                    "requires procedures.publish"
+                )
+            if check_files:
+                publish_path = self.resolve_project_path(
+                    self.procedure("publish"),
+                    "procedures.publish",
+                )
+                if not publish_path.is_file():
+                    raise SpecError(
+                        f"publish procedure not found: {publish_path}"
+                    )
 
         if not self.work_kinds:
             raise SpecError("profile must declare at least one work kind")
@@ -282,6 +303,8 @@ class ProjectProfile:
             required_roles.add("compliance")
         if self.capability("spec_review"):
             required_roles.add("spec_review")
+        if self.package_publish_after_main():
+            required_roles.add("package_release")
         for role in sorted(required_roles):
             self.role(role)
 
@@ -318,6 +341,9 @@ class ProjectProfile:
 
     def pr_merge_strategy(self) -> str:
         return self.policies.get("pr_merge_strategy", "auto").strip()
+
+    def package_publish_after_main(self) -> bool:
+        return self.release_topology == PACKAGE_PUBLISH_TOPOLOGY
 
     def command(self, key: str) -> str:
         return self.commands.get(key, "").strip()

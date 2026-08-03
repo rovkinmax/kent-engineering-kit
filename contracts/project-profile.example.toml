@@ -46,6 +46,7 @@ ship = ""
 ci = ""
 waiting_pr = ""
 cleanup = ""
+publish = ""
 
 [work_kinds.feature]
 description = "User-facing behavior, screens, flows, or business capabilities."
@@ -106,4 +107,5 @@ spec_review = "spec-reviewer"
 compliance = "compliance_reviewer"
 qa = "runtime-smoke-tester"
 release = "delivery-operator"
+package_release = "release-manager"
 ci = "ci-monitor"

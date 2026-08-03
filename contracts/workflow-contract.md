@@ -82,6 +82,7 @@ device, source-control, issue-tracker, and release adapters.
 - `pr_report`
 - `ci_report`
 - `merge_report`
+- `publication_report`
 - `closure_reason`
 - `cleanup_report`
 - `evidence_context`
@@ -89,6 +90,24 @@ device, source-control, issue-tracker, and release adapters.
 - `pr_base_oid`
 - `cleanup_mode`
 - `cleanup_session_id`
+
+## Approval-gated package publication
+
+- `release_topology = "manual-package-publish-after-main"` inserts a dedicated
+  `Publish Package` node after confirmed PR merge and before Cleanup.
+- Every merged-PR route into publication requires explicit user approval.
+- The profile must declare `procedures.publish` and the
+  `roles.package_release` role.
+- Publication runs only from a clean checkout of the exact merged source and
+  only for package identity, version, destination, override mechanism, and tag
+  policy explicitly authorized in the task body or an exact human-authored
+  task comment.
+- The publisher checks remote state before every mutation and after success.
+  Existing, partial, conflicting, or unverifiable versions block without
+  overwrite or deletion.
+- Publication failures retain the task worktree and compact the publisher
+  session behind another approval. Cleanup starts only after a non-empty
+  `publication_report` proves the remote package.
 
 ## Execution targets
 

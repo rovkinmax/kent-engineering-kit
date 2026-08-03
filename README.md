@@ -168,6 +168,14 @@ continues only when those constraints leave exactly one method. The resolved
 strategy is carried through PR creation, CI, and merge waiting; generic
 mergeability never substitutes for method-specific feasibility.
 
+Projects that declare
+`release_topology = "manual-package-publish-after-main"` also provide a
+`procedures.publish` file and `roles.package_release`. Their generated Delivery
+graph waits for the PR to merge, requires explicit approval, publishes from the
+exact merged source, verifies the remote package, and only then enters Cleanup.
+Failed or partial publication preserves the task workspace for an
+approval-gated retry.
+
 After green CI, an open feasible PR moves to a deterministic script watcher.
 Unchanged state consumes no model turn and requires no approval. Material
 changes wake the retained Waiting PR session; a confirmed merge goes directly

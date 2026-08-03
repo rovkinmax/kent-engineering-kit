@@ -89,6 +89,10 @@ MERGE_REPORT = ParameterSpec(
     "merge_report",
     "Proof that the pull request is merged or equivalent delivery is complete.",
 )
+PUBLICATION_REPORT = ParameterSpec(
+    "publication_report",
+    "Exact package, version, merged source, publish command shape, and remote verification.",
+)
 CLOSURE_REASON = ParameterSpec(
     "closure_reason",
     "User-approved reason for closing or canceling delivery without merge.",
@@ -156,6 +160,13 @@ def build_delivery_workflow(
     final_compliance = (
         pull_requests
         and profile.capability("compliance_review")
+    )
+    package_publish = profile.package_publish_after_main()
+    merged_target = "publish_package" if package_publish else "cleanup"
+    merged_prompt = (
+        package_publish_prompt(profile)
+        if package_publish
+        else cleanup_prompt(profile, merged=True)
     )
     implementation_parameters = (WORKSPACE, PLAN, WORK_KIND)
     nodes: list[NodeSpec] = [
@@ -233,6 +244,14 @@ def build_delivery_workflow(
                 ),
             ]
         )
+        if package_publish:
+            nodes.append(
+                agent_node(
+                    "publish_package",
+                    "Publish Package",
+                    profile.role("package_release"),
+                )
+            )
     if profile.capability("ci_monitoring"):
         nodes.append(agent_node("ci_monitor", "Monitor CI", ci))
     if profile.capability("managed_worktrees"):
@@ -752,11 +771,12 @@ def build_delivery_workflow(
                         key="ci_monitor_merged",
                         source="ci_monitor",
                         transition="pr_merged",
-                        target="cleanup",
-                        prompt=cleanup_prompt(profile, merged=True),
+                        target=merged_target,
+                        prompt=merged_prompt,
+                        requires_approval=package_publish,
                         transition_description=(
                             "The pull request merged before CI observation "
-                            "completed; preserve late check state and clean up."
+                            "completed; continue from the confirmed merged state."
                         ),
                         parameters=(
                             WORKSPACE,
@@ -791,12 +811,13 @@ def build_delivery_workflow(
                     key="fix_pr_merged_cleanup",
                     source="fix",
                     transition="pr_merged",
-                    target="cleanup",
+                    target=merged_target,
                     context="new_session",
-                    prompt=cleanup_prompt(profile, merged=True),
+                    prompt=merged_prompt,
+                    requires_approval=package_publish,
                     transition_description=(
                         "Recovery only: the pull request is already merged; "
-                        "skip obsolete Fix work and clean up."
+                        "skip obsolete Fix work and continue post-merge delivery."
                     ),
                     parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_REPORT),
                 ),
@@ -804,10 +825,11 @@ def build_delivery_workflow(
                     key="waiting_pr_cleanup",
                     source="waiting_pr",
                     transition="pr_merged",
-                    target="cleanup",
-                    prompt=cleanup_prompt(profile, merged=True),
+                    target=merged_target,
+                    prompt=merged_prompt,
+                    requires_approval=package_publish,
                     transition_description=(
-                        "The pull request is confirmed merged; perform conservative cleanup."
+                        "The pull request is confirmed merged; continue post-merge delivery."
                     ),
                     parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_REPORT),
                 ),
@@ -871,8 +893,9 @@ def build_delivery_workflow(
                     key="merge_watch_cleanup",
                     source="merge_watch",
                     transition="pr_merged",
-                    target="cleanup",
-                    prompt=cleanup_prompt(profile, merged=True),
+                    target=merged_target,
+                    prompt=merged_prompt,
+                    requires_approval=package_publish,
                     transition_description=(
                         "The deterministic watcher confirmed the PR merged."
                     ),
@@ -937,6 +960,50 @@ def build_delivery_workflow(
                     ),
                     parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_STRATEGY),
                 )
+            )
+
+        if package_publish:
+            edges.extend(
+                [
+                    EdgeSpec(
+                        key="publish_cleanup",
+                        source="publish_package",
+                        transition="published",
+                        target="cleanup",
+                        prompt=published_cleanup_prompt(profile),
+                        transition_description=(
+                            "The approved package is verified remotely; clean "
+                            "up the merged task resources."
+                        ),
+                        parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_REPORT,
+                            PUBLICATION_REPORT,
+                        ),
+                    ),
+                    EdgeSpec(
+                        key="publish_needs_user_action",
+                        source="publish_package",
+                        transition="needs_user_action",
+                        target="publish_package",
+                        context="compact_and_continue_session",
+                        prompt=package_publish_recovery_prompt(profile),
+                        requires_approval=True,
+                        transition_description=(
+                            "Publication is blocked or partial; retry only "
+                            "after explicit approval and a fresh remote-state check."
+                        ),
+                        parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_REPORT,
+                            BLOCKER,
+                        ),
+                    ),
+                ]
             )
 
     if profile.capability("managed_worktrees"):
@@ -1054,6 +1121,7 @@ def build_canary_workflow(
     )
     canary_profile = replace(
         profile,
+        release_topology="none",
         capabilities=capabilities,
         policies=policies,
         procedures=procedures,
@@ -1099,6 +1167,7 @@ def build_smoke_lab_workflow(
     )
     lab_profile = replace(
         profile,
+        release_topology="none",
         capabilities=capabilities,
         procedures=procedures,
     )
@@ -2017,6 +2086,143 @@ Treat cleanup as report-first. Never delete the primary checkout, dirty or
 ambiguous state, or content not proven recoverable.
 
 {completion}"""
+
+
+def package_publish_prompt(profile: ProjectProfile) -> str:
+    return f"""Publish the package for {{{{.TaskShortId}}}} only after this
+incoming approval.
+
+This dedicated node is the separate explicit user-approved release procedure
+required by the project contract. Approval authorizes only the exact package
+identity, version, destination, merged source, and tag policy declared in the
+human-authored task body or an exact human-authored task comment. It does not
+authorize source edits, another version, branch pushes, package deletion, or
+any unrelated release action.
+
+Task body:
+{{{{.TaskBody}}}}
+
+Merged delivery context:
+- Workspace: {{{{.Params.workspace_path}}}}
+- PR: {{{{.Params.pr_url}}}}
+- Branch: {{{{.Params.branch_name}}}}
+- Merge proof: {{{{.Params.merge_report}}}}
+
+{procedure_instruction(profile, "publish")}
+
+Before any remote mutation:
+
+1. Re-read repository instructions, the project contract, and latest human
+   task comments.
+2. Verify the source-control system reports the PR as merged and resolve the
+   exact merged commit.
+3. Require explicit publication authority naming the package, exact version,
+   version override mechanism, destination, and tag policy. Missing or
+   contradictory authority is `needs_user_action`.
+4. Use a clean checkout representing the exact merged source tree. Never
+   publish unmerged, dirty, or tree-divergent code, and never rewrite the
+   retained task worktree to manufacture that state.
+5. Validate generated publication metadata before mutation.
+6. Check whether the exact remote package version already exists. Never
+   overwrite or delete a colliding version.
+
+Run only the project-authorized remote publish command. Never use a local
+repository substitute for a required remote publication. Do not expose
+credentials in output, task comments, artifacts, or logs.
+
+After publication, verify the exact expected package versions through the
+remote package registry. Record package names, version, merged commit, command
+shape with secrets omitted, and verification evidence in
+`publication_report`.
+
+Complete with `published` and provide `workspace_path`, `pr_url`,
+`branch_name`, `merge_report`, and `publication_report`. Complete with
+`needs_user_action` for authentication failure, version collision, partial
+publication, source mismatch, missing authority, or unverifiable remote state;
+preserve the same delivery context and provide `blocker_reason`. A retry must
+re-check remote state before another publish attempt."""
+
+
+def package_publish_recovery_prompt(profile: ProjectProfile) -> str:
+    return f"""Resume the approval-gated package publication for
+{{{{.TaskShortId}}}}.
+
+Previous blocker: {{{{.Params.blocker_reason}}}}
+Workspace: {{{{.Params.workspace_path}}}}
+PR: {{{{.Params.pr_url}}}}
+Branch: {{{{.Params.branch_name}}}}
+Merge proof: {{{{.Params.merge_report}}}}
+
+Re-read the task body, latest human comments, repository instructions, and the
+project contract.
+
+{procedure_instruction(profile, "publish")}
+
+Approval authorizes a fresh remote-state check and, only when safe, one attempt
+to publish the exact already-approved package identity. It does not authorize
+another version, source edits, tags beyond the declared policy, package
+deletion, or overwrite.
+
+Before any publish command, inspect the remote package registry again for
+partial or completed publication and verify the clean merged source identity.
+If the package is already completely present with task-owned proof, complete as
+`published` without republishing. If state is partial, conflicting, or
+unverifiable, return `needs_user_action` again. Never hide a partial remote
+mutation.
+
+On success, provide `workspace_path`, `pr_url`, `branch_name`, `merge_report`,
+and `publication_report`. On another blocker, preserve the same delivery
+context and provide `blocker_reason`."""
+
+
+def published_cleanup_prompt(profile: ProjectProfile) -> str:
+    if not profile.capability("managed_worktrees"):
+        return f"""Perform conservative cleanup for {{{{.TaskShortId}}}} only
+after successful package publication.
+
+Workspace: {{{{.Params.workspace_path}}}}
+PR: {{{{.Params.pr_url}}}}
+Branch: {{{{.Params.branch_name}}}}
+Merge proof: {{{{.Params.merge_report}}}}
+Publication proof: {{{{.Params.publication_report}}}}
+
+{procedure_instruction(profile, "cleanup")}
+
+Require a non-empty publication report proving the exact task-authorized
+package version exists in the remote registry. Do not publish, tag, push, or
+edit project files from Cleanup. Treat cleanup as report-first and preserve
+dirty, primary, ambiguous, or unrecoverable state.
+
+Complete with `done` and provide a non-empty `cleanup_report`. Use
+`needs_user_action` with `blocker_reason` only when safe cleanup requires a
+human decision."""
+
+    return f"""Perform conservative cleanup for {{{{.TaskShortId}}}} only after
+successful package publication.
+
+Workspace: {{{{.Params.workspace_path}}}}
+PR: {{{{.Params.pr_url}}}}
+Branch: {{{{.Params.branch_name}}}}
+Merge proof: {{{{.Params.merge_report}}}}
+Publication proof: {{{{.Params.publication_report}}}}
+
+{procedure_instruction(profile, "cleanup")}
+
+Require a non-empty publication report proving the exact task-authorized
+package version exists in the remote registry. Do not publish, tag, push, or
+edit project files from Cleanup.
+
+Treat cleanup as report-first. Never delete the primary checkout, dirty or
+ambiguous state, or content not proven recoverable. Do not remove the managed
+worktree or local branch inside this agent session. The deterministic Task
+Janitor runs only after this resource-owning Cleanup session exits.
+
+Complete with `run_janitor` and provide canonical `workspace_path`;
+`task_short_id` as `{{{{.TaskShortId}}}}`; `pr_url`; `branch_name`;
+`merge_report` including the publication proof; `cleanup_mode` as `merged`;
+`cleanup_session_id` from `KENT_SESSION_ID`; and a non-empty `cleanup_report`.
+Use `needs_user_action` only when conservative preservation requires a human
+decision."""
 
 
 def janitor_recovery_prompt(profile: ProjectProfile) -> str:

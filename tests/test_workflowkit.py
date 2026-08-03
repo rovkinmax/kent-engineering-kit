@@ -518,6 +518,7 @@ class WorkflowKitTest(unittest.TestCase):
             tuple(parameter.key for parameter in by_key["prepare_pr_no_pr"].parameters),
             ("pr_report",),
         )
+
         self.assertTrue(by_key["prepare_pr_fix"].requires_approval)
         self.assertEqual(
             tuple(parameter.key for parameter in by_key["prepare_pr_fix"].parameters),
@@ -654,6 +655,95 @@ class WorkflowKitTest(unittest.TestCase):
             "kent-resolve-github-merge-strategy",
         ):
             self.assertIn(expected, prompts)
+
+    def test_manual_package_publish_topology_is_approval_gated_after_merge(
+        self,
+    ) -> None:
+        profile = self.load_profile(
+            lambda contents: (
+                contents.replace(
+                    'release_topology = "none"',
+                    'release_topology = "manual-package-publish-after-main"',
+                )
+                .replace(
+                    'publish = ""',
+                    'publish = ".kent/commands/feature-start.md"',
+                )
+            )
+        )
+        spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
+        roles = {
+            node.key: node.agent
+            for node in spec.nodes
+            if node.kind == "agent"
+        }
+
+        self.assertEqual(roles["publish_package"], "release-manager")
+        for key in (
+            "ci_monitor_merged",
+            "fix_pr_merged_cleanup",
+            "waiting_pr_cleanup",
+            "merge_watch_cleanup",
+        ):
+            self.assertEqual(by_key[key].target, "publish_package")
+            self.assertTrue(by_key[key].requires_approval)
+            self.assertIn("exact merged source tree", by_key[key].prompt)
+        self.assertEqual(by_key["publish_cleanup"].target, "cleanup")
+        self.assertFalse(by_key["publish_cleanup"].requires_approval)
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["publish_cleanup"].parameters
+            ),
+            (
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_report",
+                "publication_report",
+            ),
+        )
+        self.assertEqual(
+            by_key["publish_needs_user_action"].target,
+            "publish_package",
+        )
+        self.assertTrue(by_key["publish_needs_user_action"].requires_approval)
+        self.assertEqual(
+            by_key["publish_needs_user_action"].context,
+            "compact_and_continue_session",
+        )
+
+    def test_manual_package_publish_requires_procedure_and_role(self) -> None:
+        topology = (
+            'release_topology = "manual-package-publish-after-main"'
+        )
+        with self.assertRaisesRegex(SpecError, "requires procedures.publish"):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    'release_topology = "none"',
+                    topology,
+                )
+            )
+
+        with self.assertRaisesRegex(
+            SpecError,
+            "profile role 'package_release' is required",
+        ):
+            self.load_profile(
+                lambda contents: (
+                    contents.replace(
+                        'release_topology = "none"',
+                        topology,
+                    ).replace(
+                        'publish = ""',
+                        'publish = ".kent/commands/feature-start.md"',
+                    ).replace(
+                        'package_release = "release-manager"\n',
+                        "",
+                    )
+                )
+            )
 
     def test_dispatch_accepts_exact_git_execution_root(self) -> None:
         temporary = tempfile.TemporaryDirectory()
