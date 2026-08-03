@@ -83,6 +83,16 @@ implement = ".kent/commands/test-coverage.md"
 # mcp_policy = ".kent/adapters/mcp/policy"
 # mobile_resource_lock = ".kent/adapters/mobile/emulator-resource-lock.sh"
 # mobile_evidence_audit = ".kent/adapters/mobile/mobile-evidence-audit.sh"
+#
+# Projects that ingest Jira source context use:
+# required_adapters = ["jira_api"]
+# [adapters]
+# jira_api = ".kent/adapters/jira/jira-api.sh"
+# [integrations.jira]
+# base_url = "https://example.atlassian.net"
+# credential_namespace = "EXAMPLE"
+# op_vault = "Private"
+# op_item = "Example Jira API Token"
 
 [roles]
 orchestrator = "default"

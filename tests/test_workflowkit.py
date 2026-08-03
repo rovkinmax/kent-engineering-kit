@@ -1400,6 +1400,7 @@ class WorkflowKitTest(unittest.TestCase):
         profile_directory.mkdir()
         contents = EXAMPLE_PROFILE.read_text() + (
             "\n[adapters]\n"
+            'jira_api = ".kent/adapters/jira/jira-api.sh"\n'
             'mobile_evidence_audit = '
             '".kent/adapters/mobile/mobile-evidence-audit.sh"\n'
             'mobile_resource_lock = '
@@ -1414,6 +1415,7 @@ class WorkflowKitTest(unittest.TestCase):
         evidence_target = (
             root / ".kent" / "adapters" / "mobile" / "mobile-evidence-audit.sh"
         )
+        jira_target = root / ".kent" / "adapters" / "jira" / "jira-api.sh"
 
         created = subprocess.run(
             [str(script), "--project", str(root)],
@@ -1427,6 +1429,17 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertTrue(target.stat().st_mode & 0o111)
         self.assertTrue(evidence_target.is_file())
         self.assertTrue(evidence_target.stat().st_mode & 0o111)
+        self.assertTrue(jira_target.is_file())
+        self.assertTrue(jira_target.stat().st_mode & 0o111)
+        self.assertEqual(
+            jira_target.read_bytes(),
+            (
+                REPO_ROOT
+                / "templates"
+                / "project"
+                / "jira-api.sh"
+            ).read_bytes(),
+        )
         self.assertEqual(
             evidence_target.read_bytes(),
             (

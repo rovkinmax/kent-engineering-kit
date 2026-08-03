@@ -46,6 +46,12 @@ After approval, create:
 - optional smoke, resource-lock, evidence-audit, PR, and release adapters;
 - project-local role implementations using the canonical role keys.
 
+For projects that use Jira as a planning source, declare `jira_api` in
+`required_adapters`, configure `[integrations.jira]` with the tenant URL and
+credential namespace or 1Password pointers, and synchronize it with
+`scripts/sync-project-adapters`. Keep issue ingestion policy in the project
+skill or Plan procedure; the shared adapter is read-only.
+
 For Android projects with conditional or required Smoke, declare
 `mobile_resource_lock` and `mobile_evidence_audit` in `required_adapters` and
 `[adapters]`, synchronize them with `scripts/sync-project-adapters`, and keep

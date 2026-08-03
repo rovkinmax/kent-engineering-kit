@@ -17,6 +17,9 @@ generated toolkit workflows.
   frontmatter in project role prompts.
 - Run deterministic project verification through the executable declared by the
   profile, normally `.kent/scripts/workflow-verify`.
+- When `issue_tracker = "jira"` is used as a planning source, declare the
+  kit-managed `jira_api` adapter and a project-owned `[integrations.jira]`
+  credential namespace. The adapter is read-only and stores no credentials.
 - Use `~/.kent/bin/kent-mcp-call` and `~/.kent/bin/kent-mcp-list` for MCP
   access. Projects own credentials and project-specific server wrappers.
 - MCP call logs retain metadata, while ordinary stdout remains in Kent's shell

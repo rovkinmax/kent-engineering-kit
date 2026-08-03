@@ -15,6 +15,7 @@ bash -n "$repo_root/adapters/mcp/kent-mcp-list"
 bash -n "$repo_root/adapters/mcp/mcp-common.sh"
 bash -n "$repo_root/adapters/gradle/shell-postprocess-hook"
 bash -n "$repo_root/templates/project/emulator-resource-lock.sh"
+bash -n "$repo_root/templates/project/jira-api.sh"
 bash -n "$repo_root/templates/project/mobile-evidence-audit.sh"
 bash -n "$repo_root/templates/project/workflow-verification-dispatch"
 bash -n "$repo_root/templates/project/workflow-verify-report"
@@ -58,6 +59,10 @@ rmdir "$install_help_root"
 }
 [[ -x "$repo_root/templates/project/emulator-resource-lock.sh" ]] || {
   echo "mobile resource-lock template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/jira-api.sh" ]] || {
+  echo "Jira API template is not executable" >&2
   exit 1
 }
 [[ -x "$repo_root/templates/project/mobile-evidence-audit.sh" ]] || {
@@ -336,6 +341,7 @@ python3 -m compileall -q \
 PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
   python3 -m unittest discover -s "$repo_root/tests" -p 'test_*.py'
 "$repo_root/tests/test_mcp_adapter.sh"
+"$repo_root/tests/test_jira_adapter.sh"
 "$repo_root/tests/test_emulator_resource_lock.sh"
 "$repo_root/tests/test_mobile_evidence_audit.sh"
 

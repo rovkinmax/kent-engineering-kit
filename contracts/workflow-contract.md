@@ -423,9 +423,11 @@ Each project provides:
 - optional Smoke-decision, Smoke-execution, resource-lock, evidence-audit, PR,
   CI, and release adapters.
 
-The kit provides the global mcporter call/list adapter. Projects provide only
-credentials, server definitions, and optional project-specific stdio wrappers
-or policy.
+The kit provides the global mcporter call/list adapter and a synchronized
+project-local read-only Jira source adapter. Projects provide Jira base URLs,
+credential namespaces or 1Password pointers, server definitions, and optional
+project-specific stdio wrappers or policy. The kit never stores resolved Jira
+credentials.
 
 Profiles list indispensable executable adapter keys in `required_adapters`.
 The platform-neutral profile loader validates only that declared contract and
@@ -435,3 +437,8 @@ required runtime Smoke list `mobile_resource_lock` and
 and deterministic evidence hygiene while the project still owns emulator
 startup policy, physical-device permission, build/install targets,
 credentials, and runtime acceptance evidence.
+
+Projects that treat Jira descriptions or comments as planning sources list
+`jira_api` in `required_adapters`, declare its project-local path, and select
+their own `[integrations.jira]` credential namespace. Related repositories may
+share a namespace intentionally; unrelated repositories remain isolated.

@@ -91,6 +91,38 @@ Kent 2.3 resolves relative postprocessor paths from the service process working
 directory. Use the stable home-relative installed path rather than a
 project-relative path.
 
+## Jira source adapter
+
+Projects that use Jira as an authoritative planning source declare the
+kit-managed read-only adapter:
+
+```toml
+required_adapters = ["jira_api"]
+
+[adapters]
+jira_api = ".kent/adapters/jira/jira-api.sh"
+
+[integrations.jira]
+base_url = "https://example.atlassian.net"
+credential_namespace = "EXAMPLE"
+op_vault = "Private"
+op_item = "Example Jira API Token"
+```
+
+Synchronize it with `scripts/sync-project-adapters`. The repository stores only
+the base URL, credential namespace, and optional 1Password pointers. It never
+stores email addresses, API tokens, or resolved secrets.
+
+Credential resolution prefers generic `KENT_JIRA_*` variables, then
+`<CREDENTIAL_NAMESPACE>_JIRA_*`, then `JIRA_*`. Each form supports direct
+credentials or `_OP_REF` pointers. This lets related projects intentionally
+share one namespace while unrelated projects select independent Jira tenants
+and tokens.
+
+The common adapter supports read-only issue, comment, link, JQL, board, and
+board-issue ingestion. Project workflows own task creation, Jira mutation, and
+release-version policy; those operations are not exposed by this adapter.
+
 ## Mobile runtime safety adapters
 
 Android projects with conditional or required runtime Smoke declare:
