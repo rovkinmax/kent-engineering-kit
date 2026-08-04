@@ -57,12 +57,7 @@ class KentClient:
             )
             definition = self.require_inspect(spec.name)
         else:
-            mutation_required = self.preflight_reconcile(spec, definition)
-            if mutation_required and self.workflow_has_tasks(definition):
-                raise SpecError(
-                    f"workflow {spec.name!r} has tasks and cannot be mutated; "
-                    "use another experimental label"
-                )
+            self.preflight_reconcile(spec, definition)
 
         workflow_ref = workflow_selector_from_definition(definition)
         for node in spec.nodes:
@@ -164,7 +159,7 @@ class KentClient:
                     project_id,
                     "--workflow",
                     workflow_ref,
-                    "--page-size",
+                    "--limit",
                     "1",
                     "--json",
                 ],
@@ -272,7 +267,7 @@ class KentClient:
         project_id: str | None = None,
     ) -> tuple[dict[str, Any], ...]:
         records: list[dict[str, Any]] = []
-        page_token = ""
+        offset = 0
         while True:
             args = [
                 "workflow",
@@ -280,9 +275,7 @@ class KentClient:
             ]
             if project_id is not None:
                 args.extend(["--project", project_id])
-            args.extend(["--page-size", "100", "--json"])
-            if page_token:
-                args.extend(["--page-token", page_token])
+            args.extend(["--limit", "100", "--offset", str(offset), "--json"])
             payload = self.run_json(args)
             page = payload.get("workflows")
             if not isinstance(page, list) or not all(
@@ -292,14 +285,14 @@ class KentClient:
                     "workflow list returned an invalid workflows collection"
                 )
             records.extend(page)
-            next_page_token = payload.get("next_page_token") or ""
-            if not isinstance(next_page_token, str):
+            next_offset = payload.get("next_offset")
+            if next_offset is not None and not isinstance(next_offset, int):
                 raise KentCommandError(
-                    "workflow list returned an invalid next_page_token"
+                    "workflow list returned an invalid next_offset"
                 )
-            if not next_page_token:
+            if next_offset is None:
                 return tuple(records)
-            page_token = next_page_token
+            offset = next_offset
 
     def require_inspect(self, workflow: str) -> dict[str, Any]:
         definition = self.inspect(workflow)

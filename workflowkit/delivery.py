@@ -1080,6 +1080,7 @@ def build_delivery_workflow(
             ]
         )
 
+    edges = qualify_transition_keys(edges)
     spec = WorkflowSpec(
         name=profile.workflow_name("delivery", version),
         description=(
@@ -1193,6 +1194,38 @@ def agent_node(key: str, display_name: str, role: str) -> NodeSpec:
         agent=role,
         completion_mode="shell_command",
     )
+
+
+def transition_key(source: str, outcome: str) -> str:
+    return f"{source}_{outcome}"
+
+
+def qualify_transition_keys(edges: list[EdgeSpec]) -> list[EdgeSpec]:
+    outcomes_by_source: dict[str, set[str]] = {}
+    for edge in edges:
+        outcomes_by_source.setdefault(edge.source, set()).add(edge.transition)
+
+    qualified: list[EdgeSpec] = []
+    for edge in edges:
+        prompt = edge.prompt
+        if prompt:
+            for outcome in sorted(
+                outcomes_by_source.get(edge.target, ()),
+                key=len,
+                reverse=True,
+            ):
+                prompt = prompt.replace(
+                    f"`{outcome}`",
+                    f"`{transition_key(edge.target, outcome)}`",
+                )
+        qualified.append(
+            replace(
+                edge,
+                transition=transition_key(edge.source, edge.transition),
+                prompt=prompt,
+            )
+        )
+    return qualified
 
 
 def recovery_edge(
@@ -1669,8 +1702,8 @@ def verification_gate_prompt(profile: ProjectProfile) -> str:
     smoke_decision = smoke_decision_instruction(profile)
     return f"""Evaluate the joined verification reports without editing files.
 
-Workspace: {{{{.Params.fanout_verify.workspace_path}}}}
-Review context: {{{{.Params.fanout_verify.review_context}}}}
+Workspace: {{{{.Params.verification_dispatch_fanout_verify.workspace_path}}}}
+Review context: {{{{.Params.verification_dispatch_fanout_verify.review_context}}}}
 Verification status: {{{{.Params.verification_status}}}}
 Verification report: {{{{.Params.verification_report}}}}
 {standards}

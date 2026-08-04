@@ -23,16 +23,16 @@ documented in `docs/MODEL-POLICY.md`.
 ## Compatibility
 
 - Global prompts, skills, and role definitions remain usable with Kent 2.2.
-- Project profile schema 3 and generated workflows target Kent 2.3 or newer.
+- Project profile schema 3 and generated workflows target Kent 2.5 or newer.
 - Kent CLI/TUI, service, and Desktop must be upgraded together when crossing
-  the 2.2/2.3 protocol boundary.
-- Kent 2.3.0 workflow commands use persisted `workflow-...` IDs, while 2.3.1
-  and newer use bare canonical workflow UUIDs. The generator resolves an exact
-  display name only for discovery, then preserves the selector form returned by
-  the installed Kent version for every operation.
-- Kent 2.4 adds safe workflow-deletion previews. Destructive confirmation
-  remains an explicit user action.
-- Existing workflows retain their Source HEAD behavior after a 2.3 upgrade.
+  protocol boundaries.
+- Kent 2.5 requires every transition key to be unique across its whole
+  workflow. Generated keys are source-qualified, for example
+  `verification_gate_needs_changes`.
+- Kent 2.5 workflow and task list commands use offset pagination. The generator
+  uses canonical workflow UUIDs after exact-name discovery.
+- Workflow deletion remains an explicit user action.
+- Existing workflows retain their Source HEAD behavior after an upgrade.
   New generated workflows declare their execution-target policy explicitly.
 
 ## Installation

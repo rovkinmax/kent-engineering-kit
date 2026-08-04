@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Migrate a Kent workflow to workflow-wide transition keys."
+    )
+    parser.add_argument("workflow", help="Canonical Kent workflow UUID.")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the migration. The default is a read-only plan.",
+    )
+    return parser.parse_args()
+
+
+def run_json(args: list[str]) -> dict[str, object]:
+    environment = os.environ.copy()
+    for key in ("KENT_SESSION_ID", "KENT_RUN_ID", "KENT_STEP_ID"):
+        environment.pop(key, None)
+    result = subprocess.run(
+        ["kent", *args],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise RuntimeError(f"kent {' '.join(args)} failed: {detail}")
+    return json.loads(result.stdout)
+
+
+def desired_transition(source: str, transition: str) -> str:
+    prefix = f"{source}_"
+    return transition if transition.startswith(prefix) else prefix + transition
+
+
+def main() -> int:
+    args = parse_args()
+    definition = run_json(["workflow", "inspect", args.workflow, "--json"])
+    nodes = {
+        node["id"]: node["key"]
+        for node in definition.get("nodes", [])
+    }
+    groups = {
+        group["id"]: group
+        for group in definition.get("transition_groups", [])
+    }
+    edges = definition.get("edges", [])
+    edges_by_group: dict[str, list[dict[str, object]]] = {}
+    outcomes_by_source: dict[str, set[str]] = {}
+    transition_mapping: dict[str, set[str]] = {}
+
+    for group_id, group in groups.items():
+        source = nodes[group["source_node_id"]]
+        transition = group["transition_id"]
+        desired = desired_transition(source, transition)
+        outcomes_by_source.setdefault(source, set()).add(transition)
+        transition_mapping.setdefault(transition, set()).add(desired)
+        edges_by_group[group_id] = []
+    for edge in edges:
+        edges_by_group[edge["transition_group_id"]].append(edge)
+
+    desired_keys = [
+        desired_transition(
+            nodes[group["source_node_id"]],
+            group["transition_id"],
+        )
+        for group in groups.values()
+    ]
+    duplicates = sorted(
+        key for key in set(desired_keys) if desired_keys.count(key) > 1
+    )
+    if duplicates:
+        raise RuntimeError(
+            "workflow-wide transition migration would collide: "
+            + ", ".join(duplicates)
+        )
+
+    transition_changes: list[dict[str, str]] = []
+    for group_id, group in groups.items():
+        source = nodes[group["source_node_id"]]
+        current = group["transition_id"]
+        desired = desired_transition(source, current)
+        if desired == current:
+            continue
+        group_edges = edges_by_group[group_id]
+        if not group_edges:
+            raise RuntimeError(f"transition group {group_id} has no edges")
+        transition_changes.append(
+            {
+                "source": source,
+                "from": current,
+                "to": desired,
+                "edge_id": str(group_edges[0]["id"]),
+            }
+        )
+
+    prompt_changes: list[dict[str, str]] = []
+    for edge in edges:
+        prompt = edge.get("prompt_template")
+        if not isinstance(prompt, str) or not prompt:
+            continue
+        target = nodes[edge["target_node_id"]]
+        desired_prompt = prompt
+        for outcome in sorted(
+            outcomes_by_source.get(target, ()),
+            key=len,
+            reverse=True,
+        ):
+            desired_prompt = desired_prompt.replace(
+                f"`{outcome}`",
+                f"`{desired_transition(target, outcome)}`",
+            )
+        for current, desired_values in transition_mapping.items():
+            if len(desired_values) != 1:
+                continue
+            desired = next(iter(desired_values))
+            desired_prompt = desired_prompt.replace(
+                f".Params.{current}.",
+                f".Params.{desired}.",
+            )
+        if desired_prompt != prompt:
+            prompt_changes.append(
+                {
+                    "edge_id": str(edge["id"]),
+                    "edge_key": str(edge["key"]),
+                    "prompt": desired_prompt,
+                }
+            )
+
+    plan = {
+        "workflow_id": args.workflow,
+        "workflow_name": definition["workflow"]["name"],
+        "transition_changes": transition_changes,
+        "prompt_changes": [
+            {
+                "edge_id": change["edge_id"],
+                "edge_key": change["edge_key"],
+            }
+            for change in prompt_changes
+        ],
+    }
+    if not args.apply:
+        print(json.dumps(plan, indent=2, ensure_ascii=False))
+        return 0
+
+    for change in transition_changes:
+        run_json(
+            [
+                "workflow",
+                "edge",
+                "update",
+                args.workflow,
+                change["edge_id"],
+                "--transition",
+                change["to"],
+                "--json",
+            ]
+        )
+    for change in prompt_changes:
+        run_json(
+            [
+                "workflow",
+                "edge",
+                "update",
+                args.workflow,
+                change["edge_id"],
+                "--prompt",
+                change["prompt"],
+                "--json",
+            ]
+        )
+    validation = run_json(
+        [
+            "workflow",
+            "validate",
+            args.workflow,
+            "--mode",
+            "execution",
+            "--json",
+        ]
+    )
+    print(
+        json.dumps(
+            {
+                **plan,
+                "validation": validation,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (KeyError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        print(f"migrate-transition-keys: {error}", file=sys.stderr)
+        raise SystemExit(1)

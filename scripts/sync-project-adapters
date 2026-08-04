@@ -24,6 +24,9 @@ ADAPTER_TEMPLATES = {
 }
 COMMAND_TEMPLATES = {
     "checkpoint": REPO_ROOT / "templates" / "project" / "workflow-checkpoint",
+    "dispatch": (
+        REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch"
+    ),
     "janitor": REPO_ROOT / "templates" / "project" / "workflow-task-janitor",
     "wait_pr": (
         REPO_ROOT / "templates" / "project" / "workflow-wait-github-pr"

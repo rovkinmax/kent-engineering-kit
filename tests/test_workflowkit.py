@@ -108,7 +108,7 @@ class WorkflowKitTest(unittest.TestCase):
             edge
             for edge in spec.edges
             if edge.source == "verification_dispatch"
-            and edge.transition == "fanout_verify"
+            and edge.transition == "verification_dispatch_fanout_verify"
         ]
         self.assertEqual(
             {edge.target for edge in fanout},
@@ -179,14 +179,17 @@ class WorkflowKitTest(unittest.TestCase):
             if edge.source == "implement"
         }
 
-        continuation = implementation_edges["continue_implementation"]
+        continuation = implementation_edges["implement_continue_implementation"]
         self.assertEqual(continuation.target, "implement")
         self.assertEqual(continuation.context, "new_session")
         self.assertEqual(
             tuple(parameter.key for parameter in continuation.parameters),
             ("workspace_path", "plan_path", "work_kind"),
         )
-        self.assertEqual(implementation_edges["verify"].target, "verification_dispatch")
+        self.assertEqual(
+            implementation_edges["implement_verify"].target,
+            "verification_dispatch",
+        )
         self.assertIn(
             "exactly one ready writer-owned plan step",
             continuation.prompt,
@@ -298,17 +301,17 @@ class WorkflowKitTest(unittest.TestCase):
             "exactly one independently verifiable fix slice",
             prompts["gate_fix"],
         )
-        self.assertIn("`continue_fix`", prompts["gate_fix"])
+        self.assertIn("`fix_continue_fix`", prompts["gate_fix"])
         self.assertIn(
             "exactly one independently verifiable PR or branch recovery slice",
             prompts["prepare_pr_fix"],
         )
-        self.assertIn("`continue_fix`", prompts["prepare_pr_fix"])
+        self.assertIn("`fix_continue_fix`", prompts["prepare_pr_fix"])
         self.assertIn(
             "exactly one independently verifiable PR-feedback slice",
             prompts["waiting_pr_fix"],
         )
-        self.assertIn("`continue_fix`", prompts["waiting_pr_fix"])
+        self.assertIn("`fix_continue_fix`", prompts["waiting_pr_fix"])
         self.assertIn("unproven differential", prompts["gate_fix"])
 
     def test_standards_and_gate_require_task_scoped_differential_evidence(
@@ -341,7 +344,7 @@ class WorkflowKitTest(unittest.TestCase):
             "task-introduced or task-worsened",
             "whole-repository analyzer failure",
             "unproven differential",
-            "route to `needs_user_action`, not Fix",
+            "route to `verification_gate_needs_user_action`, not Fix",
             "target-only commits",
             "merge/replay conflict",
         ):
@@ -519,7 +522,10 @@ class WorkflowKitTest(unittest.TestCase):
         spec = build_delivery_workflow(profile, 1)
         by_key = {edge.key: edge for edge in spec.edges}
 
-        self.assertEqual(by_key["prepare_pr_ci_monitor"].transition, "monitor_ci")
+        self.assertEqual(
+            by_key["prepare_pr_ci_monitor"].transition,
+            "prepare_pr_monitor_ci",
+        )
         self.assertEqual(
             tuple(
                 parameter.key
@@ -537,7 +543,10 @@ class WorkflowKitTest(unittest.TestCase):
             tuple(parameter.key for parameter in by_key["prepare_pr_fix"].parameters),
             ("workspace_path", "blocker_reason"),
         )
-        self.assertEqual(by_key["ci_monitor_waiting_pr"].transition, "waiting_pr")
+        self.assertEqual(
+            by_key["ci_monitor_waiting_pr"].transition,
+            "ci_monitor_waiting_pr",
+        )
         self.assertEqual(
             tuple(
                 parameter.key
@@ -551,7 +560,10 @@ class WorkflowKitTest(unittest.TestCase):
                 "ci_report",
             ),
         )
-        self.assertEqual(by_key["ci_monitor_merged"].transition, "pr_merged")
+        self.assertEqual(
+            by_key["ci_monitor_merged"].transition,
+            "ci_monitor_pr_merged",
+        )
         self.assertEqual(by_key["ci_monitor_merged"].target, "cleanup")
         self.assertEqual(
             tuple(
@@ -573,10 +585,13 @@ class WorkflowKitTest(unittest.TestCase):
             by_key["prepare_pr_ci_monitor"].prompt,
         )
         self.assertIn(
-            "Never use `needs_user_action` merely because CI is still running",
+            "Never use `ci_monitor_needs_user_action` merely because CI is still running",
             by_key["prepare_pr_ci_monitor"].prompt,
         )
-        self.assertEqual(by_key["fix_pr_merged_cleanup"].transition, "pr_merged")
+        self.assertEqual(
+            by_key["fix_pr_merged_cleanup"].transition,
+            "fix_pr_merged",
+        )
         self.assertEqual(by_key["fix_pr_merged_cleanup"].target, "cleanup")
         self.assertEqual(
             tuple(
@@ -781,7 +796,10 @@ class WorkflowKitTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["transition"], "fanout_verify")
+        self.assertEqual(
+            payload["transition"],
+            "verification_dispatch_fanout_verify",
+        )
         self.assertEqual(payload["workspace_path"], str(root.resolve()))
 
     def test_dispatch_rejects_todo_artifact_as_workspace(self) -> None:
@@ -809,7 +827,10 @@ class WorkflowKitTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["transition"], "invalid_workspace")
+        self.assertEqual(
+            payload["transition"],
+            "verification_dispatch_invalid_workspace",
+        )
         self.assertEqual(payload["reported_workspace_path"], str(artifact))
         self.assertIn(str(root.resolve()), payload["fix_context"])
 
@@ -837,7 +858,10 @@ class WorkflowKitTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["transition"], "invalid_workspace")
+        self.assertEqual(
+            payload["transition"],
+            "verification_dispatch_invalid_workspace",
+        )
         self.assertEqual(payload["reported_workspace_path"], str(missing))
         self.assertIn(str(root.resolve()), payload["fix_context"])
 
@@ -849,7 +873,10 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(by_key["gate_delivery_ready"].target, "compliance")
         self.assertEqual(by_key["smoke_prepare_pr"].target, "compliance")
         self.assertEqual(by_key["compliance_prepare_pr"].target, "prepare_pr")
-        self.assertEqual(by_key["compliance_prepare_pr"].transition, "ship_pr")
+        self.assertEqual(
+            by_key["compliance_prepare_pr"].transition,
+            "compliance_ship_pr",
+        )
         self.assertEqual(
             tuple(
                 parameter.key
@@ -1034,7 +1061,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn("smoke", {node.key for node in spec.nodes})
         self.assertEqual(
             by_key["gate_smoke_required"].transition,
-            "smoke_required",
+            "verification_gate_smoke_required",
         )
         self.assertEqual(by_key["gate_smoke_required"].target, "smoke")
         self.assertEqual(
@@ -1051,7 +1078,7 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertEqual(
             by_key["gate_delivery_ready"].transition,
-            "delivery_ready",
+            "verification_gate_delivery_ready",
         )
         self.assertEqual(by_key["gate_delivery_ready"].target, "compliance")
         self.assertEqual(
@@ -1062,7 +1089,7 @@ class WorkflowKitTest(unittest.TestCase):
             ("workspace_path", "review_context", "smoke_rationale"),
         )
         self.assertIn(
-            "Uncertainty must route to `smoke_required`",
+            "Uncertainty must route to `verification_gate_smoke_required`",
             by_key["verification_join_gate"].prompt,
         )
 
@@ -1173,7 +1200,7 @@ class WorkflowKitTest(unittest.TestCase):
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)
         cancellation_edges = [
-            edge for edge in spec.edges if edge.transition == "wont_do"
+            edge for edge in spec.edges if edge.transition.endswith("_wont_do")
         ]
         self.assertGreater(len(cancellation_edges), 0)
         for edge in cancellation_edges:
@@ -1187,7 +1214,9 @@ class WorkflowKitTest(unittest.TestCase):
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)
         cancellable_nodes = {
-            edge.source for edge in spec.edges if edge.transition == "wont_do"
+            edge.source
+            for edge in spec.edges
+            if edge.transition.endswith("_wont_do")
         }
 
         for node_key in cancellable_nodes:
@@ -1642,18 +1671,18 @@ class WorkflowKitTest(unittest.TestCase):
     def test_profile_accepts_newer_minimum_kent_version(self) -> None:
         profile = self.load_profile(
             lambda contents: contents.replace(
-                'minimum_kent_version = "2.3.0"',
-                'minimum_kent_version = "2.4.1"',
+                'minimum_kent_version = "2.5.0"',
+                'minimum_kent_version = "2.5.1"',
             )
         )
-        self.assertEqual(profile.minimum_version_tuple(), (2, 4, 1))
+        self.assertEqual(profile.minimum_version_tuple(), (2, 5, 1))
 
     def test_profile_rejects_older_minimum_kent_version(self) -> None:
-        with self.assertRaisesRegex(SpecError, "2.3.0 or newer"):
+        with self.assertRaisesRegex(SpecError, "2.5.0 or newer"):
             self.load_profile(
                 lambda contents: contents.replace(
-                    'minimum_kent_version = "2.3.0"',
-                    'minimum_kent_version = "2.2.9"',
+                    'minimum_kent_version = "2.5.0"',
+                    'minimum_kent_version = "2.4.9"',
                 )
             )
 
@@ -1812,7 +1841,7 @@ class WorkflowKitTest(unittest.TestCase):
             client.apply(spec)
         self.assertEqual(commands, [])
 
-    def test_apply_preflight_rejects_graph_mutation_when_tasks_exist(self) -> None:
+    def test_preflight_allows_safe_graph_mutation_when_tasks_exist(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         spec = WorkflowSpec(
@@ -1854,11 +1883,9 @@ class WorkflowKitTest(unittest.TestCase):
         client = KentClient(Path(temporary.name))
         client.require_version = lambda *version: None
         client.inspect = lambda workflow: definition
-        client.workflow_has_tasks = lambda current: True
-        client.run_json = lambda args: commands.append(args) or {}
+        mutation_required = client.preflight_reconcile(spec, definition)
 
-        with self.assertRaisesRegex(SpecError, "has tasks and cannot be mutated"):
-            client.apply(spec)
+        self.assertTrue(mutation_required)
         self.assertEqual(commands, [])
 
     def test_workflow_task_check_scans_every_linked_project(self) -> None:
@@ -1900,7 +1927,7 @@ class WorkflowKitTest(unittest.TestCase):
                             stdout=json.dumps(
                                 {
                                     "workflows": [{"id": bare_id}],
-                                    "next_page_token": "",
+                                    "next_offset": None,
                                 }
                             ),
                             stderr="",
@@ -1976,7 +2003,7 @@ class WorkflowKitTest(unittest.TestCase):
                     stdout=json.dumps(
                         {
                             "workflows": workflows,
-                            "next_page_token": "",
+                            "next_offset": None,
                         }
                     ),
                     stderr="",
@@ -2106,7 +2133,7 @@ class WorkflowKitTest(unittest.TestCase):
                                             "name": "Shared Lab",
                                         }
                                     ],
-                                    "next_page_token": None,
+                                    "next_offset": None,
                                 }
                             ),
                             stderr="",
@@ -2251,14 +2278,14 @@ class WorkflowKitTest(unittest.TestCase):
                 EdgeSpec(
                     "one_done",
                     "one",
-                    "reported",
+                    "one_reported",
                     "done",
                     transition_description="Finish.",
                 ),
                 EdgeSpec(
                     "two_done",
                     "two",
-                    "reported",
+                    "two_reported",
                     "done",
                     transition_description="Finish.",
                 ),
@@ -2323,7 +2350,10 @@ class VerificationReportTest(unittest.TestCase):
 printf '%s\n' '{"transition":"passed","commentary":"ok","verification_report":"log"}'
 """
         )
-        self.assertEqual(result["transition"], "reported")
+        self.assertEqual(
+            result["transition"],
+            "deterministic_verify_reported",
+        )
         self.assertEqual(result["verification_status"], "passed")
 
     def test_code_failure_reports_needs_changes(self) -> None:
@@ -2354,7 +2384,10 @@ printf '%s\n' \
 
     def test_nonzero_verifier_still_reports_blocked(self) -> None:
         result = self.run_report('echo "boom" >&2\nexit 2\n')
-        self.assertEqual(result["transition"], "reported")
+        self.assertEqual(
+            result["transition"],
+            "deterministic_verify_reported",
+        )
         self.assertEqual(result["verification_status"], "blocked")
 
     def test_malformed_verifier_output_still_reports_blocked(self) -> None:

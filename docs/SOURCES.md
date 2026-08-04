@@ -18,6 +18,11 @@ The toolkit is original project infrastructure informed by:
 - Kent 2.4 model capability registry for exact GPT-5.6 model identifiers,
   context windows, reasoning levels, and verbosity support:
   https://github.com/respawn-llc/kent/blob/v2.4.0/server/llm/provider_factory.go
+- Kent 2.5 release notes for workflow-wide transition keys, offset pagination,
+  task continuity, and safe edits with existing tasks:
+  https://github.com/respawn-llc/kent/releases/tag/v2.5.0
+- Kent 2.5 workflow validation source for the global transition-key invariant:
+  https://github.com/respawn-llc/kent/blob/v2.5.0/server/workflow/validation.go
 - Kent configuration and headless-role references for model, reviewer,
   workflow concurrency, delegation depth, and role override keys:
   https://kent.sh/config.md

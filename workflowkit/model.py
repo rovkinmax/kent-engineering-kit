@@ -128,6 +128,7 @@ class WorkflowSpec:
 
         edge_by_key: dict[str, EdgeSpec] = {}
         groups: dict[tuple[str, str], list[EdgeSpec]] = {}
+        transition_sources: dict[str, str] = {}
         outgoing: dict[str, list[EdgeSpec]] = {}
         for edge in self.edges:
             edge.validate()
@@ -141,6 +142,15 @@ class WorkflowSpec:
             if edge.target not in node_by_key:
                 raise SpecError(
                     f"edge {edge.key!r} references unknown target {edge.target!r}"
+                )
+            previous_source = transition_sources.setdefault(
+                edge.transition,
+                edge.source,
+            )
+            if previous_source != edge.source:
+                raise SpecError(
+                    f"transition {edge.transition!r} is reused by source "
+                    f"{edge.source!r}; transition keys must be workflow-wide unique"
                 )
 
             target = node_by_key[edge.target]

@@ -227,7 +227,7 @@ class GitHubPrWatchTest(GitRepositoryTest):
                 "url": "https://github.com/example/repo/pull/1",
             },
         )
-        self.assertEqual(result["transition"], "pr_merged")
+        self.assertEqual(result["transition"], "merge_watch_pr_merged")
         self.assertIn("def456", result["merge_report"])
 
     def test_changed_head_wakes_waiting_pr_agent(self) -> None:
@@ -247,7 +247,7 @@ class GitHubPrWatchTest(GitRepositoryTest):
                 "url": "https://github.com/example/repo/pull/1",
             },
         )
-        self.assertEqual(result["transition"], "state_changed")
+        self.assertEqual(result["transition"], "merge_watch_state_changed")
         self.assertIn("pull_request_head_changed", result["pr_report"])
 
     def test_unchanged_open_pr_stays_in_script_loop(self) -> None:
@@ -267,7 +267,7 @@ class GitHubPrWatchTest(GitRepositoryTest):
                 "url": "https://github.com/example/repo/pull/1",
             },
         )
-        self.assertEqual(result["transition"], "still_waiting")
+        self.assertEqual(result["transition"], "merge_watch_still_waiting")
 
     def test_failed_check_wakes_with_compact_report(self) -> None:
         root = self.create_repository()
@@ -294,7 +294,7 @@ class GitHubPrWatchTest(GitRepositoryTest):
                 "url": "https://github.com/example/repo/pull/1",
             },
         )
-        self.assertEqual(result["transition"], "state_changed")
+        self.assertEqual(result["transition"], "merge_watch_state_changed")
         self.assertIn('"reason": "checks_failed"', result["pr_report"])
         self.assertIn('"name": "unit"', result["pr_report"])
         self.assertNotIn("detailsUrl", result["pr_report"])
@@ -333,7 +333,7 @@ class GitHubPrWatchTest(GitRepositoryTest):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["transition"], "state_changed")
+        self.assertEqual(payload["transition"], "merge_watch_state_changed")
         self.assertIn("exceeded 1 seconds", payload["pr_report"])
 
     def test_invalid_configured_github_cli_fails_clearly(self) -> None:
@@ -399,7 +399,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["transition"], "done")
+        self.assertEqual(payload["transition"], "task_janitor_done")
         self.assertIn("kept the primary checkout", payload["cleanup_report"])
         self.assertFalse(runtime.exists())
 
@@ -425,7 +425,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["transition"], "done")
+        self.assertEqual(payload["transition"], "task_janitor_done")
         self.assertIn("preserved runtime state", payload["cleanup_report"])
         self.assertEqual(marker.read_text(), "keep\n")
 
@@ -476,7 +476,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["transition"], "done")
+        self.assertEqual(payload["transition"], "task_janitor_done")
         self.assertIn("preserved dirty worktree", payload["cleanup_report"])
         self.assertTrue(worktree.exists())
 
@@ -538,7 +538,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["transition"], "done")
+        self.assertEqual(payload["transition"], "task_janitor_done")
         wrapper_args = json.loads(wrapper_log.read_text())
         self.assertEqual(wrapper_args[0:3], ["delete", "--session", "session-test"])
         self.assertIn("--delete-branch", wrapper_args)
