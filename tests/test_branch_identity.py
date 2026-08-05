@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +32,30 @@ BRANCH_IDENTITY = load_script_module()
 
 
 class BranchIdentityTest(unittest.TestCase):
+    def test_kent_binary_falls_back_when_service_path_is_minimal(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        fake_kent = Path(temporary.name) / "kent"
+        fake_kent.write_text("#!/bin/sh\nexit 0\n")
+        fake_kent.chmod(0o755)
+
+        with (
+            mock.patch.object(
+                BRANCH_IDENTITY,
+                "DEFAULT_KENT_PATHS",
+                (str(fake_kent),),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"PATH": "/usr/bin:/bin"},
+                clear=True,
+            ),
+        ):
+            self.assertEqual(
+                BRANCH_IDENTITY.resolve_kent_bin(),
+                str(fake_kent),
+            )
+
     def test_system_python_can_compile_runtime_script(self) -> None:
         system_python = Path("/usr/bin/python3")
         if not system_python.is_file():

@@ -49,6 +49,10 @@ interactive shell's Homebrew Python. Project Scripts must compile and import on
 the service interpreter; do not rely on `tomllib` or Python 3.10+ syntax when
 the service still uses Python 3.9.
 
+The service PATH may also omit `/opt/homebrew/bin`. Scripts that invoke the Kent
+CLI resolve an explicit `KENT_BIN` override and known Homebrew/local install
+paths instead of depending only on `shutil.which("kent")`.
+
 ## Active task recovery
 
 `kent task resume` returns after durable requeueing. It does not prove that the
