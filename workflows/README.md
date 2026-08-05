@@ -16,6 +16,7 @@ Every generated workflow:
 
 Implemented `Engineering Delivery` fragments:
 
+- optional deterministic Jira/GitHub issue branch identity before Plan;
 - planning and plan review;
 - implementation continuation with selectable continuous or fresh-per-slice
   writer sessions;
@@ -68,6 +69,13 @@ mutation. Unsupported extra graph elements fail immediately. Reconciliation
 that would change graph semantics is refused when the workflow already has task
 records. Compatible taskless changes may reconcile in place; unsupported
 structural changes use another experimental label.
+
+`generate-workflow --apply` refuses semantic reconciliation when the existing
+Workflow owns any Tasks because CLI edge updates are not atomic. Create a new
+version or retire/migrate those Tasks first. When updating a taskless legacy
+Workflow whose display name differs from the generated name, pass its canonical
+UUID with `--workflow-id`; this prevents accidental creation of a duplicate
+Workflow with the same intended version.
 
 Generator prompt changes do not rewrite task-backed live graphs. Delivery v5
 remains frozen with its recorded task history. New review-ownership or model

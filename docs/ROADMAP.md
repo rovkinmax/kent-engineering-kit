@@ -128,6 +128,29 @@ owns real task history and provides rollback.
   `setup_script` and `postprocess_hook` remain advisory integrations; project
   build entrypoints must retain their idempotent SDK/bootstrap fallback and
   must not depend on hook invocation.
+- Kent 2.5 migration proved that Resume success means only durable requeueing:
+  migrated Agent nodes can immediately fail without an assigned Session, while
+  Script nodes can execute an old task-worktree copy and emit a now-invalid
+  Transition key. Keep task-backed graphs frozen, preflight project-owned
+  command wrappers, verify post-Resume Task state, and use the documented
+  fresh-session/fan-out recovery path. Missing agent-owned red-run evidence is
+  never a user approval.
+- OSM-47 exposed an unnecessary release-date approval. Operational timestamps
+  now default to the execution environment's current calendar date when no
+  authoritative source specifies another value; business dates and changes to
+  an existing external record remain explicit decisions.
+- Appsome runs 30977709227 and 30978052315 showed self-hosted Gradle jobs
+  receiving a runner shutdown signal and ending with
+  `The operation was canceled`. Release unit passed on its third attempt;
+  PR unit passed on its second retry and Detekt on its first. CI Monitor now
+  owns up to two exact-job retries for this proven infrastructure signature
+  while preserving genuine sibling failures.
+- OSDK-4 proved that an approval-gated publisher cannot assume the interactive
+  `gh auth` token is the package credential. Publication now resolves the
+  project-declared secret just in time, verifies its actor and registry access,
+  maps it into the build's expected environment only for the publish
+  subprocess, and clears it afterward. A future profile-schema iteration may
+  validate this mapping structurally after the contract has seen more use.
 - Validate the updated Standards calibration in a newly created session.
   Ordinary technical identifiers are not secrets or PII by default, and
   security severity requires an applicable rule or concrete threat model.

@@ -96,8 +96,36 @@ class WorkflowKitTest(unittest.TestCase):
             "`closure_reason`",
             "do not paste raw review reports",
             "do not present task-scoped code fixes",
+            "Missing agent-produced bookkeeping or evidence",
+            "A missing operational date is not automatically a product decision",
+            "`kent task resume` confirms durable requeueing",
+            "Retry only the exact cancelled job",
+            "custom verification wrappers",
+            "`Fixes #51`",
         ):
             self.assertIn(expected, contract)
+
+        release_manager = (
+            REPO_ROOT / "agents" / "release-manager.md"
+        ).read_text()
+        self.assertIn(
+            "current calendar date from the execution environment",
+            release_manager,
+        )
+        self.assertIn(
+            "today's date",
+            release_manager,
+        )
+
+        ci_monitor = (REPO_ROOT / "agents" / "ci-monitor.md").read_text()
+        for expected in (
+            "The runner has received a shutdown signal",
+            "The operation was canceled",
+            "gh run rerun <run-id> --job <job-id>",
+            "at most two automatic retries",
+            "Never automatically retry",
+        ):
+            self.assertIn(expected, ci_monitor)
 
     def test_team_delivery_has_direct_fanout_join(self) -> None:
         profile = self.load_profile()
@@ -156,6 +184,63 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(roles["waiting_pr"], "ci-monitor")
         self.assertEqual(roles["cleanup"], "delivery-operator")
 
+    def test_delivery_inserts_configured_branch_identity_before_plan(self) -> None:
+        profile = self.load_profile(
+            lambda contents: (
+                contents.replace(
+                    'issue_tracker = "none"',
+                    'issue_tracker = "jira"',
+                ).replace(
+                    'branch_identity = "task"',
+                    'branch_identity = "jira"',
+                ).replace(
+                    "[commands]\n",
+                    "[commands]\n"
+                    'branch_identity = '
+                    '".kent/scripts/workflow-branch-identity"\n',
+                )
+            )
+        )
+        spec = build_delivery_workflow(profile, 1)
+        nodes = {node.key: node for node in spec.nodes}
+        edges = {edge.key: edge for edge in spec.edges}
+
+        self.assertEqual(nodes["branch_identity"].kind, "script")
+        self.assertEqual(
+            nodes["branch_identity"].script_path,
+            ".kent/scripts/workflow-branch-identity",
+        )
+        self.assertEqual(
+            edges["start_branch_identity"].target,
+            "branch_identity",
+        )
+        self.assertEqual(
+            edges["branch_identity_plan"].target,
+            "plan",
+        )
+        self.assertEqual(
+            edges["branch_identity_plan"].transition,
+            "branch_identity_ready",
+        )
+        self.assertEqual(
+            edges["branch_identity_resolution"].target,
+            "branch_identity_resolution",
+        )
+        self.assertEqual(
+            edges["branch_identity_retry"].target,
+            "branch_identity",
+        )
+        self.assertNotIn("start_plan", edges)
+
+    def test_delivery_keeps_direct_plan_start_for_task_branch_policy(self) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 1)
+        nodes = {node.key for node in spec.nodes}
+        edges = {edge.key: edge for edge in spec.edges}
+
+        self.assertNotIn("branch_identity", nodes)
+        self.assertEqual(edges["start_plan"].target, "plan")
+
     def test_gate_role_falls_back_to_orchestrator(self) -> None:
         profile = self.load_profile(
             lambda contents: contents.replace('gate = "workflow-gate"\n', "")
@@ -205,6 +290,11 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn(
             "exact human-authored task-comment ID",
             by_key["start_plan"].prompt,
+        )
+        self.assertIn("pre-edit red run", by_key["start_plan"].prompt)
+        self.assertIn(
+            "do not ask the user to waive that bookkeeping",
+            continuation.prompt,
         )
         self.assertEqual(by_key["plan_implement"].context, "new_session")
         self.assertEqual(by_key["gate_fix"].context, "new_session")
@@ -313,6 +403,14 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn("`fix_continue_fix`", prompts["waiting_pr_fix"])
         self.assertIn("unproven differential", prompts["gate_fix"])
+        self.assertIn(
+            "git branch --show-current",
+            prompts["compliance_prepare_pr"],
+        )
+        self.assertIn(
+            "Read the task's current\n`source_url`",
+            prompts["compliance_prepare_pr"],
+        )
 
     def test_standards_and_gate_require_task_scoped_differential_evidence(
         self,
@@ -345,6 +443,7 @@ class WorkflowKitTest(unittest.TestCase):
             "whole-repository analyzer failure",
             "unproven differential",
             "route to `verification_gate_needs_user_action`, not Fix",
+            "is not an external blocker",
             "target-only commits",
             "merge/replay conflict",
         ):
@@ -588,6 +687,15 @@ class WorkflowKitTest(unittest.TestCase):
             "Never use `ci_monitor_needs_user_action` merely because CI is still running",
             by_key["prepare_pr_ci_monitor"].prompt,
         )
+        for expected in (
+            "The runner has received a shutdown signal",
+            "The operation was canceled",
+            "gh run rerun <run-id> --job <job-id>",
+            "at most two automatic retries",
+            "eligible infrastructure retry",
+        ):
+            self.assertIn(expected, by_key["prepare_pr_ci_monitor"].prompt)
+        self.assertIn("Fixes #N", by_key["compliance_prepare_pr"].prompt)
         self.assertEqual(
             by_key["fix_pr_merged_cleanup"].transition,
             "fix_pr_merged",
@@ -741,6 +849,18 @@ class WorkflowKitTest(unittest.TestCase):
             by_key["publish_needs_user_action"].context,
             "compact_and_continue_session",
         )
+        publish_prompts = "\n".join(
+            (
+                by_key["merge_watch_cleanup"].prompt,
+                by_key["publish_needs_user_action"].prompt,
+            )
+        )
+        for expected in (
+            "project-declared credential source",
+            "ambient CLI authentication",
+            "publish subprocess",
+        ):
+            self.assertIn(expected, publish_prompts)
 
     def test_manual_package_publish_requires_procedure_and_role(self) -> None:
         topology = (
@@ -912,6 +1032,10 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn(
             "exact human-authored task-comment ID",
+            by_key["gate_delivery_ready"].prompt,
+        )
+        self.assertIn(
+            "Missing agent-produced evidence is not a user decision",
             by_key["gate_delivery_ready"].prompt,
         )
         self.assertIn(
@@ -1390,6 +1514,48 @@ class WorkflowKitTest(unittest.TestCase):
                 )
             )
 
+    def test_profile_rejects_unknown_branch_identity_policy(self) -> None:
+        with self.assertRaisesRegex(
+            SpecError,
+            "unsupported policies.branch_identity",
+        ):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    'branch_identity = "task"',
+                    'branch_identity = "magic"',
+                )
+            )
+
+    def test_profile_requires_jira_tracker_for_jira_branch_identity(self) -> None:
+        with self.assertRaisesRegex(
+            SpecError,
+            "requires issue_tracker = 'jira'",
+        ):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    'branch_identity = "task"',
+                    'branch_identity = "jira"',
+                )
+            )
+
+    def test_profile_requires_branch_identity_command_when_enabled(self) -> None:
+        with self.assertRaisesRegex(
+            SpecError,
+            "command 'branch_identity' is required",
+        ):
+            self.load_profile(
+                lambda contents: (
+                    contents.replace(
+                        'issue_tracker = "none"',
+                        'issue_tracker = "jira"',
+                    )
+                    .replace(
+                        'branch_identity = "task"',
+                        'branch_identity = "jira"',
+                    )
+                )
+            )
+
     def test_profile_rejects_execution_policy_in_role_prompt_frontmatter(
         self,
     ) -> None:
@@ -1530,7 +1696,11 @@ class WorkflowKitTest(unittest.TestCase):
         root = Path(temporary.name)
         profile_directory = root / ".kent"
         profile_directory.mkdir()
-        contents = EXAMPLE_PROFILE.read_text() + (
+        contents = EXAMPLE_PROFILE.read_text().replace(
+            "[commands]\n",
+            "[commands]\n"
+            'branch_identity = ".kent/scripts/workflow-branch-identity"\n',
+        ) + (
             "\n[adapters]\n"
             'jira_api = ".kent/adapters/jira/jira-api.sh"\n'
             'mobile_evidence_audit = '
@@ -1548,6 +1718,9 @@ class WorkflowKitTest(unittest.TestCase):
             root / ".kent" / "adapters" / "mobile" / "mobile-evidence-audit.sh"
         )
         jira_target = root / ".kent" / "adapters" / "jira" / "jira-api.sh"
+        branch_identity_target = (
+            root / ".kent" / "scripts" / "workflow-branch-identity"
+        )
 
         created = subprocess.run(
             [str(script), "--project", str(root)],
@@ -1563,6 +1736,8 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertTrue(evidence_target.stat().st_mode & 0o111)
         self.assertTrue(jira_target.is_file())
         self.assertTrue(jira_target.stat().st_mode & 0o111)
+        self.assertTrue(branch_identity_target.is_file())
+        self.assertTrue(branch_identity_target.stat().st_mode & 0o111)
         self.assertEqual(
             jira_target.read_bytes(),
             (
@@ -1579,6 +1754,15 @@ class WorkflowKitTest(unittest.TestCase):
                 / "templates"
                 / "project"
                 / "mobile-evidence-audit.sh"
+            ).read_bytes(),
+        )
+        self.assertEqual(
+            branch_identity_target.read_bytes(),
+            (
+                REPO_ROOT
+                / "templates"
+                / "project"
+                / "workflow-branch-identity"
             ).read_bytes(),
         )
 
@@ -1638,6 +1822,11 @@ class WorkflowKitTest(unittest.TestCase):
         policy.write_text("#!/usr/bin/env bash\necho inherit\n")
         policy.chmod(0o755)
         before = policy.read_bytes()
+        verifier = root / ".kent" / "scripts" / "workflow-verify"
+        verifier.parent.mkdir(parents=True)
+        verifier.write_text("#!/usr/bin/env bash\necho project verifier\n")
+        verifier.chmod(0o755)
+        verifier_before = verifier.read_bytes()
         contents = EXAMPLE_PROFILE.read_text() + (
             "\n[adapters]\n"
             'mcp_policy = ".kent/adapters/mcp/policy"\n'
@@ -1667,6 +1856,7 @@ class WorkflowKitTest(unittest.TestCase):
             ],
         )
         self.assertEqual(policy.read_bytes(), before)
+        self.assertEqual(verifier.read_bytes(), verifier_before)
 
     def test_profile_accepts_newer_minimum_kent_version(self) -> None:
         profile = self.load_profile(
@@ -1841,7 +2031,7 @@ class WorkflowKitTest(unittest.TestCase):
             client.apply(spec)
         self.assertEqual(commands, [])
 
-    def test_preflight_allows_safe_graph_mutation_when_tasks_exist(self) -> None:
+    def test_apply_rejects_non_atomic_graph_mutation_when_tasks_exist(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         spec = WorkflowSpec(
@@ -1883,9 +2073,41 @@ class WorkflowKitTest(unittest.TestCase):
         client = KentClient(Path(temporary.name))
         client.require_version = lambda *version: None
         client.inspect = lambda workflow: definition
-        mutation_required = client.preflight_reconcile(spec, definition)
+        client.workflow_has_tasks = lambda current: True
+        client.run_json = lambda args: commands.append(args) or {}
 
-        self.assertTrue(mutation_required)
+        with self.assertRaisesRegex(
+            SpecError,
+            "edge-by-edge reconciliation is non-atomic",
+        ):
+            client.apply(spec)
+        self.assertEqual(commands, [])
+
+    def test_apply_explicit_workflow_selector_never_creates_duplicate(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        spec = WorkflowSpec(
+            name="Generated v3",
+            description="Generated.",
+            execution_target="head",
+            nodes=(
+                NodeSpec("backlog", "start", "Backlog"),
+                NodeSpec("done", "terminal", "Done"),
+            ),
+            edges=(),
+        )
+        commands: list[list[str]] = []
+        client = KentClient(Path(temporary.name))
+        client.require_version = lambda *version: None
+        client.preflight_scripts = lambda current: None
+        client.inspect = lambda workflow: None
+        client.run_json = lambda args: commands.append(args) or {}
+
+        with self.assertRaisesRegex(SpecError, "explicit workflow.*was not found"):
+            client.apply(
+                spec,
+                workflow_selector="11111111-1111-4111-8111-111111111111",
+            )
         self.assertEqual(commands, [])
 
     def test_workflow_task_check_scans_every_linked_project(self) -> None:

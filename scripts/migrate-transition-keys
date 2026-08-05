@@ -9,6 +9,12 @@ import subprocess
 import sys
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from workflowkit import KentClient
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Migrate a Kent workflow to workflow-wide transition keys."
@@ -154,6 +160,11 @@ def main() -> int:
     if not args.apply:
         print(json.dumps(plan, indent=2, ensure_ascii=False))
         return 0
+    if transition_changes and KentClient(Path.cwd()).workflow_has_tasks(definition):
+        raise RuntimeError(
+            "workflow has tasks; task-backed transition migration is not "
+            "atomic. Create a replacement workflow or retire/migrate its tasks"
+        )
 
     for change in transition_changes:
         run_json(

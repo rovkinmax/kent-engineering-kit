@@ -20,6 +20,7 @@ bash -n "$repo_root/templates/project/mobile-evidence-audit.sh"
 bash -n "$repo_root/templates/project/workflow-verification-dispatch"
 bash -n "$repo_root/templates/project/workflow-verify-report"
 python3 -m py_compile \
+  "$repo_root/templates/project/workflow-branch-identity" \
   "$repo_root/templates/project/workflow-checkpoint" \
   "$repo_root/templates/project/workflow-wait-github-pr" \
   "$repo_root/templates/project/workflow-task-janitor"
@@ -47,6 +48,10 @@ rmdir "$install_help_root"
 }
 [[ -x "$repo_root/templates/project/workflow-checkpoint" ]] || {
   echo "workflow checkpoint template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/workflow-branch-identity" ]] || {
+  echo "workflow branch-identity template is not executable" >&2
   exit 1
 }
 [[ -x "$repo_root/templates/project/workflow-wait-github-pr" ]] || {
@@ -317,6 +322,12 @@ if profile.get("policies", {}).get("smoke") not in {
     "required",
 }:
     raise AssertionError("profile.policies.smoke is invalid")
+if profile.get("policies", {}).get("branch_identity") not in {
+    "task",
+    "jira",
+    "github_issue",
+}:
+    raise AssertionError("profile.policies.branch_identity is invalid")
 
 targets = [profile["execution"]["default_target"]]
 targets.extend(profile["execution"].get("overrides", {}).values())

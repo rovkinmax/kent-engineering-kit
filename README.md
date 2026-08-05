@@ -34,6 +34,8 @@ documented in `docs/MODEL-POLICY.md`.
 - Workflow deletion remains an explicit user action.
 - Existing workflows retain their Source HEAD behavior after an upgrade.
   New generated workflows declare their execution-target policy explicitly.
+- Upgrade and active-task recovery procedure:
+  `docs/KENT-UPGRADE-RUNBOOK.md`.
 
 ## Installation
 
@@ -104,6 +106,7 @@ Desktop. Skills, prompts, and `AGENTS.md` are consumed by new sessions.
 Project repositories provide `.kent/workflow-profile.toml`, deterministic
 verification scripts, project procedures, and these kit-managed commands:
 
+- `branch_identity` — pre-Plan Jira/GitHub issue branch resolution;
 - `checkpoint` — atomic ignored Fix/Smoke state under `.kent/runtime/`;
 - `wait_pr` — zero-model GitHub merge watching;
 - `janitor` — post-Cleanup safe managed-worktree and branch cleanup.
@@ -174,7 +177,16 @@ Projects that declare
 graph waits for the PR to merge, requires explicit approval, publishes from the
 exact merged source, verifies the remote package, and only then enters Cleanup.
 Failed or partial publication preserves the task workspace for an
-approval-gated retry.
+approval-gated retry. The project procedure owns the credential reference and
+build-tool environment mapping; the publisher resolves it just in time instead
+of depending on ambient CLI authentication.
+
+`policies.branch_identity` controls source-control naming before Plan:
+`task` retains Kent's short-ID branch, `jira` uses `feature/<KEY>`, and
+`github_issue` uses `issue-<number>` only for an issue in the same GitHub
+repository. Missing external identity keeps the Kent branch. Existing local or
+remote branch collisions stop in a recoverable user-decision node rather than
+attaching a new task to ambiguous work.
 
 After green CI, an open feasible PR moves to a deterministic script watcher.
 Unchanged state consumes no model turn and requires no approval. Material

@@ -30,7 +30,20 @@ state monitor.
   actionable regression belongs in a separate follow-up task.
 - Revalidate the configured merge method using method-specific evidence.
 - Do not edit files, commit, push, rerun arbitrary jobs, merge, or start child
-  agents.
+  agents. A workflow may explicitly authorize a bounded retry of an exact job
+  when first-party metadata and logs prove an infrastructure cancellation
+  rather than a test, analyzer, build, or product failure.
+- For an authorized GitHub retry, pin the unchanged run, head SHA, attempt, and
+  job ID. Require the failed step to be `cancelled` or the bounded log to end
+  with infrastructure evidence such as
+  `The runner has received a shutdown signal` /
+  `The operation was canceled`, with no task diagnostic. Use
+  `gh run rerun <run-id> --job <job-id>` so genuine failed siblings are not
+  repeated. Allow at most two automatic retries per logical job, wait for each
+  retry to finish, and record every attempt in the CI report.
+- Never automatically retry a user-cancelled or superseded run, a genuine
+  assertion/analyzer/compiler failure, an ambiguous cancellation, or a job
+  after the retry budget is exhausted.
 - While the PR is still open, route a failed check to Fix only when
   task-differential evidence proves the task introduced or worsened it.
   Unrelated, baseline, flaky, or unattributed failures route to user action.

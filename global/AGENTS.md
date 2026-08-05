@@ -15,6 +15,19 @@
   `После подтверждения` when those sections apply. Number independent decisions,
   do not paste raw review reports, and do not present task-scoped code fixes as
   actions the user must perform.
+- Questions and approvals are for actual user decisions or external actions.
+  Missing agent-produced bookkeeping or evidence, including an uncaptured
+  pre-edit red run, is not a user blocker. Reconstruct it only when that is
+  bounded and safe; otherwise record its absence and continue with available
+  deterministic evidence, routing to normal Fix only when acceptance remains
+  unproven. Never ask the user to waive an artifact the workflow itself failed
+  to capture.
+- A missing operational date is not automatically a product decision. When a
+  workflow action merely needs the date on which it is performed, and the task
+  or an authoritative human comment does not specify another date, resolve the
+  current calendar date from the execution environment at action time. Ask only
+  when the date has independent business meaning, conflicts with an explicit
+  source, or would change an existing external record.
 - For hard bugs, establish a deterministic command that reproduces the exact
   symptom before changing production code.
 - Before reviewing changes, pin the immutable task baseline and identify the
@@ -49,13 +62,40 @@
 - Existing and resumed sessions retain their locked system prompt and execution
   settings. Prompt changes affect newly created sessions; global configuration
   changes additionally require the documented Kent restart.
+- `kent task resume` confirms durable requeueing, not successful Session or
+  Script startup. Re-read authoritative Task state after a short delay. If it
+  returns to `interrupted`, inspect the exact reason before claiming recovery.
+  A migrated Current Node without an assigned or retained Session must be
+  re-entered through a supported incoming `new_session` Transition with its
+  preserved values; repeatedly calling Resume is not recovery.
 - `compact_and_continue_session` may retain the same session ID while performing
   a real context compaction and refreshing the session lock. Verify compaction
   events and the new lock timestamp; do not require a new ID or interpret the
   cumulative model-request count as the current context size.
+- Workflow Transition keys and Script completion output are one revisioned
+  contract. Do not mutate a task-backed graph edge by edge. Generate a new
+  Workflow version, migrate Backlog tasks, and let active tasks finish on their
+  frozen graph. During an unavoidable Kent upgrade repair, verify the checked-out
+  task worktree's Script files emit the repaired Transition keys before Resume;
+  updating only the live Workflow or only the primary checkout is insufficient.
+- When a workflow explicitly authorizes CI retry, distinguish infrastructure
+  cancellation from code failure using first-party job metadata and bounded
+  logs. A cancelled execution step plus `The runner has received a shutdown
+  signal` / `The operation was canceled` and no task diagnostic is eligible.
+  Retry only the exact cancelled job, preserve the run and head SHA, cap
+  automatic retries, and never mask a real test, analyzer, compiler, or
+  product diagnostic.
+- Generic toolkit synchronization must preserve project-owned command
+  implementations such as custom verification wrappers. A shared adapter may
+  replace a project file only when that command is explicitly kit-managed.
 - When a project uses the Kent Engineering Kit, call MCP through
   `~/.kent/bin/kent-mcp-call` and `~/.kent/bin/kent-mcp-list`. Keep credentials
   and project-specific server definitions outside the global adapter.
+- Approval-gated package publication resolves the project-declared credential
+  source just in time, verifies its principal and required registry access
+  before mutation, injects it only into the publish subprocess, and then
+  clears it. Ambient `gh auth` or inherited environment credentials are not
+  publication authority and must not be assumed to match the project contract.
 - MCP call logs are metadata-only, but normal command stdout remains in Kent's
   shell transcript. Sensitive MCP calls use `--quiet`, `--digest-output`, or
   output assertions so raw responses never reach shell output. Use
@@ -115,5 +155,19 @@
   marking it complete.
 - Prefer independently verifiable vertical slices. Treat broad mechanical
   refactors as expand-migrate-contract work when slices cannot stay green.
+- Treat the Kent task short ID and Git branch as separate identities. The task
+  short ID remains authoritative for lifecycle, comments, checkpoints, and
+  runtime state. When the project profile enables deterministic branch
+  identity, the first Script node may rename only the newly created task branch
+  before Plan: Jira uses `feature/<KEY>` with source URL priority and first
+  task-body key fallback; a same-repository GitHub issue uses
+  `issue-<number>`. Missing external identity retains the Kent branch. Never
+  rename an active task branch during rollout, silently reuse a colliding local
+  or remote branch, or infer the current Git branch from the task short ID.
+  Delivery reports `git branch --show-current`.
+- When a task resolves an issue in the same source-control repository, the pull
+  request body uses the provider's closing reference, for example `Fixes #51`
+  on GitHub. Cross-repository, partial, or follow-up relationships use a
+  non-closing link.
 - Do not commit, push, publish, flash hardware, or perform other irreversible
   actions unless the user or an applicable workflow explicitly authorizes it.

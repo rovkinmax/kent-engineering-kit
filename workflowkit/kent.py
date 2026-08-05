@@ -36,15 +36,20 @@ class KentClient:
         self,
         spec: WorkflowSpec,
         *,
-        minimum_version: tuple[int, int, int] = (2, 3, 0),
+        minimum_version: tuple[int, int, int] = (2, 5, 0),
         set_default: bool = False,
+        workflow_selector: str | None = None,
     ) -> dict[str, Any]:
         spec.validate()
         self.require_version(*minimum_version)
         self.preflight_scripts(spec)
 
-        definition = self.inspect(spec.name)
+        definition = self.inspect(workflow_selector or spec.name)
         if definition is None:
+            if workflow_selector is not None:
+                raise SpecError(
+                    f"explicit workflow {workflow_selector!r} was not found"
+                )
             self.run_json(
                 [
                     "workflow",
@@ -57,7 +62,13 @@ class KentClient:
             )
             definition = self.require_inspect(spec.name)
         else:
-            self.preflight_reconcile(spec, definition)
+            mutation_required = self.preflight_reconcile(spec, definition)
+            if mutation_required and self.workflow_has_tasks(definition):
+                raise SpecError(
+                    f"workflow {definition['workflow']['name']!r} has tasks; "
+                    "edge-by-edge reconciliation is non-atomic. Generate a new "
+                    "workflow version or migrate/retire its tasks first"
+                )
 
         workflow_ref = workflow_selector_from_definition(definition)
         for node in spec.nodes:

@@ -23,6 +23,9 @@ ADAPTER_TEMPLATES = {
     ),
 }
 COMMAND_TEMPLATES = {
+    "branch_identity": (
+        REPO_ROOT / "templates" / "project" / "workflow-branch-identity"
+    ),
     "checkpoint": REPO_ROOT / "templates" / "project" / "workflow-checkpoint",
     "dispatch": (
         REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch"

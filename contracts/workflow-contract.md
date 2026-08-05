@@ -18,6 +18,18 @@ device, source-control, issue-tracker, and release adapters.
   the interruption reason before changing task state. For a transient provider
   or transport failure, resume the interrupted node on its locked execution
   target; do not move the task or rerun completed upstream branches.
+- Resume reports durable requeueing before Session or Script startup finishes.
+  Recheck Task state after startup. `workflow_runtime_start_failed`,
+  `workflow_script_completion_failed`, or another immediate interruption is a
+  failed recovery even when the Resume command itself succeeded.
+- A Current Node migrated without an assigned or retained Session cannot be
+  repaired by repeated Resume. Re-enter the smallest supported incoming
+  `new_session` Transition with preserved values. For a failed fan-out branch,
+  re-enter the fan-out source so every sibling and Join invariant is recreated.
+- Transition keys, Script stdout, prompts, and persisted prior-value keys are
+  one versioned contract. Active workflows are frozen. Normal changes use a new
+  workflow version; taskless migration is allowed only after a complete
+  preflight proves that no Task references the graph.
 - `wont_do` is terminal, requires an explicit cancellation decision, and emits
   `closure_reason`.
 - Parallel verification branches are read-only.
@@ -40,6 +52,18 @@ device, source-control, issue-tracker, and release adapters.
 - Task-scoped source fixes belong in `fix_context`; they are not described as
   actions the user must perform. External dependencies only block the stage
   whose acceptance contract actually requires them.
+- Missing agent-produced evidence is not a user decision. A pre-edit red-run
+  requirement must be captured before the first production edit. If the agent
+  missed it, the workflow records the absence and uses bounded reconstruction
+  or current deterministic evidence; it asks the user only when acceptance
+  genuinely depends on an external fact or product decision.
+- Operational dates default deterministically. If a mutation requires only the
+  date on which it is being performed and no authoritative source specifies a
+  different date, resolve the current calendar date from the execution
+  environment immediately before dry-run and mutation. Do not request approval
+  merely to select today's date. Ask when the date represents a deadline,
+  effective period, backdate, scheduled release, or another independent
+  business choice, or when changing an existing external record's date.
 
 ## Writer session policy
 
@@ -108,6 +132,25 @@ device, source-control, issue-tracker, and release adapters.
 - `cleanup_mode`
 - `cleanup_session_id`
 
+## Branch identity
+
+- Kent task short ID is the stable workflow/lifecycle identity. It remains the
+  key for task comments, checkpoints, runtime state, and Kent commands even
+  when the Git branch has another name.
+- `policies.branch_identity = "task"` keeps Kent's native short-ID branch.
+- `jira` resolves `feature/<KEY>` from the task source URL first, otherwise
+  from the first Jira key in task-body order.
+- `github_issue` resolves `issue-<number>` only from an exact issue URL in the
+  current GitHub repository. Source URL is inspected before task-body URLs.
+- If no usable external identity exists, retain the Kent short-ID branch.
+- Branch identity runs as the first deterministic Script node before Plan.
+  Active task branches are never renamed during workflow migration.
+- An existing local or remote desired branch is ambiguous ownership, not an
+  invitation to reuse or overwrite it. Route to a recoverable user decision.
+- PR preparation reports the actual `git branch --show-current`; downstream
+  CI, merge watching, and Cleanup never reconstruct branch identity from the
+  Kent short ID.
+
 ## Approval-gated package publication
 
 - `release_topology = "manual-package-publish-after-main"` inserts a dedicated
@@ -119,6 +162,11 @@ device, source-control, issue-tracker, and release adapters.
   only for package identity, version, destination, override mechanism, and tag
   policy explicitly authorized in the task body or an exact human-authored
   task comment.
+- The project publish procedure declares the credential source and the
+  build-tool environment mapping. The publisher resolves that source just in
+  time, verifies its principal and required registry access without exposing
+  the secret, injects it only into the authorized publish subprocess, and
+  clears it afterward. Ambient CLI authentication is not a substitute.
 - The publisher checks remote state before every mutation and after success.
   Existing, partial, conflicting, or unverifiable versions block without
   overwrite or deletion.
@@ -293,6 +341,16 @@ device, source-control, issue-tracker, and release adapters.
 - Pending, queued, and in-progress CI are not blockers or transitions. CI uses
   one blocking first-party watcher for the exact PR/run and waits for terminal
   green/red/canceled state without spending a model turn per poll.
+- CI may automatically retry an exact failed GitHub Actions job when
+  first-party job metadata and bounded logs prove an infrastructure
+  cancellation: the execution step is `cancelled` or bounded logs report
+  `The runner has received a shutdown signal` / `The operation was canceled`,
+  no test/analyzer/compiler diagnostic exists, the run and head SHA are
+  unchanged, and the run was not user-cancelled or superseded. Retry only that
+  job with `gh run rerun <run-id> --job <job-id>`,
+  at most twice per logical job, waiting and re-reading authoritative state
+  after each attempt. Genuine or ambiguous failures and exhausted retries are
+  never hidden by automatic reruns.
   `needs_user_action` is reserved for authentication, access, ambiguous
   identity, contradictory policy, or another actual human decision.
 - An open, green, method-feasible pull request transitions from Waiting PR to
@@ -307,6 +365,10 @@ device, source-control, issue-tracker, and release adapters.
   resumes implementation or repeats verification on the merged task branch.
 - Task-backed workflows keep their recorded PR prompts. Apply this contract in
   a new non-default workflow and canary it before promotion.
+- When the task resolves an issue in the same repository, Prepare PR adds the
+  source-control provider's closing reference (`Fixes #N` on GitHub). A
+  cross-repository, partial, or follow-up relationship is linked without a
+  closing keyword.
 
 ## Smoke policy
 

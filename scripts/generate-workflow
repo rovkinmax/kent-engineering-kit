@@ -58,6 +58,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Set the generated workflow as project default. Requires --apply.",
     )
+    parser.add_argument(
+        "--workflow-id",
+        default="",
+        help=(
+            "Update one explicit existing workflow UUID even when its legacy "
+            "display name differs from the generated name."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -92,9 +100,10 @@ def main() -> int:
         spec,
         minimum_version=profile.minimum_version_tuple(),
         set_default=args.set_default,
+        workflow_selector=args.workflow_id.strip() or None,
     )
     snapshot_name = snapshot_filename(
-        spec.name,
+        definition["workflow"]["name"],
         disambiguate=bool(args.label.strip()),
     )
     snapshot_path = profile.project_root / ".kent" / "workflows" / snapshot_name
@@ -103,7 +112,7 @@ def main() -> int:
         json.dumps(
             {
                 "workflow_id": definition["workflow"]["id"],
-                "workflow_name": spec.name,
+                "workflow_name": definition["workflow"]["name"],
                 "workflow_kind": args.kind,
                 "execution_target": spec.execution_target,
                 "snapshot": str(snapshot_path),

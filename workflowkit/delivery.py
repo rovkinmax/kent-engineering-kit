@@ -169,6 +169,7 @@ def build_delivery_workflow(
         else cleanup_prompt(profile, merged=True)
     )
     implementation_parameters = (WORKSPACE, PLAN, WORK_KIND)
+    branch_identity_enabled = profile.branch_identity_policy() != "task"
     nodes: list[NodeSpec] = [
         NodeSpec("backlog", "start", "Backlog"),
         agent_node("plan", "Plan", orchestrator),
@@ -191,6 +192,22 @@ def build_delivery_workflow(
         NodeSpec("wont_do", "terminal", "Won't Do"),
         NodeSpec("done", "terminal", "Done"),
     ]
+    if branch_identity_enabled:
+        nodes.extend(
+            [
+                NodeSpec(
+                    "branch_identity",
+                    "script",
+                    "Branch Identity",
+                    script_path=profile.command("branch_identity"),
+                ),
+                agent_node(
+                    "branch_identity_resolution",
+                    "Branch Identity Resolution",
+                    orchestrator,
+                ),
+            ]
+        )
 
     review_branches = ["deterministic_verify"]
     if profile.capability("standards_review"):
@@ -264,79 +281,146 @@ def build_delivery_workflow(
             )
         )
 
-    edges: list[EdgeSpec] = [
-        EdgeSpec(
-            key="start_plan",
-            source="backlog",
-            transition="start",
-            target="plan",
-            prompt=plan_prompt(profile, recovery_aware=fresh_writers),
-            transition_description="Start one planning session for this task.",
-        ),
-        EdgeSpec(
-            key="plan_implement",
-            source="plan",
-            transition="implement",
-            target="implement",
-            context=writer_handoff_context,
-            prompt=implement_prompt(profile, fresh_session=fresh_writers),
-            transition_description=(
-                "Planning is complete and implementation can start without ambiguity."
+    if branch_identity_enabled:
+        edges: list[EdgeSpec] = [
+            EdgeSpec(
+                key="start_branch_identity",
+                source="backlog",
+                transition="start",
+                target="branch_identity",
+                transition_description=(
+                    "Resolve the project-declared source-control branch identity "
+                    "before any agent or code work starts."
+                ),
             ),
-            parameters=implementation_parameters,
-        ),
-        recovery_edge(
-            "plan",
-            context=non_writer_recovery_context,
-        ),
-        cancellation_edge("plan"),
-        EdgeSpec(
-            key="implement_continue",
-            source="implement",
-            transition="continue_implementation",
-            target="implement",
-            context=implementation_continuation_context,
-            prompt=implement_prompt(profile, fresh_session=fresh_writers),
-            transition_description=(
-                "One plan step is complete; continue with the next ready step."
+            EdgeSpec(
+                key="branch_identity_plan",
+                source="branch_identity",
+                transition="ready",
+                target="plan",
+                prompt=plan_prompt(profile, recovery_aware=fresh_writers),
+                transition_description=(
+                    "Branch identity is deterministic and planning can start."
+                ),
             ),
-            parameters=implementation_parameters,
-        ),
-        EdgeSpec(
-            key="implement_verify",
-            source="implement",
-            transition="verify",
-            target="verification_dispatch",
-            transition_description=(
-                "Implementation is complete; normalize inputs for read-only verification."
+            EdgeSpec(
+                key="branch_identity_resolution",
+                source="branch_identity",
+                transition="blocked",
+                target="branch_identity_resolution",
+                prompt=branch_identity_resolution_prompt(profile),
+                transition_description=(
+                    "Branch identity is ambiguous or collides with existing "
+                    "repository state and requires a user decision."
+                ),
+                parameters=(BLOCKER,),
             ),
-            parameters=(WORKSPACE, REVIEW_CONTEXT),
-        ),
-        recovery_edge(
-            "implement",
-            context=writer_recovery_context,
-            fresh_session=fresh_writers,
-            extra_parameters=(WORK_KIND,),
-            extra_prompt=work_kind_recovery_instruction(profile),
-        ),
-        cancellation_edge("implement"),
-        EdgeSpec(
-            key="fix_verify",
-            source="fix",
-            transition="verify",
-            target="verification_dispatch",
-            transition_description=(
-                "Task-scoped fixes are complete; rerun every verification branch."
+            EdgeSpec(
+                key="branch_identity_retry",
+                source="branch_identity_resolution",
+                transition="retry",
+                target="branch_identity",
+                transition_description=(
+                    "Retry deterministic branch identity after the reported "
+                    "collision or repository blocker is resolved."
+                ),
             ),
-            parameters=(WORKSPACE, REVIEW_CONTEXT),
-        ),
-        recovery_edge(
-            "fix",
-            context=writer_recovery_context,
-            fresh_session=fresh_writers,
-        ),
-        cancellation_edge("fix"),
-    ]
+            recovery_edge(
+                "branch_identity_resolution",
+                context=non_writer_recovery_context,
+                extra_prompt=(
+                    "When the exact branch blocker is resolved, choose `retry`. "
+                    "Do not rename, delete, or overwrite another branch from "
+                    "this agent node."
+                ),
+            ),
+            cancellation_edge("branch_identity_resolution"),
+        ]
+    else:
+        edges = [
+            EdgeSpec(
+                key="start_plan",
+                source="backlog",
+                transition="start",
+                target="plan",
+                prompt=plan_prompt(profile, recovery_aware=fresh_writers),
+                transition_description="Start one planning session for this task.",
+            ),
+        ]
+    edges.extend(
+        [
+            EdgeSpec(
+                key="plan_implement",
+                source="plan",
+                transition="implement",
+                target="implement",
+                context=writer_handoff_context,
+                prompt=implement_prompt(profile, fresh_session=fresh_writers),
+                transition_description=(
+                    "Planning is complete and implementation can start without "
+                    "ambiguity."
+                ),
+                parameters=implementation_parameters,
+            ),
+            recovery_edge(
+                "plan",
+                context=non_writer_recovery_context,
+            ),
+            cancellation_edge("plan"),
+        ]
+    )
+    edges.extend(
+        [
+            EdgeSpec(
+                key="implement_continue",
+                source="implement",
+                transition="continue_implementation",
+                target="implement",
+                context=implementation_continuation_context,
+                prompt=implement_prompt(profile, fresh_session=fresh_writers),
+                transition_description=(
+                    "One plan step is complete; continue with the next ready step."
+                ),
+                parameters=implementation_parameters,
+            ),
+            EdgeSpec(
+                key="implement_verify",
+                source="implement",
+                transition="verify",
+                target="verification_dispatch",
+                transition_description=(
+                    "Implementation is complete; normalize inputs for read-only "
+                    "verification."
+                ),
+                parameters=(WORKSPACE, REVIEW_CONTEXT),
+            ),
+            recovery_edge(
+                "implement",
+                context=writer_recovery_context,
+                fresh_session=fresh_writers,
+                extra_parameters=(WORK_KIND,),
+                extra_prompt=work_kind_recovery_instruction(profile),
+            ),
+            cancellation_edge("implement"),
+            EdgeSpec(
+                key="fix_verify",
+                source="fix",
+                transition="verify",
+                target="verification_dispatch",
+                transition_description=(
+                    "Task-scoped fixes are complete; rerun every verification "
+                    "branch."
+                ),
+                parameters=(WORKSPACE, REVIEW_CONTEXT),
+            ),
+            recovery_edge(
+                "fix",
+                context=writer_recovery_context,
+                fresh_session=fresh_writers,
+            ),
+            cancellation_edge("fix"),
+        ]
+    )
 
     if fresh_writers:
         edges.append(
@@ -1331,6 +1415,23 @@ def procedure_instruction(profile: ProjectProfile, key: str) -> str:
     return "Follow the project contract and repository instructions."
 
 
+def branch_identity_resolution_prompt(profile: ProjectProfile) -> str:
+    return f"""Resolve the deterministic branch-identity blocker before Plan.
+
+Project branch policy: `{profile.branch_identity_policy()}`.
+Reported blocker: {{{{.Params.blocker_reason}}}}
+
+Write all user-facing explanation in Russian. Inspect repository and task state
+without editing files, renaming branches, deleting refs, pushing, or starting
+implementation. Explain the exact collision or identity ambiguity and the
+smallest safe external action that resolves it.
+
+Choose `needs_user_action` with an updated `blocker_reason` while the blocker
+remains. After the user or external system resolves that exact blocker, verify
+it and choose `retry`. Choose `wont_do` only for an explicit cancellation and
+provide `closure_reason`."""
+
+
 def checkpoint_instruction(profile: ProjectProfile, stage: str) -> str:
     stage_details = {
         "fix": (
@@ -1461,6 +1562,10 @@ Task body:
 Keep discovery, design/spec ingestion, decisions, and implementation planning in
 this one Plan session. Ask questions when a product decision is required. Do not
 invoke nested prompt flows and do not implement production changes.
+Assign every required evidence artifact an owner and a production-edit
+boundary. If the plan requires a pre-edit red run, make it the first
+writer-owned step and require capture before any production edit. The plan must
+not turn a later failure to capture agent-owned evidence into a user approval.
 Any design, specification, or plan that narrows, replaces, or claims to
 supersede the task body must cite the exact human-authored task-comment ID or
 another explicit authoritative source. Agent-authored comments, implementation
@@ -1519,6 +1624,11 @@ Do not launch nested final Standards, Specification, Compliance, or
 project-specialized review passes; the generated verification graph owns those
 independent reviews. Bounded implementation, research, and diagnosis
 delegation remains allowed.
+Capture planned pre-edit evidence before the first production edit. If an
+inherited worktree already contains the edit and the earlier agent failed to
+retain its own red-run artifact, do not ask the user to waive that bookkeeping.
+Record the absence, reconstruct it only when bounded and safe, and continue
+with current deterministic evidence unless acceptance remains unproven.
 After marking that step complete, choose `continue_implementation` with
 `workspace_path`, `plan_path`, and the unchanged `work_kind` when unchecked
 writer-owned ready steps remain. Choose
@@ -1715,8 +1825,11 @@ Do not convert a whole-repository analyzer failure,
 pre-existing baseline debt, or an unproven differential into writer work.
 Do not convert target-only commits missing from an older task checkout into
 writer work without a proven merge/replay conflict or delivered-tree loss.
-Repository-policy contradictions and unavailable mandatory baseline evidence
-route to `needs_user_action`, not Fix.
+Repository-policy contradictions that require an actual external decision
+route to `needs_user_action`, not Fix. Missing agent-produced evidence,
+including an uncaptured pre-edit red run, is not an external blocker. Record
+the absence, reconstruct it only when bounded and safe, and choose
+`needs_changes` only when the available evidence cannot prove acceptance.
 Follow the user-facing workflow communication contract from AGENTS.md.
 Keep full technical reports in `review_context`. Transition commentary and
 `blocker_reason` must be concise, use the user's preferred conversation
@@ -1792,6 +1905,13 @@ A specification or plan may narrow or supersede the task body only with an
 exact human-authored task-comment ID or another explicit authoritative source.
 Agent-authored summaries and unsupported claims that "the user clarified" are
 not product authority.
+
+Missing agent-produced evidence is not a user decision. If a pre-edit red run
+was required but not retained, verify whether current deterministic evidence
+still proves the acceptance contract. Use `repair_evidence` for a
+packaging-only record gap or `needs_changes` when substantive acceptance is
+unproven; do not use `needs_user_action` merely to ask the user to waive the
+workflow's own missing artifact.
 
 Choose `ship_pr` only when the final work product is compliant. Provide
 `workspace_path`, a complete `review_context`, and `compliance_report`. Choose
@@ -1914,6 +2034,18 @@ This workflow explicitly authorizes committing the task changes, pushing only
 the current task branch, and creating or updating its pull request. It never
 authorizes merging, pushing protected branches, or broadening scope.
 
+Treat `git branch --show-current` as branch authority. The branch may differ
+from the Kent task short ID when the project enabled deterministic branch
+identity; never reconstruct or reject it by comparing branch text with
+`{{{{.TaskShortId}}}}`.
+
+If the task source URL or body identifies an issue in the same repository and
+this task fully resolves it, include the provider-native closing reference in
+the pull-request body, such as `Fixes #N` on GitHub. Use a non-closing link for
+cross-repository, partial, or follow-up relationships. Read the task's current
+`source_url` through Kent task metadata when it is not already visible in the
+prompt; do not infer issue linkage from branch text alone.
+
 Configured PR merge policy: `{merge_policy}`.
 
 Resolve the merge strategy once before publishing. Supported resolved values
@@ -1983,6 +2115,19 @@ use `gh run watch <run-id> --exit-status --interval 30`. After the watcher exits
 re-read authoritative PR, check, and run state before choosing a transition.
 "Bounded" monitoring means bounded identity, interval, and log scope, not an
 arbitrary wall-clock cutoff while CI is still running.
+
+This workflow authorizes a bounded retry of an exact GitHub Actions job only
+when first-party metadata and bounded logs prove infrastructure cancellation:
+the execution step is `cancelled` or bounded logs report
+`The runner has received a shutdown signal` / `The operation was canceled`,
+there is no test, analyzer, compiler, or product diagnostic, the run and head
+SHA are unchanged, and the run was not user-cancelled or superseded. Pin the
+run attempt and job ID, then use
+`gh run rerun <run-id> --job <job-id>` so genuine failed siblings are not
+repeated. Allow at most two automatic retries per logical job. Wait for each
+retry, re-read authoritative state, and include the attempt ledger in
+`ci_report`. Never retry a genuine or ambiguous failure, and do not ask the
+user merely to initiate an eligible infrastructure retry.
 
 Query authoritative PR merge state before classifying any failed or late check.
 If the PR is already merged, never route the merged task branch to Fix. Complete
@@ -2165,12 +2310,17 @@ Before any remote mutation:
    publish unmerged, dirty, or tree-divergent code, and never rewrite the
    retained task worktree to manufacture that state.
 5. Validate generated publication metadata before mutation.
-6. Check whether the exact remote package version already exists. Never
+6. Resolve the project-declared credential source just in time. Verify its
+   principal and required registry access without printing it. Do not rely on
+   ambient CLI authentication or inherited credential variables.
+7. Check whether the exact remote package version already exists. Never
    overwrite or delete a colliding version.
 
 Run only the project-authorized remote publish command. Never use a local
 repository substitute for a required remote publication. Do not expose
-credentials in output, task comments, artifacts, or logs.
+credentials in output, task comments, artifacts, or logs. Inject the resolved
+credential only into the publish subprocess using the project-declared
+environment mapping, then clear it.
 
 After publication, verify the exact expected package versions through the
 remote package registry. Record package names, version, merged commit, command
@@ -2205,12 +2355,16 @@ to publish the exact already-approved package identity. It does not authorize
 another version, source edits, tags beyond the declared policy, package
 deletion, or overwrite.
 
-Before any publish command, inspect the remote package registry again for
-partial or completed publication and verify the clean merged source identity.
+Before any publish command, re-resolve the project-declared credential source,
+verify its principal and registry access without exposing it, and do not
+substitute ambient CLI authentication. Inspect the remote package registry
+again for partial or completed publication and verify the clean merged source
+identity.
 If the package is already completely present with task-owned proof, complete as
 `published` without republishing. If state is partial, conflicting, or
 unverifiable, return `needs_user_action` again. Never hide a partial remote
-mutation.
+mutation. Inject the credential only into the authorized publish subprocess
+and clear it afterward.
 
 On success, provide `workspace_path`, `pr_url`, `branch_name`, `merge_report`,
 and `publication_report`. On another blocker, preserve the same delivery

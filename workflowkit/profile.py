@@ -14,6 +14,7 @@ DELIVERY_PROFILES = {"lite", "standard", "team", "release"}
 SMOKE_POLICIES = {"disabled", "conditional", "required"}
 WRITER_SESSION_POLICIES = {"continuous", "fresh_per_slice"}
 PR_MERGE_STRATEGIES = {"auto", "merge", "squash", "rebase"}
+BRANCH_IDENTITY_POLICIES = {"task", "jira", "github_issue"}
 PACKAGE_PUBLISH_TOPOLOGY = "manual-package-publish-after-main"
 WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
@@ -180,6 +181,26 @@ class ProjectProfile:
                 f"{pr_merge_strategy!r}; expected one of "
                 f"{sorted(PR_MERGE_STRATEGIES)}"
             )
+        branch_identity_policy = self.branch_identity_policy()
+        if branch_identity_policy not in BRANCH_IDENTITY_POLICIES:
+            raise SpecError(
+                "unsupported policies.branch_identity "
+                f"{branch_identity_policy!r}; expected one of "
+                f"{sorted(BRANCH_IDENTITY_POLICIES)}"
+            )
+        if branch_identity_policy == "jira" and self.issue_tracker != "jira":
+            raise SpecError(
+                "policies.branch_identity = 'jira' requires "
+                "issue_tracker = 'jira'"
+            )
+        if (
+            branch_identity_policy == "github_issue"
+            and self.source_control != "github"
+        ):
+            raise SpecError(
+                "policies.branch_identity = 'github_issue' requires "
+                "source_control = 'github'"
+            )
         if "device_smoke" in self.capabilities:
             raise SpecError(
                 "capabilities.device_smoke was removed in profile schema 3; "
@@ -226,6 +247,11 @@ class ProjectProfile:
             raise SpecError("profile command 'verify' is required")
         if not self.command("checkpoint"):
             raise SpecError("profile command 'checkpoint' is required")
+        if branch_identity_policy != "task" and not self.command("branch_identity"):
+            raise SpecError(
+                "profile command 'branch_identity' is required when "
+                "policies.branch_identity is not 'task'"
+            )
         if self.capability("managed_worktrees") and not self.command("janitor"):
             raise SpecError(
                 "profile command 'janitor' is required for managed worktrees"
@@ -341,6 +367,9 @@ class ProjectProfile:
 
     def pr_merge_strategy(self) -> str:
         return self.policies.get("pr_merge_strategy", "auto").strip()
+
+    def branch_identity_policy(self) -> str:
+        return self.policies.get("branch_identity", "task").strip()
 
     def package_publish_after_main(self) -> bool:
         return self.release_topology == PACKAGE_PUBLISH_TOPOLOGY

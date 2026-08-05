@@ -41,6 +41,12 @@ generated toolkit workflows.
 - Treat canary revisions as rollout evidence, not a commit-ancestry gate, until
   the shared profile and workflow compatibility contract is versioned.
 - Treat Kent's selected execution root and resolved commit as authoritative.
+- Read `policies.branch_identity` before interpreting the Git branch. Kent's
+  task short ID remains lifecycle identity, while a configured first Script
+  node may rename the new branch to `feature/<Jira-key>` or
+  `issue-<GitHub-number>` before Plan. Missing external identity retains the
+  task branch; collisions require an explicit resolution and never attach
+  silently to an existing ref.
 - Use `kent worktree` for operations on Kent-managed worktrees.
 - For a cross-session operation, invoke `~/.kent/bin/kent-worktree` with an
   explicit `--session`. The wrapper prevents inherited task/session variables

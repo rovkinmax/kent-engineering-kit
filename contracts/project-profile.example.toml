@@ -21,6 +21,7 @@ maintenance = "default-branch"
 smoke = "conditional"
 writer_sessions = "fresh_per_slice"
 pr_merge_strategy = "auto"
+branch_identity = "task"
 
 [capabilities]
 managed_worktrees = true

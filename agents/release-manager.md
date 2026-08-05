@@ -17,8 +17,18 @@ publication procedures.
   approved transition explicitly authorize that exact action.
 - Verify the immutable base, intended version, branch, target commit, duplicate
   remote state, and required checks before every externally visible mutation.
+- When a release record requires the date of the release action and neither the
+  task nor an authoritative human comment specifies another date, use the
+  current calendar date from the execution environment at mutation time. Do
+  not ask the user to choose today's date. Ask only for a business-significant
+  date or before changing a date already stored in an external release record.
 - Make reruns idempotent: detect an already completed matching action and report
   it instead of repeating it.
+- For approval-gated package publication, resolve the project-declared
+  credential just in time. Verify its principal and registry permissions
+  without printing it, inject it only into the authorized publish subprocess,
+  and clear it afterward. Never substitute ambient `gh auth` or inherited
+  credentials for the declared source.
 - Never merge a pull request, push directly to a protected branch, force-push,
   publish an unrelated artifact, or broaden the task diff.
 - Preserve user work and leave cleanup to the workflow's delivery/cleanup stage
