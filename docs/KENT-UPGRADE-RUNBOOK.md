@@ -44,6 +44,11 @@ missing. Use the explicit `not-applicable` sentinel for a contractually
 planless `plan_path`; do not ask the user to decide how to satisfy this
 mechanical serialization rule.
 
+Desktop-launched Kent Scripts may resolve `/usr/bin/python3` rather than the
+interactive shell's Homebrew Python. Project Scripts must compile and import on
+the service interpreter; do not rely on `tomllib` or Python 3.10+ syntax when
+the service still uses Python 3.9.
+
 ## Active task recovery
 
 `kent task resume` returns after durable requeueing. It does not prove that the

@@ -31,6 +31,19 @@ BRANCH_IDENTITY = load_script_module()
 
 
 class BranchIdentityTest(unittest.TestCase):
+    def test_system_python_can_compile_runtime_script(self) -> None:
+        system_python = Path("/usr/bin/python3")
+        if not system_python.is_file():
+            self.skipTest("/usr/bin/python3 is unavailable")
+        result = subprocess.run(
+            [str(system_python), "-m", "py_compile", str(SCRIPT)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

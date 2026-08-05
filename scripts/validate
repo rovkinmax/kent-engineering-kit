@@ -24,6 +24,10 @@ python3 -m py_compile \
   "$repo_root/templates/project/workflow-checkpoint" \
   "$repo_root/templates/project/workflow-wait-github-pr" \
   "$repo_root/templates/project/workflow-task-janitor"
+if [[ -x /usr/bin/python3 ]]; then
+  /usr/bin/python3 -m py_compile \
+    "$repo_root/templates/project/workflow-branch-identity"
+fi
 
 install_help_root="$(mktemp -d)"
 KENT_PERSISTENCE_ROOT="$install_help_root" \
