@@ -39,6 +39,11 @@ then deterministic branch identity, then the first writer. Treat any stranded
 worktree from this failure as upgrade/runtime debris and clean it through Kent
 after the temporary workflow/task record is retired.
 
+Kent 2.5 also rejects an empty string for a required Transition output as
+missing. Use the explicit `not-applicable` sentinel for a contractually
+planless `plan_path`; do not ask the user to decide how to satisfy this
+mechanical serialization rule.
+
 ## Active task recovery
 
 `kent task resume` returns after durable requeueing. It does not prove that the

@@ -348,6 +348,10 @@ class WorkflowKitTest(unittest.TestCase):
             "must stop for confirmation",
             by_key["start_plan"].prompt,
         )
+        self.assertIn(
+            "`not-applicable`",
+            by_key["start_plan"].prompt,
+        )
 
     def test_delivery_preserves_continuous_writer_compatibility(self) -> None:
         profile = self.load_profile(

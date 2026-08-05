@@ -16,7 +16,7 @@ REPORTED_WORKSPACE = ParameterSpec(
 )
 PLAN = ParameterSpec(
     "plan_path",
-    "Path to the approved implementation plan, or an empty string when not applicable.",
+    "Path to the approved implementation plan, or the literal not-applicable.",
 )
 WORK_KIND = ParameterSpec(
     "work_kind",
@@ -1590,8 +1590,9 @@ is absent.
 Complete with `implement` only when the plan has no unresolved product, API, UX,
 or safety ambiguity. `workspace_path` is the repository or managed-worktree
 root; it is never `.todo/<feature>` or another artifact directory. Provide that
-root plus `plan_path` and the selected `work_kind`; use an empty `plan_path`
-only when the project contract explicitly allows planless work.
+root plus `plan_path` and the selected `work_kind`; use the literal
+`not-applicable` only when the project contract explicitly allows planless
+work. Kent transition parameters must be non-empty.
 Complete with `needs_user_action` and `blocker_reason` for an external blocker.
 Choose `wont_do` only for an explicit cancellation decision and provide
 `closure_reason`."""

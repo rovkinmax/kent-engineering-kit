@@ -155,6 +155,37 @@ class BranchIdentityTest(unittest.TestCase):
         self.assertEqual(payload["plan_path"], ".todo/canary/plan.md")
         self.assertEqual(payload["work_kind"], "test")
 
+    def test_runtime_failure_routes_to_blocked_with_handoff(self) -> None:
+        self.configure("jira")
+        self.task(source_url="https://example.atlassian.net/browse/MBL-742")
+        environment = os.environ.copy()
+        environment["KENT_BIN"] = str(self.root / "missing-kent")
+        result = subprocess.run(
+            [str(SCRIPT)],
+            cwd=self.root,
+            input=json.dumps(
+                {
+                    "workspace_path": str(self.root),
+                    "plan_path": "not-applicable",
+                    "work_kind": "test",
+                    "_kent": {"task_id": "task-uuid"},
+                }
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            check=False,
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_blocked")
+        self.assertEqual(payload["workspace_path"], str(self.root))
+        self.assertEqual(payload["plan_path"], "not-applicable")
+        self.assertEqual(payload["work_kind"], "test")
+        self.assertIn("инфраструктурной", payload["blocker_reason"])
+
     def test_jira_body_uses_first_listed_key(self) -> None:
         self.configure("jira")
         self.task(body="Issues:\n- MBL-783\n- MBL-784\n")

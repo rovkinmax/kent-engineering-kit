@@ -100,6 +100,8 @@ device, source-control, issue-tracker, and release adapters.
 - `plan_path`
 - `work_kind` — stable project-profile key selected once during Plan and
   preserved through every Implement slice
+- `plan_path` uses the literal `not-applicable` when an explicitly planless
+  project flow is allowed. Required Kent Transition parameters are never empty.
 - `spec_path`
 - `fixed_point` — immutable task-delta baseline, normally Kent's resolved
   execution commit; it is distinct from the moving PR merge target
