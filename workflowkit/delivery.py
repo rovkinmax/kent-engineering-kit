@@ -75,7 +75,11 @@ REVIEW_REPORT = ParameterSpec(
     "Read-only specification and acceptance-criteria review report.",
 )
 PR_URL = ParameterSpec("pr_url", "Canonical pull request URL.")
-BRANCH_NAME = ParameterSpec("branch_name", "Task branch name.")
+BRANCH_NAME = ParameterSpec(
+    "branch_name",
+    "Exact non-empty current Git branch from git branch --show-current; "
+    "required even when no pull request exists.",
+)
 MERGE_STRATEGY = ParameterSpec(
     "merge_strategy",
     "Resolved pull-request merge strategy: merge, squash, or rebase.",
@@ -2400,7 +2404,11 @@ Complete with `run_janitor` and provide:
 
 - canonical `workspace_path`;
 - `task_short_id` as `{{{{.TaskShortId}}}}`;
-- `pr_url`, `branch_name`, and `merge_report`, using empty strings when absent;
+- `branch_name` as the exact non-empty output of
+  `git branch --show-current`, including `no_pr` and `report_only`; never use
+  `null`, `none`, `not-applicable`, an empty value, or the Kent task ID by
+  inference;
+- `pr_url` and `merge_report`, using the literal `not-applicable` when absent;
 - `cleanup_mode` as `{cleanup_mode}`;
 - `cleanup_session_id` from the current `KENT_SESSION_ID`;
 - a non-empty `cleanup_report` describing preflight and preserved resources.

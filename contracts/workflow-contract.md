@@ -523,6 +523,10 @@ device, source-control, issue-tracker, and release adapters.
 
 - Cleanup is a report-first resource-owning agent stage. It never removes its
   own Kent-managed worktree.
+- Cleanup always emits the exact non-empty `git branch --show-current` value,
+  including `no_pr` and `report_only` paths. Sentinel or inferred task-ID
+  branch values are invalid and route Janitor back to Cleanup instead of
+  completing with leaked resources.
 - For managed-worktree profiles, Cleanup emits canonical workspace, task,
   branch, PR, merge, mode, session, and preflight data to a deterministic Task
   Janitor script after the Cleanup session exits.

@@ -755,6 +755,33 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertIn("preserved dirty worktree", payload["cleanup_report"])
         self.assertTrue(worktree.exists())
 
+    def test_missing_branch_sentinel_returns_to_cleanup(self) -> None:
+        root = self.create_repository()
+        worktrees = root / ".kent" / "worktrees"
+        worktrees.mkdir(parents=True)
+        worktree = worktrees / "TASK-1"
+        self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
+
+        result = subprocess.run(
+            [str(JANITOR)],
+            cwd=worktree,
+            input=self.janitor_input(
+                worktree,
+                branch_name="null",
+                cleanup_mode="no_pr",
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["transition"], "task_janitor_blocked")
+        self.assertIn("missing branch identity", payload["cleanup_report"])
+        self.assertIn("exact current Git branch", payload["blocker_reason"])
+        self.assertTrue(worktree.exists())
+
     def test_exact_merged_pr_invokes_kent_worktree_deletion(self) -> None:
         root = self.create_repository()
         worktrees = root / ".kent" / "worktrees"

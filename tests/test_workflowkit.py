@@ -1133,6 +1133,18 @@ class WorkflowKitTest(unittest.TestCase):
             "after this resource-owning Cleanup session exits",
             by_key["waiting_pr_cleanup"].prompt,
         )
+        for key in (
+            "prepare_pr_no_pr",
+            "waiting_pr_close_without_merge",
+        ):
+            self.assertIn(
+                "`git branch --show-current`",
+                by_key[key].prompt,
+            )
+            self.assertIn(
+                "never use\n  `null`, `none`, `not-applicable`",
+                by_key[key].prompt,
+            )
 
     def test_fix_and_smoke_prompts_require_durable_checkpoints(self) -> None:
         profile = self.load_profile()
