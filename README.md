@@ -109,10 +109,16 @@ verification scripts, project procedures, and these kit-managed commands:
 - `branch_identity` — post-Plan/pre-Implement Jira/GitHub issue branch
   resolution;
 - `checkpoint` — atomic ignored Fix/Smoke state under `.kent/runtime/`;
+- `evidence` — append-only task evidence and node context metrics under
+  `.kent/runtime/`;
+- `wait_ci` — zero-model GitHub CI watching until terminal green/red state;
 - `wait_pr` — zero-model GitHub merge watching;
 - `janitor` — post-Cleanup safe managed-worktree and branch cleanup.
 
-Projects add `/.kent/runtime/` to `.gitignore`. Preview a versioned workflow:
+Projects add `/.kent/runtime/` to `.gitignore` and declare
+`[context_manifests]` entries for `plan`, `implement`, `review`, `smoke`, and
+`delivery`. Generated prompts treat the selected manifest as the node's read
+budget. Preview a versioned workflow:
 
 ```bash
 ./scripts/generate-workflow \

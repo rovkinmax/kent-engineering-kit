@@ -270,6 +270,14 @@ def build_delivery_workflow(
                 )
             )
     if profile.capability("ci_monitoring"):
+        nodes.append(
+            NodeSpec(
+                "ci_watch",
+                "script",
+                "CI Watch",
+                script_path=profile.command("wait_ci"),
+            )
+        )
         nodes.append(agent_node("ci_monitor", "Monitor CI", ci))
     if profile.capability("managed_worktrees"):
         nodes.append(
@@ -501,7 +509,7 @@ def build_delivery_workflow(
                 source="verification_dispatch",
                 transition="fanout_verify",
                 target="spec_review",
-                prompt=spec_review_prompt(),
+                prompt=spec_review_prompt(profile),
                 transition_description=(
                     "Run deterministic verification and independent read-only reviews."
                 ),
@@ -789,7 +797,7 @@ def build_delivery_workflow(
 
     if profile.capability("pull_requests"):
         created_target = (
-            "ci_monitor" if profile.capability("ci_monitoring") else "waiting_pr"
+            "ci_watch" if profile.capability("ci_monitoring") else "waiting_pr"
         )
         edges.extend(
             [
@@ -799,8 +807,8 @@ def build_delivery_workflow(
                     transition="monitor_ci",
                     target=created_target,
                     prompt=(
-                        ci_prompt(profile)
-                        if created_target == "ci_monitor"
+                        None
+                        if created_target == "ci_watch"
                         else waiting_pr_prompt(profile)
                     ),
                     transition_description=(
@@ -848,6 +856,60 @@ def build_delivery_workflow(
             edges.extend(
                 [
                     EdgeSpec(
+                        key="ci_watch_waiting_pr",
+                        source="ci_watch",
+                        transition="passed",
+                        target="waiting_pr",
+                        prompt=waiting_pr_prompt(profile),
+                        transition_description=(
+                            "The deterministic watcher confirmed terminal "
+                            "green CI; classify merge readiness once."
+                        ),
+                        parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_STRATEGY,
+                            CI_REPORT,
+                        ),
+                    ),
+                    EdgeSpec(
+                        key="ci_watch_diagnose",
+                        source="ci_watch",
+                        transition="failed",
+                        target="ci_monitor",
+                        prompt=ci_prompt(profile),
+                        transition_description=(
+                            "CI reached a failed, cancelled, empty, or "
+                            "infrastructure-error state; classify it once."
+                        ),
+                        parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_STRATEGY,
+                            CI_REPORT,
+                        ),
+                    ),
+                    EdgeSpec(
+                        key="ci_watch_merged",
+                        source="ci_watch",
+                        transition="pr_merged",
+                        target=merged_target,
+                        prompt=merged_prompt,
+                        requires_approval=package_publish,
+                        transition_description=(
+                            "The pull request merged while deterministic CI "
+                            "watching was active."
+                        ),
+                        parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_REPORT,
+                        ),
+                    ),
+                    EdgeSpec(
                         key="ci_monitor_waiting_pr",
                         source="ci_monitor",
                         transition="waiting_pr",
@@ -862,6 +924,22 @@ def build_delivery_workflow(
                             BRANCH_NAME,
                             MERGE_STRATEGY,
                             CI_REPORT,
+                        ),
+                    ),
+                    EdgeSpec(
+                        key="ci_monitor_watch",
+                        source="ci_monitor",
+                        transition="watch_ci",
+                        target="ci_watch",
+                        transition_description=(
+                            "A bounded infrastructure retry or refreshed CI "
+                            "run is ready for deterministic watching."
+                        ),
+                        parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_STRATEGY,
                         ),
                     ),
                     EdgeSpec(
@@ -898,6 +976,17 @@ def build_delivery_workflow(
                     recovery_edge(
                         "ci_monitor",
                         context=non_writer_recovery_context,
+                        extra_parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_STRATEGY,
+                            CI_REPORT,
+                        ),
+                        extra_prompt=(
+                            "Preserve the exact PR, branch, merge strategy, "
+                            "and terminal CI report."
+                        ),
                     ),
                 ]
             )
@@ -1048,12 +1137,10 @@ def build_delivery_workflow(
                     key="waiting_pr_ci_monitor",
                     source="waiting_pr",
                     transition="ci_required",
-                    target="ci_monitor",
-                    context="new_session",
-                    prompt=ci_prompt(profile),
+                    target="ci_watch",
                     transition_description=(
-                        "The PR head changed or required checks restarted; "
-                        "monitor the new exact CI state."
+                        "The PR head changed or checks restarted; wait "
+                        "deterministically for terminal CI state."
                     ),
                     parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_STRATEGY),
                 )
@@ -1428,8 +1515,32 @@ def procedure_instruction(profile: ProjectProfile, key: str) -> str:
     return "Follow the project contract and repository instructions."
 
 
+def context_instruction(
+    profile: ProjectProfile,
+    manifest_key: str,
+    node_key: str,
+    evidence_type: str,
+) -> str:
+    manifest = profile.context_manifest(manifest_key)
+    return f"""Start with `{manifest}`. It is this node's context budget:
+read its required sources, load conditional sources only when their trigger
+matches the task, and do not preload files it excludes.
+
+Before every workflow transition, append one non-empty event to the task's
+append-only evidence ledger with `{profile.command("evidence")} append --task
+{{{{.TaskShortId}}}} --workspace <workspace>`. Use `node_key` `{node_key}`,
+`evidence_type` `{evidence_type}`, the manifest path, and the exact instruction
+files actually read. Preserve duplicate file reads in `files_read` so the
+helper can measure them. Record repeated questions and verification loops;
+use JSON null for model-call or compaction counts when Kent does not expose
+them to this session. Never put secrets, raw authenticated state, or broad logs
+in the ledger."""
+
+
 def branch_identity_resolution_prompt(profile: ProjectProfile) -> str:
     return f"""Resolve the deterministic branch-identity blocker before Implement.
+
+{context_instruction(profile, "delivery", "branch_identity_resolution", "delivery")}
 
 Project branch policy: `{profile.branch_identity_policy()}`.
 Reported blocker: {{{{.Params.blocker_reason}}}}
@@ -1564,8 +1675,7 @@ an explicit confirmation request. Do not choose `implement` in that Plan run."""
 
     return f"""Plan {{{{.TaskShortId}}}}: {{{{.TaskTitle}}}}
 
-Read .kent/project-contract.md, .kent/workflow-profile.toml, and repository
-instructions first.
+{context_instruction(profile, "plan", "plan", "plan")}
 
 {work_kind_plan_instruction(profile)}
 
@@ -1616,9 +1726,9 @@ verifiable; the next step runs in another fresh writer session."""
 
     return f"""Implement {{{{.TaskShortId}}}}: {{{{.TaskTitle}}}}
 
-Read .kent/project-contract.md, .kent/workflow-profile.toml, repository
-instructions, and the plan at {{{{.Params.plan_path}}}}. Workspace:
-{{{{.Params.workspace_path}}}}.
+{context_instruction(profile, "implement", "implement", "implementation")}
+
+Plan: {{{{.Params.plan_path}}}}. Workspace: {{{{.Params.workspace_path}}}}.
 
 {work_kind_implement_instruction(profile)}
 
@@ -1686,8 +1796,9 @@ and focused checks."""
 
     return f"""Apply task-scoped fixes for {{{{.TaskShortId}}}}.
 
-Read .kent/project-contract.md and repository instructions first. Workspace:
-{{{{.Params.workspace_path}}}}. Findings:
+{context_instruction(profile, "implement", "fix", "implementation")}
+
+Workspace: {{{{.Params.workspace_path}}}}. Findings:
 {{{{.Params.fix_context}}}}
 
 {procedure_instruction(profile, "fix")}
@@ -1737,7 +1848,9 @@ def standards_review_prompt(profile: ProjectProfile) -> str:
     )
     prompt = """Run an independent read-only repository standards review.
 
-Read AGENTS.md and .kent/project-contract.md first. Workspace:
+__CONTEXT__
+
+Workspace:
 {{.Params.workspace_path}}. Review context:
 {{.Params.review_context}}
 
@@ -1772,16 +1885,27 @@ repository-policy contradiction; never route baseline-wide cleanup to Fix.
 Complete only with `reported`. Provide `standards_status` as exactly `passed`,
 `needs_changes`, or `blocked`, plus `__REPORT_KEY__` with evidence and
 path-specific findings."""
-    return prompt.replace("__REPORT_KEY__", report_key)
+    return (
+        prompt.replace("__REPORT_KEY__", report_key)
+        .replace(
+            "__CONTEXT__",
+            context_instruction(
+                profile,
+                "review",
+                "standards_review",
+                "review",
+            ),
+        )
+    )
 
 
-def spec_review_prompt() -> str:
-    return """Run an independent read-only specification review.
+def spec_review_prompt(profile: ProjectProfile) -> str:
+    return f"""Run an independent read-only specification review.
 
-Read the task body, plan/spec artifacts named in the review context, and
-.kent/project-contract.md. Workspace:
-{{.Params.workspace_path}}. Review context:
-{{.Params.review_context}}
+{context_instruction(profile, "review", "spec_review", "review")}
+
+Workspace: {{{{.Params.workspace_path}}}}. Review context:
+{{{{.Params.review_context}}}}
 
 Check acceptance criteria, product behavior, edge cases, and scope fidelity
 independently from repository standards. Do not edit files. Findings are data
@@ -1825,6 +1949,8 @@ def verification_gate_prompt(profile: ProjectProfile) -> str:
     )
     smoke_decision = smoke_decision_instruction(profile)
     return f"""Evaluate the joined verification reports without editing files.
+
+{context_instruction(profile, "review", "verification_gate", "review")}
 
 Workspace: {{{{.Params.verification_dispatch_fanout_verify.workspace_path}}}}
 Review context: {{{{.Params.verification_dispatch_fanout_verify.review_context}}}}
@@ -1871,8 +1997,9 @@ def smoke_prompt(profile: ProjectProfile) -> str:
     checkpoint = checkpoint_instruction(profile, "smoke")
     return f"""Run focused smoke testing for {{{{.TaskShortId}}}}.
 
-Read .kent/project-contract.md and repository instructions first. Workspace:
-{{{{.Params.workspace_path}}}}. Review context:
+{context_instruction(profile, "smoke", "smoke", "smoke")}
+
+Workspace: {{{{.Params.workspace_path}}}}. Review context:
 {{{{.Params.review_context}}}}
 Smoke rationale: {{{{.Params.smoke_rationale}}}}
 Required scope: {{{{.Params.smoke_scope}}}}
@@ -1900,9 +2027,9 @@ def compliance_prompt(profile: ProjectProfile) -> str:
     evidence_chain = ", ".join(completed_reviews)
     return f"""Run the final read-only delivery compliance review for {{{{.TaskShortId}}}}.
 
-Read all applicable AGENTS.md files, .kent/project-contract.md, the task body,
-human-authored task comments, and the plan/spec sources named in the review
-context. Workspace: {{{{.Params.workspace_path}}}}. Final review context:
+{context_instruction(profile, "review", "compliance", "review")}
+
+Workspace: {{{{.Params.workspace_path}}}}. Final review context:
 {{{{.Params.review_context}}}}
 
 {procedure_instruction(profile, "compliance")}
@@ -1946,6 +2073,8 @@ external decisions and provide `workspace_path`, `review_context`, and
 def compliance_recovery_prompt(profile: ProjectProfile) -> str:
     return f"""Resume the final read-only delivery compliance review.
 
+{context_instruction(profile, "review", "compliance", "review")}
+
 Workspace: {{{{.Params.workspace_path}}}}
 Final review context: {{{{.Params.review_context}}}}
 Previous blocker: {{{{.Params.blocker_reason}}}}
@@ -1969,8 +2098,9 @@ only for explicit cancellation and provide `closure_reason`."""
 def evidence_repair_prompt(profile: ProjectProfile) -> str:
     return f"""Repair packaging-only workflow evidence for {{{{.TaskShortId}}}}.
 
-Read .kent/project-contract.md and repository instructions first. Workspace:
-{{{{.Params.workspace_path}}}}. Final review context:
+{context_instruction(profile, "implement", "evidence_repair", "implementation")}
+
+Workspace: {{{{.Params.workspace_path}}}}. Final review context:
 {{{{.Params.review_context}}}}
 Allowed evidence repair:
 {{{{.Params.evidence_context}}}}
@@ -2005,6 +2135,8 @@ recovery. Choose `wont_do` only for explicit cancellation and provide
 def compliance_recheck_prompt(profile: ProjectProfile) -> str:
     return f"""Recheck final Compliance after packaging-only evidence repair.
 
+{context_instruction(profile, "review", "compliance", "review")}
+
 Workspace: {{{{.Params.workspace_path}}}}
 Updated review context: {{{{.Params.review_context}}}}
 
@@ -2037,8 +2169,9 @@ def prepare_pr_prompt(profile: ProjectProfile) -> str:
     merge_policy = profile.pr_merge_strategy()
     return f"""Prepare delivery for {{{{.TaskShortId}}}}.
 
-Read .kent/project-contract.md and repository instructions first. Workspace:
-{{{{.Params.workspace_path}}}}. Review context:
+{context_instruction(profile, "delivery", "prepare_pr", "delivery")}
+
+Workspace: {{{{.Params.workspace_path}}}}. Review context:
 {{{{.Params.review_context}}}}
 {compliance_context}
 
@@ -2113,22 +2246,20 @@ recoverable PR/branch issues; this path also requires approval. Use
 def ci_prompt(profile: ProjectProfile) -> str:
     return f"""Monitor CI for {{{{.TaskShortId}}}} without editing files.
 
+{context_instruction(profile, "delivery", "ci_monitor", "delivery")}
+
 PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
+Deterministic CI report: {{{{.Params.ci_report}}}}
 
 {procedure_instruction(profile, "ci")}
 
-Use the project source-control adapter. Never merge or push. Pending, queued, or
-in-progress checks are not workflow outcomes and must not produce
-`needs_user_action`. Resolve the exact PR/run identity, then use one blocking
-first-party watcher instead of one model turn per poll. On GitHub prefer
-`gh pr checks <pr> --watch --interval 30`; when monitoring an exact Actions run,
-use `gh run watch <run-id> --exit-status --interval 30`. After the watcher exits,
-re-read authoritative PR, check, and run state before choosing a transition.
-"Bounded" monitoring means bounded identity, interval, and log scope, not an
-arbitrary wall-clock cutoff while CI is still running.
+Use the project source-control adapter. Never merge or push. The deterministic
+CI Watch node already waited for terminal state; do not start another polling
+loop or ask the user to approve one. Re-read only the exact PR/run/job metadata
+and bounded failure logs required to classify its report.
 
 This workflow authorizes a bounded retry of an exact GitHub Actions job only
 when first-party metadata and bounded logs prove infrastructure cancellation:
@@ -2139,9 +2270,11 @@ SHA are unchanged, and the run was not user-cancelled or superseded. Pin the
 run attempt and job ID, then use
 `gh run rerun <run-id> --job <job-id>` so genuine failed siblings are not
 repeated. Allow at most two automatic retries per logical job. Wait for each
-retry, re-read authoritative state, and include the attempt ledger in
-`ci_report`. Never retry a genuine or ambiguous failure, and do not ask the
-user merely to initiate an eligible infrastructure retry.
+retry through `watch_ci`: provide `workspace_path`, `pr_url`, `branch_name`,
+and `merge_strategy`, then let the deterministic watcher wait. Include the
+attempt ledger in the next `ci_report`. Never retry a genuine or ambiguous
+failure, and do not ask the user merely to initiate an eligible infrastructure
+retry.
 
 Query authoritative PR merge state before classifying any failed or late check.
 If the PR is already merged, never route the merged task branch to Fix. Complete
@@ -2173,6 +2306,8 @@ def waiting_pr_prompt(profile: ProjectProfile) -> str:
 method in this node before starting another deterministic merge watch."""
     )
     return f"""Check delivery state for {{{{.TaskShortId}}}}.
+
+{context_instruction(profile, "delivery", "waiting_pr", "delivery")}
 
 PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
@@ -2278,6 +2413,8 @@ describing performed and skipped actions. Use `needs_user_action` with
 `blocker_reason` when safe cleanup requires a human decision."""
     return f"""Perform conservative cleanup for {{{{.TaskShortId}}}}.
 
+{context_instruction(profile, "delivery", "cleanup", "delivery")}
+
 {workspace}
 {context}
 
@@ -2292,6 +2429,8 @@ ambiguous state, or content not proven recoverable.
 def package_publish_prompt(profile: ProjectProfile) -> str:
     return f"""Publish the package for {{{{.TaskShortId}}}} only after this
 incoming approval.
+
+{context_instruction(profile, "delivery", "publish_package", "delivery")}
 
 This dedicated node is the separate explicit user-approved release procedure
 required by the project contract. Approval authorizes only the exact package
@@ -2353,6 +2492,8 @@ def package_publish_recovery_prompt(profile: ProjectProfile) -> str:
     return f"""Resume the approval-gated package publication for
 {{{{.TaskShortId}}}}.
 
+{context_instruction(profile, "delivery", "publish_package", "delivery")}
+
 Previous blocker: {{{{.Params.blocker_reason}}}}
 Workspace: {{{{.Params.workspace_path}}}}
 PR: {{{{.Params.pr_url}}}}
@@ -2390,6 +2531,8 @@ def published_cleanup_prompt(profile: ProjectProfile) -> str:
         return f"""Perform conservative cleanup for {{{{.TaskShortId}}}} only
 after successful package publication.
 
+{context_instruction(profile, "delivery", "cleanup", "delivery")}
+
 Workspace: {{{{.Params.workspace_path}}}}
 PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
@@ -2409,6 +2552,8 @@ human decision."""
 
     return f"""Perform conservative cleanup for {{{{.TaskShortId}}}} only after
 successful package publication.
+
+{context_instruction(profile, "delivery", "cleanup", "delivery")}
 
 Workspace: {{{{.Params.workspace_path}}}}
 PR: {{{{.Params.pr_url}}}}
@@ -2437,6 +2582,8 @@ decision."""
 
 def janitor_recovery_prompt(profile: ProjectProfile) -> str:
     return f"""Recover the task cleanup after deterministic Janitor failure.
+
+{context_instruction(profile, "delivery", "cleanup", "delivery")}
 
 Previous cleanup report:
 {{{{.Params.cleanup_report}}}}
@@ -2473,8 +2620,9 @@ issues. Choose `verify` only when no recovery slice remains, and provide
 
     return f"""Resolve an approved PR or branch recovery issue.
 
-Read .kent/project-contract.md, repository instructions, and latest task
-comments first. Workspace: {{{{.Params.workspace_path}}}}.
+{context_instruction(profile, "implement", "fix", "implementation")}
+
+Workspace: {{{{.Params.workspace_path}}}}.
 Recovery issue: {{{{.Params.blocker_reason}}}}
 
 {procedure_instruction(profile, "fix")}
@@ -2508,8 +2656,9 @@ issues. Choose `verify` only when no PR-feedback slice remains, and provide
 
     return f"""Fix task-scoped PR feedback.
 
-Read .kent/project-contract.md, repository instructions, and latest task
-comments first. Workspace: {{{{.Params.workspace_path}}}}.
+{context_instruction(profile, "implement", "fix", "implementation")}
+
+Workspace: {{{{.Params.workspace_path}}}}.
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}.
 PR report: {{{{.Params.pr_report}}}}
 

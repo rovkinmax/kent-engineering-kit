@@ -68,6 +68,21 @@ second_token="$(printf '%s\n' "$selection" | sed -n 's/^token=//p')"
 "$adapter" release emulator-5554 "$first_token"
 "$adapter" release emulator-5556 "$second_token"
 
+resume_token="$("$adapter" acquire emulator-5559 0 7200)"
+[[ "$("$adapter" resume emulator-5559 "$resume_token")" == "$resume_token" ]]
+[[ "$("$adapter" status emulator-5559 | head -1)" == "locked" ]]
+set +e
+"$adapter" resume emulator-5559 wrong-token >/dev/null 2>&1
+resume_mismatch_status=$?
+set -e
+[[ "$resume_mismatch_status" -eq 75 ]]
+"$adapter" release emulator-5559 "$resume_token"
+
+released_resume_token="resume-after-release-token"
+[[ "$("$adapter" resume emulator-5561 "$released_resume_token")" == "$released_resume_token" ]]
+[[ "$("$adapter" status emulator-5561 | head -1)" == "locked" ]]
+"$adapter" release emulator-5561 "$released_resume_token"
+
 contention_dir="$temporary/contention"
 mkdir -p "$contention_dir"
 for contender in {1..8}; do

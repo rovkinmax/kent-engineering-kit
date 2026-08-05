@@ -127,3 +127,8 @@ requires the normal authorization for that external action.
 - When the user grants an exception during a task, record its exact scope in a
   durable task comment before continuing so compaction and recovery sessions do
   not ask again.
+- A recovery session reads the checkpoint before acquisition. If its recorded
+  token still owns the exact resource, use the lock adapter's `resume`
+  operation to refresh the lease with the same token and current owner
+  metadata. A different live token remains busy and is never reclaimed as the
+  current task's lease.

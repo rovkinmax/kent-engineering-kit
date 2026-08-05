@@ -48,13 +48,20 @@ WORK_KIND_PROCEDURES = (
     ".kent/commands/dependency-update.md",
     ".kent/commands/test-coverage.md",
 )
+CONTEXT_MANIFESTS = (
+    ".kent/context/plan.md",
+    ".kent/context/implement.md",
+    ".kent/context/review.md",
+    ".kent/context/smoke.md",
+    ".kent/context/delivery.md",
+)
 
 
 def create_work_kind_procedures(root: Path) -> None:
-    for configured_path in WORK_KIND_PROCEDURES:
+    for configured_path in WORK_KIND_PROCEDURES + CONTEXT_MANIFESTS:
         path = root / configured_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("# Test procedure\n")
+        path.write_text("# Test context\n")
 
 
 class WorkflowKitTest(unittest.TestCase):
@@ -96,14 +103,20 @@ class WorkflowKitTest(unittest.TestCase):
             "`closure_reason`",
             "do not paste raw review reports",
             "do not present task-scoped code fixes",
-            "Missing agent-produced bookkeeping or evidence",
-            "A missing operational date is not automatically a product decision",
+            "Missing agent-produced bookkeeping",
+            "ordinary missing operational date",
             "`kent task resume` confirms durable requeueing",
-            "Retry only the exact cancelled job",
-            "custom verification wrappers",
-            "`Fixes #51`",
         ):
             self.assertIn(expected, contract)
+
+        workflow_contract = (
+            REPO_ROOT / "contracts" / "workflow-contract.md"
+        ).read_text()
+        for expected in (
+            "Retry only that\n  job",
+            "`Fixes #N`",
+        ):
+            self.assertIn(expected, workflow_contract)
 
         release_manager = (
             REPO_ROOT / "agents" / "release-manager.md"
@@ -637,16 +650,20 @@ class WorkflowKitTest(unittest.TestCase):
         by_key = {edge.key: edge for edge in spec.edges}
 
         self.assertEqual(
-            by_key["prepare_pr_ci_monitor"].transition,
+            by_key["prepare_pr_ci_watch"].transition,
             "prepare_pr_monitor_ci",
         )
         self.assertEqual(
             tuple(
                 parameter.key
-                for parameter in by_key["prepare_pr_ci_monitor"].parameters
+                for parameter in by_key["prepare_pr_ci_watch"].parameters
             ),
             ("workspace_path", "pr_url", "branch_name", "merge_strategy"),
         )
+        self.assertIsNone(by_key["prepare_pr_ci_watch"].prompt)
+        self.assertEqual(by_key["ci_watch_waiting_pr"].target, "waiting_pr")
+        self.assertEqual(by_key["ci_watch_diagnose"].target, "ci_monitor")
+        self.assertEqual(by_key["ci_watch_merged"].target, "cleanup")
         self.assertEqual(
             tuple(parameter.key for parameter in by_key["prepare_pr_no_pr"].parameters),
             ("pr_report",),
@@ -688,28 +705,28 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn(
             "never route the merged task branch to Fix",
-            by_key["prepare_pr_ci_monitor"].prompt,
+            by_key["ci_watch_diagnose"].prompt,
         )
         self.assertIn(
             "task-differential evidence",
-            by_key["prepare_pr_ci_monitor"].prompt,
+            by_key["ci_watch_diagnose"].prompt,
         )
         self.assertIn(
-            "gh pr checks <pr> --watch --interval 30",
-            by_key["prepare_pr_ci_monitor"].prompt,
+            "deterministic\nCI Watch node already waited",
+            by_key["ci_watch_diagnose"].prompt,
         )
         self.assertIn(
             "Never use `ci_monitor_needs_user_action` merely because CI is still running",
-            by_key["prepare_pr_ci_monitor"].prompt,
+            by_key["ci_watch_diagnose"].prompt,
         )
         for expected in (
             "The runner has received a shutdown signal",
             "The operation was canceled",
             "gh run rerun <run-id> --job <job-id>",
             "at most two automatic retries",
-            "eligible infrastructure retry",
+            "eligible infrastructure",
         ):
-            self.assertIn(expected, by_key["prepare_pr_ci_monitor"].prompt)
+            self.assertIn(expected, by_key["ci_watch_diagnose"].prompt)
         self.assertIn("Fixes #N", by_key["compliance_prepare_pr"].prompt)
         self.assertEqual(
             by_key["fix_pr_merged_cleanup"].transition,
@@ -771,7 +788,7 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertEqual(
             by_key["waiting_pr_ci_monitor"].target,
-            "ci_monitor",
+            "ci_watch",
         )
         self.assertIn(
             "Merely waiting for review or merge is not a blocker",
@@ -789,7 +806,7 @@ class WorkflowKitTest(unittest.TestCase):
             by_key[key].prompt or ""
             for key in (
                 "compliance_prepare_pr",
-                "prepare_pr_ci_monitor",
+                "ci_watch_diagnose",
                 "ci_monitor_waiting_pr",
                 "waiting_pr_needs_user_action",
                 "waiting_pr_fix",
@@ -832,6 +849,7 @@ class WorkflowKitTest(unittest.TestCase):
 
         self.assertEqual(roles["publish_package"], "release-manager")
         for key in (
+            "ci_watch_merged",
             "ci_monitor_merged",
             "fix_pr_merged_cleanup",
             "waiting_pr_cleanup",

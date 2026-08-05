@@ -10,6 +10,8 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT = REPO_ROOT / "templates" / "project" / "workflow-checkpoint"
+EVIDENCE = REPO_ROOT / "templates" / "project" / "workflow-evidence-ledger"
+CI_WATCH = REPO_ROOT / "templates" / "project" / "workflow-wait-github-ci"
 PR_WATCH = REPO_ROOT / "templates" / "project" / "workflow-wait-github-pr"
 JANITOR = REPO_ROOT / "templates" / "project" / "workflow-task-janitor"
 
@@ -156,6 +158,279 @@ class WorkflowCheckpointTest(GitRepositoryTest):
         )
         self.assertEqual(result.returncode, 1)
         self.assertEqual(list(external.iterdir()), [])
+
+
+class WorkflowEvidenceLedgerTest(GitRepositoryTest):
+    def append(
+        self,
+        root: Path,
+        *,
+        summary: str,
+        files_read: list[str],
+    ) -> dict[str, object]:
+        result = subprocess.run(
+            [
+                str(EVIDENCE),
+                "append",
+                "--task",
+                "TASK-4",
+                "--workspace",
+                str(root),
+            ],
+            input=json.dumps(
+                {
+                    "node_key": "implement",
+                    "evidence_type": "implementation",
+                    "summary": summary,
+                    "artifacts": [".todo/task/plan.md"],
+                    "checks": ["focused test passed"],
+                    "decisions": [],
+                    "context": {
+                        "manifest_path": ".kent/context/implement.md",
+                        "files_read": files_read,
+                        "model_calls": None,
+                        "compaction_count": None,
+                        "repeated_questions": 0,
+                        "verification_loops": 1,
+                    },
+                }
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_ledger_is_append_only_hash_chained_and_measures_context(self) -> None:
+        root = self.create_repository()
+        (root / ".kent" / "context").mkdir()
+        (root / ".kent" / "context" / "implement.md").write_text("manifest\n")
+        (root / "AGENTS.md").write_text("rules\n")
+        (root / ".todo" / "task").mkdir(parents=True)
+        (root / ".todo" / "task" / "plan.md").write_text("plan\n")
+        self.run_git(root, "add", ".")
+        self.run_git(root, "commit", "-q", "-m", "Add context")
+
+        first = self.append(
+            root,
+            summary="Implemented one slice.",
+            files_read=["AGENTS.md", "AGENTS.md"],
+        )
+        second = self.append(
+            root,
+            summary="Verified the slice.",
+            files_read=["AGENTS.md"],
+        )
+        self.assertEqual(first["sequence"], 1)
+        self.assertEqual(second["sequence"], 2)
+
+        ledger = (
+            root
+            / ".kent"
+            / "runtime"
+            / "TASK-4"
+            / "evidence-ledger.jsonl"
+        )
+        entries = [json.loads(line) for line in ledger.read_text().splitlines()]
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]["context"]["repeated_file_count"], 1)
+        self.assertEqual(
+            entries[1]["previous_hash"],
+            entries[0]["event_hash"],
+        )
+
+        summary = subprocess.run(
+            [
+                str(EVIDENCE),
+                "summary",
+                "--task",
+                "TASK-4",
+                "--workspace",
+                str(root),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(summary.returncode, 0, summary.stderr)
+        metrics = json.loads(summary.stdout)
+        self.assertEqual(metrics["entry_count"], 2)
+        self.assertEqual(metrics["repeated_file_count"], 1)
+        self.assertEqual(metrics["verification_loops"], 2)
+        self.assertEqual(metrics["unknown_model_call_entries"], 2)
+
+    def test_ledger_detects_history_rewrite(self) -> None:
+        root = self.create_repository()
+        (root / ".kent" / "context").mkdir()
+        (root / ".kent" / "context" / "implement.md").write_text("manifest\n")
+        (root / "AGENTS.md").write_text("rules\n")
+        self.run_git(root, "add", ".")
+        self.run_git(root, "commit", "-q", "-m", "Add context")
+        self.append(
+            root,
+            summary="Original evidence.",
+            files_read=["AGENTS.md"],
+        )
+        ledger = (
+            root
+            / ".kent"
+            / "runtime"
+            / "TASK-4"
+            / "evidence-ledger.jsonl"
+        )
+        entry = json.loads(ledger.read_text())
+        entry["summary"] = "Rewritten evidence."
+        ledger.write_text(json.dumps(entry) + "\n")
+
+        validate = subprocess.run(
+            [
+                str(EVIDENCE),
+                "validate",
+                "--task",
+                "TASK-4",
+                "--workspace",
+                str(root),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(validate.returncode, 1)
+        self.assertIn("invalid hash", validate.stderr)
+
+
+class GitHubCiWatchTest(GitRepositoryTest):
+    def watch(
+        self,
+        root: Path,
+        *,
+        pr_state: dict[str, object],
+        checks: list[dict[str, object]],
+        watch_exit: int = 0,
+    ) -> dict[str, object]:
+        (root / "pr-state.json").write_text(json.dumps(pr_state))
+        (root / "checks.json").write_text(json.dumps(checks))
+        fake_gh = root / "gh"
+        fake_gh.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1 $2" = "pr view" ]; then\n'
+            '  cat "$KENT_TEST_PR_STATE"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1 $2" = "pr checks" ]; then\n'
+            '  case " $* " in\n'
+            '    *" --watch "*) exit "$KENT_TEST_WATCH_EXIT" ;;\n'
+            "  esac\n"
+            '  cat "$KENT_TEST_CHECKS"\n'
+            '  exit "$KENT_TEST_WATCH_EXIT"\n'
+            "fi\n"
+            "exit 2\n"
+        )
+        fake_gh.chmod(0o755)
+        result = subprocess.run(
+            [str(CI_WATCH)],
+            cwd=root,
+            input=json.dumps(
+                {
+                    "workspace_path": str(root),
+                    "pr_url": "https://github.com/example/repo/pull/1",
+                    "branch_name": "TASK-5",
+                    "merge_strategy": "rebase",
+                }
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "PATH": "{}:{}".format(root, os.environ.get("PATH", "")),
+                "KENT_TEST_PR_STATE": str(root / "pr-state.json"),
+                "KENT_TEST_CHECKS": str(root / "checks.json"),
+                "KENT_TEST_WATCH_EXIT": str(watch_exit),
+                "KENT_CI_WATCH_TEST_MODE": "1",
+                "KENT_CI_WATCH_INTERVAL_SECONDS": "0",
+                "KENT_CI_WATCH_MAX_POLLS": "1",
+            },
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_green_checks_advance_without_agent_polling(self) -> None:
+        root = self.create_repository()
+        result = self.watch(
+            root,
+            pr_state={
+                "state": "OPEN",
+                "mergedAt": None,
+                "mergeCommit": None,
+                "headRefName": "TASK-5",
+                "headRefOid": "head",
+                "baseRefName": "main",
+                "baseRefOid": "base",
+                "url": "https://github.com/example/repo/pull/1",
+            },
+            checks=[
+                {
+                    "name": "unit",
+                    "workflow": "PR",
+                    "bucket": "pass",
+                    "state": "SUCCESS",
+                    "link": "https://github.com/example/repo/actions/runs/1",
+                }
+            ],
+        )
+        self.assertEqual(result["transition"], "ci_watch_passed")
+        self.assertIn("all_checks_terminal_green", result["ci_report"])
+
+    def test_failed_checks_wake_diagnosis_agent_once(self) -> None:
+        root = self.create_repository()
+        result = self.watch(
+            root,
+            pr_state={
+                "state": "OPEN",
+                "headRefName": "TASK-5",
+                "headRefOid": "head",
+                "baseRefName": "main",
+                "baseRefOid": "base",
+                "url": "https://github.com/example/repo/pull/1",
+            },
+            checks=[
+                {
+                    "name": "detekt",
+                    "workflow": "PR",
+                    "bucket": "fail",
+                    "state": "FAILURE",
+                    "link": "https://github.com/example/repo/actions/runs/2",
+                }
+            ],
+            watch_exit=1,
+        )
+        self.assertEqual(result["transition"], "ci_watch_failed")
+        self.assertIn("terminal_check_failure", result["ci_report"])
+
+    def test_merged_pr_skips_obsolete_ci_diagnosis(self) -> None:
+        root = self.create_repository()
+        result = self.watch(
+            root,
+            pr_state={
+                "state": "MERGED",
+                "mergedAt": "2026-08-05T00:00:00Z",
+                "mergeCommit": {"oid": "merged"},
+                "headRefName": "TASK-5",
+                "headRefOid": "head",
+                "baseRefName": "main",
+                "baseRefOid": "base",
+                "url": "https://github.com/example/repo/pull/1",
+            },
+            checks=[],
+        )
+        self.assertEqual(result["transition"], "ci_watch_pr_merged")
+        self.assertIn("merged", result["merge_report"])
 
 
 class GitHubPrWatchTest(GitRepositoryTest):

@@ -35,9 +35,18 @@ spec_review = true
 dispatch = ".kent/scripts/workflow-verification-dispatch"
 verify = ".kent/scripts/workflow-verify"
 checkpoint = ".kent/scripts/workflow-checkpoint"
+evidence = ".kent/scripts/workflow-evidence-ledger"
+wait_ci = ".kent/scripts/workflow-wait-github-ci"
 wait_pr = ".kent/scripts/workflow-wait-github-pr"
 janitor = ".kent/scripts/workflow-task-janitor"
 smoke = ""
+
+[context_manifests]
+plan = ".kent/context/plan.md"
+implement = ".kent/context/implement.md"
+review = ".kent/context/review.md"
+smoke = ".kent/context/smoke.md"
+delivery = ".kent/context/delivery.md"
 
 [procedures]
 fix = ""

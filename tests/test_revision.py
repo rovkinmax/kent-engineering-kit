@@ -26,6 +26,13 @@ WORK_KIND_PROCEDURES = (
     ".kent/commands/dependency-update.md",
     ".kent/commands/test-coverage.md",
 )
+CONTEXT_MANIFESTS = (
+    ".kent/context/plan.md",
+    ".kent/context/implement.md",
+    ".kent/context/review.md",
+    ".kent/context/smoke.md",
+    ".kent/context/delivery.md",
+)
 
 
 class RevisionPreflightTest(unittest.TestCase):
@@ -43,15 +50,17 @@ class RevisionPreflightTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         (kent / "workflow-profile.toml").write_text(EXAMPLE_PROFILE.read_text())
         (kent / "project-contract.md").write_text("# Project contract\n")
-        for configured_path in WORK_KIND_PROCEDURES:
+        for configured_path in WORK_KIND_PROCEDURES + CONTEXT_MANIFESTS:
             path = root / configured_path
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# Test procedure\n")
         for name in (
             "workflow-checkpoint",
+            "workflow-evidence-ledger",
             "workflow-task-janitor",
             "workflow-verification-dispatch",
             "workflow-verify",
+            "workflow-wait-github-ci",
             "workflow-wait-github-pr",
         ):
             path = scripts / name
@@ -71,12 +80,15 @@ class RevisionPreflightTest(unittest.TestCase):
             {
                 ".kent/project-contract.md",
                 ".kent/scripts/workflow-checkpoint",
+                ".kent/scripts/workflow-evidence-ledger",
                 ".kent/scripts/workflow-task-janitor",
                 ".kent/scripts/workflow-verification-dispatch",
                 ".kent/scripts/workflow-verify",
+                ".kent/scripts/workflow-wait-github-ci",
                 ".kent/scripts/workflow-wait-github-pr",
                 ".kent/workflow-profile.toml",
                 *WORK_KIND_PROCEDURES,
+                *CONTEXT_MANIFESTS,
             },
         )
 

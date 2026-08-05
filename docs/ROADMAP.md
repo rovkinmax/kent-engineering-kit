@@ -31,6 +31,24 @@ project default in Appsome and Puber. Obsolete infrastructure experiments were
 removed after promotion; legacy Feature Delivery remains linked because it
 owns real task history and provides rollback.
 
+Context Diet v1 iterations A and B are implemented in the current candidate
+line:
+
+- global AGENTS retains only cross-project authority, safety, session,
+  worktree, and context invariants;
+- project AGENTS files are compact indexes plus repository gotchas;
+- node context manifests gate Plan, Implement/Fix, Review, Smoke, and Delivery
+  reads;
+- task evidence is append-only and records project instruction bytes,
+  duplicate reads, repeated questions, verification loops, and nullable Kent
+  telemetry;
+- mobile leases can resume with the checkpoint's existing token instead of
+  self-blocking.
+
+Iteration C remains deferred until real-task metrics exist: experiment with
+Kent compaction thresholds and other global config one dimension at a time.
+That iteration requires a Kent restart; A and B do not.
+
 - Keep `Engineering Canary` and `Engineering Smoke Lab` generation available
   for bounded future validation without permanent project links.
 - Re-export existing workflow snapshots and verify their preserved Source HEAD

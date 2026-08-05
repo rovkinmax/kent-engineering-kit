@@ -27,6 +27,12 @@ COMMAND_TEMPLATES = {
         REPO_ROOT / "templates" / "project" / "workflow-branch-identity"
     ),
     "checkpoint": REPO_ROOT / "templates" / "project" / "workflow-checkpoint",
+    "evidence": (
+        REPO_ROOT / "templates" / "project" / "workflow-evidence-ledger"
+    ),
+    "wait_ci": (
+        REPO_ROOT / "templates" / "project" / "workflow-wait-github-ci"
+    ),
     "dispatch": (
         REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch"
     ),

@@ -41,6 +41,12 @@ the only path to a usable checkout.
 - The project adds `/.kent/runtime/` to `.gitignore`.
 - The checkpoint helper refuses to write when Git does not prove that path is
   ignored, and writes atomically inside the current repository root.
+- Append-only evidence lives beside checkpoints at
+  `.kent/runtime/<task-short-id>/evidence-ledger.jsonl`. The evidence helper
+  validates repository identity, ignored storage, project instruction paths,
+  and the hash chain before appending.
+- Checkpoints are mutable current-state snapshots. The evidence ledger is the
+  immutable slice history; neither replaces the other.
 - Task Janitor removes this runtime state only as part of safe task cleanup.
 
 ## MCP project identity

@@ -22,11 +22,15 @@ bash -n "$repo_root/templates/project/workflow-verify-report"
 python3 -m py_compile \
   "$repo_root/templates/project/workflow-branch-identity" \
   "$repo_root/templates/project/workflow-checkpoint" \
+  "$repo_root/templates/project/workflow-evidence-ledger" \
+  "$repo_root/templates/project/workflow-wait-github-ci" \
   "$repo_root/templates/project/workflow-wait-github-pr" \
   "$repo_root/templates/project/workflow-task-janitor"
 if [[ -x /usr/bin/python3 ]]; then
   /usr/bin/python3 -m py_compile \
-    "$repo_root/templates/project/workflow-branch-identity"
+    "$repo_root/templates/project/workflow-branch-identity" \
+    "$repo_root/templates/project/workflow-evidence-ledger" \
+    "$repo_root/templates/project/workflow-wait-github-ci"
 fi
 
 install_help_root="$(mktemp -d)"
@@ -52,6 +56,14 @@ rmdir "$install_help_root"
 }
 [[ -x "$repo_root/templates/project/workflow-checkpoint" ]] || {
   echo "workflow checkpoint template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/workflow-evidence-ledger" ]] || {
+  echo "workflow evidence-ledger template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/workflow-wait-github-ci" ]] || {
+  echo "GitHub CI watcher template is not executable" >&2
   exit 1
 }
 [[ -x "$repo_root/templates/project/workflow-branch-identity" ]] || {

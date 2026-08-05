@@ -134,6 +134,27 @@ device, source-control, issue-tracker, and release adapters.
 - `cleanup_mode`
 - `cleanup_session_id`
 
+## Node context manifests and evidence ledger
+
+- Every generated project declares exactly five node context manifests:
+  `plan`, `implement`, `review`, `smoke`, and `delivery`.
+- The manifest is the node's context budget. It names required sources,
+  conditionally triggered sources, and material that must not be preloaded.
+  Incoming edge prompts carry dynamic task values instead of restating project
+  documentation.
+- Agent nodes append one non-empty event before every workflow transition
+  through the profile-owned evidence command. Evidence is JSONL, hash-chained,
+  Git-ignored, and append-only. A later slice never edits an earlier event.
+- Each event records task/node identity, Git HEAD, summary, artifacts, checks,
+  decisions, exact project instruction files read, project instruction bytes,
+  repeated reads, repeated questions, and verification loops.
+- `model_calls` and `compaction_count` remain nullable until Kent exposes
+  stable session telemetry to workflow commands. Unknown values are recorded
+  as `null`, never inferred.
+- The ledger is concise metadata and evidence, not a transcript. It never
+  stores secrets, raw authenticated state, broad logs, or unredacted network
+  responses.
+
 ## Branch identity
 
 - Kent task short ID is the stable workflow/lifecycle identity. It remains the
@@ -283,6 +304,9 @@ device, source-control, issue-tracker, and release adapters.
   current Git, task, device, lock, and evidence state before skipping any work.
   A mismatch invalidates the skip decision; it does not authorize repetition of
   a recorded external mutation.
+- If the same checkpoint token still owns a Smoke resource, recovery renews
+  that lease through the adapter's resume operation instead of acquiring the
+  resource against itself.
 
 ## Final compliance
 

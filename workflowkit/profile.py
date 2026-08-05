@@ -15,6 +15,7 @@ SMOKE_POLICIES = {"disabled", "conditional", "required"}
 WRITER_SESSION_POLICIES = {"continuous", "fresh_per_slice"}
 PR_MERGE_STRATEGIES = {"auto", "merge", "squash", "rebase"}
 BRANCH_IDENTITY_POLICIES = {"task", "jira", "github_issue"}
+CONTEXT_MANIFEST_KEYS = {"plan", "implement", "review", "smoke", "delivery"}
 PACKAGE_PUBLISH_TOPOLOGY = "manual-package-publish-after-main"
 WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
@@ -56,6 +57,7 @@ class ProjectProfile:
     legacy_review_contract: bool
     commands: dict[str, str]
     procedures: dict[str, str]
+    context_manifests: dict[str, str]
     work_kinds: dict[str, WorkKind]
     adapters: dict[str, str]
     roles: dict[str, str]
@@ -134,6 +136,10 @@ class ProjectProfile:
             legacy_review_contract=legacy_review_contract,
             commands=string_table(require_table(raw, "commands"), "commands"),
             procedures=string_table(raw.get("procedures", {}), "procedures"),
+            context_manifests=string_table(
+                require_table(raw, "context_manifests"),
+                "context_manifests",
+            ),
             work_kinds=work_kind_table(require_table(raw, "work_kinds")),
             adapters=string_table(raw.get("adapters", {}), "adapters"),
             roles=string_table(require_table(raw, "roles"), "roles"),
@@ -247,6 +253,8 @@ class ProjectProfile:
             raise SpecError("profile command 'verify' is required")
         if not self.command("checkpoint"):
             raise SpecError("profile command 'checkpoint' is required")
+        if not self.command("evidence"):
+            raise SpecError("profile command 'evidence' is required")
         if branch_identity_policy != "task" and not self.command("branch_identity"):
             raise SpecError(
                 "profile command 'branch_identity' is required when "
@@ -266,6 +274,10 @@ class ProjectProfile:
                 raise SpecError(
                     "profile command 'wait_pr' is required for pull requests"
                 )
+        if self.capability("ci_monitoring") and not self.command("wait_ci"):
+            raise SpecError(
+                "profile command 'wait_ci' is required for CI monitoring"
+            )
         if self.package_publish_after_main():
             if not self.capability("pull_requests"):
                 raise SpecError(
@@ -285,6 +297,26 @@ class ProjectProfile:
                 if not publish_path.is_file():
                     raise SpecError(
                         f"publish procedure not found: {publish_path}"
+                    )
+
+        manifest_keys = set(self.context_manifests)
+        if manifest_keys != CONTEXT_MANIFEST_KEYS:
+            missing = sorted(CONTEXT_MANIFEST_KEYS - manifest_keys)
+            unknown = sorted(manifest_keys - CONTEXT_MANIFEST_KEYS)
+            raise SpecError(
+                "context_manifests must declare exactly "
+                f"{sorted(CONTEXT_MANIFEST_KEYS)}; missing={missing}, "
+                f"unknown={unknown}"
+            )
+        if check_files:
+            for key in sorted(CONTEXT_MANIFEST_KEYS):
+                manifest_path = self.resolve_project_path(
+                    self.context_manifest(key),
+                    f"context_manifests.{key}",
+                )
+                if not manifest_path.is_file():
+                    raise SpecError(
+                        f"context manifest not found: {manifest_path}"
                     )
 
         if not self.work_kinds:
@@ -379,6 +411,12 @@ class ProjectProfile:
 
     def procedure(self, key: str) -> str:
         return self.procedures.get(key, "").strip()
+
+    def context_manifest(self, key: str) -> str:
+        manifest = self.context_manifests.get(key, "").strip()
+        if not manifest:
+            raise SpecError(f"profile context manifest {key!r} is required")
+        return manifest
 
     def work_kind(self, key: str) -> WorkKind:
         try:

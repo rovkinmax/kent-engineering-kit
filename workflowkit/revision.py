@@ -148,6 +148,8 @@ def profile_requirements(
     for key, path in profile.procedures.items():
         if path:
             require(path, f"procedures.{key}")
+    for key, path in profile.context_manifests.items():
+        require(path, f"context_manifests.{key}")
     for key, work_kind in profile.work_kinds.items():
         require(work_kind.plan, f"work_kinds.{key}.plan")
         require(work_kind.implement, f"work_kinds.{key}.implement")

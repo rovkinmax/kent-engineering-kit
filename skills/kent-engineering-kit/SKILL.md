@@ -60,6 +60,10 @@ generated toolkit workflows.
 - Generated Fix and Smoke stages use the profile `checkpoint` command and
   canonical ignored `.kent/runtime/<task-short-id>/` files. Reconcile before
   repeating work and persist before every transition.
+- Every agent node starts from its profile `context_manifests` entry and
+  appends a hash-chained event through the profile `evidence` command before
+  transitioning. Record only project instruction paths; unknown Kent
+  model-call or compaction counters remain null.
 - Follow `contracts/worktree-contract.md` when a project needs setup hooks or
   untracked machine configuration.
 - Follow `contracts/mobile-smoke-contract.md` for runtime inspection,
@@ -138,6 +142,9 @@ generated toolkit workflows.
   `resolved` or `needs_user_action` result; never choose manually.
 - After green CI, an open feasible PR belongs in the deterministic `wait_pr`
   script node. Unchanged open state never becomes approval or a model turn.
+- CI waiting belongs in the deterministic `wait_ci` script node. The
+  `ci-monitor` role wakes only for a terminal failure/cancellation that needs
+  bounded classification or retry; a retry returns to the Script watcher.
 - Diagnose disputed rebase feasibility only in an isolated temporary clone or
   branch. Rewriting task history requires exact user authorization, a backup,
   final-tree proof, and force-with-lease pinned to the expected remote head.
