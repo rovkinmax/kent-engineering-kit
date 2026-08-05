@@ -16,7 +16,8 @@ Every generated workflow:
 
 Implemented `Engineering Delivery` fragments:
 
-- optional deterministic Jira/GitHub issue branch identity before Plan;
+- optional deterministic Jira/GitHub issue branch identity after Plan and
+  before Implement;
 - planning and plan review;
 - implementation continuation with selectable continuous or fresh-per-slice
   writer sessions;

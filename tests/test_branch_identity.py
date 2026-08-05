@@ -94,14 +94,27 @@ class BranchIdentityTest(unittest.TestCase):
             )
         )
 
-    def run_script(self) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    def run_script(
+        self,
+        *,
+        handoff: bool = False,
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
         environment = os.environ.copy()
         environment["KENT_BIN"] = str(self.kent)
         environment["KENT_TASK_PAYLOAD"] = str(self.payload_path)
+        workflow_input = {"_kent": {"task_id": "task-uuid"}}
+        if handoff:
+            workflow_input.update(
+                {
+                    "workspace_path": str(self.root),
+                    "plan_path": ".todo/canary/plan.md",
+                    "work_kind": "test",
+                }
+            )
         result = subprocess.run(
             [str(SCRIPT)],
             cwd=self.root,
-            input=json.dumps({"_kent": {"task_id": "task-uuid"}}),
+            input=json.dumps(workflow_input),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -130,6 +143,17 @@ class BranchIdentityTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(payload["transition"], "branch_identity_ready")
         self.assertEqual(self.branch(), "feature/MBL-742")
+
+    def test_delivery_handoff_is_preserved_after_rename(self) -> None:
+        self.configure("jira")
+        self.task(source_url="https://example.atlassian.net/browse/MBL-742")
+
+        result, payload = self.run_script(handoff=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["workspace_path"], str(self.root))
+        self.assertEqual(payload["plan_path"], ".todo/canary/plan.md")
+        self.assertEqual(payload["work_kind"], "test")
 
     def test_jira_body_uses_first_listed_key(self) -> None:
         self.configure("jira")

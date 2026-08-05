@@ -24,6 +24,21 @@ Script completion contracts.
 4. Check project-owned command implementations before synchronization. Generic
    kit sync must not replace a custom verifier or release wrapper.
 
+### Relative Script execution root
+
+On Kent 2.5, a project-relative Script used as the first executable node after
+Backlog can materialize a managed worktree but still start without a current
+node execution root. Runtime then fails with
+`relative script_path ... requires a task worktree root`. The failed start may
+leave the Task in Backlog with managed-worktree or resolved-target facts, so
+`kent task show` can also report `unlocked task has execution target facts`.
+
+Do not use a relative Script as the first executable node. Establish the task
+root through an Agent node first; generated Delivery performs read-only Plan,
+then deterministic branch identity, then the first writer. Treat any stranded
+worktree from this failure as upgrade/runtime debris and clean it through Kent
+after the temporary workflow/task record is retired.
+
 ## Active task recovery
 
 `kent task resume` returns after durable requeueing. It does not prove that the

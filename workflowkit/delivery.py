@@ -281,28 +281,46 @@ def build_delivery_workflow(
             )
         )
 
+    edges: list[EdgeSpec] = [
+        EdgeSpec(
+            key="start_plan",
+            source="backlog",
+            transition="start",
+            target="plan",
+            prompt=plan_prompt(profile, recovery_aware=fresh_writers),
+            transition_description="Start one planning session for this task.",
+        ),
+    ]
     if branch_identity_enabled:
-        edges: list[EdgeSpec] = [
-            EdgeSpec(
-                key="start_branch_identity",
-                source="backlog",
-                transition="start",
-                target="branch_identity",
-                transition_description=(
-                    "Resolve the project-declared source-control branch identity "
-                    "before any agent or code work starts."
+        edges.extend(
+            [
+                EdgeSpec(
+                    key="plan_branch_identity",
+                    source="plan",
+                    transition="implement",
+                    target="branch_identity",
+                    transition_description=(
+                        "Planning is complete; resolve source-control branch "
+                        "identity before the first implementation writer starts."
+                    ),
+                    parameters=implementation_parameters,
                 ),
-            ),
-            EdgeSpec(
-                key="branch_identity_plan",
-                source="branch_identity",
-                transition="ready",
-                target="plan",
-                prompt=plan_prompt(profile, recovery_aware=fresh_writers),
-                transition_description=(
-                    "Branch identity is deterministic and planning can start."
+                EdgeSpec(
+                    key="branch_identity_implement",
+                    source="branch_identity",
+                    transition="ready",
+                    target="implement",
+                    context=writer_handoff_context,
+                    prompt=implement_prompt(
+                        profile,
+                        fresh_session=fresh_writers,
+                    ),
+                    transition_description=(
+                        "Branch identity is deterministic and implementation "
+                        "can start."
+                    ),
+                    parameters=implementation_parameters,
                 ),
-            ),
             EdgeSpec(
                 key="branch_identity_resolution",
                 source="branch_identity",
@@ -313,7 +331,7 @@ def build_delivery_workflow(
                     "Branch identity is ambiguous or collides with existing "
                     "repository state and requires a user decision."
                 ),
-                parameters=(BLOCKER,),
+                parameters=(BLOCKER,) + implementation_parameters,
             ),
             EdgeSpec(
                 key="branch_identity_retry",
@@ -324,10 +342,12 @@ def build_delivery_workflow(
                     "Retry deterministic branch identity after the reported "
                     "collision or repository blocker is resolved."
                 ),
+                parameters=implementation_parameters,
             ),
             recovery_edge(
                 "branch_identity_resolution",
                 context=non_writer_recovery_context,
+                extra_parameters=implementation_parameters,
                 extra_prompt=(
                     "When the exact branch blocker is resolved, choose `retry`. "
                     "Do not rename, delete, or overwrite another branch from "
@@ -335,20 +355,10 @@ def build_delivery_workflow(
                 ),
             ),
             cancellation_edge("branch_identity_resolution"),
-        ]
+            ]
+        )
     else:
-        edges = [
-            EdgeSpec(
-                key="start_plan",
-                source="backlog",
-                transition="start",
-                target="plan",
-                prompt=plan_prompt(profile, recovery_aware=fresh_writers),
-                transition_description="Start one planning session for this task.",
-            ),
-        ]
-    edges.extend(
-        [
+        edges.append(
             EdgeSpec(
                 key="plan_implement",
                 source="plan",
@@ -361,7 +371,10 @@ def build_delivery_workflow(
                     "ambiguity."
                 ),
                 parameters=implementation_parameters,
-            ),
+            )
+        )
+    edges.extend(
+        [
             recovery_edge(
                 "plan",
                 context=non_writer_recovery_context,
@@ -1416,7 +1429,7 @@ def procedure_instruction(profile: ProjectProfile, key: str) -> str:
 
 
 def branch_identity_resolution_prompt(profile: ProjectProfile) -> str:
-    return f"""Resolve the deterministic branch-identity blocker before Plan.
+    return f"""Resolve the deterministic branch-identity blocker before Implement.
 
 Project branch policy: `{profile.branch_identity_policy()}`.
 Reported blocker: {{{{.Params.blocker_reason}}}}

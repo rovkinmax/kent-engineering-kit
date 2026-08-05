@@ -143,7 +143,12 @@ device, source-control, issue-tracker, and release adapters.
 - `github_issue` resolves `issue-<number>` only from an exact issue URL in the
   current GitHub repository. Source URL is inspected before task-body URLs.
 - If no usable external identity exists, retain the Kent short-ID branch.
-- Branch identity runs as the first deterministic Script node before Plan.
+- Branch identity runs as a deterministic Script after read-only Plan and
+  before the first Implement writer. Plan passes `workspace_path`, `plan_path`,
+  and `work_kind`; the Script preserves that handoff on every outcome.
+- Kent 2.5 does not provide a task execution root to a relative Script used as
+  the first executable node after Backlog. Generated workflows must establish
+  the managed root through Plan before invoking project-relative Scripts.
   Active task branches are never renamed during workflow migration.
 - An existing local or remote desired branch is ambiguous ownership, not an
   invitation to reuse or overwrite it. Route to a recoverable user decision.

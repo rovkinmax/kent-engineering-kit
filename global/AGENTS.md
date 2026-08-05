@@ -158,13 +158,14 @@
 - Treat the Kent task short ID and Git branch as separate identities. The task
   short ID remains authoritative for lifecycle, comments, checkpoints, and
   runtime state. When the project profile enables deterministic branch
-  identity, the first Script node may rename only the newly created task branch
-  before Plan: Jira uses `feature/<KEY>` with source URL priority and first
-  task-body key fallback; a same-repository GitHub issue uses
-  `issue-<number>`. Missing external identity retains the Kent branch. Never
-  rename an active task branch during rollout, silently reuse a colliding local
-  or remote branch, or infer the current Git branch from the task short ID.
-  Delivery reports `git branch --show-current`.
+  identity, its Script node may rename only the newly created task branch after
+  read-only Plan and before the first implementation writer: Jira uses
+  `feature/<KEY>` with source URL priority and first task-body key fallback; a
+  same-repository GitHub issue uses `issue-<number>`. Missing external identity
+  retains the Kent branch. Never place a relative Script directly after
+  Backlog on Kent 2.5, rename an active task branch during rollout, silently
+  reuse a colliding local or remote branch, or infer the current Git branch
+  from the task short ID. Delivery reports `git branch --show-current`.
 - When a task resolves an issue in the same source-control repository, the pull
   request body uses the provider's closing reference, for example `Fixes #51`
   on GitHub. Cross-repository, partial, or follow-up relationships use a

@@ -158,6 +158,13 @@ owns real task history and provides rollback.
   new calibration was consumed.
 - Preflight each selected execution revision against its profile-owned scripts,
   procedures, and adapters.
+- A synthetic August 5, 2026 canary proved that Kent 2.5 may materialize a
+  managed worktree yet omit the execution root for a relative Script used
+  directly after Backlog. Runtime fails with
+  `relative script_path ... requires a task worktree root` and can leave stale
+  unlocked execution-target facts. Generated branch identity therefore runs
+  after read-only Plan and before Implement, preserving the complete writer
+  handoff. Canary that exact topology before default promotion.
 - Observe ordinary default tasks across delivery-ready, Smoke, Fix, CI, and PR
   feedback paths.
 - The generated evidence-repair lane now handles packaging-only Compliance

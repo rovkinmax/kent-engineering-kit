@@ -42,11 +42,13 @@ generated toolkit workflows.
   the shared profile and workflow compatibility contract is versioned.
 - Treat Kent's selected execution root and resolved commit as authoritative.
 - Read `policies.branch_identity` before interpreting the Git branch. Kent's
-  task short ID remains lifecycle identity, while a configured first Script
+  task short ID remains lifecycle identity, while a configured Script
   node may rename the new branch to `feature/<Jira-key>` or
-  `issue-<GitHub-number>` before Plan. Missing external identity retains the
-  task branch; collisions require an explicit resolution and never attach
-  silently to an existing ref.
+  `issue-<GitHub-number>` after read-only Plan and before the first Implement
+  writer. Missing external identity retains the task branch; collisions require
+  an explicit resolution and never attach silently to an existing ref. Do not
+  put a relative Script directly after Backlog: Kent 2.5 does not supply that
+  first Script with a task execution root.
 - Use `kent worktree` for operations on Kent-managed worktrees.
 - For a cross-session operation, invoke `~/.kent/bin/kent-worktree` with an
   explicit `--session`. The wrapper prevents inherited task/session variables

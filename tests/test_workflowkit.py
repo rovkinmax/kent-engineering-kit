@@ -184,7 +184,9 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(roles["waiting_pr"], "ci-monitor")
         self.assertEqual(roles["cleanup"], "delivery-operator")
 
-    def test_delivery_inserts_configured_branch_identity_before_plan(self) -> None:
+    def test_delivery_inserts_configured_branch_identity_before_implement(
+        self,
+    ) -> None:
         profile = self.load_profile(
             lambda contents: (
                 contents.replace(
@@ -211,17 +213,26 @@ class WorkflowKitTest(unittest.TestCase):
             ".kent/scripts/workflow-branch-identity",
         )
         self.assertEqual(
-            edges["start_branch_identity"].target,
-            "branch_identity",
-        )
-        self.assertEqual(
-            edges["branch_identity_plan"].target,
+            edges["start_plan"].target,
             "plan",
         )
         self.assertEqual(
-            edges["branch_identity_plan"].transition,
+            edges["plan_branch_identity"].target,
+            "branch_identity",
+        )
+        self.assertEqual(
+            edges["branch_identity_implement"].target,
+            "implement",
+        )
+        self.assertEqual(
+            edges["branch_identity_implement"].transition,
             "branch_identity_ready",
         )
+        for key in ("plan_branch_identity", "branch_identity_implement"):
+            self.assertEqual(
+                tuple(parameter.key for parameter in edges[key].parameters),
+                ("workspace_path", "plan_path", "work_kind"),
+            )
         self.assertEqual(
             edges["branch_identity_resolution"].target,
             "branch_identity_resolution",
@@ -230,7 +241,7 @@ class WorkflowKitTest(unittest.TestCase):
             edges["branch_identity_retry"].target,
             "branch_identity",
         )
-        self.assertNotIn("start_plan", edges)
+        self.assertNotIn("plan_implement", edges)
 
     def test_delivery_keeps_direct_plan_start_for_task_branch_policy(self) -> None:
         profile = self.load_profile()

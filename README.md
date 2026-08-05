@@ -106,7 +106,8 @@ Desktop. Skills, prompts, and `AGENTS.md` are consumed by new sessions.
 Project repositories provide `.kent/workflow-profile.toml`, deterministic
 verification scripts, project procedures, and these kit-managed commands:
 
-- `branch_identity` — pre-Plan Jira/GitHub issue branch resolution;
+- `branch_identity` — post-Plan/pre-Implement Jira/GitHub issue branch
+  resolution;
 - `checkpoint` — atomic ignored Fix/Smoke state under `.kent/runtime/`;
 - `wait_pr` — zero-model GitHub merge watching;
 - `janitor` — post-Cleanup safe managed-worktree and branch cleanup.
@@ -181,12 +182,15 @@ approval-gated retry. The project procedure owns the credential reference and
 build-tool environment mapping; the publisher resolves it just in time instead
 of depending on ambient CLI authentication.
 
-`policies.branch_identity` controls source-control naming before Plan:
+`policies.branch_identity` controls source-control naming before the first
+implementation writer:
 `task` retains Kent's short-ID branch, `jira` uses `feature/<KEY>`, and
 `github_issue` uses `issue-<number>` only for an issue in the same GitHub
 repository. Missing external identity keeps the Kent branch. Existing local or
 remote branch collisions stop in a recoverable user-decision node rather than
-attaching a new task to ambiguous work.
+attaching a new task to ambiguous work. The deterministic Script runs after the
+read-only Plan handoff because Kent 2.5 does not provide a task execution root
+to a relative Script used as the first executable node.
 
 After green CI, an open feasible PR moves to a deterministic script watcher.
 Unchanged state consumes no model turn and requires no approval. Material
