@@ -846,6 +846,143 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertIn("--delete-branch", wrapper_args)
         self.assertIn(str(worktree.resolve()), wrapper_args)
 
+    def test_merged_pr_descendant_invokes_kent_worktree_deletion(self) -> None:
+        root = self.create_repository()
+        worktrees = root / ".kent" / "worktrees"
+        worktrees.mkdir(parents=True)
+        worktree = worktrees / "TASK-1"
+        self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
+        local_head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        (root / "remote-only.txt").write_text("user update\n")
+        self.run_git(root, "add", "remote-only.txt")
+        self.run_git(root, "commit", "-q", "-m", "User update")
+        pr_head = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(
+            self.run_git(
+                root,
+                "merge-base",
+                "--is-ancestor",
+                local_head,
+                pr_head,
+            ).returncode,
+            0,
+        )
+
+        pr_state = root / "pr-state.json"
+        pr_state.write_text(
+            json.dumps(
+                {
+                    "state": "MERGED",
+                    "mergedAt": "2026-08-01T00:00:00Z",
+                    "headRefName": "TASK-1",
+                    "headRefOid": pr_head,
+                    "isCrossRepository": False,
+                    "url": "https://github.com/example/repo/pull/1",
+                }
+            )
+        )
+        fake_gh = root / "gh"
+        fake_gh.write_text("#!/bin/sh\ncat \"$KENT_TEST_PR_STATE\"\n")
+        fake_gh.chmod(0o755)
+        wrapper_marker = root / "wrapper-called"
+        fake_wrapper = root / "kent-worktree"
+        fake_wrapper.write_text(
+            "#!/bin/sh\n"
+            f"touch {str(wrapper_marker)!r}\n"
+        )
+        fake_wrapper.chmod(0o755)
+
+        result = subprocess.run(
+            [str(JANITOR)],
+            cwd=worktree,
+            input=self.janitor_input(
+                worktree,
+                branch_name="TASK-1",
+                pr_url="https://github.com/example/repo/pull/1",
+                merge_report="merged",
+                cleanup_mode="merged",
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "KENT_GH_BIN": str(fake_gh),
+                "KENT_TEST_PR_STATE": str(pr_state),
+                "KENT_WORKTREE_WRAPPER": str(fake_wrapper),
+            },
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["transition"], "task_janitor_done")
+        self.assertTrue(wrapper_marker.exists())
+
+    def test_diverged_merged_pr_head_is_preserved(self) -> None:
+        root = self.create_repository()
+        worktrees = root / ".kent" / "worktrees"
+        worktrees.mkdir(parents=True)
+        worktree = worktrees / "TASK-1"
+        self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
+        (worktree / "local-only.txt").write_text("local\n")
+        self.run_git(worktree, "add", "local-only.txt")
+        self.run_git(worktree, "commit", "-q", "-m", "Local only")
+        (root / "remote-only.txt").write_text("remote\n")
+        self.run_git(root, "add", "remote-only.txt")
+        self.run_git(root, "commit", "-q", "-m", "Remote only")
+        pr_head = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+
+        pr_state = root / "pr-state.json"
+        pr_state.write_text(
+            json.dumps(
+                {
+                    "state": "MERGED",
+                    "mergedAt": "2026-08-01T00:00:00Z",
+                    "headRefName": "TASK-1",
+                    "headRefOid": pr_head,
+                    "isCrossRepository": False,
+                    "url": "https://github.com/example/repo/pull/1",
+                }
+            )
+        )
+        fake_gh = root / "gh"
+        fake_gh.write_text("#!/bin/sh\ncat \"$KENT_TEST_PR_STATE\"\n")
+        fake_gh.chmod(0o755)
+        wrapper_marker = root / "wrapper-called"
+        fake_wrapper = root / "kent-worktree"
+        fake_wrapper.write_text(
+            "#!/bin/sh\n"
+            f"touch {str(wrapper_marker)!r}\n"
+        )
+        fake_wrapper.chmod(0o755)
+
+        result = subprocess.run(
+            [str(JANITOR)],
+            cwd=worktree,
+            input=self.janitor_input(
+                worktree,
+                branch_name="TASK-1",
+                pr_url="https://github.com/example/repo/pull/1",
+                merge_report="merged",
+                cleanup_mode="merged",
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "KENT_GH_BIN": str(fake_gh),
+                "KENT_TEST_PR_STATE": str(pr_state),
+                "KENT_WORKTREE_WRAPPER": str(fake_wrapper),
+            },
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("not conclusively recoverable", payload["cleanup_report"])
+        self.assertFalse(wrapper_marker.exists())
+        self.assertTrue(worktree.exists())
+
     def test_remote_branch_deletion_uses_exact_lease(self) -> None:
         root = self.create_repository()
         remote_temporary = tempfile.TemporaryDirectory()
@@ -875,6 +1012,95 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": head,
+                    "isCrossRepository": False,
+                    "url": "https://github.com/example/repo/pull/1",
+                }
+            )
+        )
+        fake_gh = root / "gh"
+        fake_gh.write_text("#!/bin/sh\ncat \"$KENT_TEST_PR_STATE\"\n")
+        fake_gh.chmod(0o755)
+        fake_wrapper = root / "kent-worktree"
+        fake_wrapper.write_text("#!/bin/sh\nexit 0\n")
+        fake_wrapper.chmod(0o755)
+
+        result = subprocess.run(
+            [str(JANITOR)],
+            cwd=worktree,
+            input=self.janitor_input(
+                worktree,
+                branch_name="TASK-1",
+                pr_url="https://github.com/example/repo/pull/1",
+                merge_report="merged",
+                cleanup_mode="merged",
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "KENT_GH_BIN": str(fake_gh),
+                "KENT_TEST_PR_STATE": str(pr_state),
+                "KENT_WORKTREE_WRAPPER": str(fake_wrapper),
+            },
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("Remote branch removed: true", payload["cleanup_report"])
+        remote_ref = subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(remote),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/TASK-1",
+            ],
+            check=False,
+        )
+        self.assertNotEqual(remote_ref.returncode, 0)
+
+    def test_remote_descendant_branch_deletion_uses_pr_head_lease(self) -> None:
+        root = self.create_repository()
+        remote_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(remote_temporary.cleanup)
+        remote = Path(remote_temporary.name)
+        self.run_git(remote, "init", "--bare", "-q")
+        self.run_git(root, "remote", "add", "origin", str(remote))
+        primary_branch = self.run_git(
+            root,
+            "branch",
+            "--show-current",
+        ).stdout.strip()
+        self.run_git(root, "push", "-q", "-u", "origin", primary_branch)
+
+        worktrees = root / ".kent" / "worktrees"
+        worktrees.mkdir(parents=True)
+        worktree = worktrees / "TASK-1"
+        self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
+        self.run_git(worktree, "push", "-q", "-u", "origin", "TASK-1")
+        (root / "remote-only.txt").write_text("user update\n")
+        self.run_git(root, "add", "remote-only.txt")
+        self.run_git(root, "commit", "-q", "-m", "User update")
+        pr_head = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+        self.run_git(
+            root,
+            "push",
+            "-q",
+            "origin",
+            f"{pr_head}:refs/heads/TASK-1",
+        )
+
+        pr_state = root / "pr-state.json"
+        pr_state.write_text(
+            json.dumps(
+                {
+                    "state": "MERGED",
+                    "mergedAt": "2026-08-01T00:00:00Z",
+                    "headRefName": "TASK-1",
+                    "headRefOid": pr_head,
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }

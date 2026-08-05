@@ -532,7 +532,9 @@ device, source-control, issue-tracker, and release adapters.
   Janitor script after the Cleanup session exits.
 - The Janitor never deletes the primary checkout, dirty or ambiguous state, or
   content not proven recoverable. A merged-PR cleanup re-queries GitHub and
-  requires the exact branch head recorded by that merged PR.
+  requires the clean local task HEAD to equal or be an ancestor of the exact
+  branch head recorded by that merged PR. This permits safe cleanup after
+  user-authored remote commits without accepting diverged local work.
 - The same-repository remote task branch may be deleted only when its current
   OID still equals the merged PR head. Local worktree and branch deletion uses
   Kent's supported worktree command; a squash/rebase branch retained by Kent

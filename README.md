@@ -210,8 +210,9 @@ back to Compliance without rebuilding or reacquiring runtime resources.
 
 Managed-worktree Cleanup is two-phase: the Cleanup agent emits a report and
 session-scoped request, then a deterministic Task Janitor runs after that agent
-exits. It deletes only exact clean task-owned resources proven recoverable and
-preserves every dirty, primary, ambiguous, or unique resource.
+exits. It deletes only clean task-owned resources proven recoverable from the
+exact merged PR head, including a stale local HEAD that is its ancestor, and
+preserves every dirty, primary, ambiguous, diverged, or unique resource.
 
 Verification dispatch validates `workspace_path` before fan-out. The value must
 be the canonical current task repository or execution root; `.todo` artifact
