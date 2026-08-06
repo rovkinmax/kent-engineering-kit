@@ -224,15 +224,49 @@ class BranchIdentityTest(unittest.TestCase):
         self.assertEqual(payload["work_kind"], "test")
         self.assertIn("инфраструктурной", payload["blocker_reason"])
 
-    def test_jira_body_uses_first_listed_key(self) -> None:
+    def test_jira_body_uses_first_listed_issue_url(self) -> None:
         self.configure("jira")
-        self.task(body="Issues:\n- MBL-783\n- MBL-784\n")
+        self.task(
+            body=(
+                "Issues:\n"
+                "- https://example.atlassian.net/browse/MBL-783\n"
+                "- https://example.atlassian.net/browse/MBL-784\n"
+            )
+        )
 
         result, payload = self.run_script()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(payload["transition"], "branch_identity_ready")
         self.assertEqual(self.branch(), "feature/MBL-783")
+
+    def test_jira_body_ignores_referenced_task_keys(self) -> None:
+        self.configure("jira")
+        self.task(
+            short_id="OSM-53",
+            body=(
+                "The exact release baseline and OSM-51 PR #1542 fail alike.\n"
+                "Evidence: https://github.com/example/repo/actions/runs/123.\n"
+                "Do not modify OSM-51 or OSM-52 from this task.\n"
+            ),
+        )
+        self.run_git(self.root, "branch", "-m", "OSM-53")
+
+        result, payload = self.run_script()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_ready")
+        self.assertEqual(self.branch(), "OSM-53")
+
+    def test_jira_body_plain_key_is_not_authoritative(self) -> None:
+        self.configure("jira")
+        self.task(body="Related issue MBL-783 is evidence, not task identity.")
+
+        result, payload = self.run_script()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_ready")
+        self.assertEqual(self.branch(), "TASK-1")
 
     def test_missing_external_id_keeps_task_branch(self) -> None:
         self.configure("jira")

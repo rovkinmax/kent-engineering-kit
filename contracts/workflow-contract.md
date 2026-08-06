@@ -179,7 +179,9 @@ device, source-control, issue-tracker, and release adapters.
   when the Git branch has another name.
 - `policies.branch_identity = "task"` keeps Kent's native short-ID branch.
 - `jira` resolves `feature/<KEY>` from the task source URL first, otherwise
-  from the first Jira key in task-body order.
+  from the first Jira `/browse/<KEY>` issue URL in task-body order. Arbitrary
+  Jira-like task keys mentioned as comparison, dependency, or evidence are not
+  branch identity.
 - `github_issue` resolves `issue-<number>` only from an exact issue URL in the
   current GitHub repository. Source URL is inspected before task-body URLs.
 - If no usable external identity exists, retain the Kent short-ID branch.
