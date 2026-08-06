@@ -134,6 +134,13 @@ generated toolkit workflows.
   one concrete slice in the same session, never another bookkeeping-only
   `continue_fix` loop. Non-writer approval-recovery loops compact and continue
   their existing sessions.
+- Treat `needs_user_action` approval as a resume signal after the exact external
+  action is complete, never as acknowledgement of waiting. For out-of-scope
+  adjacent work, preserve scope and transition once; do not ask whether to
+  absorb the work and then create a second approval for the same blocker.
+- If task authority declares a report-only, read-only, or audit-only run, or
+  forbids repair in the frozen worktree, Implement and Fix do not edit tracked
+  or staged files. Report defects for a separately authorized revision/task.
 - Read `policies.pr_merge_strategy` before PR preparation. `auto` must resolve
   to exactly one method from repository capabilities, target-branch rules, and
   merge-queue policy; otherwise return `needs_user_action`. Carry the resolved

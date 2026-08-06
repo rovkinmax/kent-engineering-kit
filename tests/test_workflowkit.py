@@ -361,6 +361,14 @@ class WorkflowKitTest(unittest.TestCase):
         for key in ("implement_needs_user_action", "fix_needs_user_action"):
             self.assertEqual(by_key[key].context, "new_session")
             self.assertIn("fresh bounded session", by_key[key].prompt)
+            self.assertIn(
+                "Approval means only that the exact reported blocker action",
+                by_key[key].prompt,
+            )
+            self.assertIn(
+                "Do not approve until the reported external action is complete",
+                by_key[key].transition_description,
+            )
         self.assertIn(
             "legacy plan renders them as unchecked entries",
             by_key["implement_needs_user_action"].prompt,
@@ -386,6 +394,25 @@ class WorkflowKitTest(unittest.TestCase):
             "`not-applicable`",
             by_key["start_plan"].prompt,
         )
+
+    def test_writer_prompts_preserve_report_only_and_scope_boundaries(self) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        for key in ("plan_implement", "gate_fix"):
+            self.assertIn(
+                "do not edit tracked or staged files",
+                by_key[key].prompt,
+            )
+            self.assertIn(
+                "do not first call `ask_question` merely to offer scope",
+                by_key[key].prompt,
+            )
+            self.assertIn(
+                "approval is a resume signal",
+                by_key[key].prompt,
+            )
 
     def test_delivery_preserves_continuous_writer_compatibility(self) -> None:
         profile = self.load_profile(

@@ -12,6 +12,9 @@ device, source-control, issue-tracker, and release adapters.
   Workflow-owned Standards, Specification, Gate, Smoke, Compliance, PR, CI,
   and Cleanup work is never an implementation checkbox prerequisite.
 - Recoverable blockers use approval-gated `needs_user_action` self-loops.
+- A `needs_user_action` approval is a resume gate, not acknowledgement of
+  waiting. Do not approve it until the reported external action is complete;
+  approval restarts the same stage and requires fresh resolution evidence.
 - A post-Join blocker may approval-loop through verification dispatch so every
   read-only branch reruns with fresh state.
 - An interrupted node run is runtime state, not a workflow decision. Inspect
@@ -35,6 +38,10 @@ device, source-control, issue-tracker, and release adapters.
 - Parallel verification branches are read-only.
 - One writer owns fixes and integration.
 - `done` means delivered or explicitly approved report-only completion.
+- When task authority declares a run report-only, read-only, audit-only, or
+  forbids repair in its frozen worktree, Implement and Fix do not edit tracked
+  or staged files. A candidate defect is reported and repaired on a separately
+  authorized revision/task; the immutable candidate is never patched in place.
 
 ## User-facing workflow communication
 
@@ -52,6 +59,11 @@ device, source-control, issue-tracker, and release adapters.
 - Task-scoped source fixes belong in `fix_context`; they are not described as
   actions the user must perform. External dependencies only block the stage
   whose acceptance contract actually requires them.
+- A failure outside the authoritative task boundary does not prompt the user
+  to absorb adjacent scope. Preserve the boundary and submit one
+  approval-gated `needs_user_action` transition directly. Do not first ask the
+  same scope-expansion question. Its `blocker_reason` states the exact action,
+  proof of completion, and that approval must wait until completion.
 - Missing agent-produced evidence is not a user decision. A pre-edit red-run
   requirement must be captured before the first production edit. If the agent
   missed it, the workflow records the absence and uses bounded reconstruction

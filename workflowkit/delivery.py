@@ -1467,8 +1467,11 @@ criterion, update the authoritative design/specification/plan first and
 reference the exact task-comment ID. Do not restart completed work.
 {stage_contract}
 
-Verify that the exact blocker is resolved. Do not infer approval for any broader
-or destructive action.{extra_contract}"""
+Approval means only that the exact reported blocker action is now complete; it
+is not acknowledgement that waiting may begin. Verify resolution before
+editing. If the blocker remains, preserve task scope and return
+`needs_user_action` again. Do not infer approval for any broader or destructive
+action.{extra_contract}"""
             + cancellation_contract
         )
     else:
@@ -1477,10 +1480,12 @@ or destructive action.{extra_contract}"""
 
 Previous blocker: {{{{.Params.blocker_reason}}}}
 
-Use the retained compacted context, re-read current task comments and project
-instructions, verify that the blocker is actually resolved, and continue the
-same stage. Do not infer approval for any broader or destructive
-action.{extra_contract}"""
+Use the retained compacted context and re-read current task comments and
+project instructions. Approval means only that the exact reported blocker
+action is now complete; it is not acknowledgement that waiting may begin.
+Verify resolution before continuing. If the blocker remains, preserve task
+scope and return `needs_user_action` again. Do not infer approval for any
+broader or destructive action.{extra_contract}"""
             + cancellation_contract
         )
     return EdgeSpec(
@@ -1492,7 +1497,8 @@ action.{extra_contract}"""
         prompt=prompt,
         requires_approval=True,
         transition_description=(
-            "Work is externally blocked; continue this stage only after approval."
+            "Work is externally blocked. Do not approve until the reported "
+            "external action is complete; approval resumes this stage."
         ),
         parameters=(BLOCKER,) + extra_parameters,
     )
@@ -1786,6 +1792,15 @@ inherited worktree already contains the edit and the earlier agent failed to
 retain its own red-run artifact, do not ask the user to waive that bookkeeping.
 Record the absence, reconstruct it only when bounded and safe, and continue
 with current deterministic evidence unless acceptance remains unproven.
+If task authority declares this run report-only, read-only, audit-only, or
+forbids repair in the frozen worktree, do not edit tracked or staged files.
+Collect only bounded evidence and choose `verify` when the candidate satisfies
+the contract. A candidate defect is reported for a separately authorized
+revision/task; it is never repaired inside this run.
+An adjacent failure outside the authoritative task boundary is not an invitation
+to broaden scope. Preserve the declared boundary and route it directly to
+`needs_user_action`; do not first call `ask_question` merely to offer scope
+expansion.
 After marking that step complete, choose `continue_implementation` with
 `workspace_path`, `plan_path`, and the unchanged `work_kind` when unchecked
 writer-owned ready steps remain. Choose
@@ -1794,8 +1809,10 @@ writer-owned ready steps remain. Choose
 comparison point, changed files, checks, risks, and any downstream runtime
 acceptance scope for the read-only branches and Gate.
 Use `needs_user_action` only for an external blocker and provide
-`blocker_reason` plus the unchanged `work_kind`. Choose `wont_do` only for
-explicit cancellation and provide `closure_reason`."""
+`blocker_reason` plus the unchanged `work_kind`. Its approval is a resume signal
+after the named external action is complete, not acknowledgement of waiting;
+state that condition explicitly. Choose `wont_do` only for explicit
+cancellation and provide `closure_reason`."""
 
 
 def fix_prompt(
@@ -1850,12 +1867,23 @@ a finding that also exists on the pinned baseline, or an unproven differential
 is not authorization for cleanup. If the finding requires baseline-wide work
 or only exposes contradictory repository policy, do not edit; choose
 `needs_user_action` with the exact policy/evidence blocker.
+If task authority declares the run report-only, read-only, audit-only, or
+forbids repair in the frozen worktree, do not edit tracked or staged files.
+Report the candidate defect and route to `needs_user_action` or approval-gated
+`wont_do` according to that authority so a corrected revision can use a fresh
+task. Never repair the immutable candidate in place.
+An adjacent failure outside the authoritative task boundary is not an invitation
+to broaden scope. Preserve the declared boundary and route it directly to
+`needs_user_action`; do not first call `ask_question` merely to offer scope
+expansion.
 Do not launch nested final Standards, Specification, Compliance, or
 project-specialized review passes; return to the generated verification graph
 after fixing the supplied findings.
 {completion_contract}
 Use `needs_user_action` only for an external blocker and provide
-`blocker_reason`. Choose `wont_do` only for explicit cancellation and provide
+`blocker_reason`. Its approval is a resume signal after the named external
+action is complete, not acknowledgement of waiting; state that condition
+explicitly. Choose `wont_do` only for explicit cancellation and provide
 `closure_reason`."""
 
 

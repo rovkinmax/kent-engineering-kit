@@ -5,7 +5,7 @@ max_subagent_depth = 1
 
 [workflow]
 subagents = true
-concurrency = 2
+concurrency = 4
 
 [reviewer]
 frequency = "off"
