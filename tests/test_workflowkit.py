@@ -197,6 +197,27 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(roles["waiting_pr"], "ci-monitor")
         self.assertEqual(roles["cleanup"], "delivery-operator")
 
+    def test_jira_adapter_adds_relation_aware_plan_instruction(self) -> None:
+        profile = self.load_profile()
+        without_jira = build_delivery_workflow(profile, 1)
+        without_jira_plan = next(
+            edge.prompt for edge in without_jira.edges if edge.target == "plan"
+        )
+        self.assertNotIn("normalized `issue_links`", without_jira_plan)
+
+        jira_profile = replace(
+            profile,
+            required_adapters=("jira_api",),
+            adapters={"jira_api": ".kent/adapters/jira/jira-api.sh"},
+        )
+        with_jira = build_delivery_workflow(jira_profile, 1)
+        with_jira_plan = next(
+            edge.prompt for edge in with_jira.edges if edge.target == "plan"
+        )
+        self.assertIn("normalized `issue_links`", with_jira_plan)
+        self.assertIn("mandatory bounded product evidence", with_jira_plan)
+        self.assertIn("API operations/models", with_jira_plan)
+
     def test_delivery_inserts_configured_branch_identity_before_implement(
         self,
     ) -> None:

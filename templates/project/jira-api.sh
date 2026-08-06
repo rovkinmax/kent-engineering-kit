@@ -9,6 +9,7 @@ Usage:
   jira-api.sh --check-auth
   jira-api.sh issue <KEY_OR_URL>
   jira-api.sh links <KEY_OR_URL>
+  jira-api.sh relations <KEY_OR_URL>
   jira-api.sh comments <KEY_OR_URL>
   jira-api.sh search <JQL> [MAX_RESULTS]
   jira-api.sh board <BOARD_URL_OR_ID>
@@ -288,9 +289,55 @@ def urls:
       } end
   ),
   labels: (.fields.labels // []),
+  components: [
+    .fields.components[]?
+    | {id: .id, name: .name}
+  ],
   fix_versions: [
     .fields.fixVersions[]?
     | {id: .id, name: .name, released: .released}
+  ],
+  issue_links: [
+    .fields.issuelinks[]? as $link
+    | if $link.inwardIssue? then
+        {
+          id: ($link.id | tostring),
+          link_type: {
+            id: ($link.type.id | tostring),
+            name: $link.type.name,
+            inward: $link.type.inward,
+            outward: $link.type.outward
+          },
+          direction: "inward",
+          relationship: $link.type.inward,
+          issue: {
+            key: $link.inwardIssue.key,
+            url: ($base_url + "/browse/" + $link.inwardIssue.key),
+            summary: ($link.inwardIssue.fields.summary // null),
+            status: ($link.inwardIssue.fields.status.name // null),
+            type: ($link.inwardIssue.fields.issuetype.name // null)
+          }
+        }
+      elif $link.outwardIssue? then
+        {
+          id: ($link.id | tostring),
+          link_type: {
+            id: ($link.type.id | tostring),
+            name: $link.type.name,
+            inward: $link.type.inward,
+            outward: $link.type.outward
+          },
+          direction: "outward",
+          relationship: $link.type.outward,
+          issue: {
+            key: $link.outwardIssue.key,
+            url: ($base_url + "/browse/" + $link.outwardIssue.key),
+            summary: ($link.outwardIssue.fields.summary // null),
+            status: ($link.outwardIssue.fields.status.name // null),
+            type: ($link.outwardIssue.fields.issuetype.name // null)
+          }
+        }
+      else empty end
   ],
   description_text: ((.fields.description // {}) | adf_text),
   extracted_urls: (
@@ -310,7 +357,7 @@ normalize_issue() {
 issue_command() {
   local key fields raw
   key="$(issue_key "$1")"
-  fields="summary,status,issuetype,assignee,parent,description,comment,labels,fixVersions"
+  fields="summary,status,issuetype,assignee,parent,description,comment,labels,components,fixVersions,issuelinks"
   raw="$(jira_request GET "/rest/api/3/issue/${key}?fields=${fields}")"
   normalize_issue <<<"$raw"
 }
@@ -518,6 +565,9 @@ case "${1:-}" in
     ;;
   links)
     issue_command "${2:-}" | jq '{key, extracted_urls}'
+    ;;
+  relations)
+    issue_command "${2:-}" | jq '{key, issue_links}'
     ;;
   comments)
     comments_command "${2:-}"

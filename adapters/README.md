@@ -119,8 +119,10 @@ credentials or `_OP_REF` pointers. This lets related projects intentionally
 share one namespace while unrelated projects select independent Jira tenants
 and tokens.
 
-The common adapter supports read-only issue, comment, link, JQL, board, and
-board-issue ingestion. Project workflows own task creation, Jira mutation, and
+The common adapter supports read-only issue, comment, URL, Jira-relation, JQL,
+board, and board-issue ingestion. `issue` includes normalized `issue_links`;
+`relations` returns that collection directly, while `links` remains the
+extracted URL view. Project workflows own task creation, Jira mutation, and
 release-version policy; those operations are not exposed by this adapter.
 
 ## Mobile runtime safety adapters

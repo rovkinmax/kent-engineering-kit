@@ -577,3 +577,14 @@ Projects that treat Jira descriptions or comments as planning sources list
 `jira_api` in `required_adapters`, declare its project-local path, and select
 their own `[integrations.jira]` credential namespace. Related repositories may
 share a namespace intentionally; unrelated repositories remain isolated.
+
+For Jira-backed planning, normalized issue relations are the primary
+cross-platform discovery path. Plan follows related issues at most one graph
+level, identifies sibling platforms from issue metadata rather than link-type
+wording alone, and then resolves the sibling issue to a project-declared local
+reference repository. An existing sibling implementation and its tests are
+mandatory bounded product evidence. Plan records the relationship, immutable
+source commit and paths, and `checked`, `adopted`, and `rejected` conclusions.
+Explicit target-platform requirements, current design, and API contracts remain
+authoritative. Bounded API/model/flow fingerprint search is the fallback when
+Jira relations do not identify a usable sibling implementation.

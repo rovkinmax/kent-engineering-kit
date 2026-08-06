@@ -198,6 +198,11 @@ generated toolkit workflows.
   separate workflow-verification section without implementation checkboxes.
   Existing legacy checkboxes for those stages are handoff scope and do not
   prevent Implement from advancing to verification.
+- For Jira-backed work, inspect normalized issue relations before heuristic
+  cross-repository search. When a linked sibling task maps to an existing
+  project-declared implementation, Plan records its immutable commit/paths and
+  `checked`, `adopted`, and `rejected` conclusions. Use API/model/flow
+  fingerprints only when the relation graph does not produce a usable source.
 - Standards, Specification, and Compliance are leaf sessions. They must not
   call `kent run` or delegate their review to child agents.
 - Standards review pins the comparison baseline. A repository-wide analyzer

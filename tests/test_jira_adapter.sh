@@ -50,7 +50,44 @@ JSON
     },
     "comment": null,
     "labels": ["sdk"],
-    "fixVersions": []
+    "components": [{"id": "component-1", "name": "Mobile"}],
+    "fixVersions": [],
+    "issuelinks": [
+      {
+        "id": "link-1",
+        "type": {
+          "id": "10001",
+          "name": "Cloners",
+          "inward": "is cloned by",
+          "outward": "clones"
+        },
+        "inwardIssue": {
+          "key": "IOS-456",
+          "fields": {
+            "summary": "[iOS] Generate SDK",
+            "status": {"name": "Done"},
+            "issuetype": {"name": "Task"}
+          }
+        }
+      },
+      {
+        "id": "link-2",
+        "type": {
+          "id": "10003",
+          "name": "Relates",
+          "inward": "relates to",
+          "outward": "relates to"
+        },
+        "outwardIssue": {
+          "key": "WEB-789",
+          "fields": {
+            "summary": "[Web] Generate SDK",
+            "status": {"name": "In Progress"},
+            "issuetype": {"name": "Story"}
+          }
+        }
+      }
+    ]
   }
 }
 JSON
@@ -105,8 +142,39 @@ jq -e '
   and .summary == "Generate SDK"
   and .description_text == "Use https://example.invalid/spec"
   and (.extracted_urls | index("https://example.invalid/spec") != null)
+  and .components == [{"id":"component-1","name":"Mobile"}]
+  and .issue_links[0].direction == "inward"
+  and .issue_links[0].relationship == "is cloned by"
+  and .issue_links[0].issue.key == "IOS-456"
+  and .issue_links[1].direction == "outward"
+  and .issue_links[1].relationship == "relates to"
+  and .issue_links[1].issue.key == "WEB-789"
 ' "$tmp/issue.json" >/dev/null
 grep -q 'direct-user@example.invalid:direct-token' "$tmp/curl.log"
+grep -q 'issuelinks' "$tmp/curl.log"
+
+(
+  cd "$tmp/project"
+  ACME_JIRA_EMAIL="direct-user@example.invalid" \
+    ACME_JIRA_API_TOKEN="direct-token" \
+    "$adapter" relations ABC-123 >"$tmp/relations.json"
+)
+jq -e '
+  .key == "ABC-123"
+  and (.issue_links | length) == 2
+  and [.issue_links[].issue.key] == ["IOS-456", "WEB-789"]
+' "$tmp/relations.json" >/dev/null
+
+(
+  cd "$tmp/project"
+  ACME_JIRA_EMAIL="direct-user@example.invalid" \
+    ACME_JIRA_API_TOKEN="direct-token" \
+    "$adapter" links ABC-123 >"$tmp/links.json"
+)
+jq -e '
+  .key == "ABC-123"
+  and .extracted_urls == ["https://example.invalid/spec"]
+' "$tmp/links.json" >/dev/null
 
 (
   cd "$tmp/project"

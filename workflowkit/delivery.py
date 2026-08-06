@@ -1648,6 +1648,29 @@ reclassify the task during recovery. Re-emit `work_kind` on
 `continue_implementation` or another `needs_user_action` transition."""
 
 
+def jira_reference_instruction(profile: ProjectProfile) -> str:
+    if "jira_api" not in profile.required_adapters:
+        return ""
+
+    return f"""
+
+When the source contains a Jira issue, use `{profile.adapter("jira_api")}` and
+inspect its normalized `issue_links` before relying on semantic repository
+search. Follow related issues only one graph level and within the project
+procedure's research limit. Do not key platform discovery only on the Jira link
+type: use the linked issue summary, labels, components, fix versions, and
+description to identify an iOS, web, backend, or other sibling task.
+
+When a linked sibling task has an existing implementation in a
+project-declared reference repository, inspect that implementation and its
+tests as mandatory bounded product evidence. Record the Jira relationship,
+exact repository commit and paths, plus `checked`, `adopted`, and `rejected`
+conclusions. The target platform's explicit task decisions, current design,
+and API contracts remain authoritative. If no useful Jira relation exists,
+fall back to a bounded feature fingerprint built from API operations/models,
+screen or flow names, distinctive domain terms, and user-visible copy."""
+
+
 def plan_prompt(
     profile: ProjectProfile,
     *,
@@ -1682,6 +1705,7 @@ an explicit confirmation request. Do not choose `implement` in that Plan run."""
 {context_instruction(profile, "plan", "plan", "plan")}
 
 {work_kind_plan_instruction(profile)}
+{jira_reference_instruction(profile)}
 
 Task body:
 {{{{.TaskBody}}}}
