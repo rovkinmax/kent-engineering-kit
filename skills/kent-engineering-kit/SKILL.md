@@ -129,7 +129,10 @@ generated toolkit workflows.
   Implement/Fix session per independently verifiable slice; the worktree,
   authoritative artifacts, exact task-comment IDs, evidence, and structured
   transition parameters are the handoff. Use `continue_fix` only with the
-  remaining findings. Non-writer approval-recovery loops compact and continue
+  remaining findings. Once that transition creates the next Fix session, its
+  checkpoint action is consumed: a non-empty incoming `fix_context` must become
+  one concrete slice in the same session, never another bookkeeping-only
+  `continue_fix` loop. Non-writer approval-recovery loops compact and continue
   their existing sessions.
 - Read `policies.pr_merge_strategy` before PR preparation. `auto` must resolve
   to exactly one method from repository capabilities, target-branch rules, and

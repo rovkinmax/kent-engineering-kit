@@ -442,6 +442,14 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn("`fix_continue_fix`", prompts["gate_fix"])
         self.assertIn(
+            "Do not create a transition-only session",
+            prompts["gate_fix"],
+        )
+        self.assertIn(
+            "bookkeeping-only evidence",
+            prompts["gate_fix"],
+        )
+        self.assertIn(
             "exactly one independently verifiable PR or branch recovery slice",
             prompts["prepare_pr_fix"],
         )

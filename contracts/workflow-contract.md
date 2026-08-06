@@ -84,6 +84,11 @@ device, source-control, issue-tracker, and release adapters.
   transitions to verification. Each fresh Fix session completes one
   independently verifiable fix slice and uses
   `continue_fix` with only the remaining findings when more work remains.
+- A same-node `continue_fix` checkpoint action is consumed when the transition
+  creates the next Fix session. Non-empty incoming findings are the new work
+  assignment: the session rewrites `next_action` to one concrete slice and
+  completes it. It must not emit bookkeeping-only evidence and repeat the same
+  transition without production or verification work.
 - Recovery-aware Plan may adopt an explicit checkpoint commit and source task.
   It verifies the checkout, updates one authoritative artifact set, records
   which newer comments supersede earlier decisions, and plans only remaining

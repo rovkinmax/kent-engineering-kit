@@ -1565,7 +1565,12 @@ def checkpoint_instruction(profile: ProjectProfile, stage: str) -> str:
         "fix": (
             "Record the pinned baseline, supplied findings, completed fix "
             "slices, fresh green checks, remaining findings, mutation ledger, "
-            "and one next permitted action."
+            "and one next permitted action. A same-node `continue_fix` action "
+            "is consumed when the task re-enters Fix. If the current "
+            "`fix_context` still contains findings, do not repeat that "
+            "transition or append bookkeeping-only evidence: rewrite "
+            "`next_action` to one concrete remaining slice and complete it in "
+            "the current session."
         ),
         "smoke": (
             "Record acceptance stages, lock resource/token state, exact "
@@ -1813,7 +1818,11 @@ acceptance criterion, update the authoritative design/specification/plan first
 and reference the comment ID. Do not redo completed work.
 
 Apply exactly one independently verifiable fix slice and update the
-authoritative fix checklist."""
+authoritative fix checklist. A non-empty incoming `fix_context` is a work
+assignment. If the inherited checkpoint only says to take `fix_continue_fix`,
+that action was consumed by entry into this session: replace it with one
+concrete supplied slice before work. Do not create a transition-only session or
+append evidence for a bookkeeping-only handoff."""
         completion_contract = """
 After one slice, choose `continue_fix` with `workspace_path` and a refreshed
 `fix_context` containing only the remaining findings. Choose `verify` only when
