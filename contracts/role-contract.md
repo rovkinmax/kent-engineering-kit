@@ -22,9 +22,9 @@ Global or project `config.toml` owns:
 The kit supplies contract-complete global implementations for canonical
 operational roles. Kent documents workspace config as higher precedence and it
 may specialize the same role name with platform or repository-specific
-instructions and execution settings. Generated workflow correctness must not
-depend on that override: Kent 2.4 canaries observed scheduler-created direct
-workflow roles selecting the global same-named definition.
+instructions and execution settings. Every effective implementation of a
+canonical role must preserve this contract; generated workflow correctness
+must not depend on a project-only behavioral extension.
 
 Do not add `model:` or `tools:` fields to role-prompt frontmatter. This includes
 legacy provider aliases such as `sonnet`, `opus`, and `haiku`, current Kent
@@ -60,10 +60,9 @@ of those final review responsibilities before the graph fan-out.
 Standards, Specification, and Compliance are direct workflow leaf roles. Their
 config sets `agent_callable = false` and `workflow_subagent = false` so other
 agents cannot target those review roles, while their prompts prohibit the
-review sessions themselves from creating any child role. Kent 2.4 exposes
-delegation depth only as a root setting and has no per-role depth or child-tool
-policy, so the no-child guarantee is behavioral rather than tool-enforced.
-Direct workflow assignment must be revalidated after the next config restart.
+review sessions themselves from creating any child role. Delegation depth is a
+root setting rather than a per-role child policy, so the no-child guarantee is
+behavioral rather than tool-enforced.
 
 Standalone review commands may use project-specialized reviewers when no
 generated Delivery graph owns the same review pass.

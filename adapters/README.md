@@ -87,17 +87,18 @@ postprocessing_mode = "all"
 postprocess_hook = "~/.kent/hooks/gradle-worktree-warning"
 ```
 
-Kent 2.3 resolves relative postprocessor paths from the service process working
+Kent resolves relative postprocessor paths from the service process working
 directory. Use the stable home-relative installed path rather than a
 project-relative path.
 
 ## Jira source adapter
 
-Projects that use Jira as an authoritative planning source declare the
+Projects that use Jira as an authoritative planning source may declare the
 kit-managed read-only adapter:
 
 ```toml
 required_adapters = ["jira_api"]
+kit_managed_adapters = ["jira_api"]
 
 [adapters]
 jira_api = ".kent/adapters/jira/jira-api.sh"
@@ -125,12 +126,17 @@ board, and board-issue ingestion. `issue` includes normalized `issue_links`;
 extracted URL view. Project workflows own task creation, Jira mutation, and
 release-version policy; those operations are not exposed by this adapter.
 
+A project-extended adapter with the same canonical key remains project-owned
+by omitting it from `kit_managed_adapters`. The synchronizer validates the
+executable but never replaces it, even with `--update`.
+
 ## Mobile runtime safety adapters
 
 Android projects with conditional or required runtime Smoke declare:
 
 ```toml
 required_adapters = ["mobile_resource_lock", "mobile_evidence_audit"]
+kit_managed_adapters = ["mobile_resource_lock", "mobile_evidence_audit"]
 
 [adapters]
 mobile_resource_lock = ".kent/adapters/mobile/emulator-resource-lock.sh"
@@ -154,6 +160,9 @@ their workflow contract cannot operate without. These adapters do not choose a
 device policy for the project. Project procedures still define whether an
 emulator may be started, whether a physical device is allowed, the
 APK/application target, and the runtime evidence required.
+
+`kit_managed_adapters` is the explicit subset synchronized from toolkit
+templates. Required adapters outside that list are project-owned.
 
 `mobile_evidence_audit` fails closed when evidence contains broad-log
 artifacts, common authentication/account payload markers, or symlinks. It

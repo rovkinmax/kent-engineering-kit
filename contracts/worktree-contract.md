@@ -1,6 +1,6 @@
 # Worktree Contract
 
-Kent 2.3 owns managed workflow worktrees. Project setup remains responsible for
+Kent owns managed workflow worktrees. Project setup remains responsible for
 making a fresh checkout usable without silently copying unrelated local state.
 
 ## Operations
@@ -10,6 +10,13 @@ making a fresh checkout usable without silently copying unrelated local state.
   session other than the caller. The wrapper removes inherited
   `KENT_SESSION_ID`, `KENT_RUN_ID`, and `KENT_STEP_ID` before invoking the Kent
   CLI.
+- Cleanup closes every task-owned background shell and runs
+  `kent worktree leave` before handing deletion to Task Janitor. Janitor
+  verifies that the Cleanup session no longer targets the task worktree.
+- A zero exit code from `kent worktree delete --json` is not sufficient:
+  `scheduled` is non-terminal. Janitor accepts only `kind=completed` plus an
+  absent worktree path and Git registration; every other result returns to
+  Cleanup.
 - Direct Git worktree commands are allowed only for project-local worktrees that
   Kent does not manage.
 - Never move or rename a Kent-managed worktree behind the service.
@@ -21,7 +28,7 @@ making a fresh checkout usable without silently copying unrelated local state.
   arguments.
 - It prefers Kent's authoritative `KENT_WORKTREE_*` environment values when
   available.
-- It accepts the structured Kent 2.3 JSON payload on stdin. `session_id` may be
+- It accepts Kent's structured JSON setup payload on stdin. `session_id` may be
   null for workflow-created worktrees.
 - It copies or generates only an explicit allowlist of required local files.
 - Credentials and project secrets are not copied by default.

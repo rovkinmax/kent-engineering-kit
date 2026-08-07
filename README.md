@@ -22,8 +22,8 @@ documented in `docs/MODEL-POLICY.md`.
 
 ## Compatibility
 
-- Global prompts, skills, and role definitions remain usable with Kent 2.2.
-- Project profile schema 3 and generated workflows target Kent 2.5 or newer.
+- The supported generated-workflow baseline is Kent 2.5 or newer.
+- Project profiles declare and enforce their exact minimum Kent version.
 - Kent CLI/TUI, service, and Desktop must be upgraded together when crossing
   protocol boundaries.
 - Kent 2.5 requires every transition key to be unique across its whole
@@ -91,12 +91,9 @@ intentionally does not rewrite user configuration.
 
 The global baseline includes bounded implementation, build diagnosis, evidence
 gating, runtime Smoke, release lifecycle operations, PR/cleanup delivery, CI
-monitoring, research, architecture, and independent review roles. These canonical roles are
-contract-complete without project overrides. Kent documents workspace config
-as higher precedence, but Kent 2.4 canaries observed scheduler-created direct
-workflow roles selecting the global definition for a same-named role.
-Workspace specialization remains optional and workflow correctness must not
-depend on it until that behavior is clarified upstream.
+monitoring, research, architecture, and independent review roles. Canonical
+roles are contract-complete without project overrides. Workspace
+specialization remains optional and must preserve the same role contract.
 
 After changing global subagent configuration, restart Kent and reopen Kent
 Desktop. Skills, prompts, and `AGENTS.md` are consumed by new sessions.
@@ -209,10 +206,12 @@ packaging-only report/checklist defects through Evidence Repair and directly
 back to Compliance without rebuilding or reacquiring runtime resources.
 
 Managed-worktree Cleanup is two-phase: the Cleanup agent emits a report and
-session-scoped request, then a deterministic Task Janitor runs after that agent
-exits. It deletes only clean task-owned resources proven recoverable from the
-exact merged PR head, including a stale local HEAD that is its ancestor, and
-preserves every dirty, primary, ambiguous, diverged, or unique resource.
+session-scoped request after closing background shells and leaving the task
+worktree, then a deterministic Task Janitor runs after that agent exits. It
+accepts only a completed Kent deletion with verified postconditions, deletes
+only clean task-owned resources proven recoverable from the exact merged PR
+head, and preserves every dirty, primary, ambiguous, diverged, or unique
+resource.
 
 Verification dispatch validates `workspace_path` before fan-out. The value must
 be the canonical current task repository or execution root; `.todo` artifact
@@ -249,8 +248,9 @@ variants, accounts, and tested flows in project-owned procedures.
 
 ## Current phase
 
-The global toolkit and Kent 2.3+ workflow generator are implemented and
-validated against Kent 2.4. Generated workflows use a shared fan-out/Join/Gate
+The global toolkit and Kent 2.5+ workflow generator are implemented and
+validated by the repository test suite and project canaries. Generated
+workflows use a shared fan-out/Join/Gate
 lifecycle with project-owned profiles, procedures, verification, Smoke, and
 delivery adapters. Taskless generated workflows may be reconciled in place only
 when the Kent CLI can express the change without deleting nodes or edges,

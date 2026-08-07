@@ -5,6 +5,7 @@ workflow_prefix = "Example"
 delivery_profile = "standard"
 platforms = ["generic"]
 required_adapters = []
+kit_managed_adapters = []
 source_control = "github"
 issue_tracker = "none"
 release_topology = "none"
@@ -90,6 +91,7 @@ implement = ".kent/commands/test-coverage.md"
 
 # Projects with MCP policy and Android runtime Smoke use:
 # required_adapters = ["mcp_policy", "mobile_resource_lock", "mobile_evidence_audit"]
+# kit_managed_adapters = ["mobile_resource_lock", "mobile_evidence_audit"]
 # [adapters]
 # mcp_policy = ".kent/adapters/mcp/policy"
 # mobile_resource_lock = ".kent/adapters/mobile/emulator-resource-lock.sh"
@@ -97,6 +99,7 @@ implement = ".kent/commands/test-coverage.md"
 #
 # Projects that ingest Jira source context use:
 # required_adapters = ["jira_api"]
+# kit_managed_adapters = ["jira_api"]
 # [adapters]
 # jira_api = ".kent/adapters/jira/jira-api.sh"
 # [integrations.jira]

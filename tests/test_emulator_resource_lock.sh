@@ -41,8 +41,13 @@ ADB
 chmod +x "$temporary/bin/adb"
 export PATH="$temporary/bin:$PATH"
 
-token="$("$adapter" acquire emulator-5554 0 7200)"
+token="$(
+  KENT_RESOURCE_LOCK_OWNER_PID=424242 \
+    "$adapter" acquire emulator-5554 0 7200
+)"
 [[ -n "$token" ]]
+owner_file="$KENT_RESOURCE_LOCK_DIR/mobile-emulator-5554.lock/owner"
+[[ "$(sed -n 's/^pid=//p' "$owner_file")" == "424242" ]]
 status_output="$("$adapter" status emulator-5554)"
 [[ "$(printf '%s\n' "$status_output" | head -1)" == "locked" ]]
 [[ "$status_output" == *"token=<redacted>"* ]]

@@ -25,6 +25,13 @@ procedure, and authoritative plan before editing.
 - When no writer-owned plan step remains, transition to verification and carry
   any runtime acceptance scope in `review_context`; do not acquire a device,
   build/install for Smoke, or mark the downstream item complete.
+- If task authority makes the run report-only, read-only, audit-only, or
+  forbids repair in the frozen worktree, do not edit tracked or staged files.
+- Missing agent-produced evidence is not user authority work. Reconstruct it
+  only when bounded and safe; otherwise record the gap and use current
+  deterministic evidence.
+- Preserve scope when an adjacent failure is outside task authority. Do not ask
+  whether to absorb it; report the external blocker through the node contract.
 - Delegate only bounded read-only research or build diagnosis when the
   effective Kent configuration permits it.
 

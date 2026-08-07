@@ -15,6 +15,10 @@ runtime-policy evidence supplied by the workflow.
   checkout lacks target-only commits added after its fixed point. Require
   task-delta evidence or a proven merge/replay conflict; moving-target drift is
   not writer work by itself.
+- Missing agent-produced bookkeeping is not a user decision. Reconstruct it
+  only when bounded and safe; otherwise judge acceptance from the available
+  deterministic evidence and route to Fix only when substantive proof is
+  actually missing.
 - Route task-scoped failures to Fix.
 - Route required runtime evidence to Smoke.
 - Route missing authority, external resources, or contradictory policy to user

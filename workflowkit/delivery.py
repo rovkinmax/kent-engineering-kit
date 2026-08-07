@@ -1532,19 +1532,18 @@ def context_instruction(
     evidence_type: str,
 ) -> str:
     manifest = profile.context_manifest(manifest_key)
-    return f"""Start with `{manifest}`. It is this node's context budget:
-read its required sources, load conditional sources only when their trigger
-matches the task, and do not preload files it excludes.
+    return f"""Read `{manifest}` first and stay inside its required and
+conditionally triggered sources.
 
-Before every workflow transition, append one non-empty event to the task's
-append-only evidence ledger with `{profile.command("evidence")} append --task
-{{{{.TaskShortId}}}} --workspace <workspace>`. Use `node_key` `{node_key}`,
-`evidence_type` `{evidence_type}`, the manifest path, and the exact instruction
-files actually read. Preserve duplicate file reads in `files_read` so the
-helper can measure them. Record repeated questions and verification loops;
-use JSON null for model-call or compaction counts when Kent does not expose
-them to this session. Never put secrets, raw authenticated state, or broad logs
-in the ledger."""
+Before transition, pipe one non-empty JSON object to
+`{profile.command("evidence")} append --task {{{{.TaskShortId}}}} --workspace
+<workspace>`. Set `node_key` to `{node_key}`, `evidence_type` to
+`{evidence_type}`, and `context.manifest_path` to `{manifest}`.
+`context.files_read` lists other project instruction files in actual read
+order; do not repeat the manifest there. Record repeated questions and
+verification loops, use null for unavailable model/compaction counters, and
+exclude secrets or broad raw evidence. Append is idempotent for the current
+Kent run; on recovery, reuse the returned sequence/hash and continue."""
 
 
 def branch_identity_resolution_prompt(profile: ProjectProfile) -> str:
@@ -1585,27 +1584,14 @@ def checkpoint_instruction(profile: ProjectProfile, stage: str) -> str:
             "ledger, restoration state, and one next permitted action."
         ),
     }[stage]
-    return f"""Use `{profile.command("checkpoint")}` for a durable ignored
-`{stage}` checkpoint at
-`.kent/runtime/{{{{.TaskShortId}}}}/{stage}-checkpoint.json`.
-
-Before repeating work, run its `validate` and `read` commands when the file
-exists, reconcile the checkpoint with current Git/task/device state, and resume
-only its `next_action`. Before the first expensive or mutating action and after
-every completed bounded stage, pipe one JSON object to its `write` command.
-Every checkpoint contains arrays named `completed`, `remaining`, and
-`mutation_ledger`, plus a non-empty `next_action`; the helper supplies task,
-stage, workspace, schema, and timestamp fields. {stage_details}
-
-Persist the latest checkpoint before every workflow transition, including a
-blocker or finding. Never put credentials, authenticated UI content, raw logs,
-or broad device data in it. Use these exact command forms:
-
-`{profile.command("checkpoint")} validate --stage {stage} --task {{{{.TaskShortId}}}} --workspace <workspace>`
-
-`{profile.command("checkpoint")} read --stage {stage} --task {{{{.TaskShortId}}}} --workspace <workspace>`
-
-`{profile.command("checkpoint")} write --stage {stage} --task {{{{.TaskShortId}}}} --workspace <workspace>`"""
+    return f"""Maintain the ignored `{stage}` checkpoint with
+`{profile.command("checkpoint")} <validate|read|write> --stage {stage} --task
+{{{{.TaskShortId}}}} --workspace <workspace>`. Reconcile an existing checkpoint
+before repeating work. Pipe one JSON object to `write` before the first
+expensive or mutating action, after each bounded stage, and before transition.
+It contains `completed`, `remaining`, and `mutation_ledger` arrays plus one
+non-empty `next_action`. {stage_details} Exclude credentials, authenticated
+content, raw logs, and broad device data."""
 
 
 def work_kind_catalog(profile: ProjectProfile) -> str:
@@ -1776,31 +1762,10 @@ and plan progress. This generated workflow's completion contract overrides any
 legacy procedure transition names such as `audit`.
 {fresh_contract}
 
-Act as the single writer and implement exactly one ready writer-owned plan step
-per node run. Writer-owned steps change code, tests, configuration,
-documentation, or run their deterministic checks. Runtime Smoke and other
-workflow-owned review or delivery items are downstream scope, even when a
-legacy plan accidentally renders them as unchecked checklist entries. Do not
-acquire a device, build/install for Smoke, execute those stages, or mark their
-items complete.
-Do not launch nested final Standards, Specification, Compliance, or
-project-specialized review passes; the generated verification graph owns those
-independent reviews. Bounded implementation, research, and diagnosis
-delegation remains allowed.
-Capture planned pre-edit evidence before the first production edit. If an
-inherited worktree already contains the edit and the earlier agent failed to
-retain its own red-run artifact, do not ask the user to waive that bookkeeping.
-Record the absence, reconstruct it only when bounded and safe, and continue
-with current deterministic evidence unless acceptance remains unproven.
-If task authority declares this run report-only, read-only, audit-only, or
-forbids repair in the frozen worktree, do not edit tracked or staged files.
-Collect only bounded evidence and choose `verify` when the candidate satisfies
-the contract. A candidate defect is reported for a separately authorized
-revision/task; it is never repaired inside this run.
-An adjacent failure outside the authoritative task boundary is not an invitation
-to broaden scope. Preserve the declared boundary and route it directly to
-`needs_user_action`; do not first call `ask_question` merely to offer scope
-expansion.
+Apply the `implementation-worker` role contract to exactly one ready
+writer-owned plan step. Capture any planned pre-edit evidence before the first
+production edit.
+
 After marking that step complete, choose `continue_implementation` with
 `workspace_path`, `plan_path`, and the unchanged `work_kind` when unchecked
 writer-owned ready steps remain. Choose
@@ -1860,25 +1825,9 @@ Workspace: {{{{.Params.workspace_path}}}}. Findings:
 
 {checkpoint}
 
-Remain the single writer. Fix root causes without broadening product scope.
-Before editing, require each supplied finding to identify a concrete
-task-introduced or task-worsened violation. A whole-repository analyzer failure,
-a finding that also exists on the pinned baseline, or an unproven differential
-is not authorization for cleanup. If the finding requires baseline-wide work
-or only exposes contradictory repository policy, do not edit; choose
-`needs_user_action` with the exact policy/evidence blocker.
-If task authority declares the run report-only, read-only, audit-only, or
-forbids repair in the frozen worktree, do not edit tracked or staged files.
-Report the candidate defect and route to `needs_user_action` or approval-gated
-`wont_do` according to that authority so a corrected revision can use a fresh
-task. Never repair the immutable candidate in place.
-An adjacent failure outside the authoritative task boundary is not an invitation
-to broaden scope. Preserve the declared boundary and route it directly to
-`needs_user_action`; do not first call `ask_question` merely to offer scope
-expansion.
-Do not launch nested final Standards, Specification, Compliance, or
-project-specialized review passes; return to the generated verification graph
-after fixing the supplied findings.
+Apply the `fix-worker` role contract only to concrete task-introduced or
+task-worsened findings in `fix_context`. Baseline-wide debt, an unproven
+differential, or contradictory policy is not writer scope.
 {completion_contract}
 Use `needs_user_action` only for an external blocker and provide
 `blocker_reason`. Its approval is a resume signal after the named external
@@ -1911,82 +1860,33 @@ def standards_review_prompt(profile: ProjectProfile) -> str:
         if profile.legacy_review_contract
         else "standards_report"
     )
-    prompt = """Run an independent read-only repository standards review.
+    return f"""Run the independent read-only Standards Review.
 
-__CONTEXT__
+{context_instruction(profile, "review", "standards_review", "review")}
 
-Workspace:
-{{.Params.workspace_path}}. Review context:
-{{.Params.review_context}}
+Workspace: {{{{.Params.workspace_path}}}}
+Review context: {{{{.Params.review_context}}}}
 
-Inspect the change against repository architecture, engineering rules, security,
-and maintainability constraints. Do not edit files and do not run destructive
-commands. Findings are data for Join, not a routing decision.
-
-Pin the immutable task baseline named by the review context or repository
-contract. Use the task fixed point or Kent-resolved execution commit for
-task-delta review; do not substitute a newer merge-target tip. Target-only
-commits added after task start are integration inputs, not task regressions.
-Classify them only when a three-way merge or method-specific replay proves a
-conflict or delivered-tree loss. Never request copying unrelated target files
-into the task diff merely because the task checkout predates them.
-For a whole-repository analyzer or quality gate that fails on the candidate,
-establish whether the same command or equivalent machine-readable findings fail
-on that baseline. A changed file or touched method is not proof that an analyzer
-finding is new.
-
-Use `needs_changes` only for concrete task-introduced or task-worsened
-violations, with the rule, path, and differential evidence. For metric findings,
-`worsened` means the same rule/path/declaration has a larger measured value.
-For non-metric findings, it means a new normalized declaration signature or a
-larger occurrence count. Line shifts do not count, and an improved total does
-not waive an individual worsened finding. If the baseline has the same failure
-and no task delta is proven, report the baseline debt as non-blocking and use
-`passed` for the task-scoped standards result. If an explicit project rule
-requires an absolutely clean repository independent of baseline but the
-baseline itself violates that rule, use `blocked` and identify the
-repository-policy contradiction; never route baseline-wide cleanup to Fix.
+Apply the `standards-reviewer` role contract to the supplied task delta and its
+pinned baseline. Do not edit files. Findings are data for Join, not a routing
+decision.
 
 Complete only with `reported`. Provide `standards_status` as exactly `passed`,
-`needs_changes`, or `blocked`, plus `__REPORT_KEY__` with evidence and
-path-specific findings."""
-    return (
-        prompt.replace("__REPORT_KEY__", report_key)
-        .replace(
-            "__CONTEXT__",
-            context_instruction(
-                profile,
-                "review",
-                "standards_review",
-                "review",
-            ),
-        )
-    )
+`needs_changes`, or `blocked`, plus `{report_key}` with rule, path, and
+differential evidence."""
 
 
 def spec_review_prompt(profile: ProjectProfile) -> str:
-    return f"""Run an independent read-only specification review.
+    return f"""Run the independent read-only Specification Review.
 
 {context_instruction(profile, "review", "spec_review", "review")}
 
-Workspace: {{{{.Params.workspace_path}}}}. Review context:
-{{{{.Params.review_context}}}}
+Workspace: {{{{.Params.workspace_path}}}}
+Review context: {{{{.Params.review_context}}}}
 
-Check acceptance criteria, product behavior, edge cases, and scope fidelity
-independently from repository standards. Do not edit files. Findings are data
-for Join, not a routing decision.
-
-A design, specification, or plan may narrow or supersede the task body only
-when it cites the exact human-authored task-comment ID or another explicit
-authoritative source. Agent-authored summaries and unsupported claims that
-"the user clarified" are not authority. Report missing provenance as
-`blocked`; do not accept the narrowed scope or route it to writer Fix.
-
-Use the task fixed point or Kent-resolved execution commit for task-delta scope,
-not a newer merge-target tip. Missing target-only commits in an older task
-checkout are not specification regressions unless a three-way merge or
-method-specific replay proves delivered-tree loss. Do not request copying
-unrelated target files into the task diff.
+Apply the `spec-reviewer` role contract to the supplied task authority,
+acceptance evidence, and task delta. Do not edit files. Findings are data for
+Join, not a routing decision.
 
 Complete only with `reported`. Provide `spec_status` as exactly `passed`,
 `needs_changes`, or `blocked`, plus `review_report` with evidence and concrete
@@ -2024,26 +1924,11 @@ Verification report: {{{{.Params.verification_report}}}}
 {standards}
 {spec}
 
-Choose a delivery transition only when every enabled status is `passed`.
-Choose `needs_changes` only when a report proves concrete task-introduced or task-worsened findings.
-Do not convert a whole-repository analyzer failure,
-pre-existing baseline debt, or an unproven differential into writer work.
-Do not convert target-only commits missing from an older task checkout into
-writer work without a proven merge/replay conflict or delivered-tree loss.
-Repository-policy contradictions that require an actual external decision
-route to `needs_user_action`, not Fix. Missing agent-produced evidence,
-including an uncaptured pre-edit red run, is not an external blocker. Record
-the absence, reconstruct it only when bounded and safe, and choose
-`needs_changes` only when the available evidence cannot prove acceptance.
-Follow the user-facing workflow communication contract from AGENTS.md.
-Keep full technical reports in `review_context`. Transition commentary and
-`blocker_reason` must be concise, use the user's preferred conversation
-language, and name only decisions or external actions the user can actually
-perform. Number independent decisions and state what happens after approval.
-Do not paste raw review reports or present task-scoped code fixes as user
-actions; preserve those findings for the normal Fix route after authority is
-resolved. An external dependency blocks only the stage whose acceptance
-contract actually requires it.
+Apply the `workflow-gate` role contract. Choose a delivery transition only when
+every enabled status is `passed`. Do not poll or classify PR CI here; delivery
+owns CI after PR preparation. Keep full reports in `review_context` and make
+user-facing commentary name only a real decision or external action.
+
 Provide `workspace_path`, a refreshed `review_context` summarizing all reports,
 and the required Smoke decision fields. The refreshed `review_context` must
 record the profile Smoke policy, selected transition, rationale, and required
@@ -2099,25 +1984,10 @@ Workspace: {{{{.Params.workspace_path}}}}. Final review context:
 
 {procedure_instruction(profile, "compliance")}
 
-This is a thin final attestation, not another general code, architecture,
-specification, or runtime review. Verify the authority hierarchy and final
-worktree diff; confirm that {evidence_chain}, Gate, and any required Smoke
-completed with adequate evidence; confirm that a Smoke bypass has a concrete
-rationale; and check that no unresolved blocker, approval, unauthorized
-rule/spec change, or workflow obligation remains. Do not edit files or perform
-state-changing actions.
-
-A specification or plan may narrow or supersede the task body only with an
-exact human-authored task-comment ID or another explicit authoritative source.
-Agent-authored summaries and unsupported claims that "the user clarified" are
-not product authority.
-
-Missing agent-produced evidence is not a user decision. If a pre-edit red run
-was required but not retained, verify whether current deterministic evidence
-still proves the acceptance contract. Use `repair_evidence` for a
-packaging-only record gap or `needs_changes` when substantive acceptance is
-unproven; do not use `needs_user_action` merely to ask the user to waive the
-workflow's own missing artifact.
+Apply the `compliance_reviewer` role contract as a thin final attestation, not
+another broad review. Verify the final diff, authority hierarchy,
+{evidence_chain}, Gate, and any required Smoke or documented bypass. Do not
+edit files or perform state-changing actions.
 
 Choose `ship_pr` only when the final work product is compliant. Provide
 `workspace_path`, a complete `review_context`, and `compliance_report`. Choose
@@ -2207,10 +2077,9 @@ Updated review context: {{{{.Params.review_context}}}}
 
 {procedure_instruction(profile, "compliance")}
 
-Use the retained Compliance context. Inspect only the repaired evidence
-artifacts and confirm they now agree with the already-passed substantive
-results. Do not repeat code, architecture, specification, build, or runtime
-review.
+Apply the retained `compliance_reviewer` role context only to the repaired
+evidence artifacts. Confirm they agree with already-passed substantive results;
+do not repeat code, architecture, specification, build, or runtime review.
 
 Choose `ship_pr` with `workspace_path`, `review_context`, and
 `compliance_report` when the package is complete. Choose `repair_evidence`
@@ -2260,40 +2129,17 @@ prompt; do not infer issue linkage from branch text alone.
 
 Configured PR merge policy: `{merge_policy}`.
 
-Resolve the merge strategy once before publishing. Supported resolved values
-are `merge`, `squash`, and `rebase`. For `auto`, query the source-control
-system's repository capabilities, target-branch protection/rulesets, and any
-required merge-queue method. On GitHub this includes the allowed merge methods,
-`required_linear_history`, merge-queue configuration when applicable, and the
-target PR's method-specific state. Serialize the GitHub evidence as
-`repository`, `branch_protection`, applicable `rulesets`, and `merge_queue`,
-then run:
+Apply the `delivery-operator` role contract. Resolve the strategy once before
+publishing. On GitHub, serialize repository capabilities, target branch
+protection, applicable rulesets, merge queue, and PR method state, then run:
 
 `~/.kent/bin/kent-resolve-github-merge-strategy --policy {merge_policy}`
 
 The adapter's structured result is authoritative for strategy selection.
 Continue only when it returns `outcome=resolved`; for
 `outcome=needs_user_action`, preserve its code, candidates, and reason instead
-of manually choosing. An explicit policy still must be enabled and compatible
-with target-branch rules.
-
-Validate the selected method, not merely generic mergeability:
-
-- `merge` requires merge commits to be enabled, permitted by branch rules, and
-  a clean final-tree merge;
-- `squash` requires squash merging to be enabled and a clean final-tree merge;
-- `rebase` requires rebase merging to be enabled and the exact branch commits
-  to replay cleanly onto the current target branch. On GitHub, query
-  `canBeRebased`; `mergeable=MERGEABLE` or `mergeStateStatus=CLEAN` alone does
-  not prove rebase feasibility.
-
-Before an initial rebase-strategy push, test the prospective history in an
-isolated temporary clone or branch with a forced replay onto the fresh target
-tip. Do not mutate the task branch while diagnosing. A clean merge-tree or
-target-ancestor check is not a substitute for replaying the commits. After
-creating or updating the PR, requery method-specific feasibility. Route a
-task-history conflict to `needs_changes`; never dismiss a user's rebase-conflict
-report using generic mergeability.
+of manually choosing. Validate the resolved method through the role's
+method-specific contract before and after creating or updating the PR.
 
 Before committing, prove that the checkout is on a task-owned branch permitted
 by the project contract. A source workspace, detached checkout, protected
@@ -2321,25 +2167,13 @@ Deterministic CI report: {{{{.Params.ci_report}}}}
 
 {procedure_instruction(profile, "ci")}
 
-Use the project source-control adapter. Never merge or push. The deterministic
-CI Watch node already waited for terminal state; do not start another polling
-loop or ask the user to approve one. Re-read only the exact PR/run/job metadata
-and bounded failure logs required to classify its report.
-
-This workflow authorizes a bounded retry of an exact GitHub Actions job only
-when first-party metadata and bounded logs prove infrastructure cancellation:
-the execution step is `cancelled` or bounded logs report
-`The runner has received a shutdown signal` / `The operation was canceled`,
-there is no test, analyzer, compiler, or product diagnostic, the run and head
-SHA are unchanged, and the run was not user-cancelled or superseded. Pin the
-run attempt and job ID, then use
-`gh run rerun <run-id> --job <job-id>` so genuine failed siblings are not
-repeated. Allow at most two automatic retries per logical job. Wait for each
-retry through `watch_ci`: provide `workspace_path`, `pr_url`, `branch_name`,
-and `merge_strategy`, then let the deterministic watcher wait. Include the
-attempt ledger in the next `ci_report`. Never retry a genuine or ambiguous
-failure, and do not ask the user merely to initiate an eligible infrastructure
-retry.
+Apply the `ci-monitor` role contract to this exact terminal watcher report.
+Do not start another polling loop or ask for approval merely to wait. Re-read
+only the exact PR/run/job metadata and bounded failed-job logs. If the role's
+bounded exact-job retry policy applies, perform one permitted retry and choose
+`watch_ci` with `workspace_path`, `pr_url`, `branch_name`, and
+`merge_strategy`; the deterministic watcher owns the wait. Preserve every
+attempt and failure fingerprint in the next `ci_report`.
 
 Query authoritative PR merge state before classifying any failed or late check.
 If the PR is already merged, never route the merged task branch to Fix. Complete
@@ -2347,18 +2181,13 @@ with `pr_merged` and provide `workspace_path`, `pr_url`, `branch_name`, and a
 `merge_report` that includes merge proof plus the late CI state. Any actionable
 post-merge regression belongs in a separate follow-up task.
 
-While the PR remains open, revalidate the resolved method against current
-repository capabilities, target branch rules, merge queue, and PR state. For
-GitHub rebase delivery,
-`canBeRebased=true` is required; generic `MERGEABLE/CLEAN` is insufficient.
-Complete with `waiting_pr` only when all required checks are conclusively green
-and the selected method remains feasible. Provide `workspace_path`, `pr_url`,
-`branch_name`, `merge_strategy`, and `ci_report`. Use `needs_changes` with
-`workspace_path` and `fix_context` only when task-differential evidence proves
-the task introduced or worsened a code or history failure. Baseline, flaky,
-unrelated, or unattributed failures use `needs_user_action` with
-`blocker_reason`, as do external failures, policy ambiguity, or access
-problems. Never use `needs_user_action` merely because CI is still running."""
+While the PR remains open, complete with `waiting_pr` only when all required
+checks are green and the resolved method remains feasible. Provide
+`workspace_path`, `pr_url`, `branch_name`, `merge_strategy`, and `ci_report`.
+Use `needs_changes` with `workspace_path` and `fix_context` only for a proven
+task-differential code or history failure. After retry exhaustion, use
+`needs_user_action` only for a real external blocker or decision.
+Never use `needs_user_action` merely because CI is still running."""
 
 
 def waiting_pr_prompt(profile: ProjectProfile) -> str:
@@ -2381,18 +2210,9 @@ Workspace: {{{{.Params.workspace_path}}}}
 
 {procedure_instruction(profile, "waiting_pr")}
 
-Do not merge or push. Revalidate the resolved method independently from generic
-mergeability. For GitHub `rebase`, require `canBeRebased=true`;
-`mergeable=MERGEABLE`, `mergeStateStatus=CLEAN`, a clean merge-tree, or proof
-that the target branch is already an ancestor does not establish replay
-feasibility. For `merge` and `squash`, verify that the selected method remains
-enabled, allowed by branch rules or the merge queue, and final-tree mergeable.
-
-Treat a user report that the selected merge method is blocked as evidence to
-investigate, not as a claim to dismiss. If source-control signals disagree,
-reproduce a rebase failure only in an isolated temporary clone or branch using
-a forced replay onto the fresh target tip. Do not mutate the task branch during
-diagnosis.
+Apply the `ci-monitor` role contract. Do not merge or push. Revalidate the
+resolved method using method-specific evidence; investigate contradictory
+source-control or user-reported feasibility without mutating the task branch.
 
 {ci_recheck}
 
@@ -2460,6 +2280,12 @@ task-owned clean managed worktree and local branch when recoverability is
 proven. For `merged`, it may also delete the same-repository remote task branch
 only when GitHub reports the exact branch head in the merged PR and the remote
 head has not changed.
+
+Before `run_janitor`, close or terminate every task-owned background shell or
+kept-open tool session, then run `kent worktree leave` from this Cleanup
+session. Treat a failed leave request as an infrastructure blocker. The
+Janitor will refuse deletion while this session still targets the task
+worktree.
 
 Complete with `run_janitor` and provide:
 
@@ -2641,6 +2467,10 @@ ambiguous state, or content not proven recoverable. Do not remove the managed
 worktree or local branch inside this agent session. The deterministic Task
 Janitor runs only after this resource-owning Cleanup session exits.
 
+Close every task-owned background shell or kept-open tool session and run
+`kent worktree leave` from this Cleanup session before `run_janitor`. The
+Janitor must observe this session outside the task worktree before deletion.
+
 Complete with `run_janitor` and provide canonical `workspace_path`;
 `task_short_id` as `{{{{.TaskShortId}}}}`; `pr_url`; `branch_name`;
 `merge_report` including the publication proof; `cleanup_mode` as `merged`;
@@ -2662,10 +2492,13 @@ Blocker:
 {procedure_instruction(profile, "cleanup")}
 
 Use the retained Cleanup context. Do not directly remove a Kent-managed
-worktree from this agent session. If the infrastructure failure is transient
-and the same safety proofs still hold, choose `run_janitor` again with the
-complete canonical parameter contract. Otherwise choose `needs_user_action`
-with the exact blocker. Preserve every ambiguous or unique resource."""
+worktree from this agent session. Close every task-owned background shell or
+kept-open tool session. If this session still targets the task worktree, run
+`kent worktree leave` before retrying. If the infrastructure failure is
+transient and the same safety proofs still hold, choose `run_janitor` again
+with the complete canonical parameter contract. Otherwise choose
+`needs_user_action` with the exact blocker. Preserve every ambiguous or unique
+resource."""
 
 
 def pr_recovery_fix_prompt(

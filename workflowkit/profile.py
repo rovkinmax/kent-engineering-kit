@@ -47,6 +47,7 @@ class ProjectProfile:
     delivery_profile: str
     platforms: tuple[str, ...]
     required_adapters: tuple[str, ...]
+    kit_managed_adapters: tuple[str, ...]
     source_control: str
     issue_tracker: str
     release_topology: str
@@ -122,6 +123,9 @@ class ProjectProfile:
             platforms=tuple(require_string_list(raw, "platforms")),
             required_adapters=tuple(
                 require_string_list(raw, "required_adapters")
+            ),
+            kit_managed_adapters=tuple(
+                require_string_list(raw, "kit_managed_adapters")
             ),
             source_control=require_string(raw, "source_control"),
             issue_tracker=require_string(raw, "issue_tracker"),
@@ -214,6 +218,18 @@ class ProjectProfile:
             )
         if len(set(self.required_adapters)) != len(self.required_adapters):
             raise SpecError("required_adapters must not contain duplicates")
+        if len(set(self.kit_managed_adapters)) != len(
+            self.kit_managed_adapters
+        ):
+            raise SpecError("kit_managed_adapters must not contain duplicates")
+        unmanaged_requirements = set(self.kit_managed_adapters) - set(
+            self.required_adapters
+        )
+        if unmanaged_requirements:
+            raise SpecError(
+                "kit_managed_adapters must be required adapters: "
+                f"{sorted(unmanaged_requirements)}"
+            )
         for adapter_key in self.required_adapters:
             configured_path = self.adapter(adapter_key)
             if not configured_path:

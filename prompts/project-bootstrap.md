@@ -29,7 +29,7 @@ Recommend the smallest suitable delivery profile:
 Identify platform adapters such as Android, Web, iOS, embedded, or generic
 shell commands. Ask the user to decide only material choices.
 
-Use the canonical Kent 2.3 execution-target recommendations from the toolkit
+Use the canonical Kent 2.5 execution-target recommendations from the toolkit
 workflow contract. Record the selected default and workflow-kind overrides in
 the project profile instead of copying the policy into project documentation.
 
@@ -41,22 +41,24 @@ After approval, create:
 - `.kent/workflow-profile.toml`;
 - `.kent/scripts/workflow-verification-dispatch` from the toolkit template;
 - deterministic `.kent/scripts/workflow-verify-report`;
-- optional idempotent `.kent/worktrees/setup.sh` using the Kent 2.3 payload
+- optional idempotent `.kent/worktrees/setup.sh` using the Kent setup payload
   contract;
 - optional smoke, resource-lock, evidence-audit, PR, and release adapters;
 - project-local role implementations using the canonical role keys.
 
 For projects that use Jira as a planning source, declare `jira_api` in
-`required_adapters`, configure `[integrations.jira]` with the tenant URL and
-credential namespace or 1Password pointers, and synchronize it with
-`scripts/sync-project-adapters`. Keep issue ingestion policy in the project
-skill or Plan procedure; the shared adapter is read-only.
+`required_adapters`. Add it to `kit_managed_adapters` only when the project uses
+the shared read-only template; an extended project adapter remains
+project-owned. Configure `[integrations.jira]` with the tenant URL and
+credential namespace or 1Password pointers. Keep issue ingestion policy in the
+project skill or Plan procedure.
 
 For Android projects with conditional or required Smoke, declare
 `mobile_resource_lock` and `mobile_evidence_audit` in `required_adapters` and
-`[adapters]`, synchronize them with `scripts/sync-project-adapters`, and keep
-device selection plus APK/package details in the project procedure. The
-procedure must reject unfiltered logs and unexpected sensitive UI evidence.
+`kit_managed_adapters`, map them in `[adapters]`, synchronize them with
+`scripts/sync-project-adapters`, and keep device selection plus APK/package
+details in the project procedure. The procedure must reject unfiltered logs
+and unexpected sensitive UI evidence.
 
 Do not create or link live workflows until the project profile validates.
 Preview with `scripts/generate-workflow` before applying a versioned non-default

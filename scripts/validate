@@ -332,6 +332,15 @@ if not isinstance(required_adapters, list) or not all(
     isinstance(value, str) and value for value in required_adapters
 ):
     raise AssertionError("profile.required_adapters must be a string array")
+kit_managed_adapters = profile.get("kit_managed_adapters")
+if not isinstance(kit_managed_adapters, list) or not all(
+    isinstance(value, str) and value for value in kit_managed_adapters
+):
+    raise AssertionError("profile.kit_managed_adapters must be a string array")
+if not set(kit_managed_adapters).issubset(required_adapters):
+    raise AssertionError(
+        "profile.kit_managed_adapters must be required adapters"
+    )
 if profile.get("policies", {}).get("smoke") not in {
     "disabled",
     "conditional",

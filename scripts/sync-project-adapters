@@ -129,6 +129,31 @@ def main() -> int:
         raise ValueError(f"project profile not found: {profile_path}")
 
     profile = tomllib.loads(profile_path.read_text())
+    managed_adapters = profile.get("kit_managed_adapters")
+    if not isinstance(managed_adapters, list) or not all(
+        isinstance(key, str) and key.strip() for key in managed_adapters
+    ):
+        raise ValueError(
+            "profile kit_managed_adapters must be an array of non-empty strings"
+        )
+    managed_adapter_keys = {key.strip() for key in managed_adapters}
+    if len(managed_adapter_keys) != len(managed_adapters):
+        raise ValueError("profile kit_managed_adapters must not contain duplicates")
+    required_adapters = profile.get("required_adapters")
+    if not isinstance(required_adapters, list) or not all(
+        isinstance(key, str) and key.strip() for key in required_adapters
+    ):
+        raise ValueError(
+            "profile required_adapters must be an array of non-empty strings"
+        )
+    unmanaged_requirements = managed_adapter_keys - {
+        key.strip() for key in required_adapters
+    }
+    if unmanaged_requirements:
+        raise ValueError(
+            "kit_managed_adapters must be required adapters: "
+            f"{sorted(unmanaged_requirements)}"
+        )
     results = {"adapters": [], "commands": []}
     for table_name, templates in (
         ("adapters", ADAPTER_TEMPLATES),
@@ -145,7 +170,14 @@ def main() -> int:
             if not configured_path.strip():
                 continue
             target = project_target(project_root, configured_path.strip())
-            if key in templates:
+            if table_name == "adapters" and key in managed_adapter_keys:
+                if key not in templates:
+                    raise ValueError(
+                        f"no toolkit template exists for managed adapter {key!r}"
+                    )
+                source = templates[key]
+                status_label = synchronize(source, target, update=args.update)
+            elif table_name == "commands" and key in templates:
                 source = templates[key]
                 status_label = synchronize(source, target, update=args.update)
             elif table_name == "commands":
@@ -167,6 +199,14 @@ def main() -> int:
                     "target": str(target),
                 }
             )
+
+    configured_adapters = profile.get("adapters", {})
+    missing_managed_adapters = managed_adapter_keys - set(configured_adapters)
+    if missing_managed_adapters:
+        raise ValueError(
+            "kit_managed_adapters are missing from adapters: "
+            f"{sorted(missing_managed_adapters)}"
+        )
 
     print(
         json.dumps(

@@ -20,6 +20,10 @@ and exact verification findings before editing.
   deterministic verification that proves the repair.
 - Treat unsupported, contradictory, baseline-only, or externally blocked
   findings as blockers instead of changing production code.
+- If task authority makes the run report-only, read-only, audit-only, or
+  forbids repair in the frozen worktree, do not edit tracked or staged files.
+- Preserve scope when an adjacent failure is outside task authority. Do not ask
+  whether to absorb it; report the blocker through the node contract.
 - Do not duplicate workflow-owned Standards, Specification, Compliance, or
   runtime Smoke stages.
 - Do not commit, push, merge, publish, or perform external side effects unless

@@ -29,21 +29,32 @@ state monitor.
   the late CI result in merge context and continue to Cleanup; a genuinely
   actionable regression belongs in a separate follow-up task.
 - Revalidate the configured merge method using method-specific evidence.
+- For GitHub rebase delivery require `canBeRebased=true`; generic
+  `MERGEABLE/CLEAN`, a clean merge tree, or target ancestry is insufficient.
 - Do not edit files, commit, push, rerun arbitrary jobs, merge, or start child
-  agents. A workflow may explicitly authorize a bounded retry of an exact job
-  when first-party metadata and logs prove an infrastructure cancellation
-  rather than a test, analyzer, build, or product failure.
+  agents. The workflow authorizes a bounded retry only for one exact job on an
+  unchanged PR head when either:
+  - first-party metadata and bounded logs prove infrastructure cancellation;
+    or
+  - the job is unambiguously the project's UI, instrumentation, connected,
+    smoke, or unit-test job and the failure occurred during test execution.
+- Eligible test-execution failures include assertions, fixture/setup or
+  teardown exceptions, emulator/device failures, transport errors, timeouts,
+  and external service `5xx` responses. The retry is a reproducibility check;
+  it does not erase the first failure fingerprint.
 - For an authorized GitHub retry, pin the unchanged run, head SHA, attempt, and
-  job ID. Require the failed step to be `cancelled` or the bounded log to end
-  with infrastructure evidence such as
-  `The runner has received a shutdown signal` /
-  `The operation was canceled`, with no task diagnostic. Use
-  `gh run rerun <run-id> --job <job-id>` so genuine failed siblings are not
-  repeated. Allow at most two automatic retries per logical job, wait for each
-  retry to finish, and record every attempt in the CI report.
-- Never automatically retry a user-cancelled or superseded run, a genuine
-  assertion/analyzer/compiler failure, an ambiguous cancellation, or a job
-  after the retry budget is exhausted.
+  job ID. Infrastructure evidence includes a `cancelled` execution step,
+  `The runner has received a shutdown signal`, or
+  `The operation was canceled`. Use
+  `gh run rerun <run-id> --job <job-id>` so passing or differently failing
+  siblings are not repeated. Allow at most two automatic reruns after the
+  original attempt, for three total attempts per logical job. Return each retry
+  to the deterministic watcher and record every attempt and failure fingerprint
+  in the CI report.
+- Never automatically retry a user-cancelled or superseded run, an analyzer,
+  compiler, build-configuration, dependency-resolution, packaging, publishing,
+  or release failure, a failure before eligible tests actually started, an
+  ambiguous job identity, or a job after the retry budget is exhausted.
 - While the PR is still open, route a failed check to Fix only when
   task-differential evidence proves the task introduced or worsened it.
   Unrelated, baseline, flaky, or unattributed failures route to user action.

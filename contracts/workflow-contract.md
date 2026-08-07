@@ -3,6 +3,10 @@
 The common workflow layer is platform-neutral. Projects supply build, test,
 device, source-control, issue-tracker, and release adapters.
 
+This is the maintainer-facing normative source for the generator. Normal
+workflow nodes receive their role prompt, generated edge prompt, active context
+manifest, and project procedures; they do not preload this whole contract.
+
 ## Lifecycle
 
 - Kent task state owns workflow lifecycle.
@@ -82,8 +86,8 @@ device, source-control, issue-tracker, and release adapters.
 - `policies.writer_sessions = "continuous"` preserves the historical behavior:
   writer transitions reuse or compact an existing session.
 - `policies.writer_sessions = "fresh_per_slice"` starts a fresh session for
-  every Implement step and every Fix slice, including CI, Smoke, Compliance,
-  PR-feedback, and PR-recovery fixes.
+  every Implement step and every Fix slice, including PR-feedback and
+  PR-recovery fixes.
 - The policy does not alter approval-recovery continuity for Plan, Smoke,
   Compliance, PR preparation/monitoring, CI monitoring, or Cleanup. Those
   non-writer loops compact and continue their current session.
@@ -162,8 +166,11 @@ device, source-control, issue-tracker, and release adapters.
 - Agent nodes append one non-empty event before every workflow transition
   through the profile-owned evidence command. Evidence is JSONL, hash-chained,
   Git-ignored, and append-only. A later slice never edits an earlier event.
-- Each event records task/node identity, Git HEAD, summary, artifacts, checks,
-  decisions, exact project instruction files read, project instruction bytes,
+- Append is idempotent for the active `KENT_RUN_ID`. Provider recovery or
+  repeated completion of the same workflow run returns the original sequence
+  and hash instead of appending a second event.
+- Each event records task/node/Kent-run identity, Git HEAD, summary, artifacts,
+  checks, decisions, exact project instruction files read, instruction bytes,
   repeated reads, repeated questions, and verification loops.
 - `model_calls` and `compaction_count` remain nullable until Kent exposes
   stable session telemetry to workflow commands. Unknown values are recorded
@@ -223,7 +230,7 @@ device, source-control, issue-tracker, and release adapters.
 
 ## Execution targets
 
-- Generated workflows always set an explicit Kent 2.3 execution-target policy.
+- Generated workflows always set an explicit Kent 2.5 execution-target policy.
 - The profile supplies a default and may override it by workflow kind.
 - Supported policy values are `ask-on-first-execution`, `none`, `head`,
   `default-branch`, and `ref:<revision>`.
@@ -391,16 +398,26 @@ device, source-control, issue-tracker, and release adapters.
 - Pending, queued, and in-progress CI are not blockers or transitions. CI uses
   one blocking first-party watcher for the exact PR/run and waits for terminal
   green/red/canceled state without spending a model turn per poll.
-- CI may automatically retry an exact failed GitHub Actions job when
-  first-party job metadata and bounded logs prove an infrastructure
-  cancellation: the execution step is `cancelled` or bounded logs report
-  `The runner has received a shutdown signal` / `The operation was canceled`,
-  no test/analyzer/compiler diagnostic exists, the run and head SHA are
-  unchanged, and the run was not user-cancelled or superseded. Retry only that
-  job with `gh run rerun <run-id> --job <job-id>`,
-  at most twice per logical job, waiting and re-reading authoritative state
-  after each attempt. Genuine or ambiguous failures and exhausted retries are
-  never hidden by automatic reruns.
+- CI may automatically retry one exact failed GitHub Actions job on an
+  unchanged PR head when first-party metadata and bounded logs prove either an
+  infrastructure cancellation or an eligible test-execution failure.
+  Infrastructure signatures include a `cancelled` execution step,
+  `The runner has received a shutdown signal`, and
+  `The operation was canceled`. Eligible test jobs are the project's
+  unambiguous UI, instrumentation, connected, smoke, or unit-test jobs after
+  tests actually started; their retryable failures include assertions,
+  fixture/setup or teardown exceptions, emulator/device failures, transport
+  errors, timeouts, and external service `5xx` responses.
+- Retry only that
+  job with `gh run rerun <run-id> --job <job-id>`, at most
+  twice after the original attempt, for three total attempts per logical job.
+  Return every retry to the deterministic watcher and preserve every attempt
+  and failure fingerprint in the CI report. A later green attempt does not
+  erase the earlier flaky or transient evidence.
+- Never automatically retry a user-cancelled or superseded run, an analyzer,
+  compiler, build-configuration, dependency-resolution, packaging, publishing,
+  or release failure, a failure before eligible tests actually started, an
+  ambiguous job identity, or a job after the retry budget is exhausted.
   `needs_user_action` is reserved for authentication, access, ambiguous
   identity, contradictory policy, or another actual human decision.
 - An open, green, method-feasible pull request transitions from Waiting PR to
@@ -431,33 +448,6 @@ device, source-control, issue-tracker, and release adapters.
   artifact or user-observable behavior.
 - Resource unavailability never downgrades a Smoke requirement; the Smoke node
   routes it to `needs_user_action`.
-- Runtime evidence is least-privilege. Do not persist unfiltered device or
-  system logs, network payloads, authentication headers, or full UI dumps from
-  an unexpected authenticated or otherwise sensitive state.
-- The global MCP adapter logs call metadata and creates no separate raw
-  artifact by default, but normal stdout remains in the Kent shell transcript.
-  Sensitive calls use quiet, digest, or assertion output modes. Raw stdout or
-  artifact retention requires explicit confirmation that the response is both
-  necessary and non-sensitive.
-- When runtime proof needs identity-set comparison without disclosure, hash
-  only an allowlisted semantic-token pattern inside the adapter and emit opaque
-  hashes plus explicit pagination-marker booleans.
-- Project procedures retain only the scoped liveness, crash, ANR, and
-  acceptance evidence required for the decision. Unexpected sensitive state
-  produces a redacted blocker and `needs_user_action`.
-- Smoke runs are bounded acceptance checks, not open-ended exploration. Split
-  broad runtime scopes into explicit stages or request focused manual evidence.
-  If a durable user comment already supplies the only missing observation,
-  consume it without rebuilding, reinstalling, or repeating navigation.
-- Runtime interaction evidence follows `mobile-smoke-contract.md`.
-  Source-derived exact focus routes and target-aware adaptive bursts are valid;
-  ungrounded fixed loops, one model turn per key, and visibility-only
-  assertions are not. A user-reported contradiction must be resolved by
-  focused evidence before Compliance can advance delivery.
-- Focused screenshots are normal Smoke inspection and require no approval.
-  Scoped screenshots from a project-declared non-production stage/test
-  environment with synthetic data may be retained as audited workflow evidence.
-  Other retention and external publication follow `mobile-smoke-contract.md`.
 - Gate and Smoke allocate evidence by modality. Runtime covers rendering,
   focus/navigation, integration, restoration, and liveness. Passing
   deterministic evidence may cover non-observable defaults, classification,
@@ -465,33 +455,12 @@ device, source-control, issue-tracker, and release adapters.
   acceptance requires runtime proof. The workflow never demands profile reset,
   special fixtures, or test-only product semantics merely to duplicate that
   evidence.
-- Required summary, report, and checklist artifacts are non-empty before
-  Compliance accepts them.
-- Persist a concise checkpoint before a long Smoke continuation so resume does
-  not repeat completed lock, build, install, targeting, or evidence work.
-- The checkpoint is reconciled before reuse and records bounded acceptance
-  stages, exact resource ownership, sanitized evidence, restoration state, and
-  an external-action ledger. Secrets and broad authenticated state are excluded.
-- A deterministic project-local evidence audit must pass before Smoke reports
-  success or a blocker. Unsafe raw files are removed or redacted while the
-  non-sensitive summary and lock-release evidence remain.
-- Mobile target confirmation is transport-aware. The default global mcporter
-  adapter is stateless: the locked serial must be present in device discovery,
-  and every target-specific call carries the same explicit platform and device
-  ID. Process-local selection and target-query state must not be compared
-  across separate ephemeral calls. A persistent transport may additionally use
-  documented selection acknowledgement and target queries, but never replaces
-  explicit per-call device addressing. Do not require undocumented display
-  labels such as `ACTIVE`.
-- If the selected MCP schema does not expose an explicit device ID for a
-  target-specific action, that action must use the exact project platform
-  adapter instead. For Android this means `adb -s <locked-serial>`; an implicit
-  Mobile MCP `system` target cannot satisfy the contract.
-- Device-side timestamp and log-boundary syntax is platform-adapter behavior,
-  not a portable workflow contract. Validate the exact command before treating
-  it as an evidence gate; command or parsing failure is a Smoke blocker, never
-  an empty passing signal report.
-- Platform-specific classification and execution rules remain project adapters.
+- `mobile-smoke-contract.md` owns default authorization, interaction proof,
+  screenshots, side effects, evidence retention, checkpoint recovery, and
+  shared-resource behavior. Project adapters own platform-specific targeting,
+  commands, schemas, form factors, logs, and timestamp boundaries.
+- Required Smoke summaries, reports, and checklists are non-empty and pass the
+  project evidence audit before Compliance.
 - `Engineering Smoke Lab` preserves the project Smoke policy while disabling
   PR and CI stages, so both Gate branches can be tested cheaply.
 - Smoke Lab rollover uses free-form experimental labels, not semantic versions.
@@ -506,14 +475,10 @@ device, source-control, issue-tracker, and release adapters.
 - CI monitoring and Waiting PR use `ci`.
 - A node assigned to a profile role owns its transition directly and does not
   start a duplicate child session for that same role.
-- Role prompts define behavior; Kent configuration owns model, reasoning,
-  verbosity, tools, and delegation eligibility. See `role-contract.md`.
+- `role-contract.md` owns role behavior boundaries and the separation from Kent
+  model/tool/delegation configuration.
 - Project profiles must map every enabled operational node to a role available
   from the effective project or global Kent configuration.
-- The kit provides contract-complete global roles. Workspace config may
-  specialize the same role names, but workflow correctness must not depend on
-  that override because Kent 2.4 canaries observed scheduler-created direct
-  roles selecting the global definition.
 - Independent standards and specification reviews use global read-only roles.
 - Final PR-producing delivery uses a distinct global read-only compliance role
   after Gate and any required Smoke. It attests the final evidence and
@@ -548,7 +513,9 @@ device, source-control, issue-tracker, and release adapters.
   completing with leaked resources.
 - For managed-worktree profiles, Cleanup emits canonical workspace, task,
   branch, PR, merge, mode, session, and preflight data to a deterministic Task
-  Janitor script after the Cleanup session exits.
+  Janitor script after closing task-owned background shells and scheduling
+  `kent worktree leave`. Janitor verifies that Cleanup no longer targets the
+  task worktree.
 - The Janitor never deletes the primary checkout, dirty or ambiguous state, or
   content not proven recoverable. A merged-PR cleanup re-queries GitHub and
   requires the clean local task HEAD to equal or be an ancestor of the exact
@@ -560,6 +527,9 @@ device, source-control, issue-tracker, and release adapters.
   may be deleted only under the same exact merged-PR proof.
 - No-PR/report-only cleanup requires the clean HEAD to remain reachable from a
   remote ref. Closed-without-merge work is preserved.
+- Janitor treats `kind=scheduled` as non-terminal and accepts deletion only
+  after Kent returns `kind=completed` and both the worktree path and Git
+  registration are absent.
 - Safety preservation is a successful cleanup result and must be explicit in
   `cleanup_report`. Infrastructure failure returns to Cleanup with the resource
   untouched.
@@ -584,6 +554,8 @@ project-specific stdio wrappers or policy. The kit never stores resolved Jira
 credentials.
 
 Profiles list indispensable executable adapter keys in `required_adapters`.
+`kit_managed_adapters` is the explicit subset synchronized from toolkit
+templates; required adapters outside that subset are project-owned.
 The platform-neutral profile loader validates only that declared contract and
 does not infer policy from platform names. Android projects with conditional or
 required runtime Smoke list `mobile_resource_lock` and

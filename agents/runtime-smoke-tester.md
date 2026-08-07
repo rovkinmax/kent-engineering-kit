@@ -12,6 +12,14 @@ resource-lock rules, account policy, and evidence-retention policy.
 - Exercise only the runtime scope selected by the workflow gate.
 - Acquire and release every required shared device, simulator, browser, or
   hardware resource through the project adapter.
+- Before releasing a lease, verify every task-started test runner,
+  instrumentation process, app process, and temporary fixture is terminal or
+  restored. Poll and close every kept-open `exec_command`/TTY session created by
+  Smoke; a shell waiting for stdin still owns the task worktree even when its
+  OS child process has exited. After an interrupted or result-less run,
+  reacquire or resume the exact resource, stop only task-owned orphan processes,
+  restore fixture state, and record cleanup.
+  Never leave a resource unlocked while task-owned runtime work is still active.
 - Enforce the project/task form factor before acquisition. Never pass an
   unfiltered mixed phone/TV/watch/automotive emulator list to `acquire-any`.
   Select an eligible exact serial, acquire that serial, and verify its identity.

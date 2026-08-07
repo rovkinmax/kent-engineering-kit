@@ -39,6 +39,11 @@ verification, Gate, and required runtime decisions are already valid. Name the
 exact repairable files and correction. Missing underlying proof or a source
 defect is not packaging repair.
 
+Missing agent-produced bookkeeping is not a user decision. Reconstruct a
+missing pre-edit or packaging record only when bounded and safe. Otherwise
+report whether current deterministic evidence proves acceptance; do not ask the
+user to waive an artifact the workflow failed to capture.
+
 ## What To Flag
 
 Flag findings when the reviewed scope:

@@ -57,6 +57,10 @@ CONTEXT_MANIFESTS = (
 )
 
 
+def role_prompt(filename: str) -> str:
+    return (REPO_ROOT / "agents" / filename).read_text()
+
+
 def create_work_kind_procedures(root: Path) -> None:
     for configured_path in WORK_KIND_PROCEDURES + CONTEXT_MANIFESTS:
         path = root / configured_path
@@ -135,10 +139,64 @@ class WorkflowKitTest(unittest.TestCase):
             "The runner has received a shutdown signal",
             "The operation was canceled",
             "gh run rerun <run-id> --job <job-id>",
-            "at most two automatic retries",
+            "assertions",
+            "external service `5xx` responses",
+            "three total attempts",
+            "failure before eligible tests actually started",
             "Never automatically retry",
         ):
             self.assertIn(expected, ci_monitor)
+
+        smoke_tester = role_prompt("runtime-smoke-tester.md")
+        for expected in (
+            "task-started test runner",
+            "task-owned orphan processes",
+            "Never leave a resource unlocked while task-owned",
+        ):
+            self.assertIn(expected, smoke_tester)
+
+    def test_instruction_ownership_keeps_runtime_prompts_bounded(self) -> None:
+        profile = self.load_profile()
+        by_key = {
+            edge.key: edge.prompt or ""
+            for edge in build_delivery_workflow(profile, 1).edges
+        }
+        budgets = {
+            "start_plan": 6500,
+            "plan_implement": 4500,
+            "gate_fix": 4000,
+            "dispatch_standards_review": 1500,
+            "dispatch_spec_review": 1300,
+            "verification_join_gate": 3200,
+            "gate_delivery_ready": 2600,
+            "compliance_prepare_pr": 3600,
+            "ci_watch_diagnose": 2800,
+        }
+        for key, maximum in budgets.items():
+            self.assertLessEqual(
+                len(by_key[key]),
+                maximum,
+                f"{key} exceeded its generated prompt budget",
+            )
+
+        self.assertLessEqual(
+            (REPO_ROOT / "skills" / "kent-engineering-kit" / "SKILL.md")
+            .stat()
+            .st_size,
+            8000,
+        )
+        self.assertLessEqual(
+            (REPO_ROOT / "contracts" / "workflow-contract.md").stat().st_size,
+            35000,
+        )
+        self.assertNotIn(
+            "The runner has received a shutdown signal",
+            by_key["ci_watch_diagnose"],
+        )
+        self.assertIn(
+            "The runner has received a shutdown signal",
+            role_prompt("ci-monitor.md"),
+        )
 
     def test_team_delivery_has_direct_fanout_join(self) -> None:
         profile = self.load_profile()
@@ -321,12 +379,12 @@ class WorkflowKitTest(unittest.TestCase):
             "verification_dispatch",
         )
         self.assertIn(
-            "exactly one ready writer-owned plan step",
+            "writer-owned plan step",
             continuation.prompt,
         )
         self.assertIn(
             "acquire a device",
-            continuation.prompt,
+            role_prompt("implementation-worker.md"),
         )
         self.assertIn(
             "when every writer-owned plan step is complete",
@@ -338,8 +396,8 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn("pre-edit red run", by_key["start_plan"].prompt)
         self.assertIn(
-            "do not ask the user to waive that bookkeeping",
-            continuation.prompt,
+            "Missing agent-produced evidence is not user authority work",
+            role_prompt("implementation-worker.md"),
         )
         self.assertEqual(by_key["plan_implement"].context, "new_session")
         self.assertEqual(by_key["gate_fix"].context, "new_session")
@@ -400,15 +458,12 @@ class WorkflowKitTest(unittest.TestCase):
         spec = build_delivery_workflow(profile, 1)
         by_key = {edge.key: edge for edge in spec.edges}
 
+        for filename in ("implementation-worker.md", "fix-worker.md"):
+            prompt = role_prompt(filename)
+            self.assertIn("do not edit tracked or staged files", prompt)
+            self.assertIn("Do not ask\n  whether to absorb it", prompt)
+
         for key in ("plan_implement", "gate_fix"):
-            self.assertIn(
-                "do not edit tracked or staged files",
-                by_key[key].prompt,
-            )
-            self.assertIn(
-                "do not first call `ask_question` merely to offer scope",
-                by_key[key].prompt,
-            )
             self.assertIn(
                 "approval is a resume signal",
                 by_key[key].prompt,
@@ -453,11 +508,19 @@ class WorkflowKitTest(unittest.TestCase):
         prompts = {edge.key: edge.prompt or "" for edge in spec.edges}
 
         self.assertIn(
-            "generated verification graph owns those",
+            "Do not duplicate workflow-owned Standards",
+            role_prompt("implementation-worker.md"),
+        )
+        self.assertIn(
+            "Apply the `implementation-worker` role contract",
             prompts["plan_implement"],
         )
         self.assertIn(
-            "return to the generated verification graph",
+            "Do not duplicate workflow-owned Standards",
+            role_prompt("fix-worker.md"),
+        )
+        self.assertIn(
+            "Apply the `fix-worker` role contract",
             prompts["gate_fix"],
         )
         self.assertIn("checkpoint ref", prompts["start_plan"])
@@ -486,7 +549,10 @@ class WorkflowKitTest(unittest.TestCase):
             prompts["waiting_pr_fix"],
         )
         self.assertIn("`fix_continue_fix`", prompts["waiting_pr_fix"])
-        self.assertIn("unproven differential", prompts["gate_fix"])
+        self.assertIn(
+            "Fix only findings proven to be task-scoped",
+            role_prompt("fix-worker.md"),
+        )
         self.assertIn(
             "git branch --show-current",
             prompts["compliance_prepare_pr"],
@@ -505,33 +571,41 @@ class WorkflowKitTest(unittest.TestCase):
 
         standards_prompt = by_key["dispatch_standards_review"].prompt or ""
         gate_prompt = by_key["verification_join_gate"].prompt or ""
+        standards_role = role_prompt("standards-reviewer.md")
         for expected in (
             "whole-repository analyzer",
             "task-introduced or task-worsened",
             "changed file or touched method",
             "baseline debt",
-            "repository-policy contradiction",
-            "do not substitute a newer merge-target tip",
-            "Target-only\ncommits",
+            "policy\ncontradiction",
+            "do not\nsubstitute a newer merge-target tip",
+            "Target-only commits",
         ):
-            self.assertIn(expected, standards_prompt)
-        spec_prompt = by_key["dispatch_spec_review"].prompt or ""
+            self.assertIn(expected, standards_role)
+        self.assertIn(
+            "Apply the `standards-reviewer` role contract",
+            standards_prompt,
+        )
+        spec_role = role_prompt("spec-reviewer.md")
         for expected in (
-            "task fixed point",
-            "Missing target-only commits",
-            "Do not request copying",
+            "fixed point",
+            "target-only commits",
+            "Do not ask the writer to copy",
         ):
-            self.assertIn(expected, spec_prompt)
+            self.assertIn(expected, spec_role)
+        self.assertIn(
+            "Apply the `spec-reviewer` role contract",
+            by_key["dispatch_spec_review"].prompt or "",
+        )
         for expected in (
-            "task-introduced or task-worsened",
-            "whole-repository analyzer failure",
-            "unproven differential",
-            "route to `verification_gate_needs_user_action`, not Fix",
-            "is not an external blocker",
+            "Route task-scoped failures to Fix",
+            "Route missing authority",
+            "Missing agent-produced bookkeeping is not a user decision",
             "target-only commits",
             "merge/replay conflict",
         ):
-            self.assertIn(expected, gate_prompt)
+            self.assertIn(expected, role_prompt("workflow-gate.md"))
+        self.assertIn("Apply the `workflow-gate` role contract", gate_prompt)
 
     def test_install_adopts_byte_identical_managed_agent_file(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -765,10 +839,10 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn(
             "task-differential evidence",
-            by_key["ci_watch_diagnose"].prompt,
+            role_prompt("ci-monitor.md"),
         )
         self.assertIn(
-            "deterministic\nCI Watch node already waited",
+            "exact terminal watcher report",
             by_key["ci_watch_diagnose"].prompt,
         )
         self.assertIn(
@@ -779,10 +853,12 @@ class WorkflowKitTest(unittest.TestCase):
             "The runner has received a shutdown signal",
             "The operation was canceled",
             "gh run rerun <run-id> --job <job-id>",
-            "at most two automatic retries",
-            "eligible infrastructure",
+            "assertions",
+            "external service `5xx` responses",
+            "three total attempts",
+            "failure before eligible tests actually started",
         ):
-            self.assertIn(expected, by_key["ci_watch_diagnose"].prompt)
+            self.assertIn(expected, role_prompt("ci-monitor.md"))
         self.assertIn("Fixes #N", by_key["compliance_prepare_pr"].prompt)
         self.assertEqual(
             by_key["fix_pr_merged_cleanup"].transition,
@@ -858,7 +934,7 @@ class WorkflowKitTest(unittest.TestCase):
             ),
             ("workspace_path", "pr_report", "closure_reason"),
         )
-        prompts = "\n".join(
+        generated_prompts = "\n".join(
             by_key[key].prompt or ""
             for key in (
                 "compliance_prepare_pr",
@@ -868,17 +944,28 @@ class WorkflowKitTest(unittest.TestCase):
                 "waiting_pr_fix",
             )
         )
+        role_contracts = "\n".join(
+            (
+                role_prompt("delivery-operator.md"),
+                role_prompt("ci-monitor.md"),
+            )
+        )
         for expected in (
             "canBeRebased",
-            "required_linear_history",
-            "mergeable=MERGEABLE",
             "forced replay",
-            "isolated temporary clone or branch",
+            "temporary clone or branch",
+        ):
+            self.assertIn(expected, role_contracts)
+        for expected in (
             "force-with-lease",
             "outcome=needs_user_action",
             "kent-resolve-github-merge-strategy",
         ):
-            self.assertIn(expected, prompts)
+            self.assertIn(expected, generated_prompts)
+        strategy_source = (
+            REPO_ROOT / "workflowkit" / "merge_strategy.py"
+        ).read_text()
+        self.assertIn("required_linear_history", strategy_source)
 
     def test_manual_package_publish_topology_is_approval_gated_after_merge(
         self,
@@ -1117,15 +1204,15 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn(
             "exact human-authored task-comment ID",
-            by_key["dispatch_spec_review"].prompt,
+            role_prompt("spec-reviewer.md"),
         )
         self.assertIn(
             "exact human-authored task-comment ID",
-            by_key["gate_delivery_ready"].prompt,
+            role_prompt("compliance_reviewer.md"),
         )
         self.assertIn(
-            "Missing agent-produced evidence is not a user decision",
-            by_key["gate_delivery_ready"].prompt,
+            "Missing agent-produced bookkeeping is not a user decision",
+            role_prompt("compliance_reviewer.md"),
         )
         self.assertIn(
             "Final Compliance Review: {{.Params.compliance_report}}",
@@ -1189,6 +1276,10 @@ class WorkflowKitTest(unittest.TestCase):
             "after this resource-owning Cleanup session exits",
             by_key["waiting_pr_cleanup"].prompt,
         )
+        self.assertIn(
+            "kent worktree leave",
+            by_key["waiting_pr_cleanup"].prompt,
+        )
         for key in (
             "prepare_pr_no_pr",
             "waiting_pr_close_without_merge",
@@ -1211,20 +1302,24 @@ class WorkflowKitTest(unittest.TestCase):
         }
 
         self.assertIn(
-            ".kent/runtime/{{.TaskShortId}}/fix-checkpoint.json",
-            prompts["gate_fix"],
-        )
-        self.assertIn(
             ".kent/scripts/workflow-checkpoint",
             prompts["gate_fix"],
         )
         self.assertIn(
-            ".kent/runtime/{{.TaskShortId}}/smoke-checkpoint.json",
+            "--stage fix",
+            prompts["gate_fix"],
+        )
+        self.assertIn(
+            "--stage smoke",
             prompts["gate_smoke_required"],
         )
         self.assertIn(
-            "Persist the latest checkpoint before every workflow transition",
-            prompts["gate_smoke_required"],
+            ".kent/runtime/<task-short-id>/fix-checkpoint.json",
+            role_prompt("fix-worker.md"),
+        )
+        self.assertIn(
+            ".kent/runtime/<task-short-id>/smoke-checkpoint.json",
+            role_prompt("runtime-smoke-tester.md"),
         )
 
     def test_standards_and_final_compliance_capabilities_are_independent(self) -> None:
@@ -1797,10 +1892,23 @@ class WorkflowKitTest(unittest.TestCase):
         root = Path(temporary.name)
         profile_directory = root / ".kent"
         profile_directory.mkdir()
-        contents = EXAMPLE_PROFILE.read_text().replace(
-            "[commands]\n",
-            "[commands]\n"
-            'branch_identity = ".kent/scripts/workflow-branch-identity"\n',
+        contents = (
+            EXAMPLE_PROFILE.read_text()
+            .replace(
+                "required_adapters = []",
+                'required_adapters = ["jira_api", '
+                '"mobile_evidence_audit", "mobile_resource_lock"]',
+            )
+            .replace(
+                "kit_managed_adapters = []",
+                'kit_managed_adapters = ["jira_api", '
+                '"mobile_evidence_audit", "mobile_resource_lock"]',
+            )
+            .replace(
+                "[commands]\n",
+                "[commands]\n"
+                'branch_identity = ".kent/scripts/workflow-branch-identity"\n',
+            )
         ) + (
             "\n[adapters]\n"
             'jira_api = ".kent/adapters/jira/jira-api.sh"\n'
@@ -1958,6 +2066,47 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertEqual(policy.read_bytes(), before)
         self.assertEqual(verifier.read_bytes(), verifier_before)
+
+    def test_sync_preserves_known_template_when_profile_marks_it_project_owned(
+        self,
+    ) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        profile_directory = root / ".kent"
+        profile_directory.mkdir()
+        jira = root / ".kent" / "adapters" / "jira" / "jira-api.sh"
+        jira.parent.mkdir(parents=True)
+        jira.write_text("#!/usr/bin/env bash\necho project release jira\n")
+        jira.chmod(0o755)
+        before = jira.read_bytes()
+        contents = EXAMPLE_PROFILE.read_text().replace(
+            "required_adapters = []",
+            'required_adapters = ["jira_api"]',
+        ) + (
+            "\n[adapters]\n"
+            'jira_api = ".kent/adapters/jira/jira-api.sh"\n'
+        )
+        (profile_directory / "workflow-profile.toml").write_text(contents)
+        create_work_kind_procedures(root)
+
+        result = subprocess.run(
+            [
+                str(REPO_ROOT / "scripts" / "sync-project-adapters"),
+                "--project",
+                str(root),
+                "--update",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["adapters"][0]["status"], "project-owned")
+        self.assertEqual(jira.read_bytes(), before)
 
     def test_profile_accepts_newer_minimum_kent_version(self) -> None:
         profile = self.load_profile(

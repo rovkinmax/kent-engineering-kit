@@ -87,7 +87,13 @@ requires the normal authorization for that external action.
   materially supports the decision; otherwise retain only the derived
   assertion. Never retain a broad UI artifact.
 - Restore the original state and verify the restoration before releasing the
-  shared resource.
+  shared resource. Every task-started test runner, instrumentation process, app
+  process, temporary fixture, and kept-open tool shell/TTY must be terminal or
+  restored. Poll and explicitly close every Smoke-owned background shell
+  session; an idle shell waiting for stdin still blocks managed-worktree
+  cleanup. If a failed or interrupted command leaves task-owned runtime work
+  active after release, reacquire or resume the exact resource, clean only that
+  task-owned state, record the recovery, and release again.
 - If the adapter cannot establish focus, before/after state, or the required
   effect, return a blocker or finding. Do not infer success from the number of
   input events sent or from the Smoke agent's own narrative.
