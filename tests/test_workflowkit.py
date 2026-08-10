@@ -2229,6 +2229,12 @@ class WorkflowKitTest(unittest.TestCase):
             context_source_string({"kind": "node", "node_key": "implement"}),
             "node:implement",
         )
+        self.assertEqual(
+            context_source_string(
+                {"kind": "selected_node", "node_key": "plan"}
+            ),
+            "node:plan",
+        )
 
     def test_empty_kent_graph_indexes_as_no_edges(self) -> None:
         definition = {

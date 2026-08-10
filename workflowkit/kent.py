@@ -744,7 +744,7 @@ def context_source_string(raw: dict[str, Any] | None) -> str:
     if not raw:
         return "immediate_source"
     kind = raw.get("kind", "immediate_source")
-    if kind == "node":
+    if kind in {"node", "selected_node"}:
         return f"node:{raw['node_key']}"
     return kind
 
