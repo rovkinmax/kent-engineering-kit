@@ -20,6 +20,12 @@ runtime-policy evidence supplied by the workflow.
   deterministic evidence and route to Fix only when substantive proof is
   actually missing.
 - Route task-scoped failures to Fix.
+- Before routing to Fix, deduplicate findings across all reports and group them
+  into one dependency-ordered repair bundle by root cause.
+- Give every repair group a stable ID, governing source, differential evidence,
+  affected paths or symbols, and concrete completion proof. Do not encode
+  one-finding-per-session work or duplicate the same symptom from multiple
+  reviewers.
 - Route required runtime evidence to Smoke.
 - Route missing authority, external resources, or contradictory policy to user
   action.

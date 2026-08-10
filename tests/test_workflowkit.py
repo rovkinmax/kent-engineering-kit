@@ -275,6 +275,12 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn("normalized `issue_links`", with_jira_plan)
         self.assertIn("mandatory bounded product evidence", with_jira_plan)
         self.assertIn("API operations/models", with_jira_plan)
+        self.assertIn("only root issues explicitly supplied", with_jira_plan)
+        self.assertIn(
+            "`checked`, `adopted`, `rejected`, and\n`conflicts`",
+            with_jira_plan,
+        )
+        self.assertIn("deferred/out-of-scope issues", with_jira_plan)
 
     def test_delivery_inserts_configured_branch_identity_before_implement(
         self,
@@ -394,6 +400,10 @@ class WorkflowKitTest(unittest.TestCase):
             "exact human-authored task-comment ID",
             by_key["start_plan"].prompt,
         )
+        self.assertIn(
+            "SDK or\nschema upgrades",
+            by_key["start_plan"].prompt,
+        )
         self.assertIn("pre-edit red run", by_key["start_plan"].prompt)
         self.assertIn(
             "Missing agent-produced evidence is not user authority work",
@@ -501,6 +511,14 @@ class WorkflowKitTest(unittest.TestCase):
             by_key["fix_needs_user_action"].context,
             "compact_and_continue_session",
         )
+        self.assertIn(
+            "one dependency-ordered repair bundle",
+            by_key["gate_fix"].prompt,
+        )
+        self.assertIn(
+            "resolve every compatible group",
+            by_key["gate_fix"].prompt,
+        )
 
     def test_delivery_writer_prompts_reserve_final_review_for_graph(self) -> None:
         profile = self.load_profile()
@@ -580,6 +598,8 @@ class WorkflowKitTest(unittest.TestCase):
             "policy\ncontradiction",
             "do not\nsubstitute a newer merge-target tip",
             "Target-only commits",
+            "free-form strings",
+            "typed source contract",
         ):
             self.assertIn(expected, standards_role)
         self.assertIn(
@@ -606,6 +626,23 @@ class WorkflowKitTest(unittest.TestCase):
         ):
             self.assertIn(expected, role_prompt("workflow-gate.md"))
         self.assertIn("Apply the `workflow-gate` role contract", gate_prompt)
+        self.assertIn("deduplicated, dependency-ordered repair bundle", gate_prompt)
+        self.assertIn(
+            "dependency-ordered repair bundle",
+            role_prompt("workflow-gate.md"),
+        )
+        self.assertIn(
+            "stable ID",
+            role_prompt("workflow-gate.md"),
+        )
+        self.assertIn(
+            "one-finding-per-session",
+            role_prompt("workflow-gate.md"),
+        )
+        self.assertIn(
+            "linked, cloned, sibling, and dependency issues",
+            spec_role,
+        )
 
     def test_install_adopts_byte_identical_managed_agent_file(self) -> None:
         temporary = tempfile.TemporaryDirectory()

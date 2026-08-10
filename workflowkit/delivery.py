@@ -40,7 +40,7 @@ BLOCKER = ParameterSpec(
 )
 FIX_CONTEXT = ParameterSpec(
     "fix_context",
-    "Concrete task-scoped findings that the single writer must fix.",
+    "Deduplicated, dependency-ordered task-scoped repair bundle for the single writer.",
 )
 VERIFICATION_STATUS = ParameterSpec(
     "verification_status",
@@ -1653,18 +1653,26 @@ def jira_reference_instruction(profile: ProjectProfile) -> str:
 
 When the source contains a Jira issue, use `{profile.adapter("jira_api")}` and
 inspect its normalized `issue_links` before relying on semantic repository
-search. Follow related issues only one graph level and within the project
-procedure's research limit. Do not key platform discovery only on the Jira link
-type: use the linked issue summary, labels, components, fix versions, and
-description to identify an iOS, web, backend, or other sibling task.
+search. The implementation scope contains only root issues explicitly supplied
+by the task source/body or an exact human-authored task comment. Parent,
+linked, cloned, related, dependency, and sibling issues are evidence or
+dependency context only; they do not silently add requirements or implementation
+scope. Record root scope, related evidence, and deferred/out-of-scope issues
+separately. If the root issue depends on unresolved product requirements owned
+by a related issue, report that dependency instead of absorbing it.
+
+Follow related issues only one graph level and within the project procedure's
+research limit. Do not key platform discovery only on the Jira link type: use
+the linked issue summary, labels, components, fix versions, and description to
+identify an iOS, web, backend, or other sibling task.
 
 When a linked sibling task has an existing implementation in a
 project-declared reference repository, inspect that implementation and its
 tests as mandatory bounded product evidence. Record the Jira relationship,
-exact repository commit and paths, plus `checked`, `adopted`, and `rejected`
-conclusions. The target platform's explicit task decisions, current design,
-and API contracts remain authoritative. If no useful Jira relation exists,
-fall back to a bounded feature fingerprint built from API operations/models,
+exact repository commit and paths, plus `checked`, `adopted`, `rejected`, and
+`conflicts` conclusions. The target platform's explicit task decisions,
+current design, and API contracts remain authoritative. If no useful Jira
+relation exists, fall back to a bounded feature fingerprint built from API operations/models,
 screen or flow names, distinctive domain terms, and user-visible copy."""
 
 
@@ -1710,6 +1718,20 @@ Task body:
 Keep discovery, design/spec ingestion, decisions, and implementation planning in
 this one Plan session. Ask questions when a product decision is required. Do not
 invoke nested prompt flows and do not implement production changes.
+Before planning implementation, write an explicit scope boundary containing the
+included root source IDs, related evidence, dependencies, and deferred or
+out-of-scope issues. A relationship, shared parent, common design file, or
+adjacent implementation does not merge issue scopes.
+
+Inventory dependency and cross-module impact before implementation. SDK or
+schema upgrades, generated-contract changes, and adaptations in modules outside
+the root issue must be identified as either a required dependency adaptation or
+a separate deferred task. Do not silently widen product behavior to make a
+dependency compile. Preserve generated enum, sealed, identifier, provider,
+status, action, and flow types through domain boundaries; free-form string
+routing requires evidence that no typed source contract exists plus an explicit
+unknown-value strategy.
+
 Assign every required evidence artifact an owner and a production-edit
 boundary. If the plan requires a pre-edit red run, make it the first
 writer-owned step and require capture before any production edit. The plan must
@@ -1787,9 +1809,13 @@ def fix_prompt(
 ) -> str:
     bounded_contract = ""
     completion_contract = """
-Complete with `verify` and provide `workspace_path` plus a refreshed
-`review_context` containing the findings, fixes, changed files, artifact paths,
-and focused checks."""
+Treat the incoming findings as one dependency-ordered repair bundle. Deduplicate
+overlap, group findings by root cause, and resolve every compatible group in
+this retained Fix session. Verify each group narrowly and update the checkpoint
+after meaningful work; do not transition merely to hand off bookkeeping. When
+the bundle is empty, complete with `verify` and provide `workspace_path` plus a
+refreshed `review_context` containing the findings, fixes, changed files,
+artifact paths, and focused checks."""
     if bounded:
         bounded_contract = """
 
@@ -1928,6 +1954,9 @@ Apply the `workflow-gate` role contract. Choose a delivery transition only when
 every enabled status is `passed`. Do not poll or classify PR CI here; delivery
 owns CI after PR preparation. Keep full reports in `review_context` and make
 user-facing commentary name only a real decision or external action.
+
+For `needs_changes`, emit the deduplicated, dependency-ordered repair bundle
+required by the `workflow-gate` role contract.
 
 Provide `workspace_path`, a refreshed `review_context` summarizing all reports,
 and the required Smoke decision fields. The refreshed `review_context` must

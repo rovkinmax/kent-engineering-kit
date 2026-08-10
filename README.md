@@ -161,12 +161,14 @@ repository's primary worktree automatically.
 
 The optional profile policy `policies.writer_sessions` controls writer
 continuity. The backward-compatible `continuous` mode reuses or compacts
-writer sessions. `fresh_per_slice` starts a new Implement or Fix session for
-each independently verifiable slice and hands off through the task worktree,
-authoritative artifacts, exact task-comment IDs, and structured transition
-parameters. Non-writer approval-recovery loops retain compact-and-continue
-continuity. Use a new non-default workflow instance to canary this policy;
-task-backed live graphs are never rewritten to adopt it.
+writer sessions and is preferred for coupled feature work or review bundles.
+`fresh_per_slice` starts a new Implement or Fix session for each independently
+verifiable slice and is best reserved for low-coupling mechanical work with
+small handoffs. Verification Gate always deduplicates review findings into one
+dependency-ordered bundle; continuous Fix resolves every compatible group
+before re-verification. Non-writer approval-recovery loops retain
+compact-and-continue continuity. Use a new non-default workflow instance to
+canary this policy; task-backed live graphs are never rewritten to adopt it.
 
 The optional `policies.pr_merge_strategy` accepts `auto`, `merge`, `squash`,
 or `rebase` and defaults to `auto`. `auto` resolves from source-control

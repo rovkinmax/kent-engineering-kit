@@ -73,6 +73,10 @@ manifest, and project procedures; they do not preload this whole contract.
   missed it, the workflow records the absence and uses bounded reconstruction
   or current deterministic evidence; it asks the user only when acceptance
   genuinely depends on an external fact or product decision.
+- For issue-backed work, implementation scope contains only root issues named
+  by the task source/body or an exact human-authored task comment. Parent,
+  linked, cloned, sibling, and dependency issues remain evidence or dependency
+  context unless that authority explicitly includes them.
 - Operational dates default deterministically. If a mutation requires only the
   date on which it is being performed and no authoritative source specifies a
   different date, resolve the current calendar date from the execution
@@ -113,6 +117,10 @@ manifest, and project procedures; they do not preload this whole contract.
   completes through `needs_user_action` instead of selecting Implement.
 - Existing task-backed workflows retain their recorded writer policy. Changing
   this policy requires a new non-default workflow and managed-worktree canary.
+- Verification Gate deduplicates overlapping reports into one
+  dependency-ordered Fix bundle. In continuous mode, the retained Fix session
+  resolves every compatible root-cause group before re-verification. It does
+  not create a new session for each symptom or bookkeeping handoff.
 
 ## Portable parameters
 
@@ -570,12 +578,15 @@ their own `[integrations.jira]` credential namespace. Related repositories may
 share a namespace intentionally; unrelated repositories remain isolated.
 
 For Jira-backed planning, normalized issue relations are the primary
-cross-platform discovery path. Plan follows related issues at most one graph
+cross-platform discovery path, not an implementation-scope expansion
+mechanism. Plan records exact root issue scope separately from related evidence,
+dependencies, and deferred issues. It follows related issues at most one graph
 level, identifies sibling platforms from issue metadata rather than link-type
 wording alone, and then resolves the sibling issue to a project-declared local
 reference repository. An existing sibling implementation and its tests are
 mandatory bounded product evidence. Plan records the relationship, immutable
-source commit and paths, and `checked`, `adopted`, and `rejected` conclusions.
-Explicit target-platform requirements, current design, and API contracts remain
-authoritative. Bounded API/model/flow fingerprint search is the fallback when
-Jira relations do not identify a usable sibling implementation.
+source commit and paths, and `checked`, `adopted`, `rejected`, and `conflicts`
+conclusions. Explicit target-platform requirements, current design, and API
+contracts remain authoritative. Bounded API/model/flow fingerprint search is
+the fallback when Jira relations do not identify a usable sibling
+implementation.

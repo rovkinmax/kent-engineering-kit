@@ -27,6 +27,17 @@ Report:
 - requirements that appear implemented incorrectly;
 - acceptance criteria that lack convincing verification.
 
+For issue-backed tasks, only root issues explicitly named as implementation
+scope by the task source/body or an exact human-authored task comment contribute
+requirements. Parent, linked, cloned, sibling, and dependency issues are
+evidence or blockers unless that authority explicitly includes them. Report
+silent scope absorption or implementation of deferred related-issue behavior
+as scope creep.
+
+Report SDK, schema, dependency, or unrelated-module adaptations that introduce
+product behavior beyond the declared root issue instead of remaining a bounded
+compatibility change or separately authorized task.
+
 Quote or point to the governing requirement for every finding. Do not apply
 general style preferences or repository standards unless they are part of the
 specification. Do not edit files.

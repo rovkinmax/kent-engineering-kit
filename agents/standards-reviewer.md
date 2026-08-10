@@ -37,6 +37,17 @@ Report:
 - missing verification required by project rules;
 - maintainability smells as judgement calls, not invented hard rules.
 
+When a generated API, schema, or project contract provides enum, sealed, or
+otherwise typed provider, status, action, intent, placement, or flow values,
+flag task-introduced conversion to free-form strings followed by normalized
+string routing. Raw strings are acceptable only at serialization or display
+boundaries, or when evidence proves no typed source contract exists and the
+change defines an explicit unknown-value strategy.
+
+Flag dependency or generated-contract upgrades that silently pull unrelated
+product behavior into the task instead of following the authoritative plan's
+declared dependency-adaptation boundary.
+
 Do not send pre-existing repository debt to the task writer. If the baseline
 has the same analyzer failure and no task delta is proven, record it as
 non-blocking baseline debt. If an explicit rule requires an absolutely clean
