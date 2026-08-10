@@ -148,6 +148,9 @@ def build_delivery_workflow(
     writer_handoff_context = (
         "new_session" if fresh_writers else "compact_and_continue_session"
     )
+    branch_identity_handoff_source = (
+        "immediate_source" if fresh_writers else "node:plan"
+    )
     implementation_continuation_context = (
         "new_session" if fresh_writers else "continue_session"
     )
@@ -323,6 +326,7 @@ def build_delivery_workflow(
                     transition="ready",
                     target="implement",
                     context=writer_handoff_context,
+                    context_source=branch_identity_handoff_source,
                     prompt=implement_prompt(
                         profile,
                         fresh_session=fresh_writers,

@@ -326,6 +326,10 @@ class WorkflowKitTest(unittest.TestCase):
             edges["branch_identity_implement"].transition,
             "branch_identity_ready",
         )
+        self.assertEqual(
+            edges["branch_identity_implement"].context_source,
+            "immediate_source",
+        )
         for key in ("plan_branch_identity", "branch_identity_implement"):
             self.assertEqual(
                 tuple(parameter.key for parameter in edges[key].parameters),
@@ -519,6 +523,37 @@ class WorkflowKitTest(unittest.TestCase):
             "resolve every compatible group",
             by_key["gate_fix"].prompt,
         )
+
+    def test_continuous_writer_resumes_plan_after_branch_identity_script(
+        self,
+    ) -> None:
+        profile = self.load_profile(
+            lambda contents: (
+                contents.replace('writer_sessions = "fresh_per_slice"\n', "")
+                .replace(
+                    'issue_tracker = "none"',
+                    'issue_tracker = "jira"',
+                )
+                .replace(
+                    'branch_identity = "task"',
+                    'branch_identity = "jira"',
+                )
+                .replace(
+                    "[commands]\n",
+                    "[commands]\n"
+                    'branch_identity = '
+                    '".kent/scripts/workflow-branch-identity"\n',
+                )
+            )
+        )
+        by_key = {
+            edge.key: edge
+            for edge in build_delivery_workflow(profile, 1).edges
+        }
+
+        handoff = by_key["branch_identity_implement"]
+        self.assertEqual(handoff.context, "compact_and_continue_session")
+        self.assertEqual(handoff.context_source, "node:plan")
 
     def test_delivery_writer_prompts_reserve_final_review_for_graph(self) -> None:
         profile = self.load_profile()
