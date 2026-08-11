@@ -26,8 +26,8 @@ after the composition is proven across projects.
 
 Current project defaults:
 
-- Appsome Engineering Delivery v19;
-- Puber Engineering Delivery v17;
+- Appsome Engineering Delivery v21;
+- Puber Engineering Delivery v18;
 - Osome SDK Engineering Delivery v9;
 - Osome Slack Reader Engineering Delivery v1.
 
@@ -93,19 +93,21 @@ workflow revisions. It does not require a Kent restart.
   for the Kent run; automatic transition finalization remains an upstream
   reliability follow-up.
 
-OSM-53 is the current live validation of the three-attempt UI-test policy.
+OSM-53 completed the first live validation of the three-attempt UI-test policy.
+The current rollout additionally preserves retry history across watcher loops,
+restores fresh-session context/evidence contracts, and recovers same-task Smoke
+leases when acquire output is lost before checkpoint persistence.
 
 ## Next
 
-1. Finish OSM-53 and classify its final CI attempt.
-2. Review and commit the Context Diet candidate in the kit and four consumer
-   repositories.
-3. Generate one non-default replacement workflow per project.
-4. Canary managed-worktree execution, evidence append, Fix checkpoint, CI
-   watcher, and Cleanup.
-5. Promote validated revisions for new tasks and retire superseded workflows
-   after Backlog migration.
-6. Make `kent-engineering-kit` itself an Engineering Delivery consumer using
+1. Finish or recover OSM-55 on frozen Appsome v20.
+2. Recreate OSM-54 on Appsome v21 after OSM-55 completes; never start the old
+   v20 Backlog record.
+3. Exercise the new defaults through real Appsome v21 and Puber v18 tasks, and
+   the in-place SDK v9 / Slack Reader v1 graphs through their next tasks.
+4. Retire Appsome v13, v18, and v20 after their retained tasks reach terminal
+   cleanup and the v20 Backlog record is migrated.
+5. Make `kent-engineering-kit` itself an Engineering Delivery consumer using
    `scripts/validate`, no runtime Smoke, and a normal GitHub PR/CI tail.
 
 ## Follow-ups After Adoption
