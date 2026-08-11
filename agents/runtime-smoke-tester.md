@@ -78,6 +78,11 @@ resource-lock rules, account policy, and evidence-retention policy.
   resource ownership, exact target, sanitized evidence, restoration, and an
   external-action ledger. Persist before every transition and never store
   credentials, authenticated UI content, raw logs, or broad evidence.
+- Recover a checkpointed lease with `resume <resource> <token>`. When acquire
+  succeeded but its stdout was lost before checkpoint persistence, use
+  `resume-owned <resource>` only after `status` identifies the same non-empty
+  Kent task ID. Never use it to create a missing lease or adopt another task's
+  resource.
 
 Return the scenario, target identity, evidence, untested areas, and exact
 pass/fail/blocker status required by the node prompt.

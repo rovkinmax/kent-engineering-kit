@@ -55,7 +55,6 @@ class ProjectProfile:
     execution_overrides: dict[str, str]
     policies: dict[str, str]
     capabilities: dict[str, bool]
-    legacy_review_contract: bool
     commands: dict[str, str]
     procedures: dict[str, str]
     context_manifests: dict[str, str]
@@ -100,19 +99,6 @@ class ProjectProfile:
             require_table(raw, "capabilities"),
             "capabilities",
         )
-        legacy_review_contract = (
-            "standards_review" not in capabilities
-            and "compliance_review" in capabilities
-        )
-        if legacy_review_contract:
-            # TODO(profile-schema-next): Remove this compatibility path after
-            # every project explicitly migrates to separate standards_review
-            # and compliance_review capabilities in the finalized next schema.
-            # Early schema-3 profiles used compliance_review for the Standards
-            # branch and emitted compliance_report. Preserve that full contract
-            # until the project explicitly opts into the split capabilities.
-            capabilities["standards_review"] = capabilities["compliance_review"]
-            capabilities["compliance_review"] = False
         profile = cls(
             project_root=root,
             schema_version=schema_version,
@@ -137,7 +123,6 @@ class ProjectProfile:
             ),
             policies=string_table(require_table(raw, "policies"), "policies"),
             capabilities=capabilities,
-            legacy_review_contract=legacy_review_contract,
             commands=string_table(require_table(raw, "commands"), "commands"),
             procedures=string_table(raw.get("procedures", {}), "procedures"),
             context_manifests=string_table(

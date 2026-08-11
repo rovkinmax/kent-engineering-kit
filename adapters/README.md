@@ -52,10 +52,11 @@ The managed `mobile` server uses mcporter's default ephemeral lifecycle. Mobile 
 list devices, acquire the project resource lock, and pass `platform` plus the
 exact locked `deviceId` to every target-specific call. Process-local
 `device set` / `get_target` state is not a valid cross-call target guarantee.
-The current schema exposes explicit device addressing for `screen`, `input`,
-`ui`, and `app`. If a target-specific tool such as `system` lacks `deviceId`,
-use the project's exact platform adapter (`adb -s`, simulator UDID, or
-equivalent) instead of an implicit MCP target.
+The adapter enforces explicit device addressing for `screen`, `input`, `ui`,
+and `app`. It rejects generic `system` and `flow` calls because their current
+schema cannot prove one exact locked device; use the project's exact platform
+adapter (`adb -s`, simulator UDID, or equivalent) instead of an implicit MCP
+target.
 
 Project-specific stdio servers may remain executable at
 `.kent/adapters/mcp/servers/<server>` or the legacy

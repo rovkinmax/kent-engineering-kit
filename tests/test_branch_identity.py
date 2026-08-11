@@ -173,7 +173,10 @@ class BranchIdentityTest(unittest.TestCase):
         self.configure("jira")
         self.task(
             source_url="https://example.atlassian.net/browse/MBL-742",
-            body="Related MBL-999",
+            body=(
+                "Related evidence: "
+                "https://example.atlassian.net/browse/MBL-999"
+            ),
         )
 
         result, payload = self.run_script()
@@ -224,7 +227,19 @@ class BranchIdentityTest(unittest.TestCase):
         self.assertEqual(payload["work_kind"], "test")
         self.assertIn("инфраструктурной", payload["blocker_reason"])
 
-    def test_jira_body_uses_first_listed_issue_url(self) -> None:
+    def test_jira_body_uses_single_issue_url(self) -> None:
+        self.configure("jira")
+        self.task(
+            body="Root: https://example.atlassian.net/browse/MBL-783"
+        )
+
+        result, payload = self.run_script()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_ready")
+        self.assertEqual(self.branch(), "feature/MBL-783")
+
+    def test_jira_body_with_multiple_issue_urls_is_ambiguous(self) -> None:
         self.configure("jira")
         self.task(
             body=(
@@ -237,8 +252,10 @@ class BranchIdentityTest(unittest.TestCase):
         result, payload = self.run_script()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["transition"], "branch_identity_ready")
-        self.assertEqual(self.branch(), "feature/MBL-783")
+        self.assertEqual(payload["transition"], "branch_identity_blocked")
+        self.assertIn("MBL-783, MBL-784", payload["blocker_reason"])
+        self.assertIn("root issue", payload["blocker_reason"])
+        self.assertEqual(self.branch(), "TASK-1")
 
     def test_jira_body_ignores_referenced_task_keys(self) -> None:
         self.configure("jira")
@@ -347,6 +364,28 @@ class BranchIdentityTest(unittest.TestCase):
         self.assertEqual(same, "51")
         self.assertEqual(cross, "")
         self.assertEqual(body_fallback, "53")
+
+    def test_github_issue_body_with_multiple_candidates_is_ambiguous(self) -> None:
+        self.run_git(
+            self.root,
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:rovkinmax/Puber.git",
+        )
+
+        with self.assertRaisesRegex(
+            BRANCH_IDENTITY.IdentityAmbiguity,
+            "51, 52",
+        ):
+            BRANCH_IDENTITY.github_issue_number(
+                self.root,
+                "",
+                (
+                    "Root? https://github.com/rovkinmax/Puber/issues/51\n"
+                    "Related? https://github.com/rovkinmax/Puber/issues/52"
+                ),
+            )
 
 
 if __name__ == "__main__":

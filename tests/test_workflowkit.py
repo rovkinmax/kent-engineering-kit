@@ -434,6 +434,14 @@ class WorkflowKitTest(unittest.TestCase):
             self.assertEqual(by_key[key].context, "new_session")
             self.assertIn("fresh bounded session", by_key[key].prompt)
             self.assertIn(
+                "Read `.kent/context/implement.md` first",
+                by_key[key].prompt,
+            )
+            self.assertIn(
+                ".kent/scripts/workflow-evidence-ledger append",
+                by_key[key].prompt,
+            )
+            self.assertIn(
                 "Approval means only that the exact reported blocker action",
                 by_key[key].prompt,
             )
@@ -883,6 +891,19 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(
             tuple(
                 parameter.key
+                for parameter in by_key["ci_monitor_watch"].parameters
+            ),
+            (
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "ci_report",
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                parameter.key
                 for parameter in by_key["ci_monitor_waiting_pr"].parameters
             ),
             (
@@ -1313,6 +1334,14 @@ class WorkflowKitTest(unittest.TestCase):
             "do not build, install, launch, reacquire a device",
             by_key["compliance_evidence_repair"].prompt,
         )
+        self.assertIn(
+            "Read `.kent/context/implement.md` first",
+            by_key["evidence_repair_needs_user_action"].prompt,
+        )
+        self.assertIn(
+            ".kent/scripts/workflow-evidence-ledger append",
+            by_key["evidence_repair_needs_user_action"].prompt,
+        )
 
     def test_managed_worktree_cleanup_uses_task_janitor(self) -> None:
         profile = self.load_profile()
@@ -1659,52 +1688,17 @@ class WorkflowKitTest(unittest.TestCase):
         with self.assertRaisesRegex(SpecError, "ci_monitoring requires pull_requests"):
             self.load_profile(transform)
 
-    def test_schema_three_preserves_legacy_review_capability_semantics(self) -> None:
-        profile = self.load_profile(
-            lambda contents: (
-                contents.replace("standards_review = true\n", "")
-                .replace('compliance = "compliance_reviewer"\n', "")
+    def test_profile_requires_explicit_standards_review_capability(self) -> None:
+        with self.assertRaisesRegex(
+            SpecError,
+            "missing capability 'standards_review'",
+        ):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    "standards_review = true\n",
+                    "",
+                )
             )
-        )
-        spec = build_delivery_workflow(profile, 1)
-        node_keys = {node.key for node in spec.nodes}
-        by_key = {edge.key: edge for edge in spec.edges}
-
-        self.assertTrue(profile.capability("standards_review"))
-        self.assertFalse(profile.capability("compliance_review"))
-        self.assertTrue(profile.legacy_review_contract)
-        self.assertIn("standards_review", node_keys)
-        self.assertNotIn("compliance", node_keys)
-        self.assertEqual(by_key["gate_delivery_ready"].target, "prepare_pr")
-        standards_edge = by_key["standards_report_join"]
-        self.assertEqual(
-            tuple(
-                (parameter.key, parameter.description)
-                for parameter in standards_edge.parameters
-            ),
-            (
-                (
-                    "standards_status",
-                    "Repository standards status: passed, needs_changes, or blocked.",
-                ),
-                (
-                    "compliance_report",
-                    "Read-only repository standards and architecture compliance report.",
-                ),
-            ),
-        )
-        self.assertIn(
-            "plus `compliance_report`",
-            by_key["dispatch_standards_review"].prompt,
-        )
-        self.assertIn(
-            "Standards report: {{.Params.compliance_report}}",
-            by_key["verification_join_gate"].prompt,
-        )
-        self.assertNotIn(
-            "{{.Params.standards_report}}",
-            by_key["verification_join_gate"].prompt,
-        )
 
     def test_profile_rejects_schema_two(self) -> None:
         with self.assertRaisesRegex(SpecError, "expected 3"):

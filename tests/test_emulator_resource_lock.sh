@@ -83,6 +83,39 @@ set -e
 [[ "$resume_mismatch_status" -eq 75 ]]
 "$adapter" release emulator-5559 "$resume_token"
 
+owned_token="$(
+  KENT_TASK_ID=task-1 \
+    KENT_SESSION_ID=session-1 \
+    "$adapter" acquire emulator-5562 0 7200
+)"
+resumed_owned_token="$(
+  KENT_TASK_ID=task-1 \
+    KENT_SESSION_ID=session-2 \
+    KENT_RESOURCE_LOCK_OWNER_PID=515151 \
+    "$adapter" resume-owned emulator-5562
+)"
+[[ "$resumed_owned_token" == "$owned_token" ]]
+owned_owner_file="$KENT_RESOURCE_LOCK_DIR/mobile-emulator-5562.lock/owner"
+[[ "$(sed -n 's/^pid=//p' "$owned_owner_file")" == "515151" ]]
+[[ "$(sed -n 's/^task_id=//p' "$owned_owner_file")" == "task-1" ]]
+[[ "$(sed -n 's/^session_id=//p' "$owned_owner_file")" == "session-2" ]]
+set +e
+KENT_TASK_ID=task-2 \
+  "$adapter" resume-owned emulator-5562 >/dev/null 2>&1
+other_task_resume_status=$?
+KENT_TASK_ID=unknown \
+  "$adapter" resume-owned emulator-5562 >/dev/null 2>&1
+unknown_task_resume_status=$?
+KENT_TASK_ID=task-1 \
+  "$adapter" resume-owned emulator-5563 >/dev/null 2>&1
+absent_lock_resume_status=$?
+set -e
+[[ "$other_task_resume_status" -eq 75 ]]
+[[ "$unknown_task_resume_status" -eq 64 ]]
+[[ "$absent_lock_resume_status" -eq 75 ]]
+[[ "$("$adapter" status emulator-5562 | head -1)" == "locked" ]]
+"$adapter" release emulator-5562 "$owned_token"
+
 released_resume_token="resume-after-release-token"
 [[ "$("$adapter" resume emulator-5561 "$released_resume_token")" == "$released_resume_token" ]]
 [[ "$("$adapter" status emulator-5561 | head -1)" == "locked" ]]

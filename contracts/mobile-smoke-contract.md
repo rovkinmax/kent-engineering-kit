@@ -136,5 +136,11 @@ requires the normal authorization for that external action.
 - A recovery session reads the checkpoint before acquisition. If its recorded
   token still owns the exact resource, use the lock adapter's `resume`
   operation to refresh the lease with the same token and current owner
-  metadata. A different live token remains busy and is never reclaimed as the
+  metadata.
+- If acquisition succeeded but stdout was lost before the token reached the
+  checkpoint, first require `status` to show the same non-empty Kent task ID,
+  then use `resume-owned`. That operation verifies ownership under the resource
+  guard, returns the existing token, and refreshes metadata; it never creates a
+  missing lock or adopts another task's lock.
+- A different task ID or live token remains busy and is never reclaimed as the
   current task's lease.

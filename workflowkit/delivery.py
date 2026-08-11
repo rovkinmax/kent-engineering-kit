@@ -58,10 +58,6 @@ STANDARDS_REPORT = ParameterSpec(
     "standards_report",
     "Read-only repository standards, architecture, and engineering report.",
 )
-LEGACY_STANDARDS_REPORT = ParameterSpec(
-    "compliance_report",
-    "Read-only repository standards and architecture compliance report.",
-)
 COMPLIANCE_REPORT = ParameterSpec(
     "compliance_report",
     "Final delivery compliance attestation and any blocking findings.",
@@ -425,6 +421,7 @@ def build_delivery_workflow(
             ),
             recovery_edge(
                 "implement",
+                profile=profile,
                 context=writer_recovery_context,
                 fresh_session=fresh_writers,
                 extra_parameters=(WORK_KIND,),
@@ -444,6 +441,7 @@ def build_delivery_workflow(
             ),
             recovery_edge(
                 "fix",
+                profile=profile,
                 context=writer_recovery_context,
                 fresh_session=fresh_writers,
             ),
@@ -563,7 +561,7 @@ def build_delivery_workflow(
                     ),
                     parameters=(
                         STANDARDS_STATUS,
-                        standards_report_parameter(profile),
+                        STANDARDS_REPORT,
                     ),
                 )
             )
@@ -787,6 +785,7 @@ def build_delivery_workflow(
                 ),
                 recovery_edge(
                     "evidence_repair",
+                    profile=profile,
                     context=writer_recovery_context,
                     fresh_session=fresh_writers,
                     extra_parameters=(
@@ -948,6 +947,7 @@ def build_delivery_workflow(
                             PR_URL,
                             BRANCH_NAME,
                             MERGE_STRATEGY,
+                            CI_REPORT,
                         ),
                     ),
                     EdgeSpec(
@@ -1423,6 +1423,7 @@ def qualify_transition_keys(edges: list[EdgeSpec]) -> list[EdgeSpec]:
 def recovery_edge(
     node_key: str,
     *,
+    profile: ProjectProfile | None = None,
     context: str = "compact_and_continue_session",
     fresh_session: bool = False,
     extra_parameters: tuple[ParameterSpec, ...] = (),
@@ -1442,6 +1443,24 @@ def recovery_edge(
             "`wont_do` and provide `closure_reason`."
         )
     if fresh_session:
+        if profile is None:
+            raise ValueError(
+                f"fresh recovery for {node_key!r} requires a project profile"
+            )
+        manifest_contract = {
+            "implement": ("implement", "implement", "implementation"),
+            "fix": ("implement", "fix", "implementation"),
+            "evidence_repair": (
+                "implement",
+                "evidence_repair",
+                "implementation",
+            ),
+        }.get(node_key)
+        if manifest_contract is None:
+            raise ValueError(
+                f"fresh recovery context is not defined for {node_key!r}"
+            )
+        recovery_context = context_instruction(profile, *manifest_contract)
         stage_contract = {
             "plan": """
 Reconcile any declared checkpoint and source task into authoritative
@@ -1463,6 +1482,8 @@ refreshed `fix_context` containing only the remaining findings, or choose
             f"""Restart the `{node_key}` stage in a fresh bounded session after user action.
 
 Previous blocker: {{{{.Params.blocker_reason}}}}
+
+{recovery_context}
 
 Read the task body, current task comments, project instructions, authoritative
 task artifacts, preserved worktree diff, and existing evidence before editing
@@ -1585,7 +1606,11 @@ def checkpoint_instruction(profile: ProjectProfile, stage: str) -> str:
             "Record acceptance stages, lock resource/token state, exact "
             "runtime target, completed build/install/launch work, sanitized "
             "evidence paths, remaining scenarios, external-side-effect "
-            "ledger, restoration state, and one next permitted action."
+            "ledger, restoration state, and one next permitted action. "
+            "Recover a saved token with the lock adapter's `resume`. If "
+            "acquire succeeded but stdout was lost before checkpointing, use "
+            "`resume-owned` only when lock status proves the same non-empty "
+            "Kent task ID; it must not create or adopt a lock."
         ),
     }[stage]
     return f"""Maintain the ignored `{stage}` checkpoint with
@@ -1885,11 +1910,6 @@ cancellation and provide `closure_reason`."""
 
 
 def standards_review_prompt(profile: ProjectProfile) -> str:
-    report_key = (
-        "compliance_report"
-        if profile.legacy_review_contract
-        else "standards_report"
-    )
     return f"""Run the independent read-only Standards Review.
 
 {context_instruction(profile, "review", "standards_review", "review")}
@@ -1902,7 +1922,7 @@ pinned baseline. Do not edit files. Findings are data for Join, not a routing
 decision.
 
 Complete only with `reported`. Provide `standards_status` as exactly `passed`,
-`needs_changes`, or `blocked`, plus `{report_key}` with rule, path, and
+`needs_changes`, or `blocked`, plus `standards_report` with rule, path, and
 differential evidence."""
 
 
@@ -1925,14 +1945,9 @@ gaps."""
 
 def verification_gate_prompt(profile: ProjectProfile) -> str:
     if profile.capability("standards_review"):
-        standards_report = (
-            "Standards report: {{.Params.compliance_report}}"
-            if profile.legacy_review_contract
-            else "Standards report: {{.Params.standards_report}}"
-        )
         standards = (
             "Standards status: {{.Params.standards_status}}\n"
-            + standards_report
+            "Standards report: {{.Params.standards_report}}"
         )
     else:
         standards = "Standards review: not enabled by the project profile."
@@ -2205,8 +2220,9 @@ Do not start another polling loop or ask for approval merely to wait. Re-read
 only the exact PR/run/job metadata and bounded failed-job logs. If the role's
 bounded exact-job retry policy applies, perform one permitted retry and choose
 `watch_ci` with `workspace_path`, `pr_url`, `branch_name`, and
-`merge_strategy`; the deterministic watcher owns the wait. Preserve every
-attempt and failure fingerprint in the next `ci_report`.
+`merge_strategy` plus the unchanged accumulated `ci_report`; the deterministic
+watcher owns the wait and appends the new terminal observation. Preserve every
+attempt and failure fingerprint in `ci_report`.
 
 Query authoritative PR merge state before classifying any failed or late check.
 If the PR is already merged, never route the merged task branch to Fix. Complete
@@ -2620,12 +2636,6 @@ def post_smoke_target(profile: ProjectProfile) -> str:
             return "compliance"
         return "prepare_pr"
     return "cleanup"
-
-
-def standards_report_parameter(profile: ProjectProfile) -> ParameterSpec:
-    if profile.legacy_review_contract:
-        return LEGACY_STANDARDS_REPORT
-    return STANDARDS_REPORT
 
 
 def delivery_prompt(profile: ProjectProfile, target: str) -> str:

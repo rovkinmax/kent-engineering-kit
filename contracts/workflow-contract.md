@@ -194,11 +194,13 @@ manifest, and project procedures; they do not preload this whole contract.
   when the Git branch has another name.
 - `policies.branch_identity = "task"` keeps Kent's native short-ID branch.
 - `jira` resolves `feature/<KEY>` from the task source URL first, otherwise
-  from the first Jira `/browse/<KEY>` issue URL in task-body order. Arbitrary
-  Jira-like task keys mentioned as comparison, dependency, or evidence are not
-  branch identity.
+  from exactly one Jira `/browse/<KEY>` issue URL in the task body. Multiple
+  distinct body candidates without an authoritative source URL are ambiguous
+  and block before branch mutation. Arbitrary Jira-like task keys mentioned as
+  comparison, dependency, or evidence are not branch identity.
 - `github_issue` resolves `issue-<number>` only from an exact issue URL in the
-  current GitHub repository. Source URL is inspected before task-body URLs.
+  current GitHub repository. Source URL is inspected before task-body URLs;
+  multiple distinct body candidates without a source URL are ambiguous.
 - If no usable external identity exists, retain the Kent short-ID branch.
 - Branch identity runs as a deterministic Script after read-only Plan and
   before the first Implement writer. Plan passes `workspace_path`, `plan_path`,
@@ -339,8 +341,11 @@ manifest, and project procedures; they do not preload this whole contract.
   A mismatch invalidates the skip decision; it does not authorize repetition of
   a recorded external mutation.
 - If the same checkpoint token still owns a Smoke resource, recovery renews
-  that lease through the adapter's resume operation instead of acquiring the
-  resource against itself.
+  that lease through the adapter's `resume` operation instead of acquiring the
+  resource against itself. If acquisition completed but the token was lost
+  before checkpoint persistence, `resume-owned` is allowed only when guarded
+  lock metadata proves the same non-empty Kent task ID; it returns the existing
+  token and never creates or adopts a lock.
 
 ## Final compliance
 
@@ -356,10 +361,9 @@ manifest, and project procedures; they do not preload this whole contract.
   full verification fan-out.
 - `needs_user_action` is an approval-gated Compliance self-loop. `wont_do`
   remains approval-gated terminal cancellation.
-- During the schema-3 experiment, a profile that omits `standards_review`
-  retains the legacy meaning: its old `compliance_review` value controls the
-  early Standards branch and final Compliance remains disabled. Projects opt
-  into the split by declaring both capabilities explicitly.
+- Profiles declare `standards_review` and `compliance_review` explicitly.
+  Standards emits `standards_report`; final Compliance emits
+  `compliance_report`. The two reports are distinct contracts.
 - Packaging-only Compliance defects use `repair_evidence`, not normal Fix,
   when substantive source, verification, Gate, and Smoke decisions are already
   valid. Evidence Repair may edit only named ignored reports, summaries,

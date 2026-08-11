@@ -199,6 +199,34 @@ is_mobile_server() {
   [[ "$1" == "mobile" || "$1" == mobile-* ]]
 }
 
+assert_mobile_exact_target() {
+  local server_name="$1"
+  local tool_name="$2"
+  local platform device_id
+
+  [[ "$server_name" == "mobile" ]] || return 0
+
+  case "$tool_name" in
+    device)
+      return 0
+      ;;
+    screen|input|ui|app)
+      platform="$(arg_value platform || true)"
+      device_id="$(arg_value deviceId || true)"
+      if [[ -z "$platform" || -z "$device_id" ]]; then
+        printf 'mobile_exact_target_required: mobile.%s requires non-empty platform and deviceId arguments\n' \
+          "$tool_name" >&2
+        exit 2
+      fi
+      ;;
+    system|flow)
+      printf 'unsupported_mobile_implicit_target: mobile.%s cannot prove one exact device through the current schema; use an exact project platform adapter\n' \
+        "$tool_name" >&2
+      exit 2
+      ;;
+  esac
+}
+
 mobile_tool_mutates() {
   local tool_name="$1"
   local action_name="$2"
@@ -375,6 +403,8 @@ if [[ "$server" == "mobile" && "$tool" == "device" ]] &&
   printf 'unsupported_mobile_target_state: default mobile is stateless; use action=list and pass platform plus deviceId to every target-specific call\n' >&2
   exit 2
 fi
+
+assert_mobile_exact_target "$server" "$tool"
 
 if is_mobile_server "$server" && [[ "$tool" != "device" ]] &&
   [[ "$safe_output_mode" == "raw" ]]; then

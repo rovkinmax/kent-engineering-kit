@@ -191,11 +191,14 @@ of depending on ambient CLI authentication.
 implementation writer:
 `task` retains Kent's short-ID branch, `jira` uses `feature/<KEY>`, and
 `github_issue` uses `issue-<number>` only for an issue in the same GitHub
-repository. Missing external identity keeps the Kent branch. Existing local or
-remote branch collisions stop in a recoverable user-decision node rather than
-attaching a new task to ambiguous work. The deterministic Script runs after the
-read-only Plan handoff because Kent 2.5 does not provide a task execution root
-to a relative Script used as the first executable node.
+repository. The task source URL is authoritative; a body-only fallback must
+contain exactly one matching issue URL. Multiple body candidates block before
+renaming so linked or cloned issues cannot silently become branch identity.
+Missing external identity keeps the Kent branch. Existing local or remote
+branch collisions stop in a recoverable user-decision node rather than
+attaching a new task to ambiguous work. The deterministic Script runs after
+the read-only Plan handoff because Kent 2.5 does not provide a task execution
+root to a relative Script used as the first executable node.
 
 After green CI, an open feasible PR moves to a deterministic script watcher.
 Unchanged state consumes no model turn and requires no approval. Material
@@ -251,8 +254,9 @@ variants, accounts, and tested flows in project-owned procedures.
 ## Current phase
 
 The global toolkit and Kent 2.5+ workflow generator are implemented and
-validated by the repository test suite and project canaries. Generated
-workflows use a shared fan-out/Join/Gate
+validated by the repository test suite. The generator shape has prior project
+canary coverage; every new candidate still follows the rollout process in the
+roadmap. Generated workflows use a shared fan-out/Join/Gate
 lifecycle with project-owned profiles, procedures, verification, Smoke, and
 delivery adapters. Taskless generated workflows may be reconciled in place only
 when the Kent CLI can express the change without deleting nodes or edges,

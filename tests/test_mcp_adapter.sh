@@ -177,6 +177,34 @@ fi
 grep -F "requires --allow-mutate" "$tmp/mutate.err" >/dev/null
 
 if run_adapter "$args_log" \
+  "$call_adapter" mobile.input action=tap platform=android \
+  --allow-mutate --quiet >"$tmp/missing-device.out" \
+  2>"$tmp/missing-device.err"; then
+  echo "mobile call without deviceId unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -F "mobile_exact_target_required" "$tmp/missing-device.err" >/dev/null
+
+if run_adapter "$args_log" \
+  "$call_adapter" mobile.ui action=tree deviceId=emulator-5554 \
+  --digest-output >"$tmp/missing-platform.out" \
+  2>"$tmp/missing-platform.err"; then
+  echo "mobile call without platform unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -F "mobile_exact_target_required" "$tmp/missing-platform.err" >/dev/null
+
+if run_adapter "$args_log" \
+  "$call_adapter" mobile.system action=clipboard_paste platform=android \
+  --allow-mutate --quiet >"$tmp/implicit-system.out" \
+  2>"$tmp/implicit-system.err"; then
+  echo "implicit-target mobile system call unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -F "unsupported_mobile_implicit_target" \
+  "$tmp/implicit-system.err" >/dev/null
+
+if run_adapter "$args_log" \
   "$call_adapter" mobile.ui action=tree deviceId=emulator-5554 \
   platform=android --no-save-raw \
   >"$tmp/mobile-raw.out" 2>"$tmp/mobile-raw.err"; then

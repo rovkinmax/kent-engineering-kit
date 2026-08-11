@@ -44,6 +44,7 @@ class GitRepositoryTest(unittest.TestCase):
         self,
         command: list[str],
         *,
+        initial_input: str = "",
         timeout: float = 4.0,
     ) -> tuple[int, str, str]:
         with subprocess.Popen(
@@ -53,12 +54,16 @@ class GitRepositoryTest(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         ) as process:
+            assert process.stdin is not None
+            if initial_input:
+                process.stdin.write(initial_input)
+                process.stdin.flush()
             try:
                 returncode = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-                self.fail("command did not fail while stdin remained open and empty")
+                self.fail("command did not finish while stdin remained open")
             finally:
                 if process.stdin is not None:
                     process.stdin.close()
@@ -197,6 +202,28 @@ class WorkflowCheckpointTest(GitRepositoryTest):
             stderr,
         )
 
+    def test_checkpoint_open_partial_stdin_times_out(self) -> None:
+        root = self.create_repository()
+        returncode, _, stderr = self.run_with_open_stdin(
+            [
+                str(CHECKPOINT),
+                "write",
+                "--stage",
+                "fix",
+                "--task",
+                "TASK-1",
+                "--workspace",
+                str(root),
+            ],
+            initial_input="{",
+        )
+
+        self.assertEqual(returncode, 1)
+        self.assertIn(
+            "checkpoint input timed out waiting for a complete JSON object",
+            stderr,
+        )
+
     def test_checkpoint_rejects_runtime_symlink_escape(self) -> None:
         root = self.create_repository()
         external_temporary = tempfile.TemporaryDirectory()
@@ -304,7 +331,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
             root,
             summary="Implemented one slice.",
             files_read=[
-                ".kent/context/implement.md",
+                "./.kent/context/implement.md",
                 "AGENTS.md",
                 "AGENTS.md",
             ],
@@ -444,6 +471,26 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
             stderr,
         )
 
+    def test_ledger_open_partial_stdin_times_out(self) -> None:
+        root = self.create_repository()
+        returncode, _, stderr = self.run_with_open_stdin(
+            [
+                str(EVIDENCE),
+                "append",
+                "--task",
+                "TASK-4",
+                "--workspace",
+                str(root),
+            ],
+            initial_input="{",
+        )
+
+        self.assertEqual(returncode, 1)
+        self.assertIn(
+            "evidence input timed out waiting for a complete JSON object",
+            stderr,
+        )
+
     def test_ledger_detects_history_rewrite(self) -> None:
         root = self.create_repository()
         (root / ".kent" / "context").mkdir()
@@ -493,6 +540,7 @@ class GitHubCiWatchTest(GitRepositoryTest):
         pr_state: dict[str, object],
         checks: list[dict[str, object]],
         watch_exit: int = 0,
+        prior_report: dict[str, object] | None = None,
     ) -> dict[str, object]:
         (root / "pr-state.json").write_text(json.dumps(pr_state))
         (root / "checks.json").write_text(json.dumps(checks))
@@ -513,17 +561,18 @@ class GitHubCiWatchTest(GitRepositoryTest):
             "exit 2\n"
         )
         fake_gh.chmod(0o755)
+        workflow_input = {
+            "workspace_path": str(root),
+            "pr_url": "https://github.com/example/repo/pull/1",
+            "branch_name": "TASK-5",
+            "merge_strategy": "rebase",
+        }
+        if prior_report is not None:
+            workflow_input["ci_report"] = json.dumps(prior_report)
         result = subprocess.run(
             [str(CI_WATCH)],
             cwd=root,
-            input=json.dumps(
-                {
-                    "workspace_path": str(root),
-                    "pr_url": "https://github.com/example/repo/pull/1",
-                    "branch_name": "TASK-5",
-                    "merge_strategy": "rebase",
-                }
-            ),
+            input=json.dumps(workflow_input),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -567,7 +616,9 @@ class GitHubCiWatchTest(GitRepositoryTest):
             ],
         )
         self.assertEqual(result["transition"], "ci_watch_passed")
-        self.assertIn("all_checks_terminal_green", result["ci_report"])
+        report = json.loads(result["ci_report"])
+        self.assertEqual(report["reason"], "all_checks_terminal_green")
+        self.assertEqual(len(report["attempts"]), 1)
 
     def test_failed_checks_wake_diagnosis_agent_once(self) -> None:
         root = self.create_repository()
@@ -593,7 +644,65 @@ class GitHubCiWatchTest(GitRepositoryTest):
             watch_exit=1,
         )
         self.assertEqual(result["transition"], "ci_watch_failed")
-        self.assertIn("terminal_check_failure", result["ci_report"])
+        report = json.loads(result["ci_report"])
+        self.assertEqual(report["reason"], "terminal_check_failure")
+        self.assertEqual(len(report["attempts"]), 1)
+
+    def test_green_retry_preserves_prior_failure_attempt(self) -> None:
+        root = self.create_repository()
+        pr_state = {
+            "state": "OPEN",
+            "headRefName": "TASK-5",
+            "headRefOid": "head",
+            "baseRefName": "main",
+            "baseRefOid": "base",
+            "url": "https://github.com/example/repo/pull/1",
+        }
+        failed = self.watch(
+            root,
+            pr_state=pr_state,
+            checks=[
+                {
+                    "name": "unit",
+                    "workflow": "PR",
+                    "bucket": "fail",
+                    "state": "FAILURE",
+                    "link": "https://github.com/example/repo/actions/runs/2",
+                }
+            ],
+            watch_exit=1,
+        )
+        failed_report = json.loads(failed["ci_report"])
+        failed_report["failure_fingerprint"] = "unit:assertion"
+        failed_report["retry_job_id"] = 42
+
+        passed = self.watch(
+            root,
+            pr_state=pr_state,
+            checks=[
+                {
+                    "name": "unit",
+                    "workflow": "PR",
+                    "bucket": "pass",
+                    "state": "SUCCESS",
+                    "link": "https://github.com/example/repo/actions/runs/3",
+                }
+            ],
+            prior_report=failed_report,
+        )
+
+        report = json.loads(passed["ci_report"])
+        self.assertEqual(report["reason"], "all_checks_terminal_green")
+        self.assertEqual(len(report["attempts"]), 2)
+        self.assertEqual(
+            report["attempts"][0]["failure_fingerprint"],
+            "unit:assertion",
+        )
+        self.assertEqual(report["attempts"][0]["retry_job_id"], 42)
+        self.assertEqual(
+            report["attempts"][1]["reason"],
+            "all_checks_terminal_green",
+        )
 
     def test_merged_pr_skips_obsolete_ci_diagnosis(self) -> None:
         root = self.create_repository()
@@ -879,6 +988,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         runtime = root / ".kent" / "runtime" / "TASK-1"
         runtime.mkdir(parents=True)
         (runtime / "fix-checkpoint.json").write_text("{}")
+        (runtime / "evidence-ledger.jsonl").write_text("{}\n")
         result = subprocess.run(
             [str(JANITOR)],
             cwd=root,
