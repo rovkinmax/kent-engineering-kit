@@ -282,6 +282,31 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn("deferred/out-of-scope issues", with_jira_plan)
 
+    def test_sentry_adapter_adds_bounded_plan_instruction(self) -> None:
+        profile = self.load_profile()
+        without_sentry = build_delivery_workflow(profile, 1)
+        without_sentry_plan = next(
+            edge.prompt for edge in without_sentry.edges if edge.target == "plan"
+        )
+        self.assertNotIn("explicitly identifies a Sentry issue", without_sentry_plan)
+
+        sentry_profile = replace(
+            profile,
+            required_adapters=("sentry_issues",),
+            adapters={
+                "sentry_issues": ".kent/adapters/sentry/sentry-issues.sh",
+            },
+        )
+        with_sentry = build_delivery_workflow(sentry_profile, 1)
+        with_sentry_plan = next(
+            edge.prompt for edge in with_sentry.edges if edge.target == "plan"
+        )
+        self.assertIn("explicitly identifies a Sentry issue", with_sentry_plan)
+        self.assertIn("bounded latest-event evidence", with_sentry_plan)
+        self.assertIn("never persist raw", with_sentry_plan)
+        self.assertIn("mark-seen --allow-mutate", with_sentry_plan)
+        self.assertIn("Do not resolve or mute", with_sentry_plan)
+
     def test_delivery_inserts_configured_branch_identity_before_implement(
         self,
     ) -> None:
@@ -1963,12 +1988,14 @@ class WorkflowKitTest(unittest.TestCase):
             .replace(
                 "required_adapters = []",
                 'required_adapters = ["jira_api", '
-                '"mobile_evidence_audit", "mobile_resource_lock"]',
+                '"mobile_evidence_audit", "mobile_resource_lock", '
+                '"sentry_issues"]',
             )
             .replace(
                 "kit_managed_adapters = []",
                 'kit_managed_adapters = ["jira_api", '
-                '"mobile_evidence_audit", "mobile_resource_lock"]',
+                '"mobile_evidence_audit", "mobile_resource_lock", '
+                '"sentry_issues"]',
             )
             .replace(
                 "[commands]\n",
@@ -1982,6 +2009,7 @@ class WorkflowKitTest(unittest.TestCase):
             '".kent/adapters/mobile/mobile-evidence-audit.sh"\n'
             'mobile_resource_lock = '
             '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
+            'sentry_issues = ".kent/adapters/sentry/sentry-issues.sh"\n'
         )
         (profile_directory / "workflow-profile.toml").write_text(contents)
         create_work_kind_procedures(root)
@@ -1993,6 +2021,9 @@ class WorkflowKitTest(unittest.TestCase):
             root / ".kent" / "adapters" / "mobile" / "mobile-evidence-audit.sh"
         )
         jira_target = root / ".kent" / "adapters" / "jira" / "jira-api.sh"
+        sentry_target = (
+            root / ".kent" / "adapters" / "sentry" / "sentry-issues.sh"
+        )
         branch_identity_target = (
             root / ".kent" / "scripts" / "workflow-branch-identity"
         )
@@ -2011,6 +2042,8 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertTrue(evidence_target.stat().st_mode & 0o111)
         self.assertTrue(jira_target.is_file())
         self.assertTrue(jira_target.stat().st_mode & 0o111)
+        self.assertTrue(sentry_target.is_file())
+        self.assertTrue(sentry_target.stat().st_mode & 0o111)
         self.assertTrue(branch_identity_target.is_file())
         self.assertTrue(branch_identity_target.stat().st_mode & 0o111)
         self.assertEqual(
@@ -2020,6 +2053,15 @@ class WorkflowKitTest(unittest.TestCase):
                 / "templates"
                 / "project"
                 / "jira-api.sh"
+            ).read_bytes(),
+        )
+        self.assertEqual(
+            sentry_target.read_bytes(),
+            (
+                REPO_ROOT
+                / "templates"
+                / "project"
+                / "sentry-issues.sh"
             ).read_bytes(),
         )
         self.assertEqual(

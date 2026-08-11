@@ -48,10 +48,18 @@ After approval, create:
 
 For projects that use Jira as a planning source, declare `jira_api` in
 `required_adapters`. Add it to `kit_managed_adapters` only when the project uses
-the shared read-only template; an extended project adapter remains
+the shared safe template; an extended project adapter remains
 project-owned. Configure `[integrations.jira]` with the tenant URL and
 credential namespace or 1Password pointers. Keep issue ingestion policy in the
-project skill or Plan procedure.
+project skill or Plan procedure, and keep mutation approval plus language
+policy in the project contract.
+
+For projects that ingest Sentry issue context, declare `sentry_issues` in both
+adapter lists, map the synchronized adapter, and configure
+`[integrations.sentry]` with only the base URL, organization, project, and
+credential namespace. Keep tokens and 1Password item names in environment or a
+machine-local credential reference. Define when exact issues may be marked
+seen and which approval gates own resolve or mute.
 
 For Android projects with conditional or required Smoke, declare
 `mobile_resource_lock` and `mobile_evidence_audit` in `required_adapters` and

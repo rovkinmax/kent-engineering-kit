@@ -21,13 +21,40 @@ cat >"$tmp/bin/curl" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$@" >"$FAKE_CURL_LOG"
 url="${*: -1}"
+method=""
+for ((index = 1; index <= $#; index++)); do
+  if [[ "${!index}" == "--request" ]]; then
+    next=$((index + 1))
+    method="${!next}"
+    break
+  fi
+done
+printf 'METHOD=%s URL=%s\n' "$method" "$url" >>"${FAKE_CURL_REQUEST_LOG:-$FAKE_CURL_LOG}"
 case "$url" in
   */rest/api/3/myself)
     cat <<'JSON'
 {"accountId":"account-1","displayName":"Test User","active":true}
 JSON
     ;;
+  */rest/api/3/issue/ABC-123/transitions*)
+    cat <<'JSON'
+{"transitions":[{"id":"31","name":"Start progress","to":{"id":"3","name":"In Progress"},"hasScreen":false,"fields":{}}]}
+JSON
+    ;;
+  */rest/api/3/issue/ABC-123/comment*)
+    cat <<'JSON'
+{"id":"comment-1","self":"https://acme.atlassian.net/rest/api/3/issue/ABC-123/comment/comment-1","created":"2026-08-11T10:00:00.000+0000","author":{"displayName":"Test User"}}
+JSON
+    ;;
+  */rest/api/3/issue)
+    cat <<'JSON'
+{"id":"10001","key":"ABC-124","self":"https://acme.atlassian.net/rest/api/3/issue/ABC-124"}
+JSON
+    ;;
   */rest/api/3/issue/ABC-123*)
+    if [[ "$method" == "PUT" ]]; then
+      printf '{}\n'
+    else
     cat <<'JSON'
 {
   "key": "ABC-123",
@@ -91,6 +118,7 @@ JSON
   }
 }
 JSON
+    fi
     ;;
   *)
     echo "unexpected fake curl URL: $url" >&2
@@ -117,6 +145,7 @@ chmod +x "$tmp/bin/op"
 
 export PATH="$tmp/bin:$PATH"
 export FAKE_CURL_LOG="$tmp/curl.log"
+export FAKE_CURL_REQUEST_LOG="$tmp/curl-requests.log"
 export FAKE_OP_LOG="$tmp/op.log"
 
 (
@@ -125,7 +154,7 @@ export FAKE_OP_LOG="$tmp/op.log"
 )
 jq -e '
   .status == "ok"
-  and .read_only == true
+  and .read_only == false
   and .base_url == "https://acme.atlassian.net"
   and .credential_namespace == "ACME"
 ' "$tmp/self-test.json" >/dev/null
@@ -215,5 +244,111 @@ if (
   echo "Jira adapter unexpectedly accepted a mutation command" >&2
   exit 1
 fi
+
+
+# Dry-run rendering is local: it must not resolve credentials or call curl.
+rm -f "$tmp/curl.log" "$tmp/curl-requests.log" "$tmp/op.log"
+(
+  cd "$tmp/project"
+  env -u ACME_JIRA_EMAIL -u ACME_JIRA_API_TOKEN \
+    "$adapter" create-issue ABC --type Task --summary "Create SDK" \
+      --description $'Line one\nLine two' --label Android --fix-version 123 \
+      --assignee me --parent ABC-123 --dry-run >"$tmp/create-dry-run.json"
+)
+jq -e '
+  .dryRun == true
+  and .contentLanguage == "en"
+  and .payload.fields.project.key == "ABC"
+  and .payload.fields.issuetype.name == "Task"
+  and .payload.fields.summary == "Create SDK"
+  and .payload.fields.description.content[1].content[0].text == "Line two"
+  and .payload.fields.labels == ["Android"]
+  and .payload.fields.fixVersions == [{id: "123"}]
+  and .payload.fields.assignee.accountId == "currentUser()"
+  and .payload.fields.parent.key == "ABC-123"
+' "$tmp/create-dry-run.json" >/dev/null
+[[ ! -e "$tmp/curl-requests.log" ]] || { echo "dry-run called curl" >&2; exit 1; }
+[[ ! -e "$tmp/op.log" ]] || { echo "dry-run resolved credentials" >&2; exit 1; }
+
+if (
+  cd "$tmp/project"
+  env -u ACME_JIRA_EMAIL -u ACME_JIRA_API_TOKEN \
+    "$adapter" create-issue ABC --type Task --summary "Русский" --allow-mutate
+) >/dev/null 2>&1; then
+  echo "English guard unexpectedly accepted Cyrillic before auth" >&2
+  exit 1
+fi
+[[ ! -e "$tmp/curl-requests.log" ]] || { echo "English guard called curl" >&2; exit 1; }
+[[ ! -e "$tmp/op.log" ]] || { echo "English guard resolved credentials" >&2; exit 1; }
+
+if (
+  cd "$tmp/project"
+  ACME_JIRA_EMAIL="direct-user@example.invalid" ACME_JIRA_API_TOKEN="direct-token" \
+    "$adapter" create-issue ABC --type Task --summary "Create SDK"
+) >/dev/null 2>&1; then
+  echo "create-issue approval gate was bypassed" >&2
+  exit 1
+fi
+[[ ! -e "$tmp/curl-requests.log" ]] || { echo "approval gate called curl" >&2; exit 1; }
+
+rm -f "$tmp/curl.log" "$tmp/curl-requests.log"
+(
+  cd "$tmp/project"
+  ACME_JIRA_EMAIL="direct-user@example.invalid" ACME_JIRA_API_TOKEN="direct-token" \
+    "$adapter" create-issue ABC --type Task --summary "Create SDK" --allow-mutate >"$tmp/create.json"
+)
+jq -e '.key == "ABC-124" and .contentLanguage == "en"' "$tmp/create.json" >/dev/null
+grep -q 'METHOD=POST URL=https://acme.atlassian.net/rest/api/3/issue' "$tmp/curl-requests.log"
+grep -q '"summary": "Create SDK"' "$tmp/curl.log"
+
+rm -f "$tmp/curl.log" "$tmp/curl-requests.log"
+(
+  cd "$tmp/project"
+  ACME_JIRA_EMAIL="direct-user@example.invalid" ACME_JIRA_API_TOKEN="direct-token" \
+    "$adapter" edit-issue ABC-123 --summary "Edited SDK" --clear-labels \
+      --clear-fix-versions --clear-parent --allow-mutate >"$tmp/edit.json"
+)
+jq -e '.key == "ABC-123" and .updated == true and .contentLanguage == "en"' "$tmp/edit.json" >/dev/null
+grep -q 'METHOD=PUT URL=https://acme.atlassian.net/rest/api/3/issue/ABC-123' "$tmp/curl-requests.log"
+grep -q '"labels": \[\]' "$tmp/curl.log"
+grep -q '"fixVersions": \[\]' "$tmp/curl.log"
+grep -q '"parent": null' "$tmp/curl.log"
+
+rm -f "$tmp/curl.log" "$tmp/curl-requests.log"
+(
+  cd "$tmp/project"
+  ACME_JIRA_EMAIL="direct-user@example.invalid" ACME_JIRA_API_TOKEN="direct-token" \
+    "$adapter" comment-issue ABC-123 --body "Review ready" --allow-mutate >"$tmp/comment.json"
+)
+jq -e '.issueKey == "ABC-123" and .id == "comment-1" and .contentLanguage == "en"' "$tmp/comment.json" >/dev/null
+grep -q 'METHOD=POST URL=https://acme.atlassian.net/rest/api/3/issue/ABC-123/comment' "$tmp/curl-requests.log"
+grep -q '"body": {' "$tmp/curl.log"
+
+rm -f "$tmp/curl.log" "$tmp/curl-requests.log"
+(
+  cd "$tmp/project"
+  ACME_JIRA_EMAIL="direct-user@example.invalid" ACME_JIRA_API_TOKEN="direct-token" \
+    "$adapter" transition-issue ABC-123 --to "In Progress" --dry-run >"$tmp/transition-dry-run.json"
+)
+jq -e '.dryRun == true and .transition.id == "31" and .transition.to == "In Progress"' \
+  "$tmp/transition-dry-run.json" >/dev/null
+if grep -q 'METHOD=POST URL=https://acme.atlassian.net/rest/api/3/issue/ABC-123/transitions' \
+  "$tmp/curl-requests.log"; then
+  echo "transition dry-run mutated Jira" >&2
+  exit 1
+fi
+grep -q 'METHOD=GET URL=https://acme.atlassian.net/rest/api/3/issue/ABC-123/transitions' \
+  "$tmp/curl-requests.log"
+
+rm -f "$tmp/curl.log" "$tmp/curl-requests.log"
+(
+  cd "$tmp/project"
+  ACME_JIRA_EMAIL="direct-user@example.invalid" ACME_JIRA_API_TOKEN="direct-token" \
+    "$adapter" transition-issue ABC-123 --to 31 --allow-mutate >"$tmp/transition.json"
+)
+jq -e '.key == "ABC-123" and .transitioned == true and .transition.id == "31"' \
+  "$tmp/transition.json" >/dev/null
+grep -q 'METHOD=POST URL=https://acme.atlassian.net/rest/api/3/issue/ABC-123/transitions' \
+  "$tmp/curl-requests.log"
 
 echo "Jira adapter tests passed"

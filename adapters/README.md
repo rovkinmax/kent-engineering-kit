@@ -95,7 +95,7 @@ project-relative path.
 ## Jira source adapter
 
 Projects that use Jira as an authoritative planning source may declare the
-kit-managed read-only adapter:
+kit-managed adapter:
 
 ```toml
 required_adapters = ["jira_api"]
@@ -121,15 +121,64 @@ credentials or `_OP_REF` pointers. This lets related projects intentionally
 share one namespace while unrelated projects select independent Jira tenants
 and tokens.
 
-The common adapter supports read-only issue, comment, URL, Jira-relation, JQL,
-board, and board-issue ingestion. `issue` includes normalized `issue_links`;
-`relations` returns that collection directly, while `links` remains the
-extracted URL view. Project workflows own task creation, Jira mutation, and
-release-version policy; those operations are not exposed by this adapter.
+The common adapter supports issue, comment, URL, Jira-relation, JQL, board, and
+board-issue ingestion plus a small exact-target mutation surface:
+`create-issue`, `edit-issue`, `comment-issue`, and `transition-issue`. Actual
+mutations require `--allow-mutate`; safe payload previews use `--dry-run`.
+Natural-language writes default to English and require
+`--allow-non-english` for an explicit exception.
 
-A project-extended adapter with the same canonical key remains project-owned
-by omitting it from `kit_managed_adapters`. The synchronizer validates the
-executable but never replaces it, even with `--update`.
+The common adapter does not expose version release, deletion, arbitrary custom
+fields, or bulk mutation. Projects own the approval policy for its write
+commands.
+
+A project-extended adapter with the same canonical key may add separately
+gated release/version operations. It remains project-owned by omitting it from
+`kit_managed_adapters`; the synchronizer validates the executable but never
+replaces it, even with `--update`.
+
+## Sentry issue adapter
+
+Projects that ingest exact Sentry issues may declare the kit-managed adapter:
+
+```toml
+required_adapters = ["sentry_issues"]
+kit_managed_adapters = ["sentry_issues"]
+
+[adapters]
+sentry_issues = ".kent/adapters/sentry/sentry-issues.sh"
+
+[integrations.sentry]
+base_url = "https://sentry.io"
+organization = "example"
+project = "android"
+credential_namespace = "EXAMPLE"
+```
+
+The adapter uses the official Sentry REST API for structured issue/event reads
+and seen-state updates. It uses the official `sentry-cli` for resolve, mute,
+and unresolve operations. Every mutation is exact-issue only, supports
+`--dry-run`, and requires `--allow-mutate`; bulk mutation is intentionally not
+exposed.
+
+Credential resolution prefers `KENT_SENTRY_AUTH_TOKEN`, then
+`<CREDENTIAL_NAMESPACE>_SENTRY_AUTH_TOKEN`, then `SENTRY_AUTH_TOKEN`, followed
+by matching `_OP_REF` variables. A machine may instead store one 1Password
+reference in:
+
+```text
+~/.kent/credentials/sentry/<lowercase-credential-namespace>.opref
+```
+
+That local file contains only an `op://...` reference, uses mode `0600`, and is
+never committed. Profiles store the tenant coordinates and credential
+namespace only; they must not name a vault/item or contain a token.
+
+`candidates` defaults to unresolved issues and omits issues already seen by the
+current Sentry user. `issue` and `latest-event` emit bounded normalized context
+without raw request, user, breadcrumb, variable, or event-context payloads.
+An explicitly Sentry-backed task may mark its exact issue seen after durable
+task context exists. Resolve and mute remain approval-gated delivery decisions.
 
 ## Mobile runtime safety adapters
 

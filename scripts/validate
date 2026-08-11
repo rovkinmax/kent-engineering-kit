@@ -17,6 +17,7 @@ bash -n "$repo_root/adapters/gradle/shell-postprocess-hook"
 bash -n "$repo_root/templates/project/emulator-resource-lock.sh"
 bash -n "$repo_root/templates/project/jira-api.sh"
 bash -n "$repo_root/templates/project/mobile-evidence-audit.sh"
+bash -n "$repo_root/templates/project/sentry-issues.sh"
 bash -n "$repo_root/templates/project/workflow-verification-dispatch"
 bash -n "$repo_root/templates/project/workflow-verify-report"
 python3 -m py_compile \
@@ -88,6 +89,10 @@ rmdir "$install_help_root"
 }
 [[ -x "$repo_root/templates/project/mobile-evidence-audit.sh" ]] || {
   echo "mobile evidence-audit template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/sentry-issues.sh" ]] || {
+  echo "Sentry issues template is not executable" >&2
   exit 1
 }
 [[ -x "$repo_root/scripts/generate-workflow" ]] || {
@@ -378,6 +383,7 @@ PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
   python3 -m unittest discover -s "$repo_root/tests" -p 'test_*.py'
 "$repo_root/tests/test_mcp_adapter.sh"
 "$repo_root/tests/test_jira_adapter.sh"
+"$repo_root/tests/test_sentry_adapter.sh"
 "$repo_root/tests/test_emulator_resource_lock.sh"
 "$repo_root/tests/test_mobile_evidence_audit.sh"
 

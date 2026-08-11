@@ -113,8 +113,12 @@ reference needed for safe execution.
   evidence.
 - `contracts/mobile-smoke-contract.md`: runtime authorization, interaction
   proof, evidence, and resource recovery.
-- Jira projects declare the kit-managed read-only `jira_api` plus a
-  project-owned credential namespace.
+- Jira projects declare kit-managed `jira_api` plus a project-owned credential
+  namespace. Common writes are exact-target and approval-gated; project-owned
+  extensions may add release/version operations.
+- Sentry-backed projects declare kit-managed `sentry_issues`; tracked profiles
+  contain tenant coordinates and a credential namespace, never token or
+  1Password item identity.
 - MCP calls use `~/.kent/bin/kent-mcp-call` and
   `~/.kent/bin/kent-mcp-list`; project credentials and server wrappers remain
   project-owned.

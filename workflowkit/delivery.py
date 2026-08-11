@@ -1705,6 +1705,27 @@ relation exists, fall back to a bounded feature fingerprint built from API opera
 screen or flow names, distinctive domain terms, and user-visible copy."""
 
 
+def sentry_reference_instruction(profile: ProjectProfile) -> str:
+    if "sentry_issues" not in profile.required_adapters:
+        return ""
+
+    return f"""
+
+When the task source/body explicitly identifies a Sentry issue URL or
+unambiguous numeric Sentry issue ID, use `{profile.adapter("sentry_issues")}` to
+load the normalized issue and bounded latest-event evidence. Persist only the
+exception type/value/mechanism, bounded in-app frames, release/environment,
+first/last seen timestamps, count, status, and seen state; never persist raw
+request, user, breadcrumb, variable, or context payloads.
+
+Write durable Sentry source context into the task's normal planning artifacts
+before changing external state. Then preview and mark that exact issue seen;
+this automatic `mark-seen --allow-mutate` authority exists only for an
+explicitly Sentry-backed task. Do not resolve or mute a Sentry issue in Plan.
+Those outcomes require a later exact approval after a merged fix or an explicit
+no-action decision."""
+
+
 def plan_prompt(
     profile: ProjectProfile,
     *,
@@ -1740,6 +1761,7 @@ an explicit confirmation request. Do not choose `implement` in that Plan run."""
 
 {work_kind_plan_instruction(profile)}
 {jira_reference_instruction(profile)}
+{sentry_reference_instruction(profile)}
 
 Task body:
 {{{{.TaskBody}}}}

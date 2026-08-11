@@ -14,8 +14,25 @@ Usage:
   jira-api.sh search <JQL> [MAX_RESULTS]
   jira-api.sh board <BOARD_URL_OR_ID>
   jira-api.sh board-issues <BOARD_URL_OR_ID> [--status <STATUS>] [--assignee me|currentUser] [--limit <1..100>]
+  jira-api.sh transitions <KEY_OR_URL>
+  jira-api.sh transition-issue <KEY_OR_URL> --to <STATUS_OR_TRANSITION_NAME_OR_ID> \
+    [--dry-run] [--allow-mutate]
+  jira-api.sh create-issue <PROJECT_KEY> --type <ISSUE_TYPE> --summary <SUMMARY> \
+    [--description <TEXT>|--description-file <PATH>|--description-adf-file <PATH>] \
+    [--label <LABEL>] [--assignee me|unassigned] \
+    [--assignee-account-id <ACCOUNT_ID>] [--fix-version <VERSION_NAME_OR_ID>] [--parent <KEY>] \
+    [--allow-non-english] [--dry-run] [--allow-mutate]
+  jira-api.sh edit-issue <KEY_OR_URL> \
+    [--summary <SUMMARY>] [--description <TEXT>|--description-file <PATH>|--description-adf-file <PATH>] \
+    [--label <LABEL>] [--clear-labels] [--assignee me|unassigned] \
+    [--assignee-account-id <ACCOUNT_ID>] [--fix-version <VERSION_NAME_OR_ID>] \
+    [--clear-fix-versions] [--parent <KEY>] [--clear-parent] \
+    [--allow-non-english] [--dry-run] [--allow-mutate]
+  jira-api.sh comment-issue <KEY_OR_URL> \
+    (--body <TEXT>|--body-file <PATH>|--body-adf-file <PATH>) \
+    [--allow-non-english] [--dry-run] [--allow-mutate]
 
-The adapter is read-only. Credentials are resolved in this order:
+Credentials are resolved in this order:
   1. KENT_JIRA_* environment variables.
   2. <CREDENTIAL_NAMESPACE>_JIRA_* environment variables.
   3. JIRA_* environment variables.
@@ -256,6 +273,7 @@ jira_request() {
       --data "$body"
     )
   fi
+  require_command curl
   curl "${arguments[@]}" "${JIRA_BASE_URL}${path}"
 }
 
@@ -499,8 +517,491 @@ board_issues_command() {
   " <<<"$raw"
 }
 
+validate_non_empty() {
+  local name="$1"
+  local value="$2"
+  if [[ -z "$value" ]]; then
+    echo "jira-api: ${name} must not be empty" >&2
+    return 2
+  fi
+}
+
+validate_english_text() {
+  local field_name="$1"
+  local value="$2"
+  local allow_non_english="$3"
+  if [[ "$allow_non_english" == true || -z "$value" ]]; then
+    return
+  fi
+  if grep -Eq '[А-Яа-яЁё]' <<<"$value"; then
+    echo "jira-api: ${field_name} contains Cyrillic; pass --allow-non-english to override" >&2
+    return 2
+  fi
+}
+
+validate_english_json() {
+  local field_name="$1"
+  local json_value="$2"
+  local allow_non_english="$3"
+  local text
+  [[ "$allow_non_english" == true || "$json_value" == null ]] && return
+  text="$(jq -r '[.. | strings] | join("\n")' <<<"$json_value")"
+  validate_english_text "$field_name" "$text" false
+}
+
+content_language() {
+  if [[ "$1" == true ]]; then
+    printf 'explicit-non-english\n'
+  else
+    printf 'en\n'
+  fi
+}
+
+validate_label() {
+  local label="$1"
+  if [[ ! "$label" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "jira-api: invalid label: $label" >&2
+    return 2
+  fi
+}
+
+validate_fix_version() {
+  local value="$1"
+  if [[ -z "$value" || "$value" == *$'\n'* ]]; then
+    echo "jira-api: fix version must be a non-empty single-line value" >&2
+    return 2
+  fi
+}
+
+json_string_array() {
+  if (($# == 0)); then
+    printf '[]\n'
+  else
+    printf '%s\n' "$@" | jq -R . | jq -s .
+  fi
+}
+
+json_fix_versions() {
+  if (($# == 0)); then
+    printf '[]\n'
+  else
+    printf '%s\n' "$@" | jq -R 'if test("^[0-9]+$") then {id: .} else {name: .} end' | jq -s .
+  fi
+}
+
+build_adf_from_text() {
+  jq -n --arg text "$1" '
+    {
+      type: "doc",
+      version: 1,
+      content: ($text | split("\n") | map({
+        type: "paragraph",
+        content: (if . == "" then [] else [{type: "text", text: .}] end)
+      }))
+    }
+  '
+}
+
+validate_adf_file() {
+  local path="$1"
+  [[ -f "$path" ]] || {
+    echo "jira-api: missing ADF file: $path" >&2
+    return 2
+  }
+  jq -e '
+    type == "object"
+    and .type == "doc"
+    and .version == 1
+    and (.content | type == "array")
+  ' "$path" >/dev/null || {
+    echo "jira-api: invalid ADF document in: $path" >&2
+    return 2
+  }
+}
+
+build_content_json() {
+  local text="$1"
+  local text_file="$2"
+  local adf_file="$3"
+  local source_count=0
+  [[ -n "$text" ]] && source_count=$((source_count + 1))
+  [[ -n "$text_file" ]] && source_count=$((source_count + 1))
+  [[ -n "$adf_file" ]] && source_count=$((source_count + 1))
+  if ((source_count > 1)); then
+    echo "jira-api: content sources are mutually exclusive" >&2
+    return 2
+  fi
+  if [[ -n "$adf_file" ]]; then
+    validate_adf_file "$adf_file" || return
+    jq -c . "$adf_file"
+  elif [[ -n "$text_file" ]]; then
+    [[ -f "$text_file" ]] || {
+      echo "jira-api: missing content file: $text_file" >&2
+      return 2
+    }
+    build_adf_from_text "$(<"$text_file")"
+  elif [[ -n "$text" ]]; then
+    build_adf_from_text "$text"
+  else
+    printf 'null\n'
+  fi
+}
+
+validate_assignee() {
+  case "$1" in
+    ""|me|currentUser|currentUser\(\)|unassigned|null)
+      return
+      ;;
+    *)
+      echo "jira-api: assignee must be me, currentUser, or unassigned" >&2
+      return 2
+      ;;
+  esac
+}
+
+assignee_json_for_dry_run() {
+  case "$1" in
+    "") printf 'null\n' ;;
+    me|currentUser|currentUser\(\)) jq -n '{accountId: "currentUser()"}' ;;
+    unassigned|null) jq -n '{_jiraUnassign: true}' ;;
+    account-id) jq -n --arg accountId "$2" '{accountId: $accountId}' ;;
+  esac
+}
+
+assignee_json_for_network() {
+  case "$1" in
+    "") printf 'null\n' ;;
+    me|currentUser|currentUser\(\)) jira_request GET "/rest/api/3/myself" | jq '{accountId}' ;;
+    unassigned|null) jq -n '{_jiraUnassign: true}' ;;
+    account-id) jq -n --arg accountId "$2" '{accountId: $accountId}' ;;
+  esac
+}
+
+build_create_issue_payload() {
+  jq -n \
+    --arg project "$1" --arg issue_type "$2" --arg summary "$3" --arg parent "$4" \
+    --argjson description "$5" --argjson labels "$6" --argjson assignee "$7" --argjson fix_versions "$8" '
+    {
+      fields: (
+        {
+          project: {key: $project},
+          issuetype: {name: $issue_type},
+          summary: $summary
+        }
+        + (if $description == null then {} else {description: $description} end)
+        + (if ($labels | length) == 0 then {} else {labels: $labels} end)
+        + (
+          if $assignee == null then {}
+          elif ($assignee._jiraUnassign // false) then {assignee: null}
+          else {assignee: $assignee}
+          end
+        )
+        + (if $parent == "" then {} else {parent: {key: $parent}} end)
+        + (if ($fix_versions | length) == 0 then {} else {fixVersions: $fix_versions} end)
+      )
+    }
+  '
+}
+
+build_edit_issue_payload() {
+  jq -n \
+    --arg summary "$1" --arg parent "$2" --argjson clear_parent "$3" \
+    --argjson description "$4" --argjson labels "$5" --argjson replace_labels "$6" \
+    --argjson assignee "$7" --argjson fix_versions "$8" --argjson replace_fix_versions "$9" '
+    {
+      fields: (
+        {}
+        + (if $summary == "" then {} else {summary: $summary} end)
+        + (if $description == null then {} else {description: $description} end)
+        + (if $replace_labels then {labels: $labels} else {} end)
+        + (if $replace_fix_versions then {fixVersions: $fix_versions} else {} end)
+        + (if $clear_parent then {parent: null} elif $parent != "" then {parent: {key: $parent}} else {} end)
+        + (
+          if $assignee == null then {}
+          elif ($assignee._jiraUnassign // false) then {assignee: null}
+          else {assignee: $assignee}
+          end
+        )
+      )
+    }
+  '
+}
+
+build_comment_payload() {
+  jq -n --argjson body "$1" '{body: $body}'
+}
+
+require_mutation_approval() {
+  [[ "$1" == true ]] || {
+    echo "jira-api: ${2} requires exact --allow-mutate or --dry-run" >&2
+    return 2
+  }
+}
+
+create_issue_command() {
+  local project="$1"
+  shift
+  local issue_type="" summary="" description="" description_file="" description_adf_file=""
+  local parent="" assignee_mode="" assignee_account_id="" dry_run=false allow_mutate=false
+  local allow_non_english=false description_json labels_json assignee_json fix_versions_json payload language
+  local -a labels=()
+  local -a fix_versions=()
+
+  while (($#)); do
+    case "$1" in
+      --type|--summary|--description|--description-file|--description-adf-file|--label|--fix-version|\
+      --assignee|--assignee-account-id|--parent)
+        [[ $# -ge 2 ]] || { echo "jira-api: $1 requires a value" >&2; return 2; }
+        case "$1" in
+          --type) issue_type="$2" ;;
+          --summary) summary="$2" ;;
+          --description) description="$2" ;;
+          --description-file) description_file="$2" ;;
+          --description-adf-file) description_adf_file="$2" ;;
+          --label) validate_label "$2" || return; labels+=("$2") ;;
+          --fix-version) validate_fix_version "$2" || return; fix_versions+=("$2") ;;
+          --assignee) validate_assignee "$2" || return; assignee_mode="$2" ;;
+          --assignee-account-id) validate_non_empty --assignee-account-id "$2" || return
+            assignee_mode="account-id"; assignee_account_id="$2" ;;
+          --parent) parent="$(issue_key "$2")" ;;
+        esac
+        shift 2
+        ;;
+      --allow-non-english) allow_non_english=true; shift ;;
+      --dry-run) dry_run=true; shift ;;
+      --allow-mutate) allow_mutate=true; shift ;;
+      --help|-h) usage; return 0 ;;
+      *) echo "jira-api: unknown create-issue argument: $1" >&2; return 2 ;;
+    esac
+  done
+
+  validate_non_empty project "$project" || return
+  validate_non_empty type "$issue_type" || return
+  validate_non_empty summary "$summary" || return
+  description_json="$(build_content_json "$description" "$description_file" "$description_adf_file")" || return
+  validate_english_text summary "$summary" "$allow_non_english" || return
+  validate_english_json description "$description_json" "$allow_non_english" || return
+  language="$(content_language "$allow_non_english")"
+  labels_json="$(json_string_array "${labels[@]}")"
+  fix_versions_json="$(json_fix_versions "${fix_versions[@]}")"
+  assignee_json="$(assignee_json_for_dry_run "$assignee_mode" "$assignee_account_id")"
+  payload="$(build_create_issue_payload "$project" "$issue_type" "$summary" "$parent" "$description_json" \
+    "$labels_json" "$assignee_json" "$fix_versions_json")"
+
+  if [[ "$dry_run" == true ]]; then
+    jq -n --arg language "$language" --argjson payload "$payload" \
+      '{dryRun: true, contentLanguage: $language, payload: $payload}'
+    return
+  fi
+  require_mutation_approval "$allow_mutate" create-issue || return
+  if [[ "$assignee_mode" != "" ]]; then
+    assignee_json="$(assignee_json_for_network "$assignee_mode" "$assignee_account_id")"
+    payload="$(build_create_issue_payload "$project" "$issue_type" "$summary" "$parent" "$description_json" \
+      "$labels_json" "$assignee_json" "$fix_versions_json")"
+  fi
+  jira_request POST "/rest/api/3/issue" "$payload" |
+    jq --arg language "$language" '{id, key, self, contentLanguage: $language}'
+}
+
+edit_issue_command() {
+  local key="$1"
+  shift
+  local summary="" description="" description_file="" description_adf_file="" parent=""
+  local assignee_mode="" assignee_account_id="" dry_run=false allow_mutate=false allow_non_english=false
+  local clear_labels=false replace_labels=false clear_fix_versions=false replace_fix_versions=false clear_parent=false
+  local description_json labels_json assignee_json fix_versions_json payload language
+  local -a labels=()
+  local -a fix_versions=()
+
+  while (($#)); do
+    case "$1" in
+      --summary|--description|--description-file|--description-adf-file|--label|--fix-version|--assignee|\
+      --assignee-account-id|--parent)
+        [[ $# -ge 2 ]] || { echo "jira-api: $1 requires a value" >&2; return 2; }
+        case "$1" in
+          --summary) summary="$2" ;;
+          --description) description="$2" ;;
+          --description-file) description_file="$2" ;;
+          --description-adf-file) description_adf_file="$2" ;;
+          --label) validate_label "$2" || return; labels+=("$2"); replace_labels=true ;;
+          --fix-version) validate_fix_version "$2" || return; fix_versions+=("$2"); replace_fix_versions=true ;;
+          --assignee) validate_assignee "$2" || return; assignee_mode="$2" ;;
+          --assignee-account-id) validate_non_empty --assignee-account-id "$2" || return
+            assignee_mode="account-id"; assignee_account_id="$2" ;;
+          --parent) parent="$(issue_key "$2")" ;;
+        esac
+        shift 2
+        ;;
+      --clear-labels) clear_labels=true; replace_labels=true; shift ;;
+      --clear-fix-versions) clear_fix_versions=true; replace_fix_versions=true; shift ;;
+      --clear-parent) clear_parent=true; shift ;;
+      --allow-non-english) allow_non_english=true; shift ;;
+      --dry-run) dry_run=true; shift ;;
+      --allow-mutate) allow_mutate=true; shift ;;
+      --help|-h) usage; return 0 ;;
+      *) echo "jira-api: unknown edit-issue argument: $1" >&2; return 2 ;;
+    esac
+  done
+
+  if [[ "$clear_labels" == true && ${#labels[@]} -gt 0 ]]; then
+    echo "jira-api: --clear-labels cannot be combined with --label" >&2
+    return 2
+  fi
+  if [[ "$clear_fix_versions" == true && ${#fix_versions[@]} -gt 0 ]]; then
+    echo "jira-api: --clear-fix-versions cannot be combined with --fix-version" >&2
+    return 2
+  fi
+  if [[ "$clear_parent" == true && -n "$parent" ]]; then
+    echo "jira-api: --clear-parent cannot be combined with --parent" >&2
+    return 2
+  fi
+
+  description_json="$(build_content_json "$description" "$description_file" "$description_adf_file")" || return
+  validate_english_text summary "$summary" "$allow_non_english" || return
+  validate_english_json description "$description_json" "$allow_non_english" || return
+  language="$(content_language "$allow_non_english")"
+  labels_json="$(json_string_array "${labels[@]}")"
+  fix_versions_json="$(json_fix_versions "${fix_versions[@]}")"
+  assignee_json="$(assignee_json_for_dry_run "$assignee_mode" "$assignee_account_id")"
+  payload="$(build_edit_issue_payload "$summary" "$parent" "$clear_parent" "$description_json" "$labels_json" \
+    "$replace_labels" "$assignee_json" "$fix_versions_json" "$replace_fix_versions")"
+  [[ "$(jq '.fields | length' <<<"$payload")" -gt 0 ]] || {
+    echo "jira-api: edit-issue needs at least one editable field" >&2
+    return 2
+  }
+  if [[ "$dry_run" == true ]]; then
+    jq -n --arg key "$key" --arg language "$language" --argjson payload "$payload" \
+      '{dryRun: true, issueKey: $key, contentLanguage: $language, payload: $payload}'
+    return
+  fi
+  require_mutation_approval "$allow_mutate" edit-issue || return
+  if [[ "$assignee_mode" != "" ]]; then
+    assignee_json="$(assignee_json_for_network "$assignee_mode" "$assignee_account_id")"
+    payload="$(build_edit_issue_payload "$summary" "$parent" "$clear_parent" "$description_json" "$labels_json" \
+      "$replace_labels" "$assignee_json" "$fix_versions_json" "$replace_fix_versions")"
+  fi
+  jira_request PUT "/rest/api/3/issue/${key}" "$payload" >/dev/null
+  jq -n --arg key "$key" --arg language "$language" \
+    '{key: $key, updated: true, contentLanguage: $language}'
+}
+
+comment_issue_command() {
+  local key="$1"
+  shift
+  local body="" body_file="" body_adf_file="" dry_run=false allow_mutate=false allow_non_english=false
+  local body_json payload language
+
+  while (($#)); do
+    case "$1" in
+      --body|--body-file|--body-adf-file)
+        [[ $# -ge 2 ]] || { echo "jira-api: $1 requires a value" >&2; return 2; }
+        case "$1" in
+          --body) body="$2" ;;
+          --body-file) body_file="$2" ;;
+          --body-adf-file) body_adf_file="$2" ;;
+        esac
+        shift 2
+        ;;
+      --allow-non-english) allow_non_english=true; shift ;;
+      --dry-run) dry_run=true; shift ;;
+      --allow-mutate) allow_mutate=true; shift ;;
+      --help|-h) usage; return 0 ;;
+      *) echo "jira-api: unknown comment-issue argument: $1" >&2; return 2 ;;
+    esac
+  done
+
+  body_json="$(build_content_json "$body" "$body_file" "$body_adf_file")" || return
+  [[ "$body_json" != null ]] || {
+    echo "jira-api: comment-issue requires --body, --body-file, or --body-adf-file" >&2
+    return 2
+  }
+  validate_english_json comment "$body_json" "$allow_non_english" || return
+  language="$(content_language "$allow_non_english")"
+  payload="$(build_comment_payload "$body_json")"
+  if [[ "$dry_run" == true ]]; then
+    jq -n --arg key "$key" --arg language "$language" --argjson payload "$payload" \
+      '{dryRun: true, issueKey: $key, contentLanguage: $language, payload: $payload}'
+    return
+  fi
+  require_mutation_approval "$allow_mutate" comment-issue || return
+  jira_request POST "/rest/api/3/issue/${key}/comment" "$payload" |
+    jq --arg key "$key" --arg language "$language" \
+      '{issueKey: $key, id, self, created, author: (.author.displayName // null), contentLanguage: $language}'
+}
+
+transitions_command() {
+  local key="$1"
+  jira_request GET "/rest/api/3/issue/${key}/transitions?expand=transitions.fields" |
+    jq --arg key "$key" '{
+      issueKey: $key,
+      transitions: [
+        .transitions[]? | {
+          id,
+          name,
+          to: .to.name,
+          statusId: .to.id,
+          hasScreen: (.hasScreen // false),
+          fields: (.fields | keys)
+        }
+      ]
+    }'
+}
+
+transition_issue_command() {
+  local key="$1"
+  shift
+  local target="" dry_run=false allow_mutate=false transitions_json transition_id transition_name transition_to payload
+
+  while (($#)); do
+    case "$1" in
+      --to)
+        [[ $# -ge 2 ]] || { echo "jira-api: --to requires a value" >&2; return 2; }
+        target="$2"
+        shift 2
+        ;;
+      --dry-run) dry_run=true; shift ;;
+      --allow-mutate) allow_mutate=true; shift ;;
+      --help|-h) usage; return 0 ;;
+      *) echo "jira-api: unknown transition-issue argument: $1" >&2; return 2 ;;
+    esac
+  done
+  validate_non_empty --to "$target" || return
+  if [[ "$dry_run" != true ]]; then
+    require_mutation_approval "$allow_mutate" transition-issue || return
+  fi
+
+  transitions_json="$(jira_request GET "/rest/api/3/issue/${key}/transitions?expand=transitions.fields")"
+  transition_id="$(jq -r --arg target "$target" '
+    .transitions[]?
+    | select(((.id | tostring) == $target) or (.name == $target) or (.to.name == $target))
+    | (.id | tostring)
+  ' <<<"$transitions_json" | head -n 1)"
+  if [[ -z "$transition_id" ]]; then
+    echo "jira-api: transition not found: $target" >&2
+    jq '{availableTransitions: [.transitions[]? | {id, name, to: .to.name}]}' <<<"$transitions_json" >&2
+    return 2
+  fi
+  transition_name="$(jq -r --arg id "$transition_id" '.transitions[] | select((.id | tostring) == $id) | .name' <<<"$transitions_json")"
+  transition_to="$(jq -r --arg id "$transition_id" '.transitions[] | select((.id | tostring) == $id) | .to.name' <<<"$transitions_json")"
+  payload="$(jq -n --arg id "$transition_id" '{transition: {id: $id}}')"
+  if [[ "$dry_run" == true ]]; then
+    jq -n --arg key "$key" --arg name "$transition_name" --arg to "$transition_to" --argjson payload "$payload" '{
+      dryRun: true,
+      issueKey: $key,
+      transition: {id: $payload.transition.id, name: $name, to: $to},
+      payload: $payload
+    }'
+  else
+    jira_request POST "/rest/api/3/issue/${key}/transitions" "$payload" >/dev/null
+    jq -n --arg key "$key" --arg id "$transition_id" --arg name "$transition_name" --arg to "$transition_to" '{
+      key: $key,
+      transitioned: true,
+      transition: {id: $id, name: $name, to: $to}
+    }'
+  fi
+}
+
 require_command jq
-require_command curl
 PROFILE_JIRA_JSON="$(profile_jira_json)"
 CREDENTIAL_NAMESPACE="${KENT_JIRA_CREDENTIAL_NAMESPACE:-${JIRA_CREDENTIAL_NAMESPACE:-}}"
 if [[ -z "$CREDENTIAL_NAMESPACE" ]]; then
@@ -535,7 +1036,7 @@ case "${1:-}" in
       )" \
       '{
         status: $status,
-        read_only: true,
+        read_only: false,
         base_url: $base_url,
         credential_namespace: $credential_namespace,
         one_password_available: $op_available
@@ -581,6 +1082,32 @@ case "${1:-}" in
   board-issues)
     shift
     board_issues_command "$@"
+    ;;
+  transitions)
+    key="$(issue_key "${2:-}")"
+    transitions_command "$key"
+    ;;
+  transition-issue)
+    [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+    key="$(issue_key "$2")"
+    shift 2
+    transition_issue_command "$key" "$@"
+    ;;
+  create-issue)
+    [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+    create_issue_command "${@:2}"
+    ;;
+  edit-issue)
+    [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+    key="$(issue_key "$2")"
+    shift 2
+    edit_issue_command "$key" "$@"
+    ;;
+  comment-issue)
+    [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+    key="$(issue_key "$2")"
+    shift 2
+    comment_issue_command "$key" "$@"
     ;;
   *)
     usage >&2

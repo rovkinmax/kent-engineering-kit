@@ -112,10 +112,12 @@ leases when acquire output is lost before checkpoint persistence.
 
 ## Follow-ups After Adoption
 
-- Split Appsome's project-owned Jira adapter into reusable read-only and
-  separately gated release-mutation boundaries only after another project
-  needs the same extended operations. Explicit adapter ownership already
-  prevents the generic kit template from replacing it.
+- Keep Appsome's release/version Jira operations project-owned. The shared
+  adapter now owns only the reusable exact-target create/edit/comment/transition
+  subset needed by Appsome-related repositories.
+- After the Sentry adapter has real-task evidence, consider an optional
+  approval-gated post-merge status node for resolve/mute. Keep the first
+  iteration source-driven and avoid making every delivery query Sentry.
 - Observe real instruction-byte, repeated-read, question, verification-loop,
   model-call, and compaction metrics before tuning global context compaction.
 - Experiment with a lower compaction threshold only after measurements show

@@ -21,6 +21,7 @@ ADAPTER_TEMPLATES = {
     "mobile_resource_lock": (
         REPO_ROOT / "templates" / "project" / "emulator-resource-lock.sh"
     ),
+    "sentry_issues": REPO_ROOT / "templates" / "project" / "sentry-issues.sh",
 }
 COMMAND_TEMPLATES = {
     "branch_identity": (

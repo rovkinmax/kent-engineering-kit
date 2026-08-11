@@ -107,6 +107,17 @@ implement = ".kent/commands/test-coverage.md"
 # credential_namespace = "EXAMPLE"
 # op_vault = "Private"
 # op_item = "Example Jira API Token"
+#
+# Projects that ingest Sentry issue context use:
+# required_adapters = ["sentry_issues"]
+# kit_managed_adapters = ["sentry_issues"]
+# [adapters]
+# sentry_issues = ".kent/adapters/sentry/sentry-issues.sh"
+# [integrations.sentry]
+# base_url = "https://sentry.io"
+# organization = "example"
+# project = "android"
+# credential_namespace = "EXAMPLE"
 
 [roles]
 orchestrator = "default"
