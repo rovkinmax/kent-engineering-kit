@@ -330,7 +330,11 @@ class WorkflowPlanContractTest(GitRepositoryTest):
         root = self.create_repository()
         plan = root / ".todo" / "task" / "plan.md"
         plan.parent.mkdir(parents=True)
-        plan.write_text("# Plan\n\n- [ ] Implement feature\n")
+        plan.write_text(
+            "# Plan\n\n"
+            "### [ ] Step 1: Implement feature\n\n"
+            "- [ ] Verify feature\n"
+        )
 
         accepted = self.run_contract(root, mode="accept")
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
@@ -339,7 +343,11 @@ class WorkflowPlanContractTest(GitRepositoryTest):
             "plan_contract_continue",
         )
 
-        plan.write_text("# Plan\n\n- [x] Implement feature\n")
+        plan.write_text(
+            "# Plan\n\n"
+            "### [x] Step 1: Implement feature\n\n"
+            "- [x] Verify feature\n"
+        )
         checked = self.run_contract(root, mode="check")
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertEqual(
