@@ -6,14 +6,16 @@ acceptance coverage, evidence ownership, dependency boundaries, and executable
 step ordering. Unsupported decisions return to the retained Plan session
 before code changes.
 
-After review, the deterministic Plan Contract Guard stores an ignored
-normalized snapshot and digest. Checkbox state is implementation progress and
-is excluded from normalization; all other plan content remains contract data.
+After review, the graph-owned deterministic Plan Contract Accept node stores an
+ignored normalized snapshot and digest. Writer nodes cannot select this
+operation. Checkbox state is implementation progress and is excluded from
+normalization; all other plan content remains contract data.
 
-Every Implement continuation and transition to verification passes through the
-guard. An unchanged normalized plan resumes its intended route. A material
-change enters Plan Revalidation in the retained planning context, then repeats
-the independent review before accepting the new snapshot.
+Every Implement and Fix continuation and transition to verification passes
+through a route-specific graph-owned check node. An unchanged normalized plan
+resumes that fixed route. A material change enters Plan Revalidation in the
+retained planning context, then repeats the independent review before accepting
+the new snapshot.
 
 Operational feedback that selects an execution detail inside the accepted
 contract stays in the active node. Feedback that changes requirements,

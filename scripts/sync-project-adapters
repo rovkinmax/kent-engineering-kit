@@ -37,6 +37,21 @@ COMMAND_TEMPLATES = {
     "plan_contract": (
         REPO_ROOT / "templates" / "project" / "workflow-plan-contract"
     ),
+    "plan_contract_accept": (
+        REPO_ROOT / "templates" / "project" / "workflow-plan-contract-accept"
+    ),
+    "plan_contract_continue": (
+        REPO_ROOT / "templates" / "project" / "workflow-plan-contract-continue"
+    ),
+    "plan_contract_fix_continue": (
+        REPO_ROOT
+        / "templates"
+        / "project"
+        / "workflow-plan-contract-fix-continue"
+    ),
+    "plan_contract_verify": (
+        REPO_ROOT / "templates" / "project" / "workflow-plan-contract-verify"
+    ),
     "wait_ci": (
         REPO_ROOT / "templates" / "project" / "workflow-wait-github-ci"
     ),

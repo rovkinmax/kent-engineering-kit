@@ -15,7 +15,8 @@ import tempfile
 TASK_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 CHECKBOX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+\[)[ xX](\])")
 MODES = {"accept", "check"}
-ROUTES = {"start", "continue", "verify"}
+ROUTES = {"start", "continue", "verify", "fix_continue"}
+ROUTE_CONTEXT_DEFAULT = "not-applicable"
 
 
 def require_string(payload: dict[str, object], key: str) -> str:
@@ -23,6 +24,13 @@ def require_string(payload: dict[str, object], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string")
     return value.strip()
+
+
+def require_environment(key: str) -> str:
+    value = os.environ.get(key, "").strip()
+    if not value:
+        raise ValueError(f"{key} must be a non-empty environment value")
+    return value
 
 
 def run_git(
@@ -134,6 +142,7 @@ def write_snapshot(
     root: Path,
     task: str,
     plan_path: str,
+    work_kind: str,
     normalized: str,
     digest: str,
 ) -> None:
@@ -142,6 +151,7 @@ def write_snapshot(
         "schema_version": 1,
         "task_short_id": task,
         "plan_path": plan_path,
+        "work_kind": work_kind,
         "normalized_sha256": digest,
         "normalized_plan": normalized,
     }
@@ -165,13 +175,15 @@ def write_snapshot(
 def complete_route(
     route: str,
     *,
+    transition: str,
     workspace: Path,
     plan_path: str,
     work_kind: str,
     review_context: str,
+    route_context: str,
 ) -> None:
     payload: dict[str, str] = {
-        "transition": f"plan_contract_{route}",
+        "transition": transition,
         "commentary": (
             "Принятый контракт плана стабилен; продолжаю по выбранному маршруту."
         ),
@@ -184,11 +196,18 @@ def complete_route(
                 "work_kind": work_kind,
             }
         )
-    else:
+    elif route == "verify":
         payload.update(
             {
                 "workspace_path": str(workspace),
                 "review_context": review_context,
+            }
+        )
+    else:
+        payload.update(
+            {
+                "workspace_path": str(workspace),
+                "fix_context": route_context,
             }
         )
     print(json.dumps(payload, ensure_ascii=False))
@@ -200,21 +219,39 @@ def main() -> int:
         raise ValueError("workflow input must be one JSON object")
 
     workspace = repository_root(require_string(payload, "workspace_path"))
-    configured_plan = require_string(payload, "plan_path")
-    work_kind = require_string(payload, "work_kind")
-    route = require_string(payload, "plan_route")
-    mode = require_string(payload, "plan_contract_mode")
+    mode = require_environment("KENT_PLAN_CONTRACT_MODE")
+    if mode not in MODES:
+        raise ValueError("KENT_PLAN_CONTRACT_MODE must be accept or check")
     task = require_string(payload, "task_short_id")
-    review_context = require_string(payload, "review_context")
+    snapshot_path = runtime_file(workspace, task)
+
+    if mode == "accept":
+        review_context = require_string(payload, "review_context")
+        configured_plan = require_string(payload, "plan_path")
+        work_kind = require_string(payload, "work_kind")
+        route = require_string(payload, "plan_route")
+        route_context = require_string(payload, "plan_route_context")
+    else:
+        route = require_environment("KENT_PLAN_CONTRACT_ROUTE")
+        accepted = load_snapshot(snapshot_path)
+        configured_plan = accepted.get("plan_path")
+        work_kind = accepted.get("work_kind")
+        if not isinstance(configured_plan, str) or not configured_plan:
+            raise ValueError("accepted plan snapshot has no plan_path")
+        if not isinstance(work_kind, str) or not work_kind:
+            raise ValueError("accepted plan snapshot has no work_kind")
+        if route == "fix_continue":
+            route_context = require_string(payload, "fix_context")
+            review_context = route_context
+        else:
+            route_context = ROUTE_CONTEXT_DEFAULT
+            review_context = require_string(payload, "review_context")
     if route not in ROUTES:
         raise ValueError(f"unsupported plan_route: {route!r}")
-    if mode not in MODES:
-        raise ValueError(f"unsupported plan_contract_mode: {mode!r}")
 
     plan, portable_plan_path = plan_file(workspace, configured_plan)
     normalized = normalized_plan(plan)
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    snapshot_path = runtime_file(workspace, task)
 
     if mode == "accept":
         write_snapshot(
@@ -222,29 +259,35 @@ def main() -> int:
             root=workspace,
             task=task,
             plan_path=portable_plan_path,
+            work_kind=work_kind,
             normalized=normalized,
             digest=digest,
         )
         complete_route(
             route,
+            transition=f"plan_contract_{route}",
             workspace=workspace,
             plan_path=configured_plan,
             work_kind=work_kind,
             review_context=review_context,
+            route_context=route_context,
         )
         return 0
 
     ensure_safe_directory(snapshot_path.parent, workspace, create=False)
-    accepted = load_snapshot(snapshot_path)
     accepted_digest = accepted.get("normalized_sha256")
     accepted_path = accepted.get("plan_path")
     if accepted_digest == digest and accepted_path == portable_plan_path:
         complete_route(
             route,
+            transition=require_environment(
+                "KENT_PLAN_CONTRACT_STABLE_TRANSITION"
+            ),
             workspace=workspace,
             plan_path=configured_plan,
             work_kind=work_kind,
             review_context=review_context,
+            route_context=route_context,
         )
         return 0
 
@@ -257,7 +300,9 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "transition": "plan_contract_changed",
+                "transition": require_environment(
+                    "KENT_PLAN_CONTRACT_CHANGED_TRANSITION"
+                ),
                 "commentary": (
                     "Контракт плана изменился; требуется повторная сверка "
                     "требований перед продолжением."
@@ -266,6 +311,7 @@ def main() -> int:
                 "plan_path": configured_plan,
                 "work_kind": work_kind,
                 "plan_route": route,
+                "plan_route_context": route_context,
                 "plan_change_report": change_report,
                 "review_context": review_context,
                 "task_short_id": task,

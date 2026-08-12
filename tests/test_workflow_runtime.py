@@ -17,6 +17,23 @@ JANITOR = REPO_ROOT / "templates" / "project" / "workflow-task-janitor"
 PLAN_CONTRACT = (
     REPO_ROOT / "templates" / "project" / "workflow-plan-contract"
 )
+PLAN_CONTRACT_ACCEPT = (
+    REPO_ROOT / "templates" / "project" / "workflow-plan-contract-accept"
+)
+PLAN_CONTRACT_CHECK = {
+    "continue": (
+        REPO_ROOT / "templates" / "project" / "workflow-plan-contract-continue"
+    ),
+    "verify": (
+        REPO_ROOT / "templates" / "project" / "workflow-plan-contract-verify"
+    ),
+    "fix_continue": (
+        REPO_ROOT
+        / "templates"
+        / "project"
+        / "workflow-plan-contract-fix-continue"
+    ),
+}
 APK_INSTALL = (
     REPO_ROOT / "templates" / "project" / "android-apk-install-preserve"
 )
@@ -274,21 +291,35 @@ class WorkflowPlanContractTest(GitRepositoryTest):
         *,
         mode: str,
         route: str = "continue",
+        spoof_mode: str | None = None,
+        spoof_route: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [str(PLAN_CONTRACT)],
-            cwd=root,
-            input=json.dumps(
-                {
-                    "workspace_path": str(root),
-                    "plan_path": ".todo/task/plan.md",
-                    "work_kind": "feature",
-                    "plan_route": route,
-                    "plan_contract_mode": mode,
-                    "review_context": "bounded review context",
-                    "task_short_id": "TASK-PLAN",
-                }
+        executable = (
+            PLAN_CONTRACT_ACCEPT
+            if mode == "accept"
+            else PLAN_CONTRACT_CHECK[route]
+        )
+        payload = {
+            "workspace_path": str(root),
+            "plan_path": ".todo/task/plan.md",
+            "work_kind": "feature",
+            "plan_route": spoof_route or route,
+            "plan_route_context": (
+                "remaining fix bundle"
+                if route == "fix_continue"
+                else "not-applicable"
             ),
+            "review_context": "bounded review context",
+            "task_short_id": "TASK-PLAN",
+        }
+        if route == "fix_continue":
+            payload["fix_context"] = "remaining fix bundle"
+        if spoof_mode is not None:
+            payload["plan_contract_mode"] = spoof_mode
+        return subprocess.run(
+            [str(executable)],
+            cwd=root,
+            input=json.dumps(payload),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -313,7 +344,7 @@ class WorkflowPlanContractTest(GitRepositoryTest):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertEqual(
             json.loads(checked.stdout)["transition"],
-            "plan_contract_continue",
+            "plan_contract_continue_stable",
         )
 
     def test_material_plan_change_routes_to_revalidation(self) -> None:
@@ -329,9 +360,70 @@ class WorkflowPlanContractTest(GitRepositoryTest):
         changed = self.run_contract(root, mode="check", route="verify")
         self.assertEqual(changed.returncode, 0, changed.stderr)
         payload = json.loads(changed.stdout)
-        self.assertEqual(payload["transition"], "plan_contract_changed")
+        self.assertEqual(payload["transition"], "plan_contract_verify_changed")
         self.assertEqual(payload["plan_route"], "verify")
         self.assertIn("Checkbox-only progress", payload["plan_change_report"])
+
+    def test_writer_payload_cannot_override_check_mode(self) -> None:
+        root = self.create_repository()
+        plan = root / ".todo" / "task" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\n\n- [ ] Implement feature\n")
+        self.assertEqual(self.run_contract(root, mode="accept").returncode, 0)
+
+        plan.write_text("# Plan\n\n- [ ] Changed acceptance\n")
+        result = self.run_contract(
+            root,
+            mode="check",
+            spoof_mode="accept",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["transition"],
+            "plan_contract_continue_changed",
+        )
+
+    def test_writer_payload_cannot_override_check_route(self) -> None:
+        root = self.create_repository()
+        plan = root / ".todo" / "task" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\n\n- [ ] Implement feature\n")
+        self.assertEqual(self.run_contract(root, mode="accept").returncode, 0)
+
+        result = self.run_contract(
+            root,
+            mode="check",
+            route="continue",
+            spoof_route="verify",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["transition"],
+            "plan_contract_continue_stable",
+        )
+
+    def test_fix_continue_preserves_fix_bundle(self) -> None:
+        root = self.create_repository()
+        plan = root / ".todo" / "task" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\n\n- [ ] Implement feature\n")
+        self.assertEqual(
+            self.run_contract(root, mode="accept", route="fix_continue").returncode,
+            0,
+        )
+
+        checked = self.run_contract(
+            root,
+            mode="check",
+            route="fix_continue",
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        payload = json.loads(checked.stdout)
+        self.assertEqual(
+            payload["transition"],
+            "plan_contract_fix_continue_stable",
+        )
+        self.assertEqual(payload["fix_context"], "remaining fix bundle")
 
 
 class AndroidApkInstallPreserveTest(GitRepositoryTest):
@@ -340,7 +432,7 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
         root: Path,
         *,
         installed_version: int | None,
-        installed_signer: str = "aa",
+        installed_signer: str | None = "aa",
         install_failure: str = "",
     ) -> tuple[Path, dict[str, str]]:
         tools = root / "fake-tools"
@@ -390,7 +482,16 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
         apksigner = tools / "apksigner"
         apksigner.write_text(
             "#!/usr/bin/env bash\n"
-            f"echo 'Signer #1 certificate SHA-256 digest: {installed_signer}'\n"
+            "case \"${3:-}\" in\n"
+            "  *kent-installed-*)\n"
+            + (
+                f"    echo 'Signer #1 certificate SHA-256 digest: {installed_signer}'\n"
+                if installed_signer is not None
+                else "    exit 1\n"
+            )
+            + "    ;;\n"
+            "  *) echo 'Signer #1 certificate SHA-256 digest: aa' ;;\n"
+            "esac\n"
         )
         for tool in (adb, apkanalyzer, apksigner):
             tool.chmod(0o755)
@@ -445,6 +546,20 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
         self.assertEqual(result.returncode, 2, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["classification"], "downgrade_blocked")
+        self.assertNotIn("install -r", log.read_text())
+
+    def test_unknown_installed_signer_blocks_install_attempt(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(
+            root,
+            installed_version=10,
+            installed_signer=None,
+        )
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["outcome"], "blocked")
+        self.assertEqual(payload["classification"], "signer_unknown")
         self.assertNotIn("install -r", log.read_text())
 
 

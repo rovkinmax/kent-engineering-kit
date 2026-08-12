@@ -418,26 +418,22 @@ class WorkflowKitTest(unittest.TestCase):
         }
 
         continuation = implementation_edges["implement_continue_implementation"]
-        self.assertEqual(continuation.target, "plan_contract")
+        self.assertEqual(continuation.target, "plan_contract_continue")
         self.assertEqual(
             tuple(parameter.key for parameter in continuation.parameters),
             (
                 "workspace_path",
-                "plan_path",
-                "work_kind",
-                "plan_route",
                 "review_context",
-                "plan_contract_mode",
                 "task_short_id",
             ),
         )
         self.assertEqual(
             implementation_edges["implement_verify"].target,
-            "plan_contract",
+            "plan_contract_verify",
         )
         self.assertIn(
             "writer-owned plan step",
-            by_key["plan_contract_continue_implement"].prompt,
+            by_key["plan_contract_checked_continue"].prompt,
         )
         self.assertIn(
             "acquire a device",
@@ -445,7 +441,7 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn(
             "when every\nwriter-owned plan step is complete",
-            by_key["plan_contract_continue_implement"].prompt,
+            by_key["plan_contract_checked_continue"].prompt,
         )
         self.assertIn(
             "exact human-authored task-comment ID",
@@ -478,7 +474,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(by_key["fix_continue"].context, "new_session")
         self.assertEqual(
             tuple(parameter.key for parameter in by_key["fix_continue"].parameters),
-            ("workspace_path", "fix_context"),
+            ("workspace_path", "fix_context", "task_short_id"),
         )
         for key in ("implement_needs_user_action", "fix_needs_user_action"):
             self.assertEqual(by_key[key].context, "new_session")
@@ -535,7 +531,19 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(nodes["plan_contract"].kind, "script")
         self.assertEqual(
             nodes["plan_contract"].script_path,
-            ".kent/scripts/workflow-plan-contract",
+            ".kent/scripts/workflow-plan-contract-accept",
+        )
+        self.assertEqual(
+            nodes["plan_contract_continue"].script_path,
+            ".kent/scripts/workflow-plan-contract-continue",
+        )
+        self.assertEqual(
+            nodes["plan_contract_verify"].script_path,
+            ".kent/scripts/workflow-plan-contract-verify",
+        )
+        self.assertEqual(
+            nodes["plan_contract_fix_continue"].script_path,
+            ".kent/scripts/workflow-plan-contract-fix-continue",
         )
         self.assertEqual(nodes["plan_revalidation"].agent, "default")
         self.assertEqual(by_key["plan_review"].target, "plan_review")
@@ -552,16 +560,32 @@ class WorkflowKitTest(unittest.TestCase):
             "plan_review",
         )
         self.assertEqual(
-            by_key["plan_contract_revalidate"].target,
+            by_key["plan_contract_continue_revalidate"].target,
             "plan_revalidation",
         )
         self.assertEqual(
-            by_key["plan_contract_verify"].target,
+            by_key["plan_contract_checked_verify"].target,
             "verification_dispatch",
         )
         self.assertIn(
             "checkbox state alone",
-            by_key["plan_contract_revalidate"].prompt,
+            by_key["plan_contract_continue_revalidate"].prompt,
+        )
+        self.assertEqual(
+            by_key["fix_verify"].target,
+            "plan_contract_verify",
+        )
+        self.assertEqual(
+            tuple(parameter.key for parameter in by_key["fix_verify"].parameters),
+            ("workspace_path", "review_context", "task_short_id"),
+        )
+        self.assertEqual(
+            by_key["fix_continue"].target,
+            "plan_contract_fix_continue",
+        )
+        self.assertEqual(
+            by_key["plan_contract_fix_revalidate"].target,
+            "plan_revalidation",
         )
 
     def test_writer_prompts_preserve_report_only_and_scope_boundaries(self) -> None:
@@ -588,6 +612,7 @@ class WorkflowKitTest(unittest.TestCase):
             )
         )
         spec = build_delivery_workflow(profile, 1)
+        nodes = {node.key for node in spec.nodes}
         by_key = {edge.key: edge for edge in spec.edges}
 
         self.assertEqual(profile.writer_session_policy(), "continuous")
@@ -596,7 +621,7 @@ class WorkflowKitTest(unittest.TestCase):
             "compact_and_continue_session",
         )
         self.assertEqual(
-            by_key["plan_contract_continue_implement"].context,
+            by_key["plan_contract_checked_continue"].context,
             "continue_session",
         )
         self.assertEqual(
@@ -608,6 +633,9 @@ class WorkflowKitTest(unittest.TestCase):
             "previous_target_or_new",
         )
         self.assertNotIn("fix_continue", by_key)
+        self.assertNotIn("plan_contract_fix_continue", nodes)
+        self.assertNotIn("plan_contract_fix_revalidate", by_key)
+        self.assertNotIn("plan_contract_checked_fix", by_key)
         self.assertEqual(
             by_key["fix_needs_user_action"].context,
             "compact_and_continue_session",

@@ -20,11 +20,11 @@ PLAN = ParameterSpec(
 )
 PLAN_ROUTE = ParameterSpec(
     "plan_route",
-    "Post-review route: start, continue, or verify.",
+    "Post-review route: start, continue, verify, or fix_continue.",
 )
-PLAN_CONTRACT_MODE = ParameterSpec(
-    "plan_contract_mode",
-    "Plan contract operation: accept or check.",
+PLAN_ROUTE_CONTEXT = ParameterSpec(
+    "plan_route_context",
+    "Route-specific context; use not-applicable unless continuing a Fix bundle.",
 )
 PLAN_REVIEW_REPORT = ParameterSpec(
     "plan_review_report",
@@ -204,8 +204,20 @@ def build_delivery_workflow(
         NodeSpec(
             "plan_contract",
             "script",
-            "Plan Contract Guard",
-            script_path=profile.command("plan_contract"),
+            "Plan Contract Accept",
+            script_path=profile.command("plan_contract_accept"),
+        ),
+        NodeSpec(
+            "plan_contract_continue",
+            "script",
+            "Plan Contract Continue Guard",
+            script_path=profile.command("plan_contract_continue"),
+        ),
+        NodeSpec(
+            "plan_contract_verify",
+            "script",
+            "Plan Contract Verify Guard",
+            script_path=profile.command("plan_contract_verify"),
         ),
         agent_node(
             "plan_revalidation",
@@ -246,6 +258,15 @@ def build_delivery_workflow(
                     orchestrator,
                 ),
             ]
+        )
+    if fresh_writers:
+        nodes.append(
+            NodeSpec(
+                "plan_contract_fix_continue",
+                "script",
+                "Plan Contract Fix Guard",
+                script_path=profile.command("plan_contract_fix_continue"),
+            )
         )
 
     review_branches = ["deterministic_verify"]
@@ -355,6 +376,7 @@ def build_delivery_workflow(
                     PLAN,
                     WORK_KIND,
                     PLAN_ROUTE,
+                    PLAN_ROUTE_CONTEXT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
                 ),
@@ -373,7 +395,7 @@ def build_delivery_workflow(
                     PLAN,
                     WORK_KIND,
                     PLAN_ROUTE,
-                    PLAN_CONTRACT_MODE,
+                    PLAN_ROUTE_CONTEXT,
                     PLAN_REVIEW_REPORT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
@@ -396,6 +418,7 @@ def build_delivery_workflow(
                     PLAN,
                     WORK_KIND,
                     PLAN_ROUTE,
+                    PLAN_ROUTE_CONTEXT,
                     PLAN_REVIEW_REPORT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
@@ -409,6 +432,7 @@ def build_delivery_workflow(
                     PLAN,
                     WORK_KIND,
                     PLAN_ROUTE,
+                    PLAN_ROUTE_CONTEXT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
                 ),
@@ -431,6 +455,7 @@ def build_delivery_workflow(
                     PLAN,
                     WORK_KIND,
                     PLAN_ROUTE,
+                    PLAN_ROUTE_CONTEXT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
                 ),
@@ -443,14 +468,15 @@ def build_delivery_workflow(
                     PLAN,
                     WORK_KIND,
                     PLAN_ROUTE,
+                    PLAN_ROUTE_CONTEXT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
                 ),
             ),
             cancellation_edge("plan_revalidation"),
             EdgeSpec(
-                key="plan_contract_revalidate",
-                source="plan_contract",
+                key="plan_contract_continue_revalidate",
+                source="plan_contract_continue",
                 transition="changed",
                 target="plan_revalidation",
                 context="continue_session",
@@ -465,6 +491,30 @@ def build_delivery_workflow(
                     PLAN,
                     WORK_KIND,
                     PLAN_ROUTE,
+                    PLAN_ROUTE_CONTEXT,
+                    PLAN_CHANGE_REPORT,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ),
+            ),
+            EdgeSpec(
+                key="plan_contract_verify_revalidate",
+                source="plan_contract_verify",
+                transition="changed",
+                target="plan_revalidation",
+                context="continue_session",
+                context_source="node:plan",
+                prompt=plan_revalidation_prompt(profile, from_review=False),
+                transition_description=(
+                    "The normalized accepted plan changed materially; reconcile "
+                    "authority and acceptance before verification."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    PLAN_ROUTE_CONTEXT,
                     PLAN_CHANGE_REPORT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
@@ -472,6 +522,32 @@ def build_delivery_workflow(
             ),
         ]
     )
+    if fresh_writers:
+        edges.append(
+            EdgeSpec(
+                key="plan_contract_fix_revalidate",
+                source="plan_contract_fix_continue",
+                transition="changed",
+                target="plan_revalidation",
+                context="continue_session",
+                context_source="node:plan",
+                prompt=plan_revalidation_prompt(profile, from_review=False),
+                transition_description=(
+                    "A bounded Fix slice changed the accepted plan; reconcile "
+                    "authority before continuing repair."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    PLAN_ROUTE_CONTEXT,
+                    PLAN_CHANGE_REPORT,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ),
+            )
+        )
     if branch_identity_enabled:
         edges.extend(
             [
@@ -583,8 +659,64 @@ def build_delivery_workflow(
                 ),
                 parameters=(WORKSPACE, REVIEW_CONTEXT),
             ),
+            EdgeSpec(
+                key="plan_contract_checked_continue",
+                source="plan_contract_continue",
+                transition="stable",
+                target="implement",
+                context=implementation_continuation_context,
+                context_source=plan_contract_continuation_source,
+                prompt=implement_prompt(profile, fresh_session=fresh_writers),
+                transition_description=(
+                    "The accepted plan contract is unchanged; continue with "
+                    "the next ready writer-owned step."
+                ),
+                parameters=implementation_parameters,
+            ),
+            EdgeSpec(
+                key="plan_contract_checked_verify",
+                source="plan_contract_verify",
+                transition="stable",
+                target="verification_dispatch",
+                transition_description=(
+                    "The accepted plan contract is unchanged and writer work "
+                    "is complete; normalize inputs for read-only verification."
+                ),
+                parameters=(WORKSPACE, REVIEW_CONTEXT),
+            ),
         ]
     )
+    if fresh_writers:
+        edges.extend(
+            [
+                EdgeSpec(
+                    key="plan_contract_fix_continue",
+                    source="plan_contract",
+                    transition="fix_continue",
+                    target="fix",
+                    context="new_session",
+                    prompt=fix_prompt(profile, bounded=True),
+                    transition_description=(
+                        "The independently revalidated plan is accepted; "
+                        "continue the remaining bounded repair bundle."
+                    ),
+                    parameters=(WORKSPACE, FIX_CONTEXT),
+                ),
+                EdgeSpec(
+                    key="plan_contract_checked_fix",
+                    source="plan_contract_fix_continue",
+                    transition="stable",
+                    target="fix",
+                    context="new_session",
+                    prompt=fix_prompt(profile, bounded=True),
+                    transition_description=(
+                        "The accepted plan contract is unchanged; continue only "
+                        "the remaining bounded repair bundle."
+                    ),
+                    parameters=(WORKSPACE, FIX_CONTEXT),
+                ),
+            ]
+        )
     edges.extend(
         [
             recovery_edge(
@@ -600,18 +732,14 @@ def build_delivery_workflow(
                 key="implement_continue",
                 source="implement",
                 transition="continue_implementation",
-                target="plan_contract",
+                target="plan_contract_continue",
                 transition_description=(
                     "One plan step is complete; check the accepted plan contract "
                     "before starting the next writer slice."
                 ),
                 parameters=(
                     WORKSPACE,
-                    PLAN,
-                    WORK_KIND,
-                    PLAN_ROUTE,
                     REVIEW_CONTEXT,
-                    PLAN_CONTRACT_MODE,
                     TASK_SHORT_ID,
                 ),
             ),
@@ -619,17 +747,13 @@ def build_delivery_workflow(
                 key="implement_verify",
                 source="implement",
                 transition="verify",
-                target="plan_contract",
+                target="plan_contract_verify",
                 transition_description=(
                     "Implementation is complete; check the accepted plan "
                     "contract before read-only verification."
                 ),
                 parameters=(
                     WORKSPACE,
-                    PLAN,
-                    WORK_KIND,
-                    PLAN_ROUTE,
-                    PLAN_CONTRACT_MODE,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
                 ),
@@ -647,12 +771,12 @@ def build_delivery_workflow(
                 key="fix_verify",
                 source="fix",
                 transition="verify",
-                target="verification_dispatch",
+                target="plan_contract_verify",
                 transition_description=(
-                    "Task-scoped fixes are complete; rerun every verification "
-                    "branch."
+                    "Task-scoped fixes are complete; check the accepted plan "
+                    "contract before rerunning every verification branch."
                 ),
-                parameters=(WORKSPACE, REVIEW_CONTEXT),
+                parameters=(WORKSPACE, REVIEW_CONTEXT, TASK_SHORT_ID),
             ),
             recovery_edge(
                 "fix",
@@ -670,14 +794,12 @@ def build_delivery_workflow(
                 key="fix_continue",
                 source="fix",
                 transition="continue_fix",
-                target="fix",
-                context="new_session",
-                prompt=fix_prompt(profile, bounded=True),
+                target="plan_contract_fix_continue",
                 transition_description=(
-                    "One bounded fix slice is complete; continue with only the "
-                    "remaining task-scoped findings."
+                    "One bounded fix slice is complete; check the accepted plan "
+                    "before continuing the remaining task-scoped findings."
                 ),
-                parameters=(WORKSPACE, FIX_CONTEXT),
+                parameters=(WORKSPACE, FIX_CONTEXT, TASK_SHORT_ID),
             )
         )
 
@@ -2016,11 +2138,12 @@ Complete with `review_plan` only when the plan has no unresolved product, API,
 UX, or safety ambiguity. `workspace_path` is the repository or
 managed-worktree root; it is never `.todo/<feature>` or another artifact
 directory. Provide that root plus `plan_path`, selected `work_kind`,
-`plan_route=start`, `task_short_id={{{{.TaskShortId}}}}`, and a concise
-`review_context` naming the governing authority, source IDs, acceptance
-criteria, planned evidence, and risks. Use the literal `not-applicable` only
-when the project contract explicitly allows planless work. Kent transition
-parameters must be non-empty.
+`plan_route=start`, `plan_route_context=not-applicable`,
+`task_short_id={{{{.TaskShortId}}}}`, and a concise `review_context` naming the
+governing authority, source IDs, acceptance criteria, planned evidence, and
+risks. Use the literal `not-applicable` as `plan_path` only when the project
+contract explicitly allows planless work. Kent transition parameters must be
+non-empty.
 Complete with `needs_user_action` and `blocker_reason` for an external blocker.
 Choose `wont_do` only for an explicit cancellation decision and provide
 `closure_reason`."""
@@ -2060,17 +2183,14 @@ writer-owned plan step. Capture any planned pre-edit evidence before the first
 production edit.
 
 After marking that step complete, choose `continue_implementation` with
-`workspace_path`, `plan_path`, the unchanged `work_kind`,
-`plan_route=continue`, `plan_contract_mode=check`, and
-`task_short_id={{{{.TaskShortId}}}}` when unchecked writer-owned ready steps
-remain. Also provide a concise `review_context` with the completed step,
-changed files, checks, and next ready step. Choose `verify` when every
-writer-owned plan step is complete; provide the same plan identity with
-`plan_route=verify`,
-`plan_contract_mode=check`, and `task_short_id`, plus `review_context`
-summarizing plan/spec paths, the fixed comparison point, changed files, checks,
-risks, and any downstream runtime acceptance scope. Both outcomes pass through
-the deterministic Plan Contract Guard before another writer or verification.
+`workspace_path`, `task_short_id={{{{.TaskShortId}}}}`, and a concise
+`review_context` with the completed step, changed files, checks, and next ready
+step when unchecked writer-owned ready steps remain. Choose `verify` when every
+writer-owned plan step is complete; provide the same workspace/task identity
+plus `review_context` summarizing plan/spec paths, the fixed comparison point,
+changed files, checks, risks, and any downstream runtime acceptance scope.
+Both outcomes pass through graph-owned deterministic Plan Contract checks;
+writer output cannot select accept mode or a different continuation route.
 Use `needs_user_action` only for an external blocker and provide
 `blocker_reason` plus the unchanged `work_kind`. Its approval is a resume signal
 after the named external action is complete, not acknowledgement of waiting;
@@ -2088,6 +2208,7 @@ Workspace: {{{{.Params.workspace_path}}}}
 Plan: {{{{.Params.plan_path}}}}
 Work kind: {{{{.Params.work_kind}}}}
 Requested post-review route: {{{{.Params.plan_route}}}}
+Route context: {{{{.Params.plan_route_context}}}}
 Planning context: {{{{.Params.review_context}}}}
 
 Read the task body, current human-authored comments, exact source records named
@@ -2108,16 +2229,17 @@ Check:
 
 Choose `accepted` only when implementation or verification may safely follow.
 Provide `workspace_path`, `plan_path`, `work_kind`, unchanged `plan_route`,
-`plan_contract_mode=accept`, `task_short_id={{{{.TaskShortId}}}}`, a concise
+unchanged `plan_route_context`, `task_short_id={{{{.TaskShortId}}}}`, a concise
 `plan_review_report`, and refreshed `review_context` that includes the review
-result.
+result. `plan_route_context` is `not-applicable` except when preserving the
+remaining bounded Fix bundle for `fix_continue`.
 
 Choose `needs_changes` for plan-contract defects and provide the same identity,
-unchanged route, `plan_review_report`, and `review_context`; the retained Plan
-session will revise the artifact. Choose `needs_user_action` only for a real
-missing product decision or external authority and provide the preserved
-identity/context plus `blocker_reason`. Choose `wont_do` only for explicit
-cancellation and provide `closure_reason`."""
+unchanged route and route context, `plan_review_report`, and `review_context`;
+the retained Plan session will revise the artifact. Choose `needs_user_action`
+only for a real missing product decision or external authority and provide the
+preserved identity/context plus `blocker_reason`. Choose `wont_do` only for
+explicit cancellation and provide `closure_reason`."""
 
 
 def plan_revalidation_prompt(
@@ -2138,6 +2260,7 @@ Workspace: {{{{.Params.workspace_path}}}}
 Plan: {{{{.Params.plan_path}}}}
 Work kind: {{{{.Params.work_kind}}}}
 Intended route after acceptance: {{{{.Params.plan_route}}}}
+Route context: {{{{.Params.plan_route_context}}}}
 Current context: {{{{.Params.review_context}}}}
 {finding_label}
 
@@ -2154,11 +2277,14 @@ is intentionally absent from that contract.
 
 Choose `review_plan` after reconciliation and provide `workspace_path`,
 `plan_path`, unchanged `work_kind`, unchanged `plan_route`,
-`task_short_id={{{{.TaskShortId}}}}`, and refreshed `review_context`. The
-independent Plan Review will run again before the new normalized snapshot is
-accepted. Use `needs_user_action` with preserved context and `blocker_reason`
-only for a real unresolved decision or external authority. Choose `wont_do`
-only for explicit cancellation and provide `closure_reason`."""
+unchanged `plan_route_context`, `task_short_id={{{{.TaskShortId}}}}`, and
+refreshed `review_context`. Preserve the remaining bounded Fix bundle only in
+`plan_route_context` when the route is `fix_continue`; otherwise use
+`not-applicable`. The independent Plan Review will run again before the new
+normalized snapshot is accepted. Use `needs_user_action` with preserved
+context and `blocker_reason` only for a real unresolved decision or external
+authority. Choose `wont_do` only for explicit cancellation and provide
+`closure_reason`."""
 
 
 def fix_prompt(
@@ -2191,9 +2317,10 @@ that action was consumed by entry into this session: replace it with one
 concrete supplied slice before work. Do not create a transition-only session or
 append evidence for a bookkeeping-only handoff."""
         completion_contract = """
-After one slice, choose `continue_fix` with `workspace_path` and a refreshed
-`fix_context` containing only the remaining findings. Choose `verify` only when
-no fix slice remains, and provide `workspace_path` plus a refreshed
+After one slice, choose `continue_fix` with `workspace_path`,
+`task_short_id={{{{.TaskShortId}}}}`, and a refreshed `fix_context` containing
+only the remaining findings. Choose `verify` only when no fix slice remains,
+and provide `workspace_path`, the same `task_short_id`, plus a refreshed
 `review_context` containing the findings, fixes, changed files, artifact paths,
 and focused checks."""
     checkpoint = checkpoint_instruction(profile, "fix")
@@ -2233,10 +2360,11 @@ repository root with `git rev-parse --show-toplevel`, or canonical current
 directory for an intentional non-Git workspace. Do not move the worktree,
 change task artifacts, or edit code.
 
-Complete with `verify` and provide the canonical root as `workspace_path` plus
-the preserved `review_context`. Use `needs_user_action` only if Kent's execution
-root itself is unavailable or ambiguous. Choose `wont_do` only for explicit
-cancellation and provide `closure_reason`."""
+Complete with `verify` and provide the canonical root as `workspace_path`,
+`task_short_id={{.TaskShortId}}`, plus the preserved `review_context`. Use
+`needs_user_action` only if Kent's execution root itself is unavailable or
+ambiguous. Choose `wont_do` only for explicit cancellation and provide
+`closure_reason`."""
 
 
 def standards_review_prompt(profile: ProjectProfile) -> str:
@@ -2887,7 +3015,8 @@ def pr_recovery_fix_prompt(
 ) -> str:
     fresh_contract = ""
     completion_contract = """After resolving task-scoped code, complete with
-`verify` and provide `workspace_path` plus refreshed `review_context`."""
+`verify` and provide `workspace_path`, `task_short_id={{.TaskShortId}}`, plus
+refreshed `review_context`."""
     if bounded:
         fresh_contract = """
 
@@ -2897,7 +3026,8 @@ Resolve exactly one independently verifiable PR or branch recovery slice."""
         completion_contract = """After one slice, choose `continue_fix` with
 `workspace_path` and `fix_context` containing only the remaining task-scoped
 issues. Choose `verify` only when no recovery slice remains, and provide
-`workspace_path` plus refreshed `review_context`."""
+`workspace_path`, `task_short_id={{{{.TaskShortId}}}}`, plus refreshed
+`review_context`."""
 
     return f"""Resolve an approved PR or branch recovery issue.
 
@@ -2923,7 +3053,8 @@ def pr_feedback_fix_prompt(
 ) -> str:
     fresh_contract = ""
     completion_contract = """Complete with `verify` and provide
-`workspace_path` plus refreshed `review_context`."""
+`workspace_path`, `task_short_id={{.TaskShortId}}`, plus refreshed
+`review_context`."""
     if bounded:
         fresh_contract = """
 
@@ -2933,7 +3064,8 @@ Resolve exactly one independently verifiable PR-feedback slice."""
         completion_contract = """After one slice, choose `continue_fix` with
 `workspace_path` and `fix_context` containing only the remaining task-scoped
 issues. Choose `verify` only when no PR-feedback slice remains, and provide
-`workspace_path` plus refreshed `review_context`."""
+`workspace_path`, `task_short_id={{{{.TaskShortId}}}}`, plus refreshed
+`review_context`."""
 
     return f"""Fix task-scoped PR feedback.
 

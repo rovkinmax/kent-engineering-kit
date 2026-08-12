@@ -20,6 +20,10 @@ bash -n "$repo_root/templates/project/mobile-evidence-audit.sh"
 bash -n "$repo_root/templates/project/sentry-issues.sh"
 bash -n "$repo_root/templates/project/workflow-verification-dispatch"
 bash -n "$repo_root/templates/project/workflow-verify-report"
+bash -n "$repo_root/templates/project/workflow-plan-contract-accept"
+bash -n "$repo_root/templates/project/workflow-plan-contract-continue"
+bash -n "$repo_root/templates/project/workflow-plan-contract-fix-continue"
+bash -n "$repo_root/templates/project/workflow-plan-contract-verify"
 python3 -m py_compile \
   "$repo_root/templates/project/android-apk-install-preserve" \
   "$repo_root/templates/project/workflow-branch-identity" \
@@ -69,6 +73,26 @@ rmdir "$install_help_root"
   echo "workflow plan-contract template is not executable" >&2
   exit 1
 }
+for plan_contract_wrapper in \
+  workflow-plan-contract-accept \
+  workflow-plan-contract-continue \
+  workflow-plan-contract-fix-continue \
+  workflow-plan-contract-verify; do
+  [[ -x "$repo_root/templates/project/$plan_contract_wrapper" ]] || {
+    echo "$plan_contract_wrapper template is not executable" >&2
+    exit 1
+  }
+done
+for plan_contract_wrapper in \
+  workflow-plan-contract-accept \
+  workflow-plan-contract-continue \
+  workflow-plan-contract-fix-continue \
+  workflow-plan-contract-verify; do
+  [[ -x "$repo_root/templates/project/$plan_contract_wrapper" ]] || {
+    echo "$plan_contract_wrapper template is not executable" >&2
+    exit 1
+  }
+done
 [[ -x "$repo_root/templates/project/android-apk-install-preserve" ]] || {
   echo "Android APK preservation installer template is not executable" >&2
   exit 1

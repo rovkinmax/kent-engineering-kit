@@ -280,14 +280,13 @@ def main() -> int:
         return (
             0
             if classification
-            in {"package_absent", "compatible_replace", "signer_unknown"}
+            in {"package_absent", "compatible_replace"}
             else 2
         )
 
     if classification not in {
         "package_absent",
         "compatible_replace",
-        "signer_unknown",
     }:
         output["outcome"] = "blocked"
         print(json.dumps(output, ensure_ascii=False))
