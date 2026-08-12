@@ -97,21 +97,48 @@ class WorkflowKitTest(unittest.TestCase):
                 conflicts.append(name)
         self.assertEqual(conflicts, [])
 
-    def test_edge_rejects_malformed_template_placeholder(self) -> None:
+    def test_edge_rejects_malformed_template_placeholders(self) -> None:
+        malformed_prompts = (
+            "Task {{{{.TaskShortId}}}}",
+            "Task {{{.TaskShortId}}}",
+            "Task {{.TaskShortId}}}",
+            "Task {{.TaskShortId}",
+            "Task {.TaskShortId}}",
+            "Task {{TaskShortId}}",
+            "Task {{.Params.invalid-key}}",
+        )
+
+        for prompt in malformed_prompts:
+            with self.subTest(prompt=prompt):
+                edge = EdgeSpec(
+                    key="malformed_prompt",
+                    source="backlog",
+                    transition="start",
+                    target="implement",
+                    prompt=prompt,
+                    transition_description="Start implementation.",
+                )
+
+                with self.assertRaisesRegex(
+                    SpecError,
+                    "malformed template placeholder",
+                ):
+                    edge.validate()
+
+    def test_edge_accepts_supported_template_placeholders(self) -> None:
         edge = EdgeSpec(
-            key="malformed_prompt",
+            key="valid_prompt",
             source="backlog",
             transition="start",
             target="implement",
-            prompt="Task {{{{.TaskShortId}}}}",
+            prompt=(
+                "Task {{.TaskShortId}} in "
+                "{{.Params.verification_dispatch_fanout_verify.workspace_path}}"
+            ),
             transition_description="Start implementation.",
         )
 
-        with self.assertRaisesRegex(
-            SpecError,
-            "malformed template placeholder",
-        ):
-            edge.validate()
+        edge.validate()
 
     def test_global_contract_localizes_user_facing_workflow_text(self) -> None:
         contract = (REPO_ROOT / "global" / "AGENTS.md").read_text()
@@ -664,6 +691,33 @@ class WorkflowKitTest(unittest.TestCase):
             "resolve every compatible group",
             by_key["gate_fix"].prompt,
         )
+        self.assertIn(
+            "`task_short_id={{.TaskShortId}}`",
+            by_key["gate_fix"].prompt,
+        )
+
+    def test_every_fix_entry_prompt_provides_task_identity(self) -> None:
+        profiles = (
+            self.load_profile(),
+            self.load_profile(
+                lambda contents: contents.replace(
+                    'writer_sessions = "fresh_per_slice"\n',
+                    "",
+                )
+            ),
+        )
+
+        for profile in profiles:
+            with self.subTest(policy=profile.writer_session_policy()):
+                spec = build_delivery_workflow(profile, 1)
+                for edge in spec.edges:
+                    if (
+                        edge.target != "fix"
+                        or edge.source == "fix"
+                        or edge.prompt is None
+                    ):
+                        continue
+                    self.assertIn("task_short_id", edge.prompt, edge.key)
 
     def test_continuous_writer_resumes_plan_after_branch_identity_script(
         self,

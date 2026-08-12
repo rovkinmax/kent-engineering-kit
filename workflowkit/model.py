@@ -5,6 +5,9 @@ import re
 
 
 MODEL_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+TEMPLATE_EXPRESSION_PATTERN = re.compile(
+    r"^\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
+)
 NODE_KINDS = {"start", "agent", "script", "join", "terminal"}
 CONTEXT_MODES = {
     "new_session",
@@ -89,10 +92,8 @@ class EdgeSpec:
             raise SpecError(f"edge {self.key!r} has no context source")
         if not self.transition_description.strip():
             raise SpecError(f"edge {self.key!r} has no transition description")
-        if self.prompt and ("{{{{" in self.prompt or "}}}}" in self.prompt):
-            raise SpecError(
-                f"edge {self.key!r} contains a malformed template placeholder"
-            )
+        if self.prompt:
+            validate_template_placeholders(self.prompt, self.key)
         parameter_keys: set[str] = set()
         for parameter in self.parameters:
             parameter.validate()
@@ -201,6 +202,36 @@ class WorkflowSpec:
                 raise SpecError(
                     f"fan-out transition group {group_key!r} uses multiple Joins"
                 )
+
+
+def validate_template_placeholders(prompt: str, edge_key: str) -> None:
+    """Validate the bounded field-path templates used by generated prompts."""
+    cursor = 0
+    while True:
+        opening = prompt.find("{{", cursor)
+        closing = prompt.find("}}", cursor)
+        if closing != -1 and (opening == -1 or closing < opening):
+            raise SpecError(
+                f"edge {edge_key!r} contains a malformed template placeholder"
+            )
+        if opening == -1:
+            return
+
+        end = prompt.find("}}", opening + 2)
+        if end == -1:
+            raise SpecError(
+                f"edge {edge_key!r} contains a malformed template placeholder"
+            )
+        expression = prompt[opening + 2 : end].strip()
+        if not TEMPLATE_EXPRESSION_PATTERN.fullmatch(expression):
+            raise SpecError(
+                f"edge {edge_key!r} contains a malformed template placeholder"
+            )
+        cursor = end + 2
+        if cursor < len(prompt) and prompt[cursor] == "}":
+            raise SpecError(
+                f"edge {edge_key!r} contains a malformed template placeholder"
+            )
 
 
 def validate_model_key(key: str, label: str) -> None:

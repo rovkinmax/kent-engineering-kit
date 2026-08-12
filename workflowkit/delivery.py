@@ -1813,9 +1813,10 @@ another fresh writer session; choose `verify` when no writer-owned step
 remains.""",
             "fix": """
 Apply exactly one independently verifiable remaining fix slice. Update the
-authoritative fix checklist. Choose `continue_fix` with `workspace_path` and a
-refreshed `fix_context` containing only the remaining findings, or choose
-`verify` with the complete `review_context` when no fix slice remains.""",
+authoritative fix checklist. Choose `continue_fix` with `workspace_path`,
+`task_short_id={{.TaskShortId}}`, and a refreshed `fix_context` containing only
+the remaining findings, or choose `verify` with the same `task_short_id` plus
+the complete `review_context` when no fix slice remains.""",
         }.get(node_key, "")
         prompt = (
             f"""Restart the `{node_key}` stage in a fresh bounded session after user action.
@@ -2298,9 +2299,9 @@ Treat the incoming findings as one dependency-ordered repair bundle. Deduplicate
 overlap, group findings by root cause, and resolve every compatible group in
 this retained Fix session. Verify each group narrowly and update the checkpoint
 after meaningful work; do not transition merely to hand off bookkeeping. When
-the bundle is empty, complete with `verify` and provide `workspace_path` plus a
-refreshed `review_context` containing the findings, fixes, changed files,
-artifact paths, and focused checks."""
+the bundle is empty, complete with `verify` and provide `workspace_path`,
+`task_short_id={{.TaskShortId}}`, plus refreshed `review_context` containing
+the findings, fixes, changed files, artifact paths, and focused checks."""
     if bounded:
         bounded_contract = """
 
@@ -3024,10 +3025,10 @@ This is a fresh bounded writer session. Inspect the preserved diff, task
 comments, authoritative artifacts, and existing evidence before editing.
 Resolve exactly one independently verifiable PR or branch recovery slice."""
         completion_contract = """After one slice, choose `continue_fix` with
-`workspace_path` and `fix_context` containing only the remaining task-scoped
-issues. Choose `verify` only when no recovery slice remains, and provide
-`workspace_path`, `task_short_id={{.TaskShortId}}`, plus refreshed
-`review_context`."""
+`workspace_path`, `task_short_id={{.TaskShortId}}`, and `fix_context`
+containing only the remaining task-scoped issues. Choose `verify` only when no
+recovery slice remains, and provide `workspace_path`, the same
+`task_short_id`, plus refreshed `review_context`."""
 
     return f"""Resolve an approved PR or branch recovery issue.
 
@@ -3062,10 +3063,10 @@ This is a fresh bounded writer session. Inspect the preserved diff, task
 comments, authoritative artifacts, and existing evidence before editing.
 Resolve exactly one independently verifiable PR-feedback slice."""
         completion_contract = """After one slice, choose `continue_fix` with
-`workspace_path` and `fix_context` containing only the remaining task-scoped
-issues. Choose `verify` only when no PR-feedback slice remains, and provide
-`workspace_path`, `task_short_id={{.TaskShortId}}`, plus refreshed
-`review_context`."""
+`workspace_path`, `task_short_id={{.TaskShortId}}`, and `fix_context`
+containing only the remaining task-scoped issues. Choose `verify` only when no
+PR-feedback slice remains, and provide `workspace_path`, the same
+`task_short_id`, plus refreshed `review_context`."""
 
     return f"""Fix task-scoped PR feedback.
 
