@@ -89,6 +89,10 @@ class EdgeSpec:
             raise SpecError(f"edge {self.key!r} has no context source")
         if not self.transition_description.strip():
             raise SpecError(f"edge {self.key!r} has no transition description")
+        if self.prompt and ("{{{{" in self.prompt or "}}}}" in self.prompt):
+            raise SpecError(
+                f"edge {self.key!r} contains a malformed template placeholder"
+            )
         parameter_keys: set[str] = set()
         for parameter in self.parameters:
             parameter.validate()

@@ -97,6 +97,22 @@ class WorkflowKitTest(unittest.TestCase):
                 conflicts.append(name)
         self.assertEqual(conflicts, [])
 
+    def test_edge_rejects_malformed_template_placeholder(self) -> None:
+        edge = EdgeSpec(
+            key="malformed_prompt",
+            source="backlog",
+            transition="start",
+            target="implement",
+            prompt="Task {{{{.TaskShortId}}}}",
+            transition_description="Start implementation.",
+        )
+
+        with self.assertRaisesRegex(
+            SpecError,
+            "malformed template placeholder",
+        ):
+            edge.validate()
+
     def test_global_contract_localizes_user_facing_workflow_text(self) -> None:
         contract = (REPO_ROOT / "global" / "AGENTS.md").read_text()
 

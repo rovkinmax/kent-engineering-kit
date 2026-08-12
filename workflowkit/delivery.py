@@ -2318,7 +2318,7 @@ concrete supplied slice before work. Do not create a transition-only session or
 append evidence for a bookkeeping-only handoff."""
         completion_contract = """
 After one slice, choose `continue_fix` with `workspace_path`,
-`task_short_id={{{{.TaskShortId}}}}`, and a refreshed `fix_context` containing
+`task_short_id={{.TaskShortId}}`, and a refreshed `fix_context` containing
 only the remaining findings. Choose `verify` only when no fix slice remains,
 and provide `workspace_path`, the same `task_short_id`, plus a refreshed
 `review_context` containing the findings, fixes, changed files, artifact paths,
@@ -3026,7 +3026,7 @@ Resolve exactly one independently verifiable PR or branch recovery slice."""
         completion_contract = """After one slice, choose `continue_fix` with
 `workspace_path` and `fix_context` containing only the remaining task-scoped
 issues. Choose `verify` only when no recovery slice remains, and provide
-`workspace_path`, `task_short_id={{{{.TaskShortId}}}}`, plus refreshed
+`workspace_path`, `task_short_id={{.TaskShortId}}`, plus refreshed
 `review_context`."""
 
     return f"""Resolve an approved PR or branch recovery issue.
@@ -3064,7 +3064,7 @@ Resolve exactly one independently verifiable PR-feedback slice."""
         completion_contract = """After one slice, choose `continue_fix` with
 `workspace_path` and `fix_context` containing only the remaining task-scoped
 issues. Choose `verify` only when no PR-feedback slice remains, and provide
-`workspace_path`, `task_short_id={{{{.TaskShortId}}}}`, plus refreshed
+`workspace_path`, `task_short_id={{.TaskShortId}}`, plus refreshed
 `review_context`."""
 
     return f"""Fix task-scoped PR feedback.
