@@ -3,6 +3,35 @@
 This contract separates safe inspection of a test application from actions
 that require explicit user authorization.
 
+## Installation And App-Data Safety
+
+- Distinguish three operations explicitly:
+  - **fresh binary**: build the current task artifact;
+  - **preserve app data**: replace the installed binary in place with a
+    compatible signer and non-downgrade version;
+  - **destructive reset**: uninstall, clear package data, downgrade, or replace
+    an incompatible signer.
+- A normal Smoke run may build a fresh binary and use the project install
+  adapter's preservation-only operation. It must not interpret "fresh APK" as
+  permission to create a fresh app profile.
+- `adb uninstall`, `pm clear`, install with downgrade permission, simulator
+  erase, clean install, or any equivalent destructive reset requires a
+  separate explicit authorization naming that action. A general authorization
+  to test, navigate, sign in, or exercise an external flow does not imply it.
+- The deterministic Android install adapter inspects the candidate and
+  installed package, then uses only `adb install -r` for compatible or absent
+  packages. It classifies package absence, downgrade, signer mismatch,
+  transport failure, and install failure. It never deletes package data or
+  retries destructively.
+- Before install, record only the app's authentication state as
+  `authenticated`, `unauthenticated`, or `unknown`. Record the same state after
+  launch. Never store credential values, authenticated content, or secret
+  material in checkpoints, comments, reports, screenshots, or evidence.
+- A resumed Smoke session reconciles its checkpoint before rebuilding or
+  reinstalling. When the checkpoint proves the same APK digest was installed
+  successfully and the preserved flow remains authenticated, skip duplicate
+  build/install and continue from the next bounded scenario.
+
 ## Default Authorization
 
 On an acquired test emulator or simulator, focused runtime Smoke may inspect
@@ -40,6 +69,8 @@ exception, Smoke must not:
   other externally observable state changes;
 - enter credentials, approve MFA, change permissions, or provision secrets;
 - use a physical device or start an additional emulator.
+- uninstall an app, clear its data, allow a package downgrade, erase a
+  simulator, or perform another destructive reset.
 
 Local UI navigation is not an external side effect. If activating an action
 could mutate account or server state, use a non-mutating observation or a
@@ -132,7 +163,9 @@ requires the normal authorization for that external action.
   transition. Kent task/transition state is authoritative over checklist text.
 - When the user grants an exception during a task, record its exact scope in a
   durable task comment before continuing so compaction and recovery sessions do
-  not ask again.
+  not ask again. Reuse that authorization for the same account, environment,
+  action, and task scope until it is revoked or the scope materially changes.
+  Store only the authorization boundary, never credential values.
 - A recovery session reads the checkpoint before acquisition. If its recorded
   token still owns the exact resource, use the lock adapter's `resume`
   operation to refresh the lease with the same token and current owner

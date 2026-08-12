@@ -4,6 +4,18 @@
 
 - Investigate facts with available tools. Ask the user for decisions, not facts
   that can be discovered safely.
+- Changes to the Kent Engineering Kit, generated or live workflows, workflow
+  adapters/contracts, agent roles, or Kent configuration require one bounded
+  governance pass before mutation:
+  1. investigate the current behavior and affected surfaces;
+  2. present a preview naming the files, graph delta, rollout, rollback, and
+     restart impact;
+  3. obtain at least two independent read-only reviews of that preview;
+  4. obtain explicit user approval;
+  5. only then edit files or mutate live Kent state.
+  Ordinary product implementation does not inherit this ceremony. Approval is
+  valid for the previewed scope only; stop and present a new preview before a
+  material scope expansion.
 - Resolve material product or architecture decisions one at a time. Include a
   concrete recommendation and keep final authority with the user.
 - Store each durable decision in one authoritative artifact and reference it

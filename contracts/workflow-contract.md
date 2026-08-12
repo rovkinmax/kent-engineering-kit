@@ -3,9 +3,13 @@
 The common workflow layer is platform-neutral. Projects supply build, test,
 device, source-control, issue-tracker, and release adapters.
 
-This is the maintainer-facing normative source for the generator. Normal
-workflow nodes receive their role prompt, generated edge prompt, active context
-manifest, and project procedures; they do not preload this whole contract.
+This is the maintainer source for the generator. Normal nodes receive their
+role prompt, generated edge prompt, context manifest, and project procedures;
+they do not preload this contract.
+
+Kit/workflow mutation governance is defined by
+`contracts/kit-change-governance.md`. It does not apply to ordinary product
+implementation.
 
 ## Lifecycle
 
@@ -318,6 +322,9 @@ manifest, and project procedures; they do not preload this whole contract.
   and finish evidence hygiene before returning `needs_changes`.
 - Do not use a manual task move merely to inject feedback into an active node;
   it can bypass node-owned cleanup and evidence reporting.
+
+Plan Review, normalized plan snapshots, and material-change revalidation are
+defined by `contracts/plan-contract.md`.
 - Resuming an interrupted run may reuse the same session and therefore retains
   its locked prompt and execution settings. Prompt-policy fixes apply only to a
   newly created session. Repeated provider failures require checkpoint-aware

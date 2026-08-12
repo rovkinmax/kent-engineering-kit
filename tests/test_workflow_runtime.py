@@ -14,6 +14,12 @@ EVIDENCE = REPO_ROOT / "templates" / "project" / "workflow-evidence-ledger"
 CI_WATCH = REPO_ROOT / "templates" / "project" / "workflow-wait-github-ci"
 PR_WATCH = REPO_ROOT / "templates" / "project" / "workflow-wait-github-pr"
 JANITOR = REPO_ROOT / "templates" / "project" / "workflow-task-janitor"
+PLAN_CONTRACT = (
+    REPO_ROOT / "templates" / "project" / "workflow-plan-contract"
+)
+APK_INSTALL = (
+    REPO_ROOT / "templates" / "project" / "android-apk-install-preserve"
+)
 
 
 class GitRepositoryTest(unittest.TestCase):
@@ -259,6 +265,187 @@ class WorkflowCheckpointTest(GitRepositoryTest):
         )
         self.assertEqual(result.returncode, 1)
         self.assertEqual(list(external.iterdir()), [])
+
+
+class WorkflowPlanContractTest(GitRepositoryTest):
+    def run_contract(
+        self,
+        root: Path,
+        *,
+        mode: str,
+        route: str = "continue",
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(PLAN_CONTRACT)],
+            cwd=root,
+            input=json.dumps(
+                {
+                    "workspace_path": str(root),
+                    "plan_path": ".todo/task/plan.md",
+                    "work_kind": "feature",
+                    "plan_route": route,
+                    "plan_contract_mode": mode,
+                    "review_context": "bounded review context",
+                    "task_short_id": "TASK-PLAN",
+                }
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def test_checkbox_progress_does_not_change_accepted_contract(self) -> None:
+        root = self.create_repository()
+        plan = root / ".todo" / "task" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\n\n- [ ] Implement feature\n")
+
+        accepted = self.run_contract(root, mode="accept")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(
+            json.loads(accepted.stdout)["transition"],
+            "plan_contract_continue",
+        )
+
+        plan.write_text("# Plan\n\n- [x] Implement feature\n")
+        checked = self.run_contract(root, mode="check")
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(
+            json.loads(checked.stdout)["transition"],
+            "plan_contract_continue",
+        )
+
+    def test_material_plan_change_routes_to_revalidation(self) -> None:
+        root = self.create_repository()
+        plan = root / ".todo" / "task" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\n\n- [ ] Implement feature\n")
+        self.assertEqual(self.run_contract(root, mode="accept").returncode, 0)
+
+        plan.write_text(
+            "# Plan\n\n- [x] Implement feature\n- [ ] Change acceptance\n"
+        )
+        changed = self.run_contract(root, mode="check", route="verify")
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        payload = json.loads(changed.stdout)
+        self.assertEqual(payload["transition"], "plan_contract_changed")
+        self.assertEqual(payload["plan_route"], "verify")
+        self.assertIn("Checkbox-only progress", payload["plan_change_report"])
+
+
+class AndroidApkInstallPreserveTest(GitRepositoryTest):
+    def create_fake_tools(
+        self,
+        root: Path,
+        *,
+        installed_version: int | None,
+        installed_signer: str = "aa",
+        install_failure: str = "",
+    ) -> tuple[Path, dict[str, str]]:
+        tools = root / "fake-tools"
+        tools.mkdir()
+        log = root / "adb.log"
+        adb = tools / "adb"
+        adb.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -eu\n"
+            f"printf '%s\\n' \"$*\" >>{str(log)!r}\n"
+            "if [[ \"$1\" == '-s' ]]; then shift 2; fi\n"
+            "case \"${1:-} ${2:-}\" in\n"
+            "  'get-state ') echo device ;;\n"
+            + (
+                "  'shell pm') echo package:/data/app/base.apk ;;\n"
+                if installed_version is not None
+                else "  'shell pm') exit 1 ;;\n"
+            )
+            + (
+                f"  'shell dumpsys') echo 'versionCode={installed_version}' ;;\n"
+                if installed_version is not None
+                else "  'shell dumpsys') exit 1 ;;\n"
+            )
+            + (
+                "  'pull /data/app/base.apk') cp \"$2\" \"$3\" ;;\n"
+                if installed_version is not None
+                else ""
+            )
+            + (
+                f"  'install -r') echo 'Failure [INSTALL_FAILED_{install_failure}]'; exit 1 ;;\n"
+                if install_failure
+                else "  'install -r') echo Success ;;\n"
+            )
+            + "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        apkanalyzer = tools / "apkanalyzer"
+        apkanalyzer.write_text(
+            "#!/usr/bin/env bash\n"
+            "case \"$2\" in\n"
+            "  application-id) echo com.example.app ;;\n"
+            "  version-code) echo 10 ;;\n"
+            "  version-name) echo 1.0 ;;\n"
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        apksigner = tools / "apksigner"
+        apksigner.write_text(
+            "#!/usr/bin/env bash\n"
+            f"echo 'Signer #1 certificate SHA-256 digest: {installed_signer}'\n"
+        )
+        for tool in (adb, apkanalyzer, apksigner):
+            tool.chmod(0o755)
+        return log, {
+            "ADB": str(adb),
+            "APKANALYZER": str(apkanalyzer),
+            "APKSIGNER": str(apksigner),
+        }
+
+    def run_installer(
+        self,
+        root: Path,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        apk = root / "candidate.apk"
+        apk.write_bytes(b"test-apk")
+        return subprocess.run(
+            [
+                str(APK_INSTALL),
+                "install-preserve",
+                "--serial",
+                "emulator-5554",
+                "--package",
+                "com.example.app",
+                "--apk",
+                str(apk),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env={**os.environ, **env},
+        )
+
+    def test_preservation_install_never_uninstalls_or_clears(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(root, installed_version=None)
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["outcome"], "installed")
+        commands = log.read_text()
+        self.assertIn("install -r", commands)
+        self.assertNotIn("uninstall", commands)
+        self.assertNotIn(" pm clear", commands)
+        self.assertNotIn(" -d", commands)
+
+    def test_downgrade_is_classified_without_install_attempt(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(root, installed_version=11)
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["classification"], "downgrade_blocked")
+        self.assertNotIn("install -r", log.read_text())
 
 
 class WorkflowEvidenceLedgerTest(GitRepositoryTest):

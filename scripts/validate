@@ -21,9 +21,11 @@ bash -n "$repo_root/templates/project/sentry-issues.sh"
 bash -n "$repo_root/templates/project/workflow-verification-dispatch"
 bash -n "$repo_root/templates/project/workflow-verify-report"
 python3 -m py_compile \
+  "$repo_root/templates/project/android-apk-install-preserve" \
   "$repo_root/templates/project/workflow-branch-identity" \
   "$repo_root/templates/project/workflow-checkpoint" \
   "$repo_root/templates/project/workflow-evidence-ledger" \
+  "$repo_root/templates/project/workflow-plan-contract" \
   "$repo_root/templates/project/workflow-wait-github-ci" \
   "$repo_root/templates/project/workflow-wait-github-pr" \
   "$repo_root/templates/project/workflow-task-janitor"
@@ -61,6 +63,14 @@ rmdir "$install_help_root"
 }
 [[ -x "$repo_root/templates/project/workflow-evidence-ledger" ]] || {
   echo "workflow evidence-ledger template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/workflow-plan-contract" ]] || {
+  echo "workflow plan-contract template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/templates/project/android-apk-install-preserve" ]] || {
+  echo "Android APK preservation installer template is not executable" >&2
   exit 1
 }
 [[ -x "$repo_root/templates/project/workflow-wait-github-ci" ]] || {

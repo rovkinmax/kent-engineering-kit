@@ -1,5 +1,15 @@
 # Roadmap
 
+## Later Iterations
+
+- Add Kent-native monotonic task-authority revisions, durable steer event IDs,
+  transition compare-and-swap, and node entry/resume guards. Until then the kit
+  uses an ignored normalized plan snapshot and does not infer authority order
+  from private storage.
+- Revisit broader SDK absorption, naming cleanup, deduplication, and stronger
+  version coupling only after the current workflows have accumulated real
+  usage evidence.
+
 Current baseline: Kent 2.5.0, August 7, 2026.
 
 The kit is intentionally iterative. Stabilize real delivery first; normalize

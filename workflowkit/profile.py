@@ -256,6 +256,8 @@ class ProjectProfile:
             raise SpecError("profile command 'checkpoint' is required")
         if not self.command("evidence"):
             raise SpecError("profile command 'evidence' is required")
+        if not self.command("plan_contract"):
+            raise SpecError("profile command 'plan_contract' is required")
         if branch_identity_policy != "task" and not self.command("branch_identity"):
             raise SpecError(
                 "profile command 'branch_identity' is required when "

@@ -18,6 +18,22 @@ PLAN = ParameterSpec(
     "plan_path",
     "Path to the approved implementation plan, or the literal not-applicable.",
 )
+PLAN_ROUTE = ParameterSpec(
+    "plan_route",
+    "Post-review route: start, continue, or verify.",
+)
+PLAN_CONTRACT_MODE = ParameterSpec(
+    "plan_contract_mode",
+    "Plan contract operation: accept or check.",
+)
+PLAN_REVIEW_REPORT = ParameterSpec(
+    "plan_review_report",
+    "Independent read-only review of plan authority, scope, evidence, and ordering.",
+)
+PLAN_CHANGE_REPORT = ParameterSpec(
+    "plan_change_report",
+    "Deterministic summary of material plan-contract changes.",
+)
 WORK_KIND = ParameterSpec(
     "work_kind",
     "Stable project-profile work kind selected during Plan.",
@@ -140,6 +156,11 @@ def build_delivery_workflow(
     pull_requests = profile.capability("pull_requests")
     qa = profile.role("qa") if smoke_enabled else ""
     ci = profile.role("ci") if pull_requests else ""
+    plan_review_role = (
+        profile.optional_role("plan_review")
+        or profile.optional_role("spec_review")
+        or profile.role("researcher")
+    )
     fresh_writers = profile.writer_session_policy() == "fresh_per_slice"
     writer_handoff_context = (
         "new_session" if fresh_writers else "compact_and_continue_session"
@@ -149,6 +170,9 @@ def build_delivery_workflow(
     )
     implementation_continuation_context = (
         "new_session" if fresh_writers else "continue_session"
+    )
+    plan_contract_continuation_source = (
+        "immediate_source" if fresh_writers else "previous_target_or_new"
     )
     fix_context = (
         "new_session" if fresh_writers else "compact_and_continue_session"
@@ -176,6 +200,18 @@ def build_delivery_workflow(
     nodes: list[NodeSpec] = [
         NodeSpec("backlog", "start", "Backlog"),
         agent_node("plan", "Plan", orchestrator),
+        agent_node("plan_review", "Independent Plan Review", plan_review_role),
+        NodeSpec(
+            "plan_contract",
+            "script",
+            "Plan Contract Guard",
+            script_path=profile.command("plan_contract"),
+        ),
+        agent_node(
+            "plan_revalidation",
+            "Plan Revalidation",
+            orchestrator,
+        ),
         agent_node("implement", "Implement", implementation),
         NodeSpec(
             "verification_dispatch",
@@ -302,17 +338,151 @@ def build_delivery_workflow(
             transition_description="Start one planning session for this task.",
         ),
     ]
+    edges.extend(
+        [
+            EdgeSpec(
+                key="plan_review",
+                source="plan",
+                transition="review_plan",
+                target="plan_review",
+                prompt=plan_review_prompt(profile),
+                transition_description=(
+                    "Planning is complete; independently review its authority, "
+                    "scope, evidence, and executable ordering."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ),
+            ),
+            EdgeSpec(
+                key="plan_review_accept",
+                source="plan_review",
+                transition="accepted",
+                target="plan_contract",
+                transition_description=(
+                    "The independent plan review passed; accept the normalized "
+                    "plan contract and continue through its declared route."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    PLAN_CONTRACT_MODE,
+                    PLAN_REVIEW_REPORT,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ),
+            ),
+            EdgeSpec(
+                key="plan_review_revalidate",
+                source="plan_review",
+                transition="needs_changes",
+                target="plan_revalidation",
+                context="continue_session",
+                context_source="node:plan",
+                prompt=plan_revalidation_prompt(profile, from_review=True),
+                transition_description=(
+                    "The read-only review found plan-contract defects; revise "
+                    "the plan before any writer or verification stage proceeds."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    PLAN_REVIEW_REPORT,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ),
+            ),
+            recovery_edge(
+                "plan_review",
+                context=non_writer_recovery_context,
+                extra_parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ),
+            ),
+            cancellation_edge("plan_review"),
+            EdgeSpec(
+                key="plan_revalidation_review",
+                source="plan_revalidation",
+                transition="review_plan",
+                target="plan_review",
+                context="continue_session",
+                context_source="previous_target",
+                prompt=plan_review_prompt(profile),
+                transition_description=(
+                    "The plan contract was reconciled; independently re-review "
+                    "it before accepting the new snapshot."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ),
+            ),
+            recovery_edge(
+                "plan_revalidation",
+                context=non_writer_recovery_context,
+                extra_parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ),
+            ),
+            cancellation_edge("plan_revalidation"),
+            EdgeSpec(
+                key="plan_contract_revalidate",
+                source="plan_contract",
+                transition="changed",
+                target="plan_revalidation",
+                context="continue_session",
+                context_source="node:plan",
+                prompt=plan_revalidation_prompt(profile, from_review=False),
+                transition_description=(
+                    "The normalized accepted plan changed materially; reconcile "
+                    "authority and acceptance before continuing."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    PLAN_CHANGE_REPORT,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ),
+            ),
+        ]
+    )
     if branch_identity_enabled:
         edges.extend(
             [
                 EdgeSpec(
-                    key="plan_branch_identity",
-                    source="plan",
-                    transition="implement",
+                    key="plan_contract_branch_identity",
+                    source="plan_contract",
+                    transition="start",
                     target="branch_identity",
                     transition_description=(
-                        "Planning is complete; resolve source-control branch "
-                        "identity before the first implementation writer starts."
+                        "The accepted plan contract is stable; resolve "
+                        "source-control branch identity before implementation."
                     ),
                     parameters=implementation_parameters,
                 ),
@@ -333,58 +503,88 @@ def build_delivery_workflow(
                     ),
                     parameters=implementation_parameters,
                 ),
-            EdgeSpec(
-                key="branch_identity_resolution",
-                source="branch_identity",
-                transition="blocked",
-                target="branch_identity_resolution",
-                prompt=branch_identity_resolution_prompt(profile),
-                transition_description=(
-                    "Branch identity is ambiguous or collides with existing "
-                    "repository state and requires a user decision."
+                EdgeSpec(
+                    key="branch_identity_resolution",
+                    source="branch_identity",
+                    transition="blocked",
+                    target="branch_identity_resolution",
+                    prompt=branch_identity_resolution_prompt(profile),
+                    transition_description=(
+                        "Branch identity is ambiguous or collides with existing "
+                        "repository state and requires a user decision."
+                    ),
+                    parameters=(BLOCKER,) + implementation_parameters,
                 ),
-                parameters=(BLOCKER,) + implementation_parameters,
-            ),
-            EdgeSpec(
-                key="branch_identity_retry",
-                source="branch_identity_resolution",
-                transition="retry",
-                target="branch_identity",
-                transition_description=(
-                    "Retry deterministic branch identity after the reported "
-                    "collision or repository blocker is resolved."
+                EdgeSpec(
+                    key="branch_identity_retry",
+                    source="branch_identity_resolution",
+                    transition="retry",
+                    target="branch_identity",
+                    transition_description=(
+                        "Retry deterministic branch identity after the reported "
+                        "collision or repository blocker is resolved."
+                    ),
+                    parameters=implementation_parameters,
                 ),
-                parameters=implementation_parameters,
-            ),
-            recovery_edge(
-                "branch_identity_resolution",
-                context=non_writer_recovery_context,
-                extra_parameters=implementation_parameters,
-                extra_prompt=(
-                    "When the exact branch blocker is resolved, choose `retry`. "
-                    "Do not rename, delete, or overwrite another branch from "
-                    "this agent node."
+                recovery_edge(
+                    "branch_identity_resolution",
+                    context=non_writer_recovery_context,
+                    extra_parameters=implementation_parameters,
+                    extra_prompt=(
+                        "When the exact branch blocker is resolved, choose "
+                        "`retry`. Do not rename, delete, or overwrite another "
+                        "branch from this agent node."
+                    ),
                 ),
-            ),
-            cancellation_edge("branch_identity_resolution"),
+                cancellation_edge("branch_identity_resolution"),
             ]
         )
     else:
         edges.append(
             EdgeSpec(
-                key="plan_implement",
-                source="plan",
-                transition="implement",
+                key="plan_contract_implement",
+                source="plan_contract",
+                transition="start",
                 target="implement",
                 context=writer_handoff_context,
+                context_source=branch_identity_handoff_source,
                 prompt=implement_prompt(profile, fresh_session=fresh_writers),
                 transition_description=(
-                    "Planning is complete and implementation can start without "
-                    "ambiguity."
+                    "The accepted plan contract is stable and implementation "
+                    "can start without branch-identity routing."
                 ),
                 parameters=implementation_parameters,
             )
         )
+    edges.extend(
+        [
+            EdgeSpec(
+                key="plan_contract_continue_implement",
+                source="plan_contract",
+                transition="continue",
+                target="implement",
+                context=implementation_continuation_context,
+                context_source=plan_contract_continuation_source,
+                prompt=implement_prompt(profile, fresh_session=fresh_writers),
+                transition_description=(
+                    "The accepted plan contract is unchanged; continue with "
+                    "the next ready writer-owned step."
+                ),
+                parameters=implementation_parameters,
+            ),
+            EdgeSpec(
+                key="plan_contract_verify",
+                source="plan_contract",
+                transition="verify",
+                target="verification_dispatch",
+                transition_description=(
+                    "The accepted plan contract is unchanged and writer work "
+                    "is complete; normalize inputs for read-only verification."
+                ),
+                parameters=(WORKSPACE, REVIEW_CONTEXT),
+            ),
+        ]
+    )
     edges.extend(
         [
             recovery_edge(
@@ -400,24 +600,39 @@ def build_delivery_workflow(
                 key="implement_continue",
                 source="implement",
                 transition="continue_implementation",
-                target="implement",
-                context=implementation_continuation_context,
-                prompt=implement_prompt(profile, fresh_session=fresh_writers),
+                target="plan_contract",
                 transition_description=(
-                    "One plan step is complete; continue with the next ready step."
+                    "One plan step is complete; check the accepted plan contract "
+                    "before starting the next writer slice."
                 ),
-                parameters=implementation_parameters,
+                parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    REVIEW_CONTEXT,
+                    PLAN_CONTRACT_MODE,
+                    TASK_SHORT_ID,
+                ),
             ),
             EdgeSpec(
                 key="implement_verify",
                 source="implement",
                 transition="verify",
-                target="verification_dispatch",
+                target="plan_contract",
                 transition_description=(
-                    "Implementation is complete; normalize inputs for read-only "
-                    "verification."
+                    "Implementation is complete; check the accepted plan "
+                    "contract before read-only verification."
                 ),
-                parameters=(WORKSPACE, REVIEW_CONTEXT),
+                parameters=(
+                    WORKSPACE,
+                    PLAN,
+                    WORK_KIND,
+                    PLAN_ROUTE,
+                    PLAN_CONTRACT_MODE,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ),
             ),
             recovery_edge(
                 "implement",
@@ -1433,6 +1648,8 @@ def recovery_edge(
     cancellation_contract = ""
     if node_key in {
         "plan",
+        "plan_review",
+        "plan_revalidation",
         "implement",
         "fix",
         "verification_gate",
@@ -1795,12 +2012,15 @@ authority. Use `needs_user_action` before implementation when that provenance
 is absent.
 {recovery_contract}
 
-Complete with `implement` only when the plan has no unresolved product, API, UX,
-or safety ambiguity. `workspace_path` is the repository or managed-worktree
-root; it is never `.todo/<feature>` or another artifact directory. Provide that
-root plus `plan_path` and the selected `work_kind`; use the literal
-`not-applicable` only when the project contract explicitly allows planless
-work. Kent transition parameters must be non-empty.
+Complete with `review_plan` only when the plan has no unresolved product, API,
+UX, or safety ambiguity. `workspace_path` is the repository or
+managed-worktree root; it is never `.todo/<feature>` or another artifact
+directory. Provide that root plus `plan_path`, selected `work_kind`,
+`plan_route=start`, `task_short_id={{{{.TaskShortId}}}}`, and a concise
+`review_context` naming the governing authority, source IDs, acceptance
+criteria, planned evidence, and risks. Use the literal `not-applicable` only
+when the project contract explicitly allows planless work. Kent transition
+parameters must be non-empty.
 Complete with `needs_user_action` and `blocker_reason` for an external blocker.
 Choose `wont_do` only for an explicit cancellation decision and provide
 `closure_reason`."""
@@ -1840,17 +2060,105 @@ writer-owned plan step. Capture any planned pre-edit evidence before the first
 production edit.
 
 After marking that step complete, choose `continue_implementation` with
-`workspace_path`, `plan_path`, and the unchanged `work_kind` when unchecked
-writer-owned ready steps remain. Choose
-`verify` when every writer-owned plan step is complete; provide
-`workspace_path` plus `review_context` summarizing plan/spec paths, the fixed
-comparison point, changed files, checks, risks, and any downstream runtime
-acceptance scope for the read-only branches and Gate.
+`workspace_path`, `plan_path`, the unchanged `work_kind`,
+`plan_route=continue`, `plan_contract_mode=check`, and
+`task_short_id={{{{.TaskShortId}}}}` when unchecked writer-owned ready steps
+remain. Also provide a concise `review_context` with the completed step,
+changed files, checks, and next ready step. Choose `verify` when every
+writer-owned plan step is complete; provide the same plan identity with
+`plan_route=verify`,
+`plan_contract_mode=check`, and `task_short_id`, plus `review_context`
+summarizing plan/spec paths, the fixed comparison point, changed files, checks,
+risks, and any downstream runtime acceptance scope. Both outcomes pass through
+the deterministic Plan Contract Guard before another writer or verification.
 Use `needs_user_action` only for an external blocker and provide
 `blocker_reason` plus the unchanged `work_kind`. Its approval is a resume signal
 after the named external action is complete, not acknowledgement of waiting;
 state that condition explicitly. Choose `wont_do` only for explicit
 cancellation and provide `closure_reason`."""
+
+
+def plan_review_prompt(profile: ProjectProfile) -> str:
+    return f"""Independently review the proposed plan for
+{{{{.TaskShortId}}}} without editing files.
+
+{context_instruction(profile, "review", "plan_review", "review")}
+
+Workspace: {{{{.Params.workspace_path}}}}
+Plan: {{{{.Params.plan_path}}}}
+Work kind: {{{{.Params.work_kind}}}}
+Requested post-review route: {{{{.Params.plan_route}}}}
+Planning context: {{{{.Params.review_context}}}}
+
+Read the task body, current human-authored comments, exact source records named
+by the plan, and the plan itself. Use the read-only `spec-reviewer` contract,
+adapted to the proposed plan rather than an implementation diff. Do not edit
+the plan, code, task, or external systems.
+
+Check:
+
+- every narrowed or superseded decision has exact human authority;
+- root scope is separate from related evidence and deferred work;
+- product, API, UX, architecture, safety, and destructive-action choices are
+  explicit rather than invented by the planner;
+- acceptance criteria map to owned deterministic, review, or runtime evidence;
+- dependencies and generated-contract adaptations stay bounded;
+- writer steps are executable, dependency ordered, and do not hide workflow
+  stages as implementation work.
+
+Choose `accepted` only when implementation or verification may safely follow.
+Provide `workspace_path`, `plan_path`, `work_kind`, unchanged `plan_route`,
+`plan_contract_mode=accept`, `task_short_id={{{{.TaskShortId}}}}`, a concise
+`plan_review_report`, and refreshed `review_context` that includes the review
+result.
+
+Choose `needs_changes` for plan-contract defects and provide the same identity,
+unchanged route, `plan_review_report`, and `review_context`; the retained Plan
+session will revise the artifact. Choose `needs_user_action` only for a real
+missing product decision or external authority and provide the preserved
+identity/context plus `blocker_reason`. Choose `wont_do` only for explicit
+cancellation and provide `closure_reason`."""
+
+
+def plan_revalidation_prompt(
+    profile: ProjectProfile,
+    *,
+    from_review: bool,
+) -> str:
+    finding_label = (
+        "Independent Plan Review findings: {{.Params.plan_review_report}}"
+        if from_review
+        else "Detected plan-contract change: {{.Params.plan_change_report}}"
+    )
+    return f"""Revalidate the authoritative plan for {{{{.TaskShortId}}}}.
+
+{context_instruction(profile, "plan", "plan_revalidation", "plan")}
+
+Workspace: {{{{.Params.workspace_path}}}}
+Plan: {{{{.Params.plan_path}}}}
+Work kind: {{{{.Params.work_kind}}}}
+Intended route after acceptance: {{{{.Params.plan_route}}}}
+Current context: {{{{.Params.review_context}}}}
+{finding_label}
+
+Continue the retained planning context. Re-read current task comments and exact
+authority sources. Distinguish operational feedback that fits the accepted
+contract from material changes to requirements, architecture, acceptance,
+safety, or evidence. Reconcile only material changes in the authoritative
+design/specification/plan and cite exact human-authored task-comment IDs or
+other explicit sources. Do not edit production code or execute verification.
+When revalidation was triggered by deterministic drift, compare the current
+plan with the prior normalized snapshot at
+`.kent/runtime/{{{{.TaskShortId}}}}/plan-contract.json`; checkbox state alone
+is intentionally absent from that contract.
+
+Choose `review_plan` after reconciliation and provide `workspace_path`,
+`plan_path`, unchanged `work_kind`, unchanged `plan_route`,
+`task_short_id={{{{.TaskShortId}}}}`, and refreshed `review_context`. The
+independent Plan Review will run again before the new normalized snapshot is
+accepted. Use `needs_user_action` with preserved context and `blocker_reason`
+only for a real unresolved decision or external authority. Choose `wont_do`
+only for explicit cancellation and provide `closure_reason`."""
 
 
 def fix_prompt(

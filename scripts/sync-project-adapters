@@ -18,6 +18,9 @@ ADAPTER_TEMPLATES = {
     "mobile_evidence_audit": (
         REPO_ROOT / "templates" / "project" / "mobile-evidence-audit.sh"
     ),
+    "android_apk_install": (
+        REPO_ROOT / "templates" / "project" / "android-apk-install-preserve"
+    ),
     "mobile_resource_lock": (
         REPO_ROOT / "templates" / "project" / "emulator-resource-lock.sh"
     ),
@@ -30,6 +33,9 @@ COMMAND_TEMPLATES = {
     "checkpoint": REPO_ROOT / "templates" / "project" / "workflow-checkpoint",
     "evidence": (
         REPO_ROOT / "templates" / "project" / "workflow-evidence-ledger"
+    ),
+    "plan_contract": (
+        REPO_ROOT / "templates" / "project" / "workflow-plan-contract"
     ),
     "wait_ci": (
         REPO_ROOT / "templates" / "project" / "workflow-wait-github-ci"

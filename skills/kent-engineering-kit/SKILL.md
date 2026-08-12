@@ -45,6 +45,11 @@ reference needed for safe execution.
 
 ## Workflow Authoring And Rollout
 
+- Before changing this kit, generated/live workflows, workflow
+  adapters/contracts, role prompts, or Kent config, follow the global
+  Investigation → Preview → two independent read-only reviews → explicit user
+  approval → mutation sequence. A materially expanded scope requires a new
+  preview and approval.
 - Honor the profile's `minimum_kent_version`, execution-target policy,
   capabilities, role mapping, work kinds, commands, adapters, and procedures.
 - Before starting a generated workflow from a branch, tag, or commit, run
@@ -106,13 +111,17 @@ reference needed for safe execution.
 
 ## Specialized Contracts
 
+- `contracts/kit-change-governance.md`: required preview, independent review,
+  approval, and mutation boundary for kit/workflow changes.
+- `contracts/plan-contract.md`: independent Plan Review, normalized snapshots,
+  and material-change revalidation.
 - `contracts/workflow-contract.md`: graph, transitions, lifecycle, delivery,
   retry, publication, retirement, and cleanup.
 - `contracts/role-contract.md`: role ownership and Kent config boundary.
 - `contracts/worktree-contract.md`: managed worktrees, setup, checkpoints, and
   evidence.
 - `contracts/mobile-smoke-contract.md`: runtime authorization, interaction
-  proof, evidence, and resource recovery.
+  proof, preservation-safe installation, evidence, and resource recovery.
 - Jira projects declare kit-managed `jira_api` plus a project-owned credential
   namespace. Common writes are exact-target and approval-gated; project-owned
   extensions may add release/version operations.

@@ -108,6 +108,8 @@ verification scripts, project procedures, and these kit-managed commands:
 - `checkpoint` — atomic ignored Fix/Smoke state under `.kent/runtime/`;
 - `evidence` — append-only task evidence and node context metrics under
   `.kent/runtime/`;
+- `plan_contract` — ignored normalized accepted-plan snapshot and deterministic
+  drift routing that ignores checkbox-only progress;
 - `wait_ci` — zero-model GitHub CI watching until terminal green/red state;
 - `wait_pr` — zero-model GitHub merge watching;
 - `janitor` — post-Cleanup safe managed-worktree and branch cleanup.

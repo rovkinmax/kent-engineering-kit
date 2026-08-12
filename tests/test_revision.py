@@ -57,6 +57,7 @@ class RevisionPreflightTest(unittest.TestCase):
         for name in (
             "workflow-checkpoint",
             "workflow-evidence-ledger",
+            "workflow-plan-contract",
             "workflow-task-janitor",
             "workflow-verification-dispatch",
             "workflow-verify",
@@ -81,6 +82,7 @@ class RevisionPreflightTest(unittest.TestCase):
                 ".kent/project-contract.md",
                 ".kent/scripts/workflow-checkpoint",
                 ".kent/scripts/workflow-evidence-ledger",
+                ".kent/scripts/workflow-plan-contract",
                 ".kent/scripts/workflow-task-janitor",
                 ".kent/scripts/workflow-verification-dispatch",
                 ".kent/scripts/workflow-verify",

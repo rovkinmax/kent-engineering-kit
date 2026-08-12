@@ -163,7 +163,7 @@ class WorkflowKitTest(unittest.TestCase):
         }
         budgets = {
             "start_plan": 6500,
-            "plan_implement": 4500,
+            "plan_contract_implement": 5000,
             "gate_fix": 4000,
             "dispatch_standards_review": 1500,
             "dispatch_spec_review": 1300,
@@ -243,6 +243,8 @@ class WorkflowKitTest(unittest.TestCase):
             if node.kind == "agent"
         }
         self.assertEqual(roles["plan"], "default")
+        self.assertEqual(roles["plan_review"], "spec-reviewer")
+        self.assertEqual(roles["plan_revalidation"], "default")
         self.assertEqual(roles["implement"], "implementation-worker")
         self.assertEqual(roles["verification_gate"], "workflow-gate")
         self.assertEqual(roles["fix"], "fix-worker")
@@ -340,7 +342,15 @@ class WorkflowKitTest(unittest.TestCase):
             "plan",
         )
         self.assertEqual(
-            edges["plan_branch_identity"].target,
+            edges["plan_review"].target,
+            "plan_review",
+        )
+        self.assertEqual(
+            edges["plan_review_accept"].target,
+            "plan_contract",
+        )
+        self.assertEqual(
+            edges["plan_contract_branch_identity"].target,
             "branch_identity",
         )
         self.assertEqual(
@@ -355,7 +365,10 @@ class WorkflowKitTest(unittest.TestCase):
             edges["branch_identity_implement"].context_source,
             "immediate_source",
         )
-        for key in ("plan_branch_identity", "branch_identity_implement"):
+        for key in (
+            "plan_contract_branch_identity",
+            "branch_identity_implement",
+        ):
             self.assertEqual(
                 tuple(parameter.key for parameter in edges[key].parameters),
                 ("workspace_path", "plan_path", "work_kind"),
@@ -378,6 +391,8 @@ class WorkflowKitTest(unittest.TestCase):
 
         self.assertNotIn("branch_identity", nodes)
         self.assertEqual(edges["start_plan"].target, "plan")
+        self.assertEqual(edges["plan_review"].target, "plan_review")
+        self.assertEqual(edges["plan_review_accept"].target, "plan_contract")
 
     def test_gate_role_falls_back_to_orchestrator(self) -> None:
         profile = self.load_profile(
@@ -403,27 +418,34 @@ class WorkflowKitTest(unittest.TestCase):
         }
 
         continuation = implementation_edges["implement_continue_implementation"]
-        self.assertEqual(continuation.target, "implement")
-        self.assertEqual(continuation.context, "new_session")
+        self.assertEqual(continuation.target, "plan_contract")
         self.assertEqual(
             tuple(parameter.key for parameter in continuation.parameters),
-            ("workspace_path", "plan_path", "work_kind"),
+            (
+                "workspace_path",
+                "plan_path",
+                "work_kind",
+                "plan_route",
+                "review_context",
+                "plan_contract_mode",
+                "task_short_id",
+            ),
         )
         self.assertEqual(
             implementation_edges["implement_verify"].target,
-            "verification_dispatch",
+            "plan_contract",
         )
         self.assertIn(
             "writer-owned plan step",
-            continuation.prompt,
+            by_key["plan_contract_continue_implement"].prompt,
         )
         self.assertIn(
             "acquire a device",
             role_prompt("implementation-worker.md"),
         )
         self.assertIn(
-            "when every writer-owned plan step is complete",
-            continuation.prompt,
+            "when every\nwriter-owned plan step is complete",
+            by_key["plan_contract_continue_implement"].prompt,
         )
         self.assertIn(
             "exact human-authored task-comment ID",
@@ -438,7 +460,10 @@ class WorkflowKitTest(unittest.TestCase):
             "Missing agent-produced evidence is not user authority work",
             role_prompt("implementation-worker.md"),
         )
-        self.assertEqual(by_key["plan_implement"].context, "new_session")
+        self.assertEqual(
+            by_key["plan_contract_implement"].context,
+            "new_session",
+        )
         self.assertEqual(by_key["gate_fix"].context, "new_session")
         self.assertEqual(by_key["gate_fix"].context_source, "immediate_source")
         self.assertEqual(by_key["dispatch_invalid_workspace"].target, "fix")
@@ -500,6 +525,45 @@ class WorkflowKitTest(unittest.TestCase):
             by_key["start_plan"].prompt,
         )
 
+    def test_delivery_reviews_and_revalidates_the_plan_contract(self) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 1)
+        nodes = {node.key: node for node in spec.nodes}
+        by_key = {edge.key: edge for edge in spec.edges}
+
+        self.assertEqual(nodes["plan_review"].agent, "spec-reviewer")
+        self.assertEqual(nodes["plan_contract"].kind, "script")
+        self.assertEqual(
+            nodes["plan_contract"].script_path,
+            ".kent/scripts/workflow-plan-contract",
+        )
+        self.assertEqual(nodes["plan_revalidation"].agent, "default")
+        self.assertEqual(by_key["plan_review"].target, "plan_review")
+        self.assertEqual(
+            by_key["plan_review_revalidate"].target,
+            "plan_revalidation",
+        )
+        self.assertEqual(
+            by_key["plan_review_revalidate"].context_source,
+            "node:plan",
+        )
+        self.assertEqual(
+            by_key["plan_revalidation_review"].target,
+            "plan_review",
+        )
+        self.assertEqual(
+            by_key["plan_contract_revalidate"].target,
+            "plan_revalidation",
+        )
+        self.assertEqual(
+            by_key["plan_contract_verify"].target,
+            "verification_dispatch",
+        )
+        self.assertIn(
+            "checkbox state alone",
+            by_key["plan_contract_revalidate"].prompt,
+        )
+
     def test_writer_prompts_preserve_report_only_and_scope_boundaries(self) -> None:
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)
@@ -510,7 +574,7 @@ class WorkflowKitTest(unittest.TestCase):
             self.assertIn("do not edit tracked or staged files", prompt)
             self.assertIn("Do not ask\n  whether to absorb it", prompt)
 
-        for key in ("plan_implement", "gate_fix"):
+        for key in ("plan_contract_implement", "gate_fix"):
             self.assertIn(
                 "approval is a resume signal",
                 by_key[key].prompt,
@@ -528,11 +592,11 @@ class WorkflowKitTest(unittest.TestCase):
 
         self.assertEqual(profile.writer_session_policy(), "continuous")
         self.assertEqual(
-            by_key["plan_implement"].context,
+            by_key["plan_contract_implement"].context,
             "compact_and_continue_session",
         )
         self.assertEqual(
-            by_key["implement_continue"].context,
+            by_key["plan_contract_continue_implement"].context,
             "continue_session",
         )
         self.assertEqual(
@@ -599,7 +663,7 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn(
             "Apply the `implementation-worker` role contract",
-            prompts["plan_implement"],
+            prompts["plan_contract_implement"],
         )
         self.assertIn(
             "Do not duplicate workflow-owned Standards",
@@ -611,7 +675,10 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertIn("checkpoint ref", prompts["start_plan"])
         self.assertIn("exact referenced comments", prompts["start_plan"])
-        self.assertIn("fresh writer session", prompts["plan_implement"])
+        self.assertIn(
+            "fresh writer session",
+            prompts["plan_contract_implement"],
+        )
         self.assertIn(
             "exactly one independently verifiable fix slice",
             prompts["gate_fix"],
@@ -1988,13 +2055,15 @@ class WorkflowKitTest(unittest.TestCase):
             .replace(
                 "required_adapters = []",
                 'required_adapters = ["jira_api", '
-                '"mobile_evidence_audit", "mobile_resource_lock", '
+                '"android_apk_install", "mobile_evidence_audit", '
+                '"mobile_resource_lock", '
                 '"sentry_issues"]',
             )
             .replace(
                 "kit_managed_adapters = []",
                 'kit_managed_adapters = ["jira_api", '
-                '"mobile_evidence_audit", "mobile_resource_lock", '
+                '"android_apk_install", "mobile_evidence_audit", '
+                '"mobile_resource_lock", '
                 '"sentry_issues"]',
             )
             .replace(
@@ -2004,6 +2073,8 @@ class WorkflowKitTest(unittest.TestCase):
             )
         ) + (
             "\n[adapters]\n"
+            'android_apk_install = '
+            '".kent/adapters/mobile/android-apk-install-preserve"\n'
             'jira_api = ".kent/adapters/jira/jira-api.sh"\n'
             'mobile_evidence_audit = '
             '".kent/adapters/mobile/mobile-evidence-audit.sh"\n'
@@ -2016,6 +2087,13 @@ class WorkflowKitTest(unittest.TestCase):
         script = REPO_ROOT / "scripts" / "sync-project-adapters"
         target = (
             root / ".kent" / "adapters" / "mobile" / "emulator-resource-lock.sh"
+        )
+        install_target = (
+            root
+            / ".kent"
+            / "adapters"
+            / "mobile"
+            / "android-apk-install-preserve"
         )
         evidence_target = (
             root / ".kent" / "adapters" / "mobile" / "mobile-evidence-audit.sh"
@@ -2038,6 +2116,8 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(created.returncode, 0, created.stderr)
         self.assertTrue(target.is_file())
         self.assertTrue(target.stat().st_mode & 0o111)
+        self.assertTrue(install_target.is_file())
+        self.assertTrue(install_target.stat().st_mode & 0o111)
         self.assertTrue(evidence_target.is_file())
         self.assertTrue(evidence_target.stat().st_mode & 0o111)
         self.assertTrue(jira_target.is_file())
@@ -2046,6 +2126,15 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertTrue(sentry_target.stat().st_mode & 0o111)
         self.assertTrue(branch_identity_target.is_file())
         self.assertTrue(branch_identity_target.stat().st_mode & 0o111)
+        self.assertEqual(
+            install_target.read_bytes(),
+            (
+                REPO_ROOT
+                / "templates"
+                / "project"
+                / "android-apk-install-preserve"
+            ).read_bytes(),
+        )
         self.assertEqual(
             jira_target.read_bytes(),
             (
