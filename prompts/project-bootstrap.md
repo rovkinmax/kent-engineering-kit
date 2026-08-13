@@ -9,7 +9,8 @@ Inspect:
 - repository instructions and existing `.kent` files;
 - language, build system, package manager, tests, lint, and type checks;
 - Git hosting, issue tracker, CI, release process, and deployment target;
-- Git default-branch metadata, non-Git workspace needs, and desired workflow
+- Git default-branch metadata, non-Git workspace needs, configured
+  `worktrees.base_dir`, source-workspace overlap risks, and desired workflow
   execution-target policies;
 - device or hardware resources that require locking;
 - runtime evidence privacy, redaction, and retention requirements;
@@ -29,8 +30,9 @@ Recommend the smallest suitable delivery profile:
 Identify platform adapters such as Android, Web, iOS, embedded, or generic
 shell commands. Ask the user to decide only material choices.
 
-Use the canonical Kent 2.5 execution-target recommendations from the toolkit
-workflow contract. Record the selected default and workflow-kind overrides in
+Use the canonical Kent 2.6.1 execution-target recommendations from the toolkit
+workflow contract. Kent CLI/TUI, service, and Desktop must be the same approved
+version. Record the selected default and workflow-kind overrides in
 the project profile instead of copying the policy into project documentation.
 
 # Setup
@@ -69,5 +71,11 @@ details in the project procedure. The procedure must reject unfiltered logs
 and unexpected sensitive UI evidence.
 
 Do not create or link live workflows until the project profile validates.
-Preview with `scripts/generate-workflow` before applying a versioned non-default
-instance. Require a managed-worktree canary before changing the project default.
+For Kent 2.6 graph work, inspect the complete graph and compute the kit-owned
+local semantic preview before graph apply. Do not treat graph apply as a
+dry-run: it saves non-destructive changes and pauses only for destructive
+confirmation. Apply a versioned workflow non-default first, then validate and require a
+managed-worktree canary before changing the project default. Any workflow with
+Tasks is a frozen revision; create a new version rather than editing it in
+place. Task Start/Move/Resume may receive an explicit `--branch-name` when the
+initial managed-worktree branch must differ from the task short ID.

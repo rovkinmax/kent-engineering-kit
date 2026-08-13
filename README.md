@@ -22,18 +22,46 @@ documented in `docs/MODEL-POLICY.md`.
 
 ## Compatibility
 
-- The supported generated-workflow baseline is Kent 2.5 or newer.
+- The approved generated-workflow baseline is **Kent 2.6.1**, released August
+  13, 2026. Kent 2.6.0 was released August 12, 2026; do not mix those dates
+  or run a mixed CLI/TUI, service, and Desktop version set.
 - Project profiles declare and enforce their exact minimum Kent version.
 - Kent CLI/TUI, service, and Desktop must be upgraded together when crossing
   protocol boundaries.
-- Kent 2.5 requires every transition key to be unique across its whole
-  workflow. Generated keys are source-qualified, for example
-  `verification_gate_needs_changes`.
-- Kent 2.5 workflow and task list commands use offset pagination. The generator
-  uses canonical workflow UUIDs after exact-name discovery.
+- Workflow graph inspection and editing use the Kent 2.6 graph document
+  contract: `kent workflow graph inspect <uuid>` exports the complete graph,
+  while the kit computes the required local semantic preview. Then
+  `kent workflow graph apply <path|->` validates and atomically saves the
+  document. Graph apply is not a general dry-run: without `--confirm` it saves
+  non-destructive changes and pauses only for destructive impact.
+- A workflow referenced by any Task is a frozen task-backed revision for this
+  kit. Semantic graph changes are applied to a new non-default workflow
+  revision; existing Tasks are never rewritten or moved between incompatible
+  graphs. Keep the previous revision linked for rollback until its Tasks are
+  terminal.
+- Kent 2.5's workflow-wide transition-key and offset-pagination contracts
+  remain compatibility facts for existing data; the generator uses canonical
+  workflow UUIDs and source-qualified transition keys.
+- `kent task watch`/`wait` and `kent run watch`/`wait` provide scriptable,
+  long-running observation without polling model sessions. `kent question` and
+  `kent question answer` inspect and answer pending Task or Session questions
+  and approvals.
+- `kent task start`, `move`, and `resume` accept `--branch-name` for an
+  explicit initial managed-worktree branch. The task short ID remains the
+  lifecycle identity; Git branch identity is separate and must be reported
+  exactly.
+- Managed worktrees must remain inside Kent's configured `worktrees.base_dir`
+  and must not overlap their source Workspace. Worktree setup failures preserve
+  actionable recovery choices rather than silently discarding the retained
+  target or worktree.
+- Script failures preserve stderr diagnostics and leave invalid or unavailable
+  scripts as resumable interrupted work. Resume is asynchronous: re-read Task
+  state and recover through the smallest valid workflow entry, not by assuming
+  that a successful command means a Session or Script started.
 - Workflow deletion remains an explicit user action.
-- Existing workflows retain their Source HEAD behavior after an upgrade.
-  New generated workflows declare their execution-target policy explicitly.
+- Existing workflows retain their recorded execution-target and graph
+  behavior after an upgrade. New generated workflows declare their
+  execution-target policy explicitly.
 - Upgrade and active-task recovery procedure:
   `docs/KENT-UPGRADE-RUNBOOK.md`.
 
@@ -200,8 +228,10 @@ renaming so linked or cloned issues cannot silently become branch identity.
 Missing external identity keeps the Kent branch. Existing local or remote
 branch collisions stop in a recoverable user-decision node rather than
 attaching a new task to ambiguous work. The deterministic Script runs after
-the read-only Plan handoff because Kent 2.5 does not provide a task execution
-root to a relative Script used as the first executable node.
+the read-only Plan handoff so the task root is established before
+project-relative Scripts run. This remains a kit portability guard; Kent 2.6.1
+also enforces the managed-worktree `base_dir` namespace and preserves recovery
+diagnostics.
 
 After green CI, an open feasible PR moves to a deterministic script watcher.
 Unchanged state consumes no model turn and requires no approval. Material
@@ -256,7 +286,7 @@ variants, accounts, and tested flows in project-owned procedures.
 
 ## Current phase
 
-The global toolkit and Kent 2.5+ workflow generator are implemented and
+The global toolkit and Kent 2.6.1 workflow generator are implemented and
 validated by the repository test suite. The generator shape has prior project
 canary coverage; every new candidate still follows the rollout process in the
 roadmap. Generated workflows use a shared fan-out/Join/Gate

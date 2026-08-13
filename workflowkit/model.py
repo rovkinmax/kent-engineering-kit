@@ -9,6 +9,8 @@ TEMPLATE_EXPRESSION_PATTERN = re.compile(
     r"^\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
 )
 NODE_KINDS = {"start", "agent", "script", "join", "terminal"}
+PARAMETER_PURPOSES = {"ordinary", "target_assignee", "target_thinking"}
+SELECTION_MODES = {"configured", "previous_node"}
 CONTEXT_MODES = {
     "new_session",
     "continue_session",
@@ -24,11 +26,16 @@ class SpecError(ValueError):
 class ParameterSpec:
     key: str
     description: str
+    purpose: str = "ordinary"
 
     def validate(self) -> None:
         validate_model_key(self.key, "parameter")
         if not self.description.strip():
             raise SpecError(f"parameter {self.key!r} has no description")
+        if self.purpose not in PARAMETER_PURPOSES:
+            raise SpecError(
+                f"parameter {self.key!r} has unsupported purpose {self.purpose!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -73,6 +80,8 @@ class EdgeSpec:
     prompt: str | None = None
     transition_description: str = ""
     parameters: tuple[ParameterSpec, ...] = field(default_factory=tuple)
+    assignee_selection: str = "configured"
+    thinking_selection: str = "configured"
     requires_approval: bool = False
 
     def validate(self) -> None:
@@ -92,9 +101,20 @@ class EdgeSpec:
             raise SpecError(f"edge {self.key!r} has no context source")
         if not self.transition_description.strip():
             raise SpecError(f"edge {self.key!r} has no transition description")
+        if self.assignee_selection not in SELECTION_MODES:
+            raise SpecError(
+                f"edge {self.key!r} has unsupported assignee selection "
+                f"{self.assignee_selection!r}"
+            )
+        if self.thinking_selection not in SELECTION_MODES:
+            raise SpecError(
+                f"edge {self.key!r} has unsupported thinking selection "
+                f"{self.thinking_selection!r}"
+            )
         if self.prompt:
             validate_template_placeholders(self.prompt, self.key)
         parameter_keys: set[str] = set()
+        purposes: set[str] = set()
         for parameter in self.parameters:
             parameter.validate()
             if parameter.key in parameter_keys:
@@ -102,6 +122,35 @@ class EdgeSpec:
                     f"edge {self.key!r} repeats parameter {parameter.key!r}"
                 )
             parameter_keys.add(parameter.key)
+            if parameter.purpose != "ordinary":
+                if parameter.purpose in purposes:
+                    raise SpecError(
+                        f"edge {self.key!r} repeats parameter purpose "
+                        f"{parameter.purpose!r}"
+                    )
+                purposes.add(parameter.purpose)
+        if self.assignee_selection == "previous_node":
+            if "target_assignee" not in purposes:
+                raise SpecError(
+                    f"edge {self.key!r} selects an assignee without a "
+                    "target_assignee parameter"
+                )
+        elif "target_assignee" in purposes:
+            raise SpecError(
+                f"edge {self.key!r} declares target_assignee while assignee "
+                "selection is configured"
+            )
+        if self.thinking_selection == "previous_node":
+            if "target_thinking" not in purposes:
+                raise SpecError(
+                    f"edge {self.key!r} selects thinking without a "
+                    "target_thinking parameter"
+                )
+        elif "target_thinking" in purposes:
+            raise SpecError(
+                f"edge {self.key!r} declares target_thinking while thinking "
+                "selection is configured"
+            )
 
 
 @dataclass(frozen=True)
@@ -173,7 +222,14 @@ class WorkflowSpec:
 
         for group_key, group_edges in groups.items():
             contracts = {
-                tuple((parameter.key, parameter.description) for parameter in edge.parameters)
+                tuple(
+                    (
+                        parameter.key,
+                        parameter.description,
+                        parameter.purpose,
+                    )
+                    for parameter in edge.parameters
+                )
                 for edge in group_edges
             }
             if len(contracts) != 1:

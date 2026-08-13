@@ -29,10 +29,9 @@ reference needed for safe execution.
 
 ## Shared And Project Boundaries
 
-- The shared workflow layer owns lifecycle, approvals, fan-out, Join, portable
-  transition parameters, deterministic waiting, and task-owned cleanup.
-- The project owns build commands, architecture rules, device details, source
-  integrations, release policy, credentials, and concrete procedures.
+- Shared workflow owns lifecycle, approvals, fan-out/Join, portable parameters,
+  deterministic waiting, and task cleanup. Projects own build, architecture,
+  devices, integrations, release policy, credentials, and procedures.
 - `required_adapters` declares runtime dependencies;
   `kit_managed_adapters` is the explicit subset synchronized from kit
   templates. Other adapters are project-owned and never replaced.
@@ -52,11 +51,17 @@ reference needed for safe execution.
   preview and approval.
 - Honor the profile's `minimum_kent_version`, execution-target policy,
   capabilities, role mapping, work kinds, commands, adapters, and procedures.
+- Approved baseline: Kent 2.6.1 (August 13, 2026); keep CLI/TUI, service, and
+  Desktop on one version.
 - Before starting a generated workflow from a branch, tag, or commit, run
   `~/.kent/bin/kent-preflight-revision` with `--project` and `--ref`. It checks
   the selected revision's project contract, procedures, executable commands,
   and required adapters directly from Git objects without checking them out.
-- Preview generated workflows without `--apply`.
+- Preview generated workflows without `--apply`. For Kent 2.6 graph edits,
+  inspect the complete graph, compute the kit-owned local semantic preview,
+  then use graph apply for one atomic save. Graph apply itself is not a
+  non-mutating preview. Task-backed workflows are frozen: create a new version
+  for semantic changes and retain the old one for rollback.
 - Apply versioned workflows non-default first. Use `--set-default` only after a
   managed-worktree canary passes.
 - Changing a project default affects only new tasks. Keep the previous workflow
@@ -67,26 +72,24 @@ reference needed for safe execution.
   without committing, pushing, or creating a pull request. Use a free-form lab
   label only after the current graph has tasks or needs unsupported structural
   rewiring.
-- During lab iteration, reconcile a generated workflow in place only while it
-  has no task records in any linked project and the Kent CLI can express the
-  change without deleting nodes/edges, changing edge sources, or removing an
-  approval.
+- Reconcile a lab in place only while taskless and without deleting nodes or
+  edges, changing edge sources, or removing approvals.
 - Once tasks reference a workflow, treat its graph as frozen and create another
   free-form experimental label for semantic changes.
-- Preview retirement with `kent workflow delete <bare-workflow-uuid> --json`.
-  The preview is
-  non-destructive. Only the user may repeat it with `--confirm`; deletion
-  removes the workflow definition, project links, and task database rows but
-  intentionally retains repository files and managed worktrees.
+- Preview retirement with `kent workflow delete <bare-workflow-uuid> --json`;
+  only the user may confirm. Deletion removes workflow links and task rows but
+  retains repository files and managed worktrees.
+- Managed worktrees stay below `worktrees.base_dir` and outside the source
+  Workspace. Setup failures preserve stderr and resumable recovery; do not
+  bypass Kent with direct worktree mutation. Start/Move/Resume accept
+  `--branch-name`; task/run watch/wait and `kent question` provide deterministic
+  observation and question/approval control.
 - Generated managed-worktree Cleanup hands deletion to the post-session Task
   Janitor. Never replace it with direct `git worktree remove`; inspect its
   report when safety preservation leaves a resource in place.
-- Before confirmation, recreate every Backlog task in the replacement workflow
-  with its title, body, source URL, labels, relevant comments, and old short ID.
-  Do not move records between incompatible graphs. Completed/canceled history
-  may be discarded when the user accepts it.
-- Inspect and clean retained worktrees separately and never edit the Kent
-  database directly.
+- Before retirement, recreate Backlog tasks in the replacement workflow with
+  their source data and old short IDs; do not move them between incompatible
+  graphs. Inspect retained worktrees separately; never edit Kent's database.
 
 ## Runtime Operation
 
@@ -95,15 +98,13 @@ reference needed for safe execution.
   `~/.kent/bin/kent-worktree ... --session <id>`.
 - Diagnose `interrupted` state before moving a task. Resume is asynchronous;
   re-read task state after a short delay.
-- Read the active context manifest and append one evidence event before every
-  agent transition. `files_read` excludes the manifest recorded separately.
-- Fix and Smoke reconcile their ignored checkpoint before repeating work and
-  persist it before transition.
-- Branch identity is resolved by the configured deterministic Script after
-  Plan. The task short ID remains lifecycle identity; current Git branch comes
-  from Git.
-- Pending CI and an unchanged open PR belong to deterministic Script watchers.
-  Agent roles wake only for a classification, retry, or decision.
+- Read the active manifest and append evidence before each agent transition;
+  `files_read` excludes the manifest. Fix and Smoke reconcile their ignored
+  checkpoint before repeating work and persist it before transition.
+- Branch identity is resolved by the deterministic Script after Plan. The
+  task short ID remains lifecycle identity; current Git branch comes from Git.
+- Pending CI and unchanged PRs belong to deterministic Script watchers; agent
+  roles wake only for classification, retry, or decision.
 - Approval is for a real decision or completed external action, never passive
   waiting.
 - Operational roles are assigned directly. Standards, Specification, and
@@ -111,8 +112,8 @@ reference needed for safe execution.
 
 ## Specialized Contracts
 
-- `contracts/kit-change-governance.md`: required preview, independent review,
-  approval, and mutation boundary for kit/workflow changes.
+- `contracts/kit-change-governance.md`: preview, independent review, approval,
+  and mutation boundary for kit/workflow changes.
 - `contracts/plan-contract.md`: independent Plan Review, normalized snapshots,
   and material-change revalidation.
 - `contracts/workflow-contract.md`: graph, transitions, lifecycle, delivery,
@@ -123,11 +124,8 @@ reference needed for safe execution.
 - `contracts/mobile-smoke-contract.md`: runtime authorization, interaction
   proof, preservation-safe installation, evidence, and resource recovery.
 - Jira projects declare kit-managed `jira_api` plus a project-owned credential
-  namespace. Common writes are exact-target and approval-gated; project-owned
-  extensions may add release/version operations.
-- Sentry-backed projects declare kit-managed `sentry_issues`; tracked profiles
-  contain tenant coordinates and a credential namespace, never token or
-  1Password item identity.
+  namespace; extensions own release/version operations. Sentry profiles contain
+  tenant coordinates and a credential namespace, never token or 1Password item.
 - MCP calls use `~/.kent/bin/kent-mcp-call` and
   `~/.kent/bin/kent-mcp-list`; project credentials and server wrappers remain
   project-owned.

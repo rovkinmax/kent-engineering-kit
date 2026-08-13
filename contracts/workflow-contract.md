@@ -37,10 +37,11 @@ implementation.
   repaired by repeated Resume. Re-enter the smallest supported incoming
   `new_session` Transition with preserved values. For a failed fan-out branch,
   re-enter the fan-out source so every sibling and Join invariant is recreated.
-- Transition keys, Script stdout, prompts, and persisted prior-value keys are
-  one versioned contract. Active workflows are frozen. Normal changes use a new
-  workflow version; taskless migration is allowed only after a complete
-  preflight proves that no Task references the graph.
+- Transition keys, Script stdout, prompts, and prior-value keys form one
+  versioned contract. Runtime baseline: Kent 2.6.1 (August 13, 2026).
+- Graph inspect/apply supports complete export, local semantic preview, and
+  explicit-confirmation atomic apply. Task-backed workflows are frozen; use a
+  new version for semantic changes and never move Tasks between revisions.
 - `wont_do` is terminal, requires an explicit cancellation decision, and emits
   `closure_reason`.
 - Parallel verification branches are read-only.
@@ -193,31 +194,26 @@ implementation.
 
 ## Branch identity
 
-- Kent task short ID is the stable workflow/lifecycle identity. It remains the
-  key for task comments, checkpoints, runtime state, and Kent commands even
-  when the Git branch has another name.
-- `policies.branch_identity = "task"` keeps Kent's native short-ID branch.
-- `jira` resolves `feature/<KEY>` from the task source URL first, otherwise
-  from exactly one Jira `/browse/<KEY>` issue URL in the task body. Multiple
-  distinct body candidates without an authoritative source URL are ambiguous
-  and block before branch mutation. Arbitrary Jira-like task keys mentioned as
-  comparison, dependency, or evidence are not branch identity.
-- `github_issue` resolves `issue-<number>` only from an exact issue URL in the
-  current GitHub repository. Source URL is inspected before task-body URLs;
-  multiple distinct body candidates without a source URL are ambiguous.
-- If no usable external identity exists, retain the Kent short-ID branch.
-- Branch identity runs as a deterministic Script after read-only Plan and
-  before the first Implement writer. Plan passes `workspace_path`, `plan_path`,
-  and `work_kind`; the Script preserves that handoff on every outcome.
-- Kent 2.5 does not provide a task execution root to a relative Script used as
-  the first executable node after Backlog. Generated workflows must establish
-  the managed root through Plan before invoking project-relative Scripts.
-  Active task branches are never renamed during workflow migration.
-- An existing local or remote desired branch is ambiguous ownership, not an
-  invitation to reuse or overwrite it. Route to a recoverable user decision.
-- PR preparation reports the actual `git branch --show-current`; downstream
-  CI, merge watching, and Cleanup never reconstruct branch identity from the
-  Kent short ID.
+- Kent task short ID is the stable lifecycle identity for comments,
+  checkpoints, runtime state, and commands, even when Git uses another branch.
+- `policies.branch_identity = "task"` keeps Kent's short-ID branch.
+- `jira` resolves `feature/<KEY>` from the source URL or exactly one Jira
+  `/browse/<KEY>` body URL; multiple candidates block before mutation.
+  Comparison/dependency keys are not branch identity.
+- `github_issue` resolves `issue-<number>` only from an exact URL in the
+  current repository; multiple body candidates without a source URL are
+  ambiguous.
+- With no usable external identity, retain the Kent short-ID branch.
+- Branch identity runs as a Script after Plan and before the first writer;
+  Plan values are preserved on every outcome.
+- Plan establishes the managed root before project-relative Scripts run.
+  Migration never renames active branches; humans may pass `--branch-name` to
+  Start, Move, or Resume. Kent 2.6.1 keeps worktrees under `base_dir` and out of
+  the source Workspace; out-of-namespace paths require Kent recovery.
+- An existing desired branch is ambiguous ownership, not an invitation to
+  reuse or overwrite it; route to a recoverable user decision.
+- PR preparation reports `git branch --show-current`; downstream stages never
+  reconstruct branch identity from the task ID.
 
 ## Approval-gated package publication
 
@@ -244,7 +240,7 @@ implementation.
 
 ## Execution targets
 
-- Generated workflows always set an explicit Kent 2.5 execution-target policy.
+- Generated workflows always set an explicit Kent 2.6.1 execution-target policy.
 - The profile supplies a default and may override it by workflow kind.
 - Supported policy values are `ask-on-first-execution`, `none`, `head`,
   `default-branch`, and `ref:<revision>`.
@@ -301,6 +297,11 @@ implementation.
 
 ## Active feedback and recovery
 
+- Task/run watch and wait are deterministic observers, not model-polling loops.
+  `kent question`/`answer` own pending questions and approvals. Start, Move,
+  and Resume accept `--branch-name`; the short ID remains lifecycle identity.
+  Resume is asynchronous; re-read state and use retained-worktree recovery.
+  Kent 2.6.1 preserves Script stderr.
 - Task comments are durable records but do not interrupt or update the context
   of an already running node.
 - User feedback for an active run is delivered through `kent run steer` or the
@@ -381,8 +382,8 @@ defined by `contracts/plan-contract.md`.
 
 ## Pull-request merge strategy
 
-- `policies.pr_merge_strategy` accepts `auto`, `merge`, `squash`, or `rebase`
-  and defaults to `auto`.
+- `policies.pr_merge_strategy` accepts `auto`, `merge`, `squash`, or `rebase`;
+  default `auto`.
 - Prepare PR resolves the strategy once and carries the resolved
   `merge_strategy` through CI and Waiting PR.
 - `auto` intersects repository-enabled methods, target-branch protection and

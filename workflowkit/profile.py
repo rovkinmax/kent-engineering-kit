@@ -142,9 +142,9 @@ class ProjectProfile:
                 f"unsupported profile schema {self.schema_version}; expected 3"
             )
         minimum_version = self.minimum_version_tuple()
-        if minimum_version < (2, 5, 0):
+        if minimum_version < (2, 6, 1):
             raise SpecError(
-                "profile minimum_kent_version must be 2.5.0 or newer"
+                "profile minimum_kent_version must be 2.6.1 or newer"
             )
         if self.delivery_profile not in DELIVERY_PROFILES:
             raise SpecError(

@@ -6,6 +6,17 @@ making a fresh checkout usable without silently copying unrelated local state.
 ## Operations
 
 - Use `kent worktree` commands for Kent-managed worktrees.
+- Kent 2.6.1 requires every managed worktree path, automatic or explicitly
+  selected, to remain under the configured `worktrees.base_dir` and never
+  overlap the source Workspace. Validate this namespace before upgrade and
+  before recovery. A persisted path outside it cannot be activated or restored
+  until moved with a supported Kent operation.
+- Do not treat `kent task start`, `move`, or `resume` as synchronous worktree
+  completion. Re-read Task state and preserve the retained target/worktree when
+  startup is still in progress or fails.
+- The initial managed-worktree branch may be supplied with `--branch-name` on
+  Task Start, Move, or Resume. It is not a reason to rename an active task
+  branch during workflow migration.
 - Use `~/.kent/bin/kent-worktree <command> --session <id> ...` when targeting a
   session other than the caller. The wrapper removes inherited
   `KENT_SESSION_ID`, `KENT_RUN_ID`, and `KENT_STEP_ID` before invoking the Kent
@@ -32,6 +43,15 @@ making a fresh checkout usable without silently copying unrelated local state.
   null for workflow-created worktrees.
 - It copies or generates only an explicit allowlist of required local files.
 - Credentials and project secrets are not copied by default.
+
+## Setup and recovery diagnostics
+
+Kent 2.6.1 preserves Script stderr diagnostics and keeps invalid, unavailable,
+or failed setup work resumable. Setup failures must expose an actionable choice:
+retry the retained target, select another permitted target, or inspect and clean
+up the retained worktree. Project setup hooks and verification commands must
+write useful diagnostics to stderr without leaking credentials or raw
+authenticated payloads.
 
 ## Verification resilience
 

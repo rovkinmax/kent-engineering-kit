@@ -23,6 +23,27 @@ The toolkit is original project infrastructure informed by:
   https://github.com/respawn-llc/kent/releases/tag/v2.5.0
 - Kent 2.5 workflow validation source for the global transition-key invariant:
   https://github.com/respawn-llc/kent/blob/v2.5.0/server/workflow/validation.go
+- Kent 2.6.0 release notes for graph inspect and atomic graph apply, dynamic
+  assignee/thinking selection, speculative
+  compaction, task/run watch and wait, `kent question`, explicit
+  `--branch-name`, worktree `base_dir` enforcement, and stderr-preserving
+  recovery. Released August 12, 2026:
+  https://github.com/respawn-llc/kent/releases/tag/v2.6.0
+- Kent 2.6.1 release notes for frozen workflow provenance repair and immutable
+  legacy-source proof. Released August 13, 2026:
+  https://github.com/respawn-llc/kent/releases/tag/v2.6.1
+- Kent 2.6.1 workflow graph CLI implementation for complete graph inspection
+  and atomic graph application:
+  https://github.com/respawn-llc/kent/blob/v2.6.1/cli/kent/workflow_command.go
+- Kent workflow and task guide for graph lifecycle, task-backed revisions, and
+  preview/apply operation:
+  https://kent.sh/workflows/
+- Kent worktree guide for the configured `worktrees.base_dir` namespace and
+  source-workspace separation:
+  https://kent.sh/worktrees/
+- Kent headless guide for run observation, questions, and recovery-facing
+  automation:
+  https://kent.sh/headless/
 - Kent configuration and headless-role references for model, reviewer,
   workflow concurrency, delegation depth, and role override keys:
   https://kent.sh/config.md

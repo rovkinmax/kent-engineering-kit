@@ -9,6 +9,7 @@ import subprocess
 import uuid
 from typing import Any
 
+from .graph import WorkflowMutationPlan, graph_matches_spec, plan_workflow_graph
 from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
 
 
@@ -36,7 +37,7 @@ class KentClient:
         self,
         spec: WorkflowSpec,
         *,
-        minimum_version: tuple[int, int, int] = (2, 5, 0),
+        minimum_version: tuple[int, int, int] = (2, 6, 1),
         set_default: bool = False,
         workflow_selector: str | None = None,
     ) -> dict[str, Any]:
@@ -45,6 +46,7 @@ class KentClient:
         self.preflight_scripts(spec)
 
         definition = self.inspect(workflow_selector or spec.name)
+        created = definition is None
         if definition is None:
             if workflow_selector is not None:
                 raise SpecError(
@@ -61,34 +63,161 @@ class KentClient:
                 ]
             )
             definition = self.require_inspect(spec.name)
-        else:
-            mutation_required = self.preflight_reconcile(spec, definition)
-            if mutation_required and self.workflow_has_tasks(definition):
-                raise SpecError(
-                    f"workflow {definition['workflow']['name']!r} has tasks; "
-                    "edge-by-edge reconciliation is non-atomic. Generate a new "
-                    "workflow version or migrate/retire its tasks first"
-                )
 
         workflow_ref = workflow_selector_from_definition(definition)
-        for node in spec.nodes:
-            self.ensure_node(workflow_ref, node, definition)
+        graph_before = self.inspect_graph(workflow_ref)
+        workflow_before = definition["workflow"]
+        metadata_changed = not metadata_matches(workflow_before, spec)
+        plan = plan_workflow_graph(
+            spec,
+            graph_before,
+            metadata_changed=metadata_changed,
+        )
+        if plan.graph_changed and not created and self.workflow_has_tasks(definition):
+            raise SpecError(
+                f"workflow {workflow_before['name']!r} has tasks; its graph is "
+                "frozen. Generate a new workflow version or migrate/retire its "
+                "tasks first"
+            )
+        if plan.graph_changed and not created and self.workflow_is_linked(definition):
+            raise SpecError(
+                f"workflow {workflow_before['name']!r} is linked to a project; "
+                "generate a new workflow revision instead of reconciling it "
+                "in place"
+            )
+
+        graph_saved = False
+        metadata_saved = False
+        try:
+            if plan.graph_changed:
+                self.apply_graph_plan(plan)
+                graph_saved = True
+            if plan.metadata_changed:
+                self.ensure_workflow_metadata(workflow_ref, spec, definition)
+                metadata_saved = True
             definition = self.require_inspect(workflow_ref)
+            graph_after = self.inspect_graph(workflow_ref)
+            self.assert_exact_graph_document(spec, graph_after)
+            if not metadata_matches(definition["workflow"], spec):
+                raise SpecError(
+                    f"workflow {spec.name!r} metadata does not match the specification"
+                )
+            self.validate(workflow_ref)
+        except Exception as original_error:
+            if graph_saved or metadata_saved:
+                try:
+                    self.rollback_reconcile(
+                        workflow_ref,
+                        graph_before=graph_before,
+                        workflow_before=workflow_before,
+                        restore_graph=graph_saved,
+                        restore_metadata=metadata_saved,
+                    )
+                except Exception as rollback_error:
+                    raise KentCommandError(
+                        f"workflow reconcile failed: {original_error}; "
+                        f"rollback also failed: {rollback_error}"
+                    ) from original_error
+            raise
 
-        self.assert_no_extra_nodes(spec, definition)
-
-        for edge in spec.edges:
-            self.ensure_edge(workflow_ref, edge, definition)
-            definition = self.require_inspect(workflow_ref)
-
-        self.ensure_workflow_metadata(workflow_ref, spec, definition)
-        definition = self.require_inspect(workflow_ref)
-
-        self.assert_exact_graph(spec, definition)
-        self.validate(workflow_ref)
         self.link(workflow_ref, set_default=set_default)
         self.validate(workflow_ref)
         return self.require_inspect(workflow_ref)
+
+    def inspect_graph(self, workflow: str) -> dict[str, Any]:
+        return self.run_json(["workflow", "graph", "inspect", workflow])
+
+    def apply_graph_plan(self, plan: WorkflowMutationPlan) -> dict[str, Any]:
+        return self.apply_graph_document(
+            plan.document,
+            confirm_destructive=plan.destructive,
+        )
+
+    def apply_graph_document(
+        self,
+        document: dict[str, Any],
+        *,
+        confirm_destructive: bool,
+    ) -> dict[str, Any]:
+        encoded = json.dumps(document, ensure_ascii=False)
+        result = self.run(
+            ["workflow", "graph", "apply", "-", "--json"],
+            check=False,
+            input_text=encoded,
+        )
+        outcome = decode_json(
+            result.stdout,
+            f"{self.binary} workflow graph apply",
+        )
+        kind = outcome.get("outcome")
+        if result.returncode == 0 and kind in {"saved", "unchanged"}:
+            return outcome
+        if kind == "confirmation_required" and confirm_destructive:
+            confirmed = self.run(
+                ["workflow", "graph", "apply", "-", "--confirm", "--json"],
+                check=False,
+                input_text=encoded,
+            )
+            confirmed_outcome = decode_json(
+                confirmed.stdout,
+                f"{self.binary} workflow graph apply --confirm",
+            )
+            if confirmed.returncode == 0 and confirmed_outcome.get("outcome") in {
+                "saved",
+                "unchanged",
+            }:
+                return confirmed_outcome
+            raise KentCommandError(graph_apply_error(confirmed, confirmed_outcome))
+        raise KentCommandError(graph_apply_error(result, outcome))
+
+    def rollback_reconcile(
+        self,
+        workflow_ref: str,
+        *,
+        graph_before: dict[str, Any],
+        workflow_before: dict[str, Any],
+        restore_graph: bool,
+        restore_metadata: bool,
+    ) -> None:
+        failures: list[str] = []
+        if restore_graph:
+            try:
+                current = self.inspect_graph(workflow_ref)
+                rollback = json.loads(json.dumps(graph_before))
+                rollback["expected_version"] = current["expected_version"]
+                self.apply_graph_document(rollback, confirm_destructive=True)
+            except Exception as error:
+                failures.append(f"graph rollback failed: {error}")
+        if restore_metadata:
+            try:
+                self.run_json(
+                    [
+                        "workflow",
+                        "update",
+                        workflow_ref,
+                        "--description",
+                        workflow_before.get("description") or "",
+                        "--execution-target",
+                        execution_target_from_policy(
+                            workflow_before.get("execution_target_policy") or {}
+                        ),
+                        "--json",
+                    ]
+                )
+            except Exception as error:
+                failures.append(f"metadata rollback failed: {error}")
+        if failures:
+            raise KentCommandError("; ".join(failures))
+
+    def assert_exact_graph_document(
+        self,
+        spec: WorkflowSpec,
+        graph: dict[str, Any],
+    ) -> None:
+        if not graph_matches_spec(spec, graph):
+            raise SpecError(
+                f"workflow {spec.name!r} graph does not match the specification"
+            )
 
     def preflight_reconcile(
         self,
@@ -190,6 +319,22 @@ class KentClient:
                 ),
             )
             if payload.get("tasks"):
+                return True
+        return False
+
+    def workflow_is_linked(self, definition: dict[str, Any]) -> bool:
+        workflow_id = definition.get("workflow", {}).get("id")
+        workflow_ref = canonical_workflow_selector(workflow_id)
+        if workflow_ref is None:
+            raise KentCommandError(
+                f"workflow definition returned invalid id {workflow_id!r}"
+            )
+        for project_id in self.project_ids():
+            linked_workflows = {
+                canonical_workflow_selector(record.get("id"))
+                for record in self.workflow_records(project_id=project_id)
+            }
+            if workflow_ref in linked_workflows:
                 return True
         return False
 
@@ -647,6 +792,7 @@ class KentClient:
         args: list[str],
         *,
         check: bool = True,
+        input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         for key in ("KENT_SESSION_ID", "KENT_RUN_ID", "KENT_STEP_ID"):
@@ -656,6 +802,7 @@ class KentClient:
             cwd=self.workspace,
             env=environment,
             text=True,
+            input=input_text,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -703,7 +850,11 @@ def edge_index(definition: dict[str, Any]) -> dict[str, dict[str, Any]]:
     derived_wiring = definition.get("derived_wiring") or {}
     contracts = {
         item["edge_id"]: tuple(
-            ParameterSpec(field["name"], field["description"])
+            ParameterSpec(
+                field["name"],
+                field["description"],
+                field.get("purpose", "ordinary"),
+            )
             for field in item.get("required_provision_fields", [])
         )
         for item in (derived_wiring.get("edges") or [])
@@ -722,6 +873,8 @@ def edge_index(definition: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "prompt": edge.get("prompt_template"),
             "description": group.get("description") or "",
             "parameters": contracts.get(edge["id"], ()),
+            "assignee_selection": edge.get("assignee_selection", "configured"),
+            "thinking_selection": edge.get("thinking_selection", "configured"),
         }
     return index
 
@@ -737,6 +890,20 @@ def edge_matches(existing: dict[str, Any], spec: EdgeSpec) -> bool:
         and (existing["prompt"] or None) == (spec.prompt or None)
         and existing["description"] == spec.transition_description
         and existing["parameters"] == spec.parameters
+        and existing.get("assignee_selection", "configured")
+        == spec.assignee_selection
+        and existing.get("thinking_selection", "configured")
+        == spec.thinking_selection
+    )
+
+
+def metadata_matches(workflow: dict[str, Any], spec: WorkflowSpec) -> bool:
+    return (
+        workflow.get("description") == spec.description
+        and execution_target_from_policy(
+            workflow.get("execution_target_policy") or {}
+        )
+        == spec.execution_target
     )
 
 
@@ -798,6 +965,19 @@ def command_error(result: subprocess.CompletedProcess[str]) -> str:
     command = " ".join(str(part) for part in result.args)
     detail = result.stderr.strip() or result.stdout.strip() or "no output"
     return f"{command} failed with exit {result.returncode}: {detail}"
+
+
+def graph_apply_error(
+    result: subprocess.CompletedProcess[str],
+    outcome: dict[str, Any],
+) -> str:
+    message = outcome.get("message")
+    blockers = outcome.get("blockers")
+    detail = message or blockers or result.stderr.strip() or "no diagnostic"
+    return (
+        f"{' '.join(str(part) for part in result.args)} failed with "
+        f"outcome {outcome.get('outcome')!r}: {detail}"
+    )
 
 
 def spec_as_json(spec: WorkflowSpec) -> dict[str, Any]:

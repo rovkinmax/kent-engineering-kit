@@ -16,14 +16,17 @@ from workflowkit.delivery import (
 )
 from workflowkit.kent import (
     KentClient,
+    KentCommandError,
     canonical_workflow_selector,
     context_source_string,
     edge_index,
     execution_target_from_policy,
 )
+from workflowkit.graph import graph_matches_spec, plan_workflow_graph
 from workflowkit.model import (
     EdgeSpec,
     NodeSpec,
+    ParameterSpec,
     SpecError,
     WorkflowSpec,
     validate_execution_target,
@@ -2406,18 +2409,18 @@ class WorkflowKitTest(unittest.TestCase):
     def test_profile_accepts_newer_minimum_kent_version(self) -> None:
         profile = self.load_profile(
             lambda contents: contents.replace(
-                'minimum_kent_version = "2.5.0"',
-                'minimum_kent_version = "2.5.1"',
+                'minimum_kent_version = "2.6.1"',
+                'minimum_kent_version = "2.7.0"',
             )
         )
-        self.assertEqual(profile.minimum_version_tuple(), (2, 5, 1))
+        self.assertEqual(profile.minimum_version_tuple(), (2, 7, 0))
 
     def test_profile_rejects_older_minimum_kent_version(self) -> None:
-        with self.assertRaisesRegex(SpecError, "2.5.0 or newer"):
+        with self.assertRaisesRegex(SpecError, "2.6.1 or newer"):
             self.load_profile(
                 lambda contents: contents.replace(
-                    'minimum_kent_version = "2.5.0"',
-                    'minimum_kent_version = "2.4.9"',
+                    'minimum_kent_version = "2.6.1"',
+                    'minimum_kent_version = "2.6.0"',
                 )
             )
 
@@ -2576,11 +2579,77 @@ class WorkflowKitTest(unittest.TestCase):
         client = KentClient(Path(temporary.name))
         client.require_version = lambda *version: None
         client.inspect = lambda workflow: definition
+        client.inspect_graph = lambda workflow: {
+            "workflow_id": definition["workflow"]["id"],
+            "expected_version": 1,
+            "graph": {
+                "node_groups": [],
+                "nodes": definition["nodes"],
+                "transition_groups": definition["transition_groups"],
+                "edges": definition["edges"],
+            },
+        }
         client.run_json = lambda args: commands.append(args) or {}
 
-        with self.assertRaisesRegex(SpecError, "unexpected edges"):
+        with self.assertRaisesRegex(SpecError, "frozen"):
+            client.workflow_has_tasks = lambda current: True
             client.apply(spec)
         self.assertEqual(commands, [])
+
+    def test_apply_rejects_graph_mutation_for_linked_taskless_workflow(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        spec = WorkflowSpec(
+            name="Minimal v1",
+            description="Minimal workflow.",
+            execution_target="head",
+            nodes=(
+                NodeSpec("backlog", "start", "Backlog"),
+                NodeSpec("done", "terminal", "Done"),
+            ),
+            edges=(),
+        )
+        definition = {
+            "workflow": {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "name": "Minimal v1",
+                "description": "Minimal workflow.",
+                "execution_target_policy": {"mode": "head"},
+            },
+        }
+        client = KentClient(Path(temporary.name))
+        client.require_version = lambda *version: None
+        client.inspect = lambda workflow: definition
+        client.inspect_graph = lambda workflow: {
+            "workflow_id": definition["workflow"]["id"],
+            "expected_version": 1,
+            "graph": {
+                "node_groups": [],
+                "nodes": [
+                    {
+                        "id": "node-backlog",
+                        "key": "backlog",
+                        "kind": "start",
+                        "display_name": "Wrong",
+                        "group_id": None,
+                    },
+                    {
+                        "id": "node-done",
+                        "key": "done",
+                        "kind": "terminal",
+                        "display_name": "Done",
+                        "group_id": None,
+                    },
+                ],
+                "transition_groups": [],
+                "edges": [],
+            },
+        }
+        client.workflow_has_tasks = lambda current: False
+        client.workflow_is_linked = lambda current: True
+
+        with self.assertRaisesRegex(SpecError, "linked to a project"):
+            client.apply(spec)
 
     def test_apply_rejects_non_atomic_graph_mutation_when_tasks_exist(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -2624,15 +2693,254 @@ class WorkflowKitTest(unittest.TestCase):
         client = KentClient(Path(temporary.name))
         client.require_version = lambda *version: None
         client.inspect = lambda workflow: definition
+        client.inspect_graph = lambda workflow: {
+            "workflow_id": definition["workflow"]["id"],
+            "expected_version": 1,
+            "graph": {
+                "node_groups": [],
+                "nodes": definition["nodes"],
+                "transition_groups": [],
+                "edges": [],
+            },
+        }
         client.workflow_has_tasks = lambda current: True
         client.run_json = lambda args: commands.append(args) or {}
 
         with self.assertRaisesRegex(
             SpecError,
-            "edge-by-edge reconciliation is non-atomic",
+            "graph is frozen",
         ):
             client.apply(spec)
         self.assertEqual(commands, [])
+
+    def test_graph_projection_preserves_ids_order_and_unknown_fields(self) -> None:
+        spec = WorkflowSpec(
+            name="Minimal v1",
+            description="Minimal.",
+            execution_target="head",
+            nodes=(
+                NodeSpec("backlog", "start", "Backlog"),
+                NodeSpec(
+                    "implement",
+                    "agent",
+                    "Implement",
+                    agent="default",
+                    completion_mode="shell_command",
+                ),
+                NodeSpec("done", "terminal", "Done"),
+            ),
+            edges=(
+                EdgeSpec(
+                    "start_implement",
+                    "backlog",
+                    "start",
+                    "implement",
+                    prompt="Implement.",
+                    transition_description="Start.",
+                ),
+                EdgeSpec(
+                    "implement_done",
+                    "implement",
+                    "finish",
+                    "done",
+                    transition_description="Finish.",
+                ),
+            ),
+        )
+        graph = {
+            "workflow_id": "11111111-1111-4111-8111-111111111111",
+            "expected_version": 7,
+            "future_top_level": "keep",
+            "graph": {
+                "node_groups": [],
+                "future_graph": {"keep": True},
+                "nodes": [
+                    {
+                        "id": "node-backlog",
+                        "key": "backlog",
+                        "kind": "start",
+                        "display_name": "Backlog",
+                        "group_id": None,
+                        "future_node": "keep",
+                    },
+                    {
+                        "id": "node-done",
+                        "key": "done",
+                        "kind": "terminal",
+                        "display_name": "Done",
+                        "group_id": None,
+                    },
+                ],
+                "transition_groups": [],
+                "edges": [],
+            },
+        }
+
+        plan = plan_workflow_graph(spec, graph, metadata_changed=False)
+
+        self.assertTrue(plan.graph_changed)
+        self.assertEqual(
+            [node["key"] for node in plan.document["graph"]["nodes"]],
+            ["backlog", "done", "implement"],
+        )
+        self.assertEqual(plan.document["graph"]["nodes"][0]["id"], "node-backlog")
+        self.assertEqual(
+            plan.document["graph"]["nodes"][0]["future_node"],
+            "keep",
+        )
+        self.assertEqual(plan.document["future_top_level"], "keep")
+        self.assertEqual(plan.document["graph"]["future_graph"], {"keep": True})
+
+    def test_graph_projection_round_trips_selection_parameter_purposes(self) -> None:
+        edge = EdgeSpec(
+            "start_implement",
+            "backlog",
+            "start",
+            "implement",
+            prompt="Implement.",
+            transition_description="Start.",
+            parameters=(
+                ParameterSpec("scope", "Scope."),
+                ParameterSpec(
+                    "target_role",
+                    "Selected role.",
+                    purpose="target_assignee",
+                ),
+                ParameterSpec(
+                    "target_thinking",
+                    "Selected thinking.",
+                    purpose="target_thinking",
+                ),
+            ),
+            assignee_selection="previous_node",
+            thinking_selection="previous_node",
+        )
+        spec = WorkflowSpec(
+            name="Selection v1",
+            description="Selection.",
+            execution_target="head",
+            nodes=(
+                NodeSpec("backlog", "start", "Backlog"),
+                NodeSpec(
+                    "implement",
+                    "agent",
+                    "Implement",
+                    agent="default",
+                    completion_mode="shell_command",
+                ),
+                NodeSpec("done", "terminal", "Done"),
+            ),
+            edges=(edge,),
+        )
+        graph = {
+            "workflow_id": "11111111-1111-4111-8111-111111111111",
+            "expected_version": 1,
+            "graph": {
+                "node_groups": [],
+                "nodes": [],
+                "transition_groups": [],
+                "edges": [],
+            },
+        }
+
+        projected = plan_workflow_graph(
+            spec,
+            graph,
+            metadata_changed=False,
+        ).document
+        self.assertTrue(graph_matches_spec(spec, projected))
+        projected_edge = projected["graph"]["edges"][0]
+        self.assertEqual(projected_edge["assignee_selection"], "previous_node")
+        self.assertEqual(projected_edge["thinking_selection"], "previous_node")
+        self.assertEqual(
+            [parameter["purpose"] for parameter in projected_edge["parameters"]],
+            ["ordinary", "target_assignee", "target_thinking"],
+        )
+
+    def test_graph_projection_omits_empty_parameter_collection(self) -> None:
+        spec = WorkflowSpec(
+            name="Minimal v1",
+            description="Minimal.",
+            execution_target="head",
+            nodes=(
+                NodeSpec("backlog", "start", "Backlog"),
+                NodeSpec("done", "terminal", "Done"),
+            ),
+            edges=(
+                EdgeSpec(
+                    "finish",
+                    "backlog",
+                    "finish",
+                    "done",
+                    transition_description="Finish.",
+                ),
+            ),
+        )
+        graph = {
+            "workflow_id": "11111111-1111-4111-8111-111111111111",
+            "expected_version": 1,
+            "graph": {
+                "node_groups": [],
+                "nodes": [],
+                "transition_groups": [],
+                "edges": [],
+            },
+        }
+        projected = plan_workflow_graph(
+            spec,
+            graph,
+            metadata_changed=False,
+        ).document
+        self.assertNotIn("parameters", projected["graph"]["edges"][0])
+        self.assertTrue(graph_matches_spec(spec, projected))
+
+    def test_edge_selection_requires_exact_protected_parameters(self) -> None:
+        with self.assertRaisesRegex(SpecError, "target_assignee parameter"):
+            EdgeSpec(
+                "select",
+                "backlog",
+                "start",
+                "done",
+                transition_description="Select.",
+                assignee_selection="previous_node",
+            ).validate()
+        with self.assertRaisesRegex(SpecError, "repeats parameter purpose"):
+            EdgeSpec(
+                "select",
+                "backlog",
+                "start",
+                "done",
+                transition_description="Select.",
+                parameters=(
+                    ParameterSpec("one", "One.", "target_assignee"),
+                    ParameterSpec("two", "Two.", "target_assignee"),
+                ),
+                assignee_selection="previous_node",
+            ).validate()
+
+    def test_graph_projection_rejects_node_groups(self) -> None:
+        spec = WorkflowSpec(
+            name="Minimal v1",
+            description="Minimal.",
+            execution_target="head",
+            nodes=(
+                NodeSpec("backlog", "start", "Backlog"),
+                NodeSpec("done", "terminal", "Done"),
+            ),
+            edges=(),
+        )
+        graph = {
+            "workflow_id": "11111111-1111-4111-8111-111111111111",
+            "expected_version": 1,
+            "graph": {
+                "node_groups": [{"id": "group"}],
+                "nodes": [],
+                "transition_groups": [],
+                "edges": [],
+            },
+        }
+        with self.assertRaisesRegex(SpecError, "node_groups"):
+            plan_workflow_graph(spec, graph, metadata_changed=False)
 
     def test_apply_explicit_workflow_selector_never_creates_duplicate(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -2660,6 +2968,109 @@ class WorkflowKitTest(unittest.TestCase):
                 workflow_selector="11111111-1111-4111-8111-111111111111",
             )
         self.assertEqual(commands, [])
+
+    def test_graph_apply_retries_only_confirmation_required_outcome(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        calls: list[tuple[list[str], str | None]] = []
+        outcomes = iter(
+            (
+                subprocess.CompletedProcess(
+                    [],
+                    1,
+                    stdout=json.dumps(
+                        {
+                            "outcome": "confirmation_required",
+                            "impact": {"removed_node_count": 1},
+                        }
+                    ),
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps({"outcome": "saved"}),
+                    stderr="",
+                ),
+            )
+        )
+        client = KentClient(Path(temporary.name))
+
+        def run(
+            args: list[str],
+            *,
+            check: bool = True,
+            input_text: str | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append((args, input_text))
+            result = next(outcomes)
+            result.args = args
+            return result
+
+        client.run = run
+        document = {
+            "workflow_id": "11111111-1111-4111-8111-111111111111",
+            "expected_version": 2,
+            "graph": {
+                "node_groups": [],
+                "nodes": [],
+                "transition_groups": [],
+                "edges": [],
+            },
+        }
+
+        outcome = client.apply_graph_document(
+            document,
+            confirm_destructive=True,
+        )
+
+        self.assertEqual(outcome["outcome"], "saved")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("--confirm", calls[0][0])
+        self.assertIn("--confirm", calls[1][0])
+        self.assertEqual(calls[0][1], calls[1][1])
+
+    def test_graph_apply_stale_version_fails_without_retry(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        calls: list[list[str]] = []
+        client = KentClient(Path(temporary.name))
+
+        def run(
+            args: list[str],
+            *,
+            check: bool = True,
+            input_text: str | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            return subprocess.CompletedProcess(
+                args,
+                1,
+                stdout=json.dumps(
+                    {
+                        "outcome": "blocked",
+                        "message": "expected version 2, current version 3",
+                    }
+                ),
+                stderr="",
+            )
+
+        client.run = run
+        with self.assertRaisesRegex(KentCommandError, "current version 3"):
+            client.apply_graph_document(
+                {
+                    "workflow_id": "11111111-1111-4111-8111-111111111111",
+                    "expected_version": 2,
+                    "graph": {
+                        "node_groups": [],
+                        "nodes": [],
+                        "transition_groups": [],
+                        "edges": [],
+                    },
+                },
+                confirm_destructive=True,
+            )
+        self.assertEqual(len(calls), 1)
 
     def test_workflow_task_check_scans_every_linked_project(self) -> None:
         temporary = tempfile.TemporaryDirectory()

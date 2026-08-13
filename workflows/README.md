@@ -5,7 +5,7 @@ snapshots, not an alternate source of truth.
 
 ## Supported Baseline
 
-- Kent 2.5 or newer;
+- Kent 2.6.1 or newer;
 - profile schema 3;
 - workflow-wide unique transition keys;
 - explicit execution-target policy;
