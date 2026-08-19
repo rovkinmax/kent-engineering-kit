@@ -159,6 +159,11 @@ def profile_requirements(
             f"adapters.{key}",
             executable=True,
         )
+    if profile.release is not None:
+        require(profile.release.spec_path, "release.spec_path")
+        if profile.release.builder_path:
+            require(profile.release.builder_path, "release.builder_path")
+        require(profile.release.snapshot_path, "release.snapshot_path")
     return requirements
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import os
 import re
 from typing import Any
@@ -17,6 +17,24 @@ PR_MERGE_STRATEGIES = {"auto", "merge", "squash", "rebase"}
 BRANCH_IDENTITY_POLICIES = {"task", "jira", "github_issue"}
 CONTEXT_MANIFEST_KEYS = {"plan", "implement", "review", "smoke", "delivery"}
 PACKAGE_PUBLISH_TOPOLOGY = "manual-package-publish-after-main"
+SCHEMA4_ONLY_ROOT_KEYS = {
+    "kit_managed_commands",
+    "command_versions",
+    "release",
+}
+RELEASE_FIELDS = {
+    "topology_kind",
+    "adoption_mode",
+    "spec_path",
+    "builder_path",
+    "snapshot_path",
+}
+RELEASE_TOPOLOGY_ADOPTIONS = {
+    "appsome-release-publication": "managed-in-place",
+    "puber-release": "managed-in-place",
+    "sdk-merged-main-publication": "metadata-only",
+    "slack-reader-release": "managed-in-place",
+}
 WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 ROLE_PROMPT_DIRECTORIES = (
@@ -38,6 +56,15 @@ class WorkKind:
 
 
 @dataclass(frozen=True)
+class ReleaseProfile:
+    topology_kind: str
+    adoption_mode: str
+    spec_path: str
+    builder_path: str
+    snapshot_path: str
+
+
+@dataclass(frozen=True)
 class ProjectProfile:
     project_root: Path
     schema_version: int
@@ -50,7 +77,10 @@ class ProjectProfile:
     kit_managed_adapters: tuple[str, ...]
     source_control: str
     issue_tracker: str
-    release_topology: str
+    release_topology: str | None
+    kit_managed_commands: tuple[str, ...]
+    command_versions: dict[str, str]
+    release: ReleaseProfile | None
     execution_default: str
     execution_overrides: dict[str, str]
     policies: dict[str, str]
@@ -90,10 +120,38 @@ class ProjectProfile:
         except tomllib.TOMLDecodeError as error:
             raise SpecError(f"cannot load project profile {source}: {error}") from error
         schema_version = require_int(raw, "schema_version")
-        if schema_version != 3:
+        if schema_version not in {3, 4}:
             raise SpecError(
-                f"unsupported profile schema {schema_version}; expected 3"
+                f"unsupported profile schema {schema_version}; expected 3 or 4"
             )
+        if schema_version == 3:
+            schema4_fields = sorted(SCHEMA4_ONLY_ROOT_KEYS & set(raw))
+            if schema4_fields:
+                raise SpecError(
+                    "profile schema 3 does not support root keys: "
+                    f"{schema4_fields}"
+                )
+            release_topology: str | None = require_string(
+                raw,
+                "release_topology",
+            )
+            kit_managed_commands: tuple[str, ...] = ()
+            command_versions: dict[str, str] = {}
+            release: ReleaseProfile | None = None
+        else:
+            if "release_topology" in raw:
+                raise SpecError(
+                    "profile schema 4 does not support release_topology"
+                )
+            release_topology = None
+            kit_managed_commands = tuple(
+                require_string_list(raw, "kit_managed_commands")
+            )
+            command_versions = string_table(
+                require_table(raw, "command_versions"),
+                "command_versions",
+            )
+            release = release_profile(require_table(raw, "release"))
         execution = require_table(raw, "execution")
         capabilities = bool_table(
             require_table(raw, "capabilities"),
@@ -115,7 +173,10 @@ class ProjectProfile:
             ),
             source_control=require_string(raw, "source_control"),
             issue_tracker=require_string(raw, "issue_tracker"),
-            release_topology=require_string(raw, "release_topology"),
+            release_topology=release_topology,
+            kit_managed_commands=kit_managed_commands,
+            command_versions=command_versions,
+            release=release,
             execution_default=require_string(execution, "default_target"),
             execution_overrides=string_table(
                 execution.get("overrides", {}),
@@ -137,10 +198,12 @@ class ProjectProfile:
         return profile
 
     def validate(self, *, check_files: bool = True) -> None:
-        if self.schema_version != 3:
+        if self.schema_version not in {3, 4}:
             raise SpecError(
-                f"unsupported profile schema {self.schema_version}; expected 3"
+                f"unsupported profile schema {self.schema_version}; expected 3 or 4"
             )
+        if self.schema_version == 4:
+            self.validate_schema4(check_files=check_files)
         minimum_version = self.minimum_version_tuple()
         if minimum_version < (2, 6, 1):
             raise SpecError(
@@ -383,6 +446,115 @@ class ProjectProfile:
         if check_files:
             validate_project_role_prompts(self.project_root)
 
+    def validate_schema4(self, *, check_files: bool) -> None:
+        if len(set(self.kit_managed_commands)) != len(
+            self.kit_managed_commands
+        ):
+            raise SpecError("kit_managed_commands must not contain duplicates")
+
+        managed_commands = set(self.kit_managed_commands)
+        for key in sorted(managed_commands):
+            if not self.command(key):
+                raise SpecError(
+                    f"kit managed command {key!r} must have a non-empty "
+                    "path in commands"
+                )
+        version_keys = set(self.command_versions)
+        if version_keys != managed_commands:
+            missing = sorted(managed_commands - version_keys)
+            extra = sorted(version_keys - managed_commands)
+            raise SpecError(
+                "command_versions must match kit_managed_commands exactly: "
+                f"missing={missing}, extra={extra}"
+            )
+        for key, version in sorted(self.command_versions.items()):
+            if SEMVER_PATTERN.fullmatch(version) is None:
+                raise SpecError(
+                    f"command_versions.{key} must use numeric "
+                    "major.minor.patch format"
+                )
+
+        if self.release is None:
+            raise SpecError("profile schema 4 requires a release table")
+        if self.release.topology_kind not in RELEASE_TOPOLOGY_ADOPTIONS:
+            raise SpecError(
+                f"unsupported release.topology_kind "
+                f"{self.release.topology_kind!r}"
+            )
+        expected_adoption = RELEASE_TOPOLOGY_ADOPTIONS[
+            self.release.topology_kind
+        ]
+        if self.release.adoption_mode != expected_adoption:
+            raise SpecError(
+                f"release.topology_kind {self.release.topology_kind!r} "
+                f"requires adoption_mode {expected_adoption!r}"
+            )
+        if (
+            self.release.adoption_mode == "managed-in-place"
+            and not self.release.builder_path
+        ):
+            raise SpecError(
+                "release.builder_path is required for managed-in-place"
+            )
+        if (
+            self.release.adoption_mode == "metadata-only"
+            and self.release.builder_path
+        ):
+            raise SpecError(
+                "release.builder_path must be empty for metadata-only"
+            )
+
+        targets: dict[str, str] = {}
+        for table_name, table in (
+            ("adapters", self.adapters),
+            ("commands", self.commands),
+        ):
+            for key, path in sorted(table.items()):
+                if not path:
+                    continue
+                normalized = validate_normalized_project_path(
+                    path,
+                    f"{table_name}.{key}",
+                )
+                previous = targets.get(normalized)
+                if previous is not None:
+                    raise SpecError(
+                        f"{table_name}.{key} aliases {previous}; "
+                        "adapter and command targets must be unique"
+                    )
+                targets[normalized] = f"{table_name}.{key}"
+
+        validate_normalized_project_path(
+            self.release.spec_path,
+            "release.spec_path",
+        )
+        if self.release.builder_path:
+            validate_normalized_project_path(
+                self.release.builder_path,
+                "release.builder_path",
+            )
+        validate_normalized_project_path(
+            self.release.snapshot_path,
+            "release.snapshot_path",
+        )
+        if not check_files:
+            return
+        for field, configured_path in (
+            ("spec_path", self.release.spec_path),
+            ("builder_path", self.release.builder_path),
+            ("snapshot_path", self.release.snapshot_path),
+        ):
+            if not configured_path:
+                continue
+            path = self.resolve_project_path(
+                configured_path,
+                f"release.{field}",
+            )
+            if not path.is_file():
+                raise SpecError(
+                    f"release {field.replace('_', ' ')} not found: {path}"
+                )
+
     def execution_target(self, workflow_kind: str) -> str:
         return self.execution_overrides.get(workflow_kind, self.execution_default)
 
@@ -416,7 +588,10 @@ class ProjectProfile:
         return self.policies.get("branch_identity", "task").strip()
 
     def package_publish_after_main(self) -> bool:
-        return self.release_topology == PACKAGE_PUBLISH_TOPOLOGY
+        return (
+            self.schema_version == 3
+            and self.release_topology == PACKAGE_PUBLISH_TOPOLOGY
+        )
 
     def command(self, key: str) -> str:
         return self.commands.get(key, "").strip()
@@ -530,6 +705,48 @@ def string_table(raw: Any, label: str) -> dict[str, str]:
             raise SpecError(f"{label}.{key} must be a string")
         result[key] = value.strip()
     return result
+
+
+def release_profile(raw: Any) -> ReleaseProfile:
+    if not isinstance(raw, dict):
+        raise SpecError("release must be a TOML table")
+    missing_fields = RELEASE_FIELDS - set(raw)
+    unknown_fields = set(raw) - RELEASE_FIELDS
+    if missing_fields or unknown_fields:
+        raise SpecError(
+            "release must declare exactly "
+            f"{sorted(RELEASE_FIELDS)}; missing={sorted(missing_fields)}, "
+            f"unknown={sorted(unknown_fields)}"
+        )
+    return ReleaseProfile(
+        topology_kind=require_string(raw, "topology_kind"),
+        adoption_mode=require_string(raw, "adoption_mode"),
+        spec_path=require_string(raw, "spec_path"),
+        builder_path=optional_string(raw, "builder_path"),
+        snapshot_path=require_string(raw, "snapshot_path"),
+    )
+
+
+def optional_string(raw: dict[str, Any], key: str) -> str:
+    value = raw.get(key, "")
+    if not isinstance(value, str):
+        raise SpecError(f"{key} must be a string")
+    return value.strip()
+
+
+def validate_normalized_project_path(path: str, label: str) -> str:
+    relative = PurePosixPath(path)
+    if (
+        not path
+        or relative.is_absolute()
+        or "\\" in path
+        or relative.as_posix() != path
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise SpecError(
+            f"{label} must be a normalized project-relative path: {path!r}"
+        )
+    return relative.as_posix()
 
 
 def bool_table(raw: Any, label: str) -> dict[str, bool]:

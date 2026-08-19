@@ -35,8 +35,43 @@ CONTEXT_MANIFESTS = (
 )
 
 
+def schema4_profile_contents(*, metadata_only: bool = False) -> str:
+    contents = EXAMPLE_PROFILE.read_text()
+    contents = contents.replace(
+        "schema_version = 3\n",
+        (
+            "schema_version = 4\n"
+            'kit_managed_commands = ["dispatch"]\n'
+        ),
+    )
+    contents = contents.replace('release_topology = "none"\n', "")
+    topology_kind = (
+        "sdk-merged-main-publication"
+        if metadata_only
+        else "appsome-release-publication"
+    )
+    adoption_mode = "metadata-only" if metadata_only else "managed-in-place"
+    builder_path = "" if metadata_only else ".kent/release/build.sh"
+    contents += (
+        "\n[command_versions]\n"
+        'dispatch = "1.2.3"\n'
+        "\n[release]\n"
+        f'topology_kind = "{topology_kind}"\n'
+        f'adoption_mode = "{adoption_mode}"\n'
+        'spec_path = ".kent/release/spec.toml"\n'
+        f'builder_path = "{builder_path}"\n'
+        'snapshot_path = ".kent/release/snapshot.toml"\n'
+    )
+    return contents
+
+
 class RevisionPreflightTest(unittest.TestCase):
-    def create_project(self) -> Path:
+    def create_project(
+        self,
+        *,
+        schema4: bool = False,
+        metadata_only: bool = False,
+    ) -> Path:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -48,7 +83,11 @@ class RevisionPreflightTest(unittest.TestCase):
         kent = root / ".kent"
         scripts = kent / "scripts"
         scripts.mkdir(parents=True)
-        (kent / "workflow-profile.toml").write_text(EXAMPLE_PROFILE.read_text())
+        (kent / "workflow-profile.toml").write_text(
+            schema4_profile_contents(metadata_only=metadata_only)
+            if schema4
+            else EXAMPLE_PROFILE.read_text()
+        )
         (kent / "project-contract.md").write_text("# Project contract\n")
         for configured_path in WORK_KIND_PROCEDURES + CONTEXT_MANIFESTS:
             path = root / configured_path
@@ -71,6 +110,17 @@ class RevisionPreflightTest(unittest.TestCase):
             path = scripts / name
             path.write_text("#!/usr/bin/env bash\nexit 0\n")
             path.chmod(0o755)
+        if schema4:
+            for configured_path in (
+                ".kent/release/spec.toml",
+                ".kent/release/snapshot.toml",
+            ):
+                path = root / configured_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# Test release artifact\n")
+            if not metadata_only:
+                builder = root / ".kent/release/build.sh"
+                builder.write_text("#!/usr/bin/env bash\nexit 0\n")
         self.commit_all(root, "Add project workflow adapter")
         return root
 
@@ -155,6 +205,39 @@ class RevisionPreflightTest(unittest.TestCase):
         with self.assertRaisesRegex(
             RevisionPreflightError,
             "required path not found.*emulator-resource-lock",
+        ):
+            preflight_project_revision(root, "HEAD")
+
+    def test_preflight_includes_schema_four_release_closure(self) -> None:
+        root = self.create_project(schema4=True)
+
+        result = preflight_project_revision(root, "HEAD")
+
+        checked = {path.path for path in result.checked_paths}
+        self.assertIn(".kent/release/spec.toml", checked)
+        self.assertIn(".kent/release/build.sh", checked)
+        self.assertIn(".kent/release/snapshot.toml", checked)
+
+    def test_preflight_omits_optional_metadata_only_builder(self) -> None:
+        root = self.create_project(schema4=True, metadata_only=True)
+
+        checked = {
+            path.path
+            for path in preflight_project_revision(root, "HEAD").checked_paths
+        }
+
+        self.assertIn(".kent/release/spec.toml", checked)
+        self.assertNotIn(".kent/release/build.sh", checked)
+        self.assertIn(".kent/release/snapshot.toml", checked)
+
+    def test_preflight_requires_schema_four_release_files(self) -> None:
+        root = self.create_project(schema4=True)
+        self.run_git(root, "rm", "-q", ".kent/release/snapshot.toml")
+        self.commit_all(root, "Remove release snapshot")
+
+        with self.assertRaisesRegex(
+            RevisionPreflightError,
+            "required path not found.*release/snapshot.toml",
         ):
             preflight_project_revision(root, "HEAD")
 

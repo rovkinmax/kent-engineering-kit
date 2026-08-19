@@ -32,7 +32,7 @@ from workflowkit.model import (
     validate_execution_target,
 )
 from workflowkit.naming import snapshot_filename
-from workflowkit.profile import ProjectProfile
+from workflowkit.profile import ProjectProfile, ReleaseProfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -71,6 +71,34 @@ def create_work_kind_procedures(root: Path) -> None:
         path.write_text("# Test context\n")
 
 
+def schema4_profile_contents(
+    *,
+    topology_kind: str = "appsome-release-publication",
+    adoption_mode: str = "managed-in-place",
+    builder_path: str = ".kent/release/build.sh",
+) -> str:
+    contents = EXAMPLE_PROFILE.read_text()
+    contents = contents.replace(
+        "schema_version = 3\n",
+        (
+            "schema_version = 4\n"
+            'kit_managed_commands = ["dispatch"]\n\n'
+        ),
+    )
+    contents = contents.replace('release_topology = "none"\n', "")
+    contents += (
+        "\n[command_versions]\n"
+        'dispatch = "1.2.3"\n'
+        "\n[release]\n"
+        f'topology_kind = "{topology_kind}"\n'
+        f'adoption_mode = "{adoption_mode}"\n'
+        'spec_path = ".kent/release/spec.toml"\n'
+        f'builder_path = "{builder_path}"\n'
+        'snapshot_path = ".kent/release/snapshot.toml"\n'
+    )
+    return contents
+
+
 class WorkflowKitTest(unittest.TestCase):
     def load_profile(self, transform=lambda value: value) -> ProjectProfile:
         temporary = tempfile.TemporaryDirectory()
@@ -81,6 +109,29 @@ class WorkflowKitTest(unittest.TestCase):
         contents = transform(EXAMPLE_PROFILE.read_text())
         (profile_directory / "workflow-profile.toml").write_text(contents)
         create_work_kind_procedures(root)
+        return ProjectProfile.load(root)
+
+    def load_schema4_profile(
+        self,
+        transform=lambda value: value,
+    ) -> ProjectProfile:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        profile_directory = root / ".kent"
+        profile_directory.mkdir()
+        (profile_directory / "workflow-profile.toml").write_text(
+            transform(schema4_profile_contents())
+        )
+        create_work_kind_procedures(root)
+        for configured_path in (
+            ".kent/release/spec.toml",
+            ".kent/release/build.sh",
+            ".kent/release/snapshot.toml",
+        ):
+            path = root / configured_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# Test release artifact\n")
         return ProjectProfile.load(root)
 
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
@@ -1906,6 +1957,308 @@ class WorkflowKitTest(unittest.TestCase):
                     )
                 )
             )
+
+    def test_profile_accepts_schema_three_extension_tables(self) -> None:
+        profile = self.load_profile(
+            lambda contents: contents
+            + '\n[integrations.example]\nname = "project-owned"\n'
+        )
+
+        self.assertEqual(profile.schema_version, 3)
+        self.assertEqual(profile.release_topology, "none")
+        self.assertIsNone(profile.release)
+
+    def test_schema_three_rejects_only_schema_four_root_keys(self) -> None:
+        root_key_values = {
+            "kit_managed_commands": 'kit_managed_commands = []\n',
+            "command_versions": "[command_versions]\ndispatch = \"1.2.3\"\n",
+            "release": (
+                "[release]\n"
+                'topology_kind = "appsome-release-publication"\n'
+            ),
+        }
+        for key, fragment in root_key_values.items():
+            with self.subTest(key=key):
+                def add_root_key(contents: str, fragment: str = fragment) -> str:
+                    if fragment.startswith("["):
+                        return contents + "\n" + fragment
+                    return contents.replace(
+                        "schema_version = 3\n",
+                        "schema_version = 3\n" + fragment,
+                    )
+
+                with self.assertRaisesRegex(
+                    SpecError,
+                    "schema 3 does not support root keys",
+                ):
+                    self.load_profile(add_root_key)
+
+    def test_schema_four_accepts_release_profile_and_disables_legacy_publish(
+        self,
+    ) -> None:
+        profile = self.load_schema4_profile()
+
+        self.assertEqual(profile.schema_version, 4)
+        self.assertIsInstance(profile.release, ReleaseProfile)
+        self.assertEqual(profile.kit_managed_commands, ("dispatch",))
+        self.assertEqual(profile.command_versions, {"dispatch": "1.2.3"})
+        self.assertFalse(profile.package_publish_after_main())
+        self.assertNotIn(
+            "publish_package",
+            {node.key for node in build_delivery_workflow(profile, 1).nodes},
+        )
+
+    def test_schema_four_variants_remain_valid_without_legacy_publish(
+        self,
+    ) -> None:
+        profile = self.load_schema4_profile()
+        variant = replace(profile, release_topology="none")
+        variant.validate(check_files=True)
+        self.assertFalse(variant.package_publish_after_main())
+
+        canary = build_canary_workflow(variant, 1)
+        smoke_lab = build_smoke_lab_workflow(variant)
+
+        canary.validate()
+        smoke_lab.validate()
+        variant_nodes = {node.key for node in canary.nodes}
+        variant_nodes.update(node.key for node in smoke_lab.nodes)
+        self.assertNotIn(
+            "publish_package",
+            variant_nodes,
+        )
+
+    def test_schema_four_rejects_legacy_release_topology(self) -> None:
+        with self.assertRaisesRegex(
+            SpecError,
+            "schema 4 does not support release_topology",
+        ):
+            self.load_schema4_profile(
+                lambda contents: contents.replace(
+                    "schema_version = 4\n",
+                    'schema_version = 4\nrelease_topology = "none"\n',
+                )
+            )
+
+    def test_schema_four_requires_unique_managed_commands(self) -> None:
+        with self.assertRaisesRegex(
+            SpecError,
+            "kit_managed_commands must not contain duplicates",
+        ):
+            self.load_schema4_profile(
+                lambda contents: contents.replace(
+                    'kit_managed_commands = ["dispatch"]',
+                    'kit_managed_commands = ["dispatch", "dispatch"]',
+                )
+            )
+
+        with self.assertRaisesRegex(
+            SpecError,
+            "must have a non-empty path in commands",
+        ):
+            self.load_schema4_profile(
+                lambda contents: contents.replace(
+                    'dispatch = ".kent/scripts/workflow-verification-dispatch"',
+                    'dispatch = ""',
+                )
+            )
+
+        with self.assertRaisesRegex(
+            SpecError,
+            "must have a non-empty path in commands",
+        ):
+            self.load_schema4_profile(
+                lambda contents: contents.replace(
+                    'dispatch = ".kent/scripts/workflow-verification-dispatch"\n',
+                    "",
+                )
+            )
+
+    def test_schema_four_requires_exact_valid_command_versions(self) -> None:
+        invalid_versions = {
+            "missing": lambda contents: contents.replace(
+                'dispatch = "1.2.3"\n',
+                "",
+            ),
+            "extra": lambda contents: contents.replace(
+                'dispatch = "1.2.3"\n',
+                'dispatch = "1.2.3"\nextra = "1.0.0"\n',
+            ),
+            "invalid": lambda contents: contents.replace(
+                'dispatch = "1.2.3"',
+                'dispatch = "1.2"',
+            ),
+        }
+        for name, transform in invalid_versions.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    SpecError,
+                    "command_versions",
+                ):
+                    self.load_schema4_profile(transform)
+
+    def test_schema_four_closes_release_table_and_validates_topology_pairs(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(SpecError, "release must declare exactly"):
+            self.load_schema4_profile(
+                lambda contents: contents.replace(
+                    'snapshot_path = ".kent/release/snapshot.toml"\n',
+                    'snapshot_path = ".kent/release/snapshot.toml"\nextra = "nope"\n',
+                )
+            )
+
+        for topology_kind in (
+            "unknown",
+            "appsome-release-publication",
+        ):
+            with self.subTest(topology_kind=topology_kind):
+                with self.assertRaisesRegex(
+                    SpecError,
+                    "unsupported release.topology_kind|requires adoption_mode",
+                ):
+                    self.load_schema4_profile(
+                        lambda contents, topology_kind=topology_kind: contents.replace(
+                            'topology_kind = "appsome-release-publication"',
+                            f'topology_kind = "{topology_kind}"',
+                        ).replace(
+                            'adoption_mode = "managed-in-place"',
+                            'adoption_mode = "metadata-only"',
+                        )
+                    )
+
+    def test_schema_four_accepts_all_approved_topology_adoption_pairs(
+        self,
+    ) -> None:
+        pairs = (
+            ("appsome-release-publication", "managed-in-place", ".kent/release/build.sh"),
+            ("puber-release", "managed-in-place", ".kent/release/build.sh"),
+            ("sdk-merged-main-publication", "metadata-only", ""),
+            ("slack-reader-release", "managed-in-place", ".kent/release/build.sh"),
+        )
+        for topology_kind, adoption_mode, builder_path in pairs:
+            with self.subTest(topology_kind=topology_kind):
+                def transform(contents: str) -> str:
+                    return contents.replace(
+                        'topology_kind = "appsome-release-publication"',
+                        f'topology_kind = "{topology_kind}"',
+                    ).replace(
+                        'adoption_mode = "managed-in-place"',
+                        f'adoption_mode = "{adoption_mode}"',
+                    ).replace(
+                        'builder_path = ".kent/release/build.sh"',
+                        f'builder_path = "{builder_path}"',
+                    )
+
+                profile = self.load_schema4_profile(transform)
+                self.assertEqual(profile.release.topology_kind, topology_kind)
+                self.assertEqual(profile.release.adoption_mode, adoption_mode)
+                self.assertEqual(profile.release.builder_path, builder_path)
+                self.assertFalse(profile.package_publish_after_main())
+
+    def test_schema_four_enforces_builder_rules(self) -> None:
+        with self.assertRaisesRegex(
+            SpecError,
+            "builder_path is required for managed-in-place",
+        ):
+            self.load_schema4_profile(
+                lambda contents: contents.replace(
+                    'builder_path = ".kent/release/build.sh"',
+                    'builder_path = ""',
+                )
+            )
+
+        profile = self.load_schema4_profile(
+            lambda contents: contents.replace(
+                'topology_kind = "appsome-release-publication"',
+                'topology_kind = "sdk-merged-main-publication"',
+            ).replace(
+                'adoption_mode = "managed-in-place"',
+                'adoption_mode = "metadata-only"',
+            ).replace(
+                'builder_path = ".kent/release/build.sh"',
+                'builder_path = ""',
+            )
+        )
+        self.assertEqual(profile.release.builder_path, "")
+
+        with self.assertRaisesRegex(
+            SpecError,
+            "builder_path must be empty for metadata-only",
+        ):
+            self.load_schema4_profile(
+                lambda contents: contents.replace(
+                    'topology_kind = "appsome-release-publication"',
+                    'topology_kind = "sdk-merged-main-publication"',
+                ).replace(
+                    'adoption_mode = "managed-in-place"',
+                    'adoption_mode = "metadata-only"',
+                )
+            )
+
+    def test_schema_four_rejects_path_escapes_and_target_aliases(self) -> None:
+        for field, replacement in (
+            (
+                "release",
+                (
+                    'spec_path = ".kent/release/spec.toml"',
+                    'spec_path = "../release/spec.toml"',
+                ),
+            ),
+            (
+                "command",
+                (
+                    'dispatch = ".kent/scripts/workflow-verification-dispatch"',
+                    'dispatch = "../scripts/dispatch"',
+                ),
+            ),
+            (
+                "adapter",
+                (
+                    "[release]\n",
+                    '[adapters]\nlock = "../adapters/lock"\n\n[release]\n',
+                ),
+            ),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    SpecError,
+                    "normalized project-relative path",
+                ):
+                    self.load_schema4_profile(
+                        lambda contents, replacement=replacement: contents.replace(
+                            *replacement
+                        )
+                    )
+
+        with self.assertRaisesRegex(SpecError, "targets must be unique"):
+            self.load_schema4_profile(
+                lambda contents: contents.replace(
+                    "\n[release]\n",
+                    (
+                        "\n[adapters]\n"
+                        'project_adapter = ".kent/scripts/workflow-verification-dispatch"\n'
+                        "\n[release]\n"
+                    ),
+                )
+            )
+
+    def test_schema_four_release_files_are_required_and_symlink_safe(self) -> None:
+        profile = self.load_schema4_profile()
+        spec_path = profile.resolve_project_path(
+            profile.release.spec_path,
+            "release.spec_path",
+        )
+        spec_path.unlink()
+        with self.assertRaisesRegex(SpecError, "release spec path not found"):
+            ProjectProfile.load(profile.project_root)
+
+        outside = profile.project_root.parent / "outside-release-spec.toml"
+        outside.write_text("# outside\n")
+        self.addCleanup(outside.unlink)
+        spec_path.symlink_to(outside)
+        with self.assertRaisesRegex(SpecError, "release.spec_path.*symlinks"):
+            ProjectProfile.load(profile.project_root)
 
     def test_profile_rejects_legacy_device_smoke_capability(self) -> None:
         with self.assertRaisesRegex(SpecError, "device_smoke was removed"):
