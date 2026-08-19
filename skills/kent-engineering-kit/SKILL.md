@@ -29,18 +29,18 @@ reference needed for safe execution.
 
 ## Shared And Project Boundaries
 
-- Shared workflow owns lifecycle, approvals, fan-out/Join, portable parameters,
-  deterministic waiting, and task cleanup. Projects own build, architecture,
-  devices, integrations, release policy, credentials, and procedures.
-- `required_adapters` declares runtime dependencies;
-  `kit_managed_adapters` is the explicit subset synchronized from kit
-  templates. Other adapters are project-owned and never replaced.
-- Use canonical profile role keys. Project overrides may specialize a role but
-  must preserve `contracts/role-contract.md`.
-- Reject `model:` and `tools:` frontmatter in role prompts. Configure execution
-  policy through Kent.
-- Run deterministic verification through the profile command, normally
-  `.kent/scripts/workflow-verify`.
+- Shared workflow owns lifecycle, approvals, fan-out/Join, parameters, waiting,
+  cleanup; projects own build, architecture, devices, integrations, release,
+  credentials, procedures.
+- Schema 3 retains legacy synchronization; Schema 4 owns commands, exact
+  versions, release identity.
+- `required_adapters`: runtime dependencies; `kit_managed_adapters`: exact
+  subset; remaining adapters are project-owned. Loader is platform-neutral.
+- Synchronizer consumes `ProjectProfile`, validates the plan; see
+  `contracts/workflow-contract.md` for fields and pairs. No migration/activation.
+- Canonical roles preserve role contract; reject `model:`/`tools:`; Kent
+  config owns execution.
+- Verify via profile command, normally `.kent/scripts/workflow-verify`.
 
 ## Workflow Authoring And Rollout
 

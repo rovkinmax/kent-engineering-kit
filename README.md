@@ -143,6 +143,28 @@ verification scripts, project procedures, and these kit-managed commands:
 - `wait_pr` — zero-model GitHub merge watching;
 - `janitor` — post-Cleanup safe managed-worktree and branch cleanup.
 
+Profile synchronization has a strict dual-schema boundary. Schema 3 preserves
+legacy `release_topology` and implicit ownership of known command templates;
+schema 4 requires explicit `kit_managed_commands`, matching
+`command_versions`, and a closed `release` table. Approved release identities
+are `appsome-release-publication/managed-in-place`,
+`puber-release/managed-in-place`, `sdk-merged-main-publication/metadata-only`,
+and `slack-reader-release/managed-in-place`.
+The closed `release` fields are `topology_kind`, `adoption_mode`, `spec_path`,
+`builder_path`, and `snapshot_path`; managed-in-place requires a non-empty
+`builder_path`, while metadata-only requires an empty one.
+
+Schema-4 synchronization owns only listed managed adapters and commands. Every
+other non-empty command is executable project-owned content, and the explicit
+template registry is checked before a complete no-write preflight plan is
+applied. Schema 3 remains supported during the transition; any later
+contraction, migration, or activation requires a separate approved change.
+`required_adapters` declares executable runtime dependencies and
+`kit_managed_adapters` the exact synchronized subset; remaining adapters are
+project-owned. The loader is platform-neutral and Android lock/evidence
+adapters do not own project startup, device permissions, build/install,
+credentials, or runtime acceptance.
+
 Projects add `/.kent/runtime/` to `.gitignore` and declare
 `[context_manifests]` entries for `plan`, `implement`, `review`, `smoke`, and
 `delivery`. Generated prompts treat the selected manifest as the node's read

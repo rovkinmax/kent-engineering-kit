@@ -2,17 +2,22 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import sys
 import tempfile
-import tomllib
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from workflowkit.profile import ProjectProfile
+
+
 ADAPTER_TEMPLATES = {
     "jira_api": REPO_ROOT / "templates" / "project" / "jira-api.sh",
     "mobile_evidence_audit": (
@@ -26,43 +31,77 @@ ADAPTER_TEMPLATES = {
     ),
     "sentry_issues": REPO_ROOT / "templates" / "project" / "sentry-issues.sh",
 }
+
+
+@dataclass(frozen=True)
+class CommandTemplate:
+    source: Path
+    version: str
+
+
 COMMAND_TEMPLATES = {
-    "branch_identity": (
-        REPO_ROOT / "templates" / "project" / "workflow-branch-identity"
+    "branch_identity": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-branch-identity",
+        "1.0.0",
     ),
-    "checkpoint": REPO_ROOT / "templates" / "project" / "workflow-checkpoint",
-    "evidence": (
-        REPO_ROOT / "templates" / "project" / "workflow-evidence-ledger"
+    "checkpoint": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-checkpoint",
+        "1.0.0",
     ),
-    "plan_contract": (
-        REPO_ROOT / "templates" / "project" / "workflow-plan-contract"
+    "evidence": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-evidence-ledger",
+        "1.0.0",
     ),
-    "plan_contract_accept": (
-        REPO_ROOT / "templates" / "project" / "workflow-plan-contract-accept"
+    "plan_contract": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-plan-contract",
+        "1.0.0",
     ),
-    "plan_contract_continue": (
-        REPO_ROOT / "templates" / "project" / "workflow-plan-contract-continue"
+    "plan_contract_accept": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-plan-contract-accept",
+        "1.0.0",
     ),
-    "plan_contract_fix_continue": (
+    "plan_contract_continue": CommandTemplate(
         REPO_ROOT
         / "templates"
         / "project"
-        / "workflow-plan-contract-fix-continue"
+        / "workflow-plan-contract-continue",
+        "1.0.0",
     ),
-    "plan_contract_verify": (
-        REPO_ROOT / "templates" / "project" / "workflow-plan-contract-verify"
+    "plan_contract_fix_continue": CommandTemplate(
+        REPO_ROOT
+        / "templates"
+        / "project"
+        / "workflow-plan-contract-fix-continue",
+        "1.0.0",
     ),
-    "wait_ci": (
-        REPO_ROOT / "templates" / "project" / "workflow-wait-github-ci"
+    "plan_contract_verify": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-plan-contract-verify",
+        "1.0.0",
     ),
-    "dispatch": (
-        REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch"
+    "wait_ci": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-wait-github-ci",
+        "1.0.0",
     ),
-    "janitor": REPO_ROOT / "templates" / "project" / "workflow-task-janitor",
-    "wait_pr": (
-        REPO_ROOT / "templates" / "project" / "workflow-wait-github-pr"
+    "dispatch": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch",
+        "1.0.0",
+    ),
+    "janitor": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-task-janitor",
+        "1.0.0",
+    ),
+    "wait_pr": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-wait-github-pr",
+        "1.0.0",
     ),
 }
+
+
+@dataclass(frozen=True)
+class PlannedSynchronization:
+    target: Path
+    source_bytes: bytes
+    status: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--update",
         action="store_true",
-        help="Replace a differing managed adapter with the toolkit template.",
+        help="Replace differing managed adapters and commands with templates.",
     )
     return parser.parse_args()
 
@@ -89,13 +128,16 @@ def project_target(project_root: Path, configured_path: str) -> Path:
         raise ValueError(f"adapter path must be project-relative: {configured_path}")
 
     target = project_root
-    for part in relative.parts:
-        if part in ("", "."):
-            continue
+    parts = [part for part in relative.parts if part not in ("", ".")]
+    for index, part in enumerate(parts):
         target /= part
         if target.is_symlink():
             raise ValueError(
                 f"adapter path must not contain symlinks: {configured_path}"
+            )
+        if index < len(parts) - 1 and target.exists() and not target.is_dir():
+            raise ValueError(
+                f"adapter path has non-directory component: {configured_path}"
             )
 
     resolved = target.resolve()
@@ -104,18 +146,66 @@ def project_target(project_root: Path, configured_path: str) -> Path:
     return target
 
 
-def synchronize(source: Path, target: Path, *, update: bool) -> str:
-    source_bytes = source.read_bytes()
+def read_template(source: Path, key: str) -> bytes:
+    if source.is_symlink():
+        raise ValueError(
+            f"toolkit template for {key!r} must not be a symlink: {source}"
+        )
+    try:
+        source_mode = source.lstat().st_mode
+    except FileNotFoundError as error:
+        raise ValueError(
+            f"toolkit template for {key!r} not found: {source}"
+        ) from error
+    if not stat.S_ISREG(source_mode):
+        raise ValueError(
+            f"toolkit template for {key!r} is not a regular file: {source}"
+        )
+    return source.read_bytes()
+
+
+def validate_project_owned_target(
+    target: Path,
+    *,
+    kind: str,
+) -> None:
     if target.is_symlink():
-        raise ValueError(f"adapter target must not be a symlink: {target}")
+        raise ValueError(f"project-owned {kind} must not be a symlink: {target}")
+    try:
+        target_mode = target.lstat().st_mode
+    except FileNotFoundError as error:
+        raise ValueError(f"project-owned {kind} not found: {target}") from error
+    if not stat.S_ISREG(target_mode):
+        raise ValueError(
+            f"project-owned {kind} is not a regular file: {target}"
+        )
+    if not os.access(target, os.X_OK):
+        raise ValueError(
+            f"project-owned {kind} is not executable: {target}"
+        )
+
+
+def plan_synchronization(
+    source: Path,
+    target: Path,
+    *,
+    key: str,
+    update: bool,
+) -> PlannedSynchronization:
+    source_bytes = read_template(source, key)
+    if target.is_symlink():
+        raise ValueError(f"managed target must not be a symlink: {target}")
     if target.exists():
         target_mode = target.lstat().st_mode
         if not stat.S_ISREG(target_mode):
-            raise ValueError(f"adapter target is not a file: {target}")
-        if target.read_bytes() != source_bytes:
+            raise ValueError(
+                f"managed target is not a regular file: {target}"
+            )
+        target_bytes = target.read_bytes()
+        if target_bytes != source_bytes:
             if not update:
                 raise ValueError(
-                    f"adapter differs from toolkit template: {target}; "
+                    f"managed target differs from toolkit template: {target}; "
                     "rerun with --update after reviewing the diff"
                 )
             status_label = "updated"
@@ -123,8 +213,16 @@ def synchronize(source: Path, target: Path, *, update: bool) -> str:
             status_label = "unchanged"
     else:
         status_label = "created"
+    return PlannedSynchronization(
+        target=target,
+        source_bytes=source_bytes,
+        status=status_label,
+    )
 
-    if status_label != "unchanged":
+
+def apply_synchronization(plan: PlannedSynchronization) -> None:
+    target = plan.target
+    if plan.status != "unchanged":
         target.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             dir=target.parent,
@@ -133,14 +231,189 @@ def synchronize(source: Path, target: Path, *, update: bool) -> str:
         os.close(descriptor)
         temporary_path = Path(temporary_name)
         try:
-            shutil.copyfile(source, temporary_path)
+            temporary_path.write_bytes(plan.source_bytes)
             temporary_path.chmod(0o755)
             os.replace(temporary_path, target)
         finally:
             temporary_path.unlink(missing_ok=True)
     else:
         target.chmod(0o755)
-    return status_label
+
+
+def synchronize(
+    source: Path,
+    target: Path,
+    *,
+    key: str,
+    update: bool,
+) -> str:
+    plan = plan_synchronization(
+        source,
+        target,
+        key=key,
+        update=update,
+    )
+    apply_synchronization(plan)
+    return plan.status
+
+
+def validate_schema4_command_versions(profile: ProjectProfile) -> None:
+    for key in profile.kit_managed_commands:
+        template = COMMAND_TEMPLATES.get(key)
+        if template is None:
+            raise ValueError(
+                f"no toolkit template exists for managed command {key!r}"
+            )
+        expected = template.version
+        actual = profile.command_versions[key]
+        if actual != expected:
+            raise ValueError(
+                f"command_versions.{key} is {actual!r}; "
+                f"expected toolkit template version {expected!r}"
+            )
+
+
+def synchronize_schema3(
+    profile: ProjectProfile,
+    project_root: Path,
+    *,
+    update: bool,
+) -> dict[str, list[dict[str, str]]]:
+    results = {"adapters": [], "commands": []}
+    managed_adapter_keys = set(profile.kit_managed_adapters)
+    for key, configured_path in sorted(profile.adapters.items()):
+        if not configured_path:
+            continue
+        target = project_target(project_root, configured_path)
+        if key in managed_adapter_keys:
+            source = ADAPTER_TEMPLATES.get(key)
+            if source is None:
+                raise ValueError(
+                    f"no toolkit template exists for managed adapter {key!r}"
+                )
+            status_label = synchronize(
+                source,
+                target,
+                key=key,
+                update=update,
+            )
+        else:
+            if not target.is_file():
+                raise ValueError(
+                    f"project-owned adapter not found: {target}"
+                )
+            if not os.access(target, os.X_OK):
+                raise ValueError(
+                    f"project-owned adapter is not executable: {target}"
+                )
+            status_label = "project-owned"
+        results["adapters"].append(
+            {
+                "adapter": key,
+                "status": status_label,
+                "target": str(target),
+            }
+        )
+
+    for key, configured_path in sorted(profile.commands.items()):
+        if not configured_path:
+            continue
+        target = project_target(project_root, configured_path)
+        template = COMMAND_TEMPLATES.get(key)
+        if template is None:
+            continue
+        status_label = synchronize(
+            template.source,
+            target,
+            key=key,
+            update=update,
+        )
+        results["commands"].append(
+            {
+                "command": key,
+                "status": status_label,
+                "target": str(target),
+            }
+        )
+    return results
+
+
+def plan_schema4(
+    profile: ProjectProfile,
+    project_root: Path,
+    *,
+    update: bool,
+) -> tuple[list[PlannedSynchronization], dict[str, list[dict[str, str]]]]:
+    validate_schema4_command_versions(profile)
+    managed_adapter_keys = set(profile.kit_managed_adapters)
+    managed_command_keys = set(profile.kit_managed_commands)
+    plans: list[PlannedSynchronization] = []
+    results = {"adapters": [], "commands": []}
+
+    for key, configured_path in sorted(profile.adapters.items()):
+        if not configured_path:
+            continue
+        target = project_target(project_root, configured_path)
+        if key in managed_adapter_keys:
+            source = ADAPTER_TEMPLATES.get(key)
+            if source is None:
+                raise ValueError(
+                    f"no toolkit template exists for managed adapter {key!r}"
+                )
+            plan = plan_synchronization(
+                source,
+                target,
+                key=key,
+                update=update,
+            )
+            plans.append(plan)
+            status_label = plan.status
+        else:
+            validate_project_owned_target(
+                target,
+                kind="adapter",
+            )
+            status_label = "project-owned"
+        results["adapters"].append(
+            {
+                "adapter": key,
+                "status": status_label,
+                "target": str(target),
+            }
+        )
+
+    for key, configured_path in sorted(profile.commands.items()):
+        if not configured_path:
+            continue
+        target = project_target(project_root, configured_path)
+        if key in managed_command_keys:
+            template = COMMAND_TEMPLATES.get(key)
+            if template is None:
+                raise ValueError(
+                    f"no toolkit template exists for managed command {key!r}"
+                )
+            plan = plan_synchronization(
+                template.source,
+                target,
+                key=key,
+                update=update,
+            )
+            plans.append(plan)
+            status_label = plan.status
+        else:
+            validate_project_owned_target(
+                target,
+                kind="command",
+            )
+            status_label = "project-owned"
+        results["commands"].append(
+            {
+                "command": key,
+                "status": status_label,
+                "target": str(target),
+            }
+        )
+    return plans, results
 
 
 def main() -> int:
@@ -150,84 +423,25 @@ def main() -> int:
     if not profile_path.is_file():
         raise ValueError(f"project profile not found: {profile_path}")
 
-    profile = tomllib.loads(profile_path.read_text())
-    managed_adapters = profile.get("kit_managed_adapters")
-    if not isinstance(managed_adapters, list) or not all(
-        isinstance(key, str) and key.strip() for key in managed_adapters
-    ):
-        raise ValueError(
-            "profile kit_managed_adapters must be an array of non-empty strings"
+    profile = ProjectProfile.from_toml(
+        project_root,
+        profile_path.read_text(),
+        source=str(profile_path),
+        check_files=False,
+    )
+    if profile.schema_version == 4:
+        plans, results = plan_schema4(
+            profile,
+            project_root,
+            update=args.update,
         )
-    managed_adapter_keys = {key.strip() for key in managed_adapters}
-    if len(managed_adapter_keys) != len(managed_adapters):
-        raise ValueError("profile kit_managed_adapters must not contain duplicates")
-    required_adapters = profile.get("required_adapters")
-    if not isinstance(required_adapters, list) or not all(
-        isinstance(key, str) and key.strip() for key in required_adapters
-    ):
-        raise ValueError(
-            "profile required_adapters must be an array of non-empty strings"
-        )
-    unmanaged_requirements = managed_adapter_keys - {
-        key.strip() for key in required_adapters
-    }
-    if unmanaged_requirements:
-        raise ValueError(
-            "kit_managed_adapters must be required adapters: "
-            f"{sorted(unmanaged_requirements)}"
-        )
-    results = {"adapters": [], "commands": []}
-    for table_name, templates in (
-        ("adapters", ADAPTER_TEMPLATES),
-        ("commands", COMMAND_TEMPLATES),
-    ):
-        configured = profile.get(table_name, {})
-        if not isinstance(configured, dict):
-            raise ValueError(f"profile {table_name} must be a TOML table")
-        for key, configured_path in sorted(configured.items()):
-            if not isinstance(configured_path, str):
-                raise ValueError(
-                    f"{table_name}.{key} must be a string"
-                )
-            if not configured_path.strip():
-                continue
-            target = project_target(project_root, configured_path.strip())
-            if table_name == "adapters" and key in managed_adapter_keys:
-                if key not in templates:
-                    raise ValueError(
-                        f"no toolkit template exists for managed adapter {key!r}"
-                    )
-                source = templates[key]
-                status_label = synchronize(source, target, update=args.update)
-            elif table_name == "commands" and key in templates:
-                source = templates[key]
-                status_label = synchronize(source, target, update=args.update)
-            elif table_name == "commands":
-                continue
-            else:
-                if not target.is_file():
-                    raise ValueError(
-                        f"project-owned {table_name[:-1]} not found: {target}"
-                    )
-                if table_name == "adapters" and not os.access(target, os.X_OK):
-                    raise ValueError(
-                        f"project-owned adapter is not executable: {target}"
-                    )
-                status_label = "project-owned"
-            results[table_name].append(
-                {
-                    table_name[:-1]: key,
-                    "status": status_label,
-                    "target": str(target),
-                }
-            )
-
-    configured_adapters = profile.get("adapters", {})
-    missing_managed_adapters = managed_adapter_keys - set(configured_adapters)
-    if missing_managed_adapters:
-        raise ValueError(
-            "kit_managed_adapters are missing from adapters: "
-            f"{sorted(missing_managed_adapters)}"
+        for plan in plans:
+            apply_synchronization(plan)
+    else:
+        results = synchronize_schema3(
+            profile,
+            project_root,
+            update=args.update,
         )
 
     print(
@@ -246,6 +460,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
+    except (OSError, ValueError) as error:
         print(f"sync-project-adapters: {error}", file=sys.stderr)
         raise SystemExit(1)

@@ -6,10 +6,25 @@ snapshots, not an alternate source of truth.
 ## Supported Baseline
 
 - Kent 2.6.1 or newer;
-- profile schema 3;
+- profile schemas 3 and 4 at a strict compatibility boundary;
 - workflow-wide unique transition keys;
 - explicit execution-target policy;
 - execution-mode validation before task creation.
+
+Schema 3 retains legacy `release_topology` and known-command synchronization.
+Schema 4 requires explicit command ownership and versions plus a closed
+`release` table. Its approved topology/adoption identities are
+`appsome-release-publication/managed-in-place`,
+`puber-release/managed-in-place`, `sdk-merged-main-publication/metadata-only`,
+and `slack-reader-release/managed-in-place`. Synchronization plans every
+managed write before applying it; no project migration or activation is
+automatic.
+The closed release fields are `topology_kind`, `adoption_mode`, `spec_path`,
+`builder_path`, and `snapshot_path`; managed-in-place requires a builder path,
+metadata-only requires none. `required_adapters` declares executable runtime
+dependencies, while `kit_managed_adapters` is the exact synchronized subset;
+remaining adapters and platform-specific startup/device/build/install work
+remain project-owned.
 
 ## Generated Workflows
 

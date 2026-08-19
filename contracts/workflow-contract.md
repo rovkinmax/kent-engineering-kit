@@ -567,22 +567,21 @@ Each project provides:
 - optional Smoke-decision, Smoke-execution, resource-lock, evidence-audit, PR,
   CI, and release adapters.
 
-The kit provides the global mcporter call/list adapter and a synchronized
-project-local read-only Jira source adapter. Projects provide Jira base URLs,
-credential namespaces or 1Password pointers, server definitions, and optional
-project-specific stdio wrappers or policy. The kit never stores resolved Jira
-credentials.
+Kit provides mcporter and read-only Jira adapters. Projects own URLs,
+credential pointers, servers, wrappers, policy; Kit stores no credentials.
 
-Profiles list indispensable executable adapter keys in `required_adapters`.
-`kit_managed_adapters` is the explicit subset synchronized from toolkit
-templates; required adapters outside that subset are project-owned.
-The platform-neutral profile loader validates only that declared contract and
-does not infer policy from platform names. Android projects with conditional or
-required runtime Smoke list `mobile_resource_lock` and
-`mobile_evidence_audit`. The shared adapters own machine-wide lock mechanics
-and deterministic evidence hygiene while the project still owns emulator
-startup policy, physical-device permission, build/install targets,
-credentials, and runtime acceptance evidence.
+Schema 3 keeps release_topology and known-command sync. Schema 4 requires
+managed commands, exact command_versions, and release fields topology_kind,
+adoption_mode, spec_path, builder_path, and snapshot_path. Managed-in-place
+allows appsome-release-publication, puber-release, and slack-reader-release;
+metadata-only allows sdk-merged-main-publication. The former needs a builder;
+the latter forbids it. required_adapters lists executable dependencies;
+kit_managed_adapters is the exact Kit subset; others are project-owned.
+Loader is platform-neutral. Conditional or required Android Smoke uses
+mobile_resource_lock and mobile_evidence_audit. Shared code owns lock and
+evidence hygiene; projects own startup, devices, build/install, credentials,
+and acceptance. Synchronizer loads ProjectProfile and preflights paths before
+writes. No automatic migration or activation.
 
 Projects that treat Jira descriptions or comments as planning sources list
 `jira_api` in `required_adapters`, declare its project-local path, and select

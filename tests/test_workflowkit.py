@@ -88,7 +88,7 @@ def schema4_profile_contents(
     contents = contents.replace('release_topology = "none"\n', "")
     contents += (
         "\n[command_versions]\n"
-        'dispatch = "1.2.3"\n'
+        'dispatch = "1.0.0"\n'
         "\n[release]\n"
         f'topology_kind = "{topology_kind}"\n'
         f'adoption_mode = "{adoption_mode}"\n'
@@ -97,6 +97,23 @@ def schema4_profile_contents(
         'snapshot_path = ".kent/release/snapshot.toml"\n'
     )
     return contents
+
+
+def schema4_with_managed_adapter(contents: str) -> str:
+    return (
+        contents.replace(
+            "required_adapters = []",
+            'required_adapters = ["mobile_resource_lock"]',
+        ).replace(
+            "kit_managed_adapters = []",
+            'kit_managed_adapters = ["mobile_resource_lock"]',
+        )
+        + (
+            "\n[adapters]\n"
+            'mobile_resource_lock = '
+            '".kent/adapters/mobile/emulator-resource-lock.sh"\n'
+        )
+    )
 
 
 class WorkflowKitTest(unittest.TestCase):
@@ -133,6 +150,65 @@ class WorkflowKitTest(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# Test release artifact\n")
         return ProjectProfile.load(root)
+
+    def create_schema4_sync_project(
+        self,
+        transform=lambda value: value,
+    ) -> tuple[Path, ProjectProfile]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        profile_directory = root / ".kent"
+        profile_directory.mkdir()
+        contents = transform(schema4_profile_contents())
+        profile_path = profile_directory / "workflow-profile.toml"
+        profile_path.write_text(contents)
+        create_work_kind_procedures(root)
+        profile = ProjectProfile.from_toml(
+            root,
+            contents,
+            check_files=False,
+        )
+        for configured_path in profile.commands.values():
+            if configured_path:
+                path = root / configured_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# Project-owned command\n")
+                path.chmod(0o755)
+        for configured_path in profile.adapters.values():
+            if configured_path:
+                path = root / configured_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# Project-owned adapter\n")
+                path.chmod(0o755)
+        for key in profile.kit_managed_commands:
+            path = root / profile.command(key)
+            path.unlink(missing_ok=True)
+        for key in profile.kit_managed_adapters:
+            path = root / profile.adapter(key)
+            path.unlink(missing_ok=True)
+        return root, profile
+
+    def run_sync_project_adapters(
+        self,
+        root: Path,
+        *,
+        update: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            str(REPO_ROOT / "scripts" / "sync-project-adapters"),
+            "--project",
+            str(root),
+        ]
+        if update:
+            command.append("--update")
+        return subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
 
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
         config = tomllib.loads(
@@ -1971,7 +2047,7 @@ class WorkflowKitTest(unittest.TestCase):
     def test_schema_three_rejects_only_schema_four_root_keys(self) -> None:
         root_key_values = {
             "kit_managed_commands": 'kit_managed_commands = []\n',
-            "command_versions": "[command_versions]\ndispatch = \"1.2.3\"\n",
+            "command_versions": "[command_versions]\ndispatch = \"1.0.0\"\n",
             "release": (
                 "[release]\n"
                 'topology_kind = "appsome-release-publication"\n'
@@ -2001,7 +2077,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(profile.schema_version, 4)
         self.assertIsInstance(profile.release, ReleaseProfile)
         self.assertEqual(profile.kit_managed_commands, ("dispatch",))
-        self.assertEqual(profile.command_versions, {"dispatch": "1.2.3"})
+        self.assertEqual(profile.command_versions, {"dispatch": "1.0.0"})
         self.assertFalse(profile.package_publish_after_main())
         self.assertNotIn(
             "publish_package",
@@ -2077,15 +2153,15 @@ class WorkflowKitTest(unittest.TestCase):
     def test_schema_four_requires_exact_valid_command_versions(self) -> None:
         invalid_versions = {
             "missing": lambda contents: contents.replace(
-                'dispatch = "1.2.3"\n',
+                'dispatch = "1.0.0"\n',
                 "",
             ),
             "extra": lambda contents: contents.replace(
-                'dispatch = "1.2.3"\n',
-                'dispatch = "1.2.3"\nextra = "1.0.0"\n',
+                'dispatch = "1.0.0"\n',
+                'dispatch = "1.0.0"\nextra = "1.0.0"\n',
             ),
             "invalid": lambda contents: contents.replace(
-                'dispatch = "1.2.3"',
+                'dispatch = "1.0.0"',
                 'dispatch = "1.2"',
             ),
         }
@@ -2670,6 +2746,201 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(refused_symlink.returncode, 1)
         self.assertIn("symlink", refused_symlink.stderr)
         self.assertEqual(unrelated.read_bytes(), unrelated_before)
+
+    def test_sync_schema4_managed_create_update_and_exact_registry_version(
+        self,
+    ) -> None:
+        root, profile = self.create_schema4_sync_project(
+            schema4_with_managed_adapter
+        )
+        result = self.run_sync_project_adapters(root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        dispatch = root / profile.command("dispatch")
+        adapter = root / profile.adapter("mobile_resource_lock")
+        self.assertTrue(dispatch.is_file())
+        self.assertTrue(adapter.is_file())
+        self.assertEqual(profile.command_versions["dispatch"], "1.0.0")
+        self.assertEqual(
+            next(
+                item
+                for item in payload["commands"]
+                if item["command"] == "dispatch"
+            )["status"],
+            "created",
+        )
+        self.assertEqual(
+            next(
+                item
+                for item in payload["commands"]
+                if item["command"] == "verify"
+            )["status"],
+            "project-owned",
+        )
+
+        dispatch.write_text("foreign command\n")
+        adapter.write_text("foreign adapter\n")
+        updated = self.run_sync_project_adapters(root, update=True)
+
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertEqual(
+            dispatch.read_bytes(),
+            (
+                REPO_ROOT
+                / "templates"
+                / "project"
+                / "workflow-verification-dispatch"
+            ).read_bytes(),
+        )
+        self.assertEqual(
+            adapter.read_bytes(),
+            (
+                REPO_ROOT
+                / "templates"
+                / "project"
+                / "emulator-resource-lock.sh"
+            ).read_bytes(),
+        )
+
+    def test_sync_schema4_version_mismatch_does_not_write(self) -> None:
+        root, profile = self.create_schema4_sync_project(
+            lambda contents: contents.replace(
+                'dispatch = "1.0.0"',
+                'dispatch = "1.1.0"',
+            )
+        )
+        result = self.run_sync_project_adapters(root, update=True)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("expected toolkit template version", result.stderr)
+        self.assertFalse((root / profile.command("dispatch")).exists())
+
+    def test_sync_schema4_unknown_managed_template_does_not_write(self) -> None:
+        def transform(contents: str) -> str:
+            return contents.replace(
+                'kit_managed_commands = ["dispatch"]',
+                'kit_managed_commands = ["unknown"]',
+            ).replace(
+                'dispatch = "1.0.0"',
+                'unknown = "1.0.0"',
+            ).replace(
+                "[commands]\n",
+                '[commands]\nunknown = ".kent/scripts/unknown"\n',
+            )
+
+        root, profile = self.create_schema4_sync_project(transform)
+        result = self.run_sync_project_adapters(root, update=True)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no toolkit template exists", result.stderr)
+        self.assertFalse((root / profile.command("unknown")).exists())
+
+    def test_sync_schema4_preserves_known_template_project_owned_command(
+        self,
+    ) -> None:
+        root, profile = self.create_schema4_sync_project()
+        initial = self.run_sync_project_adapters(root)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        verify = root / profile.command("verify")
+        verify.write_text("project-owned verify\n")
+        verify_before = verify.read_bytes()
+        dispatch = root / profile.command("dispatch")
+        dispatch.write_text("foreign dispatch\n")
+
+        result = self.run_sync_project_adapters(root, update=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verify.read_bytes(), verify_before)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            next(
+                item
+                for item in payload["commands"]
+                if item["command"] == "verify"
+            )["status"],
+            "project-owned",
+        )
+
+    def test_sync_schema4_rejects_symlink_and_non_executable_project_command(
+        self,
+    ) -> None:
+        for mode in ("symlink", "non-executable"):
+            with self.subTest(mode=mode):
+                root, profile = self.create_schema4_sync_project()
+                verify = root / profile.command("verify")
+                if mode == "symlink":
+                    outside = root.parent / f"{root.name}-outside-command"
+                    outside.write_text("outside\n")
+                    outside.chmod(0o755)
+                    self.addCleanup(outside.unlink)
+                    verify.unlink()
+                    verify.symlink_to(outside)
+                else:
+                    verify.chmod(0o644)
+
+                result = self.run_sync_project_adapters(root, update=True)
+
+                self.assertEqual(result.returncode, 1)
+                if mode == "symlink":
+                    self.assertIn("symlink", result.stderr)
+                else:
+                    self.assertIn("project-owned command", result.stderr)
+                self.assertFalse((root / profile.command("dispatch")).exists())
+
+    def test_sync_schema4_late_preflight_failure_writes_nothing(self) -> None:
+        def transform(contents: str) -> str:
+            return schema4_with_managed_adapter(
+                contents.replace(
+                    "[commands]\n",
+                    (
+                        "[commands]\n"
+                        'zz_project_owned = ".kent/scripts/zz-project-owned"\n'
+                    ),
+                )
+            )
+
+        root, profile = self.create_schema4_sync_project(transform)
+        late_target = root / profile.command("zz_project_owned")
+        late_target.chmod(0o644)
+        result = self.run_sync_project_adapters(root, update=True)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("project-owned command", result.stderr)
+        self.assertFalse((root / profile.command("dispatch")).exists())
+
+    def test_sync_schema4_managed_ancestor_failure_writes_nothing(self) -> None:
+        def transform(contents: str) -> str:
+            return schema4_with_managed_adapter(
+                contents.replace(
+                    'kit_managed_commands = ["dispatch"]',
+                    'kit_managed_commands = ["dispatch", "wait_pr"]',
+                )
+                .replace(
+                    'dispatch = "1.0.0"\n',
+                    'dispatch = "1.0.0"\nwait_pr = "1.0.0"\n',
+                )
+                .replace(
+                    'wait_pr = ".kent/scripts/workflow-wait-github-pr"',
+                    'wait_pr = ".kent/scripts/late/wait-pr"',
+                )
+            )
+
+        root, profile = self.create_schema4_sync_project(transform)
+        dispatch = root / profile.command("dispatch")
+        dispatch.write_text("foreign dispatch\n")
+        dispatch_before = dispatch.read_bytes()
+        late_parent = root / ".kent/scripts/late"
+        late_parent.rmdir()
+        late_parent.write_text("not a directory\n")
+
+        result = self.run_sync_project_adapters(root, update=True)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("non-directory component", result.stderr)
+        self.assertEqual(dispatch.read_bytes(), dispatch_before)
+        self.assertFalse((root / profile.command("wait_pr")).exists())
+        self.assertFalse((root / profile.adapter("mobile_resource_lock")).exists())
 
     def test_sync_project_adapters_preserves_project_owned_adapter(self) -> None:
         temporary = tempfile.TemporaryDirectory()
