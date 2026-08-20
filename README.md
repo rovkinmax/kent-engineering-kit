@@ -143,6 +143,36 @@ verification scripts, project procedures, and these kit-managed commands:
 - `wait_pr` — zero-model GitHub merge watching;
 - `janitor` — post-Cleanup safe managed-worktree and branch cleanup.
 
+## Selected-revision release preflight
+
+Schema 4 release profiles are checked from the selected Git revision before
+any workflow or publication decision. Preflight reads the release spec,
+tracked source manifest, snapshot, optional executable builder, profile-owned
+commands and procedures, job workflow sources, and approval Scripts from Git
+blobs; it never falls back to release files in the working tree.
+
+The manifest owns only sorted, normalized additions and trees. Preflight
+derives the mandatory profile and release closure, validates regular-file and
+executable modes, expands regular-file trees, checks prompt-reference
+coverage, and records raw SHA-256 values for the selected spec, manifest,
+snapshot, and builder. Snapshot input is accepted only as a JSON object.
+
+Use the revision launcher with an explicitly selected ref:
+
+```bash
+~/.kent/bin/kent-preflight-revision \
+  --project /path/to/project \
+  --ref <revision>
+```
+
+The schema-4 JSON preview is source-side and read-only:
+`source_contract_valid=true`, `runtime_attested=false`,
+`job_sources_validated=false`, `activation_authorized=false`, and
+`snapshot_json_valid=true`. It does not invoke a builder, generate or validate
+a workflow graph, call Kent, or activate publication. Runtime envelopes,
+external-root bytes, project release semantics, and live effects remain owned
+by later project and runtime slices.
+
 Profile synchronization has a strict dual-schema boundary. Schema 3 preserves
 legacy `release_topology` and implicit ownership of known command templates;
 schema 4 requires explicit `kit_managed_commands`, matching

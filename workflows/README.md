@@ -26,6 +26,23 @@ dependencies, while `kit_managed_adapters` is the exact synchronized subset;
 remaining adapters and platform-specific startup/device/build/install work
 remain project-owned.
 
+## Selected-revision release closure
+
+Schema 4 preflight reads the release spec, source manifest, snapshot, optional
+builder, profile-derived paths, declared job workflow paths, and approval Script
+paths from the selected Git revision. It derives the mandatory closure before
+applying manifest additions, expands sorted regular-file trees, enforces Git
+file modes, checks declared prompt coverage, and records raw blob SHA-256
+digests. It does not trust working-tree release files or invoke a builder,
+generator, Kent client, graph validator, or graph apply.
+
+The emitted preview is deliberately source-side:
+`source_contract_valid=true`, `runtime_attested=false`,
+`job_sources_validated=false`, `activation_authorized=false`, and
+`snapshot_json_valid=true`. Schema 3 retains its existing checked-path and JSON
+shape. Runtime attestation, external-root byte capture, project adapters, and
+live publication remain separate contracts.
+
 ## Generated Workflows
 
 `Engineering Delivery` composes:

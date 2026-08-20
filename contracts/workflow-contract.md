@@ -215,29 +215,27 @@ implementation.
 - PR preparation reports `git branch --show-current`; downstream stages never
   reconstruct branch identity from the task ID.
 
-## Approval-gated package publication
+## Release source and publication contracts
 
-- `release_topology = "manual-package-publish-after-main"` inserts a dedicated
-  `Publish Package` node after confirmed PR merge and before Cleanup.
-- Every merged-PR route into publication requires explicit user approval.
-- The profile must declare `procedures.publish` and the
-  `roles.package_release` role.
-- Publication runs only from a clean checkout of the exact merged source and
-  only for package identity, version, destination, override mechanism, and tag
-  policy explicitly authorized in the task body or an exact human-authored
-  task comment.
-- The project publish procedure declares the credential source and the
-  build-tool environment mapping. The publisher resolves that source just in
-  time, verifies its principal and required registry access without exposing
-  the secret, injects it only into the authorized publish subprocess, and
-  clears it afterward. Ambient CLI authentication is not a substitute.
-- The publisher checks remote state before every mutation and after success.
-  Existing, partial, conflicting, or unverifiable versions block without
-  overwrite or deletion.
-- Publication failures retain the task worktree and compact the publisher
-  session behind another approval. Cleanup starts only after a non-empty
-  `publication_report` proves the remote package.
-
+- Schema 3 `manual-package-publish-after-main` retains its approval-gated
+  `Publish Package` node, requires `procedures.publish` and
+  `roles.package_release`, exact merged source, and authorized package,
+  version, destination, and tag policy. Credentials resolve just in time;
+  remote pre/poststate is checked, overwrite/deletion is forbidden, and Cleanup
+  requires `publication_report`.
+- Schema 4 adds no publication node. Its spec, tracked manifest,
+  snapshot, and optional executable builder are validated from the selected
+  commit. Preflight derives profile/job sources, expands only regular files,
+  records raw digests, and emits a read-only source preview; runtime
+  attestation and activation stay false.
+- Required and qualification jobs are credential-safe; effect jobs are explicit.
+  Normalized adapters expose effective permissions/env/defaults,
+  matrices, ordered steps/inputs, conditions, secrets, and failure masking.
+- Publication variants use typed Kent-transition or GitHub-run authority, a
+  derived job-manifest digest, canonical bytes, and optional Script-owned
+  Russian approval. Projects own release semantics; runtime envelopes and
+  external-root bytes are verified separately. No migration, apply,
+  publication, or default change is automatic.
 ## Execution targets
 
 - Generated workflows always set an explicit Kent 2.6.1 execution-target policy.
