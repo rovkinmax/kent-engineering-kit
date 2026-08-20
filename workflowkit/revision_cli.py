@@ -6,6 +6,11 @@ from pathlib import Path
 import sys
 
 from .revision import RevisionPreflightError, preflight_project_revision
+from .runtime import (
+    RuntimeContractError,
+    capture_runtime_source_envelope,
+    parse_runtime_external_captures,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,7 +32,22 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Local Git revision or exact commit selected for task execution.",
     )
+    parser.add_argument(
+        "--capture-runtime-envelope",
+        action="store_true",
+        help="Capture ordered runtime external roots from exact stdin.",
+    )
     return parser.parse_args()
+
+
+def read_runtime_capture_stdin() -> bytes:
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    raw = stream.read(6 * 1024 * 1024 + 1)
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if not isinstance(raw, bytes):
+        raise RuntimeContractError("runtime capture stdin did not return bytes")
+    return raw
 
 
 def main() -> int:
@@ -36,13 +56,25 @@ def main() -> int:
         args.project,
         args.ref,
     )
-    print(json.dumps(result.as_json(), indent=2, ensure_ascii=False))
+    if args.capture_runtime_envelope:
+        if result.selected_runtime_source_inputs is None:
+            raise RuntimeContractError(
+                "runtime capture requires a schema-4 selected source bundle"
+            )
+        captures = parse_runtime_external_captures(read_runtime_capture_stdin())
+        output = capture_runtime_source_envelope(
+            result.selected_runtime_source_inputs,
+            captures,
+        )
+    else:
+        output = result.as_json()
+    print(json.dumps(output, indent=2, ensure_ascii=False))
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except RevisionPreflightError as error:
+    except (RevisionPreflightError, RuntimeContractError) as error:
         print(f"preflight-revision: {error}", file=sys.stderr)
         raise SystemExit(1)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,12 @@ import unittest
 from workflowkit.revision import (
     RevisionPreflightError,
     preflight_project_revision,
+)
+from workflowkit.runtime import (
+    RuntimeContractError,
+    SelectedRuntimeSourceInputs,
+    capture_runtime_source_envelope,
+    revalidate_runtime_source_envelope,
 )
 
 
@@ -549,6 +556,241 @@ class RevisionPreflightTest(unittest.TestCase):
         self.assertNotIn(".kent/release/build.sh", checked)
         self.assertIn(".kent/release/snapshot.json", checked)
 
+    def test_schema4_selected_runtime_inputs_are_preflight_proven(self) -> None:
+        root = self.create_project(schema4=True)
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["external_roots"] = [
+            {
+                "kind": "effective-role",
+                "key": "release-manager",
+                "runtime_digest_required": True,
+            }
+        ]
+        manifest_path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n")
+        self.commit_all(root, "Declare runtime external root")
+
+        result = preflight_project_revision(root, "HEAD")
+        inputs = result.selected_runtime_source_inputs
+        self.assertIsInstance(inputs, SelectedRuntimeSourceInputs)
+        self.assertEqual(
+            inputs.selected_runtime_source_inputs_sha256,
+            inputs.as_dict()["selected_runtime_source_inputs_sha256"],
+        )
+        self.assertEqual(
+            result.as_json()["selected_runtime_source_inputs"],
+            inputs.as_dict(),
+        )
+        captured = capture_runtime_source_envelope(
+            inputs,
+            [("effective-role", "release-manager", b"role bytes")],
+        )
+        envelope = captured["runtime_source_envelope"]
+        self.assertEqual(envelope["project_commit"], result.commit_oid)
+        self.assertEqual(envelope["external_roots"][0]["byte_count"], 10)
+        self.assertNotIn("role bytes", json.dumps(captured))
+        for bad in (
+            [],
+            [("effective-role", "wrong", b"role bytes")],
+            [("effective-role", "release-manager", bytearray(b"role bytes"))],
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RuntimeContractError):
+                    capture_runtime_source_envelope(inputs, bad)
+        with self.assertRaises(RuntimeContractError):
+            SelectedRuntimeSourceInputs(
+                "example",
+                "owner/repository",
+                "appsome-release-publication",
+                result.commit_oid,
+                b"{}",
+                "0" * 64,
+                {},
+                (),
+            )
+
+    def test_schema4_runtime_capture_cli_keeps_one_process_proof(self) -> None:
+        root = self.create_project(schema4=True)
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["external_roots"] = [
+            {
+                "kind": "effective-role",
+                "key": "release-manager",
+                "runtime_digest_required": True,
+            }
+        ]
+        manifest_path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n")
+        self.commit_all(root, "Declare CLI runtime root")
+        request = {
+            "schema": "runtime-external-captures-v1",
+            "roots": [
+                {
+                    "kind": "effective-role",
+                    "key": "release-manager",
+                    "contents_base64": "cm9sZSBieXRlcw==",
+                }
+            ],
+        }
+        result = subprocess.run(
+            [
+                str(REPO_ROOT / "scripts" / "preflight-revision"),
+                "--project",
+                str(root),
+                "--ref",
+                "HEAD",
+                "--capture-runtime-envelope",
+            ],
+            input=json.dumps(request, separators=(",", ":")),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "KENT_ENGINEERING_KIT_PYTHON": sys.executable,
+            },
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            payload["project_commit"],
+            preflight_project_revision(root, "HEAD").commit_oid,
+        )
+        self.assertEqual(
+            payload["runtime_source_envelope"]["schema"],
+            "runtime-source-envelope-v1",
+        )
+        self.assertNotIn("role bytes", result.stdout)
+        self.assertNotIn("runtime", result.stderr.lower())
+
+    def test_schema4_runtime_envelope_revalidation_rejects_drift(self) -> None:
+        root = self.create_project(schema4=True)
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["external_roots"] = [
+            {
+                "kind": "effective-role",
+                "key": "alpha",
+                "runtime_digest_required": True,
+            },
+            {
+                "kind": "effective-role",
+                "key": "beta",
+                "runtime_digest_required": True,
+            },
+        ]
+        manifest_path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n")
+        self.commit_all(root, "Declare two runtime roots")
+        inputs = preflight_project_revision(
+            root,
+            "HEAD",
+        ).selected_runtime_source_inputs
+        self.assertIsNotNone(inputs)
+        captures = [
+            ("effective-role", "alpha", b"alpha"),
+            ("effective-role", "beta", b"beta"),
+        ]
+        captured = capture_runtime_source_envelope(inputs, captures)
+        self.assertEqual(
+            revalidate_runtime_source_envelope(inputs, captured, captures),
+            captured,
+        )
+        for bad_previous in (
+            {
+                **captured,
+                "runtime_source_envelope_digest": "1" * 64,
+            },
+            {
+                **captured,
+                "runtime_source_envelope": {
+                    **captured["runtime_source_envelope"],
+                    "external_roots": list(
+                        reversed(
+                            captured["runtime_source_envelope"]["external_roots"]
+                        )
+                    ),
+                },
+            },
+            {
+                **captured,
+                "runtime_source_envelope": {
+                    **captured["runtime_source_envelope"],
+                    "external_roots": [
+                        *captured["runtime_source_envelope"]["external_roots"],
+                        {
+                            "kind": "effective-role",
+                            "key": "extra",
+                            "byte_count": 0,
+                            "sha256": "0" * 64,
+                        },
+                    ],
+                },
+            },
+        ):
+            with self.subTest(bad_previous=bad_previous):
+                with self.assertRaises(RuntimeContractError):
+                    revalidate_runtime_source_envelope(
+                        inputs,
+                        bad_previous,
+                        captures,
+                    )
+        for bad_captures in (
+            [
+                ("effective-role", "alpha", b"changed"),
+                ("effective-role", "beta", b"beta"),
+            ],
+            [
+                ("effective-role", "beta", b"beta"),
+                ("effective-role", "alpha", b"alpha"),
+            ],
+            [
+                ("effective-role", "alpha", b"alpha"),
+                ("effective-role", "alpha", b"alpha"),
+            ],
+        ):
+            with self.subTest(bad_captures=bad_captures):
+                with self.assertRaises(RuntimeContractError):
+                    revalidate_runtime_source_envelope(
+                        inputs,
+                        captured,
+                        bad_captures,
+                    )
+
+    def test_schema4_runtime_proof_rejects_json_and_foreign_module_instances(
+        self,
+    ) -> None:
+        root = self.create_project(schema4=True)
+        result = preflight_project_revision(root, "HEAD")
+        inputs = result.selected_runtime_source_inputs
+        self.assertIsNotNone(inputs)
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_source_envelope(inputs.as_dict(), [])
+        runtime_path = REPO_ROOT / "workflowkit" / "runtime.py"
+        spec = importlib.util.spec_from_file_location(
+            "foreign_runtime_instance",
+            runtime_path,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        foreign = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(foreign)
+        foreign_inputs = foreign._make_selected_runtime_source_inputs(
+            project_name="example",
+            repository="owner/repository",
+            topology_kind="appsome-release-publication",
+            project_commit=result.commit_oid,
+            source_preview={},
+            artifact_digests={
+                "spec_raw_blob_sha256": "0" * 64,
+                "source_manifest_raw_blob_sha256": "0" * 64,
+                "snapshot_raw_blob_sha256": "0" * 64,
+            },
+            external_roots=(),
+        )
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_source_envelope(foreign_inputs, [])
+
     def test_preflight_requires_schema_four_release_files(self) -> None:
         root = self.create_project(schema4=True)
         self.run_git(root, "rm", "-q", ".kent/release/snapshot.json")
@@ -1018,11 +1260,17 @@ class RevisionPreflightTest(unittest.TestCase):
 
     def test_schema4_cli_preview_is_deterministic(self) -> None:
         root = self.create_project(schema4=True)
-        before = sorted(
-            path.relative_to(root).as_posix()
-            for path in root.rglob("*")
-            if not path.is_symlink()
-        )
+        def snapshot_project_entries() -> list[str]:
+            entries = []
+            for path in root.rglob("*"):
+                relative = path.relative_to(root)
+                if relative.parts and relative.parts[0] == ".git":
+                    continue
+                if not path.is_symlink():
+                    entries.append(relative.as_posix())
+            return sorted(entries)
+
+        before = snapshot_project_entries()
         outputs = []
         for _ in range(2):
             result = subprocess.run(
@@ -1047,11 +1295,7 @@ class RevisionPreflightTest(unittest.TestCase):
         self.assertEqual(outputs[0], outputs[1])
         payload = json.loads(outputs[0])
         self.assertTrue(payload["release_preview"]["source_contract_valid"])
-        after = sorted(
-            path.relative_to(root).as_posix()
-            for path in root.rglob("*")
-            if not path.is_symlink()
-        )
+        after = snapshot_project_entries()
         self.assertEqual(before, after)
 
     def test_cli_reports_ready_revision_as_json(self) -> None:

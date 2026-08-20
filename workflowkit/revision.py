@@ -16,6 +16,11 @@ from .release import (
     SelectedReleaseArtifacts,
     render_release_preview,
 )
+from .runtime import (
+    RuntimeExternalRoot,
+    SelectedRuntimeSourceInputs,
+    _make_selected_runtime_source_inputs,
+)
 
 
 PROFILE_PATH = ".kent/workflow-profile.toml"
@@ -45,6 +50,7 @@ class RevisionPreflightResult:
     workflow_prefix: str
     checked_paths: tuple[CheckedRevisionPath, ...]
     release_preview: dict[str, Any] | None = None
+    selected_runtime_source_inputs: SelectedRuntimeSourceInputs | None = None
 
     def as_json(self) -> dict[str, Any]:
         payload = {
@@ -58,7 +64,15 @@ class RevisionPreflightResult:
         }
         if self.release_preview is not None:
             payload["release_preview"] = self.release_preview
+        if self.selected_runtime_source_inputs is not None:
+            payload["selected_runtime_source_inputs"] = (
+                self.selected_runtime_source_inputs.as_dict()
+            )
         return payload
+
+    @property
+    def runtime_source_inputs(self) -> SelectedRuntimeSourceInputs | None:
+        return self.selected_runtime_source_inputs
 
 
 @dataclass(frozen=True)
@@ -247,6 +261,28 @@ def preflight_project_revision(
         raise RevisionPreflightError(
             f"cannot render release preview at {requested_ref}: {error}"
         ) from error
+    try:
+        runtime_inputs = _make_selected_runtime_source_inputs(
+            project_name=spec.project_name,
+            repository=spec.repository,
+            topology_kind=spec.topology_kind,
+            project_commit=commit_oid,
+            source_preview=preview,
+            artifact_digests=preview["artifact_digests"],
+            external_roots=tuple(
+                RuntimeExternalRoot(
+                    root.kind,
+                    root.key,
+                    root.runtime_digest_required,
+                )
+                for root in manifest.external_roots
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise RevisionPreflightError(
+            f"cannot bind selected runtime source inputs at "
+            f"{requested_ref}: {error}"
+        ) from error
     checked_paths = tuple(
         sorted(
             set(checked_by_path.values()),
@@ -261,6 +297,7 @@ def preflight_project_revision(
         workflow_prefix=profile.workflow_prefix,
         checked_paths=checked_paths,
         release_preview=preview,
+        selected_runtime_source_inputs=runtime_inputs,
     )
 
 
