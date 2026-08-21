@@ -129,6 +129,10 @@ PR_BASE_OID = ParameterSpec(
     "pr_base_oid",
     "Pull-request base commit observed after green CI.",
 )
+PR_FEEDBACK_CURSOR = ParameterSpec(
+    "pr_feedback_cursor",
+    "Opaque validated cursor for incremental GitHub pull-request feedback.",
+)
 CLEANUP_MODE = ParameterSpec(
     "cleanup_mode",
     "Cleanup proof mode: merged, no_pr, closed_without_merge, or report_only.",
@@ -180,6 +184,8 @@ def build_delivery_workflow(
     fix_context_source = (
         "immediate_source" if fresh_writers else "previous_target_or_new"
     )
+    runtime_v2 = profile.runtime_contracts_v2()
+    pr_cursor_parameters = (PR_FEEDBACK_CURSOR,) if runtime_v2 else ()
     writer_recovery_context = (
         "new_session" if fresh_writers else "compact_and_continue_session"
     )
@@ -993,7 +999,11 @@ def build_delivery_workflow(
                     "All verification passed and delivery may continue without "
                     "runtime smoke."
                 ),
-                parameters=(WORKSPACE, REVIEW_CONTEXT, SMOKE_RATIONALE),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                    SMOKE_RATIONALE,
+                ),
             )
         )
 
@@ -1050,7 +1060,11 @@ def build_delivery_workflow(
                     transition_description=(
                         "Final compliance passed; prepare or update the task pull request."
                     ),
-                    parameters=(WORKSPACE, REVIEW_CONTEXT, COMPLIANCE_REPORT),
+                    parameters=(
+                        WORKSPACE,
+                        REVIEW_CONTEXT,
+                        COMPLIANCE_REPORT,
+                    ),
                 ),
                 EdgeSpec(
                     key="compliance_fix",
@@ -1158,7 +1172,12 @@ def build_delivery_workflow(
                     transition_description=(
                         "The pull request exists and its delivery state must be checked."
                     ),
-                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_STRATEGY),
+                    parameters=(
+                        WORKSPACE,
+                        PR_URL,
+                        BRANCH_NAME,
+                        MERGE_STRATEGY,
+                    ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
                     key="prepare_pr_no_pr",
@@ -1215,7 +1234,7 @@ def build_delivery_workflow(
                             BRANCH_NAME,
                             MERGE_STRATEGY,
                             CI_REPORT,
-                        ),
+                        ) + pr_cursor_parameters,
                     ),
                     EdgeSpec(
                         key="ci_watch_diagnose",
@@ -1233,7 +1252,7 @@ def build_delivery_workflow(
                             BRANCH_NAME,
                             MERGE_STRATEGY,
                             CI_REPORT,
-                        ),
+                        ) + pr_cursor_parameters,
                     ),
                     EdgeSpec(
                         key="ci_watch_merged",
@@ -1268,7 +1287,7 @@ def build_delivery_workflow(
                             BRANCH_NAME,
                             MERGE_STRATEGY,
                             CI_REPORT,
-                        ),
+                        ) + pr_cursor_parameters,
                     ),
                     EdgeSpec(
                         key="ci_monitor_watch",
@@ -1285,7 +1304,7 @@ def build_delivery_workflow(
                             BRANCH_NAME,
                             MERGE_STRATEGY,
                             CI_REPORT,
-                        ),
+                        ) + pr_cursor_parameters,
                     ),
                     EdgeSpec(
                         key="ci_monitor_merged",
@@ -1327,7 +1346,7 @@ def build_delivery_workflow(
                             BRANCH_NAME,
                             MERGE_STRATEGY,
                             CI_REPORT,
-                        ),
+                        ) + pr_cursor_parameters,
                         extra_prompt=(
                             "Preserve the exact PR, branch, merge strategy, "
                             "and terminal CI report."
@@ -1380,7 +1399,7 @@ def build_delivery_workflow(
                         MERGE_STRATEGY,
                         PR_HEAD_OID,
                         PR_BASE_OID,
-                    ),
+                    ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
                     key="merge_watch_still_waiting",
@@ -1398,7 +1417,7 @@ def build_delivery_workflow(
                         MERGE_STRATEGY,
                         PR_HEAD_OID,
                         PR_BASE_OID,
-                    ),
+                    ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
                     key="merge_watch_state_changed",
@@ -1418,7 +1437,7 @@ def build_delivery_workflow(
                         BRANCH_NAME,
                         MERGE_STRATEGY,
                         PR_REPORT,
-                    ),
+                    ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
                     key="merge_watch_cleanup",
@@ -1444,7 +1463,13 @@ def build_delivery_workflow(
                         "Waiting PR requires an actual human decision or "
                         "external access recovery."
                     ),
-                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_STRATEGY, BLOCKER),
+                    parameters=(
+                        WORKSPACE,
+                        PR_URL,
+                        BRANCH_NAME,
+                        MERGE_STRATEGY,
+                        BLOCKER,
+                    ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
                     key="waiting_pr_fix",
@@ -1460,7 +1485,11 @@ def build_delivery_workflow(
                     transition_description=(
                         "The PR state requires task-scoped changes before merge."
                     ),
-                    parameters=(WORKSPACE, MERGE_STRATEGY, PR_REPORT),
+                    parameters=(
+                        WORKSPACE,
+                        MERGE_STRATEGY,
+                        PR_REPORT,
+                    ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
                     key="waiting_pr_close_without_merge",
@@ -1487,7 +1516,12 @@ def build_delivery_workflow(
                         "The PR head changed or checks restarted; wait "
                         "deterministically for terminal CI state."
                     ),
-                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_STRATEGY),
+                    parameters=(
+                        WORKSPACE,
+                        PR_URL,
+                        BRANCH_NAME,
+                        MERGE_STRATEGY,
+                    ) + pr_cursor_parameters,
                 )
             )
 
@@ -2608,12 +2642,20 @@ def prepare_pr_prompt(profile: ProjectProfile) -> str:
         else "Final Compliance Review is disabled by the project profile."
     )
     merge_policy = profile.pr_merge_strategy()
+    cursor = (
+        "\nFor runtime-contract v2, initialize the outgoing PR feedback "
+        "cursor to the literal `uninitialized` on the first PR watcher edge; "
+        "do not read an incoming cursor here.\n"
+        if profile.runtime_contracts_v2()
+        else ""
+    )
     return f"""Prepare delivery for {{{{.TaskShortId}}}}.
 
 {context_instruction(profile, "delivery", "prepare_pr", "delivery")}
 
 Workspace: {{{{.Params.workspace_path}}}}. Review context:
 {{{{.Params.review_context}}}}
+{cursor}
 {compliance_context}
 
 {procedure_instruction(profile, "ship")}
@@ -2658,10 +2700,20 @@ Complete through `monitor_ci` and provide `workspace_path`, `pr_url`, and
 applicable, choose `no_pr` and provide `pr_report`; this path requires
 approval. Use `needs_changes` with `workspace_path` and `blocker_reason` for
 recoverable PR/branch issues; this path also requires approval. Use
-`needs_user_action` with `blocker_reason` for external blockers."""
+`needs_user_action` with `blocker_reason` for external blockers.
+
+Prepare PR emits `pr_feedback_cursor=uninitialized`; delivery preserves
+supplied cursors and never synthesizes materialized cursors. Only the
+deterministic PR watcher resets invalid cursors to `uninitialized` with
+`pull_request_feedback_invalid`."""
 
 
 def ci_prompt(profile: ProjectProfile) -> str:
+    cursor = (
+        "\nIncremental PR feedback cursor: {{.Params.pr_feedback_cursor}}\n"
+        if profile.runtime_contracts_v2()
+        else ""
+    )
     return f"""Monitor CI for {{{{.TaskShortId}}}} without editing files.
 
 {context_instruction(profile, "delivery", "ci_monitor", "delivery")}
@@ -2671,6 +2723,7 @@ Branch: {{{{.Params.branch_name}}}}
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
 Deterministic CI report: {{{{.Params.ci_report}}}}
+{cursor}
 
 {procedure_instruction(profile, "ci")}
 
@@ -2699,6 +2752,11 @@ Never use `needs_user_action` merely because CI is still running."""
 
 
 def waiting_pr_prompt(profile: ProjectProfile) -> str:
+    cursor = (
+        "\nIncremental PR feedback cursor: {{.Params.pr_feedback_cursor}}\n"
+        if profile.runtime_contracts_v2()
+        else ""
+    )
     ci_recheck = (
         """If the PR head changed or required checks restarted, choose
 `ci_required` and provide `workspace_path`, `pr_url`, `branch_name`, and
@@ -2715,6 +2773,7 @@ PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
+{cursor}
 
 {procedure_instruction(profile, "waiting_pr")}
 
@@ -2751,6 +2810,13 @@ def waiting_pr_changed_prompt(profile: ProjectProfile) -> str:
 
 The deterministic watcher stopped because PR state changed:
 {{.Params.pr_report}}
+"""
+        + (
+            "\nValidated PR feedback cursor: {{.Params.pr_feedback_cursor}}\n"
+            if profile.runtime_contracts_v2()
+            else ""
+        )
+        + """
 
 Classify only that fresh state. Do not repeat passive polling in the agent."""
     )
@@ -3052,6 +3118,11 @@ def pr_feedback_fix_prompt(
     *,
     bounded: bool = False,
 ) -> str:
+    cursor = (
+        "\nValidated PR feedback cursor: {{.Params.pr_feedback_cursor}}\n"
+        if profile.runtime_contracts_v2()
+        else ""
+    )
     fresh_contract = ""
     completion_contract = """Complete with `verify` and provide
 `workspace_path`, `task_short_id={{.TaskShortId}}`, plus refreshed
@@ -3075,6 +3146,7 @@ PR-feedback slice remains, and provide `workspace_path`, the same
 Workspace: {{{{.Params.workspace_path}}}}.
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}.
 PR report: {{{{.Params.pr_report}}}}
+{cursor}
 
 {procedure_instruction(profile, "fix")}
 {fresh_contract}

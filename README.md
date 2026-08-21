@@ -14,6 +14,19 @@ The kit separates:
 Project repositories remain responsible for architecture rules, build commands,
 device details, release policy, and integration credentials.
 
+## Runtime contract v2
+
+Schema-4 projects adopt runtime v2 atomically through
+`runtime_contracts@2.0.0`. The conditional `verify`, evidence, janitor, GitHub
+CI, and GitHub PR commands must use the same version and support-module parent
+directory. Partial or mixed adoption is rejected. Terminal evidence is sealed
+under a stable lock; verification output is bounded and content-addressed; raw
+child output never becomes transition authority.
+
+`./scripts/validate` is source-only by default. Installed-state checks and
+mcporter configuration checks require the explicit
+`./scripts/validate --installed-state` mode.
+
 Role behavior and execution policy are separate contracts. Role prompts must
 not declare `model` or `tools`; global or project Kent configuration owns
 model, reasoning, verbosity, tool availability, and delegation eligibility. See

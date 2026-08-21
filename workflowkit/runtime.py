@@ -9,6 +9,7 @@ import base64
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import re
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
@@ -19,6 +20,40 @@ class RuntimeContractError(ValueError):
 
 
 RuntimeValidationError = RuntimeContractError
+
+
+class _FrozenList(tuple):
+    """Private marker preserving list semantics during materialization."""
+
+
+def _freeze_classification_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                key: _freeze_classification_value(item)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, list):
+        return _FrozenList(
+            _freeze_classification_value(item) for item in value
+        )
+    if isinstance(value, tuple):
+        return tuple(_freeze_classification_value(item) for item in value)
+    return value
+
+
+def _thaw_classification_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _thaw_classification_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, _FrozenList):
+        return [_thaw_classification_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_thaw_classification_value(item) for item in value)
+    return value
 
 
 MAX_CAPTURE_STDIN_BYTES = 6 * 1024 * 1024
@@ -35,6 +70,8 @@ MAX_CI_UNEXPECTED_OBSERVATIONS = 10000
 MAX_CI_ATTEMPTS = 8
 MAX_CI_REPORT_BYTES = 64 * 1024
 MAX_CI_ATTEMPT_BYTES = 48 * 1024
+MAX_OBSERVATION_CANONICAL_BYTES = 4 * 1024 * 1024
+MAX_CANONICAL_JSON_NESTING = 100
 
 SOURCE_ENVELOPE_SCHEMA = "runtime-source-envelope-v1"
 SELECTED_INPUTS_SCHEMA = "selected-runtime-source-inputs-v1"
@@ -46,6 +83,168 @@ VERIFICATION_REPORT_SCHEMA = "workflow-verification-report-v2"
 PR_CURSOR_SCHEMA = "github-pr-feedback-cursor-v1"
 EXPECTED_CHECKS_SCHEMA = "github-ci-expected-checks-v1"
 CI_REPORT_SCHEMA = "github-ci-report-v2"
+
+
+@dataclass(frozen=True)
+class RejectedObservationReceipt:
+    source: str
+    count: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.source not in {"projected_rows", "unexpected_rows"}:
+            raise RuntimeContractError("unsupported rejected observation source")
+        if not isinstance(self.count, int) or isinstance(self.count, bool):
+            raise RuntimeContractError("rejected observation count must be an integer")
+        if not 0 <= self.count <= 2147483647:
+            raise RuntimeContractError("rejected observation count is out of range")
+        if not isinstance(self.sha256, str) or not SHA256_RE.fullmatch(self.sha256):
+            raise RuntimeContractError("rejected observation digest is invalid")
+
+
+@dataclass(frozen=True)
+class RejectedObservationHardLimit:
+    source: str
+    prefix_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.source not in {"projected_rows", "unexpected_rows"}:
+            raise RuntimeContractError("unsupported rejected observation source")
+        if not isinstance(self.prefix_sha256, str) or not SHA256_RE.fullmatch(
+            self.prefix_sha256
+        ):
+            raise RuntimeContractError("rejected observation prefix is invalid")
+
+
+@dataclass(frozen=True)
+class ExpectedCiClassification:
+    state: str
+    value: Mapping[str, Any] | None
+    projected_observations: (
+        RejectedObservationReceipt | RejectedObservationHardLimit | None
+    )
+    unexpected_observations: (
+        RejectedObservationReceipt | RejectedObservationHardLimit | None
+    )
+    grammar_error: RuntimeContractError | None = None
+
+    def __post_init__(self) -> None:
+        if self.state not in {
+            "ordinary",
+            "observation_limit",
+            "grammar_invalid",
+            "hard_limit",
+        }:
+            raise RuntimeContractError("unsupported expected CI classification state")
+        if self.state in {"ordinary", "observation_limit"}:
+            if not isinstance(self.value, Mapping):
+                raise RuntimeContractError(
+                    "expected CI classification value must be a mapping"
+                )
+            object.__setattr__(
+                self,
+                "value",
+                _freeze_classification_value(self.value),
+            )
+        elif self.value is not None:
+            raise RuntimeContractError(
+                "bounded expected CI classifications must not carry a value"
+            )
+        if self.state == "grammar_invalid":
+            if not isinstance(self.grammar_error, RuntimeContractError):
+                raise RuntimeContractError(
+                    "grammar-invalid classifications require a grammar error"
+                )
+            if not isinstance(
+                self.projected_observations,
+                RejectedObservationReceipt,
+            ) or self.projected_observations.source != "projected_rows" or (
+                self.unexpected_observations is not None
+            ):
+                raise RuntimeContractError(
+                    "grammar-invalid classifications require projected observations"
+                )
+        elif self.state == "observation_limit":
+            if not isinstance(
+                self.projected_observations,
+                RejectedObservationReceipt,
+            ) or not isinstance(
+                self.unexpected_observations,
+                RejectedObservationReceipt,
+            ) or self.projected_observations.source != "projected_rows" or (
+                self.unexpected_observations.source != "unexpected_rows"
+            ):
+                raise RuntimeContractError(
+                    "observation-limit classifications require both receipts"
+                )
+            if self.grammar_error is not None:
+                raise RuntimeContractError(
+                    "observation-limit classifications must not carry a grammar error"
+                )
+        elif self.state == "hard_limit":
+            projected_hard = isinstance(
+                self.projected_observations,
+                RejectedObservationHardLimit,
+            )
+            unexpected_hard = isinstance(
+                self.unexpected_observations,
+                RejectedObservationHardLimit,
+            )
+            projected_receipt = isinstance(
+                self.projected_observations,
+                RejectedObservationReceipt,
+            )
+            valid_projected_hard = (
+                projected_hard
+                and self.projected_observations.source == "projected_rows"
+                and self.unexpected_observations is None
+            )
+            valid_unexpected_hard = (
+                projected_receipt
+                and self.projected_observations.source == "projected_rows"
+                and unexpected_hard
+                and self.unexpected_observations.source == "unexpected_rows"
+            )
+            if not (valid_projected_hard or valid_unexpected_hard):
+                raise RuntimeContractError(
+                    "hard-limit classification has an unreachable receipt shape"
+                )
+            if self.grammar_error is not None:
+                raise RuntimeContractError(
+                    "hard-limit classifications must not carry a grammar error"
+                )
+        else:
+            if not isinstance(
+                self.projected_observations,
+                (RejectedObservationReceipt, type(None)),
+            ) or (
+                isinstance(
+                    self.projected_observations,
+                    RejectedObservationReceipt,
+                )
+                and self.projected_observations.source != "projected_rows"
+            ) or self.unexpected_observations is not None:
+                raise RuntimeContractError(
+                    "ordinary classifications require only projected observations"
+                )
+            if self.grammar_error is not None:
+                raise RuntimeContractError(
+                    "ordinary classifications must not carry a grammar error"
+                )
+
+    def materialize_value(self) -> dict[str, Any]:
+        if self.value is None:
+            raise RuntimeContractError("classification has no ordinary value")
+        materialized = _thaw_classification_value(self.value)
+        if not isinstance(materialized, dict):
+            raise RuntimeContractError(
+                "classification value did not materialize as a mapping"
+            )
+        return materialized
+
+
+class CiAttemptSizeLimit(RuntimeContractError):
+    """Raised only when a canonical CI attempt exceeds its wire limit."""
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -69,13 +268,13 @@ def canonical_bytes(value: Any) -> bytes:
     """Return compact, UTF-8, sorted-key JSON bytes without NaN values."""
 
     try:
-        return json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return b"".join(_canonical_byte_chunks(value))
+    except RuntimeContractError:
+        raise
+    except RecursionError as error:
+        raise RuntimeContractError(
+            "canonical JSON nesting exceeds its limit"
+        ) from error
     except (TypeError, ValueError, UnicodeEncodeError) as error:
         raise RuntimeContractError(
             f"value is not canonical JSON: {error}"
@@ -93,6 +292,201 @@ def sha256_bytes(value: bytes) -> str:
 
 def canonical_sha256(value: Any) -> str:
     return sha256_bytes(canonical_bytes(value))
+
+
+_CANONICAL_TEXT_FRAGMENT_CHARS = 1024
+_CANONICAL_ESCAPES = {
+    '"': '\\"',
+    "\\": "\\\\",
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+
+def _iter_canonical_string(value: str) -> Iterable[str]:
+    yield '"'
+    fragment: list[str] = []
+    fragment_length = 0
+    for index, character in enumerate(value):
+        codepoint = ord(character)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            raise UnicodeEncodeError(
+                "utf-8",
+                value,
+                index,
+                index + 1,
+                "surrogates not allowed",
+            )
+        escaped = _CANONICAL_ESCAPES.get(character)
+        if escaped is None:
+            escaped = (
+                "\\u{:04x}".format(codepoint)
+                if codepoint < 0x20
+                else character
+            )
+        if (
+            fragment
+            and fragment_length + len(escaped)
+            > _CANONICAL_TEXT_FRAGMENT_CHARS
+        ):
+            yield "".join(fragment)
+            fragment = []
+            fragment_length = 0
+        fragment.append(escaped)
+        fragment_length += len(escaped)
+    if fragment:
+        yield "".join(fragment)
+    yield '"'
+
+
+def _canonical_object_key(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("out-of-range float values are not JSON compliant")
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    raise TypeError(
+        "keys must be str, int, float, bool or None, not {}".format(
+            type(value).__name__
+        )
+    )
+
+
+def _iter_canonical_fragments(
+    value: Any,
+    active: set[int] | None = None,
+    nesting: int = 0,
+) -> Iterable[str]:
+    if active is None:
+        active = set()
+    if value is None:
+        yield "null"
+    elif value is True:
+        yield "true"
+    elif value is False:
+        yield "false"
+    elif isinstance(value, int):
+        yield str(value)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("out-of-range float values are not JSON compliant")
+        yield json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    elif isinstance(value, str):
+        yield from _iter_canonical_string(value)
+    elif isinstance(value, (list, tuple)):
+        next_nesting = nesting + 1
+        if next_nesting > MAX_CANONICAL_JSON_NESTING:
+            raise RuntimeContractError(
+                "canonical JSON nesting exceeds its limit"
+            )
+        identity = id(value)
+        if identity in active:
+            raise ValueError("Circular reference detected")
+        active.add(identity)
+        try:
+            yield "["
+            for index, item in enumerate(value):
+                if index:
+                    yield ","
+                yield from _iter_canonical_fragments(
+                    item,
+                    active,
+                    next_nesting,
+                )
+            yield "]"
+        finally:
+            active.remove(identity)
+    elif isinstance(value, dict):
+        next_nesting = nesting + 1
+        if next_nesting > MAX_CANONICAL_JSON_NESTING:
+            raise RuntimeContractError(
+                "canonical JSON nesting exceeds its limit"
+            )
+        identity = id(value)
+        if identity in active:
+            raise ValueError("Circular reference detected")
+        active.add(identity)
+        try:
+            try:
+                keys = sorted(value)
+            except TypeError:
+                raise TypeError("keys are not mutually comparable") from None
+            yield "{"
+            for index, key in enumerate(keys):
+                if index:
+                    yield ","
+                yield from _iter_canonical_string(_canonical_object_key(key))
+                yield ":"
+                yield from _iter_canonical_fragments(
+                    value[key],
+                    active,
+                    next_nesting,
+                )
+            yield "}"
+        finally:
+            active.remove(identity)
+    else:
+        raise TypeError(
+            "Object of type {} is not JSON serializable".format(
+                type(value).__name__
+            )
+        )
+
+
+def _canonical_byte_chunks(value: Any) -> Iterable[bytes]:
+    for fragment in _iter_canonical_fragments(value):
+        for offset in range(0, len(fragment), _CANONICAL_TEXT_FRAGMENT_CHARS):
+            piece = fragment[offset : offset + _CANONICAL_TEXT_FRAGMENT_CHARS]
+            yield piece.encode("utf-8")
+
+
+def _bounded_canonical_observation(
+    rows: Sequence[Mapping[str, Any]],
+    source: str,
+) -> RejectedObservationReceipt | RejectedObservationHardLimit:
+    if source not in {"projected_rows", "unexpected_rows"}:
+        raise RuntimeContractError("unsupported observation receipt source")
+    digest = hashlib.sha256()
+    retained = 0
+    limit = MAX_OBSERVATION_CANONICAL_BYTES + 1
+    try:
+        for encoded in _canonical_byte_chunks(rows):
+            remaining = limit - retained
+            prefix = encoded[:remaining]
+            if prefix:
+                digest.update(prefix)
+                retained += len(prefix)
+            if retained == limit:
+                return RejectedObservationHardLimit(source, digest.hexdigest())
+    except RecursionError as error:
+        raise RuntimeContractError(
+            "canonical JSON nesting exceeds its limit"
+        ) from error
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise RuntimeContractError(
+            f"observations are not canonical JSON: {error}"
+        ) from error
+    return RejectedObservationReceipt(source, len(rows), digest.hexdigest())
 
 
 def parse_canonical_json(
@@ -122,9 +516,25 @@ def parse_canonical_json(
         )
     except RuntimeContractError:
         raise
+    except RecursionError as error:
+        raise RuntimeContractError(
+            f"{label} exceeds the canonical JSON nesting limit"
+        ) from error
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeContractError(f"{label} is invalid JSON: {error}") from error
-    if canonical_bytes(value) != raw_bytes:
+    try:
+        encoded = canonical_bytes(value)
+    except RecursionError as error:
+        raise RuntimeContractError(
+            f"{label} exceeds the canonical JSON nesting limit"
+        ) from error
+    except RuntimeContractError as error:
+        if str(error) == "canonical JSON nesting exceeds its limit":
+            raise RuntimeContractError(
+                f"{label} exceeds the canonical JSON nesting limit"
+            ) from error
+        raise
+    if encoded != raw_bytes:
         raise RuntimeContractError(f"{label} is not canonical JSON")
     return value
 
@@ -1784,7 +2194,32 @@ def _empty_expected_check_observation_metadata() -> dict[str, Any]:
     }
 
 
-def classify_expected_ci_checks(
+def _project_observed_rows(observed: Sequence[Any]) -> list[dict[str, Any]]:
+    fields = ("workflow_name", "check_name", "bucket", "state", "link")
+    projected = []
+    for item in observed:
+        if isinstance(item, Mapping):
+            projected.append({field: item.get(field) for field in fields})
+        else:
+            projected.append({field: None for field in fields})
+    return projected
+
+
+def _observation_limit_value(
+    receipt: RejectedObservationReceipt,
+) -> dict[str, Any]:
+    return _expected_check_result(
+        "report_invalid",
+        {
+            "expected_checks": [],
+            "unexpected_check_count": receipt.count,
+            "unexpected_checks_sha256": receipt.sha256,
+        },
+        reason="observation_limit",
+    )
+
+
+def classify_expected_ci_checks_with_receipt(
     expected: Mapping[str, Any],
     observed: Sequence[Mapping[str, Any]],
     *,
@@ -1792,7 +2227,7 @@ def classify_expected_ci_checks(
     current_head_oid: str,
     runtime_source_envelope_digest: str,
     expected_checks_digest: str,
-) -> dict[str, Any]:
+) -> ExpectedCiClassification:
     expected = validate_expected_ci_checks(expected)
     current_repository = _string(current_repository, "current_repository")
     if not REPOSITORY_RE.fullmatch(current_repository):
@@ -1809,24 +2244,35 @@ def classify_expected_ci_checks(
     empty_metadata = _empty_expected_check_observation_metadata()
     expected_object_digest = expected_ci_checks_sha256(expected)
     if expected["repository"] != current_repository:
-        return _expected_check_result(
-            "expected_contract_invalid",
-            empty_metadata,
+        return ExpectedCiClassification(
+            "ordinary",
+            _expected_check_result("expected_contract_invalid", empty_metadata),
+            None,
+            None,
         )
     if expected["project_commit"] != current_head_oid:
-        return _expected_check_result("source_changed", empty_metadata)
+        return ExpectedCiClassification(
+            "ordinary",
+            _expected_check_result("source_changed", empty_metadata),
+            None,
+            None,
+        )
     if (
         expected["runtime_source_envelope_digest"]
         != runtime_source_envelope_digest
     ):
-        return _expected_check_result(
-            "expected_contract_invalid",
-            empty_metadata,
+        return ExpectedCiClassification(
+            "ordinary",
+            _expected_check_result("expected_contract_invalid", empty_metadata),
+            None,
+            None,
         )
     if expected_object_digest != expected_checks_digest:
-        return _expected_check_result(
-            "expected_contract_invalid",
-            empty_metadata,
+        return ExpectedCiClassification(
+            "ordinary",
+            _expected_check_result("expected_contract_invalid", empty_metadata),
+            None,
+            None,
         )
     expected_by_identity = {
         (item["workflow_name"], item["check_name"]): item
@@ -1834,68 +2280,135 @@ def classify_expected_ci_checks(
     }
     if not isinstance(observed, Sequence) or isinstance(observed, (str, bytes)):
         raise RuntimeContractError("observed checks must be a sequence")
-    normalized = [
-        _validate_observed_check(item, f"observed[{index}]")
-        for index, item in enumerate(observed)
-    ]
-    metadata = _expected_check_observation_metadata(
-        normalized,
-        expected_by_identity,
+    projected = _project_observed_rows(observed)
+    projected_receipt = _bounded_canonical_observation(
+        projected,
+        "projected_rows",
     )
+    if isinstance(projected_receipt, RejectedObservationHardLimit):
+        return ExpectedCiClassification(
+            "hard_limit",
+            None,
+            projected_receipt,
+            None,
+        )
+    try:
+        normalized = [
+            _validate_observed_check(item, f"observed[{index}]")
+            for index, item in enumerate(observed)
+        ]
+    except RuntimeContractError as error:
+        return ExpectedCiClassification(
+            "grammar_invalid",
+            None,
+            projected_receipt,
+            None,
+            error,
+        )
+    ordered = sorted(normalized, key=_observed_check_sort_key)
+    expected_rows = [
+        item
+        for item in ordered
+        if (item["workflow_name"], item["check_name"]) in expected_by_identity
+    ]
+    unexpected_rows = [
+        item
+        for item in ordered
+        if (item["workflow_name"], item["check_name"]) not in expected_by_identity
+    ]
+    unexpected_receipt = _bounded_canonical_observation(
+        unexpected_rows,
+        "unexpected_rows",
+    )
+    if isinstance(unexpected_receipt, RejectedObservationHardLimit):
+        return ExpectedCiClassification(
+            "hard_limit",
+            None,
+            projected_receipt,
+            unexpected_receipt,
+        )
+    metadata = {
+        "expected_checks": expected_rows,
+        "unexpected_check_count": unexpected_receipt.count,
+        "unexpected_checks_sha256": unexpected_receipt.sha256,
+    }
     identities = [
         (item["workflow_name"], item["check_name"]) for item in normalized
     ]
-    if len(identities) != len(set(identities)):
-        return _expected_check_result(
-            "duplicate_observed_check",
-            metadata,
+    if unexpected_receipt.count > MAX_CI_UNEXPECTED_OBSERVATIONS:
+        return ExpectedCiClassification(
+            "observation_limit",
+            _observation_limit_value(unexpected_receipt),
+            projected_receipt,
+            unexpected_receipt,
         )
-    expected_count = len(metadata["expected_checks"])
-    unexpected_count = metadata["unexpected_check_count"]
-    if (
-        expected_count > MAX_CI_EXPECTED_OBSERVATIONS
-        or unexpected_count > MAX_CI_UNEXPECTED_OBSERVATIONS
-    ):
-        return _expected_check_result(
-            "report_invalid",
-            metadata,
-            reason="observation_limit",
+    if len(identities) != len(set(identities)):
+        return ExpectedCiClassification(
+            "ordinary",
+            _expected_check_result("duplicate_observed_check", metadata),
+            projected_receipt,
+            None,
         )
     observed_by_identity = dict(zip(identities, normalized))
     if not observed:
-        return _expected_check_result("no_checks_reported", metadata)
+        value = _expected_check_result("no_checks_reported", metadata)
+        return ExpectedCiClassification("ordinary", value, projected_receipt, None)
     missing = sorted(set(expected_by_identity) - set(observed_by_identity))
     if missing:
-        return _expected_check_result(
-            "expected_check_missing",
-            metadata,
-            missing=missing,
+        value = _expected_check_result(
+            "expected_check_missing", metadata, missing=missing
         )
+        return ExpectedCiClassification("ordinary", value, projected_receipt, None)
     for identity, item in observed_by_identity.items():
         if identity not in expected_by_identity:
             continue
         if item["bucket"] == "fail" or item["bucket"] == "cancel":
-            return _expected_check_result(
-                "expected_check_failed",
-                metadata,
-                check=identity,
+            value = _expected_check_result(
+                "expected_check_failed", metadata, check=identity
             )
+            return ExpectedCiClassification("ordinary", value, projected_receipt, None)
         if item["bucket"] == "skipping" and not expected_by_identity[identity]["allow_skipped"]:
-            return _expected_check_result(
-                "expected_check_skipped",
-                metadata,
-                check=identity,
+            value = _expected_check_result(
+                "expected_check_skipped", metadata, check=identity
             )
+            return ExpectedCiClassification("ordinary", value, projected_receipt, None)
         if item["bucket"] == "pending":
-            return _expected_check_result(
-                "pending_limit",
-                metadata,
-                check=identity,
+            value = _expected_check_result(
+                "pending_limit", metadata, check=identity
             )
-    return _expected_check_result(
-        "all_expected_checks_terminal_green",
-        metadata,
+            return ExpectedCiClassification("ordinary", value, projected_receipt, None)
+    value = _expected_check_result(
+        "all_expected_checks_terminal_green", metadata
     )
+    return ExpectedCiClassification("ordinary", value, projected_receipt, None)
+
+
+def classify_expected_ci_checks(
+    expected: Mapping[str, Any],
+    observed: Sequence[Mapping[str, Any]],
+    *,
+    current_repository: str,
+    current_head_oid: str,
+    runtime_source_envelope_digest: str,
+    expected_checks_digest: str,
+) -> dict[str, Any]:
+    classification = classify_expected_ci_checks_with_receipt(
+        expected,
+        observed,
+        current_repository=current_repository,
+        current_head_oid=current_head_oid,
+        runtime_source_envelope_digest=runtime_source_envelope_digest,
+        expected_checks_digest=expected_checks_digest,
+    )
+    if classification.state == "grammar_invalid":
+        if classification.grammar_error is not None:
+            raise classification.grammar_error
+        raise RuntimeContractError("observed checks have invalid grammar")
+    if classification.state == "hard_limit":
+        raise RuntimeContractError("observations exceed their canonical byte limit")
+    if classification.value is None:
+        raise RuntimeContractError("classification has no ordinary value")
+    return classification.materialize_value()
 
 
 CI_REPORT_REASONS = {
@@ -1954,7 +2467,39 @@ def _validate_ci_attempt(value: Mapping[str, Any], label: str) -> dict[str, Any]
     observations = data["expected_checks"]
     if not isinstance(observations, list):
         raise RuntimeContractError(f"{label}.expected_checks must be an array")
-    if len(observations) > MAX_CI_EXPECTED_OBSERVATIONS:
+    raw_safe_error = data["safe_error"]
+    raw_error_code = (
+        raw_safe_error.get("code")
+        if isinstance(raw_safe_error, Mapping)
+        else None
+    )
+    unexpected_count = _integer(
+        data["unexpected_check_count"],
+        f"{label}.unexpected_check_count",
+    )
+    exceptional_observation_attempt = (
+        raw_error_code == "observation_limit"
+        and unexpected_count > MAX_CI_UNEXPECTED_OBSERVATIONS
+    )
+    hard_limit_attempt = (
+        reason == "report_invalid" and raw_error_code == "hard_limit"
+    )
+    if (
+        (exceptional_observation_attempt or hard_limit_attempt)
+        and reason != "report_invalid"
+    ):
+        raise RuntimeContractError(
+            f"{label}.bounded observation errors require report_invalid"
+        )
+    special_observation_attempt = (
+        reason == "report_invalid"
+        and (exceptional_observation_attempt or hard_limit_attempt)
+    )
+    if special_observation_attempt and observations:
+        raise RuntimeContractError(
+            f"{label}.expected_checks must be empty for a bounded observation error"
+        )
+    if not special_observation_attempt and len(observations) > MAX_CI_EXPECTED_OBSERVATIONS:
         raise RuntimeContractError(f"{label}.expected_checks exceeds its limit")
     normalized_observations = [
         _validate_observed_check(item, f"{label}.expected_checks[{index}]")
@@ -2028,11 +2573,42 @@ def _validate_ci_attempt(value: Mapping[str, Any], label: str) -> dict[str, Any]
                 f"{label}.safe_error.stderr_sha256",
             ),
         }
-    unexpected_count = _integer(
-        data["unexpected_check_count"],
-        f"{label}.unexpected_check_count",
-    )
-    if unexpected_count > MAX_CI_UNEXPECTED_OBSERVATIONS:
+    if special_observation_attempt and retry is not None:
+        raise RuntimeContractError(
+            f"{label}.retry must be null for a bounded observation error"
+        )
+    if (
+        special_observation_attempt
+        and safe_error is not None
+        and safe_error["code"] == "hard_limit"
+        and unexpected_count != 0
+    ):
+        raise RuntimeContractError(
+            f"{label}.unexpected_check_count must be zero for hard_limit"
+        )
+    if (
+        special_observation_attempt
+        and safe_error is not None
+        and safe_error["code"] == "hard_limit"
+    ):
+        if data["unexpected_checks_sha256"] != canonical_sha256([]):
+            raise RuntimeContractError(
+                f"{label}.unexpected_checks_sha256 must represent empty observations"
+            )
+        empty_output_digest = sha256_bytes(b"")
+        if safe_error["stdout_sha256"] != empty_output_digest:
+            raise RuntimeContractError(
+                f"{label}.safe_error.stdout_sha256 must represent empty output"
+            )
+        if safe_error["stderr_sha256"] != empty_output_digest:
+            raise RuntimeContractError(
+                f"{label}.safe_error.stderr_sha256 must represent empty output"
+            )
+    if special_observation_attempt and unexpected_count > 2147483647:
+        raise RuntimeContractError(
+            f"{label}.unexpected_check_count is too large"
+        )
+    if not special_observation_attempt and unexpected_count > MAX_CI_UNEXPECTED_OBSERVATIONS:
         raise RuntimeContractError(
             f"{label}.unexpected_check_count is too large"
         )
@@ -2052,7 +2628,7 @@ def _validate_ci_attempt(value: Mapping[str, Any], label: str) -> dict[str, Any]
         "safe_error": safe_error,
     }
     if len(canonical_bytes(result)) > MAX_CI_ATTEMPT_BYTES:
-        raise RuntimeContractError(
+        raise CiAttemptSizeLimit(
             f"{label} exceeds the {MAX_CI_ATTEMPT_BYTES}-byte limit"
         )
     return result
@@ -2159,6 +2735,94 @@ def discarded_attempt_digest(
         + bytes.fromhex(previous_digest)
         + attempt_bytes
     )
+
+
+def make_observation_limit_attempt(
+    *,
+    sequence: int,
+    head_oid: str,
+    base_oid: str,
+    receipt: RejectedObservationReceipt,
+    watcher_exit_code: int | None = None,
+) -> dict[str, Any]:
+    if not isinstance(receipt, RejectedObservationReceipt):
+        raise RuntimeContractError("observation limit requires a receipt")
+    return _validate_ci_attempt(
+        {
+            "sequence": sequence,
+            "head_oid": head_oid,
+            "base_oid": base_oid,
+            "reason": "report_invalid",
+            "watcher_exit_code": watcher_exit_code,
+            "expected_checks": [],
+            "unexpected_check_count": receipt.count,
+            "unexpected_checks_sha256": receipt.sha256,
+            "retry": None,
+            "safe_error": {
+                "code": "observation_limit",
+                "exit_code": watcher_exit_code,
+                "stdout_sha256": sha256_bytes(b""),
+                "stderr_sha256": sha256_bytes(b""),
+            },
+        },
+        "observation_limit_attempt",
+    )
+
+
+def make_observation_hard_limit_attempt(
+    *,
+    sequence: int,
+    head_oid: str,
+    base_oid: str,
+    hard_limit: RejectedObservationHardLimit,
+    watcher_exit_code: int | None = None,
+) -> dict[str, Any]:
+    if not isinstance(hard_limit, RejectedObservationHardLimit):
+        raise RuntimeContractError("hard limit requires a hard-limit receipt")
+    empty_digest = canonical_sha256([])
+    empty_output_digest = sha256_bytes(b"")
+    return _validate_ci_attempt(
+        {
+            "sequence": sequence,
+            "head_oid": head_oid,
+            "base_oid": base_oid,
+            "reason": "report_invalid",
+            "watcher_exit_code": watcher_exit_code,
+            "expected_checks": [],
+            "unexpected_check_count": 0,
+            "unexpected_checks_sha256": empty_digest,
+            "retry": None,
+            "safe_error": {
+                "code": "hard_limit",
+                "exit_code": watcher_exit_code,
+                "stdout_sha256": empty_output_digest,
+                "stderr_sha256": empty_output_digest,
+            },
+        },
+        "observation_hard_limit_attempt",
+    )
+
+
+def prepare_ci_attempt(
+    value: Mapping[str, Any],
+    projected_receipt: RejectedObservationReceipt,
+) -> dict[str, Any]:
+    if not isinstance(projected_receipt, RejectedObservationReceipt):
+        raise RuntimeContractError("attempt preparation requires a receipt")
+    if projected_receipt.source != "projected_rows":
+        raise RuntimeContractError(
+            "attempt preparation requires a projected_rows receipt"
+        )
+    try:
+        return _validate_ci_attempt(value, "attempt")
+    except CiAttemptSizeLimit:
+        return make_observation_limit_attempt(
+            sequence=value["sequence"],
+            head_oid=value["head_oid"],
+            base_oid=value["base_oid"],
+            receipt=projected_receipt,
+            watcher_exit_code=value.get("watcher_exit_code"),
+        )
 
 
 def make_report_invalid_attempt(
@@ -2408,11 +3072,16 @@ def validate_ci_report_history(
 
 __all__ = [
     "CI_REPORT_SCHEMA",
+    "CiAttemptSizeLimit",
+    "ExpectedCiClassification",
     "EXPECTED_CHECKS_SCHEMA",
     "EXTERNAL_CAPTURE_SCHEMA",
+    "MAX_CANONICAL_JSON_NESTING",
     "PR_CURSOR_SCHEMA",
     "RuntimeContractError",
     "RuntimeExternalRoot",
+    "RejectedObservationHardLimit",
+    "RejectedObservationReceipt",
     "SelectedRuntimeSourceInputs",
     "TERMINAL_MARKER_SCHEMA",
     "TERMINAL_SEAL_REQUEST_SCHEMA",
@@ -2428,17 +3097,21 @@ __all__ = [
     "capture_runtime_source_envelope",
     "check_state_sha256",
     "classify_expected_ci_checks",
+    "classify_expected_ci_checks_with_receipt",
     "classify_ci_report",
     "classify_pr_feedback",
     "classify_terminal_state",
     "classify_verification_report",
     "discarded_attempt_digest",
     "expected_ci_checks_sha256",
+    "make_observation_hard_limit_attempt",
+    "make_observation_limit_attempt",
     "make_pr_feedback_cursor",
     "make_report_invalid_attempt",
     "parse_runtime_external_captures",
     "parse_canonical_json",
     "parse_terminal_marker_line",
+    "prepare_ci_attempt",
     "revalidate_runtime_source_envelope",
     "sha256_bytes",
     "terminal_marker_line",

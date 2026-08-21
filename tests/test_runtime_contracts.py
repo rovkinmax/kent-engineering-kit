@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import tracemalloc
+from types import MappingProxyType
 import unittest
+from unittest import mock
 
+import workflowkit.runtime as runtime_module
 from workflowkit.runtime import (
     RuntimeContractError,
     append_ci_report_attempt,
@@ -16,15 +21,19 @@ from workflowkit.runtime import (
     check_state_sha256,
     classify_ci_report,
     classify_expected_ci_checks,
+    classify_expected_ci_checks_with_receipt,
     classify_pr_feedback,
     classify_terminal_state,
     classify_verification_report,
     discarded_attempt_digest,
     expected_ci_checks_sha256,
     make_pr_feedback_cursor,
+    make_observation_hard_limit_attempt,
+    make_observation_limit_attempt,
     make_report_invalid_attempt,
     parse_runtime_external_captures,
     parse_terminal_marker_line,
+    prepare_ci_attempt,
     terminal_marker_line,
     validate_ci_report,
     validate_cleanup_report,
@@ -110,13 +119,196 @@ def ci_report() -> dict[str, object]:
 
 class RuntimeContractTest(unittest.TestCase):
     def test_canonical_json_is_compact_sorted_and_digestable(self) -> None:
-        self.assertEqual(canonical_bytes({"z": 1, "a": "é"}), b'{"a":"\xc3\xa9","z":1}')
+        ordinary = {"z": 1, "a": "é"}
         self.assertEqual(
-            canonical_sha256({"z": 1, "a": "é"}),
+            canonical_bytes(ordinary),
+            json.dumps(
+                ordinary,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8"),
+        )
+        self.assertEqual(
+            canonical_sha256(ordinary),
             "fb64e573f7cde5b7efeda52ffc4bdd57572055b0b7e64a70172606c82c6c7eac",
         )
         with self.assertRaises(RuntimeContractError):
+            canonical_bytes(MappingProxyType({"a": 1}))
+        with self.assertRaises(RuntimeContractError):
             canonical_bytes(float("nan"))
+
+    def test_canonical_json_unicode_control_and_surrogate_parity(self) -> None:
+        values = [
+            "",
+            "é😀",
+            "\x00\x01\x08\t\n\x0b\x0c\r\x1f",
+            '"\\',
+            "\u2028",
+            {"é": ["😀", "\n", "\x1f"]},
+        ]
+        for value in values:
+            with self.subTest(value=value):
+                expected = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                self.assertEqual(canonical_bytes(value), expected)
+        for value in ("\ud800", "\ud83d\ude00", {"bad": "\ud800"}):
+            with self.subTest(value=value):
+                with self.assertRaises(RuntimeContractError):
+                    canonical_bytes(value)
+
+    def test_bounded_canonical_encoder_streams_large_string_tokens(self) -> None:
+        limit = runtime_module.MAX_OBSERVATION_CANONICAL_BYTES + 1
+        opening = b'[{"payload":"'
+        rows = [{"payload": "x" * (16 * 1024 * 1024)}]
+        update_sizes: list[int] = []
+        real_sha256 = runtime_module.hashlib.sha256
+
+        class TrackingDigest:
+            def __init__(self) -> None:
+                self._digest = real_sha256()
+
+            def update(self, value: bytes) -> None:
+                update_sizes.append(len(value))
+                self._digest.update(value)
+
+            def hexdigest(self) -> str:
+                return self._digest.hexdigest()
+
+        tracemalloc.start()
+        try:
+            with mock.patch.object(
+                runtime_module.hashlib,
+                "sha256",
+                side_effect=TrackingDigest,
+            ):
+                receipt = runtime_module._bounded_canonical_observation(
+                    rows,
+                    "projected_rows",
+                )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        expected_prefix = opening + b"x" * (limit - len(opening))
+        self.assertIsInstance(
+            receipt,
+            runtime_module.RejectedObservationHardLimit,
+        )
+        self.assertEqual(
+            receipt.prefix_sha256,
+            hashlib.sha256(expected_prefix).hexdigest(),
+        )
+        self.assertTrue(update_sizes)
+        self.assertLessEqual(max(update_sizes), 4096)
+        self.assertLess(peak, 2 * 1024 * 1024)
+
+    def test_canonical_json_nesting_limit_and_recursion_translation(self) -> None:
+        def nested(depth: int, form: str) -> object:
+            value: object = 0
+            for index in range(depth):
+                if form == "list":
+                    value = [value]
+                elif form == "tuple":
+                    value = (value,)
+                elif form == "object":
+                    value = {"value": value}
+                else:
+                    value = [value] if index % 2 == 0 else {"value": value}
+            return value
+
+        for form in ("list", "tuple", "object", "mixed"):
+            with self.subTest(form=form):
+                value = nested(
+                    runtime_module.MAX_CANONICAL_JSON_NESTING,
+                    form,
+                )
+                expected = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                self.assertEqual(canonical_bytes(value), expected)
+                self.assertEqual(
+                    canonical_sha256(value),
+                    hashlib.sha256(expected).hexdigest(),
+                )
+                with self.assertRaises(RuntimeContractError):
+                    canonical_bytes(nested(101, form))
+
+        raw_limit = b"[" * 100 + b"0" + b"]" * 100
+        self.assertEqual(
+            runtime_module.parse_canonical_json(
+                raw_limit,
+                label="nested value",
+                max_bytes=runtime_module.MAX_FEEDBACK_BYTES,
+            ),
+            nested(100, "list"),
+        )
+        for value in (nested(1000, "list"),):
+            with self.subTest(raw=False):
+                with self.assertRaises(RuntimeContractError) as failure:
+                    canonical_bytes(value)
+                self.assertNotIn("RecursionError", str(failure.exception))
+        raw_over_depth = b"[" * 1000 + b"0" + b"]" * 1000
+        with self.assertRaises(RuntimeContractError) as failure:
+            runtime_module.parse_canonical_json(
+                raw_over_depth,
+                label="nested value",
+                max_bytes=runtime_module.MAX_FEEDBACK_BYTES,
+            )
+        self.assertNotIn("RecursionError", str(failure.exception))
+        with self.assertRaises(RuntimeContractError):
+            runtime_module._bounded_canonical_observation(
+                [{"nested": nested(101, "list")}],
+                "projected_rows",
+            )
+
+        with mock.patch.object(
+            runtime_module.json,
+            "loads",
+            side_effect=RecursionError("interpreter detail"),
+        ):
+            with self.assertRaises(RuntimeContractError) as failure:
+                runtime_module.parse_canonical_json(b"0", label="fixture")
+        self.assertEqual(
+            str(failure.exception),
+            "fixture exceeds the canonical JSON nesting limit",
+        )
+
+        with mock.patch.object(
+            runtime_module,
+            "_iter_canonical_fragments",
+            side_effect=RecursionError("interpreter detail"),
+        ):
+            with self.assertRaises(RuntimeContractError) as failure:
+                canonical_bytes(0)
+        self.assertEqual(
+            str(failure.exception),
+            "canonical JSON nesting exceeds its limit",
+        )
+
+        with mock.patch.object(
+            runtime_module,
+            "_canonical_byte_chunks",
+            side_effect=RecursionError("interpreter detail"),
+        ):
+            with self.assertRaises(RuntimeContractError) as failure:
+                runtime_module._bounded_canonical_observation(
+                    [{"value": 1}],
+                    "projected_rows",
+                )
+        self.assertEqual(
+            str(failure.exception),
+            "canonical JSON nesting exceeds its limit",
+        )
 
     def test_standalone_import_has_no_package_dependency(self) -> None:
         path = Path(__file__).resolve().parents[1] / "workflowkit" / "runtime.py"
@@ -744,6 +936,629 @@ class RuntimeContractTest(unittest.TestCase):
                     ],
                 }
             )
+
+    def test_expected_ci_receipts_authority_grammar_order_and_permutation(self) -> None:
+        expected = expected_checks()
+        digest = expected_ci_checks_sha256(expected)
+        malformed = [{"workflow_name": "bad"}]
+        stale = classify_expected_ci_checks_with_receipt(
+            expected,
+            malformed,
+            current_repository="owner/repository",
+            current_head_oid="1" * 40,
+            runtime_source_envelope_digest=ZERO_SHA256,
+            expected_checks_digest=digest,
+        )
+        self.assertEqual(stale.state, "ordinary")
+        self.assertIsNone(stale.projected_observations)
+        self.assertIsNone(stale.unexpected_observations)
+        self.assertEqual(stale.value["transition"], "source_changed")
+        invalid = classify_expected_ci_checks_with_receipt(
+            expected,
+            malformed,
+            current_repository="owner/repository",
+            current_head_oid=ZERO_SHA1,
+            runtime_source_envelope_digest=ZERO_SHA256,
+            expected_checks_digest=digest,
+        )
+        self.assertEqual(invalid.state, "grammar_invalid")
+        self.assertIsNone(invalid.value)
+        self.assertIsNotNone(invalid.grammar_error)
+        self.assertEqual(invalid.projected_observations.source, "projected_rows")
+        projected = invalid.projected_observations
+        unexpected = runtime_module.RejectedObservationReceipt(
+            "unexpected_rows",
+            1,
+            ZERO_SHA256,
+        )
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.ExpectedCiClassification(
+                "grammar_invalid",
+                None,
+                runtime_module.RejectedObservationReceipt(
+                    "unexpected_rows",
+                    projected.count,
+                    projected.sha256,
+                ),
+                None,
+                invalid.grammar_error,
+            )
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.ExpectedCiClassification(
+                "observation_limit",
+                {},
+                projected,
+                projected,
+            )
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.ExpectedCiClassification(
+                "hard_limit",
+                None,
+                projected,
+                unexpected,
+            )
+        with self.assertRaises(RuntimeContractError):
+            classify_expected_ci_checks(
+                expected,
+                malformed,
+                current_repository="owner/repository",
+                current_head_oid=ZERO_SHA1,
+                runtime_source_envelope_digest=ZERO_SHA256,
+                expected_checks_digest=digest,
+            )
+        unexpected_a = {**observed_check(), "check_name": "a"}
+        unexpected_b = {**observed_check(), "check_name": "b"}
+        first = classify_expected_ci_checks_with_receipt(
+            expected,
+            [unexpected_b, observed_check(), unexpected_a],
+            current_repository="owner/repository",
+            current_head_oid=ZERO_SHA1,
+            runtime_source_envelope_digest=ZERO_SHA256,
+            expected_checks_digest=digest,
+        )
+        second = classify_expected_ci_checks_with_receipt(
+            expected,
+            [unexpected_a, unexpected_b, observed_check()],
+            current_repository="owner/repository",
+            current_head_oid=ZERO_SHA1,
+            runtime_source_envelope_digest=ZERO_SHA256,
+            expected_checks_digest=digest,
+        )
+        self.assertEqual(
+            first.value["unexpected_checks_sha256"],
+            second.value["unexpected_checks_sha256"],
+        )
+        over_limit = [
+            {**observed_check(), "check_name": f"unexpected-{index}"}
+            for index in range(10000)
+        ]
+        over_limit.insert(5000, {**observed_check(), "check_name": "unexpected-0"})
+        limited = classify_expected_ci_checks_with_receipt(
+            expected,
+            [observed_check(), *over_limit],
+            current_repository="owner/repository",
+            current_head_oid=ZERO_SHA1,
+            runtime_source_envelope_digest=ZERO_SHA256,
+            expected_checks_digest=digest,
+        )
+        self.assertEqual(limited.state, "observation_limit")
+        self.assertIsNotNone(limited.value)
+        self.assertEqual(limited.projected_observations.source, "projected_rows")
+        self.assertEqual(limited.unexpected_observations.count, 10001)
+
+    def test_observation_encoder_and_typed_attempt_boundaries(self) -> None:
+        expected = expected_checks()
+        limit = runtime_module.MAX_OBSERVATION_CANONICAL_BYTES
+        prefix = len(canonical_bytes([{"x": ""}]))
+        exact_rows = [{"x": "a" * (limit - prefix)}]
+        exact = runtime_module._bounded_canonical_observation(
+            exact_rows,
+            "projected_rows",
+        )
+        self.assertEqual(exact.count, 1)
+        self.assertEqual(exact.sha256, canonical_sha256(exact_rows))
+        over_rows = [{"x": "a" * (limit - prefix + 1)}]
+        hard = runtime_module._bounded_canonical_observation(
+            over_rows,
+            "projected_rows",
+        )
+        self.assertEqual(hard.source, "projected_rows")
+        self.assertEqual(
+            hard.prefix_sha256,
+            runtime_module.sha256_bytes(
+                canonical_bytes(over_rows)[: limit + 1]
+            ),
+        )
+        receipt = runtime_module.RejectedObservationReceipt(
+            "projected_rows",
+            10001,
+            "b" * 64,
+        )
+        attempt = make_observation_limit_attempt(
+            sequence=1,
+            head_oid=ZERO_SHA1,
+            base_oid=ZERO_SHA1,
+            receipt=receipt,
+        )
+        self.assertEqual(attempt["unexpected_check_count"], 10001)
+        self.assertEqual(validate_ci_report_history(
+            build_ci_report(
+                mode="expected-v1",
+                repository="owner/repository",
+                pull_number=1,
+                runtime_source_envelope_digest=ZERO_SHA256,
+                expected_ci_checks_sha256=expected_ci_checks_sha256(expected),
+                attempts=[attempt],
+            )
+        ), build_ci_report(
+            mode="expected-v1",
+            repository="owner/repository",
+            pull_number=1,
+            runtime_source_envelope_digest=ZERO_SHA256,
+            expected_ci_checks_sha256=expected_ci_checks_sha256(expected),
+            attempts=[attempt],
+        ))
+        hard_attempt = make_observation_hard_limit_attempt(
+            sequence=1,
+            head_oid=ZERO_SHA1,
+            base_oid=ZERO_SHA1,
+            hard_limit=hard,
+        )
+        self.assertEqual(hard_attempt["safe_error"]["code"], "hard_limit")
+        self.assertEqual(hard_attempt["unexpected_check_count"], 0)
+        hard_classification = runtime_module.ExpectedCiClassification(
+            "hard_limit",
+            None,
+            hard,
+            None,
+        )
+        self.assertIsNone(hard_classification.value)
+        for malformed in (
+            {
+                **attempt,
+                "expected_checks": [observed_check()],
+            },
+            {
+                **attempt,
+                "retry": {
+                    "job_id": 1,
+                    "failure_fingerprint_sha256": ZERO_SHA256,
+                },
+            },
+            {
+                **hard_attempt,
+                "unexpected_check_count": 1,
+            },
+            {
+                **attempt,
+                "unexpected_check_count": 2147483648,
+            },
+        ):
+            with self.assertRaises(RuntimeContractError):
+                validate_ci_report(
+                    {
+                        **ci_report(),
+                        "attempts": [malformed],
+                    }
+                )
+        oversized = ci_attempt()
+        oversized["expected_checks"] = [
+            {
+                "workflow_name": "W" * 256,
+                "check_name": f"{index:03d}-" + "C" * 252,
+                "bucket": "pass",
+                "state": "SUCCESS",
+                "link": "https://github.com/owner/repository/actions/runs/1",
+            }
+            for index in range(100)
+        ]
+        prepared = prepare_ci_attempt(oversized, receipt)
+        self.assertEqual(prepared["safe_error"]["code"], "observation_limit")
+        self.assertEqual(prepared["unexpected_check_count"], receipt.count)
+        with self.assertRaises(RuntimeContractError):
+            prepare_ci_attempt(
+                {**oversized, "reason": "not-a-reason"},
+                receipt,
+            )
+        with self.assertRaises(RuntimeContractError):
+            prepare_ci_attempt(
+                oversized,
+                runtime_module.RejectedObservationReceipt(
+                    "unexpected_rows",
+                    10001,
+                    "b" * 64,
+                ),
+            )
+
+    def test_observation_limit_history_compatibility_and_hard_fields(self) -> None:
+        legacy = {
+            **ci_attempt(reason="report_invalid"),
+            "expected_checks": [observed_check()],
+            "unexpected_check_count": 1,
+            "unexpected_checks_sha256": canonical_sha256([observed_check()]),
+            "retry": {
+                "job_id": 7,
+                "failure_fingerprint_sha256": "a" * 64,
+            },
+            "safe_error": {
+                "code": "observation_limit",
+                "exit_code": 1,
+                "stdout_sha256": "b" * 64,
+                "stderr_sha256": "c" * 64,
+            },
+        }
+        self.assertEqual(
+            validate_ci_report({**ci_report(), "attempts": [legacy]})[
+                "attempts"
+            ][0],
+            legacy,
+        )
+
+        def bounded(count: int) -> dict[str, object]:
+            return {
+                **ci_attempt(reason="report_invalid"),
+                "expected_checks": [],
+                "unexpected_check_count": count,
+                "unexpected_checks_sha256": "d" * 64,
+                "retry": None,
+                "safe_error": {
+                    "code": "observation_limit",
+                    "exit_code": 1,
+                    "stdout_sha256": "e" * 64,
+                    "stderr_sha256": "f" * 64,
+                },
+            }
+
+        for count in (10000, 10001, 2147483647):
+            with self.subTest(count=count):
+                validate_ci_report(
+                    {**ci_report(), "attempts": [bounded(count)]}
+                )
+        with self.assertRaises(RuntimeContractError):
+            validate_ci_report(
+                {**ci_report(), "attempts": [bounded(2147483648)]}
+            )
+
+        hard = make_observation_hard_limit_attempt(
+            sequence=1,
+            head_oid=ZERO_SHA1,
+            base_oid=ZERO_SHA1,
+            hard_limit=runtime_module.RejectedObservationHardLimit(
+                "projected_rows",
+                "1" * 64,
+            ),
+            watcher_exit_code=1,
+        )
+        mutations = {
+            "unexpected_digest": {
+                **hard,
+                "unexpected_checks_sha256": "2" * 64,
+            },
+            "stdout_digest": {
+                **hard,
+                "safe_error": {
+                    **hard["safe_error"],
+                    "stdout_sha256": "3" * 64,
+                },
+            },
+            "stderr_digest": {
+                **hard,
+                "safe_error": {
+                    **hard["safe_error"],
+                    "stderr_sha256": "4" * 64,
+                },
+            },
+            "wrong_safe_error": {
+                **hard,
+                "safe_error": {
+                    **hard["safe_error"],
+                    "code": "not-safe",
+                },
+            },
+            "missing_safe_error_field": {
+                **hard,
+                "safe_error": {
+                    "code": "hard_limit",
+                    "exit_code": 1,
+                    "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+                },
+            },
+            "nonempty_expected": {
+                **hard,
+                "expected_checks": [observed_check()],
+            },
+            "retry": {
+                **hard,
+                "retry": {
+                    "job_id": 1,
+                    "failure_fingerprint_sha256": ZERO_SHA256,
+                },
+            },
+            "nonzero_count": {
+                **hard,
+                "unexpected_check_count": 1,
+            },
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                with self.assertRaises(RuntimeContractError):
+                    validate_ci_report(
+                        {**ci_report(), "attempts": [mutation]}
+                    )
+
+    def test_report_invalid_safe_error_null_preserves_c1_boundaries(self) -> None:
+        expected = observed_check()
+        expected_digest = canonical_sha256([expected])
+        retry = {
+            "job_id": 7,
+            "failure_fingerprint_sha256": "a" * 64,
+        }
+        for count in (0, 1, 10000):
+            with self.subTest(count=count):
+                attempt = {
+                    **ci_attempt(reason="report_invalid"),
+                    "expected_checks": [expected],
+                    "unexpected_check_count": count,
+                    "unexpected_checks_sha256": expected_digest,
+                    "retry": retry,
+                    "safe_error": None,
+                }
+                validated = validate_ci_report(
+                    {**ci_report(), "attempts": [attempt]}
+                )
+                self.assertEqual(validated["attempts"][0], attempt)
+
+        with self.assertRaises(RuntimeContractError):
+            validate_ci_report(
+                {
+                    **ci_report(),
+                    "attempts": [
+                        {
+                            **ci_attempt(reason="report_invalid"),
+                            "expected_checks": [expected],
+                            "unexpected_check_count": 10001,
+                            "unexpected_checks_sha256": expected_digest,
+                            "retry": retry,
+                            "safe_error": None,
+                        }
+                    ],
+                }
+            )
+
+        observation_limit = make_observation_limit_attempt(
+            sequence=1,
+            head_oid=ZERO_SHA1,
+            base_oid=ZERO_SHA1,
+            receipt=runtime_module.RejectedObservationReceipt(
+                "unexpected_rows",
+                10001,
+                "b" * 64,
+            ),
+        )
+        self.assertEqual(observation_limit["safe_error"]["code"], "observation_limit")
+        hard_limit = make_observation_hard_limit_attempt(
+            sequence=1,
+            head_oid=ZERO_SHA1,
+            base_oid=ZERO_SHA1,
+            hard_limit=runtime_module.RejectedObservationHardLimit(
+                "projected_rows",
+                "c" * 64,
+            ),
+        )
+        self.assertEqual(hard_limit["safe_error"]["code"], "hard_limit")
+        self.assertEqual(hard_limit["unexpected_check_count"], 0)
+
+    def test_expected_ci_classification_is_deeply_immutable_and_materializes(self) -> None:
+        receipt = runtime_module.RejectedObservationReceipt(
+            "projected_rows",
+            1,
+            "a" * 64,
+        )
+        source = {
+            "transition": "all_expected_checks_terminal_green",
+            "nested": {
+                "items": [{"name": "unit"}],
+                "tuple": ("stable", {"value": 1}),
+            },
+        }
+        classification = runtime_module.ExpectedCiClassification(
+            "ordinary",
+            source,
+            receipt,
+            None,
+        )
+        source["nested"]["items"].append({"name": "mutated"})
+        source["nested"]["tuple"][1]["value"] = 2
+
+        frozen = classification.value
+        self.assertIsNotNone(frozen)
+        assert frozen is not None
+        with self.assertRaises(TypeError):
+            frozen["nested"] = {}
+        with self.assertRaises(TypeError):
+            frozen["nested"]["items"][0]["name"] = "mutated"
+        with self.assertRaises(TypeError):
+            frozen["nested"]["items"][0] = {}
+        with self.assertRaises(AttributeError):
+            frozen["nested"]["items"].append({"name": "mutated"})
+
+        first = classification.materialize_value()
+        second = classification.materialize_value()
+        self.assertIsInstance(first["nested"]["items"], list)
+        self.assertIsInstance(first["nested"]["tuple"], tuple)
+        self.assertIsInstance(first["nested"]["tuple"][1], dict)
+        first["nested"]["items"][0]["name"] = "changed"
+        first["nested"]["items"].append({"name": "new"})
+        first["nested"]["tuple"][1]["value"] = 9
+        self.assertEqual(second["nested"]["items"], [{"name": "unit"}])
+        self.assertEqual(second["nested"]["tuple"][1]["value"], 1)
+        self.assertEqual(classification.materialize_value(), second)
+        self.assertEqual(classification.projected_observations, receipt)
+
+        expected = expected_checks()
+        digest = expected_ci_checks_sha256(expected)
+        legacy_first = classify_expected_ci_checks(
+            expected,
+            [observed_check()],
+            current_repository="owner/repository",
+            current_head_oid=ZERO_SHA1,
+            runtime_source_envelope_digest=ZERO_SHA256,
+            expected_checks_digest=digest,
+        )
+        legacy_second = classify_expected_ci_checks(
+            expected,
+            [observed_check()],
+            current_repository="owner/repository",
+            current_head_oid=ZERO_SHA1,
+            runtime_source_envelope_digest=ZERO_SHA256,
+            expected_checks_digest=digest,
+        )
+        legacy_first["expected_checks"][0]["check_name"] = "changed"
+        self.assertEqual(
+            legacy_second["expected_checks"][0]["check_name"],
+            "unit",
+        )
+
+    def test_expected_ci_acceptance_matrix_boundaries_and_authority(self) -> None:
+        expected = expected_checks()
+        digest = expected_ci_checks_sha256(expected)
+        expected_row = observed_check()
+        unexpected_rows = [
+            {
+                **expected_row,
+                "check_name": "unexpected-{:05d}".format(index),
+            }
+            for index in range(10000)
+        ]
+        ordinary = classify_expected_ci_checks_with_receipt(
+            expected,
+            [expected_row, *unexpected_rows[:10000]],
+            current_repository="owner/repository",
+            current_head_oid=ZERO_SHA1,
+            runtime_source_envelope_digest=ZERO_SHA256,
+            expected_checks_digest=digest,
+        )
+        self.assertEqual(ordinary.state, "ordinary")
+        self.assertEqual(ordinary.value["unexpected_check_count"], 10000)
+        for field, value in (
+            ("repository", "other/repository"),
+            ("head", "1" * 40),
+            ("runtime_source_envelope_digest", "1" * 64),
+            ("expected_checks_digest", "1" * 64),
+        ):
+            arguments = {
+                "current_repository": "owner/repository",
+                "current_head_oid": ZERO_SHA1,
+                "runtime_source_envelope_digest": ZERO_SHA256,
+                "expected_checks_digest": digest,
+            }
+            if field == "repository":
+                arguments["current_repository"] = value
+            elif field == "head":
+                arguments["current_head_oid"] = value
+            elif field == "expected_checks_digest":
+                arguments[field] = value
+            else:
+                arguments[field] = value
+            for observations in (
+                [{"workflow_name": "bad"}],
+                [{"workflow_name": "x" * 5_000_000}],
+            ):
+                with mock.patch.object(
+                    runtime_module,
+                    "_bounded_canonical_observation",
+                    side_effect=AssertionError("authority must short-circuit"),
+                ):
+                    authority = classify_expected_ci_checks_with_receipt(
+                        expected,
+                        observations,
+                        **arguments,
+                    )
+                self.assertEqual(authority.state, "ordinary")
+                self.assertIsNone(authority.projected_observations)
+                self.assertIsNone(authority.unexpected_observations)
+
+        non_special = {
+            **ci_attempt(),
+            "unexpected_check_count": 10001,
+        }
+        with self.assertRaises(RuntimeContractError):
+            validate_ci_report({**ci_report(), "attempts": [non_special]})
+
+        def sized_candidate(extra: int) -> dict[str, object]:
+            rows = [
+                {
+                    **observed_check(),
+                    "workflow_name": "W",
+                    "check_name": "{:03d}".format(index),
+                    "link": "https://github.com/" + "x" * 1522,
+                }
+                for index in range(30)
+            ]
+            rows[-1]["link"] += "x" * extra
+            return {**ci_attempt(), "expected_checks": rows}
+
+        exact = sized_candidate(10)
+        self.assertEqual(
+            len(canonical_bytes(exact)),
+            runtime_module.MAX_CI_ATTEMPT_BYTES,
+        )
+        projected_receipt = runtime_module.RejectedObservationReceipt(
+            "projected_rows",
+            30,
+            ZERO_SHA256,
+        )
+        self.assertEqual(
+            prepare_ci_attempt(exact, projected_receipt),
+            exact,
+        )
+        over = prepare_ci_attempt(
+            sized_candidate(11),
+            projected_receipt,
+        )
+        self.assertEqual(over["safe_error"]["code"], "observation_limit")
+        with self.assertRaises(RuntimeContractError):
+            prepare_ci_attempt(
+                {**sized_candidate(11), "reason": "not-a-reason"},
+                projected_receipt,
+            )
+
+        special_attempts = [
+            make_observation_limit_attempt(
+                sequence=index,
+                head_oid=ZERO_SHA1,
+                base_oid=ZERO_SHA1,
+                receipt=runtime_module.RejectedObservationReceipt(
+                    "unexpected_rows",
+                    10001,
+                    "a" * 64,
+                ),
+            )
+            if index % 2
+            else make_observation_hard_limit_attempt(
+                sequence=index,
+                head_oid=ZERO_SHA1,
+                base_oid=ZERO_SHA1,
+                hard_limit=runtime_module.RejectedObservationHardLimit(
+                    "projected_rows",
+                    "b" * 64,
+                ),
+            )
+            for index in range(1, 10)
+        ]
+        special_report = build_ci_report(
+            mode="expected-v1",
+            repository="owner/repository",
+            pull_number=1,
+            runtime_source_envelope_digest=ZERO_SHA256,
+            expected_ci_checks_sha256=digest,
+            attempts=special_attempts,
+        )
+        self.assertEqual(special_report["discarded_attempt_count"], 1)
+        self.assertEqual(
+            validate_ci_report_history(special_report, [special_attempts[0]]),
+            special_report,
+        )
 
     def test_ci_report_attempts_and_discarded_chain_are_bounded(self) -> None:
         report = ci_report()

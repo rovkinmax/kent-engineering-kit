@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -188,6 +189,37 @@ class WorkflowKitTest(unittest.TestCase):
             path = root / profile.adapter(key)
             path.unlink(missing_ok=True)
         return root, profile
+
+    def schema4_runtime_v2_contents(self) -> str:
+        contents = schema4_profile_contents()
+        contents = contents.replace(
+            'kit_managed_commands = ["dispatch"]',
+            (
+                'kit_managed_commands = ["runtime_contracts", "verify", '
+                '"evidence", "janitor", "wait_pr", "wait_ci"]'
+            ),
+        )
+        contents = contents.replace(
+            'dispatch = ".kent/scripts/workflow-verification-dispatch"\n',
+            (
+                'dispatch = ".kent/scripts/workflow-verification-dispatch"\n'
+                'runtime_contracts = ".kent/scripts/workflow_runtime_contracts.py"\n'
+            ),
+        )
+        contents = contents.replace(
+            '[command_versions]\n'
+            'dispatch = "1.0.0"\n',
+            (
+                '[command_versions]\n'
+                'runtime_contracts = "2.0.0"\n'
+                'verify = "2.0.0"\n'
+                'evidence = "2.0.0"\n'
+                'janitor = "2.0.0"\n'
+                'wait_pr = "2.0.0"\n'
+                'wait_ci = "2.0.0"\n'
+            ),
+        )
+        return contents
 
     def run_sync_project_adapters(
         self,
@@ -1198,6 +1230,17 @@ class WorkflowKitTest(unittest.TestCase):
             tuple(parameter.key for parameter in by_key["prepare_pr_no_pr"].parameters),
             ("pr_report",),
         )
+        self.assertTrue(
+            all(
+                parameter.key != "pr_feedback_cursor"
+                for edge in by_key.values()
+                for parameter in edge.parameters
+            )
+        )
+        self.assertNotIn(
+            "{{.Params.pr_feedback_cursor}}",
+            "\n".join(edge.prompt or "" for edge in by_key.values()),
+        )
 
         self.assertTrue(by_key["prepare_pr_fix"].requires_approval)
         self.assertEqual(
@@ -2084,6 +2127,99 @@ class WorkflowKitTest(unittest.TestCase):
             {node.key for node in build_delivery_workflow(profile, 1).nodes},
         )
 
+    def test_schema_four_runtime_v2_requires_complete_conditional_adoption(
+        self,
+    ) -> None:
+        profile = self.load_schema4_profile(
+            lambda _: self.schema4_runtime_v2_contents()
+        )
+        self.assertTrue(profile.runtime_contracts_v2())
+        workflow = build_delivery_workflow(profile, 1)
+        cursor_edges = [
+            edge for edge in workflow.edges
+            if any(
+                parameter.key == "pr_feedback_cursor"
+                for parameter in edge.parameters
+            )
+        ]
+        self.assertTrue(cursor_edges)
+        expected_cursor_edges = {
+            "prepare_pr_ci_watch",
+            "ci_watch_waiting_pr",
+            "ci_watch_diagnose",
+            "ci_monitor_waiting_pr",
+            "ci_monitor_watch",
+            "ci_monitor_needs_user_action",
+            "waiting_pr_watch_merge",
+            "merge_watch_still_waiting",
+            "merge_watch_state_changed",
+            "waiting_pr_needs_user_action",
+            "waiting_pr_fix",
+            "waiting_pr_ci_monitor",
+        }
+        self.assertEqual(
+            {
+                edge.key
+                for edge in cursor_edges
+            },
+            expected_cursor_edges,
+        )
+        self.assertIn(
+            "uninitialized",
+            "\n".join(
+                edge.prompt or ""
+                for edge in workflow.edges
+            ),
+        )
+        self.assertIn(
+            "{{.Params.pr_feedback_cursor}}",
+            "\n".join(edge.prompt or "" for edge in workflow.edges),
+        )
+        delivery_prompts = "\n".join(
+            edge.prompt or ""
+            for edge in workflow.edges
+            if edge.prompt
+        )
+        normalized_delivery_prompts = " ".join(delivery_prompts.split())
+        self.assertIn("deterministic PR watcher", delivery_prompts)
+        self.assertIn("pull_request_feedback_invalid", delivery_prompts)
+        self.assertIn(
+            "delivery preserves supplied cursors",
+            normalized_delivery_prompts,
+        )
+        self.assertIn(
+            "never synthesizes materialized cursors",
+            normalized_delivery_prompts,
+        )
+
+        coexist = self.schema4_runtime_v2_contents().replace(
+            '"wait_ci"]',
+            '"wait_ci", "dispatch"]',
+        ).replace(
+            'wait_ci = "2.0.0"\n',
+            'wait_ci = "2.0.0"\ndispatch = "1.0.0"\n',
+        )
+        coexist_profile = self.load_schema4_profile(lambda _: coexist)
+        self.assertTrue(coexist_profile.runtime_contracts_v2())
+
+        with self.assertRaisesRegex(SpecError, "exact conditional"):
+            self.load_schema4_profile(
+                lambda _: self.schema4_runtime_v2_contents().replace(
+                    '"wait_pr", "wait_ci"]',
+                    '"wait_pr"]',
+                ).replace(
+                    'wait_ci = "2.0.0"\n',
+                    "",
+                )
+            )
+        with self.assertRaisesRegex(SpecError, "all runtime-contract v2"):
+            self.load_schema4_profile(
+                lambda _: self.schema4_runtime_v2_contents().replace(
+                    'evidence = "2.0.0"',
+                    'evidence = "1.0.0"',
+                )
+            )
+
     def test_schema_four_variants_remain_valid_without_legacy_publish(
         self,
     ) -> None:
@@ -2801,6 +2937,29 @@ class WorkflowKitTest(unittest.TestCase):
                 / "project"
                 / "emulator-resource-lock.sh"
             ).read_bytes(),
+        )
+
+    def test_sync_schema4_runtime_v2_copies_byte_identical_support_module(
+        self,
+    ) -> None:
+        root, profile = self.create_schema4_sync_project(
+            lambda _: self.schema4_runtime_v2_contents()
+        )
+        result = self.run_sync_project_adapters(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        support = root / profile.command("runtime_contracts")
+        self.assertEqual(
+            support.read_bytes(),
+            (REPO_ROOT / "workflowkit" / "runtime.py").read_bytes(),
+        )
+        self.assertEqual(support.stat().st_mode & 0o777, 0o755)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            {
+                item["command"] for item in payload["commands"]
+                if item["status"] == "created"
+            },
+            set(profile.kit_managed_commands),
         )
 
     def test_sync_schema4_version_mismatch_does_not_write(self) -> None:
@@ -4123,27 +4282,49 @@ class VerificationReportTest(unittest.TestCase):
         self,
         verifier_body: str,
         *,
-        workflow_input: str = "{}",
-        log_contents: str | None = None,
-    ) -> dict[str, str]:
+        workflow_input: str | None = None,
+    ) -> dict[str, object]:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
-        verifier = root / "verify"
-        verifier.write_text("#!/usr/bin/env bash\n" + verifier_body)
+        scripts = root / ".kent" / "scripts"
+        scripts.mkdir(parents=True)
+        verifier = scripts / "workflow-compile-verify"
+        verifier.write_text("#!/bin/sh\n" + verifier_body)
         verifier.chmod(0o755)
-        log_path = root / "verify.log"
-        if log_contents is not None:
-            log_path.write_text(log_contents)
-
-        environment = os.environ.copy()
-        environment["KENT_WORKFLOW_VERIFY_SCRIPT"] = str(verifier)
-        environment["KENT_WORKFLOW_VERIFY_LOG"] = str(log_path)
+        shutil.copyfile(
+            REPO_ROOT / "workflowkit" / "runtime.py",
+            scripts / "workflow_runtime_contracts.py",
+        )
+        wrapper = scripts / "workflow-verify-report"
+        shutil.copyfile(VERIFY_REPORT, wrapper)
+        wrapper.chmod(0o755)
+        (root / ".gitignore").write_text("/build/\nbuild/kent-workflow/*\n")
+        subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.name", "Kent Test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.email", "kent@example.invalid"],
+            check=True,
+        )
+        (root / "tracked.txt").write_text("ready\n")
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-q", "-m", "Initial"],
+            check=True,
+        )
+        effective_input = (
+            workflow_input
+            if workflow_input is not None
+            else json.dumps({"workspace_path": str(root)})
+        )
         result = subprocess.run(
-            [str(VERIFY_REPORT)],
+            [str(wrapper)],
             cwd=root,
-            env=environment,
-            input=workflow_input,
+            env=os.environ.copy(),
+            input=effective_input,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -4152,10 +4333,21 @@ class VerificationReportTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def parse_verification_report(
+        self,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        report = json.loads(str(payload["verification_report"]))
+        self.assertEqual(
+            set(report),
+            {"schema", "code", "log_path", "log_sha256", "exit_code"},
+        )
+        return report
+
     def test_passed_verifier_reports_passed_even_with_stderr_diagnostics(self) -> None:
         result = self.run_report(
             """echo "diagnostic" >&2
-printf '%s\n' '{"transition":"passed","commentary":"ok","verification_report":"log"}'
+printf '%s\n' '{"transition":"passed"}'
 """
         )
         self.assertEqual(
@@ -4163,48 +4355,75 @@ printf '%s\n' '{"transition":"passed","commentary":"ok","verification_report":"l
             "deterministic_verify_reported",
         )
         self.assertEqual(result["verification_status"], "passed")
+        self.assertEqual(
+            self.parse_verification_report(result)["code"],
+            "passed",
+        )
 
     def test_code_failure_reports_needs_changes(self) -> None:
         result = self.run_report(
             """printf '%s\n' \
-'{"transition":"failed","commentary":"tests failed","verification_report":"assertion"}'
+'{"transition":"failed"}'
 """
         )
         self.assertEqual(result["verification_status"], "needs_changes")
+        self.assertEqual(
+            self.parse_verification_report(result)["code"],
+            "verification_failed",
+        )
 
     def test_environment_failure_reports_blocked(self) -> None:
         result = self.run_report(
             """printf '%s\n' \
-'{"transition":"failed","commentary":"compile failed","verification_report":"see log"}'
+'{"transition":"blocked"}'
 """,
-            log_contents="SDK location not found",
         )
         self.assertEqual(result["verification_status"], "blocked")
+        self.assertEqual(
+            self.parse_verification_report(result)["code"],
+            "verification_blocked",
+        )
 
     def test_stderr_environment_failure_is_case_insensitive(self) -> None:
         result = self.run_report(
             """echo "permission denied while opening toolchain" >&2
 printf '%s\n' \
-'{"transition":"failed","commentary":"compile failed","verification_report":"no log"}'
+'{"transition":"blocked"}'
 """
         )
         self.assertEqual(result["verification_status"], "blocked")
+        self.assertEqual(
+            self.parse_verification_report(result)["code"],
+            "verification_blocked",
+        )
 
-    def test_nonzero_verifier_still_reports_blocked(self) -> None:
+    def test_nonzero_verifier_reports_needs_changes(self) -> None:
         result = self.run_report('echo "boom" >&2\nexit 2\n')
         self.assertEqual(
             result["transition"],
             "deterministic_verify_reported",
         )
-        self.assertEqual(result["verification_status"], "blocked")
+        self.assertEqual(result["verification_status"], "needs_changes")
+        self.assertEqual(
+            self.parse_verification_report(result)["code"],
+            "child_exit_nonzero",
+        )
 
     def test_malformed_verifier_output_still_reports_blocked(self) -> None:
         result = self.run_report("echo not-json\n")
         self.assertEqual(result["verification_status"], "blocked")
+        self.assertEqual(
+            self.parse_verification_report(result)["code"],
+            "child_output_invalid",
+        )
 
     def test_invalid_workflow_input_still_reports_blocked(self) -> None:
         result = self.run_report("exit 99\n", workflow_input="not-json")
         self.assertEqual(result["verification_status"], "blocked")
+        self.assertEqual(
+            self.parse_verification_report(result)["code"],
+            "input_invalid",
+        )
 
 
 if __name__ == "__main__":

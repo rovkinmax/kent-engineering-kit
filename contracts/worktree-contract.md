@@ -76,6 +76,11 @@ the only path to a usable checkout.
   immutable slice history; neither replaces the other.
 - Task Janitor removes this runtime state only as part of safe task cleanup.
 
+Runtime v2 opens workspace, `.kent`, runtime, task, and lock components
+descriptor-relatively with no-following and owner-only regular-file checks.
+Terminal cleanup preserves the ledger and sentinel until the owning Kent
+deletion is acknowledged.
+
 ## MCP project identity
 
 The global MCP adapter separates the current execution root from the primary

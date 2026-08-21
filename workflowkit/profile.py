@@ -37,6 +37,12 @@ RELEASE_TOPOLOGY_ADOPTIONS = {
 }
 WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+RUNTIME_CONTRACT_VERSION = "2.0.0"
+RUNTIME_CONTRACT_COMMANDS = {
+    "runtime_contracts",
+    "verify",
+    "evidence",
+}
 ROLE_PROMPT_DIRECTORIES = (
     Path(".kent/subagents"),
     Path(".kent/agents"),
@@ -474,6 +480,65 @@ class ProjectProfile:
                     "major.minor.patch format"
                 )
 
+        runtime_keys = set(self.kit_managed_commands) & {
+            "runtime_contracts",
+            "verify",
+            "evidence",
+            "janitor",
+            "wait_pr",
+            "wait_ci",
+        }
+        runtime_versions = {
+            key for key, value in self.command_versions.items()
+            if key in runtime_keys and value == RUNTIME_CONTRACT_VERSION
+        }
+        v2_adoption = "runtime_contracts" in runtime_keys
+        if v2_adoption:
+            if self.command_versions.get("runtime_contracts") != RUNTIME_CONTRACT_VERSION:
+                raise SpecError(
+                    "runtime_contracts adoption requires command_versions.runtime_contracts = "
+                    f"{RUNTIME_CONTRACT_VERSION!r}"
+                )
+            expected = set(RUNTIME_CONTRACT_COMMANDS)
+            if self.capabilities.get("managed_worktrees", False):
+                expected.add("janitor")
+            if self.capabilities.get("pull_requests", False):
+                expected.add("wait_pr")
+            if self.capabilities.get("ci_monitoring", False):
+                expected.add("wait_ci")
+            if runtime_keys != expected:
+                raise SpecError(
+                    "runtime-contract v2 kit_managed_commands must contain the "
+                    "exact conditional runtime subset "
+                    f"{sorted(expected)!r}"
+                )
+            if any(
+                self.command_versions.get(key) != RUNTIME_CONTRACT_VERSION
+                for key in expected
+            ):
+                raise SpecError(
+                    "all runtime-contract v2 managed commands must use "
+                    f"{RUNTIME_CONTRACT_VERSION!r}"
+                )
+            support_parent = Path(self.command("runtime_contracts")).parent
+            for key in sorted(expected):
+                if Path(self.command(key)).parent != support_parent:
+                    raise SpecError(
+                        "runtime-contract v2 managed command paths must share "
+                        "the runtime_contracts parent directory"
+                    )
+        elif runtime_versions or any(
+            key in runtime_keys for key in ("verify", "evidence", "janitor", "wait_pr", "wait_ci")
+        ):
+            if runtime_versions:
+                raise SpecError(
+                    "command version 2.0.0 requires runtime_contracts adoption"
+                )
+            if "runtime_contracts" in self.command_versions:
+                raise SpecError(
+                    "runtime_contracts must be managed to adopt runtime contracts"
+                )
+
         if self.release is None:
             raise SpecError("profile schema 4 requires a release table")
         if self.release.topology_kind not in RELEASE_TOPOLOGY_ADOPTIONS:
@@ -591,6 +656,14 @@ class ProjectProfile:
         return (
             self.schema_version == 3
             and self.release_topology == PACKAGE_PUBLISH_TOPOLOGY
+        )
+
+    def runtime_contracts_v2(self) -> bool:
+        return (
+            self.schema_version == 4
+            and "runtime_contracts" in self.kit_managed_commands
+            and self.command_versions.get("runtime_contracts")
+            == RUNTIME_CONTRACT_VERSION
         )
 
     def command(self, key: str) -> str:

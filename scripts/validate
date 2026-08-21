@@ -2,6 +2,15 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+installed_state=0
+if [[ "${1:-}" == "--installed-state" ]]; then
+  installed_state=1
+  shift
+fi
+if [[ $# -ne 0 ]]; then
+  echo "usage: scripts/validate [--installed-state]" >&2
+  exit 2
+fi
 kent_root="${KENT_PERSISTENCE_ROOT:-$HOME/.kent}"
 
 bash -n "$repo_root/scripts/install"
@@ -19,7 +28,6 @@ bash -n "$repo_root/templates/project/jira-api.sh"
 bash -n "$repo_root/templates/project/mobile-evidence-audit.sh"
 bash -n "$repo_root/templates/project/sentry-issues.sh"
 bash -n "$repo_root/templates/project/workflow-verification-dispatch"
-bash -n "$repo_root/templates/project/workflow-verify-report"
 bash -n "$repo_root/templates/project/workflow-plan-contract-accept"
 bash -n "$repo_root/templates/project/workflow-plan-contract-continue"
 bash -n "$repo_root/templates/project/workflow-plan-contract-fix-continue"
@@ -29,6 +37,7 @@ python3 -m py_compile \
   "$repo_root/templates/project/workflow-branch-identity" \
   "$repo_root/templates/project/workflow-checkpoint" \
   "$repo_root/templates/project/workflow-evidence-ledger" \
+  "$repo_root/templates/project/workflow-verify-report" \
   "$repo_root/templates/project/workflow-plan-contract" \
   "$repo_root/templates/project/workflow-wait-github-ci" \
   "$repo_root/templates/project/workflow-wait-github-pr" \
@@ -245,6 +254,7 @@ for skill_file in "$repo_root"/skills/*/SKILL.md; do
   echo "$name" >>"$names_file"
 done
 
+if [[ "$installed_state" -eq 1 ]]; then
 for target in \
   "$kent_root/AGENTS.md" \
   "$kent_root/bin/kent-mcp-call" \
@@ -348,6 +358,7 @@ def compare(expected_value, actual_value, path):
 
 compare(expected, actual, "config")
 PY
+fi
 
 python3 - "$repo_root/contracts/project-profile.example.toml" <<'PY'
 import pathlib
@@ -412,7 +423,9 @@ python3 -m compileall -q \
   "$repo_root/workflowkit" \
   "$repo_root/scripts/generate-workflow" \
   "$repo_root/scripts/sync-project-adapters"
-"$repo_root/scripts/configure-mcporter"
+if [[ "$installed_state" -eq 1 ]]; then
+  "$repo_root/scripts/configure-mcporter"
+fi
 PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
   python3 -m unittest discover -s "$repo_root/tests" -p 'test_*.py'
 "$repo_root/tests/test_mcp_adapter.sh"

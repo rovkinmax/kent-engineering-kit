@@ -40,6 +40,10 @@ class CommandTemplate:
 
 
 COMMAND_TEMPLATES = {
+    "runtime_contracts": CommandTemplate(
+        REPO_ROOT / "workflowkit" / "runtime.py",
+        "2.0.0",
+    ),
     "branch_identity": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-branch-identity",
         "1.0.0",
@@ -50,7 +54,7 @@ COMMAND_TEMPLATES = {
     ),
     "evidence": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-evidence-ledger",
-        "1.0.0",
+        "2.0.0",
     ),
     "plan_contract": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-plan-contract",
@@ -80,7 +84,7 @@ COMMAND_TEMPLATES = {
     ),
     "wait_ci": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-wait-github-ci",
-        "1.0.0",
+        "2.0.0",
     ),
     "dispatch": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch",
@@ -88,12 +92,24 @@ COMMAND_TEMPLATES = {
     ),
     "janitor": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-task-janitor",
-        "1.0.0",
+        "2.0.0",
     ),
     "wait_pr": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-wait-github-pr",
-        "1.0.0",
+        "2.0.0",
     ),
+    "verify": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-verify-report",
+        "2.0.0",
+    ),
+}
+V2_COMMANDS = {
+    "runtime_contracts",
+    "verify",
+    "evidence",
+    "janitor",
+    "wait_ci",
+    "wait_pr",
 }
 
 
@@ -265,6 +281,8 @@ def validate_schema4_command_versions(profile: ProjectProfile) -> None:
                 f"no toolkit template exists for managed command {key!r}"
             )
         expected = template.version
+        if key in V2_COMMANDS and not profile.runtime_contracts_v2():
+            expected = "1.0.0"
         actual = profile.command_versions[key]
         if actual != expected:
             raise ValueError(
@@ -320,7 +338,7 @@ def synchronize_schema3(
             continue
         target = project_target(project_root, configured_path)
         template = COMMAND_TEMPLATES.get(key)
-        if template is None:
+        if template is None or key in V2_COMMANDS:
             continue
         status_label = synchronize(
             template.source,
@@ -387,6 +405,20 @@ def plan_schema4(
             continue
         target = project_target(project_root, configured_path)
         if key in managed_command_keys:
+            if key in V2_COMMANDS and not profile.runtime_contracts_v2():
+                validate_project_owned_target(
+                    target,
+                    kind="command",
+                )
+                status_label = "project-owned"
+                results["commands"].append(
+                    {
+                        "command": key,
+                        "status": status_label,
+                        "target": str(target),
+                    }
+                )
+                continue
             template = COMMAND_TEMPLATES.get(key)
             if template is None:
                 raise ValueError(

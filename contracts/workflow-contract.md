@@ -52,6 +52,8 @@ implementation.
   or staged files. A candidate defect is reported and repaired on a separately
   authorized revision/task; the immutable candidate is never patched in place.
 
+Runtime v2 is atomic.
+
 ## User-facing workflow communication
 
 - Direct questions, transition commentary, `blocker_reason`, `closure_reason`,
@@ -407,15 +409,6 @@ defined by `contracts/plan-contract.md`.
   the authorized final-tree invariant, and update only the task branch with
   force-with-lease. Any lease, tree, target-tip, or authorization mismatch
   returns `needs_user_action`.
-- CI checks authoritative PR state before classifying failures. If the PR is
-  already merged, a late failed check never returns the merged task to Fix;
-  Cleanup receives the merge proof and late-CI report, while any actionable
-  regression is tracked as a separate follow-up task. While a PR remains open,
-  `needs_changes` requires task-differential evidence. Baseline, flaky,
-  unrelated, or unattributed failures use `needs_user_action`.
-- Pending, queued, and in-progress CI are not blockers or transitions. CI uses
-  one blocking first-party watcher for the exact PR/run and waits for terminal
-  green/red/canceled state without spending a model turn per poll.
 - CI may automatically retry one exact failed GitHub Actions job on an
   unchanged PR head when first-party metadata and bounded logs prove either an
   infrastructure cancellation or an eligible test-execution failure.
@@ -454,6 +447,10 @@ defined by `contracts/plan-contract.md`.
   source-control provider's closing reference (`Fixes #N` on GitHub). A
   cross-repository, partial, or follow-up relationship is linked without a
   closing keyword.
+
+### CI limit
+Authority(repo/head/envelope/digest)>projection/grammar/encode; mismatch→ordinary/null; pending waits; late→Cleanup; open→diff; receipt=projected_rows×5; unexpected=sorted−expected; >10,000 before duplicate/terminal.
+Bounded canonical encoder: sorted-key compact UTF-8 parity(ensure_ascii=false,allow_nan=false); strings emitted in escaped pieces; no complete oversized token/string kept; nesting=100; RecursionError→RuntimeContractError; hash 4 MiB+1→hard_limit, not wire; observation_limit=report_invalid/[]/null,count+digest≤2147483647; hard_limit=zero count/empty digests; child≤4 MiB+1→terminate/reap groups; >48 KiB→convert; history bounded.
 
 ## Smoke policy
 

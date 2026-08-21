@@ -3,6 +3,11 @@
 Live workflow definitions are stored in Kent. Project JSON files are audit
 snapshots, not an alternate source of truth.
 
+Runtime v2 is selected only by the schema-4 `runtime_contracts@2.0.0`
+adoption discriminator. It adds the validated `pr_feedback_cursor` carrier to
+existing delivery edges without adding nodes or changing transition ownership.
+Legacy schema-3 and schema-4 workflow output remains v1-compatible.
+
 ## Supported Baseline
 
 - Kent 2.6.1 or newer;
