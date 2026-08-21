@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import shlex
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 
 
@@ -12,14 +16,84 @@ SCRIPT = REPO_ROOT / "scripts" / "configure-mcporter"
 
 
 class ConfigureMcporterTest(unittest.TestCase):
-    def run_script(self, config: Path, *arguments: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [str(SCRIPT), "--config", str(config), *arguments],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+    def run_script(
+        self,
+        config: Path,
+        *arguments: str,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            fake_mcporter = Path(directory) / "mcporter"
+            fake_mcporter.write_text(
+                textwrap.dedent(
+                    f"""\
+                    exec {shlex.quote(str(Path(sys.executable).resolve()))} \
+                      - "$@" <<'PYTHON'
+                    import json
+                    import os
+                    from pathlib import Path
+                    import sys
+
+                    arguments = sys.argv[1:]
+                    if len(arguments) < 3 or arguments[0] != "--config":
+                        raise SystemExit(2)
+                    config = Path(arguments[1])
+                    command = arguments[2:]
+
+                    if command == ["config", "get", "mobile", "--json"]:
+                        if not config.is_file():
+                            raise SystemExit(1)
+                        value = json.loads(config.read_text())
+                        entry = value.get("mcpServers", {{}}).get("mobile")
+                        if not isinstance(entry, dict):
+                            raise SystemExit(1)
+                        result = dict(entry)
+                        result["source"] = {{
+                            "path": os.path.realpath(config),
+                        }}
+                        print(json.dumps(result))
+                        raise SystemExit(0)
+
+                    if command == [
+                        "config",
+                        "add",
+                        "mobile",
+                        "--command",
+                        "npx",
+                        "--",
+                        "-y",
+                        "claude-in-mobile@latest",
+                    ]:
+                        value = (
+                            json.loads(config.read_text())
+                            if config.is_file()
+                            else {{}}
+                        )
+                        value.setdefault("mcpServers", {{}})["mobile"] = {{
+                            "command": "npx",
+                            "args": ["-y", "claude-in-mobile@latest"],
+                        }}
+                        config.write_text(json.dumps(value))
+                        raise SystemExit(0)
+
+                    raise SystemExit(2)
+                    PYTHON
+                    """
+                )
+            )
+            fake_mcporter.chmod(0o700)
+            environment = os.environ.copy()
+            inherited_path = environment.get("PATH", "")
+            environment["PATH"] = str(fake_mcporter.parent) + (
+                os.pathsep + inherited_path if inherited_path else ""
+            )
+            return subprocess.run(
+                [str(SCRIPT), "--config", str(config), *arguments],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                check=False,
+            )
 
     def test_apply_adds_mobile_and_preserves_existing_servers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
