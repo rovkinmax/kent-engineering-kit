@@ -5556,6 +5556,24 @@ class GitHubPrWatchTest(GitRepositoryTest):
 
 
 class WorkflowJanitorTest(GitRepositoryTest):
+    def _write_valid_runtime_file(
+        self,
+        path: Path,
+        content: str | bytes = b"",
+    ) -> None:
+        payload = content.encode() if isinstance(content, str) else content
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(payload)
+        finally:
+            os.close(descriptor)
+
     def install_v2_runtime_commands(self, root: Path) -> Path:
         scripts = root / ".kent" / "scripts"
         scripts.mkdir(parents=True)
@@ -6063,7 +6081,10 @@ class WorkflowJanitorTest(GitRepositoryTest):
         tombstone = runtime_dir / f".evidence-cleanup-{digest}"
         active.rename(tombstone)
         (tombstone / "evidence-ledger.jsonl").unlink()
-        (runtime_dir / f".evidence-terminal-{hashlib.sha256(b'TASK-1').hexdigest()}").write_bytes(b"")
+        sentinel = runtime_dir / (
+            ".evidence-terminal-" + hashlib.sha256(b"TASK-1").hexdigest()
+        )
+        self._write_valid_runtime_file(sentinel)
         result = subprocess.run(
             [str(scripts / "workflow-task-janitor")],
             input=self.janitor_input(root, cleanup_report=marker_line),
@@ -6094,9 +6115,11 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         active.rename(tombstone)
         for name in ("fix-checkpoint.json", "smoke-checkpoint.json"):
-            (tombstone / name).write_text("{}\n")
-        sentinel = runtime_dir / f".evidence-terminal-{hashlib.sha256(b'TASK-1').hexdigest()}"
-        sentinel.write_bytes(b"")
+            self._write_valid_runtime_file(tombstone / name, "{}\n")
+        sentinel = runtime_dir / (
+            ".evidence-terminal-" + hashlib.sha256(b"TASK-1").hexdigest()
+        )
+        self._write_valid_runtime_file(sentinel)
         janitor = load_template_module(
             scripts / "workflow-task-janitor",
             "janitor_checkpoint_order_test",
@@ -6140,12 +6163,12 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 )
                 (runtime_dir / "TASK-1").rename(tombstone)
                 for entry in subset:
-                    (tombstone / entry).write_text("{}\n")
+                    self._write_valid_runtime_file(tombstone / entry, "{}\n")
                 sentinel = runtime_dir / (
                     ".evidence-terminal-"
                     + hashlib.sha256(b"TASK-1").hexdigest()
                 )
-                sentinel.write_bytes(b"")
+                self._write_valid_runtime_file(sentinel)
                 janitor = load_template_module(
                     scripts / "workflow-task-janitor",
                     "janitor_checkpoint_subset_test",
@@ -6240,14 +6263,22 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 )
                 runtime_inode = runtime_dir.stat().st_ino
                 tombstone_path = None
+                tombstone_identity = None
                 if name == "ledger":
-                    (task / "fix-checkpoint.json").write_text("{}\n")
-                    (task / "smoke-checkpoint.json").write_text("{}\n")
+                    self._write_valid_runtime_file(
+                        task / "fix-checkpoint.json",
+                        "{}\n",
+                    )
+                    self._write_valid_runtime_file(
+                        task / "smoke-checkpoint.json",
+                        "{}\n",
+                    )
                 fired = False
                 runtime_calls = 0
 
                 def injected(fd: int) -> None:
-                    nonlocal fired, runtime_calls, tombstone_path
+                    nonlocal fired, runtime_calls, tombstone_identity
+                    nonlocal tombstone_path
                     metadata = janitor.os.fstat(fd)
                     if name == "rename_runtime_parent":
                         matches = (
@@ -6277,9 +6308,17 @@ class WorkflowJanitorTest(GitRepositoryTest):
                             ]
                             if tombstones:
                                 tombstone_path = tombstones[0]
+                                tombstone_metadata = tombstone_path.stat()
+                                tombstone_identity = (
+                                    tombstone_metadata.st_dev,
+                                    tombstone_metadata.st_ino,
+                                )
                         matches = (
                             tombstone_path is not None
-                            and metadata.st_ino == tombstone_path.stat().st_ino
+                            and tombstone_identity
+                            == (metadata.st_dev, metadata.st_ino)
+                            and tombstone_path.is_dir()
+                            and not any(tombstone_path.iterdir())
                         )
                     else:
                         matches = (
@@ -6458,14 +6497,15 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 (runtime_dir / "TASK-1").rename(tombstone)
                 for entry in entries:
                     if entry != "evidence-ledger.jsonl":
-                        (tombstone / entry).write_text("{}\n")
-                (
-                    runtime_dir
-                    / (
-                        ".evidence-terminal-"
-                        + hashlib.sha256(b"TASK-1").hexdigest()
-                    )
-                ).write_bytes(b"")
+                        self._write_valid_runtime_file(
+                            tombstone / entry,
+                            "{}\n",
+                        )
+                sentinel = runtime_dir / (
+                    ".evidence-terminal-"
+                    + hashlib.sha256(b"TASK-1").hexdigest()
+                )
+                self._write_valid_runtime_file(sentinel)
                 janitor = load_template_module(
                     scripts / "workflow-task-janitor",
                     "janitor_fsync_{}".format(name),
@@ -7084,7 +7124,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         sentinel = runtime_dir / (
             ".evidence-terminal-" + hashlib.sha256(b"TASK-1").hexdigest()
         )
-        sentinel.write_bytes(b"")
+        self._write_valid_runtime_file(sentinel)
         inode = sentinel.stat().st_ino
         janitor = load_template_module(
             scripts / "workflow-task-janitor",
@@ -7133,7 +7173,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         sentinel = runtime_dir / (
             ".evidence-terminal-" + hashlib.sha256(b"TASK-1").hexdigest()
         )
-        sentinel.write_bytes(b"")
+        self._write_valid_runtime_file(sentinel)
         runtime_inode = runtime_dir.stat().st_ino
         janitor = load_template_module(
             scripts / "workflow-task-janitor",
