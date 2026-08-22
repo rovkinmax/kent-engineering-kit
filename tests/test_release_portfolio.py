@@ -73,6 +73,21 @@ class ReleasePortfolioTest(unittest.TestCase):
             with self.assertRaises(Exception):
                 verify_release_portfolio(plan)
 
+    def test_runtime_report_path_cannot_be_supplied_without_write_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = {"schema": "release-portfolio-plan-v1"}
+            path, digest = plan_file(root, value)
+            plan = load_plan(
+                path,
+                schema="release-portfolio-plan-v1",
+                expected_sha256=digest,
+            )
+            with self.assertRaises(PlanValidationError):
+                verify_release_portfolio(
+                    plan, report_path=root / "report.json", write_report=False
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -892,6 +892,8 @@ def verify_release_portfolio(
     report_path: Path | None = None,
     write_report: bool = False,
 ) -> dict[str, Any]:
+    if report_path is not None and not write_report:
+        raise PlanValidationError("report_path is allowed only with write_report")
     data = _closed(plan.value, {"schema", "kit", "projects", "report_path"}, "portfolio plan")
     kit = _closed(_required(data, "kit", "portfolio plan"), {"root", "repository", "commit"}, "kit")
     kit_root = _absolute_path(_required(kit, "root", "kit"), "kit.root")
@@ -3329,6 +3331,9 @@ def activate_primary_checkout(
         _activation_preflight(data)
         if _git(data["primary_root"], "rev-parse", "HEAD") != data["target_commit"]:
             raise OperationError("primary target readback mismatch")
+        final_prompt = _activation_lstat(Path(data["role"]["prompt_path"]))
+        if final_prompt["kind"] != "symlink" or Path(data["role"]["prompt_path"]).resolve() != Path(data["role"]["kit_prompt_path"]).resolve():
+            raise OperationError("final release-decision prompt readback mismatch")
         journal.persist({**journal.state, "phase": "verified"})
         return {
             "schema": "kit-primary-activation-report-v2",

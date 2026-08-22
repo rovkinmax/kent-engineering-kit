@@ -7,7 +7,12 @@ import subprocess
 import tempfile
 import unittest
 
-from workflowkit.operations import activate_primary_checkout, canonical_bytes, load_plan
+from workflowkit.operations import (
+    OperationJournal,
+    activate_primary_checkout,
+    canonical_bytes,
+    load_plan,
+)
 
 
 def git(root: Path, *args: str) -> str:
@@ -40,6 +45,8 @@ class PrimaryActivationTest(unittest.TestCase):
             git(root, "reset", "--hard", "-q", baseline)
             kit_prompt = root.parent / "kit-release-decision.md"
             kit_prompt.write_text("release decision\n")
+            config = root.parent / "config.toml"
+            config.write_text("[roles.release_decision]\nprompt = true\n")
             value = {
                 "schema": "kit-primary-activation-plan-v1",
                 "state_dir": str(root.parent / "state"),
@@ -49,13 +56,18 @@ class PrimaryActivationTest(unittest.TestCase):
                 "target_commit": target,
                 "role": {
                     "prompt_path": str(root.parent / "installed-release-decision.md"),
-                    "config_path": str(root.parent / "config.toml"),
+                    "config_path": str(config),
                     "kit_prompt_path": str(kit_prompt),
                     "expected_prompt_sha256": hashlib.sha256(
                         b"installed\n"
                     ).hexdigest(),
                 },
                 "git_config_allowlist": {},
+                "tracking": None,
+                "installed_links": [],
+                "prompt_prestate": {"kind": "absent", "target": None, "sha256": None},
+                "backups": {"path": str(root.parent / "installed-release-decision.md.release-decision.backup"), "kind": "absent", "sha256": None},
+                "source_prompt_sha256": hashlib.sha256(b"release decision\n").hexdigest(),
             }
             path = root.parent / "plan.json"
             raw = canonical_bytes(value)
@@ -65,6 +77,8 @@ class PrimaryActivationTest(unittest.TestCase):
                 schema="kit-primary-activation-plan-v1",
                 expected_sha256=hashlib.sha256(raw).hexdigest(),
             )
+            with OperationJournal(root.parent / "state", "kit-primary-activation", plan) as journal:
+                journal.persist({"phase": "prepared", "effects": {}})
             report = activate_primary_checkout(
                 plan, mode="rollback", confirm=True
             )
