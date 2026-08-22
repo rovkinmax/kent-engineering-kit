@@ -373,41 +373,66 @@ def _safe_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+_CHILD_GATE = r"""
+import base64, json, os, sys
+release_fd = int(sys.argv[1])
+command = json.loads(base64.b64decode(sys.argv[2]).decode())
+cwd = sys.argv[3]
+env = json.loads(base64.b64decode(sys.argv[4]).decode())
+if not os.read(release_fd, 1):
+    raise SystemExit(125)
+os.close(release_fd)
+os.chdir(cwd)
+os.execve(command[0], command, env)
+"""
+
 _GUARDIAN = r"""
 import base64, json, os, selectors, signal, subprocess, sys
 lock_fd = int(sys.argv[1])
 report_fd = int(sys.argv[2])
-command = json.loads(base64.b64decode(sys.argv[3]).decode())
-cwd = sys.argv[4]
-env = json.loads(base64.b64decode(sys.argv[5]).decode())
-limit = int(sys.argv[6])
-stdin_bytes = base64.b64decode(sys.argv[7])
-child = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, stdin=subprocess.PIPE, close_fds=True,
-                         pass_fds=(lock_fd,))
-if stdin_bytes:
-    child.stdin.write(stdin_bytes)
-child.stdin.close()
-os.write(report_fd, (json.dumps({"pid": child.pid}) + "\n").encode())
+control_fd = int(sys.argv[3])
+command = json.loads(base64.b64decode(sys.argv[4]).decode())
+cwd = sys.argv[5]
+env = json.loads(base64.b64decode(sys.argv[6]).decode())
+limit = int(sys.argv[7])
+stdin_bytes = base64.b64decode(sys.argv[8])
+gate_read, gate_write = os.pipe()
+gate = subprocess.Popen(
+    [sys.executable, "-c", sys.argv[9], str(gate_read),
+     base64.b64encode(json.dumps(command, separators=(",", ":")).encode()).decode(),
+     cwd, base64.b64encode(json.dumps(env, separators=(",", ":")).encode()).decode()],
+    cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE, close_fds=True, pass_fds=(lock_fd, gate_read),
+    start_new_session=True)
+os.close(gate_read)
+os.write(report_fd, (json.dumps({"pid": gate.pid}) + "\n").encode())
 os.close(report_fd)
-streams = {child.stdout: bytearray(), child.stderr: bytearray()}
-buffers = {child.stdout: streams[child.stdout], child.stderr: streams[child.stderr]}
-selector = selectors.DefaultSelector()
-for stream in streams:
-    selector.register(stream, selectors.EVENT_READ)
 def stop(signum, _frame):
     try:
-        child.terminate()
-        child.wait(timeout=5)
+        gate.terminate()
+        gate.wait(timeout=5)
     except Exception:
         try:
-            child.kill()
-            child.wait(timeout=2)
+            gate.kill()
+            gate.wait(timeout=2)
         except Exception:
             pass
     raise SystemExit(128 + signum)
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
+if not os.read(control_fd, 1):
+    stop(signal.SIGTERM, None)
+os.close(control_fd)
+os.write(gate_write, b"1")
+os.close(gate_write)
+if stdin_bytes:
+    gate.stdin.write(stdin_bytes)
+gate.stdin.close()
+streams = {gate.stdout: bytearray(), gate.stderr: bytearray()}
+buffers = {gate.stdout: streams[gate.stdout], gate.stderr: streams[gate.stderr]}
+selector = selectors.DefaultSelector()
+for stream in streams:
+    selector.register(stream, selectors.EVENT_READ)
 while streams:
     for key, _ in selector.select(0.1):
         chunk = key.fileobj.read1(65536)
@@ -416,14 +441,14 @@ while streams:
             streams.pop(key.fileobj, None)
         elif len(buffers[key.fileobj]) < limit:
             buffers[key.fileobj].extend(chunk[:limit-len(buffers[key.fileobj])])
-    if child.poll() is not None and not streams:
+    if gate.poll() is not None and not streams:
         break
-child.wait()
-sys.stdout.buffer.write(bytes(buffers.get(child.stdout, b""))[-limit:])
-sys.stderr.buffer.write(bytes(buffers.get(child.stderr, b""))[-limit:])
+gate.wait()
+sys.stdout.buffer.write(bytes(buffers.get(gate.stdout, b""))[-limit:])
+sys.stderr.buffer.write(bytes(buffers.get(gate.stderr, b""))[-limit:])
 sys.stdout.flush()
 sys.stderr.flush()
-raise SystemExit(child.returncode)
+raise SystemExit(gate.returncode)
 """
 
 
@@ -467,6 +492,7 @@ class EffectResult:
     stderr_sha256: str
     guardian_pid: int | None
     child_pid: int | None
+    settlement: str | None = None
 
 
 def run_effect(
@@ -480,13 +506,33 @@ def run_effect(
     postimage_sha256: str | None = None,
     extra_env: Mapping[str, str] | None = None,
     stdin_bytes: bytes | None = None,
+    current_sha256: Callable[[], str] | None = None,
 ) -> EffectResult:
     if timeout <= 0 or timeout > 300:
         raise PlanValidationError("effect timeout must be between 0 and 300 seconds")
     command = _argv(list(command), "effect command")
-    if not Path(command[0]).is_absolute():
-        raise PlanValidationError("effect executable must be an absolute path")
+    executable = Path(command[0])
+    if (
+        not executable.is_absolute()
+        or executable.is_symlink()
+        or not executable.is_file()
+        or not os.access(executable, os.X_OK)
+    ):
+        raise PlanValidationError("effect executable must be a regular executable file")
     cwd = _absolute_path(str(cwd), "effect cwd")
+    if not cwd.is_dir() or cwd.is_symlink():
+        raise PlanValidationError("effect cwd must be a regular directory")
+    if stdin_bytes is not None and len(stdin_bytes) > MAX_OUTPUT:
+        raise PlanValidationError("effect stdin is too large")
+    for name, value in (
+        ("preimage_sha256", preimage_sha256),
+        ("postimage_sha256", postimage_sha256),
+    ):
+        if value is not None:
+            _sha256(value, name)
+    if current_sha256 is not None and not callable(current_sha256):
+        raise PlanValidationError("current readback must be callable")
+    env = _safe_env(extra_env)
     digest = canonical_sha256(command)
     state = journal.state or {}
     effects = dict(state.get("effects") or {})
@@ -496,7 +542,7 @@ def run_effect(
         if status == "settled_preimage":
             if previous.get("settled_invocation") == journal.invocation_id:
                 raise JournalError("same-cycle effect replay is forbidden")
-        elif status not in {None}:
+        elif status not in {None, "settled_preimage"}:
             raise JournalError(f"effect {effect_key!r} is already {status!r}")
     effects[effect_key] = {
         "status": "attempted",
@@ -512,13 +558,11 @@ def run_effect(
     if lock_fd is None:
         raise JournalError("effect requires the held operation lock")
     read_fd, write_fd = os.pipe()
-    env = _safe_env(extra_env)
+    control_read, control_write = os.pipe()
     encoded_command = base64.b64encode(canonical_bytes(command)).decode()
     encoded_env = base64.b64encode(canonical_bytes(env)).decode()
     if stdin_bytes is None:
         stdin_bytes = b""
-    if len(stdin_bytes) > MAX_OUTPUT:
-        raise PlanValidationError("effect stdin is too large")
     encoded_stdin = base64.b64encode(stdin_bytes).decode()
     guardian = subprocess.Popen(
         [
@@ -527,45 +571,77 @@ def run_effect(
             _GUARDIAN,
             str(lock_fd),
             str(write_fd),
+            str(control_read),
             encoded_command,
             str(cwd),
             encoded_env,
             str(MAX_OUTPUT),
             encoded_stdin,
+            _CHILD_GATE,
         ],
         cwd=str(cwd),
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        pass_fds=(lock_fd, write_fd),
+        pass_fds=(lock_fd, write_fd, control_read),
         start_new_session=True,
         close_fds=True,
     )
     os.close(write_fd)
+    os.close(control_read)
     child_pid: int | None = None
+    acknowledged = False
+    acknowledgement_error: EffectBlocked | None = None
     try:
         acknowledgement = selectors.DefaultSelector()
         acknowledgement.register(read_fd, selectors.EVENT_READ)
         if not acknowledgement.select(timeout):
-            raise EffectBlocked("effect guardian acknowledgement timed out")
-        data = os.read(read_fd, 4096)
-        if not data:
-            raise EffectBlocked("effect guardian acknowledgement was lost")
-        child_pid = int(json.loads(data.splitlines()[0].decode())["pid"])
-        if data:
-            child_pid = int(json.loads(data.splitlines()[0].decode())["pid"])
+            acknowledgement_error = EffectBlocked(
+                "effect guardian acknowledgement timed out"
+            )
+        else:
+            data = os.read(read_fd, 4096)
+            if not data:
+                acknowledgement_error = EffectBlocked(
+                    "effect guardian acknowledgement was lost"
+                )
+            else:
+                child_pid = int(json.loads(data.splitlines()[0].decode())["pid"])
+                if not _pid_alive(child_pid):
+                    acknowledgement_error = EffectBlocked(
+                        "effect child is not alive after acknowledgement"
+                    )
+                else:
+                    acknowledged = True
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
-        guardian.terminate()
-        try:
-            guardian.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            guardian.kill()
-            guardian.wait(timeout=2)
-        raise EffectBlocked("effect guardian acknowledgement was invalid") from error
+        acknowledgement_error = EffectBlocked(
+            "effect guardian acknowledgement was invalid"
+        )
+        acknowledgement_error.__cause__ = error
     finally:
         os.close(read_fd)
+    if not acknowledged:
+        try:
+            guardian.terminate()
+            guardian.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                guardian.kill()
+                guardian.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        os.close(control_write)
+        effects[effect_key]["status"] = "unresolved"
+        journal.persist({**journal.state, "effects": effects})
+        raise acknowledgement_error or EffectBlocked(
+            "effect guardian acknowledgement was not durable"
+        )
     effects[effect_key]["child"] = {"guardian_pid": guardian.pid, "child_pid": child_pid}
     journal.persist({**journal.state, "effects": effects})
+    try:
+        os.write(control_write, b"1")
+    finally:
+        os.close(control_write)
     try:
         stdout, stderr = _bounded_communicate(guardian, timeout)
     except subprocess.TimeoutExpired as error:
@@ -575,7 +651,7 @@ def run_effect(
         except subprocess.TimeoutExpired:
             guardian.kill()
             guardian.wait(timeout=2)
-        effects[effect_key]["status"] = "ambiguous"
+        effects[effect_key]["status"] = "unresolved"
         journal.persist({**journal.state, "effects": effects})
         raise EffectBlocked(f"effect {effect_key!r} timed out") from error
     result = EffectResult(
@@ -591,9 +667,29 @@ def run_effect(
         "stdout_sha256": result.stdout_sha256,
         "stderr_sha256": result.stderr_sha256,
     }
-    effects[effect_key]["status"] = "verified" if result.returncode == 0 else "failed"
+    effects[effect_key]["status"] = "unresolved"
     journal.persist({**journal.state, "effects": effects})
-    if result.returncode:
+    if current_sha256 is None:
+        if result.returncode:
+            raise EffectFailed(f"effect {effect_key!r} exited {result.returncode}")
+        raise EffectBlocked("effect requires an exact current-state readback")
+    settlement = _settle_effect(
+        journal,
+        effect_key,
+        current_sha256(),
+        preimage_sha256,
+        postimage_sha256,
+    )
+    result = EffectResult(
+        result.command_digest,
+        result.returncode,
+        result.stdout_sha256,
+        result.stderr_sha256,
+        result.guardian_pid,
+        result.child_pid,
+        settlement,
+    )
+    if result.returncode and settlement not in {"preimage", "postimage"}:
         raise EffectFailed(f"effect {effect_key!r} exited {result.returncode}")
     return result
 
@@ -608,19 +704,21 @@ def _pid_alive(pid: int | None) -> bool:
     return True
 
 
-def recover_effect(
+def _settle_effect(
     journal: OperationJournal,
-    *,
     effect_key: str,
+    current: str,
     preimage_sha256: str | None,
     postimage_sha256: str | None,
-    current_sha256: Callable[[], str],
 ) -> str:
-    state = journal.require_phase({"prepared", "in_progress", "activation_committed"})
+    state = journal.state or {}
     entry = (state.get("effects") or {}).get(effect_key)
-    if not isinstance(entry, dict) or entry.get("status") != "attempted":
-        raise JournalError(f"effect {effect_key!r} is not awaiting settlement")
-    current = current_sha256()
+    if not isinstance(entry, dict):
+        raise JournalError(f"effect {effect_key!r} is not journaled")
+    if entry.get("preimage_sha256") != preimage_sha256:
+        raise JournalError("effect preimage identity drifted")
+    if entry.get("postimage_sha256") != postimage_sha256:
+        raise JournalError("effect postimage identity drifted")
     if postimage_sha256 and current == postimage_sha256:
         entry["status"] = "verified"
         journal.persist({**state, "effects": state["effects"]})
@@ -633,6 +731,37 @@ def recover_effect(
     entry["status"] = "ambiguous"
     journal.persist({**state, "effects": state["effects"]})
     raise EffectBlocked("effect completion is ambiguous")
+
+
+def recover_effect(
+    journal: OperationJournal,
+    *,
+    effect_key: str,
+    preimage_sha256: str | None,
+    postimage_sha256: str | None,
+    current_sha256: Callable[[], str],
+) -> str:
+    state = journal.require_phase({"prepared", "in_progress", "activation_committed"})
+    entry = (state.get("effects") or {}).get(effect_key)
+    if not isinstance(entry, dict):
+        raise JournalError(f"effect {effect_key!r} is not awaiting settlement")
+    if entry.get("status") == "settled_preimage":
+        if entry.get("settled_invocation") == journal.invocation_id:
+            raise JournalError("same-cycle settled effect replay is forbidden")
+        raise JournalError("settled preimage requires a new effect attempt")
+    if entry.get("status") not in {
+        "attempted",
+        "unresolved",
+        "failed",
+    }:
+        raise JournalError("effect is not awaiting settlement")
+    return _settle_effect(
+        journal,
+        effect_key,
+        current_sha256(),
+        preimage_sha256,
+        postimage_sha256,
+    )
 
 
 def _run(command: Sequence[str], *, cwd: Path, timeout: float = 30.0) -> tuple[int, bytes, bytes]:
@@ -685,6 +814,22 @@ def _kent_json(kent: Path, args: Sequence[str], *, cwd: Path) -> dict[str, Any]:
     return _json_command([str(kent), *args], cwd=cwd)
 
 
+def _kent_optional(kent: Path, args: Sequence[str], *, cwd: Path) -> dict[str, Any]:
+    code, out, err = _run([str(kent), *args], cwd=cwd)
+    if code == 0:
+        try:
+            value = json.loads(out.decode("utf-8"), object_pairs_hook=_duplicate_free)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise OperationError("Kent command did not return JSON") from error
+        if not isinstance(value, dict):
+            raise OperationError("Kent command returned a non-object")
+        return value
+    text = (err + out).decode("utf-8", errors="replace").lower()
+    if "not found" in text or "no such" in text or "unknown workflow" in text:
+        return {"present": False}
+    raise OperationError(err.decode(errors="replace") or "Kent command failed")
+
+
 def _git(root: Path, *args: str, check: bool = True) -> str:
     command = ["/usr/bin/git", "-C", str(root), *args]
     code, out, err = _run(command, cwd=root)
@@ -707,20 +852,38 @@ def _repository_identity(root: Path) -> str:
 
 def _atomic_write(path: Path, data: bytes) -> None:
     path = _absolute_path(str(path), "report_path")
+    if path.is_symlink():
+        raise JournalError("report path must not be a symlink")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.parent / f".{path.name}.tmp"
-    if temporary.exists():
-        raise JournalError("deterministic report temporary file already exists")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    lock_path = path.with_name(f".{path.name}.lock")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    lock_fd = os.open(lock_path, flags, 0o600)
     try:
-        os.write(fd, data)
-        os.fsync(fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(lock_fd)
+        raise JournalError("report lock is held by another writer") from error
+    temporary = path.parent / f".{path.name}.tmp"
+    try:
+        if temporary.exists():
+            raise JournalError("deterministic report temporary file already exists")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+        if path.read_bytes() != data:
+            raise JournalError("report readback mismatch")
     finally:
-        os.close(fd)
-    os.replace(temporary, path)
-    _fsync_directory(path.parent)
-    if path.read_bytes() != data:
-        raise JournalError("report readback mismatch")
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def verify_release_portfolio(
@@ -759,12 +922,18 @@ def verify_release_portfolio(
             raise OperationError(str(error)) from error
         if result.commit_oid != commit:
             raise OperationError("selected project commit changed during preflight")
+        if result.release_preview is None or result.runtime_source_inputs is None:
+            raise OperationError("schema-4 release/runtime inputs are incomplete")
+        source_digests = _selected_source_digests(root, commit)
         records.append(
             {
                 "repository": repository,
                 "commit": commit,
-                "profile_sha256": _blob_digest(root, commit, ".kent/workflow-profile.toml"),
-                "source_digests": _selected_source_digests(root, commit),
+                "profile_sha256": source_digests["profile_sha256"],
+                "release_spec_sha256": source_digests["release_spec_sha256"],
+                "source_manifest_sha256": source_digests["source_manifest_sha256"],
+                "snapshot_sha256": source_digests["snapshot_sha256"],
+                "builder_sha256": source_digests["builder_sha256"],
                 "release_preview_sha256": (
                     canonical_sha256(result.release_preview)
                     if result.release_preview is not None
@@ -785,13 +954,15 @@ def verify_release_portfolio(
         "projects": sorted(records, key=lambda item: item["repository"]),
         "ready": True,
     }
-    target = report_path
-    if target is None and "report_path" in data:
-        target = _absolute_path(data["report_path"], "report_path")
     if write_report:
-        if target is None:
-            raise PlanValidationError("write_report requires report_path")
+        if "report_path" not in data:
+            raise PlanValidationError("write_report requires a plan-bound report_path")
+        target = _absolute_path(data["report_path"], "report_path")
+        if report_path is not None and Path(report_path) != target:
+            raise PlanValidationError("report path differs from the plan binding")
         _atomic_write(target, canonical_bytes(report) + b"\n")
+    elif report_path is not None:
+        raise PlanValidationError("report_path is allowed only with write_report")
     return report
 
 
@@ -809,7 +980,7 @@ def _blob_bytes(root: Path, commit: str, path: str) -> bytes:
     return out
 
 
-def _selected_source_digests(root: Path, commit: str) -> dict[str, str]:
+def _selected_source_digests(root: Path, commit: str) -> dict[str, Any]:
     profile_path = ".kent/workflow-profile.toml"
     profile_bytes = _blob_bytes(root, commit, profile_path)
     try:
@@ -819,6 +990,8 @@ def _selected_source_digests(root: Path, commit: str) -> dict[str, str]:
             source=f"{commit}:{profile_path}",
             check_files=False,
         )
+        if profile.schema_version != 4:
+            raise OperationError("portfolio requires schema-4 projects")
         spec_path = profile.release.spec_path
         spec_bytes = _blob_bytes(root, commit, spec_path)
         spec = ReleaseSpec.from_toml(
@@ -826,12 +999,20 @@ def _selected_source_digests(root: Path, commit: str) -> dict[str, str]:
         )
         manifest_path = spec.source_manifest.path
         manifest_bytes = _blob_bytes(root, commit, manifest_path)
+        snapshot_bytes = _blob_bytes(root, commit, profile.release.snapshot_path)
+        builder_bytes = (
+            _blob_bytes(root, commit, profile.release.builder_path)
+            if profile.release.builder_path
+            else None
+        )
     except (AttributeError, UnicodeDecodeError, ValueError, KeyError) as error:
         raise OperationError("selected release source is not schema-4 complete") from error
     return {
         "profile_sha256": sha256_bytes(profile_bytes),
         "release_spec_sha256": sha256_bytes(spec_bytes),
         "source_manifest_sha256": sha256_bytes(manifest_bytes),
+        "snapshot_sha256": sha256_bytes(snapshot_bytes),
+        "builder_sha256": sha256_bytes(builder_bytes) if builder_bytes else None,
     }
 
 
@@ -857,6 +1038,7 @@ def _session_manifest(path: Path) -> list[dict[str, Any]]:
     if not root.is_dir() or root.is_symlink():
         raise OperationError("retained Session directory is absent or unsafe")
     result: list[dict[str, Any]] = []
+    total_bytes = 0
     for entry in sorted(root.rglob("*")):
         relative = entry.relative_to(root)
         if any(part in {".", ".."} for part in relative.parts):
@@ -872,6 +1054,11 @@ def _session_manifest(path: Path) -> list[dict[str, Any]]:
             "bytes": info.st_size if kind == "file" else 0,
         }
         if kind == "file":
+            if info.st_size > MAX_OUTPUT:
+                raise OperationError("Session manifest file exceeds the bound")
+            total_bytes += info.st_size
+            if total_bytes > MAX_OUTPUT:
+                raise OperationError("Session manifest exceeds the byte bound")
             record["sha256"] = sha256_bytes(entry.read_bytes())
         result.append(record)
     if len(result) > MAX_LIST:
@@ -879,13 +1066,51 @@ def _session_manifest(path: Path) -> list[dict[str, Any]]:
     return result
 
 
+def _session_path(session: Mapping[str, Any], roots: Sequence[Path]) -> Path:
+    if session.get("relative") is not None:
+        root = _absolute_path(session.get("root"), "session.root")
+        relative = Path(_string(session["relative"], "session.relative"))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise OperationError("Session path traversal is forbidden")
+        path = root / relative
+    else:
+        path = _absolute_path(session.get("path"), "session.path")
+    path = path.absolute()
+    matching_root = next(
+        (
+            root.absolute()
+            for root in roots
+            if path == root.absolute() or root.absolute() in path.parents
+        ),
+        None,
+    )
+    if matching_root is None:
+        raise EffectBlocked("Session path is outside the declared roots")
+    relative_parts = path.relative_to(matching_root).parts
+    current = matching_root
+    if current.is_symlink():
+        raise EffectBlocked("Session root is a symlink")
+    for part in relative_parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            raise EffectBlocked("Session path is absent") from None
+        if stat.S_ISLNK(info.st_mode):
+            raise EffectBlocked("Session path contains a symlink")
+    if not current.is_dir():
+        raise EffectBlocked("Session path is not a directory")
+    return current
+
+
+KENT_SCHEMA_IDENTITY = "kent-2.6.1"
+
+
 def _typed_member(member: Mapping[str, Any], index: int) -> dict[str, Any]:
     _reject_raw_protocol_fields(member, f"members[{index}]")
     allowed = {
         "workflow_id",
         "revision",
-        "project_id",
-        "project",
         "links",
         "default",
         "tasks",
@@ -893,18 +1118,21 @@ def _typed_member(member: Mapping[str, Any], index: int) -> dict[str, Any]:
         "worktrees",
         "retained",
         "absent",
-        "preimage",
-        "postimage",
-        "resource_inventory",
-        "expected",
+        "delete_preview",
     }
     item = _closed(member, allowed, f"members[{index}]")
     workflow_id = _uuid(_required(item, "workflow_id", f"members[{index}]"), "workflow_id")
     revision = _sha1(_required(item, "revision", f"members[{index}]"), "revision")
     tasks = _bounded_list(item.get("tasks", []), f"members[{index}].tasks")
     for task in tasks:
-        if not isinstance(task, dict):
-            raise PlanValidationError("task inventory must contain objects")
+        task = _closed(
+            task,
+            {"id", "terminal", "current_node", "approval_pending", "status"},
+            "task",
+        )
+        _string(_required(task, "id", "task.id"), "task.id")
+        if "status" in task:
+            _string(task["status"], "task.status")
         if task.get("terminal") is not True:
             raise PlanValidationError("D9 refuses a nonterminal task")
         if task.get("current_node") not in (None, ""):
@@ -912,11 +1140,46 @@ def _typed_member(member: Mapping[str, Any], index: int) -> dict[str, Any]:
         if task.get("approval_pending") is True:
             raise PlanValidationError("D9 refuses a pending approval")
     _unique(
-        [_string(task.get("id"), "task.id") for task in tasks if isinstance(task, dict)],
+        [_string(task.get("id"), "task.id") for task in tasks],
         "task identities",
     )
     for key in ("links", "sessions", "worktrees", "retained", "absent"):
         _bounded_list(item.get(key, []), f"members[{index}].{key}")
+    if not isinstance(item.get("links"), list) or not isinstance(
+        item.get("default"), (str, type(None), dict)
+    ):
+        raise PlanValidationError("D9 links/default inventory is not typed")
+    for link in item.get("links", []):
+        if not isinstance(link, dict):
+            raise PlanValidationError("D9 link records must be objects")
+        _closed(link, {"project_id", "workflow_id", "is_default"}, "D9 link")
+        _uuid(_required(link, "project_id", "D9 link"), "D9 link.project_id")
+        _uuid(_required(link, "workflow_id", "D9 link"), "D9 link.workflow_id")
+        if not isinstance(_required(link, "is_default", "D9 link"), bool):
+            raise PlanValidationError("D9 link.is_default must be boolean")
+    if isinstance(item.get("default"), dict):
+        _closed(item["default"], {"project_id", "workflow_id"}, "D9 default")
+        _uuid(_required(item["default"], "project_id", "D9 default"), "default.project_id")
+        _uuid(_required(item["default"], "workflow_id", "D9 default"), "default.workflow_id")
+    for resource_name in ("retained", "absent"):
+        for resource in item.get(resource_name, []):
+            if not isinstance(resource, dict):
+                raise PlanValidationError(f"D9 {resource_name} records must be objects")
+            _closed(resource, {"kind", "id", "path", "sha256"}, f"D9 {resource_name}")
+            _string(_required(resource, "kind", f"D9 {resource_name}"), f"{resource_name}.kind")
+            _string(_required(resource, "id", f"D9 {resource_name}"), f"{resource_name}.id")
+            if resource.get("path") is not None:
+                _absolute_path(resource["path"], f"{resource_name}.path")
+            if resource.get("sha256") is not None:
+                _sha256(resource["sha256"], f"{resource_name}.sha256")
+    preview = _closed(
+        _required(item, "delete_preview", f"members[{index}]"),
+        {"workflow_id", "sha256"},
+        f"members[{index}].delete_preview",
+    )
+    if _uuid(preview.get("workflow_id"), "delete_preview.workflow_id") != workflow_id:
+        raise PlanValidationError("delete preview workflow identity drifted")
+    _sha256(_required(preview, "sha256", "delete_preview"), "delete_preview.sha256")
     for worktree in item.get("worktrees", []):
         if not isinstance(worktree, dict):
             raise PlanValidationError("worktree records must be objects")
@@ -934,13 +1197,17 @@ def _typed_member(member: Mapping[str, Any], index: int) -> dict[str, Any]:
             raise PlanValidationError("Session records must be objects")
         _closed(
             session,
-            {"id", "status", "path", "manifest", "retained", "task_id"},
+            {"id", "status", "path", "relative", "root", "manifest", "retained", "task_id"},
             f"members[{index}].session",
         )
         _string(_required(session, "id", "session.id"), "session.id")
         _string(_required(session, "status", "session.status"), "session.status")
         if session.get("path") is not None:
             _absolute_path(session["path"], "session.path")
+        if session.get("relative") is not None:
+            _string(session["relative"], "session.relative")
+        if session.get("root") is not None:
+            _absolute_path(session["root"], "session.root")
         if session.get("manifest") is not None:
             canonical_bytes(session["manifest"])
     return {
@@ -954,50 +1221,28 @@ def _typed_member(member: Mapping[str, Any], index: int) -> dict[str, Any]:
 def _validate_d9_plan(plan: LoadedPlan) -> dict[str, Any]:
     data = _closed(
         plan.value,
-        {
-            "schema",
-            "project_id",
-            "state_dir",
-            "kent",
-            "kent_path",
-            "kent_sha256",
-            "database",
-            "database_path",
-            "schema_identity",
-            "project_root",
-            "session_roots",
-            "members",
-            "retained_resources",
-        },
+        {"schema", "project_id", "state_dir", "kent", "database", "members"},
         "retirement plan",
     )
     project_id = _uuid(_required(data, "project_id", "retirement plan"), "project_id")
     state_dir = _absolute_path(_required(data, "state_dir", "retirement plan"), "state_dir")
-    kent_value = data.get("kent") or {}
-    if isinstance(kent_value, dict):
-        kent = _closed(kent_value, {"path", "sha256"}, "kent")
-        kent_path = _kent_path(_required(kent, "path", "kent"), "kent.path")
-        kent_sha = _sha256(_required(kent, "sha256", "kent"), "kent.sha256")
-    else:
-        kent_path = _kent_path(data.get("kent_path"), "kent_path")
-        kent_sha = _sha256(_required(data, "kent_sha256", "retirement plan"), "kent_sha256")
+    kent = _closed(_required(data, "kent", "retirement plan"), {"path", "sha256"}, "kent")
+    kent_path = _kent_path(_required(kent, "path", "kent"), "kent.path")
+    kent_sha = _sha256(_required(kent, "sha256", "kent"), "kent.sha256")
     _verify_executable(kent_path, kent_sha)
-    database = data.get("database") or {}
-    if isinstance(database, dict) and database:
-        database = _closed(database, {"path", "schema", "project_root", "session_roots"}, "database")
-        database_path = _absolute_path(_required(database, "path", "database"), "database.path")
-        schema_identity = _string(_required(database, "schema", "database"), "database.schema")
-        project_root = _absolute_path(_required(database, "project_root", "database"), "database.project_root")
-        session_roots = [_absolute_path(item, "session_root") for item in _bounded_list(
-            _required(database, "session_roots", "database"), "database.session_roots"
-        )]
-    else:
-        database_path = _absolute_path(data.get("database_path"), "database_path")
-        schema_identity = _string(data.get("schema_identity"), "schema_identity")
-        project_root = _absolute_path(data.get("project_root"), "project_root")
-        session_roots = [_absolute_path(item, "session_root") for item in _bounded_list(
-            data.get("session_roots", []), "session_roots"
-        )]
+    database = _closed(
+        _required(data, "database", "retirement plan"),
+        {"path", "schema", "project_root", "session_roots"},
+        "database",
+    )
+    database_path = _absolute_path(_required(database, "path", "database"), "database.path")
+    schema_identity = _string(_required(database, "schema", "database"), "database.schema")
+    if schema_identity != KENT_SCHEMA_IDENTITY:
+        raise PlanValidationError("unsupported Kent persistence schema")
+    project_root = _absolute_path(_required(database, "project_root", "database"), "database.project_root")
+    session_roots = [_absolute_path(item, "session_root") for item in _bounded_list(
+        _required(database, "session_roots", "database"), "database.session_roots"
+    )]
     members = [_typed_member(raw, index) for index, raw in enumerate(
         _bounded_list(_required(data, "members", "retirement plan"), "members")
     )]
@@ -1040,37 +1285,100 @@ def _kent_pages(
             raise OperationError("Kent pagination exceeded the bounded inventory")
 
 
-def _d9_read_inventory(parsed: Mapping[str, Any]) -> dict[str, Any]:
+def _page_rows(pages: Any, keys: Sequence[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for page in pages if isinstance(pages, list) else []:
+        if not isinstance(page, dict):
+            raise OperationError("Kent pagination returned a non-object page")
+        values: Any = []
+        for key in keys:
+            if key in page:
+                values = page[key]
+                break
+        if not isinstance(values, list):
+            raise OperationError("Kent pagination returned non-list rows")
+        rows.extend(row for row in values if isinstance(row, dict))
+    return rows
+
+
+def _d9_read_inventory(
+    parsed: Mapping[str, Any],
+    reference: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Run the complete source-owned read protocol, never a plan command."""
     kent = parsed["kent"]
     _verify_executable(kent, parsed["kent_sha256"])
     project = parsed["project_id"]
     cwd = parsed["project_root"]
+    workflow_pages = _kent_pages(
+        kent, ["workflow", "list", "--project", project], cwd=cwd
+    )
+    workflow_rows = _page_rows(workflow_pages, ("items", "workflows"))
     result: dict[str, Any] = {
         "projects": _kent_json(kent, ["project", "list", "--json"], cwd=cwd),
-        "workflows": _kent_pages(
-            kent, ["workflow", "list", "--project", project], cwd=cwd
-        ),
+        "workflows": workflow_pages,
         "worktrees": _kent_json(kent, ["worktree", "list", "--json"], cwd=cwd),
         "database_schema": parsed["schema"],
     }
     for member in parsed["members"]:
         _d9_check_git_resources(member)
-        _d9_check_session_manifests(member)
+        _d9_check_session_manifests(member, parsed["session_roots"])
         wid = member["workflow_id"]
+        listed = any(
+            row.get("id", row.get("workflow_id")) == wid for row in workflow_rows
+        )
+        if not listed:
+            reference_member = reference.get(wid, {}) if isinstance(reference, Mapping) else {}
+            reference_sqlite = reference_member.get("sqlite", {}) if isinstance(reference_member, Mapping) else {}
+            retained_session_ids = [
+                row.get("session_id")
+                for row in reference_sqlite.get("sessions", [])
+                if isinstance(row, dict) and isinstance(row.get("session_id"), str)
+            ]
+            retained_task_ids = [
+                task["id"]
+                for task in member.get("tasks", [])
+                if isinstance(task, dict) and isinstance(task.get("id"), str)
+            ]
+            retained_session_ids.extend(
+                session.get("id", session.get("session_id"))
+                for session in reference_member.get("sessions", [])
+                if isinstance(session, dict)
+                and isinstance(session.get("id", session.get("session_id")), str)
+            )
+            result[wid] = {
+                "workflow": {"present": False, "workflow_id": wid},
+                "tasks": [],
+                "task_rows": [],
+                "task_show": [],
+                "sessions": [],
+                "sqlite": _sqlite_snapshot(
+                    parsed["database"], parsed["schema"],
+                    retained_session_ids, retained_task_ids,
+                ),
+            }
+            continue
         tasks = _kent_pages(
             kent,
             ["task", "list", "--project", project, "--workflow", wid],
             cwd=cwd,
         )
         task_rows = [
-            row
-            for page in tasks
-            for row in page.get("items", page.get("tasks", []))
-            if isinstance(row, dict)
+            row for row in _page_rows(tasks, ("items", "tasks"))
         ]
+        task_ids = {
+            str(task["id"])
+            for task in member.get("tasks", [])
+            if isinstance(task, dict) and isinstance(task.get("id"), str)
+        }
+        task_ids.update(
+            str(task.get("id", task.get("task_id")))
+            for task in task_rows
+            if isinstance(task, dict)
+            and isinstance(task.get("id", task.get("task_id")), str)
+        )
         result[wid] = {
-            "workflow": _kent_json(kent, ["workflow", "inspect", wid, "--json"], cwd=cwd),
+            "workflow": _kent_optional(kent, ["workflow", "inspect", wid, "--json"], cwd=cwd),
             "graph": _kent_json(kent, ["workflow", "graph", "inspect", wid, "--json"], cwd=cwd),
             "validate": _kent_json(
                 kent, ["workflow", "validate", wid, "--json"], cwd=cwd
@@ -1082,32 +1390,53 @@ def _d9_read_inventory(parsed: Mapping[str, Any]) -> dict[str, Any]:
                 cwd=cwd,
             ),
         }
+        result[wid]["links"] = result[wid]["workflow"].get("links", [])
+        result[wid]["default"] = result[wid]["workflow"].get("default")
+        result[wid]["current_nodes"] = result[wid]["workflow"].get("current_nodes", [])
+        result[wid]["pending_approvals"] = result[wid]["workflow"].get("pending_approvals", [])
         for task in task_rows:
             task_id = task.get("id", task.get("task_id"))
             if isinstance(task_id, str):
                 result[wid].setdefault("task_show", []).append(
-                    _kent_json(kent, ["task", "show", "--project", project, task_id, "--json"], cwd=cwd)
+                    _kent_json(kent, ["task", "show", task_id, "--project", project, "--json"], cwd=cwd)
                 )
                 result[wid].setdefault("sessions", []).extend(
                     _kent_pages(
                         kent,
-                        ["task", "sessions", "--project", project, task_id],
+                        ["task", "sessions", task_id, "--project", project],
                         cwd=cwd,
                     )
                 )
-                session_ids = [
-                    session.get("id", session.get("session_id"))
-                    for page in result[wid].get("sessions", [])
-                    for session in page.get("items", page.get("sessions", []))
-                    if isinstance(session, dict)
-                ]
-                for session_id in session_ids:
+        session_rows = _page_rows(
+            result[wid].get("sessions", []), ("items", "sessions")
+        )
+        session_ids = {
+            str(session.get("id", session.get("session_id")))
+            for session in session_rows
+            if isinstance(session.get("id", session.get("session_id")), str)
+        }
+        if reference:
+            old = reference.get(wid, {})
+            for session in old.get("sessions", []) if isinstance(old, dict) else []:
+                if isinstance(session, dict):
+                    session_id = session.get("session_id", session.get("id"))
                     if isinstance(session_id, str):
-                        result[wid].setdefault("sqlite_sessions", []).append(
-                            _sqlite_session_by_id(
-                                parsed["database"], parsed["schema"], session_id
-                            )
-                        )
+                        session_ids.add(session_id)
+            old_sqlite = old.get("sqlite", {}) if isinstance(old, dict) else {}
+            for session in old_sqlite.get("sessions", []) if isinstance(old_sqlite, dict) else []:
+                if isinstance(session, dict) and isinstance(session.get("session_id"), str):
+                    session_ids.add(session["session_id"])
+        result[wid]["sqlite"] = _sqlite_snapshot(
+            parsed["database"],
+            parsed["schema"],
+            sorted(session_ids),
+            sorted(task_ids),
+        )
+        result[wid]["links"] = result[wid]["workflow"].get("links", [])
+        result[wid]["default"] = result[wid]["workflow"].get("default")
+        result[wid]["current_nodes"] = result[wid]["workflow"].get("current_nodes", [])
+        result[wid]["pending_approvals"] = result[wid]["workflow"].get("pending_approvals", [])
+        result[wid]["task_rows"] = task_rows
     return result
 
 
@@ -1128,66 +1457,219 @@ def _d9_check_git_resources(member: Mapping[str, Any]) -> None:
             raise EffectBlocked("managed worktree HEAD drifted")
 
 
-def _d9_check_session_manifests(member: Mapping[str, Any]) -> None:
+def _d9_check_session_manifests(
+    member: Mapping[str, Any],
+    roots: Sequence[Path],
+) -> None:
     for session in member.get("sessions", []):
-        if session.get("retained") is not True or not session.get("path"):
+        if session.get("retained") is not True:
             continue
-        actual = _session_manifest(Path(session["path"]))
+        actual = _session_manifest(_session_path(session, roots))
         expected = session.get("manifest")
         if expected is not None and canonical_sha256(actual) != canonical_sha256(expected):
             raise EffectBlocked("retained Session manifest drifted")
 
 
-def _sqlite_session_by_id(
+def _d9_member_live_gate(
+    member: Mapping[str, Any],
+    live: Mapping[str, Any],
+    *,
+    require_preview: bool = True,
+) -> None:
+    wid = member["workflow_id"]
+    workflow = live.get("workflow")
+    if not isinstance(workflow, dict):
+        raise EffectBlocked(f"D9 workflow {wid} readback is not an object")
+    if workflow.get("present") is False:
+        raise EffectBlocked(f"D9 workflow {wid} is absent before deletion")
+    if workflow.get("id", workflow.get("workflow_id", wid)) != wid:
+        raise EffectBlocked(f"D9 workflow {wid} identity drifted")
+    plan_tasks = {
+        str(task["id"]): task
+        for task in member.get("tasks", [])
+        if isinstance(task, dict)
+    }
+    live_tasks = live.get("task_rows", _page_rows(live.get("tasks"), ("items", "tasks")))
+    live_by_id: dict[str, Mapping[str, Any]] = {}
+    for task in live_tasks:
+        task_id = task.get("id", task.get("task_id"))
+        if isinstance(task_id, str):
+            live_by_id[task_id] = task
+    if set(live_by_id) != set(plan_tasks):
+        raise EffectBlocked(f"D9 task inventory drifted for {wid}")
+    for task_id, task in live_by_id.items():
+        if task.get("terminal") is not True:
+            raise EffectBlocked(f"D9 refuses live nonterminal task {task_id}")
+        if task.get("current_node") not in (None, ""):
+            raise EffectBlocked(f"D9 refuses active Current Node {task_id}")
+        if task.get("approval_pending") is True:
+            raise EffectBlocked(f"D9 refuses pending approval {task_id}")
+        expected = plan_tasks[task_id]
+        for key in ("status", "current_node", "terminal", "approval_pending"):
+            if key in expected and task.get(key) != expected.get(key):
+                raise EffectBlocked(f"D9 task {task_id} drifted: {key}")
+    if "links" in member and canonical_sha256(live.get("links", [])) != canonical_sha256(member["links"]):
+        raise EffectBlocked(f"D9 links drifted for {wid}")
+    if "default" in member and canonical_sha256(live.get("default")) != canonical_sha256(member["default"]):
+        raise EffectBlocked(f"D9 default drifted for {wid}")
+    if live.get("current_nodes"):
+        raise EffectBlocked(f"D9 has active Current Nodes for {wid}")
+    if live.get("pending_approvals"):
+        raise EffectBlocked(f"D9 has pending approvals for {wid}")
+    if require_preview:
+        preview = live.get("preview")
+        if not isinstance(preview, dict):
+            raise EffectBlocked(f"D9 delete preview is missing for {wid}")
+        expected_digest = member["delete_preview"]["sha256"]
+        actual_digest = preview.get("sha256")
+        if actual_digest is None:
+            actual_digest = canonical_sha256(preview)
+        if actual_digest != expected_digest:
+            raise EffectBlocked(f"D9 delete preview drifted for {wid}")
+
+
+def _d9_inventory_digest(
+    inventory: Mapping[str, Any],
+    workflow_ids: Sequence[str],
+) -> str:
+    normalized = {
+        key: inventory.get(key)
+        for key in ("projects", "workflows", "worktrees", "database_schema")
+    }
+    normalized["members"] = {
+        workflow_id: inventory.get(workflow_id)
+        for workflow_id in workflow_ids
+    }
+    return canonical_sha256(normalized)
+
+
+def _d9_current_digest(
+    parsed: Mapping[str, Any],
+    member: Mapping[str, Any],
+    reference: Mapping[str, Any] | None,
+) -> str:
+    inventory = _d9_read_inventory(parsed, reference)
+    _d9_member_live_gate(member, inventory[member["workflow_id"]])
+    return _d9_inventory_digest(inventory, [item["workflow_id"] for item in parsed["members"]])
+
+
+def _sqlite_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {"bytes_hex": value.hex()}
+    return value
+
+
+def _sqlite_schema_check(
+    connection: sqlite3.Connection,
+    expected_schema: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if expected_schema != KENT_SCHEMA_IDENTITY:
+        raise OperationError("unsupported Kent persistence schema")
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    required = {"sessions", "session_workflow_node_associations"}
+    if not required.issubset(tables):
+        raise OperationError("Kent persistence schema fingerprint is incomplete")
+    session_info = list(connection.execute("PRAGMA table_info(sessions)"))
+    association_info = list(
+        connection.execute(
+            "PRAGMA table_info(session_workflow_node_associations)"
+        )
+    )
+    session_columns = tuple(row[1] for row in session_info)
+    association_columns = tuple(row[1] for row in association_info)
+    if not {"id", "task_id"}.issubset(session_columns):
+        raise OperationError("sessions schema fingerprint is unsupported")
+    if not {"session_id", "task_id"}.issubset(association_columns):
+        raise OperationError("association schema fingerprint is unsupported")
+    session_fk = list(connection.execute("PRAGMA foreign_key_list(sessions)"))
+    association_fk = list(
+        connection.execute(
+            "PRAGMA foreign_key_list(session_workflow_node_associations)"
+        )
+    )
+    if not any(row[3] == "task_id" and row[6].upper() == "SET NULL" for row in session_fk):
+        raise OperationError("sessions.task_id cascade fingerprint is unsupported")
+    if not any(row[3] == "task_id" and row[6].upper() == "CASCADE" for row in association_fk):
+        raise OperationError("association task cascade fingerprint is unsupported")
+    return session_columns, association_columns
+
+
+def _sqlite_snapshot(
     database: Path,
     expected_schema: str,
-    session_id: str,
+    session_ids: Sequence[str],
+    task_ids: Sequence[str],
 ) -> dict[str, Any]:
-    """Read only the schema-owned Session row; plans cannot provide SQL."""
+    """Read only fixed Session and association queries; plans supply no SQL."""
     if not database.is_file() or database.is_symlink():
         raise OperationError("Kent persistence database is absent or unsafe")
     uri = f"file:{database}?mode=ro"
+    connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(uri, uri=True)
         connection.execute("PRAGMA query_only=ON")
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
+        session_columns, association_columns = _sqlite_schema_check(
+            connection, expected_schema
+        )
+        sessions: list[dict[str, Any]] = []
+        for session_id in session_ids:
+            rows = connection.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchall()
+            if len(rows) > 1:
+                raise OperationError("Session identity matched multiple rows")
+            sessions.append(
+                {
+                    "session_id": session_id,
+                    "present": bool(rows),
+                    "row": (
+                        {
+                            key: _sqlite_value(value)
+                            for key, value in zip(session_columns, rows[0])
+                        }
+                        if rows
+                        else None
+                    ),
+                }
             )
-        }
-        if expected_schema and expected_schema not in {"kent-2.6.1", "sqlite"}:
-            raise OperationError("unsupported Kent persistence schema")
-        if "sessions" not in tables:
-            return {"session_id": session_id, "present": False}
-        columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(sessions)")
-        }
-        if "id" not in columns:
-            raise OperationError("Session table has no supported identity column")
-        row = connection.execute(
-            "SELECT * FROM sessions WHERE id = ?",
-            (session_id,),
-        ).fetchall()
-        if len(row) != 1:
-            return {"session_id": session_id, "present": False, "matches": len(row)}
-        names = [
-            item[1]
-            for item in connection.execute("PRAGMA table_info(sessions)")
-        ]
+        associations: list[dict[str, Any]] = []
+        for session_id in session_ids:
+            for row in connection.execute(
+                "SELECT * FROM session_workflow_node_associations WHERE session_id = ?",
+                (session_id,),
+            ).fetchall():
+                associations.append(
+                    {
+                        key: _sqlite_value(value)
+                        for key, value in zip(association_columns, row)
+                    }
+                )
+        for task_id in task_ids:
+            for row in connection.execute(
+                "SELECT * FROM session_workflow_node_associations WHERE task_id = ?",
+                (task_id,),
+            ).fetchall():
+                item = {
+                    key: _sqlite_value(value)
+                    for key, value in zip(association_columns, row)
+                }
+                if item not in associations:
+                    associations.append(item)
         return {
-            "session_id": session_id,
-            "present": True,
-            "row": dict(zip(names, row[0])),
+            "sessions": sessions,
+            "associations": associations,
         }
     except sqlite3.Error as error:
         raise OperationError(f"read-only Session query failed: {error}") from error
     finally:
-        try:
+        if connection is not None:
             connection.close()
-        except (NameError, AttributeError):
-            pass
 
 
 def _kent_delete_command(kent: Path, workflow_id: str, confirm: bool) -> list[str]:
@@ -1213,23 +1695,26 @@ def retire_workflow_batch(
         raise PlanValidationError("retirement mode must be preview, apply, or resume")
     if kent is not None and str(kent) != str(parsed["kent"]):
         raise PlanValidationError("runtime --kent differs from the plan-bound executable")
+    workflow_ids = [item["workflow_id"] for item in parsed["members"]]
     if mode == "preview":
         inventory = _d9_read_inventory(parsed)
+        _d9_validate_batch_inventory(parsed, inventory, {}, inventory)
         return {
             "schema": "workflow-retirement-batch-report-v2",
             "plan_sha256": plan.sha256,
             "phase": "preview",
-            "inventory_sha256": canonical_sha256(inventory),
+            "inventory_sha256": _d9_inventory_digest(inventory, workflow_ids),
             "effects_released": 0,
         }
     with OperationJournal(parsed["state_dir"], "workflow-retirement-batch", plan) as journal:
         if journal.state is None:
             inventory = _d9_read_inventory(parsed)
+            _d9_validate_batch_inventory(parsed, inventory, {}, inventory)
             journal.persist(
                 {
                     "phase": "prepared",
                     "inventory": inventory,
-                    "inventory_sha256": canonical_sha256(inventory),
+                    "inventory_sha256": _d9_inventory_digest(inventory, workflow_ids),
                     "members": [
                         {"workflow_id": item["workflow_id"], "status": "pending"}
                         for item in parsed["members"]
@@ -1244,23 +1729,58 @@ def retire_workflow_batch(
         for member in parsed["members"]:
             if statuses[member["workflow_id"]] == "verified":
                 continue
-            inventory = _d9_read_inventory(parsed)
-            if canonical_sha256(inventory) != state["inventory_sha256"]:
-                raise EffectBlocked("D9 preimage changed before member effect")
+            inventory = _d9_read_inventory(parsed, state.get("inventory"))
+            _d9_validate_batch_inventory(parsed, inventory, statuses, state["inventory"])
             journal.persist({**journal.state, "phase": "in_progress"})
             wid = member["workflow_id"]
-            run_effect(
-                journal,
-                effect_key=f"delete:{wid}",
-                command=_kent_delete_command(parsed["kent"], wid, True),
-                cwd=parsed["project_root"],
+            before = inventory.get(wid, {})
+            preimage = canonical_sha256(before)
+            preview = before.get("preview")
+            if not isinstance(preview, dict):
+                raise EffectBlocked(f"D9 delete preview is missing for {wid}")
+            postimage = canonical_sha256(
+                {"workflow": {"present": False, "workflow_id": wid}}
             )
-            post = _d9_read_inventory(parsed)
-            member_record = post.get(wid, {})
-            if member_record.get("workflow", {}).get("present", True):
-                raise EffectBlocked(f"retired workflow {wid} is still present")
-            before = state.get("inventory", {}).get(wid, {})
-            _validate_d9_postimage(member, before, member_record)
+
+            def current() -> str:
+                latest = _d9_read_inventory(parsed, state.get("inventory"))
+                latest_member = latest.get(wid, {})
+                if latest_member.get("workflow", {}).get("present", True):
+                    _d9_member_live_gate(member, latest_member)
+                    return preimage
+                _validate_d9_postimage(member, before, latest_member)
+                return postimage
+
+            effect_key = f"delete:{wid}"
+            existing = (journal.state.get("effects") or {}).get(effect_key)
+            if isinstance(existing, dict) and existing.get("status") in {
+                "attempted", "unresolved", "failed", "ambiguous"
+            }:
+                settled = recover_effect(
+                    journal,
+                    effect_key=effect_key,
+                    preimage_sha256=preimage,
+                    postimage_sha256=postimage,
+                    current_sha256=current,
+                )
+            else:
+                settled = run_effect(
+                    journal,
+                    effect_key=effect_key,
+                    command=_kent_delete_command(parsed["kent"], wid, True),
+                    cwd=parsed["project_root"],
+                    preimage_sha256=preimage,
+                    postimage_sha256=postimage,
+                    current_sha256=current,
+                ).settlement
+            if settled == "preimage":
+                return {
+                    "schema": "workflow-retirement-batch-report-v2",
+                    "plan_sha256": plan.sha256,
+                    "phase": "in_progress",
+                    "settled": "preimage",
+                    "effects_released": len(journal.state.get("effects", {})),
+                }
             statuses[wid] = "verified"
             journal.persist(
                 {
@@ -1271,6 +1791,8 @@ def retire_workflow_batch(
                     ],
                 }
             )
+        final = _d9_read_inventory(parsed, state.get("inventory"))
+        _d9_validate_batch_inventory(parsed, final, statuses, state["inventory"])
         journal.persist({**journal.state, "phase": "complete"})
         return {
             "schema": "workflow-retirement-batch-report-v2",
@@ -1280,6 +1802,35 @@ def retire_workflow_batch(
         }
 
 
+def _d9_validate_batch_inventory(
+    parsed: Mapping[str, Any],
+    inventory: Mapping[str, Any],
+    statuses: Mapping[str, str],
+    prepared: Mapping[str, Any],
+) -> None:
+    ids = [item["workflow_id"] for item in parsed["members"]]
+    if inventory.get("database_schema") not in (None, parsed["schema"]):
+        raise EffectBlocked("D9 database schema identity drifted")
+    for member in parsed["members"]:
+        wid = member["workflow_id"]
+        live = inventory.get(wid)
+        if not isinstance(live, dict):
+            raise EffectBlocked(f"D9 member inventory is missing for {wid}")
+        if statuses.get(wid) == "verified":
+            if live.get("workflow", {}).get("present", True):
+                raise EffectBlocked(f"D9 verified workflow {wid} reappeared")
+            continue
+        _d9_member_live_gate(member, live)
+        old = prepared.get(wid) if isinstance(prepared, Mapping) else None
+        if isinstance(old, Mapping):
+            old_copy = dict(old)
+            old_copy.pop("preview", None)
+            current_copy = dict(live)
+            current_copy.pop("preview", None)
+            if canonical_sha256(current_copy) != canonical_sha256(old_copy):
+                raise EffectBlocked(f"D9 pending member preimage drifted for {wid}")
+
+
 def _validate_d9_postimage(
     member: Mapping[str, Any],
     before: Mapping[str, Any],
@@ -1287,10 +1838,10 @@ def _validate_d9_postimage(
 ) -> None:
     if after.get("workflow", {}).get("present", False):
         raise EffectBlocked("D9 exact absence was not proved")
-    before_sessions = before.get("sqlite_sessions", [])
-    after_sessions = after.get("sqlite_sessions", [])
-    if not before_sessions:
-        return
+    before_sqlite = before.get("sqlite", {})
+    after_sqlite = after.get("sqlite", {})
+    before_sessions = before_sqlite.get("sessions", []) if isinstance(before_sqlite, dict) else []
+    after_sessions = after_sqlite.get("sessions", []) if isinstance(after_sqlite, dict) else []
     before_by_id = {
         row.get("session_id"): row
         for row in before_sessions
@@ -1314,10 +1865,30 @@ def _validate_d9_postimage(
                         raise EffectBlocked("Session task association did not cascade to NULL")
                 elif old_row.get(key) != new_row.get(key):
                     raise EffectBlocked("non-association Session field changed")
+    deleted_task_ids = {
+        task["id"] for task in member.get("tasks", []) if isinstance(task, dict)
+    }
+    before_associations = (
+        before_sqlite.get("associations", []) if isinstance(before_sqlite, dict) else []
+    )
+    after_associations = (
+        after_sqlite.get("associations", []) if isinstance(after_sqlite, dict) else []
+    )
+    expected_associations = [
+        row
+        for row in before_associations
+        if row.get("task_id") not in deleted_task_ids
+    ]
+    if canonical_sha256(after_associations) != canonical_sha256(expected_associations):
+        raise EffectBlocked("Session workflow-node association delta is not exact")
     for session in member.get("sessions", []):
-        if session.get("retained") is True and session.get("path"):
+        if session.get("retained") is True and (
+            session.get("path") or session.get("relative")
+        ):
             expected = session.get("manifest")
-            actual = _session_manifest(Path(session["path"]))
+            actual = _session_manifest(
+                _session_path(session, [Path(session.get("root") or Path(session["path"]).parent)])
+            )
             if expected is not None and canonical_sha256(actual) != canonical_sha256(expected):
                 raise EffectBlocked("retained Session filesystem manifest changed")
 
@@ -1383,77 +1954,127 @@ def _compare_terminal_inventory(
 def _validate_canonical_plan(plan: LoadedPlan) -> dict[str, Any]:
     data = _closed(
         plan.value,
-        {"schema", "state_dir", "kent", "kent_path", "kent_sha256", "workflows", "d9_journal"},
+        {"schema", "state_dir", "kent", "workflows", "d9"},
         "canonical plan",
     )
     state_dir = _absolute_path(_required(data, "state_dir", "canonical plan"), "state_dir")
-    kent = data.get("kent") or {}
-    if isinstance(kent, dict):
-        kent = _closed(kent, {"path", "sha256"}, "kent")
-        path = _kent_path(_required(kent, "path", "kent"), "kent.path")
-        digest = _sha256(_required(kent, "sha256", "kent"), "kent.sha256")
-    else:
-        path = _kent_path(data.get("kent_path"), "kent_path")
-        digest = _sha256(data.get("kent_sha256"), "kent_sha256")
+    kent = _closed(_required(data, "kent", "canonical plan"), {"path", "sha256"}, "kent")
+    path = _kent_path(_required(kent, "path", "kent"), "kent.path")
+    digest = _sha256(_required(kent, "sha256", "kent"), "kent.sha256")
     _verify_executable(path, digest)
+    dependency = _closed(_required(data, "d9", "canonical plan"), {"none", "path", "sha256", "operation", "phase", "members"}, "d9")
+    if dependency.get("none") is True:
+        if set(dependency) != {"none"}:
+            raise PlanValidationError("canonical d9 none marker must be closed")
+        d9 = None
+    else:
+        if dependency.get("none") is not False:
+            raise PlanValidationError("canonical d9 dependency must be explicit")
+        d9 = {
+            "path": _absolute_path(_required(dependency, "path", "d9"), "d9.path"),
+            "sha256": _sha256(_required(dependency, "sha256", "d9"), "d9.sha256"),
+            "operation": _string(_required(dependency, "operation", "d9"), "d9.operation"),
+            "phase": _string(_required(dependency, "phase", "d9"), "d9.phase"),
+            "members": [_uuid(value, "d9.member") for value in _bounded_list(
+                _required(dependency, "members", "d9"), "d9.members"
+            )],
+        }
+        if d9["phase"] != "complete":
+            raise PlanValidationError("canonical d9 dependency is not complete")
+        _unique(d9["members"], "d9 members")
+        if d9["operation"] != "workflow-retirement-batch":
+            raise PlanValidationError("canonical d9 operation is unsupported")
     workflows = _bounded_list(_required(data, "workflows", "canonical plan"), "workflows")
     if not workflows:
         raise PlanValidationError("canonical plan has no workflows")
     parsed = []
     for index, raw in enumerate(workflows):
-        if not isinstance(raw, dict):
-            raise PlanValidationError("workflow entry must be an object")
         _reject_raw_protocol_fields(raw, f"workflows[{index}]")
-        allowed = {
-            "workflow_id",
-            "project_id",
-            "intent",
-            "expected_version",
-            "revision",
-            "preimage",
-            "postimage",
-            "target",
-            "graph",
-            "metadata",
-            "tasks",
-            "current_nodes",
-            "pending_approvals",
-            "terminal_tasks",
-            "terminal_anchors",
-            "links",
-            "default",
-            "rollback",
-            "allow_create",
-        }
-        item = _closed(raw, allowed, f"workflows[{index}]")
+        item = _closed(
+            raw,
+            {
+                "workflow_id", "project_id", "intent", "expected_version", "graph",
+                "metadata", "terminal_tasks", "terminal_anchors", "links", "default",
+            },
+            f"workflows[{index}]",
+        )
+        item = dict(item)
         item["workflow_id"] = _uuid(_required(item, "workflow_id", "workflow_id"), "workflow_id")
+        _uuid(_required(item, "project_id", "workflow.project_id"), "workflow.project_id")
         intent = _string(_required(item, "intent", "intent"), "intent")
         if intent not in {"graph-only", "metadata-only", "graph-and-metadata"}:
             raise PlanValidationError("canonical intent is not typed")
-        _workflow_gate(item, f"workflows[{index}]")
-        _terminal_gate(item, f"workflows[{index}]")
-        if "expected_version" not in item and "revision" not in item:
-            raise PlanValidationError("canonical plan must bind an expected revision")
-        if item.get("allow_create", False) is not False:
-            raise PlanValidationError("canonical reconciliation may not create workflows")
-        if "graph" in item and not isinstance(item["graph"], dict):
-            raise PlanValidationError("target graph must be a document")
-        if "metadata" in item and not isinstance(item["metadata"], dict):
-            raise PlanValidationError("target metadata must be an object")
+        version = _required(item, "expected_version", "workflow.expected_version")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            raise PlanValidationError("workflow.expected_version must be a non-negative integer")
+        if intent in {"graph-only", "graph-and-metadata"}:
+            graph = _closed(_required(item, "graph", "workflow"), {"version", "nodes", "edges"}, "workflow.graph")
+            if graph.get("version") != version:
+                raise PlanValidationError("target graph version must equal expected_version")
+            _bounded_list(_required(graph, "nodes", "workflow.graph"), "workflow.graph.nodes")
+            _bounded_list(_required(graph, "edges", "workflow.graph"), "workflow.graph.edges")
+            item["graph"] = graph
+        elif "graph" in item:
+            raise PlanValidationError("metadata-only workflow may not carry a graph")
+        if intent in {"metadata-only", "graph-and-metadata"}:
+            metadata = _closed(_required(item, "metadata", "workflow"), {"name", "description", "execution_target"}, "workflow.metadata")
+            _string(_required(metadata, "name", "workflow.metadata"), "metadata.name")
+            _string(_required(metadata, "description", "workflow.metadata"), "metadata.description", nonempty=False)
+            _string(_required(metadata, "execution_target", "workflow.metadata"), "metadata.execution_target")
+            item["metadata"] = metadata
+        elif "metadata" in item:
+            raise PlanValidationError("graph-only workflow may not carry metadata")
+        for key in ("terminal_tasks", "terminal_anchors", "links"):
+            _bounded_list(_required(item, key, f"workflow.{key}"), f"workflow.{key}")
+        if not isinstance(_required(item, "default", "workflow"), (str, type(None))):
+            raise PlanValidationError("workflow.default must be a string or null")
         parsed.append(item)
     _unique([item["workflow_id"] for item in parsed], "canonical workflow identities")
-    return {"state_dir": state_dir, "kent": path, "kent_sha256": digest, "workflows": parsed,
-            "d9_journal": data.get("d9_journal")}
+    if d9 and not set(item["workflow_id"] for item in parsed).issubset(set(d9["members"])):
+        raise PlanValidationError("canonical workflows are not covered by D9 dependency")
+    return {
+        "state_dir": state_dir,
+        "kent": path,
+        "kent_sha256": digest,
+        "workflows": parsed,
+        "d9": d9,
+    }
 
 
 def _canonical_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, Any]:
     wid = item["workflow_id"]
-    project = item.get("project_id")
-    args = ["workflow", "inspect", wid, "--json"]
-    if project:
-        args[2:2] = ["--project", str(project)]
-    root = item.get("project_root", Path.cwd())
-    return _kent_json(parsed["kent"], args, cwd=Path(root))
+    project = item["project_id"]
+    root = Path.cwd()
+    workflow = _kent_json(parsed["kent"], ["workflow", "inspect", wid, "--json"], cwd=root)
+    graph = _kent_json(parsed["kent"], ["workflow", "graph", "inspect", wid, "--json"], cwd=root)
+    validation = _kent_json(parsed["kent"], ["workflow", "validate", wid, "--json"], cwd=root)
+    tasks = _kent_pages(parsed["kent"], ["task", "list", "--project", project, "--workflow", wid], cwd=root)
+    task_rows = _page_rows(tasks, ("items", "tasks"))
+    details = []
+    for task in task_rows:
+        task_id = task.get("id", task.get("task_id"))
+        if isinstance(task_id, str):
+            details.append(_kent_json(parsed["kent"], ["task", "show", task_id, "--project", project, "--json"], cwd=root))
+    observed = dict(workflow)
+    observed.update(
+        {
+            "workflow_id": wid,
+            "project_id": project,
+            "graph": graph.get("graph", graph),
+            "validation": validation,
+            "tasks": task_rows,
+            "task_details": details,
+            "links": workflow.get("links", []),
+            "default": workflow.get("default"),
+            "current_nodes": workflow.get("current_nodes", []),
+            "pending_approvals": workflow.get("pending_approvals", []),
+            "terminal_tasks": [
+                {"id": row.get("id", row.get("task_id")), "status": row.get("status")}
+                for row in task_rows if row.get("terminal") is True
+            ],
+        }
+    )
+    return observed
 
 
 def _canonical_effects(
@@ -1462,21 +2083,16 @@ def _canonical_effects(
     *,
     restore: bool = False,
     confirm: bool = True,
+    graph_document: Mapping[str, Any] | None = None,
 ) -> list[list[str]]:
     wid = item["workflow_id"]
     metadata = item.get("metadata") or {}
-    graph = item.get("graph") or {}
-    if restore:
-        metadata = (item.get("preimage") or {}).get("metadata", metadata)
-        graph = (item.get("preimage") or {}).get("graph", graph)
-    version = item.get("expected_version")
+    graph = graph_document if graph_document is not None else item.get("graph") or {}
     commands: list[list[str]] = []
     if item["intent"] in {"graph-only", "graph-and-metadata"}:
         commands.append([str(parsed["kent"]), "workflow", "graph", "apply", "-"])
         if confirm:
             commands[-1].append("--confirm")
-        if version is not None:
-            commands[-1].extend(["--expected-version", str(version)])
         commands[-1].append("--json")
     if item["intent"] in {"metadata-only", "graph-and-metadata"}:
         commands.append(
@@ -1494,7 +2110,6 @@ def _canonical_effects(
                 "--json",
             ]
         )
-    del version
     return commands
 
 
@@ -1575,6 +2190,660 @@ def reconcile_canonical_workflows(
         journal.persist({**journal.state, "phase": "complete"})
         return {"schema": "canonical-workflow-report-v2", "phase": "complete",
                 "effects_released": len(journal.state.get("effects", {}))}
+
+
+def _canonical_version(snapshot: Mapping[str, Any]) -> int:
+    for key in ("version", "revision", "graph_version", "expected_version"):
+        value = snapshot.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    graph = snapshot.get("graph")
+    if isinstance(graph, dict) and isinstance(graph.get("version"), int):
+        return graph["version"]
+    raise EffectBlocked("canonical workflow version is absent")
+
+
+def _canonical_target_graph(item: Mapping[str, Any], expected_version: int) -> dict[str, Any]:
+    graph = dict(item.get("graph") or {})
+    graph["expected_version"] = expected_version
+    return graph
+
+
+def _canonical_d9_check(dependency: Mapping[str, Any] | None) -> None:
+    if dependency is None:
+        return
+    path = Path(dependency["path"])
+    if path.is_symlink() or not path.is_file():
+        raise EffectBlocked("canonical D9 journal is absent or unsafe")
+    if sha256_bytes(path.read_bytes()) != dependency["sha256"]:
+        raise EffectBlocked("canonical D9 journal digest drifted")
+    try:
+        value = json.loads(path.read_text(), object_pairs_hook=_duplicate_free)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EffectBlocked("canonical D9 journal is not readable") from error
+    if not isinstance(value, dict) or value.get("operation") != dependency["operation"]:
+        raise EffectBlocked("canonical D9 journal operation drifted")
+    if value.get("phase") != "complete":
+        raise EffectBlocked("canonical D9 journal is not complete")
+    member_rows = {
+        row.get("workflow_id"): row
+        for row in value.get("members", [])
+        if isinstance(row, dict)
+    }
+    for workflow_id in dependency["members"]:
+        if member_rows.get(workflow_id, {}).get("status") != "verified":
+            raise EffectBlocked("canonical D9 member is not verified")
+
+
+def _canonical_validate_live(
+    item: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    *,
+    expected_version: int | None = None,
+) -> None:
+    if snapshot.get("present") is False:
+        raise EffectBlocked("canonical workflow is absent")
+    if expected_version is not None and _canonical_version(snapshot) != expected_version:
+        raise EffectBlocked("canonical workflow version drifted")
+    if snapshot.get("current_nodes"):
+        raise EffectBlocked("canonical workflow has an active Current Node")
+    if snapshot.get("pending_approvals"):
+        raise EffectBlocked("canonical workflow has a pending approval")
+    tasks = snapshot.get("tasks", [])
+    if not isinstance(tasks, list):
+        raise EffectBlocked("canonical task inventory is not a list")
+    for task in tasks:
+        if not isinstance(task, dict) or task.get("terminal") is not True:
+            raise EffectBlocked("canonical workflow has a nonterminal task")
+    if canonical_sha256(snapshot.get("links", [])) != canonical_sha256(item["links"]):
+        raise EffectBlocked("canonical workflow links drifted")
+    if canonical_sha256(snapshot.get("default")) != canonical_sha256(item["default"]):
+        raise EffectBlocked("canonical workflow default drifted")
+    expected_terminal = item["terminal_tasks"]
+    actual_terminal = snapshot.get("terminal_tasks", [])
+    if canonical_sha256(actual_terminal) != canonical_sha256(expected_terminal):
+        raise EffectBlocked("canonical terminal task inventory drifted")
+
+
+def _canonical_expected_post(
+    before: Mapping[str, Any],
+    item: Mapping[str, Any],
+    *,
+    graph: bool,
+    metadata: bool,
+) -> dict[str, Any]:
+    expected = dict(before)
+    if graph:
+        expected["graph"] = item["graph"]
+        expected["version"] = _canonical_version(before) + 1
+    if metadata:
+        expected["metadata"] = item["metadata"]
+    return expected
+
+
+def _canonical_state_digest(snapshot: Mapping[str, Any]) -> str:
+    return canonical_sha256(snapshot)
+
+
+def _validate_canonical_plan(plan: LoadedPlan) -> dict[str, Any]:
+    data = _closed(
+        plan.value, {"schema", "state_dir", "kent", "d9", "workflows"}, "canonical plan"
+    )
+    state_dir = _absolute_path(_required(data, "state_dir", "canonical plan"), "state_dir")
+    kent = _closed(_required(data, "kent", "canonical plan"), {"path", "sha256"}, "kent")
+    kent_path = _kent_path(_required(kent, "path", "kent"), "kent.path")
+    kent_sha = _sha256(_required(kent, "sha256", "kent"), "kent.sha256")
+    _verify_executable(kent_path, kent_sha)
+    dependency_raw = _closed(_required(data, "d9", "canonical plan"), {"none", "path", "sha256", "operation", "phase", "members"}, "d9")
+    if dependency_raw.get("none") is True:
+        if set(dependency_raw) != {"none"}:
+            raise PlanValidationError("canonical d9 none marker is not closed")
+        dependency = None
+    else:
+        if dependency_raw.get("none") is not False:
+            raise PlanValidationError("canonical d9 dependency must declare none=false")
+        dependency = {
+            "path": _absolute_path(_required(dependency_raw, "path", "d9"), "d9.path"),
+            "sha256": _sha256(_required(dependency_raw, "sha256", "d9"), "d9.sha256"),
+            "operation": _string(_required(dependency_raw, "operation", "d9"), "d9.operation"),
+            "phase": _string(_required(dependency_raw, "phase", "d9"), "d9.phase"),
+            "members": [_uuid(value, "d9.member") for value in _bounded_list(
+                _required(dependency_raw, "members", "d9"), "d9.members"
+            )],
+        }
+        if dependency["operation"] != "workflow-retirement-batch" or dependency["phase"] != "complete":
+            raise PlanValidationError("canonical d9 dependency is unsupported")
+    workflows: list[dict[str, Any]] = []
+    for index, raw in enumerate(_bounded_list(_required(data, "workflows", "canonical plan"), "workflows")):
+        _reject_raw_protocol_fields(raw, f"workflows[{index}]")
+        item = _closed(
+            raw,
+            {"workflow_id", "project_id", "intent", "expected_version", "graph",
+             "metadata", "terminal_tasks", "terminal_anchors", "links", "default"},
+            f"workflows[{index}]",
+        )
+        item = dict(item)
+        item["workflow_id"] = _uuid(_required(item, "workflow_id", "workflow"), "workflow_id")
+        item["project_id"] = _uuid(_required(item, "project_id", "workflow"), "project_id")
+        intent = _string(_required(item, "intent", "workflow"), "intent")
+        if intent not in {"graph-only", "metadata-only", "graph-and-metadata"}:
+            raise PlanValidationError("canonical intent is unsupported")
+        version = _required(item, "expected_version", "workflow")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            raise PlanValidationError("canonical expected_version must be a non-negative integer")
+        for key in ("terminal_tasks", "terminal_anchors", "links"):
+            _bounded_list(_required(item, key, "workflow"), f"workflow.{key}")
+        if not isinstance(_required(item, "default", "workflow"), (str, type(None))):
+            raise PlanValidationError("canonical default must be a string or null")
+        if intent in {"graph-only", "graph-and-metadata"}:
+            graph = _closed(_required(item, "graph", "workflow"), {"version", "nodes", "edges"}, "workflow.graph")
+            if graph["version"] != version + 1:
+                raise PlanValidationError("target graph must advance exactly one version")
+            _bounded_list(_required(graph, "nodes", "workflow.graph"), "workflow.graph.nodes")
+            _bounded_list(_required(graph, "edges", "workflow.graph"), "workflow.graph.edges")
+            item["graph"] = graph
+        elif "graph" in item:
+            raise PlanValidationError("metadata-only workflow cannot carry graph")
+        if intent in {"metadata-only", "graph-and-metadata"}:
+            metadata = _closed(_required(item, "metadata", "workflow"), {"name", "description", "execution_target"}, "workflow.metadata")
+            _string(_required(metadata, "name", "workflow.metadata"), "metadata.name")
+            _string(_required(metadata, "description", "workflow.metadata"), "metadata.description", nonempty=False)
+            _string(_required(metadata, "execution_target", "workflow.metadata"), "metadata.execution_target")
+            item["metadata"] = metadata
+        elif "metadata" in item:
+            raise PlanValidationError("graph-only workflow cannot carry metadata")
+        workflows.append(item)
+    if not workflows:
+        raise PlanValidationError("canonical plan has no workflows")
+    _unique([item["workflow_id"] for item in workflows], "canonical workflow identities")
+    if dependency and not set(item["workflow_id"] for item in workflows).issubset(set(dependency["members"])):
+        raise PlanValidationError("canonical workflows are not covered by D9")
+    return {"state_dir": state_dir, "kent": kent_path, "kent_sha256": kent_sha, "d9": dependency, "workflows": workflows}
+
+
+def _canonical_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, Any]:
+    kent = parsed["kent"]
+    root = Path.cwd()
+    wid = item["workflow_id"]
+    project = item["project_id"]
+    workflow = _kent_json(kent, ["workflow", "inspect", wid, "--json"], cwd=root)
+    graph = _kent_json(kent, ["workflow", "graph", "inspect", wid, "--json"], cwd=root)
+    validation = _kent_json(kent, ["workflow", "validate", wid, "--json"], cwd=root)
+    task_pages = _kent_pages(kent, ["task", "list", "--project", project, "--workflow", wid], cwd=root)
+    tasks = _page_rows(task_pages, ("items", "tasks"))
+    details = []
+    for task in tasks:
+        task_id = task.get("id", task.get("task_id"))
+        if isinstance(task_id, str):
+            details.append(_kent_json(kent, ["task", "show", task_id, "--project", project, "--json"], cwd=root))
+    result = dict(workflow)
+    result.update({
+        "workflow_id": wid,
+        "project_id": project,
+        "graph": graph.get("graph", graph),
+        "validation": validation,
+        "tasks": tasks,
+        "task_details": details,
+        "links": workflow.get("links", []),
+        "default": workflow.get("default"),
+        "current_nodes": workflow.get("current_nodes", []),
+        "pending_approvals": workflow.get("pending_approvals", []),
+        "terminal_tasks": [
+            {"id": task.get("id", task.get("task_id")), "status": task.get("status")}
+            for task in tasks if task.get("terminal") is True
+        ],
+    })
+    result["version"] = _canonical_version(result)
+    return result
+
+
+def _canonical_effects(
+    parsed: Mapping[str, Any],
+    item: Mapping[str, Any],
+    *,
+    restore: bool = False,
+    confirm: bool = True,
+    graph_document: Mapping[str, Any] | None = None,
+) -> list[list[str]]:
+    del restore
+    commands: list[list[str]] = []
+    if item["intent"] in {"graph-only", "graph-and-metadata"}:
+        command = [str(parsed["kent"]), "workflow", "graph", "apply", "-"]
+        if confirm:
+            command.append("--confirm")
+        command.append("--json")
+        commands.append(command)
+    if item["intent"] in {"metadata-only", "graph-and-metadata"}:
+        metadata = item["metadata"]
+        commands.append([
+            str(parsed["kent"]), "workflow", "update", item["workflow_id"],
+            "--name", metadata["name"], "--description", metadata["description"],
+            "--execution-target", metadata["execution_target"], "--json",
+        ])
+    return commands
+
+
+def reconcile_canonical_workflows(
+    plan: LoadedPlan,
+    *,
+    mode: str,
+    confirm: bool | str = False,
+    kent: str | Path | None = None,
+) -> dict[str, Any]:
+    parsed = _validate_canonical_plan(plan)
+    if kent is not None and str(kent) != str(parsed["kent"]):
+        raise PlanValidationError("runtime --kent differs from plan executable")
+    if mode not in {"prepare", "apply", "rollback"}:
+        raise PlanValidationError("canonical mode is unsupported")
+    if mode in {"apply", "rollback"} and confirm not in (True, plan.sha256):
+        raise PlanValidationError("canonical mutation requires confirmation")
+    _canonical_d9_check(parsed["d9"])
+    with OperationJournal(parsed["state_dir"], "canonical-workflow-reconcile", plan) as journal:
+        if mode == "prepare":
+            if journal.state is not None:
+                raise JournalError("canonical prepare refuses an existing journal")
+            live = [_canonical_read(parsed, item) for item in parsed["workflows"]]
+            for item, observed in zip(parsed["workflows"], live):
+                _canonical_validate_live(item, observed, expected_version=item["expected_version"])
+            journal.persist({
+                "phase": "prepared",
+                "preimage": live,
+                "members": [{"workflow_id": item["workflow_id"], "status": "prepared"} for item in parsed["workflows"]],
+                "effects": {},
+            })
+            return {"schema": "canonical-workflow-report-v2", "phase": "prepared", "effects_released": 0}
+        state = journal.require_phase({"prepared", "in_progress", "complete"})
+        if mode == "rollback":
+            if state["phase"] != "prepared":
+                raise JournalError("canonical rollback is allowed only from prepared")
+            journal.persist({**state, "phase": "rolled_back"})
+            return {"schema": "canonical-workflow-report-v2", "phase": "rolled_back", "effects_released": 0}
+        if state["phase"] == "complete":
+            return {"schema": "canonical-workflow-report-v2", "phase": "complete", "resumed": True}
+        journal.persist({**state, "phase": "in_progress"})
+        for item in parsed["workflows"]:
+            wid = item["workflow_id"]
+            before = _canonical_read(parsed, item)
+            _canonical_validate_live(item, before, expected_version=item["expected_version"])
+            prepared = next(row for row in state["preimage"] if row["workflow_id"] == wid)
+            if _canonical_state_digest(before) != _canonical_state_digest(prepared):
+                raise EffectBlocked("canonical prepared preimage drifted")
+            graph_document = dict(item.get("graph") or {})
+            graph_document["expected_version"] = item["expected_version"]
+            commands = _canonical_effects(parsed, item, graph_document=graph_document)
+            for number, command in enumerate(commands):
+                is_graph = "graph" in command
+                is_metadata = "update" in command
+                expected = _canonical_expected_post(
+                    before, item, graph=is_graph, metadata=is_metadata
+                )
+                pre_hash = _canonical_state_digest(before)
+                post_hash = _canonical_state_digest(expected)
+
+                def current(
+                    before=before, expected=expected, is_graph=is_graph, is_metadata=is_metadata
+                ) -> str:
+                    latest = _canonical_read(parsed, item)
+                    _canonical_validate_live(item, latest)
+                    if is_graph:
+                        if latest.get("graph") != item["graph"] or _canonical_version(latest) != item["graph"]["version"]:
+                            if _canonical_state_digest(latest) == _canonical_state_digest(before):
+                                return pre_hash
+                            raise EffectBlocked("canonical graph postimage is not exact")
+                    if is_metadata and latest.get("metadata") != item["metadata"]:
+                        if _canonical_state_digest(latest) == _canonical_state_digest(before):
+                            return pre_hash
+                        raise EffectBlocked("canonical metadata postimage is not exact")
+                    if is_graph and latest.get("graph") != item["graph"]:
+                        raise EffectBlocked("canonical graph postimage is not exact")
+                    return post_hash
+
+                key = f"apply:{wid}:{number}"
+                existing = (journal.state.get("effects") or {}).get(key)
+                if isinstance(existing, dict) and existing.get("status") in {"attempted", "unresolved", "failed", "ambiguous"}:
+                    settled = recover_effect(
+                        journal, effect_key=key, preimage_sha256=pre_hash,
+                        postimage_sha256=post_hash, current_sha256=current,
+                    )
+                else:
+                    settled = run_effect(
+                        journal, effect_key=key, command=command, cwd=Path.cwd(),
+                        preimage_sha256=pre_hash, postimage_sha256=post_hash,
+                        stdin_bytes=canonical_bytes(graph_document) if is_graph else None,
+                        current_sha256=current,
+                    ).settlement
+                if settled == "preimage":
+                    return {"schema": "canonical-workflow-report-v2", "phase": "in_progress", "settled": "preimage", "effects_released": len(journal.state.get("effects", {}))}
+                before = _canonical_read(parsed, item)
+        journal.persist({**journal.state, "phase": "complete"})
+        return {"schema": "canonical-workflow-report-v2", "phase": "complete", "effects_released": len(journal.state.get("effects", {}))}
+
+
+def _validate_canonical_plan(plan: LoadedPlan) -> dict[str, Any]:
+    data = _closed(
+        plan.value, {"schema", "state_dir", "kent", "d9", "workflows"}, "canonical plan"
+    )
+    state_dir = _absolute_path(_required(data, "state_dir", "canonical plan"), "state_dir")
+    kent = _closed(_required(data, "kent", "canonical plan"), {"path", "sha256"}, "kent")
+    kent_path = _kent_path(_required(kent, "path", "kent"), "kent.path")
+    kent_sha = _sha256(_required(kent, "sha256", "kent"), "kent.sha256")
+    _verify_executable(kent_path, kent_sha)
+    raw_d9 = _closed(_required(data, "d9", "canonical plan"), {"none", "path", "sha256", "operation", "phase", "members"}, "d9")
+    d9: dict[str, Any] | None
+    if raw_d9.get("none") is True:
+        if set(raw_d9) != {"none"}:
+            raise PlanValidationError("canonical d9 none marker is not closed")
+        d9 = None
+    else:
+        if raw_d9.get("none") is not False:
+            raise PlanValidationError("canonical d9 dependency must explicitly declare none")
+        d9 = {
+            "path": _absolute_path(_required(raw_d9, "path", "d9"), "d9.path"),
+            "sha256": _sha256(_required(raw_d9, "sha256", "d9"), "d9.sha256"),
+            "operation": _string(_required(raw_d9, "operation", "d9"), "d9.operation"),
+            "phase": _string(_required(raw_d9, "phase", "d9"), "d9.phase"),
+            "members": [_uuid(value, "d9.member") for value in _bounded_list(
+                _required(raw_d9, "members", "d9"), "d9.members"
+            )],
+        }
+        if d9["operation"] != "workflow-retirement-batch" or d9["phase"] != "complete":
+            raise PlanValidationError("canonical d9 dependency is unsupported")
+    workflows: list[dict[str, Any]] = []
+    for index, raw in enumerate(_bounded_list(_required(data, "workflows", "canonical plan"), "workflows")):
+        _reject_raw_protocol_fields(raw, f"workflows[{index}]")
+        item = dict(_closed(
+            raw,
+            {
+                "workflow_id", "project_id", "intent", "expected_version", "graph",
+                "metadata", "terminal_tasks", "terminal_anchors", "links", "default",
+            },
+            f"workflows[{index}]",
+        ))
+        item["workflow_id"] = _uuid(_required(item, "workflow_id", "workflow"), "workflow_id")
+        item["project_id"] = _uuid(_required(item, "project_id", "workflow"), "project_id")
+        intent = _string(_required(item, "intent", "workflow"), "intent")
+        if intent not in {"graph-only", "metadata-only", "graph-and-metadata"}:
+            raise PlanValidationError("canonical intent is unsupported")
+        version = _required(item, "expected_version", "workflow")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            raise PlanValidationError("canonical expected_version must be a non-negative integer")
+        for key in ("terminal_tasks", "terminal_anchors", "links"):
+            _bounded_list(_required(item, key, "workflow"), f"workflow.{key}")
+        if not isinstance(_required(item, "default", "workflow"), (str, type(None))):
+            raise PlanValidationError("canonical default must be a string or null")
+        if intent in {"graph-only", "graph-and-metadata"}:
+            graph = dict(_closed(
+                _required(item, "graph", "workflow"),
+                {"version", "expected_version", "nodes", "edges"},
+                "workflow.graph",
+            ))
+            if graph.get("expected_version", version) != version or graph["version"] != version + 1:
+                raise PlanValidationError("target graph must advance exactly one version")
+            _bounded_list(_required(graph, "nodes", "workflow.graph"), "workflow.graph.nodes")
+            _bounded_list(_required(graph, "edges", "workflow.graph"), "workflow.graph.edges")
+            item["graph"] = graph
+        elif "graph" in item:
+            raise PlanValidationError("metadata-only workflow cannot carry graph")
+        if intent in {"metadata-only", "graph-and-metadata"}:
+            metadata = _closed(
+                _required(item, "metadata", "workflow"),
+                {"name", "description", "execution_target"},
+                "workflow.metadata",
+            )
+            _string(_required(metadata, "name", "workflow.metadata"), "metadata.name")
+            _string(_required(metadata, "description", "workflow.metadata"), "metadata.description", nonempty=False)
+            _string(_required(metadata, "execution_target", "workflow.metadata"), "metadata.execution_target")
+            item["metadata"] = metadata
+        elif "metadata" in item:
+            raise PlanValidationError("graph-only workflow cannot carry metadata")
+        workflows.append(item)
+    if not workflows:
+        raise PlanValidationError("canonical plan has no workflows")
+    _unique([item["workflow_id"] for item in workflows], "canonical workflow identities")
+    if d9 and not set(item["workflow_id"] for item in workflows).issubset(set(d9["members"])):
+        raise PlanValidationError("canonical workflows are not covered by D9")
+    return {"state_dir": state_dir, "kent": kent_path, "kent_sha256": kent_sha, "d9": d9, "workflows": workflows}
+
+
+def _canonical_version(snapshot: Mapping[str, Any]) -> int:
+    for key in ("version", "revision", "graph_version"):
+        value = snapshot.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    graph = snapshot.get("graph")
+    if isinstance(graph, dict) and isinstance(graph.get("version"), int):
+        return graph["version"]
+    raise EffectBlocked("canonical workflow version is absent")
+
+
+def _canonical_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, Any]:
+    kent = parsed["kent"]
+    root = Path.cwd()
+    wid = item["workflow_id"]
+    project = item["project_id"]
+    project_list = _kent_json(kent, ["project", "list", "--json"], cwd=root)
+    workflow = _kent_json(kent, ["workflow", "inspect", wid, "--json"], cwd=root)
+    graph_raw = _kent_json(kent, ["workflow", "graph", "inspect", wid, "--json"], cwd=root)
+    validation = _kent_json(kent, ["workflow", "validate", wid, "--json"], cwd=root)
+    task_pages = _kent_pages(kent, ["task", "list", "--project", project, "--workflow", wid], cwd=root)
+    tasks = _page_rows(task_pages, ("items", "tasks"))
+    details = []
+    for task in tasks:
+        task_id = task.get("id", task.get("task_id"))
+        if isinstance(task_id, str):
+            details.append(_kent_json(kent, ["task", "show", task_id, "--project", project, "--json"], cwd=root))
+    graph = graph_raw.get("graph", graph_raw)
+    if not isinstance(graph, dict):
+        raise OperationError("canonical graph readback is not an object")
+    result = dict(workflow)
+    result.update(
+        {
+            "workflow_id": wid,
+            "project_id": project,
+            "project_list": project_list,
+            "graph": graph,
+            "validation": validation,
+            "tasks": tasks,
+            "task_details": details,
+            "links": workflow.get("links", []),
+            "default": workflow.get("default"),
+            "current_nodes": workflow.get("current_nodes", []),
+            "pending_approvals": workflow.get("pending_approvals", []),
+            "terminal_tasks": [
+                {"id": task.get("id", task.get("task_id")), "status": task.get("status")}
+                for task in tasks if task.get("terminal") is True
+            ],
+            "version": workflow.get("version", workflow.get("revision", graph.get("version"))),
+        }
+    )
+    return result
+
+
+def _canonical_gate(item: Mapping[str, Any], snapshot: Mapping[str, Any], expected_version: int) -> None:
+    if snapshot.get("present") is False:
+        raise EffectBlocked("canonical workflow is absent")
+    if _canonical_version(snapshot) != expected_version:
+        raise EffectBlocked("canonical workflow version drifted")
+    if snapshot.get("current_nodes") or snapshot.get("pending_approvals"):
+        raise EffectBlocked("canonical workflow is not quiescent")
+    project_list = snapshot.get("project_list", {})
+    project_rows = (
+        project_list.get("items", project_list.get("projects", []))
+        if isinstance(project_list, dict)
+        else []
+    )
+    if not isinstance(project_rows, list):
+        project_rows = []
+    if project_rows and not any(
+        row.get("id", row.get("project_id")) == item["project_id"]
+        for row in project_rows
+    ):
+        raise EffectBlocked("canonical project linkage is absent")
+    tasks = snapshot.get("tasks")
+    if not isinstance(tasks, list) or any(
+        not isinstance(task, dict) or task.get("terminal") is not True for task in tasks
+    ):
+        raise EffectBlocked("canonical workflow has a nonterminal task")
+    if canonical_sha256(snapshot.get("links", [])) != canonical_sha256(item["links"]):
+        raise EffectBlocked("canonical links drifted")
+    if canonical_sha256(snapshot.get("default")) != canonical_sha256(item["default"]):
+        raise EffectBlocked("canonical default drifted")
+    if canonical_sha256(snapshot.get("terminal_tasks", [])) != canonical_sha256(item["terminal_tasks"]):
+        raise EffectBlocked("canonical terminal task inventory drifted")
+    graph_nodes = {
+        node.get("id"): node.get("kind")
+        for node in snapshot.get("graph", {}).get("nodes", [])
+        if isinstance(node, dict)
+    }
+    for anchor in item["terminal_anchors"]:
+        if not isinstance(anchor, dict):
+            raise EffectBlocked("canonical terminal anchor is not typed")
+        if graph_nodes.get(anchor.get("id")) != anchor.get("kind"):
+            raise EffectBlocked("canonical terminal anchor drifted")
+
+
+def _canonical_effects(
+    parsed: Mapping[str, Any],
+    item: Mapping[str, Any],
+    *,
+    restore: bool = False,
+    confirm: bool = True,
+    graph_document: Mapping[str, Any] | None = None,
+) -> list[list[str]]:
+    del restore, graph_document
+    commands: list[list[str]] = []
+    if item["intent"] in {"graph-only", "graph-and-metadata"}:
+        command = [str(parsed["kent"]), "workflow", "graph", "apply", "-"]
+        if confirm:
+            command.append("--confirm")
+        command.append("--json")
+        commands.append(command)
+    if item["intent"] in {"metadata-only", "graph-and-metadata"}:
+        metadata = item["metadata"]
+        commands.append([
+            str(parsed["kent"]), "workflow", "update", item["workflow_id"],
+            "--name", metadata["name"], "--description", metadata["description"],
+            "--execution-target", metadata["execution_target"], "--json",
+        ])
+    return commands
+
+
+def _canonical_d9_check(dependency: Mapping[str, Any] | None) -> None:
+    if dependency is None:
+        return
+    path = dependency["path"]
+    if path.is_symlink() or not path.is_file() or sha256_bytes(path.read_bytes()) != dependency["sha256"]:
+        raise EffectBlocked("canonical D9 journal is absent or drifted")
+    try:
+        value = json.loads(path.read_text(), object_pairs_hook=_duplicate_free)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EffectBlocked("canonical D9 journal is invalid") from error
+    if value.get("operation") != dependency["operation"] or value.get("phase") != "complete":
+        raise EffectBlocked("canonical D9 dependency is not complete")
+    rows = {row.get("workflow_id"): row for row in value.get("members", []) if isinstance(row, dict)}
+    if any(rows.get(member, {}).get("status") != "verified" for member in dependency["members"]):
+        raise EffectBlocked("canonical D9 member is not verified")
+
+
+def reconcile_canonical_workflows(
+    plan: LoadedPlan,
+    *,
+    mode: str,
+    confirm: bool | str = False,
+    kent: str | Path | None = None,
+) -> dict[str, Any]:
+    parsed = _validate_canonical_plan(plan)
+    if kent is not None and str(kent) != str(parsed["kent"]):
+        raise PlanValidationError("runtime --kent differs from plan executable")
+    if mode not in {"prepare", "apply", "rollback"}:
+        raise PlanValidationError("canonical mode is unsupported")
+    if mode in {"apply", "rollback"} and confirm not in (True, plan.sha256):
+        raise PlanValidationError("canonical mutation requires confirmation")
+    _canonical_d9_check(parsed["d9"])
+    with OperationJournal(parsed["state_dir"], "canonical-workflow-reconcile", plan) as journal:
+        if mode == "prepare":
+            if journal.state is not None:
+                raise JournalError("canonical prepare refuses an existing journal")
+            live = [_canonical_read(parsed, item) for item in parsed["workflows"]]
+            for item, snapshot in zip(parsed["workflows"], live):
+                _canonical_gate(item, snapshot, item["expected_version"])
+            journal.persist({
+                "phase": "prepared",
+                "preimage": live,
+                "members": [{"workflow_id": item["workflow_id"], "status": "prepared"} for item in parsed["workflows"]],
+                "effects": {},
+            })
+            return {"schema": "canonical-workflow-report-v2", "phase": "prepared", "effects_released": 0}
+        state = journal.require_phase({"prepared", "in_progress", "complete"})
+        if mode == "rollback":
+            if state["phase"] != "prepared":
+                raise JournalError("canonical rollback is allowed only from prepared")
+            journal.persist({**state, "phase": "rolled_back"})
+            return {"schema": "canonical-workflow-report-v2", "phase": "rolled_back", "effects_released": 0}
+        if state["phase"] == "complete":
+            return {"schema": "canonical-workflow-report-v2", "phase": "complete", "resumed": True}
+        journal.persist({**state, "phase": "in_progress"})
+        for item in parsed["workflows"]:
+            wid = item["workflow_id"]
+            before = _canonical_read(parsed, item)
+            expected_version = item["expected_version"]
+            _canonical_gate(item, before, expected_version)
+            prepared = next(row for row in state["preimage"] if row["workflow_id"] == wid)
+            if canonical_sha256(before) != canonical_sha256(prepared):
+                raise EffectBlocked("canonical prepared preimage drifted")
+            graph_doc = dict(item.get("graph") or {})
+            graph_doc["expected_version"] = expected_version
+            for number, command in enumerate(_canonical_effects(parsed, item, graph_document=graph_doc)):
+                is_graph = "graph" in command
+                pre_hash = canonical_sha256(before)
+                target_graph = item.get("graph")
+                target_version = target_graph["version"] if isinstance(target_graph, dict) else expected_version
+                key = f"apply:{wid}:{number}"
+
+                def current(
+                    before=before, is_graph=is_graph, target_graph=target_graph,
+                    target_version=target_version, item=item,
+                ) -> str:
+                    latest = _canonical_read(parsed, item)
+                    _canonical_gate(item, latest, expected_version if is_graph else target_version)
+                    if is_graph:
+                        if latest.get("graph") != target_graph or _canonical_version(latest) != target_version:
+                            if canonical_sha256(latest) == canonical_sha256(before):
+                                return pre_hash
+                            raise EffectBlocked("canonical graph readback is partial or ambiguous")
+                    else:
+                        if latest.get("name") != item["metadata"]["name"] and latest.get("metadata", {}).get("name") != item["metadata"]["name"]:
+                            if canonical_sha256(latest) == canonical_sha256(before):
+                                return pre_hash
+                            raise EffectBlocked("canonical metadata readback is partial or ambiguous")
+                    return target_hash
+
+                target_hash = canonical_sha256(
+                    {
+                        **before,
+                        "graph": target_graph if is_graph else before.get("graph"),
+                        "version": target_version if is_graph else _canonical_version(before),
+                        **({"name": item["metadata"]["name"], "description": item["metadata"]["description"], "execution_target": item["metadata"]["execution_target"]} if not is_graph else {}),
+                    }
+                )
+                existing = (journal.state.get("effects") or {}).get(key)
+                if isinstance(existing, dict) and existing.get("status") in {"attempted", "unresolved", "failed", "ambiguous"}:
+                    settled = recover_effect(
+                        journal, effect_key=key, preimage_sha256=pre_hash,
+                        postimage_sha256=target_hash, current_sha256=current,
+                    )
+                else:
+                    settled = run_effect(
+                        journal, effect_key=key, command=command, cwd=Path.cwd(),
+                        preimage_sha256=pre_hash, postimage_sha256=target_hash,
+                        stdin_bytes=canonical_bytes(graph_doc) if is_graph else None,
+                        current_sha256=current,
+                    ).settlement
+                if settled == "preimage":
+                    return {"schema": "canonical-workflow-report-v2", "phase": "in_progress", "settled": "preimage", "effects_released": len(journal.state.get("effects", {}))}
+                before = _canonical_read(parsed, item)
+        journal.persist({**journal.state, "phase": "complete"})
+        return {"schema": "canonical-workflow-report-v2", "phase": "complete", "effects_released": len(journal.state.get("effects", {}))}
 
 
 def _validate_activation_plan(plan: LoadedPlan) -> dict[str, Any]:
@@ -1773,6 +3042,299 @@ def activate_primary_checkout(
             journal.persist({**journal.state, "phase": "verified"})
         return {"schema": "kit-primary-activation-report-v2", "phase": "verified",
                 "effects_released": len(journal.state.get("effects", {}))}
+
+
+def _activation_lstat(path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        return {"kind": "symlink", "target": os.readlink(path)}
+    if path.exists():
+        if path.is_file():
+            return {"kind": "file", "sha256": sha256_bytes(path.read_bytes())}
+        if path.is_dir():
+            return {"kind": "directory"}
+    return {"kind": "absent"}
+
+
+def _validate_activation_plan(plan: LoadedPlan) -> dict[str, Any]:
+    data = _closed(
+        plan.value,
+        {
+            "schema", "state_dir", "primary_root", "branch", "baseline_commit",
+            "target_commit", "role", "git_config_allowlist", "tracking",
+            "installed_links", "prompt_prestate", "backups", "source_prompt_sha256",
+        },
+        "activation plan",
+    )
+    if _string(_required(data, "branch", "activation plan"), "branch") != "main":
+        raise PlanValidationError("primary activation is restricted to main")
+    _sha1(_required(data, "baseline_commit", "activation plan"), "baseline_commit")
+    _sha1(_required(data, "target_commit", "activation plan"), "target_commit")
+    state_dir = _absolute_path(_required(data, "state_dir", "activation plan"), "state_dir")
+    primary_root = _absolute_path(_required(data, "primary_root", "activation plan"), "primary_root")
+    role = _closed(
+        _required(data, "role", "activation plan"),
+        {"prompt_path", "config_path", "kit_prompt_path", "expected_prompt_sha256"},
+        "role",
+    )
+    for key in ("prompt_path", "config_path", "kit_prompt_path"):
+        _absolute_path(_required(role, key, "role"), f"role.{key}")
+    _sha256(_required(role, "expected_prompt_sha256", "role"), "role.expected_prompt_sha256")
+    _sha256(_required(data, "source_prompt_sha256", "activation plan"), "source_prompt_sha256")
+    allowlist = _required(data, "git_config_allowlist", "activation plan")
+    if not isinstance(allowlist, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in allowlist.items()
+    ):
+        raise PlanValidationError("git_config_allowlist must be a string map")
+    tracking = _required(data, "tracking", "activation plan")
+    if not isinstance(tracking, (str, type(None))):
+        raise PlanValidationError("tracking must be a string or null")
+    links = _bounded_list(_required(data, "installed_links", "activation plan"), "installed_links")
+    for index, link in enumerate(links):
+        link = _closed(link, {"path", "target"}, f"installed_links[{index}]")
+        _absolute_path(_required(link, "path", f"installed_links[{index}]"), "installed link.path")
+        _absolute_path(_required(link, "target", f"installed_links[{index}]"), "installed link.target")
+    prestate = _closed(
+        _required(data, "prompt_prestate", "activation plan"),
+        {"kind", "target", "sha256"},
+        "prompt_prestate",
+    )
+    if prestate["kind"] not in {"absent", "file", "symlink"}:
+        raise PlanValidationError("prompt_prestate.kind is unsupported")
+    if prestate.get("target") is not None:
+        _string(prestate["target"], "prompt_prestate.target")
+    if prestate.get("sha256") is not None:
+        _sha256(prestate["sha256"], "prompt_prestate.sha256")
+    backups = _closed(_required(data, "backups", "activation plan"), {"path", "sha256", "kind"}, "backups")
+    if backups.get("path") is not None:
+        _absolute_path(backups["path"], "backups.path")
+    if backups.get("sha256") is not None:
+        _sha256(backups["sha256"], "backups.sha256")
+    return {
+        **data,
+        "state_dir": state_dir,
+        "primary_root": primary_root,
+        "role": {**role},
+        "git_config_allowlist": dict(allowlist),
+        "installed_links": links,
+        "prompt_prestate": prestate,
+        "backups": backups,
+    }
+
+
+def _activation_preflight(data: Mapping[str, Any]) -> dict[str, Any]:
+    root = data["primary_root"]
+    if not root.is_dir() or root.is_symlink():
+        raise OperationError("primary checkout root is unsafe")
+    if Path(_git(root, "rev-parse", "--show-toplevel")).resolve() != root.resolve():
+        raise OperationError("primary checkout root mismatch")
+    if _git(root, "branch", "--show-current") != "main":
+        raise OperationError("primary checkout is not on main")
+    if _git(root, "status", "--porcelain"):
+        raise OperationError("primary checkout is dirty")
+    baseline = data["baseline_commit"]
+    target = data["target_commit"]
+    if _git(root, "rev-parse", "HEAD") != baseline:
+        raise OperationError("primary baseline does not match the plan")
+    if _git(root, "rev-parse", "refs/heads/main") != baseline:
+        raise OperationError("local main ref does not match the baseline")
+    _git(root, "cat-file", "-e", f"{target}^{{commit}}")
+    _git(root, "merge-base", "--is-ancestor", baseline, target)
+    tracking = data["tracking"]
+    actual_tracking = _git(root, "config", "--local", "--get-regexp", r"^branch\.main\.", check=False)
+    if tracking is not None and actual_tracking != tracking:
+        raise OperationError("main tracking configuration drifted")
+    dangerous = {}
+    for key in (
+        "core.hookspath", "credential.helper", "core.askpass", "pager.diff",
+        "pager.show", "pager.log", "maintenance.auto", "core.attributesfile",
+        "core.whitespace",
+    ):
+        dangerous[key] = _git(root, "config", "--local", "--get", key, check=False)
+    for key, value in dangerous.items():
+        if value and data["git_config_allowlist"].get(key) != value:
+            raise OperationError(f"unapproved Git configuration: {key}")
+    role = data["role"]
+    source = Path(role["kit_prompt_path"])
+    if source.is_symlink() or not source.is_file():
+        raise OperationError("Kit source prompt is absent or unsafe")
+    if sha256_bytes(source.read_bytes()) != data["source_prompt_sha256"]:
+        raise OperationError("Kit source prompt digest drifted")
+    config = Path(role["config_path"])
+    if config.is_symlink() or not config.is_file():
+        raise OperationError("role configuration is absent or unsafe")
+    try:
+        import tomllib
+        parsed_config = tomllib.loads(config.read_text())
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise OperationError("role configuration is invalid") from error
+    config_text = config.read_text()
+    if any(key in config_text for key in ("model =", "tools =", "workflow =", "agent =")):
+        raise OperationError("role configuration contains forbidden execution authority")
+    if not isinstance(parsed_config, dict):
+        raise OperationError("role configuration is not an object")
+    registrations = parsed_config.get("roles", parsed_config.get("subagents", {}))
+    if not isinstance(registrations, dict) or not any(
+        key in registrations for key in ("release-decision", "release_decision")
+    ):
+        raise OperationError("release-decision role is not registered")
+    for link in data["installed_links"]:
+        path = Path(link["path"])
+        target_path = Path(link["target"])
+        if not path.is_symlink() or path.resolve() != target_path.resolve() or not target_path.exists():
+            raise OperationError("installed Kit link is missing, foreign, or dangling")
+    prompt = Path(role["prompt_path"])
+    actual_prestate = _activation_lstat(prompt)
+    if actual_prestate["kind"] == "file" and actual_prestate.get("sha256") != role["expected_prompt_sha256"]:
+        raise OperationError("installed prompt bytes drifted")
+    if actual_prestate["kind"] == "symlink":
+        if prompt.resolve() != source.resolve() or not source.exists():
+            raise OperationError("installed prompt symlink is foreign or dangling")
+    if actual_prestate["kind"] not in {"absent", "file", "symlink"}:
+        raise OperationError("installed prompt kind is unsupported")
+    if actual_prestate != data["prompt_prestate"] and actual_prestate["kind"] != "file":
+        raise OperationError("installed prompt prestate drifted")
+    backup_path = Path(data["backups"]["path"]) if data["backups"].get("path") else prompt.with_name(prompt.name + ".release-decision.backup")
+    backup_state = _activation_lstat(backup_path)
+    expected_backup_kind = data["backups"].get("kind", "absent")
+    if backup_state["kind"] != expected_backup_kind:
+        raise OperationError("activation backup state drifted")
+    if data["backups"].get("sha256") and backup_state.get("sha256") != data["backups"]["sha256"]:
+        raise OperationError("activation backup digest drifted")
+    return {
+        "root": str(root),
+        "current_commit": _git(root, "rev-parse", "HEAD"),
+        "target_commit": target,
+        "source_prompt_sha256": data["source_prompt_sha256"],
+        "prompt": actual_prestate,
+        "backup": backup_state,
+        "config_sha256": sha256_bytes(config.read_bytes()),
+    }
+
+
+def activate_primary_checkout(
+    plan: LoadedPlan,
+    *,
+    mode: str,
+    confirm: bool | str = False,
+) -> dict[str, Any]:
+    data = _validate_activation_plan(plan)
+    if mode not in {"preview", "apply", "rollback"}:
+        raise PlanValidationError("activation mode is unsupported")
+    if mode == "preview":
+        return {
+            "schema": "kit-primary-activation-report-v2",
+            "phase": "preview",
+            "plan_sha256": plan.sha256,
+            "preflight": _activation_preflight(data),
+            "effects_released": 0,
+        }
+    if confirm not in (True, plan.sha256):
+        raise PlanValidationError("activation mutation requires confirmation")
+    journal_obj = OperationJournal(data["state_dir"], "kit-primary-activation", plan)
+    with journal_obj as journal:
+        if mode == "rollback":
+            if journal.state is None:
+                raise JournalError("activation rollback requires a prepared journal")
+            state = journal.require_phase({"prepared"})
+            journal.persist({**state, "phase": "rolled_back"})
+            return {"schema": "kit-primary-activation-report-v2", "phase": "rolled_back", "effects_released": 0}
+        if journal.state is None:
+            journal.persist({"phase": "prepared", "preflight": _activation_preflight(data), "effects": {}})
+        state = journal.require_phase({"prepared", "activation_committed", "primary_promoted", "role_adopted", "verified"})
+        if state["phase"] == "prepared":
+            _activation_preflight(data)
+            journal.persist({**state, "phase": "activation_committed"})
+            root = data["primary_root"]
+            pre_hash = canonical_sha256({"head": data["baseline_commit"]})
+            post_hash = canonical_sha256({"head": data["target_commit"]})
+
+            def current_head() -> str:
+                head = _git(root, "rev-parse", "HEAD")
+                if head == data["baseline_commit"]:
+                    return pre_hash
+                if head == data["target_commit"]:
+                    return post_hash
+                raise EffectBlocked("primary HEAD is ambiguous")
+
+            command = [
+                "/usr/bin/git", "-C", str(root), "-c", "core.hooksPath=/dev/null",
+                "-c", "credential.helper=", "-c", "maintenance.auto=false",
+                "merge", "--ff-only", data["target_commit"],
+            ]
+            result = run_effect(
+                journal, effect_key="primary-merge", command=command, cwd=root,
+                preimage_sha256=pre_hash, postimage_sha256=post_hash,
+                extra_env={
+                    "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat",
+                    "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                },
+                current_sha256=current_head,
+            )
+            if result.settlement == "preimage":
+                return {"schema": "kit-primary-activation-report-v2", "phase": "activation_committed", "settled": "preimage", "effects_released": 0}
+            state = journal.state
+            journal.persist({**state, "phase": "primary_promoted"})
+        elif state["phase"] == "activation_committed":
+            _activation_preflight(data)
+            effect = (state.get("effects") or {}).get("primary-merge")
+            if not isinstance(effect, dict):
+                raise JournalError("activation merge effect is missing")
+            pre_hash = canonical_sha256({"head": data["baseline_commit"]})
+            post_hash = canonical_sha256({"head": data["target_commit"]})
+
+            def current_head() -> str:
+                head = _git(data["primary_root"], "rev-parse", "HEAD")
+                if head == data["baseline_commit"]:
+                    return pre_hash
+                if head == data["target_commit"]:
+                    return post_hash
+                raise EffectBlocked("primary HEAD is ambiguous")
+
+            if effect.get("status") == "settled_preimage":
+                return {"schema": "kit-primary-activation-report-v2", "phase": "activation_committed", "settled": "preimage", "effects_released": 0}
+            settled = recover_effect(
+                journal, effect_key="primary-merge", preimage_sha256=pre_hash,
+                postimage_sha256=post_hash, current_sha256=current_head,
+            )
+            if settled == "preimage":
+                return {"schema": "kit-primary-activation-report-v2", "phase": "activation_committed", "settled": "preimage", "effects_released": 0}
+            journal.persist({**journal.state, "phase": "primary_promoted"})
+        if journal.state["phase"] == "primary_promoted":
+            _activation_preflight(data)
+            role = data["role"]
+            prompt = Path(role["prompt_path"])
+            source = Path(role["kit_prompt_path"])
+            backup = Path(data["backups"]["path"]) if data["backups"].get("path") else prompt.with_name(prompt.name + ".release-decision.backup")
+            if prompt.is_symlink():
+                if prompt.resolve() != source.resolve():
+                    raise OperationError("installed prompt symlink is foreign")
+            elif prompt.exists():
+                if not prompt.is_file() or sha256_bytes(prompt.read_bytes()) != role["expected_prompt_sha256"]:
+                    raise OperationError("installed prompt is not the approved regular file")
+                if not backup.exists():
+                    prompt.rename(backup)
+                elif not backup.is_file() or sha256_bytes(backup.read_bytes()) != role["expected_prompt_sha256"]:
+                    raise OperationError("activation backup would be clobbered")
+                if prompt.exists() and not prompt.is_symlink():
+                    prompt.unlink()
+                if not prompt.exists():
+                    prompt.symlink_to(source)
+            else:
+                prompt.parent.mkdir(parents=True, exist_ok=True)
+                prompt.symlink_to(source)
+            if not prompt.is_symlink() or prompt.resolve() != source.resolve():
+                raise OperationError("installed prompt adoption readback failed")
+            journal.persist({**journal.state, "phase": "role_adopted"})
+        _activation_preflight(data)
+        if _git(data["primary_root"], "rev-parse", "HEAD") != data["target_commit"]:
+            raise OperationError("primary target readback mismatch")
+        journal.persist({**journal.state, "phase": "verified"})
+        return {
+            "schema": "kit-primary-activation-report-v2",
+            "phase": "verified",
+            "effects_released": len(journal.state.get("effects", {})),
+        }
 
 
 def main_guardian(argv: Sequence[str]) -> int:

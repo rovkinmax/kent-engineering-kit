@@ -7,11 +7,14 @@ import tempfile
 import unittest
 
 from workflowkit.operations import (
+    EffectBlocked,
     OperationJournal,
     PlanValidationError,
     canonical_bytes,
+    canonical_sha256,
     load_plan,
     recover_effect,
+    run_effect,
     retire_workflow_batch,
 )
 
@@ -35,7 +38,7 @@ def base_plan(root: Path, *, terminal: bool = True) -> dict:
         },
         "database": {
             "path": str(root / "kent.sqlite"),
-            "schema": "sqlite",
+            "schema": "kent-2.6.1",
             "project_root": str(root),
             "session_roots": [],
         },
@@ -52,10 +55,15 @@ def base_plan(root: Path, *, terminal: bool = True) -> dict:
                     }
                 ],
                 "links": [],
+                "default": None,
                 "sessions": [],
                 "worktrees": [],
                 "retained": [],
                 "absent": [],
+                "delete_preview": {
+                    "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+                    "sha256": "c" * 64,
+                },
             }
         ],
     }
@@ -105,6 +113,8 @@ class WorkflowRetirementTest(unittest.TestCase):
                         "effects": {
                             "delete:x": {
                                 "status": "attempted",
+                                "preimage_sha256": "a" * 64,
+                                "postimage_sha256": "b" * 64,
                                 "child": {"guardian_pid": 999999, "child_pid": 999998},
                             }
                         },
@@ -120,6 +130,59 @@ class WorkflowRetirementTest(unittest.TestCase):
                     ),
                     "preimage",
                 )
+
+    def test_known_zero_exit_requires_exact_postimage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, digest = plan_file(root, base_plan(root))
+            plan = load_plan(path, schema="workflow-retirement-batch-plan-v1", expected_sha256=digest)
+            with OperationJournal(root / "state", "workflow-retirement-batch", plan) as journal:
+                journal.persist({"phase": "in_progress", "effects": {}})
+                with self.assertRaises(EffectBlocked):
+                    run_effect(
+                        journal,
+                        effect_key="delete:x",
+                        command=["/usr/bin/python3", "-c", "pass"],
+                        cwd=root,
+                        preimage_sha256="a" * 64,
+                        postimage_sha256="b" * 64,
+                    )
+                self.assertEqual(journal.state["effects"]["delete:x"]["status"], "unresolved")
+
+    def test_settled_preimage_allows_one_later_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, digest = plan_file(root, base_plan(root))
+            plan = load_plan(path, schema="workflow-retirement-batch-plan-v1", expected_sha256=digest)
+            marker = root / "marker"
+            with OperationJournal(root / "state", "workflow-retirement-batch", plan) as journal:
+                journal.persist(
+                    {
+                        "phase": "in_progress",
+                        "effects": {
+                            "delete:x": {
+                                "status": "settled_preimage",
+                                "attempt": 1,
+                                "settled_invocation": "previous",
+                                "command_digest": canonical_sha256(["/usr/bin/python3", "-c", "pass"]),
+                                "preimage_sha256": "a" * 64,
+                                "postimage_sha256": "b" * 64,
+                            }
+                        },
+                    }
+                )
+                result = run_effect(
+                    journal,
+                    effect_key="delete:x",
+                    command=["/usr/bin/python3", "-c", f"open({str(marker)!r}, 'w').write('ok')"],
+                    cwd=root,
+                    preimage_sha256="a" * 64,
+                    postimage_sha256="b" * 64,
+                    current_sha256=lambda: "b" * 64,
+                )
+                self.assertEqual(result.settlement, "postimage")
+                self.assertTrue(marker.is_file())
+                self.assertEqual(journal.state["effects"]["delete:x"]["attempt"], 2)
 
 
 if __name__ == "__main__":
