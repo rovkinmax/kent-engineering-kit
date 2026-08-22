@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 from pathlib import Path
@@ -278,9 +279,30 @@ def _fd_path(descriptor: int) -> str:
     path = f"/dev/fd/{descriptor}"
     try:
         opened = os.fstat(descriptor)
-        resolved = os.stat(path)
     except OSError as error:
         raise VerificationFailure("verifier_unsafe") from error
+    opened_identity = (opened.st_dev, opened.st_ino)
+    try:
+        resolved = os.stat(path)
+    except OSError as error:
+        if error.errno != errno.EBADF:
+            raise VerificationFailure("verifier_unsafe") from error
+        try:
+            current = os.fstat(descriptor)
+        except OSError as current_error:
+            raise VerificationFailure("verifier_unsafe") from current_error
+        if (current.st_dev, current.st_ino) != opened_identity:
+            raise VerificationFailure("verifier_unsafe")
+        try:
+            resolved = os.stat(path)
+        except OSError as retry_error:
+            raise VerificationFailure("verifier_unsafe") from retry_error
+    try:
+        final = os.fstat(descriptor)
+    except OSError as error:
+        raise VerificationFailure("verifier_unsafe") from error
+    if (final.st_dev, final.st_ino) != opened_identity:
+        raise VerificationFailure("verifier_unsafe")
     if resolved.st_ino != opened.st_ino:
         raise VerificationFailure("verifier_unsafe")
     return path

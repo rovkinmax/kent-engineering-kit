@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -59,9 +60,13 @@ def load_template_module(path: Path, name: str):
     return module
 
 
-def assert_pids_gone(testcase: unittest.TestCase, pid_file: Path) -> None:
+def assert_pids_gone(
+    testcase: unittest.TestCase,
+    pid_file: Path,
+    timeout: float = 2.0,
+) -> None:
     pids = [int(value) for value in pid_file.read_text().split()]
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + timeout
     alive = list(pids)
     while alive and time.monotonic() < deadline:
         alive = []
@@ -2131,6 +2136,161 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         self.assertNotIn("PYTHONHOME", environment)
         self.assertNotIn("__CF_USER_TEXT_ENCODING", environment)
 
+    def test_verify_fd_path_descriptor_identity_matrix(self) -> None:
+        module = load_template_module(
+            VERIFY_REPORT,
+            "verify_report_fd_path_identity_matrix",
+        )
+        base_os = module.os
+
+        class DelegatingOS:
+            def __init__(self, fstat, stat):
+                self._base = base_os
+                self._fstat = fstat
+                self._stat = stat
+                self.path = base_os.path
+
+            def fstat(self, descriptor):
+                return self._fstat(descriptor)
+
+            def stat(self, path):
+                return self._stat(path)
+
+            def __getattr__(self, name):
+                return getattr(self._base, name)
+
+        def metadata(device: int, inode: int):
+            return types.SimpleNamespace(st_dev=device, st_ino=inode)
+
+        cases = (
+            (
+                "initial_fstat_failure",
+                [OSError(errno.EBADF, "initial")],
+                [],
+                "verifier_unsafe",
+                1,
+                0,
+            ),
+            (
+                "transient_ebadf",
+                [metadata(1, 2), metadata(1, 2), metadata(1, 2)],
+                [OSError(errno.EBADF, "first"), metadata(9, 2)],
+                None,
+                3,
+                2,
+            ),
+            (
+                "persistent_ebadf",
+                [metadata(1, 2), metadata(1, 2)],
+                [OSError(errno.EBADF, "first"), OSError(errno.EBADF, "second")],
+                "verifier_unsafe",
+                2,
+                2,
+            ),
+            (
+                "first_non_ebadf",
+                [metadata(1, 2)],
+                [OSError(errno.EACCES, "denied")],
+                "verifier_unsafe",
+                1,
+                1,
+            ),
+            (
+                "retry_non_ebadf",
+                [metadata(1, 2), metadata(1, 2)],
+                [OSError(errno.EBADF, "first"), OSError(errno.EACCES, "denied")],
+                "verifier_unsafe",
+                2,
+                2,
+            ),
+            (
+                "current_fstat_failure",
+                [metadata(1, 2), OSError(errno.EIO, "current")],
+                [OSError(errno.EBADF, "first")],
+                "verifier_unsafe",
+                2,
+                1,
+            ),
+            (
+                "identity_change_after_ebadf",
+                [metadata(1, 2), metadata(1, 3)],
+                [OSError(errno.EBADF, "first")],
+                "verifier_unsafe",
+                2,
+                1,
+            ),
+            (
+                "final_fstat_failure",
+                [metadata(1, 2), OSError(errno.EIO, "final")],
+                [metadata(9, 2)],
+                "verifier_unsafe",
+                2,
+                1,
+            ),
+            (
+                "final_identity_change",
+                [metadata(1, 2), metadata(1, 3)],
+                [metadata(9, 2)],
+                "verifier_unsafe",
+                2,
+                1,
+            ),
+            (
+                "resolved_device_change_allowed",
+                [metadata(1, 2), metadata(1, 2)],
+                [metadata(9, 2)],
+                None,
+                2,
+                1,
+            ),
+            (
+                "resolved_inode_mismatch",
+                [metadata(1, 2), metadata(1, 2)],
+                [metadata(9, 3)],
+                "verifier_unsafe",
+                2,
+                1,
+            ),
+        )
+        original_stat = os.stat
+        original_fstat = os.fstat
+        for name, fstat_values, stat_values, code, expected_fstat, expected_stat in cases:
+            with self.subTest(case=name):
+                fstat_calls = 0
+                stat_calls = 0
+
+                def fake_fstat(_descriptor):
+                    nonlocal fstat_calls
+                    value = fstat_values[fstat_calls]
+                    fstat_calls += 1
+                    if isinstance(value, BaseException):
+                        raise value
+                    return value
+
+                def fake_stat(_path):
+                    nonlocal stat_calls
+                    value = stat_values[stat_calls]
+                    stat_calls += 1
+                    if isinstance(value, BaseException):
+                        raise value
+                    return value
+
+                with mock.patch.object(
+                    module,
+                    "os",
+                    DelegatingOS(fake_fstat, fake_stat),
+                ):
+                    if code is None:
+                        self.assertEqual(module._fd_path(42), "/dev/fd/42")
+                    else:
+                        with self.assertRaises(module.VerificationFailure) as raised:
+                            module._fd_path(42)
+                        self.assertEqual(raised.exception.code, code)
+                self.assertEqual(fstat_calls, expected_fstat)
+                self.assertEqual(stat_calls, expected_stat)
+        self.assertIs(os.stat, original_stat)
+        self.assertIs(os.fstat, original_fstat)
+
     def test_verify_ignores_legacy_script_and_log_overrides(self) -> None:
         outside = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, outside)
@@ -2283,21 +2443,32 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         outside = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, outside)
 
-        ready = outside / "timeout-grandchild-ready"
-        marker = outside / "timeout-grandchild-marker"
-        grandchild_code = (
-            "import pathlib, time; "
-            + f"pathlib.Path({str(ready)!r}).write_text('ready'); "
-            + "time.sleep(0.4); "
-            + f"pathlib.Path({str(marker)!r}).write_text('leaked')"
+        timeout_ready = outside / "timeout-grandchild-ready"
+        timeout_release = outside / "timeout-grandchild-release"
+        timeout_marker = outside / "timeout-grandchild-marker"
+        def release_and_wait(release: Path, ready: Path) -> None:
+            release.touch()
+            if ready.exists():
+                assert_pids_gone(self, ready, timeout=5.0)
+        def grandchild_code(ready: Path, release: Path, marker: Path) -> str:
+            return (
+                "import os, pathlib, time; "
+                + f"pathlib.Path({str(ready)!r}).write_text(str(os.getpid())); "
+                + f"release = pathlib.Path({str(release)!r}); "
+                + "exec('while not release.exists():\\n time.sleep(0.01)'); "
+                + f"pathlib.Path({str(marker)!r}).write_text('leaked')"
+            )
+        self.addCleanup(release_and_wait, timeout_release, timeout_ready)
+        timeout_code = grandchild_code(
+            timeout_ready, timeout_release, timeout_marker
         )
         root = self.create_repository()
         self.install_verify_fixture(
             root,
             "#!/usr/bin/env python3\n"
             "import pathlib, subprocess, sys, time\n"
-            + f"subprocess.Popen([sys.executable, '-c', {grandchild_code!r}])\n"
-            + f"deadline = time.monotonic() + 1; ready = pathlib.Path({str(ready)!r})\n"
+            + f"subprocess.Popen([sys.executable, '-c', {timeout_code!r}])\n"
+            + f"deadline = time.monotonic() + 1; ready = pathlib.Path({str(timeout_ready)!r})\n"
             + "while not ready.exists() and time.monotonic() < deadline: time.sleep(0.001)\n"
             + "assert ready.exists()\n"
             "time.sleep(5)\n",
@@ -2307,30 +2478,43 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             "verify_report_timeout_group_test",
         )
         module.TIMEOUT_SECONDS = 0.05
-        report = self.run_module_in_workspace(module, root)
-        self.assertEqual(report["code"], "child_timeout")
-        self.assertTrue(self.wait_for_path(ready))
-        self.assert_no_path_for_duration(marker, 0.7)
-        self.assertFalse(marker.exists())
+        original_popen = module.subprocess.Popen
 
-        ready = outside / "output-grandchild-ready"
-        marker = outside / "output-grandchild-marker"
-        grandchild_code = (
-            "import pathlib, time; "
-            + f"pathlib.Path({str(ready)!r}).write_text('ready'); "
-            + "time.sleep(0.4); "
-            + f"pathlib.Path({str(marker)!r}).write_text('leaked')"
+        def wait_for_timeout_ready(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            if kwargs.get("start_new_session"): self.assertTrue(
+                self.wait_for_path(timeout_ready, 5)
+            )
+            return process
+
+        with mock.patch.object(
+            module.subprocess,
+            "Popen",
+            side_effect=wait_for_timeout_ready,
+        ):
+            report = self.run_module_in_workspace(module, root)
+        self.assertEqual(report["code"], "child_timeout")
+        assert_pids_gone(self, timeout_ready)
+        timeout_release.touch()
+        self.assert_no_path_for_duration(timeout_marker, 0.7)
+        self.assertFalse(timeout_marker.exists())
+        output_ready = outside / "output-grandchild-ready"
+        output_release = outside / "output-grandchild-release"
+        output_marker = outside / "output-grandchild-marker"
+        self.addCleanup(release_and_wait, output_release, output_ready)
+        output_code = grandchild_code(
+            output_ready, output_release, output_marker
         )
         root = self.create_repository()
         self.install_verify_fixture(
             root,
             "#!/usr/bin/env python3\n"
             "import pathlib, subprocess, sys, time\n"
-            + f"subprocess.Popen([sys.executable, '-c', {grandchild_code!r}])\n"
-            + f"deadline = time.monotonic() + 1; ready = pathlib.Path({str(ready)!r})\n"
+            + f"subprocess.Popen([sys.executable, '-c', {output_code!r}])\n"
+            + f"deadline = time.monotonic() + 1; ready = pathlib.Path({str(output_ready)!r})\n"
             + "while not ready.exists() and time.monotonic() < deadline: time.sleep(0.001)\n"
             + "assert ready.exists()\n"
-            "sys.stdout.write('x' * (4 * 1024 * 1024 + 1024))\n"
+            "sys.stdout.write('x' * (5 * 1024))\n"
             "sys.stdout.flush()\n"
             "time.sleep(5)\n",
         )
@@ -2338,12 +2522,14 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             root / ".kent" / "scripts" / "workflow-verify-report",
             "verify_report_output_group_test",
         )
-        module.OUTPUT_LIMIT = 4 * 1024 * 1024
+        module.OUTPUT_LIMIT = 4 * 1024
         report = self.run_module_in_workspace(module, root)
         self.assertEqual(report["code"], "log_limit_exceeded")
-        self.assertTrue(self.wait_for_path(ready))
-        self.assert_no_path_for_duration(marker, 0.7)
-        self.assertFalse(marker.exists())
+        self.assertTrue(self.wait_for_path(output_ready))
+        assert_pids_gone(self, output_ready)
+        output_release.touch()
+        self.assert_no_path_for_duration(output_marker, 0.7)
+        self.assertFalse(output_marker.exists())
 
     def test_verify_phase_hooks_reject_child_path_swap_and_temp_parent_swap(
         self,
