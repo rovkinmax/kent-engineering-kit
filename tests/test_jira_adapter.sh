@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 adapter="$repo_root/templates/project/jira-api.sh"
+real_jq="$(command -v jq)"
 tmp="$(mktemp -d)"
 trap 'rm -r "$tmp"' EXIT
 
@@ -280,6 +281,47 @@ if (
 fi
 [[ ! -e "$tmp/curl-requests.log" ]] || { echo "English guard called curl" >&2; exit 1; }
 [[ ! -e "$tmp/op.log" ]] || { echo "English guard resolved credentials" >&2; exit 1; }
+
+if (cd "$tmp/project" && env -u ACME_JIRA_EMAIL -u ACME_JIRA_API_TOKEN \
+  "$adapter" create-issue ABC --type Task --summary "Ёж" --allow-mutate \
+  >/dev/null 2>&1); then
+  echo "English guard unexpectedly accepted Ёж before auth" >&2
+  exit 1
+fi
+[[ ! -e "$tmp/curl-requests.log" && ! -e "$tmp/op.log" ]] ||
+  { echo "Ёж guard reached curl or credentials" >&2; exit 1; }
+
+(
+  cd "$tmp/project" &&
+    env -u ACME_JIRA_EMAIL -u ACME_JIRA_API_TOKEN "$adapter" create-issue ABC \
+      --type Task --summary "Русский" --allow-non-english --dry-run
+) >"$tmp/russian-dry-run.json"
+jq -e '.dryRun == true and .contentLanguage == "explicit-non-english"
+  and .payload.fields.summary == "Русский"' "$tmp/russian-dry-run.json" >/dev/null
+[[ ! -e "$tmp/curl-requests.log" && ! -e "$tmp/op.log" ]] ||
+  { echo "non-English dry-run reached curl or credentials" >&2; exit 1; }
+
+cat >"$tmp/bin/jq" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+for argument in "$@"; do
+  [[ "$argument" == *'test("[\u0410-\u042F\u0430-\u044F\u0401\u0451]")'* ]] || continue
+  printf 'language-filter-error\n' >>"$JQ_SHIM_LOG"; exit 91
+done
+exec "$REAL_JQ" "$@"
+EOF
+chmod +x "$tmp/bin/jq"
+export REAL_JQ="$real_jq" JQ_SHIM_LOG="$tmp/jq-shim.log"
+if (cd "$tmp/project" && env -u ACME_JIRA_EMAIL -u ACME_JIRA_API_TOKEN \
+  "$adapter" create-issue ABC --type Task --summary "Русский" --allow-mutate \
+  >/dev/null 2>&1); then
+  echo "Jira adapter unexpectedly ignored a jq language-filter failure" >&2
+  exit 1
+fi
+grep -q '^language-filter-error$' "$tmp/jq-shim.log" &&
+  [[ ! -e "$tmp/curl-requests.log" && ! -e "$tmp/op.log" ]] ||
+  { echo "jq failure reached curl or credentials" >&2; exit 1; }
+rm "$tmp/bin/jq"
 
 if (
   cd "$tmp/project"

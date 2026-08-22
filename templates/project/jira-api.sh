@@ -530,11 +530,23 @@ validate_english_text() {
   local field_name="$1"
   local value="$2"
   local allow_non_english="$3"
+  local contains_cyrillic
   if [[ "$allow_non_english" == true || -z "$value" ]]; then
     return
   fi
-  if grep -Eq '[А-Яа-яЁё]' <<<"$value"; then
+  if ! contains_cyrillic="$(
+    jq -nr --arg value "$value" \
+      '$value | test("[\u0410-\u042F\u0430-\u044F\u0401\u0451]")' 2>/dev/null
+  )"; then
+    echo "jira-api: unable to validate ${field_name} language" >&2
+    return 2
+  fi
+  if [[ "$contains_cyrillic" == true ]]; then
     echo "jira-api: ${field_name} contains Cyrillic; pass --allow-non-english to override" >&2
+    return 2
+  fi
+  if [[ "$contains_cyrillic" != false ]]; then
+    echo "jira-api: unable to validate ${field_name} language" >&2
     return 2
   fi
 }
