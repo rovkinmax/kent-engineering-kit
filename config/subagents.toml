@@ -205,3 +205,17 @@ workflow_subagent = false
 shell = true
 patch = false
 edit = false
+
+[subagents.release-decision]
+description = "Tool-less human decision gate for deterministic release state."
+model = "gpt-5.6-luna"
+system_prompt_file = "agents/release-decision.md"
+thinking_level = "low"
+model_verbosity = "low"
+agent_callable = false
+workflow_subagent = false
+
+[subagents.release-decision.tools]
+shell = false
+patch = false
+edit = false

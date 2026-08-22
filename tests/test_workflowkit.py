@@ -259,6 +259,28 @@ class WorkflowKitTest(unittest.TestCase):
                 conflicts.append(name)
         self.assertEqual(conflicts, [])
 
+    def test_release_decision_role_is_toolless_and_operations_are_documented(self) -> None:
+        config = tomllib.loads(
+            (REPO_ROOT / "config" / "subagents.toml").read_text()
+        )
+        role = config["subagents"]["release-decision"]
+        self.assertEqual(role["system_prompt_file"], "agents/release-decision.md")
+        self.assertFalse(role["agent_callable"])
+        self.assertFalse(role["workflow_subagent"])
+        self.assertEqual(role["tools"], {"shell": False, "patch": False, "edit": False})
+        prompt = (REPO_ROOT / "agents" / "release-decision.md").read_text()
+        self.assertNotIn("model:", prompt)
+        self.assertNotIn("tools:", prompt)
+        skill = (REPO_ROOT / "skills" / "kent-engineering-kit" / "SKILL.md").read_text()
+        for expected in (
+            "retire-workflow-batch",
+            "reconcile-canonical-workflows",
+            "activate-primary-checkout",
+            "Mutation requires `--confirm`",
+            "Recovery never signals a PID",
+        ):
+            self.assertIn(expected, skill)
+
     def test_edge_rejects_malformed_template_placeholders(self) -> None:
         malformed_prompts = (
             "Task {{{{.TaskShortId}}}}",

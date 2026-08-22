@@ -33,6 +33,11 @@ bash -n "$repo_root/templates/project/workflow-plan-contract-continue"
 bash -n "$repo_root/templates/project/workflow-plan-contract-fix-continue"
 bash -n "$repo_root/templates/project/workflow-plan-contract-verify"
 python3 -m py_compile \
+  "$repo_root/workflowkit/operations.py" \
+  "$repo_root/scripts/activate-primary-checkout" \
+  "$repo_root/scripts/reconcile-canonical-workflows" \
+  "$repo_root/scripts/retire-workflow-batch" \
+  "$repo_root/scripts/verify-release-portfolio" \
   "$repo_root/templates/project/android-apk-install-preserve" \
   "$repo_root/templates/project/workflow-branch-identity" \
   "$repo_root/templates/project/workflow-checkpoint" \
@@ -154,6 +159,16 @@ done
   echo "GitHub merge-strategy resolver is not executable" >&2
   exit 1
 }
+for operations_script in \
+  activate-primary-checkout \
+  reconcile-canonical-workflows \
+  retire-workflow-batch \
+  verify-release-portfolio; do
+  [[ -x "$repo_root/scripts/$operations_script" ]] || {
+    echo "$operations_script is not executable" >&2
+    exit 1
+  }
+done
 [[ -x "$repo_root/scripts/configure-mcporter" ]] || {
   echo "mcporter configurator is not executable" >&2
   exit 1

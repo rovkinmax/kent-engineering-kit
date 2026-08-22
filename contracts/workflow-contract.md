@@ -39,9 +39,15 @@ implementation.
   re-enter the fan-out source so every sibling and Join invariant is recreated.
 - Transition keys, Script stdout, prompts, and prior-value keys form one
   versioned contract. Runtime baseline: Kent 2.6.1 (August 13, 2026).
-- Graph inspect/apply supports complete export, local semantic preview, and
-  explicit-confirmation atomic apply. Task-backed workflows are frozen; use a
-  new version for semantic changes and never move Tasks between revisions.
+- Graph apply is complete, previewed, confirmed, and atomic. Generic
+  task-backed changes use a new non-default version and managed-worktree
+  canary.
+- Canonical exception: an approved release may advance the same linked/default
+  UUID once only with terminal tasks/anchors, settled approvals, quiescence,
+  exact source/target and link/default invariants, a live gate, and forward
+  restore. Preserve terminal IDs/statuses/anchors; forbid replacement,
+  link/default/create/promotion effects and concurrent allocation. Disclose
+  the absent canary at live approval.
 - `wont_do` is terminal, requires an explicit cancellation decision, and emits
   `closure_reason`.
 - Parallel verification branches are read-only.
@@ -583,16 +589,11 @@ Projects that treat Jira descriptions or comments as planning sources list
 their own `[integrations.jira]` credential namespace. Related repositories may
 share a namespace intentionally; unrelated repositories remain isolated.
 
-For Jira-backed planning, normalized issue relations are the primary
-cross-platform discovery path, not an implementation-scope expansion
-mechanism. Plan records exact root issue scope separately from related evidence,
-dependencies, and deferred issues. It follows related issues at most one graph
-level, identifies sibling platforms from issue metadata rather than link-type
-wording alone, and then resolves the sibling issue to a project-declared local
-reference repository. An existing sibling implementation and its tests are
-mandatory bounded product evidence. Plan records the relationship, immutable
-source commit and paths, and `checked`, `adopted`, `rejected`, and `conflicts`
-conclusions. Explicit target-platform requirements, current design, and API
-contracts remain authoritative. Bounded API/model/flow fingerprint search is
-the fallback when Jira relations do not identify a usable sibling
-implementation.
+For Jira-backed planning, issue relations discover cross-platform evidence, not
+scope. Record root scope separately from related evidence/dependencies/deferred
+issues; follow one graph level, identify siblings from metadata, and resolve
+each to its project-local reference repository. Existing sibling
+implementation/tests are mandatory. Record the relationship, source
+commit/paths, and `checked`, `adopted`, `rejected`, and `conflicts`.
+Requirements/design/API contracts remain authoritative; bounded fingerprints
+are the fallback when relations do not identify a usable sibling.

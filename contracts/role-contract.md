@@ -32,6 +32,12 @@ model names, and Claude-era tool lists. Describe behavioral restrictions in
 the prompt body, while Kent configuration enforces actual model and tool
 availability.
 
+The release-decision role is intentionally tool-less. Operational release
+drivers are deterministic Scripts: they consume canonical digest-bound plans,
+require explicit mutation confirmation, and report preimage/postimage
+settlement without granting shell, patch, edit, delegation, or workflow
+subagent access.
+
 ## Review Ownership
 
 Generated Delivery workflows assign operational ownership directly from the
