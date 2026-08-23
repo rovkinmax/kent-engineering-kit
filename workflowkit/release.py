@@ -15,6 +15,12 @@ from typing import Any, Iterable, Mapping, Sequence
 import tomllib
 
 from .model import SpecError
+from .runtime import (
+    RuntimeAuthorityBinding,
+    RuntimeContractError,
+    RuntimeExecutionContext,
+    _resolve_runtime_authority_binding as _runtime_resolve_runtime_authority_binding,
+)
 
 
 class ReleaseSpecError(SpecError):
@@ -122,6 +128,12 @@ KENT_AUTHORITY_KEYS = {
     "approval_authority",
     "authority_transition",
 }
+KENT_TEMPLATE_KEYS = {
+    "kind",
+    "workflow_id",
+    "project_id",
+    "approval_authority",
+}
 GITHUB_AUTHORITY_KEYS = {
     "kind",
     "workflow_path",
@@ -132,6 +144,14 @@ GITHUB_AUTHORITY_KEYS = {
     "head_sha",
     "ref",
 }
+GITHUB_TEMPLATE_KEYS = {
+    "kind",
+    "workflow_path",
+    "workflow_name",
+    "event",
+    "ref_policy",
+}
+REF_POLICY_KEYS = {"kind", "ref", "prefix", "project_field"}
 APPROVAL_KEYS = {
     "variant_key",
     "source_path",
@@ -1501,6 +1521,208 @@ class ProjectField:
         return cls.from_dict(value, label)
 
 
+_POLICY_SENTINELS = {
+    "runtime",
+    "dynamic",
+    "current",
+    "auto",
+    "any",
+    "unknown",
+    "unset",
+    "null",
+    "none",
+    "*",
+    "-",
+    "0",
+    "$runtime",
+    "${runtime}",
+    "<runtime>",
+}
+
+
+def _policy_source_string(value: Any, label: str) -> str:
+    value = _string(value, label)
+    if value != value.strip():
+        _error(f"{label} must be normalized")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        _error(f"{label} contains a control character")
+    if (
+        "{" in value
+        or "}" in value
+        or value.startswith("$")
+        or (value.startswith("<") and value.endswith(">"))
+        or value.casefold() in _POLICY_SENTINELS
+    ):
+        _error(f"{label} contains a runtime placeholder")
+    return value
+
+
+def _validate_ref_value(value: Any, label: str) -> str:
+    value = _policy_source_string(value, label)
+    if not value.startswith(("refs/heads/", "refs/tags/")) or value.endswith("/"):
+        _error(f"{label} must be a normalized refs/heads or refs/tags ref")
+    if any(character.isspace() for character in value):
+        _error(f"{label} must not contain whitespace")
+    if any(token in value for token in ("..", "@{", "//", "\\", "~", "^", ":", "?", "*", "[")):
+        _error(f"{label} contains forbidden ref syntax")
+    for component in value.split("/")[2:]:
+        if (
+            not component
+            or component in {".", ".."}
+            or component.startswith(".")
+            or component.endswith(".")
+            or component.endswith(".lock")
+        ):
+            _error(f"{label} contains an invalid component")
+    return value
+
+
+@dataclass(frozen=True)
+class GitHubRefPolicy:
+    kind: str
+    ref: str | None = None
+    prefix: str | None = None
+    project_field: str | None = None
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "GitHubRefPolicy":
+        data = _closed(value, REF_POLICY_KEYS, "ref_policy")
+        kind = _policy_source_string(
+            _required(data, "kind", "ref_policy"), "ref_policy.kind"
+        )
+        if kind == "exact":
+            if set(data) != {"kind", "ref"}:
+                _error("exact ref_policy must contain only kind and ref")
+            return cls(
+                kind=kind,
+                ref=_validate_ref_value(
+                    _required(data, "ref", "ref_policy"), "ref_policy.ref"
+                ),
+            )
+        if kind == "prefix_project_field":
+            if set(data) != {"kind", "prefix", "project_field"}:
+                _error("prefix_project_field policy has invalid fields")
+            prefix = _policy_source_string(
+                _required(data, "prefix", "ref_policy"), "ref_policy.prefix"
+            )
+            if not prefix.startswith(("refs/heads/", "refs/tags/")):
+                _error("ref_policy.prefix must begin with refs/heads or refs/tags")
+            if any(character.isspace() for character in prefix):
+                _error("ref_policy.prefix must not contain whitespace")
+            if "\\" in prefix or any(
+                token in prefix for token in ("..", "@{", "//", "~", "^", ":", "?", "*", "[")
+            ):
+                _error("ref_policy.prefix contains forbidden ref syntax")
+            ref_prefix = prefix.split("/", 2)[2]
+            fixed_components = ref_prefix.split("/")[:-1]
+            for component in fixed_components:
+                if (
+                    not component
+                    or component in {".", ".."}
+                    or component.startswith(".")
+                    or component.endswith(".")
+                    or component.endswith(".lock")
+                ):
+                    _error("ref_policy.prefix contains an invalid fixed component")
+            if ref_prefix and not ref_prefix.endswith("/") and (
+                ref_prefix.split("/")[-1].startswith(".")
+            ):
+                _error("ref_policy.prefix contains an invalid partial component")
+            project_field = _policy_source_string(
+                _required(data, "project_field", "ref_policy"),
+                "ref_policy.project_field",
+            )
+            if not IDENTIFIER_RE.fullmatch(project_field):
+                _error("ref_policy.project_field must be an identifier")
+            return cls(
+                kind=kind,
+                prefix=prefix,
+                project_field=project_field,
+            )
+        _error("ref_policy.kind is unsupported")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "GitHubRefPolicy":
+        return cls.from_dict(value)
+
+    def as_dict(self) -> dict[str, Any]:
+        if self.kind == "exact":
+            return {"kind": self.kind, "ref": self.ref}
+        return {
+            "kind": self.kind,
+            "prefix": self.prefix,
+            "project_field": self.project_field,
+        }
+
+    def resolve(self, project_values: Mapping[str, Any]) -> str:
+        if self.kind == "exact":
+            return _validate_ref_value(self.ref, "ref_policy.ref")
+        if self.project_field not in project_values:
+            _error("ref_policy.project_field is absent from operation project fields")
+        value = project_values[self.project_field]
+        if not isinstance(value, str) or not value:
+            _error("ref_policy.project_field must resolve to a non-empty string")
+        result = f"{self.prefix}{value}"
+        return _validate_ref_value(result, "resolved ref")
+
+
+@dataclass(frozen=True)
+class AuthorityTemplateSpec:
+    kind: str
+    values: dict[str, Any]
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "AuthorityTemplateSpec":
+        data = _mapping(value, "authority_kind")
+        kind = _policy_source_string(
+            _required(data, "kind", "authority_kind"), "authority_kind.kind"
+        )
+        if kind == "kent_transition_template":
+            data = _closed(data, KENT_TEMPLATE_KEYS, "authority_kind")
+            _require_keys(data, KENT_TEMPLATE_KEYS, "authority_kind")
+            workflow_id = _policy_source_string(
+                data["workflow_id"], "authority_kind.workflow_id"
+            )
+            project_id = _policy_source_string(
+                data["project_id"], "authority_kind.project_id"
+            )
+            approval = _policy_source_string(
+                data["approval_authority"], "authority_kind.approval_authority"
+            )
+            if not UUID_RE.fullmatch(workflow_id):
+                _error("authority_kind.workflow_id must be a UUID")
+            if not project_id.startswith("project-") or not UUID_RE.fullmatch(
+                project_id.removeprefix("project-")
+            ):
+                _error("authority_kind.project_id must be project-<UUID>")
+            if not AUTHORITY_SLUG_RE.fullmatch(approval):
+                _error("authority_kind.approval_authority must be a normalized slug")
+        elif kind == "github_run_template":
+            data = _closed(data, GITHUB_TEMPLATE_KEYS, "authority_kind")
+            _require_keys(data, GITHUB_TEMPLATE_KEYS, "authority_kind")
+            workflow_path = _policy_source_string(
+                data["workflow_path"], "authority_kind.workflow_path"
+            )
+            workflow_name = _policy_source_string(
+                data["workflow_name"], "authority_kind.workflow_name"
+            )
+            event = _policy_source_string(data["event"], "authority_kind.event")
+            _path(workflow_path, "authority_kind.workflow_path")
+            if event not in SUPPORTED_EVENT_NAMES:
+                _error("authority_kind.event is unsupported")
+            data["ref_policy"] = GitHubRefPolicy.from_dict(data["ref_policy"]).as_dict()
+        else:
+            _error(f"authority_kind.kind is unsupported: {kind!r}")
+        return cls(kind=kind, values=dict(data))
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "AuthorityTemplateSpec":
+        return cls.from_dict(value)
+
+    def as_dict(self) -> dict[str, Any]:
+        return dict(self.values)
+
+
 @dataclass(frozen=True)
 class AuthoritySpec:
     kind: str
@@ -1612,7 +1834,7 @@ class AuthoritySpec:
 class OperationVariant:
     key: str
     operation_kind: str
-    authority_kind: AuthoritySpec
+    authority_kind: AuthoritySpec | AuthorityTemplateSpec
     authority_transitions: tuple[str, ...]
     required_job_contract_keys: tuple[str, ...]
     qualification_job_contract_keys: tuple[str, ...]
@@ -1621,7 +1843,13 @@ class OperationVariant:
     project_fields: tuple[ProjectField, ...]
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any], index: int = 0) -> "OperationVariant":
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+        index: int = 0,
+        *,
+        schema_version: int = 1,
+    ) -> "OperationVariant":
         label = f"operation_variants[{index}]"
         data = _closed(value, OPERATION_VARIANT_KEYS, label)
         _require_keys(data, OPERATION_VARIANT_KEYS, label)
@@ -1650,8 +1878,14 @@ class OperationVariant:
                 _required(data, "operation_kind", label),
                 f"{label}.operation_kind",
             ),
-            authority_kind=AuthoritySpec.from_dict(
-                _required(data, "authority_kind", label)
+            authority_kind=(
+                AuthorityTemplateSpec.from_dict(
+                    _required(data, "authority_kind", label)
+                )
+                if schema_version == 2
+                else AuthoritySpec.from_dict(
+                    _required(data, "authority_kind", label)
+                )
             ),
             authority_transitions=_sorted_keys(
                 _required(data, "authority_transitions", label),
@@ -1686,17 +1920,20 @@ class OperationVariant:
         )
         if len(set(all_keys)) != len(all_keys):
             _error(f"operation variant {self.key!r} repeats a job contract key")
-        if self.authority_kind.kind == "kent_transition":
+        if self.authority_kind.kind in {
+            "kent_transition",
+            "kent_transition_template",
+        }:
             if not self.authority_transitions:
                 _error(f"operation variant {self.key!r} needs authority transitions")
-            if (
+            if self.authority_kind.kind == "kent_transition" and (
                 self.authority_kind.values["authority_transition"]
                 not in self.authority_transitions
             ):
                 _error("Kent authority_transition is not in authority_transitions")
         elif self.authority_transitions:
             _error("github_run authority transitions must be empty")
-        if self.authority_kind.kind == "github_run" and self.approval_required:
+        if self.authority_kind.kind in {"github_run", "github_run_template"} and self.approval_required:
             _error("github_run operation variants cannot require approval")
 
     def as_dict(self) -> dict[str, Any]:
@@ -1812,7 +2049,10 @@ class ApprovalMaterialization:
             or self.decision_may_select_approval
         ):
             _error("approval materialization safety booleans are invalid")
-        if not variant.approval_required or variant.authority_kind.kind != "kent_transition":
+        if not variant.approval_required or variant.authority_kind.kind not in {
+            "kent_transition",
+            "kent_transition_template",
+        }:
             _error("only approval-required kent_transition variants may materialize approval")
         allowed = set(variant.authority_transitions)
         if set(self.templates) != allowed:
@@ -1923,10 +2163,14 @@ class ReleaseSpec:
             _required(data, "schema_version", "release spec"),
             "release spec.schema_version",
         )
-        if schema_version != 1:
-            _error("release spec schema_version must be 1")
+        if schema_version not in {1, 2}:
+            _error("release spec schema_version must be 1 or 2")
         variants = tuple(
-            OperationVariant.from_dict(item, index)
+            OperationVariant.from_dict(
+                item,
+                index,
+                schema_version=schema_version,
+            )
             for index, item in enumerate(
                 _list(data["operation_variants"], "operation_variants")
             )
@@ -2036,6 +2280,35 @@ class ReleaseSpec:
             _error("release spec.adoption_mode is unsupported")
         self.workflow_source_intent.validate(adoption_mode=self.adoption_mode)
         self.source_manifest.validate()
+        for variant in self.operation_variants:
+            if self.schema_version == 1:
+                if not isinstance(variant.authority_kind, AuthoritySpec):
+                    _error("schema-1 operation variants require concrete authority")
+            else:
+                if not isinstance(variant.authority_kind, AuthorityTemplateSpec):
+                    _error("schema-2 operation variants require authority templates")
+                template = variant.authority_kind
+                if template.kind == "kent_transition_template":
+                    if template.values["workflow_id"] != self.workflow_source_intent.id:
+                        _error("Kent template workflow_id must match workflow_source_intent.id")
+                    if not template.values["project_id"].startswith("project-") or not (
+                        UUID_RE.fullmatch(
+                            template.values["project_id"].removeprefix("project-")
+                        )
+                    ):
+                        _error("Kent template project_id is invalid")
+                else:
+                    policy = GitHubRefPolicy.from_dict(template.values["ref_policy"])
+                    if policy.kind == "prefix_project_field":
+                        names = [field.name for field in variant.project_fields]
+                        if names.count(policy.project_field) != 1:
+                            _error("ref_policy.project_field must exist exactly once")
+                        field = next(
+                            field for field in variant.project_fields
+                            if field.name == policy.project_field
+                        )
+                        if field.type != "string" or field.nullable:
+                            _error("ref_policy.project_field must be a non-null string")
         tables = {
             "required": self.required_jobs_v1,
             "qualification": self.qualification_jobs_v1,
@@ -2159,6 +2432,22 @@ def _coerce_workflows(
     if len(set(paths)) != len(paths):
         _error("workflow source paths must be unique")
     return workflows
+
+
+def _resolve_runtime_authority_binding(
+    binding: RuntimeAuthorityBinding,
+    execution_context: RuntimeExecutionContext,
+    *,
+    runtime_source_envelope_digest: str,
+) -> Mapping[str, Any]:
+    try:
+        return _runtime_resolve_runtime_authority_binding(
+            binding,
+            execution_context,
+            runtime_source_envelope_digest=runtime_source_envelope_digest,
+        )
+    except RuntimeContractError as error:
+        _error(str(error))
 
 
 def _event_matches(selector: Any, event: Mapping[str, Any]) -> bool:
@@ -2662,6 +2951,8 @@ def canonicalize_publication_operation(
     validated_jobs: ValidatedOperationJobs,
     *,
     spec: ReleaseSpec | None = None,
+    runtime_execution_context: RuntimeExecutionContext | None = None,
+    runtime_authority_binding: RuntimeAuthorityBinding | None = None,
 ) -> CanonicalizedPublicationOperation:
     if spec is None:
         _error("canonicalization requires ReleaseSpec")
@@ -2672,6 +2963,14 @@ def canonicalize_publication_operation(
     )
     if spec_variant is None or spec_variant.as_dict() != selected.as_dict():
         _error("operation variant does not match ReleaseSpec")
+    if spec.schema_version == 1:
+        if runtime_execution_context is not None or runtime_authority_binding is not None:
+            _error("schema-1 canonicalization does not accept runtime proofs")
+    else:
+        if not isinstance(runtime_execution_context, RuntimeExecutionContext):
+            _error("schema-2 canonicalization requires runtime execution context")
+        if not isinstance(runtime_authority_binding, RuntimeAuthorityBinding):
+            _error("schema-2 canonicalization requires runtime authority binding")
     if not isinstance(validated_jobs, ValidatedOperationJobs):
         _error("canonicalization requires ValidatedOperationJobs")
     if validated_jobs._proof is not _VALIDATION_TOKEN:
@@ -2728,14 +3027,29 @@ def canonicalize_publication_operation(
     )
     if not SHA256_RE.fullmatch(runtime_digest):
         _error("operation.runtime_source_envelope_digest must be lowercase 64-hex")
+    resolved_runtime: Mapping[str, Any] | None = None
+    if spec.schema_version == 2:
+        resolved_runtime = _resolve_runtime_authority_binding(
+            runtime_authority_binding,
+            runtime_execution_context,
+            runtime_source_envelope_digest=runtime_digest,
+        )
+        if resolved_runtime["repository"] != spec.repository:
+            _error("runtime authority repository does not match ReleaseSpec.repository")
     expected_jobs_digest = validated_jobs.operation_jobs_manifest_digest
     if data["operation_jobs_manifest_digest"] != expected_jobs_digest:
         _error("operation job manifest digest does not match validated jobs")
-    authority = AuthoritySpec.from_dict(data["authority"])
-    if authority.kind != selected.authority_kind.kind:
-        _error("operation authority kind does not match variant")
-    if authority.as_dict() != selected.authority_kind.as_dict():
-        _error("operation authority does not match the variant authority")
+    operation_authority = AuthoritySpec.from_dict(data["authority"])
+    if resolved_runtime is not None and operation_authority.as_dict() != (
+        resolved_runtime["authority"]
+    ):
+        _error("operation authority does not match runtime binding")
+    authority = operation_authority
+    if spec.schema_version == 1:
+        if authority.kind != selected.authority_kind.kind:
+            _error("operation authority kind does not match variant")
+        if authority.as_dict() != selected.authority_kind.as_dict():
+            _error("operation authority does not match the variant authority")
     project_values = data["project_fields"]
     if not isinstance(project_values, Mapping):
         _error("operation.project_fields must be a table")
@@ -2750,6 +3064,33 @@ def canonicalize_publication_operation(
             field_spec,
             f"operation.project_fields.{field_spec.name}",
         )
+    if spec.schema_version == 2:
+        template = selected.authority_kind
+        if template.kind == "kent_transition_template":
+            if authority.kind != "kent_transition":
+                _error("operation authority kind does not match Kent template")
+            for key in (
+                "workflow_id",
+                "project_id",
+                "approval_authority",
+            ):
+                if authority.values[key] != template.values[key]:
+                    _error(f"operation authority {key} does not match template")
+            if authority.values["authority_transition"] not in selected.authority_transitions:
+                _error("operation authority transition is not allowed")
+            if authority.values["task_short_id"] != runtime_execution_context.task_short_id:
+                _error("operation authority task_short_id does not match context")
+        else:
+            if authority.kind != "github_run":
+                _error("operation authority kind does not match GitHub template")
+            for key in ("workflow_path", "workflow_name", "event"):
+                if authority.values[key] != template.values[key]:
+                    _error(f"operation authority {key} does not match template")
+            policy = GitHubRefPolicy.from_dict(template.values["ref_policy"])
+            if authority.values["head_sha"] != resolved_runtime["project_commit"]:
+                _error("GitHub head_sha does not match selected project commit")
+            if authority.values["ref"] != policy.resolve(canonical_project):
+                _error("GitHub ref does not match tracked ref policy")
     canonical = {
         "schema_version": 1,
         "variant_key": selected.key,
@@ -3125,8 +3466,10 @@ def operation_jobs_manifest_digest(validated: ValidatedOperationJobs) -> str:
 __all__ = [
     "ApprovalMaterialization",
     "AuthoritySpec",
+    "AuthorityTemplateSpec",
     "CanonicalizedPublicationOperation",
     "ExternalRoot",
+    "GitHubRefPolicy",
     "JobContractTable",
     "NormalizedGitHubJobV1",
     "NormalizedGitHubStepV1",

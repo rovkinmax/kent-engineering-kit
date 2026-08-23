@@ -826,6 +826,598 @@ def _require_proven_inputs(
     return value
 
 
+_SEALED_RUNTIME_PROOF = object()
+_RUNTIME_SENTINELS = {
+    "runtime",
+    "dynamic",
+    "current",
+    "auto",
+    "any",
+    "unknown",
+    "unset",
+    "null",
+    "none",
+    "*",
+    "-",
+    "0",
+    "$runtime",
+    "${runtime}",
+    "<runtime>",
+}
+_TASK_UUID_RE = re.compile(
+    r"^task-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+_TASK_SHORT_ID_RE = re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+$")
+_AUTHORITY_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_SUPPORTED_GITHUB_EVENTS = {
+    "branch_protection_rule",
+    "check_run",
+    "check_suite",
+    "create",
+    "delete",
+    "deployment",
+    "deployment_status",
+    "discussion",
+    "discussion_comment",
+    "fork",
+    "gollum",
+    "issue_comment",
+    "issues",
+    "label",
+    "merge_group",
+    "milestone",
+    "page_build",
+    "project",
+    "project_card",
+    "project_column",
+    "public",
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "pull_request_target",
+    "push",
+    "release",
+    "repository_dispatch",
+    "schedule",
+    "status",
+    "watch",
+    "workflow_call",
+    "workflow_dispatch",
+    "workflow_run",
+}
+
+
+def _policy_string(value: Any, label: str) -> str:
+    value = _string(value, label)
+    if value != value.strip():
+        raise RuntimeContractError(f"{label} must be normalized")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise RuntimeContractError(f"{label} contains a control character")
+    lowered = value.casefold()
+    if (
+        "{" in value
+        or "}" in value
+        or value.startswith("$")
+        or (value.startswith("<") and value.endswith(">"))
+        or lowered in _RUNTIME_SENTINELS
+    ):
+        raise RuntimeContractError(f"{label} contains a runtime placeholder")
+    return value
+
+
+def _runtime_path(value: Any, label: str) -> str:
+    value = _policy_string(value, label)
+    if value.startswith("/") or "\\" in value:
+        raise RuntimeContractError(f"{label} must be a project-relative path")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise RuntimeContractError(f"{label} is not normalized")
+    return value
+
+
+def _runtime_ref(value: Any, label: str) -> str:
+    value = _policy_string(value, label)
+    if not value.startswith(("refs/heads/", "refs/tags/")) or value.endswith("/"):
+        raise RuntimeContractError(f"{label} is not a normalized Git ref")
+    if any(character.isspace() for character in value):
+        raise RuntimeContractError(f"{label} must not contain whitespace")
+    if any(token in value for token in ("..", "@{", "//", "\\", "~", "^", ":", "?", "*", "[")):
+        raise RuntimeContractError(f"{label} contains forbidden ref syntax")
+    for component in value.split("/")[2:]:
+        if (
+            not component
+            or component in {".", ".."}
+            or component.startswith(".")
+            or component.endswith(".")
+            or component.endswith(".lock")
+        ):
+            raise RuntimeContractError(f"{label} contains an invalid component")
+    return value
+
+
+def _sealed_new(cls: type[Any], values: Mapping[str, Any]) -> Any:
+    instance = object.__new__(cls)
+    for key, value in values.items():
+        object.__setattr__(instance, key, value)
+    return instance
+
+
+@dataclass(frozen=True, init=False)
+class RuntimeExecutionContext:
+    kind: str
+    task_id: str | None
+    task_short_id: str | None
+    workflow_id: str | None
+    workflow_revision: int | None
+    project_id: str | None
+    project_commit: str
+    authority_transition: str | None
+    repository: str | None
+    workflow_path: str | None
+    workflow_name: str | None
+    event: str | None
+    run_id: int | None
+    attempt: int | None
+    head_sha: str | None
+    ref: str | None
+    selected_runtime_source_inputs_sha256: str
+    execution_context_sha256: str
+    _proof: object
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("RuntimeExecutionContext is sealed")
+
+    def __repr__(self) -> str:
+        return (
+            "RuntimeExecutionContext("
+            f"kind={self.kind!r}, "
+            f"selected_runtime_source_inputs_sha256="
+            f"{self.selected_runtime_source_inputs_sha256!r})"
+        )
+
+
+@dataclass(frozen=True, init=False)
+class RuntimeAuthorityBinding:
+    authority: Mapping[str, Any]
+    repository: str
+    project_commit: str
+    selected_runtime_source_inputs_sha256: str
+    execution_context_sha256: str
+    runtime_source_envelope: Mapping[str, Any]
+    runtime_source_envelope_digest: str
+    provenance_fingerprint: str
+    _proof: object
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("RuntimeAuthorityBinding is sealed")
+
+    def __repr__(self) -> str:
+        return (
+            "RuntimeAuthorityBinding("
+            f"repository={self.repository!r}, "
+            f"project_commit={self.project_commit!r})"
+        )
+
+
+def _context_core(context: RuntimeExecutionContext) -> dict[str, Any]:
+    return {
+        "kind": context.kind,
+        "task_id": context.task_id,
+        "task_short_id": context.task_short_id,
+        "workflow_id": context.workflow_id,
+        "workflow_revision": context.workflow_revision,
+        "project_id": context.project_id,
+        "project_commit": context.project_commit,
+        "authority_transition": context.authority_transition,
+        "repository": context.repository,
+        "workflow_path": context.workflow_path,
+        "workflow_name": context.workflow_name,
+        "event": context.event,
+        "run_id": context.run_id,
+        "attempt": context.attempt,
+        "head_sha": context.head_sha,
+        "ref": context.ref,
+        "selected_runtime_source_inputs_sha256": (
+            context.selected_runtime_source_inputs_sha256
+        ),
+    }
+
+
+def _require_context(
+    value: Any,
+    inputs: SelectedRuntimeSourceInputs,
+) -> RuntimeExecutionContext:
+    inputs = _require_proven_inputs(inputs)
+    if not isinstance(value, RuntimeExecutionContext):
+        raise RuntimeContractError("runtime execution context is not sealed")
+    if any(
+        not hasattr(value, field)
+        for field in ("_proof", "selected_runtime_source_inputs_sha256")
+    ):
+        raise RuntimeContractError("runtime execution context is incomplete")
+    if value._proof is not _SEALED_RUNTIME_PROOF:
+        raise RuntimeContractError("runtime execution context proof is invalid")
+    if value.selected_runtime_source_inputs_sha256 != (
+        inputs.selected_runtime_source_inputs_sha256
+    ):
+        raise RuntimeContractError("runtime execution context uses another source")
+    if value.execution_context_sha256 != canonical_sha256(_context_core(value)):
+        raise RuntimeContractError("runtime execution context fingerprint is stale")
+    return value
+
+
+def capture_runtime_execution_context(
+    inputs: SelectedRuntimeSourceInputs,
+    current_execution: Mapping[str, Any],
+) -> RuntimeExecutionContext:
+    inputs = _require_proven_inputs(inputs)
+    data = dict(current_execution) if isinstance(current_execution, Mapping) else None
+    if data is None:
+        raise RuntimeContractError("current execution must be a mapping")
+    kind = data.get("kind")
+    if kind == "kent_transition":
+        if set(data) != {
+            "kind", "task_id", "task_short_id", "workflow_id",
+            "workflow_revision", "project_id", "project_commit",
+            "authority_transition",
+        }:
+            raise RuntimeContractError("Kent execution context has invalid fields")
+        task_id = _string(data["task_id"], "task_id")
+        if not _TASK_UUID_RE.fullmatch(task_id):
+            raise RuntimeContractError("task_id must be task-<UUID>")
+        task_short_id = _string(data["task_short_id"], "task_short_id")
+        if not _TASK_SHORT_ID_RE.fullmatch(task_short_id):
+            raise RuntimeContractError("task_short_id has invalid grammar")
+        workflow_id = _string(data["workflow_id"], "workflow_id")
+        if not re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
+            workflow_id,
+        ):
+            raise RuntimeContractError("workflow_id must be a UUID")
+        revision = data["workflow_revision"]
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
+            raise RuntimeContractError("workflow_revision must be positive")
+        project_id = _string(data["project_id"], "project_id")
+        if not re.fullmatch(
+            r"project-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
+            project_id,
+        ):
+            raise RuntimeContractError("project_id must be project-<UUID>")
+        commit = _commit(data["project_commit"], "project_commit")
+        if commit != inputs.project_commit:
+            raise RuntimeContractError("Kent context commit does not match selected source")
+        transition = _policy_string(data["authority_transition"], "authority_transition")
+        if not _AUTHORITY_KEY_RE.fullmatch(transition):
+            raise RuntimeContractError("authority_transition is not normalized")
+        values = {
+            "kind": kind,
+            "task_id": task_id,
+            "task_short_id": task_short_id,
+            "workflow_id": workflow_id,
+            "workflow_revision": revision,
+            "project_id": project_id,
+            "project_commit": commit,
+            "authority_transition": transition,
+            "repository": None,
+            "workflow_path": None,
+            "workflow_name": None,
+            "event": None,
+            "run_id": None,
+            "attempt": None,
+            "head_sha": None,
+            "ref": None,
+            "selected_runtime_source_inputs_sha256": (
+                inputs.selected_runtime_source_inputs_sha256
+            ),
+            "_proof": _SEALED_RUNTIME_PROOF,
+        }
+    elif kind == "github_run":
+        if set(data) != {
+            "kind", "repository", "workflow_path", "workflow_name", "event",
+            "run_id", "attempt", "head_sha", "ref",
+        }:
+            raise RuntimeContractError("GitHub execution context has invalid fields")
+        repository = _string(data["repository"], "repository")
+        if not REPOSITORY_RE.fullmatch(repository) or repository != inputs.repository:
+            raise RuntimeContractError("GitHub repository does not match selected source")
+        path = _runtime_path(data["workflow_path"], "workflow_path")
+        name = _policy_string(data["workflow_name"], "workflow_name")
+        event = _policy_string(data["event"], "event")
+        if event not in _SUPPORTED_GITHUB_EVENTS:
+            raise RuntimeContractError("GitHub event is unsupported")
+        run_id = data["run_id"]
+        attempt = data["attempt"]
+        if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
+            raise RuntimeContractError("run_id must be positive")
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt <= 0:
+            raise RuntimeContractError("attempt must be positive")
+        head_sha = _commit(data["head_sha"], "head_sha")
+        if head_sha != inputs.project_commit:
+            raise RuntimeContractError("GitHub head_sha does not match selected source")
+        ref = _runtime_ref(data["ref"], "ref")
+        values = {
+            "kind": kind,
+            "task_id": None,
+            "task_short_id": None,
+            "workflow_id": None,
+            "workflow_revision": None,
+            "project_id": None,
+            "project_commit": inputs.project_commit,
+            "authority_transition": None,
+            "repository": repository,
+            "workflow_path": path,
+            "workflow_name": name,
+            "event": event,
+            "run_id": run_id,
+            "attempt": attempt,
+            "head_sha": head_sha,
+            "ref": ref,
+            "selected_runtime_source_inputs_sha256": (
+                inputs.selected_runtime_source_inputs_sha256
+            ),
+            "_proof": _SEALED_RUNTIME_PROOF,
+        }
+    else:
+        raise RuntimeContractError("current execution kind is unsupported")
+    values["execution_context_sha256"] = canonical_sha256(
+        {key: value for key, value in values.items() if key != "_proof"}
+    )
+    return _sealed_new(RuntimeExecutionContext, values)
+
+
+def _authority_values(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RuntimeContractError("observed authority must be a mapping")
+    data = dict(value)
+    kind = data.get("kind")
+    if kind == "kent_transition":
+        required = {
+            "kind", "task_short_id", "workflow_id", "workflow_revision",
+            "project_id", "approval_authority", "authority_transition",
+        }
+        if set(data) != required:
+            raise RuntimeContractError("Kent authority has invalid fields")
+        if not _TASK_SHORT_ID_RE.fullmatch(_policy_string(data["task_short_id"], "task_short_id")):
+            raise RuntimeContractError("authority task_short_id is invalid")
+        if not re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
+            _policy_string(data["workflow_id"], "workflow_id"),
+        ):
+            raise RuntimeContractError("authority workflow_id is invalid")
+        revision = data["workflow_revision"]
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
+            raise RuntimeContractError("authority workflow_revision is invalid")
+        project_id = _policy_string(data["project_id"], "project_id")
+        if not project_id.startswith("project-"):
+            raise RuntimeContractError("authority project_id is invalid")
+        approval = _policy_string(data["approval_authority"], "approval_authority")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]*", approval):
+            raise RuntimeContractError("approval_authority is not normalized")
+        transition = _policy_string(data["authority_transition"], "authority_transition")
+        if not _AUTHORITY_KEY_RE.fullmatch(transition):
+            raise RuntimeContractError("authority_transition is not normalized")
+        return {
+            "kind": "kent_transition",
+            "task_short_id": data["task_short_id"],
+            "workflow_id": data["workflow_id"],
+            "workflow_revision": revision,
+            "project_id": data["project_id"],
+            "approval_authority": approval,
+            "authority_transition": transition,
+        }
+    if kind == "github_run":
+        required = {
+            "kind", "workflow_path", "workflow_name", "event", "run_id",
+            "attempt", "head_sha", "ref",
+        }
+        if set(data) != required:
+            raise RuntimeContractError("GitHub authority has invalid fields")
+        path = _runtime_path(data["workflow_path"], "workflow_path")
+        name = _policy_string(data["workflow_name"], "workflow_name")
+        event = _policy_string(data["event"], "event")
+        if event not in _SUPPORTED_GITHUB_EVENTS:
+            raise RuntimeContractError("authority event is unsupported")
+        run_id = data["run_id"]
+        attempt = data["attempt"]
+        if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
+            raise RuntimeContractError("authority run_id is invalid")
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt <= 0:
+            raise RuntimeContractError("authority attempt is invalid")
+        head_sha = _commit(data["head_sha"], "head_sha")
+        ref = _runtime_ref(data["ref"], "ref")
+        return {
+            "kind": "github_run",
+            "workflow_path": path,
+            "workflow_name": name,
+            "event": event,
+            "run_id": run_id,
+            "attempt": attempt,
+            "head_sha": head_sha,
+            "ref": ref,
+        }
+    raise RuntimeContractError("authority kind is unsupported")
+
+
+def capture_runtime_authority_binding(
+    inputs: SelectedRuntimeSourceInputs,
+    captures: Iterable[tuple[str, str, bytes]],
+    execution_context: RuntimeExecutionContext,
+    observed_authority: Mapping[str, Any],
+) -> RuntimeAuthorityBinding:
+    inputs = _require_proven_inputs(inputs)
+    context = _require_context(execution_context, inputs)
+    captured = capture_runtime_source_envelope(inputs, captures)
+    authority = _authority_values(observed_authority)
+    if authority["kind"] != context.kind:
+        raise RuntimeContractError("authority kind does not match execution context")
+    if context.kind == "kent_transition":
+        for key in (
+            "task_short_id",
+            "workflow_id",
+            "workflow_revision",
+            "project_id",
+            "authority_transition",
+        ):
+            if authority[key] != getattr(context, key):
+                raise RuntimeContractError(f"Kent authority {key} does not match context")
+        repository = inputs.repository
+    else:
+        for key in (
+            "workflow_path",
+            "workflow_name",
+            "event",
+            "run_id",
+            "attempt",
+            "head_sha",
+            "ref",
+        ):
+            if authority[key] != getattr(context, key):
+                raise RuntimeContractError(f"GitHub authority {key} does not match context")
+        repository = context.repository
+    envelope = _freeze_classification_value(captured["runtime_source_envelope"])
+    authority_frozen = _freeze_classification_value(authority)
+    provenance = canonical_sha256(
+        {
+            "authority": authority,
+            "repository": repository,
+            "project_commit": inputs.project_commit,
+            "runtime_source_envelope": captured["runtime_source_envelope"],
+            "runtime_source_envelope_digest": captured[
+                "runtime_source_envelope_digest"
+            ],
+            "selected_runtime_source_inputs_sha256": (
+                inputs.selected_runtime_source_inputs_sha256
+            ),
+            "execution_context_sha256": context.execution_context_sha256,
+        }
+    )
+    return _sealed_new(
+        RuntimeAuthorityBinding,
+        {
+            "authority": authority_frozen,
+            "repository": repository,
+            "project_commit": inputs.project_commit,
+            "selected_runtime_source_inputs_sha256": (
+                inputs.selected_runtime_source_inputs_sha256
+            ),
+            "execution_context_sha256": context.execution_context_sha256,
+            "runtime_source_envelope": envelope,
+            "runtime_source_envelope_digest": captured[
+                "runtime_source_envelope_digest"
+            ],
+            "provenance_fingerprint": provenance,
+            "_proof": _SEALED_RUNTIME_PROOF,
+        },
+    )
+
+
+def _resolve_runtime_authority_binding(
+    binding: RuntimeAuthorityBinding,
+    execution_context: RuntimeExecutionContext,
+    *,
+    runtime_source_envelope_digest: str,
+) -> Mapping[str, Any]:
+    if not isinstance(binding, RuntimeAuthorityBinding):
+        raise RuntimeContractError("runtime authority binding is not sealed")
+    if any(
+        not hasattr(binding, field)
+        for field in ("_proof", "authority", "runtime_source_envelope")
+    ):
+        raise RuntimeContractError("runtime authority binding is incomplete")
+    if binding._proof is not _SEALED_RUNTIME_PROOF:
+        raise RuntimeContractError("runtime authority binding proof is invalid")
+    if not isinstance(execution_context, RuntimeExecutionContext):
+        raise RuntimeContractError("runtime execution context is not sealed")
+    if any(
+        not hasattr(execution_context, field)
+        for field in ("_proof", "execution_context_sha256")
+    ):
+        raise RuntimeContractError("runtime execution context is incomplete")
+    if execution_context._proof is not _SEALED_RUNTIME_PROOF:
+        raise RuntimeContractError("runtime execution context proof is invalid")
+    _digest(runtime_source_envelope_digest, "runtime_source_envelope_digest")
+    _digest(
+        binding.selected_runtime_source_inputs_sha256,
+        "binding.selected_runtime_source_inputs_sha256",
+    )
+    _commit(binding.project_commit, "binding.project_commit")
+    if binding.selected_runtime_source_inputs_sha256 != (
+        execution_context.selected_runtime_source_inputs_sha256
+    ):
+        raise RuntimeContractError("binding uses a different selected source")
+    if binding.execution_context_sha256 != execution_context.execution_context_sha256:
+        raise RuntimeContractError("binding uses a different execution context")
+    if binding.project_commit != execution_context.project_commit:
+        raise RuntimeContractError("binding uses a different project commit")
+    if (
+        execution_context.kind == "github_run"
+        and binding.repository != execution_context.repository
+    ):
+        raise RuntimeContractError("binding uses a different repository")
+    if binding.runtime_source_envelope_digest != runtime_source_envelope_digest:
+        raise RuntimeContractError("runtime source envelope digest drifted")
+    if binding.execution_context_sha256 != canonical_sha256(_context_core(execution_context)):
+        raise RuntimeContractError("execution context fingerprint is stale")
+    envelope = _thaw_classification_value(binding.runtime_source_envelope)
+    if binding.runtime_source_envelope_digest != sha256_bytes(
+        canonical_bytes(envelope)
+    ):
+        raise RuntimeContractError("runtime source envelope fingerprint is stale")
+    authority = _authority_values(_thaw_classification_value(binding.authority))
+    if authority["kind"] != execution_context.kind:
+        raise RuntimeContractError("binding authority kind is stale")
+    if execution_context.kind == "kent_transition":
+        for key in (
+            "task_short_id",
+            "workflow_id",
+            "workflow_revision",
+            "project_id",
+            "authority_transition",
+        ):
+            if authority[key] != getattr(execution_context, key):
+                raise RuntimeContractError(f"binding authority {key} is stale")
+    else:
+        for key in (
+            "workflow_path",
+            "workflow_name",
+            "event",
+            "run_id",
+            "attempt",
+            "head_sha",
+            "ref",
+        ):
+            if authority[key] != getattr(execution_context, key):
+                raise RuntimeContractError(f"binding authority {key} is stale")
+    if binding.provenance_fingerprint != canonical_sha256(
+        {
+            "authority": authority,
+            "repository": binding.repository,
+            "project_commit": binding.project_commit,
+            "runtime_source_envelope": envelope,
+            "runtime_source_envelope_digest": binding.runtime_source_envelope_digest,
+            "selected_runtime_source_inputs_sha256": (
+                binding.selected_runtime_source_inputs_sha256
+            ),
+            "execution_context_sha256": binding.execution_context_sha256,
+        }
+    ):
+        raise RuntimeContractError("runtime authority binding fingerprint is stale")
+    return {
+        "authority": authority,
+        "repository": binding.repository,
+        "project_commit": binding.project_commit,
+        "runtime_source_envelope_digest": binding.runtime_source_envelope_digest,
+        "selected_runtime_source_inputs_sha256": (
+            binding.selected_runtime_source_inputs_sha256
+        ),
+        "execution_context_sha256": binding.execution_context_sha256,
+    }
+
+
 def _envelope_payload(
     inputs: SelectedRuntimeSourceInputs,
     captures: Sequence[tuple[str, str, bytes]],
@@ -3079,6 +3671,8 @@ __all__ = [
     "MAX_CANONICAL_JSON_NESTING",
     "PR_CURSOR_SCHEMA",
     "RuntimeContractError",
+    "RuntimeAuthorityBinding",
+    "RuntimeExecutionContext",
     "RuntimeExternalRoot",
     "RejectedObservationHardLimit",
     "RejectedObservationReceipt",
@@ -3095,6 +3689,8 @@ __all__ = [
     "canonical_json_bytes",
     "canonical_sha256",
     "capture_runtime_source_envelope",
+    "capture_runtime_authority_binding",
+    "capture_runtime_execution_context",
     "check_state_sha256",
     "classify_expected_ci_checks",
     "classify_expected_ci_checks_with_receipt",

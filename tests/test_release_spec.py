@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import importlib.util
 import json
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
+import workflowkit
 from workflowkit.release import (
     ApprovalMaterialization,
     AuthoritySpec,
+    AuthorityTemplateSpec,
+    GitHubRefPolicy,
     NormalizedGitHubWorkflowSourceV1,
     ReleaseSourceManifest,
     ReleaseSpec,
@@ -25,6 +30,16 @@ from workflowkit.release import (
     validate_qualification_job_sources,
     validate_required_job_sources,
     WorkflowSourceIntent,
+)
+from workflowkit.runtime import (
+    RuntimeAuthorityBinding,
+    RuntimeContractError,
+    RuntimeExecutionContext,
+    RuntimeExternalRoot,
+    _make_selected_runtime_source_inputs,
+    _resolve_runtime_authority_binding,
+    capture_runtime_authority_binding,
+    capture_runtime_execution_context,
 )
 
 
@@ -295,6 +310,917 @@ def valid_spec() -> dict:
 
 
 class ReleaseSpecTest(unittest.TestCase):
+    def _runtime_inputs(
+        self,
+        *,
+        commit: str = "a" * 40,
+        external_roots: tuple[RuntimeExternalRoot, ...] = (),
+    ):
+        return _make_selected_runtime_source_inputs(
+            project_name="Example",
+            repository="owner/repository",
+            topology_kind="appsome-release-publication",
+            project_commit=commit,
+            source_preview={"selected": True},
+            artifact_digests={
+                "spec_raw_blob_sha256": "b" * 64,
+                "source_manifest_raw_blob_sha256": "c" * 64,
+                "snapshot_raw_blob_sha256": "d" * 64,
+            },
+            external_roots=external_roots,
+        )
+
+    def _github_chain(
+        self,
+        *,
+        commit: str = "a" * 40,
+        ref: str = "refs/heads/main",
+        run_id: int = 7,
+        attempt: int = 1,
+    ):
+        inputs = self._runtime_inputs(commit=commit)
+        execution = {
+            "kind": "github_run",
+            "repository": "owner/repository",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "run_id": run_id,
+            "attempt": attempt,
+            "head_sha": commit,
+            "ref": ref,
+        }
+        context = capture_runtime_execution_context(inputs, execution)
+        authority = {
+            key: execution[key]
+            for key in (
+                "kind",
+                "workflow_path",
+                "workflow_name",
+                "event",
+                "run_id",
+                "attempt",
+                "head_sha",
+                "ref",
+            )
+        }
+        binding = capture_runtime_authority_binding(
+            inputs,
+            [],
+            context,
+            authority,
+        )
+        return inputs, context, binding, authority
+
+    def _kent_chain(
+        self,
+        *,
+        commit: str = "a" * 40,
+        task_short_id: str = "KIT-42",
+        transition: str = "approve",
+        workflow_revision: int = 2,
+    ):
+        inputs = self._runtime_inputs(commit=commit)
+        execution = {
+            "kind": "kent_transition",
+            "task_id": "task-123e4567-e89b-12d3-a456-426614174000",
+            "task_short_id": task_short_id,
+            "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+            "workflow_revision": workflow_revision,
+            "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+            "project_commit": commit,
+            "authority_transition": transition,
+        }
+        context = capture_runtime_execution_context(inputs, execution)
+        authority = {
+            "kind": "kent_transition",
+            "task_short_id": task_short_id,
+            "workflow_id": execution["workflow_id"],
+            "workflow_revision": execution["workflow_revision"],
+            "project_id": execution["project_id"],
+            "approval_authority": "release-manager",
+            "authority_transition": transition,
+        }
+        binding = capture_runtime_authority_binding(inputs, [], context, authority)
+        return inputs, context, binding, authority
+
+    def _validated_jobs(self, spec: ReleaseSpec) -> object:
+        workflow = normalized_workflow(
+            jobs=[
+                job("required_release", validation_required=True),
+                job(
+                    "publish_release",
+                    condition="github.event_name == 'workflow_dispatch'",
+                    permissions={"contents": "write"},
+                ),
+            ]
+        )
+        return validate_operation_jobs(
+            spec.operation_variants[0],
+            workflow,
+            required=spec.required_jobs_v1,
+            qualification=spec.qualification_jobs_v1,
+            effect=spec.effect_jobs_v1,
+        )
+
+    def test_schema2_templates_and_ref_policy_are_closed(self) -> None:
+        spec_data = valid_spec()
+        spec_data["schema_version"] = 2
+        variant = spec_data["operation_variants"][0]
+        variant["authority_kind"] = {
+            "kind": "github_run_template",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "ref_policy": {
+                "kind": "prefix_project_field",
+                "prefix": "refs/tags/v",
+                "project_field": "version",
+            },
+        }
+        variant["authority_transitions"] = []
+        variant["approval_required"] = False
+        spec = ReleaseSpec.from_dict(spec_data)
+        self.assertIsInstance(spec.operation_variants[0].authority_kind, AuthorityTemplateSpec)
+        self.assertEqual(
+            spec.operation_variants[0].authority_kind.values["ref_policy"],
+            {
+                "kind": "prefix_project_field",
+                "prefix": "refs/tags/v",
+                "project_field": "version",
+            },
+        )
+        with self.assertRaises(ReleaseSpecError):
+            GitHubRefPolicy.from_dict(
+                {"kind": "exact", "ref": "refs/tags/v1", "extra": True}
+            )
+        with self.assertRaises(ReleaseSpecError):
+            GitHubRefPolicy.from_dict(
+                {"kind": "exact", "ref": "refs/tags/{version}"}
+            )
+        missing_field = deepcopy(spec_data)
+        missing_field["operation_variants"][0]["project_fields"] = []
+        with self.assertRaises(ReleaseSpecError):
+            ReleaseSpec.from_dict(missing_field)
+        nullable_field = deepcopy(spec_data)
+        nullable_field["operation_variants"][0]["project_fields"][0]["nullable"] = True
+        with self.assertRaises(ReleaseSpecError):
+            ReleaseSpec.from_dict(nullable_field)
+
+    def test_schema_bound_authority_kinds_do_not_cross_versions(self) -> None:
+        concrete_kent = valid_spec()
+        concrete_kent["operation_variants"][0]["authority_kind"] = {
+            "kind": "kent_transition_template",
+            "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+            "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+            "approval_authority": "release-manager",
+        }
+        concrete_github = valid_spec()
+        concrete_github["operation_variants"][0]["authority_kind"] = {
+            "kind": "github_run_template",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "ref_policy": {"kind": "exact", "ref": "refs/heads/main"},
+        }
+        for concrete in (concrete_kent, concrete_github):
+            with self.assertRaises(ReleaseSpecError):
+                ReleaseSpec.from_dict(concrete)
+        templated_kent = deepcopy(concrete_kent)
+        templated_kent["schema_version"] = 2
+        templated_kent["operation_variants"][0]["authority_kind"] = {
+            "kind": "kent_transition",
+            "task_short_id": "KIT-42",
+            "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+            "workflow_revision": 2,
+            "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+            "approval_authority": "release-manager",
+            "authority_transition": "approve",
+        }
+        templated_kent["operation_variants"][0]["authority_transitions"] = ["approve"]
+        templated_kent["operation_variants"][0]["approval_required"] = False
+        templated_github = deepcopy(concrete_github)
+        templated_github["schema_version"] = 2
+        templated_github["operation_variants"][0]["authority_kind"] = (
+            valid_spec()["operation_variants"][0]["authority_kind"]
+        )
+        for templated in (templated_kent, templated_github):
+            with self.assertRaises(ReleaseSpecError):
+                ReleaseSpec.from_dict(templated)
+
+    def test_schema1_rejects_every_runtime_argument_shape(self) -> None:
+        spec = ReleaseSpec.from_dict(valid_spec())
+        workflow = normalized_workflow(
+            jobs=[
+                job("required_release", validation_required=True),
+                job(
+                    "publish_release",
+                    condition="github.event_name == 'workflow_dispatch'",
+                    permissions={"contents": "write"},
+                ),
+            ]
+        )
+        validated = validate_operation_jobs(
+            spec.operation_variants[0],
+            workflow,
+            required=spec.required_jobs_v1,
+            qualification=spec.qualification_jobs_v1,
+            effect=spec.effect_jobs_v1,
+        )
+        _inputs, context, binding, authority = self._github_chain()
+        operation = {
+            "schema_version": 1,
+            "variant_key": "publish",
+            "operation_kind": "publish",
+            "repository": "owner/repository",
+            "runtime_source_envelope_digest": "b" * 64,
+            "operation_jobs_manifest_digest": validated.operation_jobs_manifest_digest,
+            "authority": spec.operation_variants[0].authority_kind.as_dict(),
+            "project_fields": {"version": "1.2.3"},
+        }
+        concrete = AuthoritySpec.from_dict(authority)
+        for argument in (context, binding, concrete, {}, object()):
+            for keyword in ("runtime_execution_context", "runtime_authority_binding"):
+                with self.subTest(keyword=keyword, argument=type(argument).__name__):
+                    with self.assertRaises(ReleaseSpecError):
+                        canonicalize_publication_operation(
+                            operation,
+                            spec.operation_variants[0],
+                            validated,
+                            spec=spec,
+                            **{keyword: argument},
+                        )
+
+    def test_schema1_golden_operation_digests_remain_frozen(self) -> None:
+        github = ReleaseSpec.from_dict(valid_spec())
+        github_jobs = self._validated_jobs(github)
+        github_operation = {
+            "schema_version": 1,
+            "variant_key": "publish",
+            "operation_kind": "publish",
+            "repository": "owner/repository",
+            "runtime_source_envelope_digest": "b" * 64,
+            "operation_jobs_manifest_digest": github_jobs.operation_jobs_manifest_digest,
+            "authority": github.operation_variants[0].authority_kind.as_dict(),
+            "project_fields": {"version": "1.2.3"},
+        }
+        github_result = canonicalize_publication_operation(
+            github_operation,
+            github.operation_variants[0],
+            github_jobs,
+            spec=github,
+        )
+        self.assertEqual(
+            github_result.operation_digest,
+            "ff8e1bd0cf69743407d16fd1226506dce5872e94352290b1ec8f169b9cf0c974",
+        )
+        kent_data = valid_spec()
+        kent_data["operation_variants"][0]["authority_kind"] = {
+            "kind": "kent_transition",
+            "task_short_id": "KIT-42",
+            "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+            "workflow_revision": 2,
+            "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+            "approval_authority": "release-manager",
+            "authority_transition": "approve",
+        }
+        kent_data["operation_variants"][0]["authority_transitions"] = ["approve"]
+        kent_data["operation_variants"][0]["approval_required"] = True
+        kent_data["approval_materializations"] = [
+            {
+                "variant_key": "publish",
+                "source_path": ".kent/scripts/approve",
+                "source_node_key": "approval",
+                "source_node_kind": "script",
+                "authority_transition_parameter": "authority_transition",
+                "summary_language": "ru",
+                "summary_sections": ["Нужно от вас", "Почему", "После подтверждения"],
+                "materialized_before_pending_approval": True,
+                "commentary_equals_summary": True,
+                "decision_may_select_approval": False,
+                "required_fields": ["version"],
+                "templates": {
+                    "approve": {
+                        "Нужно от вас": "Версия {{version}}",
+                        "Почему": "Digest {{operation_digest}}",
+                        "После подтверждения": "Продолжить",
+                    }
+                },
+            }
+        ]
+        kent = ReleaseSpec.from_dict(kent_data)
+        kent_jobs = self._validated_jobs(kent)
+        kent_operation = {
+            "schema_version": 1,
+            "variant_key": "publish",
+            "operation_kind": "publish",
+            "repository": "owner/repository",
+            "runtime_source_envelope_digest": "b" * 64,
+            "operation_jobs_manifest_digest": kent_jobs.operation_jobs_manifest_digest,
+            "authority": kent.operation_variants[0].authority_kind.as_dict(),
+            "project_fields": {"version": "1.2.3"},
+        }
+        kent_result = canonicalize_publication_operation(
+            kent_operation,
+            kent.operation_variants[0],
+            kent_jobs,
+            spec=kent,
+        )
+        self.assertEqual(
+            kent_result.operation_digest,
+            "8a69bad667751421cf4fa20457edb22d67c9c17d7f5d963b80f7b5b4571ccee0",
+        )
+
+    def test_schema2_source_strings_reject_all_placeholder_forms(self) -> None:
+        sentinels = (
+            "runtime",
+            "dynamic",
+            "current",
+            "auto",
+            "any",
+            "unknown",
+            "unset",
+            "null",
+            "none",
+            "*",
+            "-",
+            "0",
+            "$runtime",
+            "${runtime}",
+            "<runtime>",
+        )
+        invalid = (
+            *sentinels,
+            " leading",
+            "trailing ",
+            "{value}",
+            "$value",
+            "<value>",
+            "bad\x00value",
+            "bad\x7fvalue",
+        )
+        kent = {
+            "kind": "kent_transition_template",
+            "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+            "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+            "approval_authority": "release-manager",
+        }
+        for field in tuple(kent):
+            for value in invalid:
+                broken = deepcopy(kent)
+                broken[field] = value
+                with self.subTest(kind="kent", field=field, value=repr(value)):
+                    with self.assertRaises(ReleaseSpecError):
+                        AuthorityTemplateSpec.from_dict(broken)
+        github = {
+            "kind": "github_run_template",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "ref_policy": {
+                "kind": "exact",
+                "ref": "refs/heads/main",
+            },
+        }
+        for field in ("kind", "workflow_path", "workflow_name", "event"):
+            for value in invalid:
+                broken = deepcopy(github)
+                broken[field] = value
+                with self.subTest(kind="github", field=field, value=repr(value)):
+                    with self.assertRaises(ReleaseSpecError):
+                        AuthorityTemplateSpec.from_dict(broken)
+        for field in ("kind", "ref"):
+            for value in invalid:
+                broken = deepcopy(github["ref_policy"])
+                broken[field] = value
+                with self.subTest(kind="ref_policy", field=field, value=repr(value)):
+                    with self.assertRaises(ReleaseSpecError):
+                        GitHubRefPolicy.from_dict(broken)
+        for field in ("kind", "prefix", "project_field"):
+            for value in invalid:
+                broken = {
+                    "kind": "prefix_project_field",
+                    "prefix": "refs/tags/v",
+                    "project_field": "version",
+                }
+                broken[field] = value
+                with self.subTest(kind="ref_policy", field=field, value=repr(value)):
+                    with self.assertRaises(ReleaseSpecError):
+                        GitHubRefPolicy.from_dict(broken)
+
+    def test_schema2_ref_policy_grammar_and_fixed_prefix_components(self) -> None:
+        for prefix in (
+            "refs/tags/.hidden",
+            "refs/tags/.",
+            "refs/tags/.hidden/",
+            "refs/tags/foo./",
+            "refs/tags/foo.lock/",
+            "refs/tags/..",
+        ):
+            with self.subTest(prefix=prefix):
+                with self.assertRaises(ReleaseSpecError):
+                    GitHubRefPolicy.from_dict(
+                        {
+                            "kind": "prefix_project_field",
+                            "prefix": prefix,
+                            "project_field": "version",
+                        }
+                    )
+        policy = GitHubRefPolicy.from_dict(
+            {
+                "kind": "prefix_project_field",
+                "prefix": "refs/tags/foo.",
+                "project_field": "version",
+            }
+        )
+        self.assertEqual(policy.resolve({"version": "1"}), "refs/tags/foo.1")
+        for ref in (
+            "refs/heads/main branch",
+            "refs/heads/.hidden",
+            "refs/heads/release.lock",
+            "refs/heads/foo/",
+            "refs/heads/a//b",
+            "refs/heads/a..b",
+        ):
+            with self.subTest(ref=ref):
+                with self.assertRaises(ReleaseSpecError):
+                    GitHubRefPolicy.from_dict({"kind": "exact", "ref": ref})
+        for field_mutation in (
+            lambda fields: fields.clear(),
+            lambda fields: fields[0].update({
+                "name": "version",
+                "type": "integer",
+                "nullable": False,
+                "approval_renderable": True,
+            }),
+            lambda fields: fields[0].update({
+                "name": "version",
+                "type": "string",
+                "nullable": True,
+                "approval_renderable": True,
+            }),
+        ):
+            spec_data = valid_spec()
+            spec_data["schema_version"] = 2
+            spec_data["operation_variants"][0]["authority_kind"] = {
+                "kind": "github_run_template",
+                "workflow_path": ".github/workflows/release.yml",
+                "workflow_name": "Release",
+                "event": "workflow_dispatch",
+                "ref_policy": {
+                    "kind": "prefix_project_field",
+                    "prefix": "refs/tags/v",
+                    "project_field": "version",
+                },
+            }
+            field_mutation(spec_data["operation_variants"][0]["project_fields"])
+            with self.assertRaises(ReleaseSpecError):
+                ReleaseSpec.from_dict(spec_data)
+
+    def test_public_exports_add_exact_runtime_template_symbols(self) -> None:
+        expected = {
+            "KentClient", "ApprovalMaterialization", "AuthoritySpec",
+            "AuthorityTemplateSpec",
+            "CanonicalizedPublicationOperation", "ExternalRoot",
+            "GitHubRefPolicy",
+            "JobContractTable", "NormalizedGitHubJobV1",
+            "NormalizedGitHubStepV1", "NormalizedGitHubWorkflowSourceV1",
+            "OperationVariant", "ProjectField", "ProjectProfile",
+            "ReleaseProfile", "ReleaseSourceManifest", "ReleaseSpec",
+            "ReleaseSpecError", "SelectedReleaseArtifacts",
+            "SourceManifestReference", "SourceManifestSpec", "WorkKind",
+            "ValidatedJobBinding", "ValidatedOperationJobs",
+            "WorkflowSourceIntent", "build_canary_workflow",
+            "build_delivery_workflow", "build_smoke_lab_workflow",
+            "canonical_bytes", "canonical_sha256",
+            "canonicalize_publication_operation",
+            "operation_jobs_manifest_bytes", "operation_jobs_manifest_digest",
+            "preflight_project_revision", "render_approval_summary",
+            "render_release_preview", "RuntimeContractError",
+            "RuntimeExecutionContext",
+            "RuntimeAuthorityBinding",
+            "RuntimeExternalRoot", "SelectedRuntimeSourceInputs",
+            "capture_runtime_execution_context",
+            "capture_runtime_authority_binding",
+            "append_ci_report_attempt", "build_ci_report",
+            "build_terminal_marker", "build_terminal_seal_record",
+            "capture_runtime_source_envelope", "check_state_sha256",
+            "classify_ci_report", "classify_expected_ci_checks",
+            "classify_pr_feedback", "classify_terminal_state",
+            "classify_verification_report", "expected_ci_checks_sha256",
+            "make_pr_feedback_cursor", "make_report_invalid_attempt",
+            "parse_runtime_external_captures", "parse_canonical_json",
+            "revalidate_runtime_source_envelope", "runtime_canonical_bytes",
+            "runtime_canonical_sha256", "validate_ci_report",
+            "validate_ci_report_history", "validate_captured_runtime_source_envelope",
+            "validate_cleanup_report", "validate_expected_ci_checks",
+            "validate_pr_feedback_cursor", "validate_runtime_source_envelope",
+            "validate_terminal_chain", "validate_terminal_marker",
+            "validate_terminal_seal_record", "validate_terminal_seal_request",
+            "validate_verification_report", "validate_approval_materialization",
+            "validate_effect_job_sources", "validate_operation_jobs",
+            "validate_qualification_job_sources", "validate_required_job_sources",
+        }
+        self.assertEqual(set(workflowkit.__all__), expected)
+        self.assertNotIn("_resolve_runtime_authority_binding", workflowkit.__all__)
+        self.assertNotIn("resolve_runtime_authority_binding", workflowkit.__all__)
+        self.assertNotIn("resolve_runtime_authority_binding", __import__(
+            "workflowkit.runtime", fromlist=["__all__"]
+        ).__all__)
+
+    def test_runtime_context_and_binding_are_sealed(self) -> None:
+        inputs = _make_selected_runtime_source_inputs(
+            project_name="Example",
+            repository="owner/repository",
+            topology_kind="appsome-release-publication",
+            project_commit="a" * 40,
+            source_preview={"selected": True},
+            artifact_digests={
+                "spec_raw_blob_sha256": "b" * 64,
+                "source_manifest_raw_blob_sha256": "c" * 64,
+                "snapshot_raw_blob_sha256": "d" * 64,
+            },
+            external_roots=(RuntimeExternalRoot("env", "release"),),
+        )
+        context = capture_runtime_execution_context(
+            inputs,
+            {
+                "kind": "github_run",
+                "repository": "owner/repository",
+                "workflow_path": ".github/workflows/release.yml",
+                "workflow_name": "Release",
+                "event": "workflow_dispatch",
+                "run_id": 7,
+                "attempt": 1,
+                "head_sha": "a" * 40,
+                "ref": "refs/heads/main",
+            },
+        )
+        authority = {
+            "kind": "github_run",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "run_id": 7,
+            "attempt": 1,
+            "head_sha": "a" * 40,
+            "ref": "refs/heads/main",
+        }
+        binding = capture_runtime_authority_binding(
+            inputs, [("env", "release", b"stable")], context, authority
+        )
+        self.assertIsInstance(context, RuntimeExecutionContext)
+        self.assertIsInstance(binding, RuntimeAuthorityBinding)
+        with self.assertRaises(TypeError):
+            RuntimeExecutionContext()
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_authority_binding(
+                inputs,
+                [("env", "release", b"stable")],
+                context,
+                {**authority, "ref": "refs/heads/other"},
+            )
+
+    def test_sealed_objects_reject_mapping_json_foreign_and_mutation(self) -> None:
+        inputs, context, binding, _authority = self._github_chain()
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_authority_binding(
+                inputs,
+                [],
+                {"kind": "github_run"},
+                {},
+            )
+        with self.assertRaises(TypeError):
+            json.dumps(context)
+        with self.assertRaises(TypeError):
+            json.dumps(binding)
+        with self.assertRaises(TypeError):
+            RuntimeAuthorityBinding()
+        with self.assertRaises(TypeError):
+            binding.authority["run_id"] = 9
+        with self.assertRaises(RuntimeContractError):
+            _resolve_runtime_authority_binding(
+                {},
+                context,
+                runtime_source_envelope_digest=binding.runtime_source_envelope_digest,
+            )
+        stale_context = self._github_chain()[1]
+        object.__setattr__(stale_context, "execution_context_sha256", "0" * 64)
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_authority_binding(
+                inputs,
+                [],
+                stale_context,
+                _authority,
+            )
+        stale_source_context = self._github_chain()[1]
+        object.__setattr__(
+            stale_source_context,
+            "selected_runtime_source_inputs_sha256",
+            "0" * 64,
+        )
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_authority_binding(
+                inputs,
+                [],
+                stale_source_context,
+                _authority,
+            )
+        stale_binding = self._github_chain()[2]
+        object.__setattr__(stale_binding, "provenance_fingerprint", "0" * 64)
+        with self.assertRaises(RuntimeContractError):
+            _resolve_runtime_authority_binding(
+                stale_binding,
+                context,
+                runtime_source_envelope_digest=binding.runtime_source_envelope_digest,
+            )
+        stale_source_binding = self._github_chain()[2]
+        object.__setattr__(
+            stale_source_binding,
+            "selected_runtime_source_inputs_sha256",
+            "0" * 64,
+        )
+        with self.assertRaises(RuntimeContractError):
+            _resolve_runtime_authority_binding(
+                stale_source_binding,
+                context,
+                runtime_source_envelope_digest=binding.runtime_source_envelope_digest,
+            )
+        runtime_path = Path(__file__).resolve().parents[1] / "workflowkit" / "runtime.py"
+        spec = importlib.util.spec_from_file_location("foreign_runtime", runtime_path)
+        foreign = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(foreign)
+        foreign_inputs = foreign._make_selected_runtime_source_inputs(
+            project_name="Example",
+            repository="owner/repository",
+            topology_kind="appsome-release-publication",
+            project_commit="a" * 40,
+            source_preview={"selected": True},
+            artifact_digests={
+                "spec_raw_blob_sha256": "b" * 64,
+                "source_manifest_raw_blob_sha256": "c" * 64,
+                "snapshot_raw_blob_sha256": "d" * 64,
+            },
+            external_roots=(),
+        )
+        foreign_context = foreign.capture_runtime_execution_context(
+            foreign_inputs,
+            {
+                "kind": "github_run",
+                "repository": "owner/repository",
+                "workflow_path": ".github/workflows/release.yml",
+                "workflow_name": "Release",
+                "event": "workflow_dispatch",
+                "run_id": 7,
+                "attempt": 1,
+                "head_sha": "a" * 40,
+                "ref": "refs/heads/main",
+            },
+        )
+        foreign_authority = {
+            "kind": "github_run",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "run_id": 7,
+            "attempt": 1,
+            "head_sha": "a" * 40,
+            "ref": "refs/heads/main",
+        }
+        foreign_binding = foreign.capture_runtime_authority_binding(
+            foreign_inputs,
+            [],
+            foreign_context,
+            foreign_authority,
+        )
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_authority_binding(
+                inputs,
+                [],
+                foreign_context,
+                _authority,
+            )
+        with self.assertRaises(RuntimeContractError):
+            _resolve_runtime_authority_binding(
+                foreign_binding,
+                context,
+                runtime_source_envelope_digest=binding.runtime_source_envelope_digest,
+            )
+
+    def test_runtime_proof_rejects_cross_source_and_cross_context_pairs(self) -> None:
+        inputs_a, context_a, binding_a, authority_a = self._github_chain(
+            commit="a" * 40,
+            run_id=7,
+        )
+        inputs_b, context_b, _binding_b, _authority_b = self._github_chain(
+            commit="b" * 40,
+            run_id=8,
+        )
+        with self.assertRaises(RuntimeContractError):
+            _resolve_runtime_authority_binding(
+                binding_a,
+                context_b,
+                runtime_source_envelope_digest=binding_a.runtime_source_envelope_digest,
+            )
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_authority_binding(
+                inputs_b,
+                [],
+                context_a,
+                authority_a,
+            )
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_authority_binding(
+                inputs_a,
+                [],
+                context_a,
+                {**authority_a, "run_id": 8},
+            )
+        bad_execution = {
+            "kind": "github_run",
+            "repository": "owner/repository",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "run_id": 7,
+            "attempt": 1,
+            "head_sha": "b" * 40,
+            "ref": "refs/heads/main",
+        }
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_execution_context(inputs_a, bad_execution)
+        kent_inputs, kent_context, _kent_binding, kent_authority = self._kent_chain()
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_authority_binding(
+                kent_inputs,
+                [],
+                kent_context,
+                {**kent_authority, "authority_transition": "reject"},
+            )
+
+    def test_two_independent_kent_and_github_proof_chains_succeed(self) -> None:
+        def schema2_spec(authority_kind: dict) -> ReleaseSpec:
+            data = valid_spec()
+            data["schema_version"] = 2
+            data["operation_variants"][0]["authority_kind"] = authority_kind
+            data["operation_variants"][0]["authority_transitions"] = (
+                ["approve"] if authority_kind["kind"] == "kent_transition_template" else []
+            )
+            data["operation_variants"][0]["approval_required"] = False
+            return ReleaseSpec.from_dict(data)
+
+        for template, chain_factory, chain_values in (
+            (
+                {
+                    "kind": "kent_transition_template",
+                    "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+                    "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+                    "approval_authority": "release-manager",
+                },
+                lambda values: self._kent_chain(
+                    commit=values[0],
+                    task_short_id=values[1],
+                    workflow_revision=values[2],
+                ),
+                (("a" * 40, "KIT-42", 2), ("b" * 40, "KIT-43", 3)),
+            ),
+            (
+                {
+                    "kind": "github_run_template",
+                    "workflow_path": ".github/workflows/release.yml",
+                    "workflow_name": "Release",
+                    "event": "workflow_dispatch",
+                    "ref_policy": {"kind": "exact", "ref": "refs/heads/main"},
+                },
+                lambda commit: self._github_chain(
+                    commit=commit[0],
+                    ref="refs/heads/main",
+                    run_id=commit[1],
+                    attempt=commit[2],
+                ),
+                (("a" * 40, 7, 1), ("b" * 40, 8, 2)),
+            ),
+        ):
+            spec = schema2_spec(template)
+            validated = self._validated_jobs(spec)
+            for values in chain_values:
+                _inputs, context, binding, authority = chain_factory(values)
+                operation = {
+                    "schema_version": 1,
+                    "variant_key": "publish",
+                    "operation_kind": "publish",
+                    "repository": "owner/repository",
+                    "runtime_source_envelope_digest": (
+                        binding.runtime_source_envelope_digest
+                    ),
+                    "operation_jobs_manifest_digest": (
+                        validated.operation_jobs_manifest_digest
+                    ),
+                    "authority": authority,
+                    "project_fields": {"version": "1.2.3"},
+                }
+                result = canonicalize_publication_operation(
+                    operation,
+                    spec.operation_variants[0],
+                    validated,
+                    spec=spec,
+                    runtime_execution_context=context,
+                    runtime_authority_binding=binding,
+                )
+                self.assertEqual(result.operation["authority"], authority)
+
+    def test_bound_exact_prefix_ref_and_kent_transition_drift_reject(self) -> None:
+        def github_spec(policy: dict) -> ReleaseSpec:
+            data = valid_spec()
+            data["schema_version"] = 2
+            data["operation_variants"][0]["authority_kind"] = {
+                "kind": "github_run_template",
+                "workflow_path": ".github/workflows/release.yml",
+                "workflow_name": "Release",
+                "event": "workflow_dispatch",
+                "ref_policy": policy,
+            }
+            data["operation_variants"][0]["authority_transitions"] = []
+            data["operation_variants"][0]["approval_required"] = False
+            return ReleaseSpec.from_dict(data)
+
+        def canonical_operation(spec, chain):
+            _inputs, context, binding, authority = chain
+            validated = self._validated_jobs(spec)
+            operation = {
+                "schema_version": 1,
+                "variant_key": "publish",
+                "operation_kind": "publish",
+                "repository": "owner/repository",
+                "runtime_source_envelope_digest": binding.runtime_source_envelope_digest,
+                "operation_jobs_manifest_digest": validated.operation_jobs_manifest_digest,
+                "authority": authority,
+                "project_fields": {"version": "1.2.3"},
+            }
+            return canonicalize_publication_operation(
+                operation,
+                spec.operation_variants[0],
+                validated,
+                spec=spec,
+                runtime_execution_context=context,
+                runtime_authority_binding=binding,
+            )
+
+        with self.assertRaises(ReleaseSpecError):
+            canonical_operation(
+                github_spec(
+                    {
+                        "kind": "exact",
+                        "ref": "refs/heads/main",
+                    }
+                ),
+                self._github_chain(ref="refs/heads/other"),
+            )
+        with self.assertRaises(ReleaseSpecError):
+            canonical_operation(
+                github_spec(
+                    {
+                        "kind": "prefix_project_field",
+                        "prefix": "refs/tags/v",
+                        "project_field": "version",
+                    }
+                ),
+                self._github_chain(ref="refs/tags/v2.0.0"),
+            )
+
+        kent_data = valid_spec()
+        kent_data["schema_version"] = 2
+        kent_data["operation_variants"][0]["authority_kind"] = {
+            "kind": "kent_transition_template",
+            "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+            "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+            "approval_authority": "release-manager",
+        }
+        kent_data["operation_variants"][0]["authority_transitions"] = ["approve"]
+        kent_data["operation_variants"][0]["approval_required"] = False
+        kent = ReleaseSpec.from_dict(kent_data)
+        _inputs, context, binding, authority = self._kent_chain(transition="reject")
+        validated = self._validated_jobs(kent)
+        operation = {
+            "schema_version": 1,
+            "variant_key": "publish",
+            "operation_kind": "publish",
+            "repository": "owner/repository",
+            "runtime_source_envelope_digest": binding.runtime_source_envelope_digest,
+            "operation_jobs_manifest_digest": validated.operation_jobs_manifest_digest,
+            "authority": authority,
+            "project_fields": {"version": "1.2.3"},
+        }
+        with self.assertRaises(ReleaseSpecError):
+            canonicalize_publication_operation(
+                operation,
+                kent.operation_variants[0],
+                validated,
+                spec=kent,
+                runtime_execution_context=context,
+                runtime_authority_binding=binding,
+            )
+
     def test_canonical_json_is_sorted_and_has_no_newline(self) -> None:
         encoded = canonical_json_bytes({"z": 1, "a": True})
         self.assertEqual(encoded, b'{"a":true,"z":1}')
@@ -1149,6 +2075,171 @@ class ReleaseSpecTest(unittest.TestCase):
                 validated,
                 spec=spec,
             )
+
+    def test_schema2_github_proof_chain_binds_concrete_operation(self) -> None:
+        spec_data = valid_spec()
+        spec_data["schema_version"] = 2
+        spec_data["operation_variants"][0]["authority_kind"] = {
+            "kind": "github_run_template",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "ref_policy": {
+                "kind": "prefix_project_field",
+                "prefix": "refs/tags/v",
+                "project_field": "version",
+            },
+        }
+        spec = ReleaseSpec.from_dict(spec_data)
+        workflow = normalized_workflow(
+            jobs=[
+                job("required_release", validation_required=True),
+                job(
+                    "publish_release",
+                    condition="github.event_name == 'workflow_dispatch'",
+                    permissions={"contents": "write"},
+                ),
+            ]
+        )
+        validated = validate_operation_jobs(
+            spec.operation_variants[0],
+            workflow,
+            required=spec.required_jobs_v1,
+            qualification=spec.qualification_jobs_v1,
+            effect=spec.effect_jobs_v1,
+        )
+        inputs = _make_selected_runtime_source_inputs(
+            project_name="Example",
+            repository="owner/repository",
+            topology_kind="appsome-release-publication",
+            project_commit="a" * 40,
+            source_preview={"selected": True},
+            artifact_digests={
+                "spec_raw_blob_sha256": "b" * 64,
+                "source_manifest_raw_blob_sha256": "c" * 64,
+                "snapshot_raw_blob_sha256": "d" * 64,
+            },
+            external_roots=(),
+        )
+        current_execution = {
+            "kind": "github_run",
+            "repository": "owner/repository",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "run_id": 7,
+            "attempt": 1,
+            "head_sha": "a" * 40,
+            "ref": "refs/tags/v1.2.3",
+        }
+        context = capture_runtime_execution_context(inputs, current_execution)
+        binding = capture_runtime_authority_binding(
+            inputs,
+            [],
+            context,
+            {
+                key: current_execution[key]
+                for key in (
+                    "kind",
+                    "workflow_path",
+                    "workflow_name",
+                    "event",
+                    "run_id",
+                    "attempt",
+                    "head_sha",
+                    "ref",
+                )
+            },
+        )
+        operation = {
+            "schema_version": 1,
+            "variant_key": "publish",
+            "operation_kind": "publish",
+            "repository": "owner/repository",
+            "runtime_source_envelope_digest": binding.runtime_source_envelope_digest,
+            "operation_jobs_manifest_digest": validated.operation_jobs_manifest_digest,
+            "authority": dict(binding.authority),
+            "project_fields": {"version": "1.2.3"},
+        }
+        result = canonicalize_publication_operation(
+            operation,
+            spec.operation_variants[0],
+            validated,
+            spec=spec,
+            runtime_execution_context=context,
+            runtime_authority_binding=binding,
+        )
+        self.assertEqual(result.operation["authority"], dict(binding.authority))
+        for mutation in (
+            lambda value: value["authority"].update({"run_id": 8}),
+            lambda value: value.update(
+                {"runtime_source_envelope_digest": "c" * 64}
+            ),
+            lambda value: value["project_fields"].update({"version": "2.0.0"}),
+        ):
+            broken = deepcopy(operation)
+            mutation(broken)
+            with self.assertRaises(ReleaseSpecError):
+                canonicalize_publication_operation(
+                    broken,
+                    spec.operation_variants[0],
+                    validated,
+                    spec=spec,
+                    runtime_execution_context=context,
+                    runtime_authority_binding=binding,
+                )
+
+    def test_schema2_kent_template_accepts_exact_approval_materialization(self) -> None:
+        spec_data = valid_spec()
+        spec_data["schema_version"] = 2
+        spec_data["operation_variants"][0]["authority_kind"] = {
+            "kind": "kent_transition_template",
+            "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+            "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+            "approval_authority": "release-manager",
+        }
+        spec_data["operation_variants"][0]["authority_transitions"] = ["approve"]
+        spec_data["operation_variants"][0]["approval_required"] = True
+        spec_data["approval_materializations"] = [
+            {
+                "variant_key": "publish",
+                "source_path": ".kent/scripts/approve",
+                "source_node_key": "approval",
+                "source_node_kind": "script",
+                "authority_transition_parameter": "authority_transition",
+                "summary_language": "ru",
+                "summary_sections": ["Нужно от вас", "Почему", "После подтверждения"],
+                "materialized_before_pending_approval": True,
+                "commentary_equals_summary": True,
+                "decision_may_select_approval": False,
+                "required_fields": ["version"],
+                "templates": {
+                    "approve": {
+                        "Нужно от вас": "Версия {{version}}",
+                        "Почему": "Digest {{operation_digest}}",
+                        "После подтверждения": "Продолжить",
+                    }
+                },
+            }
+        ]
+        spec = ReleaseSpec.from_dict(spec_data)
+        operation = {
+            "variant_key": "publish",
+            "authority_transition": "approve",
+            "project_fields": {"version": "1.2.3"},
+        }
+        summary = render_approval_summary(
+            spec.approval_materializations[0],
+            operation,
+            "b" * 64,
+        )
+        self.assertEqual(summary, "Версия 1.2.3\nDigest " + "b" * 64 + "\nПродолжить")
+        mismatched = deepcopy(spec_data)
+        mismatched["workflow_source_intent"]["id"] = (
+            "223e4567-e89b-12d3-a456-426614174000"
+        )
+        with self.assertRaises(ReleaseSpecError):
+            ReleaseSpec.from_dict(mismatched)
 
     def test_nullable_project_fields_and_authority_formats(self) -> None:
         spec_data = valid_spec()

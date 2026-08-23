@@ -239,11 +239,11 @@ Runtime v2 is atomic.
 - Required and qualification jobs are credential-safe; effect jobs are explicit.
   Normalized adapters expose effective permissions/env/defaults,
   matrices, ordered steps/inputs, conditions, secrets, and failure masking.
-- Publication variants use typed Kent-transition or GitHub-run authority, a
-  derived job-manifest digest, canonical bytes, and optional Script-owned
-  Russian approval. Projects own release semantics; runtime envelopes and
-  external-root bytes are verified separately. No migration, apply,
+- Publication variants use concrete or runtime-bound template authority,
+  derived job-manifest digests, canonical bytes, and optional Script-owned
+  Russian approval. Runtime proofs bind selected sources; no migration, apply,
   publication, or default change is automatic.
+
 ## Execution targets
 
 - Generated workflows always set an explicit Kent 2.6.1 execution-target policy.

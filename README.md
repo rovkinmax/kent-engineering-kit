@@ -23,6 +23,14 @@ directory. Partial or mixed adoption is rejected. Terminal evidence is sealed
 under a stable lock; verification output is bounded and content-addressed; raw
 child output never becomes transition authority.
 
+Release schema 2 adds runtime-bound authority templates without changing the
+persisted publication operation schema. Tracked Kent templates fix workflow
+identity and approval policy; tracked GitHub templates fix workflow identity
+and a closed exact or project-field ref policy. Adapters capture the current
+execution context and external-root source envelope in same-process sealed
+proof objects. Canonicalization rejects serialized, foreign-module, stale, or
+authority-substituted proof chains.
+
 `./scripts/validate` is source-only by default. Installed-state checks and
 mcporter configuration checks require the explicit
 `./scripts/validate --installed-state` mode.

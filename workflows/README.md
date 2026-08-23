@@ -8,6 +8,15 @@ adoption discriminator. It adds the validated `pr_feedback_cursor` carrier to
 existing delivery edges without adding nodes or changing transition ownership.
 Legacy schema-3 and schema-4 workflow output remains v1-compatible.
 
+Release authority template schema 2 is a separate release-spec boundary. The
+adapter must capture selected-revision inputs, current Kent or GitHub
+execution, and raw external-root bytes in one process, then bind the observed
+concrete authority to that sealed context. Do not derive runtime values from a
+tracked template, prior run, operation mapping, or JSON round-trip. The
+release resolver accepts only the sealed proof chain and the operation's exact
+source-envelope digest; it materializes the unchanged concrete authority into
+the existing publication operation.
+
 ## Supported Baseline
 
 - Kent 2.6.1 or newer;

@@ -15,8 +15,13 @@ from workflowkit.revision import (
     preflight_project_revision,
 )
 from workflowkit.runtime import (
+    RuntimeAuthorityBinding,
     RuntimeContractError,
+    RuntimeExecutionContext,
     SelectedRuntimeSourceInputs,
+    _resolve_runtime_authority_binding,
+    capture_runtime_authority_binding,
+    capture_runtime_execution_context,
     capture_runtime_source_envelope,
     revalidate_runtime_source_envelope,
 )
@@ -97,6 +102,8 @@ def release_spec_contents(
     *,
     topology_kind: str = "appsome-release-publication",
     adoption_mode: str = "managed-in-place",
+    schema_version: int = 1,
+    both_templates: bool = False,
     project_name: str = "example",
     repository: str = "owner/repository",
     workflow_path: str = ".github/workflows/release.yml",
@@ -228,8 +235,56 @@ def release_spec_contents(
             }
         ],
     }
+    variants = [variant]
+    if schema_version == 2 and both_templates:
+        project_fields = [
+            {
+                "name": "version",
+                "type": "string",
+                "nullable": False,
+                "approval_renderable": True,
+            }
+        ]
+        shared_jobs = {
+            "required_job_contract_keys": ["required_release_contract"],
+            "qualification_job_contract_keys": [],
+            "effect_job_contract_keys": ["publish_release_contract"],
+            "project_fields": project_fields,
+        }
+        variants = [
+            {
+                **shared_jobs,
+                "key": "approve",
+                "operation_kind": "publish-approval",
+                "authority_kind": {
+                    "kind": "kent_transition_template",
+                    "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+                    "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+                    "approval_authority": "release-manager",
+                },
+                "authority_transitions": ["approve"],
+                "approval_required": bool(approval_path),
+            },
+            {
+                **shared_jobs,
+                "key": "publish",
+                "operation_kind": "publish",
+                "authority_kind": {
+                    "kind": "github_run_template",
+                    "workflow_path": workflow_path,
+                    "workflow_name": "Release",
+                    "event": "workflow_dispatch",
+                    "ref_policy": {
+                        "kind": "exact",
+                        "ref": "refs/heads/main",
+                    },
+                },
+                "authority_transitions": [],
+                "approval_required": False,
+            },
+        ]
     roots = {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "spec_kind": "release",
         "topology_kind": topology_kind,
         "adoption_mode": adoption_mode,
@@ -268,12 +323,13 @@ def release_spec_contents(
             "schema": "effect_jobs_v1",
             "jobs": [effect],
         },
-        "operation_variants": [variant],
+        "operation_variants": variants,
     }
     if approval_path:
+        approval_variant_key = "approve" if schema_version == 2 else "publish"
         roots["approval_materializations"] = [
             {
-                "variant_key": "publish",
+                "variant_key": approval_variant_key,
                 "source_path": approval_path,
                 "source_node_key": "approval",
                 "source_node_kind": "script",
@@ -350,6 +406,8 @@ class RevisionPreflightTest(unittest.TestCase):
         schema4: bool = False,
         metadata_only: bool = False,
         approval: bool = False,
+        release_schema_version: int = 1,
+        both_templates: bool = False,
     ) -> Path:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -409,6 +467,8 @@ class RevisionPreflightTest(unittest.TestCase):
                             if approval
                             else None
                         ),
+                        schema_version=release_schema_version,
+                        both_templates=both_templates,
                     ),
                 ),
                 (
@@ -555,6 +615,191 @@ class RevisionPreflightTest(unittest.TestCase):
         self.assertIn(".kent/release/spec.toml", checked)
         self.assertNotIn(".kent/release/build.sh", checked)
         self.assertIn(".kent/release/snapshot.json", checked)
+
+    def test_schema2_preflight_reads_both_template_families_from_git_blob(self) -> None:
+        root = self.create_project(
+            schema4=True,
+            release_schema_version=2,
+            both_templates=True,
+        )
+
+        result = preflight_project_revision(root, "HEAD")
+        self.assertIsNotNone(result.release_preview)
+        self.assertIsNotNone(result.selected_runtime_source_inputs)
+        preview = result.release_preview
+        self.assertEqual(
+            [item["authority_kind"]["kind"] for item in preview["operation_variants"]],
+            ["kent_transition_template", "github_run_template"],
+        )
+        self.assertEqual(
+            preview["artifact_digests"]["spec_raw_blob_sha256"],
+            hashlib.sha256(
+                (root / ".kent/release/spec.toml").read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            result.selected_runtime_source_inputs.project_commit,
+            result.commit_oid,
+        )
+        self.assertIn(
+            ".kent/release/spec.toml",
+            {item.path for item in result.checked_paths},
+        )
+
+    def test_schema2_preflight_mints_same_process_proofs_and_keeps_closure(self) -> None:
+        root = self.create_project(
+            schema4=True,
+            approval=True,
+            release_schema_version=2,
+            both_templates=True,
+        )
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["external_roots"] = [
+            {
+                "kind": "effective-role",
+                "key": "release-manager",
+                "runtime_digest_required": True,
+            }
+        ]
+        manifest_path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n")
+        self.commit_all(root, "Add schema-2 runtime root")
+        result = preflight_project_revision(root, "HEAD")
+        inputs = result.selected_runtime_source_inputs
+        self.assertIsInstance(inputs, SelectedRuntimeSourceInputs)
+        checked = {item.path for item in result.checked_paths}
+        self.assertIn(".kent/scripts/approve-release", checked)
+        self.assertEqual(
+            result.release_preview["artifact_digests"]["spec_raw_blob_sha256"],
+            hashlib.sha256(
+                self.run_git(root, "show", "HEAD:.kent/release/spec.toml").stdout.encode()
+            ).hexdigest(),
+        )
+        captures = [("effective-role", "release-manager", b"release role")]
+        kent_execution = {
+            "kind": "kent_transition",
+            "task_id": "task-123e4567-e89b-12d3-a456-426614174000",
+            "task_short_id": "KIT-42",
+            "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+            "workflow_revision": 2,
+            "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+            "project_commit": result.commit_oid,
+            "authority_transition": "approve",
+        }
+        kent_context = capture_runtime_execution_context(inputs, kent_execution)
+        kent_binding = capture_runtime_authority_binding(
+            inputs,
+            captures,
+            kent_context,
+            {
+                "kind": "kent_transition",
+                "task_short_id": "KIT-42",
+                "workflow_id": kent_execution["workflow_id"],
+                "workflow_revision": 2,
+                "project_id": kent_execution["project_id"],
+                "approval_authority": "release-manager",
+                "authority_transition": "approve",
+            },
+        )
+        github_execution = {
+            "kind": "github_run",
+            "repository": "owner/repository",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "run_id": 7,
+            "attempt": 1,
+            "head_sha": result.commit_oid,
+            "ref": "refs/heads/main",
+        }
+        github_context = capture_runtime_execution_context(inputs, github_execution)
+        github_binding = capture_runtime_authority_binding(
+            inputs,
+            captures,
+            github_context,
+            {
+                key: github_execution[key]
+                for key in (
+                    "kind",
+                    "workflow_path",
+                    "workflow_name",
+                    "event",
+                    "run_id",
+                    "attempt",
+                    "head_sha",
+                    "ref",
+                )
+            },
+        )
+        self.assertIsInstance(kent_context, RuntimeExecutionContext)
+        self.assertIsInstance(kent_binding, RuntimeAuthorityBinding)
+        self.assertIsInstance(github_context, RuntimeExecutionContext)
+        self.assertIsInstance(github_binding, RuntimeAuthorityBinding)
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_execution_context(inputs.as_dict(), kent_execution)
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_authority_binding(
+                inputs,
+                captures,
+                kent_execution,
+                {},
+            )
+        serialized_context = json.loads(
+            json.dumps(
+                {
+                    field: getattr(kent_context, field)
+                    for field in (
+                        "kind",
+                        "task_id",
+                        "task_short_id",
+                        "workflow_id",
+                        "workflow_revision",
+                        "project_id",
+                        "project_commit",
+                        "authority_transition",
+                    )
+                }
+            )
+        )
+        with self.assertRaises(RuntimeContractError):
+            capture_runtime_authority_binding(
+                inputs,
+                captures,
+                serialized_context,
+                {},
+            )
+        serialized_binding = json.loads(
+            json.dumps(
+                {
+                    "authority": dict(kent_binding.authority),
+                    "repository": kent_binding.repository,
+                    "project_commit": kent_binding.project_commit,
+                    "selected_runtime_source_inputs_sha256": (
+                        kent_binding.selected_runtime_source_inputs_sha256
+                    ),
+                    "execution_context_sha256": kent_binding.execution_context_sha256,
+                    "runtime_source_envelope": {},
+                    "runtime_source_envelope_digest": (
+                        kent_binding.runtime_source_envelope_digest
+                    ),
+                    "provenance_fingerprint": kent_binding.provenance_fingerprint,
+                }
+            )
+        )
+        with self.assertRaises(RuntimeContractError):
+            _resolve_runtime_authority_binding(
+                serialized_binding,
+                kent_context,
+                runtime_source_envelope_digest=kent_binding.runtime_source_envelope_digest,
+            )
+        original_preview = result.release_preview
+        (root / ".kent/release/spec.toml").write_text("schema_version = 1\n")
+        reread = preflight_project_revision(root, "HEAD")
+        self.assertEqual(reread.release_preview, original_preview)
+        self.assertEqual(
+            reread.selected_runtime_source_inputs.project_commit,
+            result.commit_oid,
+        )
 
     def test_schema4_selected_runtime_inputs_are_preflight_proven(self) -> None:
         root = self.create_project(schema4=True)
