@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import selectors
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -29,6 +30,11 @@ UUID_RE = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[89abAB][0-9a-fA-F]{3}-
 MAX_LIST = 256
 MAX_COMMAND = 64
 MAX_OUTPUT = 256 * 1024
+EXEC_ENTRY_LIMIT = 128 * 1024
+EXEC_AGGREGATE_LIMIT = 512 * 1024
+EXEC_FD_DECIMAL_RESERVE = 20
+EXEC_WRITE_CHUNK = 65536
+SETUP_KILL_REAP_GRACE = 2.0
 JOURNAL_SCHEMA = 'kit-operation-journal-v1'
 PHASES = {'prepared', 'in_progress', 'complete', 'verified', 'activation_committed', 'primary_promoted', 'role_adopted',
         'rolled_back'}
@@ -309,58 +315,94 @@ os.chdir(cwd)
 os.execve(command[0], command, env)
 """
 _GUARDIAN = r"""
-import base64, json, os, selectors, signal, subprocess, sys
+import base64, hashlib, json, os, selectors, signal, subprocess, sys
 lock_fd = int(sys.argv[1])
 report_fd = int(sys.argv[2])
 control_fd = int(sys.argv[3])
-command = json.loads(base64.b64decode(sys.argv[4]).decode())
+command_encoded = sys.argv[4]
+command = json.loads(base64.b64decode(command_encoded).decode())
 cwd = sys.argv[5]
-env = json.loads(base64.b64decode(sys.argv[6]).decode())
+env_encoded = sys.argv[6]
+env = json.loads(base64.b64decode(env_encoded).decode())
 limit = int(sys.argv[7])
-stdin_view = memoryview(base64.b64decode(sys.argv[8]))
-gate_read, gate_write = os.pipe()
-child = subprocess.Popen(
-    [
-        sys.executable,
-        "-c",
-        sys.argv[9],
-        str(gate_read),
-        base64.b64encode(json.dumps(command, separators=(",", ":")).encode()).decode(),
-        cwd,
-        base64.b64encode(json.dumps(env, separators=(",", ":")).encode()).decode(),
-    ],
-    cwd=cwd,
-    env=env,
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    close_fds=True,
-    pass_fds=(lock_fd, gate_read),
-    start_new_session=True,
-)
-os.close(gate_read)
-os.write(report_fd, (json.dumps({"pid": child.pid}) + "\n").encode())
-os.close(report_fd)
+expected_length = int(sys.argv[8])
+expected_sha256 = sys.argv[9]
+fd_decimal_limit = int(sys.argv[10])
+if expected_length < 0 or expected_length > limit:
+    raise SystemExit(126)
+if len(expected_sha256) != 64 or any(character not in "0123456789abcdef" for character in expected_sha256):
+    raise SystemExit(126)
+stdin_bytes = sys.stdin.buffer.read(limit + 1)
+if len(stdin_bytes) != expected_length or hashlib.sha256(stdin_bytes).hexdigest() != expected_sha256:
+    raise SystemExit(126)
+stdin_view = memoryview(stdin_bytes)
+child = None
 
 def stop(signum, _frame):
-    try:
-        child.terminate()
-        child.wait(timeout=5)
-    except Exception:
+    if child is not None:
         try:
-            child.kill()
-            child.wait(timeout=2)
+            child.terminate()
+            child.wait(timeout=5)
         except Exception:
-            pass
+            try:
+                child.kill()
+                child.wait(timeout=2)
+            except Exception:
+                pass
     raise SystemExit(128 + signum)
 
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
-if not os.read(control_fd, 1):
+gate_read, gate_write = os.pipe()
+gate_read_arg = str(gate_read)
+if len(gate_read_arg) > fd_decimal_limit:
+    os.close(gate_read)
+    os.close(gate_write)
+    raise SystemExit(126)
+try:
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            sys.argv[11],
+            gate_read_arg,
+            command_encoded,
+            cwd,
+            env_encoded,
+        ],
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        pass_fds=(lock_fd, gate_read),
+        start_new_session=True,
+    )
+except Exception:
+    os.close(gate_read)
+    os.close(gate_write)
+    raise
+os.close(gate_read)
+report = (json.dumps({"pid": child.pid}, separators=(",", ":")) + "\n").encode()
+try:
+    if os.write(report_fd, report) != len(report):
+        stop(signal.SIGTERM, None)
+    os.close(report_fd)
+except Exception:
     stop(signal.SIGTERM, None)
-os.close(control_fd)
-os.write(gate_write, b"1")
-os.close(gate_write)
+if os.read(control_fd, 1) != b"1":
+    stop(signal.SIGTERM, None)
+try:
+    os.close(control_fd)
+except OSError:
+    pass
+if os.write(gate_write, b"1") != 1:
+    stop(signal.SIGTERM, None)
+try:
+    os.close(gate_write)
+except OSError:
+    pass
 selector = selectors.DefaultSelector()
 buffers = {"stdout": bytearray(), "stderr": bytearray()}
 for name, stream in (("stdout", child.stdout), ("stderr", child.stderr)):
@@ -406,6 +448,146 @@ sys.stdout.flush()
 sys.stderr.flush()
 raise SystemExit(child.returncode)
 """
+
+def _encoded_json(value: Any) -> str:
+    return base64.b64encode(canonical_bytes(value)).decode('ascii')
+
+def _guardian_argv(lock_fd: int | str, report_fd: int | str, control_fd: int | str, command_encoded: str, cwd: Path,
+        env_encoded: str, stdin_length: int, stdin_sha256: str) -> list[str]:
+    return [sys.executable, '-c', _GUARDIAN, str(lock_fd), str(report_fd), str(control_fd), command_encoded, str(cwd),
+            env_encoded, str(MAX_OUTPUT), str(stdin_length), stdin_sha256, str(EXEC_FD_DECIMAL_RESERVE), _CHILD_GATE]
+
+def _child_gate_argv(release_fd: int | str, command_encoded: str, cwd: Path, env_encoded: str) -> list[str]:
+    return [sys.executable, '-c', _CHILD_GATE, str(release_fd), command_encoded, str(cwd), env_encoded]
+
+def _exec_vector_size(argv: Sequence[str], env: Mapping[str, str]) -> tuple[list[int], int]:
+    entries = [*argv, *(f'{key}={value}' for key, value in sorted(env.items()))]
+    sizes = [len(os.fsencode(entry)) + 1 for entry in entries]
+    pointer_bytes = (len(argv) + len(env) + 2) * struct.calcsize('P')
+    return (sizes, sum(sizes) + pointer_bytes)
+
+def _validate_exec_vector(argv: Sequence[str], env: Mapping[str, str], label: str) -> None:
+    sizes, aggregate = _exec_vector_size(argv, env)
+    labels = [*(f'argv[{index}]' for index in range(len(argv))),
+            *(f'environment.{key}' for key in sorted(env))]
+    for entry_label, size in zip(labels, sizes, strict=True):
+        if size > EXEC_ENTRY_LIMIT:
+            raise PlanValidationError(f'{label} {entry_label} exceeds the process-exec entry limit')
+    if aggregate > EXEC_AGGREGATE_LIMIT:
+        raise PlanValidationError(f'{label} exceeds the aggregate process-exec limit')
+
+def _validate_effect_exec_vectors(command: Sequence[str], cwd: Path, env: Mapping[str, str], stdin_length: int,
+        stdin_sha256: str, lock_fd: int) -> tuple[str, str]:
+    lock_arg = str(lock_fd)
+    if len(lock_arg) > EXEC_FD_DECIMAL_RESERVE:
+        raise PlanValidationError('operation lock descriptor exceeds the process-exec reserve')
+    _validate_exec_vector(command, env, 'effect child')
+    command_encoded = _encoded_json(command)
+    env_encoded = _encoded_json(env)
+    reserved_fd = '9' * EXEC_FD_DECIMAL_RESERVE
+    guardian_argv = _guardian_argv(lock_arg, reserved_fd, reserved_fd, command_encoded, cwd, env_encoded,
+            stdin_length, stdin_sha256)
+    child_gate_argv = _child_gate_argv(reserved_fd, command_encoded, cwd, env_encoded)
+    _validate_exec_vector(guardian_argv, env, 'effect guardian')
+    _validate_exec_vector(child_gate_argv, env, 'effect child gate')
+    return (command_encoded, env_encoded)
+
+def _descriptor_arg(fd: int) -> str:
+    value = str(fd)
+    if len(value) > EXEC_FD_DECIMAL_RESERVE:
+        raise EffectBlocked('allocated descriptor exceeds the process-exec reserve')
+    return value
+
+def _close_fd(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+def _close_stream(stream: Any) -> None:
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except (OSError, ValueError):
+        pass
+
+def _transfer_guardian_stdin(process: subprocess.Popen[bytes], payload: bytes, deadline: float, timeout: float) -> None:
+    stream = process.stdin
+    if stream is None:
+        raise EffectBlocked('effect guardian stdin is unavailable')
+    if not payload:
+        stream.close()
+        return
+    fd = stream.fileno()
+    os.set_blocking(fd, False)
+    selector = selectors.DefaultSelector()
+    view = memoryview(payload)
+    try:
+        selector.register(fd, selectors.EVENT_WRITE)
+        while view:
+            if process.poll() is not None:
+                raise EffectBlocked('effect guardian exited during stdin transfer')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EffectBlocked(f'effect guardian stdin transfer exceeded {timeout} seconds')
+            events = selector.select(min(0.1, remaining))
+            if not events:
+                continue
+            try:
+                written = os.write(fd, view[:EXEC_WRITE_CHUNK])
+            except (BrokenPipeError, OSError) as error:
+                raise EffectBlocked('effect guardian closed stdin during transfer') from error
+            if type(written) is not int or written <= 0 or written > len(view):
+                raise EffectBlocked('effect guardian stdin transfer made no valid progress')
+            view = view[written:]
+    finally:
+        selector.close()
+    stream.close()
+
+def _read_guardian_ack(process: subprocess.Popen[bytes], report_fd: int, deadline: float, timeout: float) -> int:
+    selector = selectors.DefaultSelector()
+    data = bytearray()
+    os.set_blocking(report_fd, False)
+    try:
+        selector.register(report_fd, selectors.EVENT_READ)
+        while b'\n' not in data:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EffectBlocked(f'effect guardian acknowledgement exceeded {timeout} seconds')
+            events = selector.select(min(0.1, remaining))
+            if not events:
+                if process.poll() is not None:
+                    raise EffectBlocked('effect guardian acknowledgement was lost')
+                continue
+            try:
+                chunk = os.read(report_fd, 4096 - len(data))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                raise EffectBlocked('effect guardian acknowledgement was lost')
+            data.extend(chunk)
+            if len(data) >= 4096 and b'\n' not in data:
+                raise EffectBlocked('effect guardian acknowledgement was too large')
+    finally:
+        selector.close()
+    line, separator, trailing = bytes(data).partition(b'\n')
+    if separator != b'\n' or trailing:
+        raise EffectBlocked('effect guardian acknowledgement was invalid')
+    try:
+        acknowledgement = json.loads(line.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EffectBlocked('effect guardian acknowledgement was invalid') from error
+    if not isinstance(acknowledgement, dict) or set(acknowledgement) != {'pid'}:
+        raise EffectBlocked('effect guardian acknowledgement was invalid')
+    child_pid = acknowledgement['pid']
+    if type(child_pid) is not int or child_pid <= 0:
+        raise EffectBlocked('effect guardian acknowledgement was invalid')
+    if not _pid_alive(child_pid):
+        raise EffectBlocked('effect child is not alive after acknowledgement')
+    return child_pid
 
 def _bounded_communicate(process: subprocess.Popen[bytes], timeout: float, limit: int=MAX_OUTPUT) -> tuple[bytes,
         bytes]:
@@ -478,6 +660,35 @@ def _verify_effect_identity(entry: Mapping[str, Any], expected: Mapping[str, Any
         if entry.get(key) != value:
             raise JournalError(f'effect identity drifted: {key}')
 
+def _wait_owned_until(process: subprocess.Popen[bytes], deadline: float) -> bool:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return process.poll() is not None
+    try:
+        process.wait(timeout=remaining)
+    except (OSError, subprocess.TimeoutExpired):
+        return process.poll() is not None
+    return True
+
+def _terminate_owned_during_setup(process: subprocess.Popen[bytes], deadline: float) -> None:
+    kill_deadline = deadline + SETUP_KILL_REAP_GRACE
+    try:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        if not _wait_owned_until(process, deadline):
+            try:
+                if process.poll() is None:
+                    process.kill()
+            except OSError:
+                pass
+            _wait_owned_until(process, kill_deadline)
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            _close_stream(stream)
+
 def _terminate_owned(process: subprocess.Popen[bytes]) -> None:
     try:
         if process.poll() is None:
@@ -505,6 +716,11 @@ def run_effect(journal: OperationJournal, *, effect_key: str, command: Sequence[
         raise PlanValidationError('effect requires an exact current-state readback')
     command, cwd, env, stdin_bytes, identity = _effect_inputs(command, cwd, extra_env, stdin_bytes, preimage_sha256,
             postimage_sha256)
+    lock_fd = journal._lock_fd
+    if lock_fd is None:
+        raise JournalError('effect requires the held operation lock')
+    command_encoded, env_encoded = _validate_effect_exec_vectors(command, cwd, env, len(stdin_bytes),
+            identity['stdin_sha256'], lock_fd)
     state = journal.state or {}
     effects = dict(state.get('effects') or {})
     previous = effects.get(effect_key)
@@ -518,51 +734,70 @@ def run_effect(journal: OperationJournal, *, effect_key: str, command: Sequence[
     effects[effect_key] = {**identity, 'status': 'attempted', 'attempt': int((previous or {}).get('attempt', 0)) + 1,
             'child': None}
     journal.persist({**state, 'phase': state.get('phase', 'in_progress'), 'effects': effects})
-    lock_fd = journal._lock_fd
-    if lock_fd is None:
-        raise JournalError('effect requires the held operation lock')
-    read_fd, write_fd = os.pipe()
-    control_read, control_write = os.pipe()
-    guardian = subprocess.Popen([sys.executable, '-c', _GUARDIAN, str(lock_fd), str(write_fd), str(control_read),
-            base64.b64encode(canonical_bytes(command)).decode(), str(cwd),
-            base64.b64encode(canonical_bytes(env)).decode(), str(MAX_OUTPUT), base64.b64encode(stdin_bytes).decode(),
-            _CHILD_GATE], cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(lock_fd,
-            write_fd, control_read), start_new_session=True, close_fds=True)
-    os.close(write_fd)
-    os.close(control_read)
+    attempt = effects[effect_key]['attempt']
+    read_fd: int | None = None
+    write_fd: int | None = None
+    control_read: int | None = None
+    control_write: int | None = None
+    guardian: subprocess.Popen[bytes] | None = None
     child_pid: int | None = None
-    acknowledgement_error: EffectBlocked | None = None
-    acknowledgement = selectors.DefaultSelector()
+    released = False
     try:
-        acknowledgement.register(read_fd, selectors.EVENT_READ)
-        if not acknowledgement.select(timeout):
-            acknowledgement_error = EffectBlocked('effect guardian acknowledgement timed out')
-        else:
-            data = os.read(read_fd, 4096)
-            if not data:
-                acknowledgement_error = EffectBlocked('effect guardian acknowledgement was lost')
-            else:
-                child_pid = int(json.loads(data.splitlines()[0].decode())['pid'])
-                if not _pid_alive(child_pid):
-                    acknowledgement_error = EffectBlocked('effect child is not alive after acknowledgement')
-    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
-        acknowledgement_error = EffectBlocked('effect guardian acknowledgement was invalid')
-        acknowledgement_error.__cause__ = error
-    finally:
-        acknowledgement.close()
+        read_fd, write_fd = os.pipe()
+        control_read, control_write = os.pipe()
+        deadline = time.monotonic() + timeout
+        guardian_argv = _guardian_argv(_descriptor_arg(lock_fd), _descriptor_arg(write_fd),
+                _descriptor_arg(control_read), command_encoded, cwd, env_encoded, len(stdin_bytes),
+                identity['stdin_sha256'])
+        guardian = subprocess.Popen(guardian_argv, cwd=str(cwd), env=env, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(lock_fd, write_fd, control_read),
+                start_new_session=True, close_fds=True)
+        os.close(write_fd)
+        write_fd = None
+        os.close(control_read)
+        control_read = None
+        _transfer_guardian_stdin(guardian, stdin_bytes, deadline, timeout)
+        child_pid = _read_guardian_ack(guardian, read_fd, deadline, timeout)
         os.close(read_fd)
-    if acknowledgement_error is not None or child_pid is None:
-        os.close(control_write)
-        _terminate_owned(guardian)
-        effects[effect_key]['status'] = 'unresolved'
+        read_fd = None
+        expected_entry = {**identity, 'status': 'attempted', 'attempt': attempt,
+                'child': {'guardian_pid': guardian.pid, 'child_pid': child_pid}}
+        effects[effect_key] = expected_entry
         journal.persist({**journal.state, 'effects': effects})
-        raise acknowledgement_error or EffectBlocked('effect guardian acknowledgement was not durable')
-    effects[effect_key]['child'] = {'guardian_pid': guardian.pid, 'child_pid': child_pid}
-    journal.persist({**journal.state, 'effects': effects})
-    try:
-        os.write(control_write, b'1')
-    finally:
-        os.close(control_write)
+        persisted = ((journal.state or {}).get('effects') or {}).get(effect_key)
+        if persisted != expected_entry:
+            raise JournalError('effect child ownership readback mismatch')
+        written = os.write(control_write, b'1')
+        if type(written) is not int or written != 1:
+            raise EffectBlocked('effect child release write was not confirmed')
+        released = True
+        _close_fd(control_write)
+        control_write = None
+    except Exception as error:
+        if released:
+            raise
+        _close_fd(control_write)
+        control_write = None
+        _close_fd(control_read)
+        control_read = None
+        _close_fd(read_fd)
+        read_fd = None
+        _close_fd(write_fd)
+        write_fd = None
+        if guardian is not None:
+            _terminate_owned_during_setup(guardian, deadline)
+        repair_state = journal.state or state
+        repair_effects = dict(repair_state.get('effects') or effects)
+        repair_effects[effect_key] = {**identity, 'status': 'unresolved', 'attempt': attempt, 'child': None}
+        try:
+            journal.persist({**repair_state, 'effects': repair_effects})
+        except Exception as repair_error:
+            raise EffectBlocked('effect setup failed and journal repair could not be persisted') from repair_error
+        if isinstance(error, EffectBlocked):
+            raise
+        raise EffectBlocked('effect setup failed before child release') from error
+    if guardian is None or child_pid is None:
+        raise EffectBlocked('effect guardian setup completed without durable ownership')
     try:
         stdout, stderr = _bounded_communicate(guardian, timeout)
     except subprocess.TimeoutExpired as error:
