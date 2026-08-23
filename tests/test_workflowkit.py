@@ -2344,7 +2344,6 @@ class WorkflowKitTest(unittest.TestCase):
 
         for topology_kind in (
             "unknown",
-            "appsome-release-publication",
         ):
             with self.subTest(topology_kind=topology_kind):
                 with self.assertRaisesRegex(
@@ -2361,12 +2360,45 @@ class WorkflowKitTest(unittest.TestCase):
                         )
                     )
 
+        with self.assertRaisesRegex(
+            SpecError,
+            (
+                r"\Arelease\.topology_kind 'appsome-release-publication' "
+                r"requires adoption_mode 'managed-in-place'\Z"
+            ),
+        ):
+            self.load_schema4_profile(
+                lambda contents: contents.replace(
+                    'adoption_mode = "managed-in-place"',
+                    'adoption_mode = "metadata-only"',
+                )
+            )
+
+        with self.assertRaisesRegex(
+            SpecError,
+            (
+                r"\Arelease\.topology_kind "
+                r"'sdk-merged-main-publication' requires adoption_mode one of "
+                r"\('managed-in-place', 'metadata-only'\)\Z"
+            ),
+        ):
+            self.load_schema4_profile(
+                lambda contents: contents.replace(
+                    'topology_kind = "appsome-release-publication"',
+                    'topology_kind = "sdk-merged-main-publication"',
+                ).replace(
+                    'adoption_mode = "managed-in-place"',
+                    'adoption_mode = "unsupported"',
+                )
+            )
+
     def test_schema_four_accepts_all_approved_topology_adoption_pairs(
         self,
     ) -> None:
         pairs = (
             ("appsome-release-publication", "managed-in-place", ".kent/release/build.sh"),
             ("puber-release", "managed-in-place", ".kent/release/build.sh"),
+            ("sdk-merged-main-publication", "managed-in-place", ".kent/release/build.sh"),
             ("sdk-merged-main-publication", "metadata-only", ""),
             ("slack-reader-release", "managed-in-place", ".kent/release/build.sh"),
         )
@@ -2391,16 +2423,24 @@ class WorkflowKitTest(unittest.TestCase):
                 self.assertFalse(profile.package_publish_after_main())
 
     def test_schema_four_enforces_builder_rules(self) -> None:
-        with self.assertRaisesRegex(
-            SpecError,
-            "builder_path is required for managed-in-place",
+        for topology_kind in (
+            "appsome-release-publication",
+            "sdk-merged-main-publication",
         ):
-            self.load_schema4_profile(
-                lambda contents: contents.replace(
-                    'builder_path = ".kent/release/build.sh"',
-                    'builder_path = ""',
+            with self.subTest(topology_kind=topology_kind):
+                with self.assertRaisesRegex(
+                    SpecError,
+                    "builder_path is required for managed-in-place",
+                ):
+                    self.load_schema4_profile(
+                        lambda contents, topology_kind=topology_kind: contents.replace(
+                            'topology_kind = "appsome-release-publication"',
+                            f'topology_kind = "{topology_kind}"',
+                        ).replace(
+                            'builder_path = ".kent/release/build.sh"',
+                            'builder_path = ""',
+                        )
                 )
-            )
 
         profile = self.load_schema4_profile(
             lambda contents: contents.replace(

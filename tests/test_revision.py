@@ -48,7 +48,12 @@ CONTEXT_MANIFESTS = (
 )
 
 
-def schema4_profile_contents(*, metadata_only: bool = False) -> str:
+def schema4_profile_contents(
+    *,
+    topology_kind: str = "appsome-release-publication",
+    adoption_mode: str = "managed-in-place",
+    builder_path: str = ".kent/release/build.sh",
+) -> str:
     contents = EXAMPLE_PROFILE.read_text()
     contents = contents.replace(
         "schema_version = 3\n",
@@ -58,13 +63,6 @@ def schema4_profile_contents(*, metadata_only: bool = False) -> str:
         ),
     )
     contents = contents.replace('release_topology = "none"\n', "")
-    topology_kind = (
-        "sdk-merged-main-publication"
-        if metadata_only
-        else "appsome-release-publication"
-    )
-    adoption_mode = "metadata-only" if metadata_only else "managed-in-place"
-    builder_path = "" if metadata_only else ".kent/release/build.sh"
     contents += (
         "\n[command_versions]\n"
         'dispatch = "1.2.3"\n'
@@ -404,7 +402,9 @@ class RevisionPreflightTest(unittest.TestCase):
         self,
         *,
         schema4: bool = False,
-        metadata_only: bool = False,
+        topology_kind: str = "appsome-release-publication",
+        adoption_mode: str = "managed-in-place",
+        builder_path: str = ".kent/release/build.sh",
         approval: bool = False,
         release_schema_version: int = 1,
         both_templates: bool = False,
@@ -421,7 +421,11 @@ class RevisionPreflightTest(unittest.TestCase):
         scripts = kent / "scripts"
         scripts.mkdir(parents=True)
         (kent / "workflow-profile.toml").write_text(
-            schema4_profile_contents(metadata_only=metadata_only)
+            schema4_profile_contents(
+                topology_kind=topology_kind,
+                adoption_mode=adoption_mode,
+                builder_path=builder_path,
+            )
             if schema4
             else EXAMPLE_PROFILE.read_text()
         )
@@ -452,16 +456,8 @@ class RevisionPreflightTest(unittest.TestCase):
                 (
                     ".kent/release/spec.toml",
                     release_spec_contents(
-                        topology_kind=(
-                            "sdk-merged-main-publication"
-                            if metadata_only
-                            else "appsome-release-publication"
-                        ),
-                        adoption_mode=(
-                            "metadata-only"
-                            if metadata_only
-                            else "managed-in-place"
-                        ),
+                        topology_kind=topology_kind,
+                        adoption_mode=adoption_mode,
                         approval_path=(
                             ".kent/scripts/approve-release"
                             if approval
@@ -474,11 +470,7 @@ class RevisionPreflightTest(unittest.TestCase):
                 (
                     ".kent/release/source-manifest.json",
                     source_manifest_contents(
-                        topology_kind=(
-                            "sdk-merged-main-publication"
-                            if metadata_only
-                            else "appsome-release-publication"
-                        ),
+                        topology_kind=topology_kind,
                     ),
                 ),
                 (".kent/release/snapshot.json", "{}\n"),
@@ -487,8 +479,8 @@ class RevisionPreflightTest(unittest.TestCase):
                 path = root / configured_path
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(contents)
-            if not metadata_only:
-                builder = root / ".kent/release/build.sh"
+            if builder_path:
+                builder = root / builder_path
                 builder.write_text("#!/usr/bin/env bash\nexit 0\n")
                 builder.chmod(0o755)
             if approval:
@@ -605,7 +597,12 @@ class RevisionPreflightTest(unittest.TestCase):
         self.assertIn(".kent/release/snapshot.json", checked)
 
     def test_preflight_omits_optional_metadata_only_builder(self) -> None:
-        root = self.create_project(schema4=True, metadata_only=True)
+        root = self.create_project(
+            schema4=True,
+            topology_kind="sdk-merged-main-publication",
+            adoption_mode="metadata-only",
+            builder_path="",
+        )
 
         checked = {
             path.path
@@ -615,6 +612,46 @@ class RevisionPreflightTest(unittest.TestCase):
         self.assertIn(".kent/release/spec.toml", checked)
         self.assertNotIn(".kent/release/build.sh", checked)
         self.assertIn(".kent/release/snapshot.json", checked)
+
+    def test_preflight_accepts_sdk_managed_release_closure(self) -> None:
+        root = self.create_project(
+            schema4=True,
+            topology_kind="sdk-merged-main-publication",
+            adoption_mode="managed-in-place",
+            builder_path=".kent/release/build.sh",
+        )
+
+        result = preflight_project_revision(root, "HEAD")
+
+        checked = {item.path for item in result.checked_paths}
+        self.assertIn(".kent/release/build.sh", checked)
+        self.assertTrue(result.release_preview["source_contract_valid"])
+        self.assertEqual(
+            result.release_preview["workflow_source_intent"]["update_kind"],
+            "graph-and-metadata",
+        )
+        self.assertEqual(
+            result.selected_runtime_source_inputs.topology_kind,
+            "sdk-merged-main-publication",
+        )
+        self.assertEqual(
+            result.release_preview["artifact_digests"]["builder_raw_blob_sha256"],
+            hashlib.sha256(
+                self.run_git(
+                    root,
+                    "show",
+                    "HEAD:.kent/release/build.sh",
+                ).stdout.encode()
+            ).hexdigest(),
+        )
+        builder = root / ".kent/release/build.sh"
+        builder.chmod(0o644)
+        self.commit_all(root, "Drop SDK builder executable mode")
+        with self.assertRaisesRegex(
+            RevisionPreflightError,
+            "build.sh.*not executable",
+        ):
+            preflight_project_revision(root, "HEAD")
 
     def test_schema2_preflight_reads_both_template_families_from_git_blob(self) -> None:
         root = self.create_project(
@@ -1440,7 +1477,12 @@ class RevisionPreflightTest(unittest.TestCase):
         self.commit_all(root, "Drop builder executable mode")
         with self.assertRaisesRegex(RevisionPreflightError, "build.sh.*not executable"):
             preflight_project_revision(root, "HEAD")
-        metadata = self.create_project(schema4=True, metadata_only=True)
+        metadata = self.create_project(
+            schema4=True,
+            topology_kind="sdk-merged-main-publication",
+            adoption_mode="metadata-only",
+            builder_path="",
+        )
         result = preflight_project_revision(metadata, "HEAD")
         checked = {item.path for item in result.checked_paths}
         self.assertNotIn(".kent/release/build.sh", checked)

@@ -574,9 +574,11 @@ credential pointers, servers, wrappers, policy; Kit stores no credentials.
 Schema 3 keeps release_topology and known-command sync. Schema 4 requires
 managed commands, exact command_versions, and release fields topology_kind,
 adoption_mode, spec_path, builder_path, and snapshot_path. Managed-in-place
-allows appsome-release-publication, puber-release, and slack-reader-release;
-metadata-only allows sdk-merged-main-publication. The former needs a builder;
-the latter forbids it. required_adapters lists executable dependencies;
+allows appsome-release-publication, puber-release, slack-reader-release,
+and sdk-merged-main-publication; SDK allows both. Managed needs builder and
+graph intent; metadata-only needs metadata intent, no builder.
+Sync/generation/apply are manual.
+required_adapters lists executable dependencies;
 kit_managed_adapters is the exact Kit subset; others are project-owned.
 Loader is platform-neutral. Conditional or required Android Smoke uses
 mobile_resource_lock and mobile_evidence_audit. Shared code owns lock and

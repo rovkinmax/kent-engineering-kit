@@ -29,10 +29,13 @@ Schema 3 retains legacy `release_topology` and known-command synchronization.
 Schema 4 requires explicit command ownership and versions plus a closed
 `release` table. Its approved topology/adoption identities are
 `appsome-release-publication/managed-in-place`,
-`puber-release/managed-in-place`, `sdk-merged-main-publication/metadata-only`,
-and `slack-reader-release/managed-in-place`. Synchronization plans every
-managed write before applying it; no project migration or activation is
-automatic.
+`puber-release/managed-in-place`,
+`sdk-merged-main-publication/managed-in-place` or
+`sdk-merged-main-publication/metadata-only`, and
+`slack-reader-release/managed-in-place`. Managed-in-place requires a builder
+and graph-bearing workflow intent; metadata-only forbids a builder and requires
+metadata-only workflow intent. Synchronization, migration, generation, apply,
+and activation remain non-automatic.
 The closed release fields are `topology_kind`, `adoption_mode`, `spec_path`,
 `builder_path`, and `snapshot_path`; managed-in-place requires a builder path,
 metadata-only requires none. `required_adapters` declares executable runtime

@@ -30,10 +30,10 @@ RELEASE_FIELDS = {
     "snapshot_path",
 }
 RELEASE_TOPOLOGY_ADOPTIONS = {
-    "appsome-release-publication": "managed-in-place",
-    "puber-release": "managed-in-place",
-    "sdk-merged-main-publication": "metadata-only",
-    "slack-reader-release": "managed-in-place",
+    "appsome-release-publication": ("managed-in-place",),
+    "puber-release": ("managed-in-place",),
+    "sdk-merged-main-publication": ("managed-in-place", "metadata-only"),
+    "slack-reader-release": ("managed-in-place",),
 }
 WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
@@ -546,13 +546,18 @@ class ProjectProfile:
                 f"unsupported release.topology_kind "
                 f"{self.release.topology_kind!r}"
             )
-        expected_adoption = RELEASE_TOPOLOGY_ADOPTIONS[
+        accepted_adoptions = RELEASE_TOPOLOGY_ADOPTIONS[
             self.release.topology_kind
         ]
-        if self.release.adoption_mode != expected_adoption:
+        if self.release.adoption_mode not in accepted_adoptions:
+            if len(accepted_adoptions) == 1:
+                raise SpecError(
+                    f"release.topology_kind {self.release.topology_kind!r} "
+                    f"requires adoption_mode {accepted_adoptions[0]!r}"
+                )
             raise SpecError(
                 f"release.topology_kind {self.release.topology_kind!r} "
-                f"requires adoption_mode {expected_adoption!r}"
+                f"requires adoption_mode one of {accepted_adoptions!r}"
             )
         if (
             self.release.adoption_mode == "managed-in-place"
