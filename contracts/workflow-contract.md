@@ -225,11 +225,11 @@ Runtime v2 is atomic.
 
 ## Release source and publication contracts
 
-- Schema 3 manual-package-publish-after-main: approval-gated Publish Package,procedures.publish/roles.package_release,exact merged source,authorized package/version/destination/tag policy,JIT credentials,remote pre/poststate,no overwrite/delete,Cleanup publication_report.
-- Schema 4 no publication node,selected-commit preflight derives profile/job sources,spec/manifest/snapshot/optional builder->regular files,raw digests/read-only preview,runtime attestation/activation false.
-- Required/qualification credential-safe,effects explicit. Normalized adapters: permissions/env/defaults,matrices,ordered steps/inputs,conditions/secrets/failure masking.
-- github-packages-classic-pat-step-read job-local,arbitrary source secret ref->fixed GITHUB_PACKAGES_TOKEN env,1 unconditional run-only recipient,uses/with empty,cache-read iff full-SHA restore-only,default secretless,operator-owned scope/account/SSO/expiry/rotation,Kit no enforce/prove. pull_request/push/deployment/workflow_dispatch source-policy rows.
-- Variants: concrete/runtime-bound template authority,job-manifest digests,canonical bytes,optional Script-owned Russian approval,runtime proofs bind selected sources,man. migration/apply/publication/default.
+- Schema 3 manual-package-publish-after-main approval-gated Publish Package,procedures.publish/roles.package_release,exact merged source,authorized package/version/destination/tag policy,JIT credentials,remote pre/poststate,no overwrite/delete,Cleanup publication_report
+- Schema 4 no publication node,selected-commit preflight derives profile/job sources,spec/manifest/snapshot/optional builder->regular files,raw digests/read-only preview,runtime attestation/activation false
+- Required/qualification credential-safe,effects explicit,Normalized adapters: permissions/env/defaults,matrices,ordered steps/inputs,conditions/secrets/failure masking
+- github-packages-classic-pat-step-read job-local,arbitrary source secret ref->fixed GITHUB_PACKAGES_TOKEN env,1 unconditional run-only recipient,uses/with empty,cache-read iff full-SHA restore-only,default secretless,operator-owned scope/account/SSO/expiry/rotation,not enforced/proved by Kit,pull_request/push/deployment/workflow_dispatch source-policy rows
+- Variants concrete/runtime-bound template authority,job-manifest digests,canonical bytes,optional Script-owned Russian approval,runtime proofs bind selected sources,manual migration/apply/publication/default
 
 ## Execution targets
 
