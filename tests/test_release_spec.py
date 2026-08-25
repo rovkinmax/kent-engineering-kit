@@ -1674,6 +1674,217 @@ class ReleaseSpecTest(unittest.TestCase):
         with self.assertRaises(ReleaseSpecError):
             validate_required_job_sources(drifted, table)
 
+    def test_advisory_effect_step_overlay_is_sparse_and_fail_closed(self) -> None:
+        effect_job = job(
+            "publish_release",
+            condition="github.event_name == 'workflow_dispatch'",
+            permissions={"contents": "write"},
+            steps=[step(run="echo optional", continue_on_error=True)],
+        )
+        source = normalized_workflow(
+            jobs=[
+                job("required_release", validation_required=True),
+                effect_job,
+            ]
+        )
+        unmarked = {
+            "schema": "effect_jobs_v1",
+            "jobs": [
+                contract_row("effect", "publish_release_contract", effect_job)
+            ],
+        }
+        with self.assertRaisesRegex(ReleaseSpecError, "failure-masking step"):
+            validate_effect_job_sources(source, unmarked)
+
+        marked = deepcopy(unmarked)
+        marked["jobs"][0]["steps"][0]["advisory_effect"] = True
+        spec_data = valid_spec()
+        spec_data["effect_jobs_v1"] = marked
+        spec = ReleaseSpec.from_dict(spec_data)
+        effect_contract = spec.as_dict()["effect_jobs_v1"]["jobs"][0]["steps"][0]
+        self.assertIn(
+            "advisory_effect",
+            effect_contract,
+        )
+        self.assertTrue(effect_contract["advisory_effect"])
+        self.assertNotIn("advisory_effect", effect_job["steps"][0])
+        legacy_spec = ReleaseSpec.from_dict(valid_spec())
+        self.assertNotIn(
+            "advisory_effect",
+            legacy_spec.as_dict()["effect_jobs_v1"]["jobs"][0]["steps"][0],
+        )
+        validated = validate_operation_jobs(
+            spec.operation_variants[0],
+            source,
+            required=spec.required_jobs_v1,
+            qualification=spec.qualification_jobs_v1,
+            effect=spec.effect_jobs_v1,
+        )
+        self.assertEqual(
+            validated.effect[0].as_dict()["step_contract"],
+            [
+                {
+                    "step_index": 0,
+                    "validation_required": False,
+                    "advisory_effect": True,
+                }
+            ],
+        )
+        self.assertNotIn("advisory_effect", validated.effect[0].job["steps"][0])
+        effect_manifest = next(
+            item
+            for item in validated.operation_jobs_manifest["bindings"]
+            if item["set_kind"] == "effect"
+        )
+        self.assertEqual(
+            effect_manifest["step_contract"],
+            validated.effect[0].as_dict()["step_contract"],
+        )
+        legacy = self._validated_jobs(legacy_spec)
+        legacy_repeat = self._validated_jobs(ReleaseSpec.from_dict(valid_spec()))
+        self.assertEqual(
+            legacy.operation_jobs_manifest_digest,
+            legacy_repeat.operation_jobs_manifest_digest,
+        )
+        self.assertNotEqual(
+            validated.operation_jobs_manifest_digest,
+            legacy.operation_jobs_manifest_digest,
+        )
+        manifest_without_marker = deepcopy(validated.operation_jobs_manifest)
+        next(
+            item
+            for item in manifest_without_marker["bindings"]
+            if item["set_kind"] == "effect"
+        )["step_contract"][0].pop(
+            "advisory_effect"
+        )
+        self.assertNotEqual(
+            validated.operation_jobs_manifest_digest,
+            sha256_digest(manifest_without_marker),
+        )
+
+        drifted = deepcopy(source.as_dict())
+        next(
+            item
+            for item in drifted["jobs"]
+            if item["job_key"] == "publish_release"
+        )["steps"][0]["continue_on_error"] = False
+        with self.assertRaisesRegex(ReleaseSpecError, "normalized source drift"):
+            validate_effect_job_sources(
+                NormalizedGitHubWorkflowSourceV1.from_dict(drifted),
+                marked,
+            )
+
+        noncontinued = deepcopy(marked)
+        noncontinued["jobs"][0]["steps"][0]["advisory_effect"] = True
+        noncontinued["jobs"][0]["steps"][0]["continue_on_error"] = False
+        noncontinued_source_job = deepcopy(effect_job)
+        noncontinued_source_job["steps"][0]["continue_on_error"] = False
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "requires continue_on_error",
+        ):
+            validate_effect_job_sources(
+                normalized_workflow(
+                    jobs=[
+                        job("required_release", validation_required=True),
+                        noncontinued_source_job,
+                    ]
+                ),
+                noncontinued,
+            )
+
+        validation_required = deepcopy(marked)
+        validation_required["jobs"][0]["steps"][0]["validation_required"] = True
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "may not be validation_required",
+        ):
+            validate_effect_job_sources(source, validation_required)
+
+        false_marker = deepcopy(marked)
+        false_marker["jobs"][0]["steps"][0]["advisory_effect"] = False
+        with self.assertRaisesRegex(ReleaseSpecError, "must be true"):
+            validate_effect_job_sources(source, false_marker)
+
+        unknown_marker = deepcopy(marked)
+        unknown_marker["jobs"][0]["steps"][0]["unexpected"] = True
+        with self.assertRaisesRegex(ReleaseSpecError, "unknown keys"):
+            validate_effect_job_sources(source, unknown_marker)
+
+        required_marker = contract_row(
+            "required",
+            "required-marker",
+            job("required_release", validation_required=True),
+        )
+        required_marker["steps"][0]["advisory_effect"] = True
+        with self.assertRaisesRegex(ReleaseSpecError, "unknown keys"):
+            validate_required_job_sources(
+                normalized_workflow(
+                    jobs=[job("required_release", validation_required=True)]
+                ),
+                {"schema": "required_jobs_v1", "jobs": [required_marker]},
+            )
+
+        qualification_job = job("unit_tests")
+        qualification_marker = contract_row(
+            "qualification",
+            "qualification-marker",
+            qualification_job,
+        )
+        qualification_marker["steps"][0]["advisory_effect"] = True
+        with self.assertRaisesRegex(ReleaseSpecError, "unknown keys"):
+            validate_qualification_job_sources(
+                normalized_workflow(jobs=[qualification_job]),
+                {
+                    "schema": "qualification_jobs_v1",
+                    "jobs": [qualification_marker],
+                },
+            )
+
+        two_step_job = job(
+            "publish_release",
+            condition="github.event_name == 'workflow_dispatch'",
+            permissions={"contents": "write"},
+            steps=[
+                step(run="echo optional", continue_on_error=True),
+                step(run="echo also optional", continue_on_error=True),
+            ],
+        )
+        two_step = contract_row("effect", "two-step", two_step_job)
+        two_step["steps"][0]["advisory_effect"] = True
+        with self.assertRaisesRegex(ReleaseSpecError, "failure-masking step"):
+            validate_effect_job_sources(
+                normalized_workflow(
+                    jobs=[
+                        job("required_release", validation_required=True),
+                        two_step_job,
+                    ]
+                ),
+                {"schema": "effect_jobs_v1", "jobs": [two_step]},
+            )
+
+        job_continue = deepcopy(effect_job)
+        job_continue["continue_on_error"] = True
+        job_continue_contract = contract_row(
+            "effect",
+            "job-continue",
+            job_continue,
+        )
+        with self.assertRaisesRegex(ReleaseSpecError, "continue on error"):
+            validate_effect_job_sources(
+                normalized_workflow(
+                    jobs=[
+                        job("required_release", validation_required=True),
+                        job_continue,
+                    ]
+                ),
+                {
+                    "schema": "effect_jobs_v1",
+                    "jobs": [job_continue_contract],
+                },
+            )
+
     def test_expanded_matrix_rows_have_pairwise_identity(self) -> None:
         raw = normalized_workflow(
             jobs=[

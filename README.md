@@ -31,6 +31,21 @@ execution context and external-root source envelope in same-process sealed
 proof objects. Canonicalization rejects serialized, foreign-module, stale, or
 authority-substituted proof chains.
 
+## Advisory effect steps
+
+Effect-job contracts remain strict by default: a step with
+`continue_on_error = true` is rejected unless the matching exact contract step
+also declares the sparse overlay `advisory_effect = true`. The overlay is
+retained only in the contract step projection; the normalized workflow source
+continues to represent the exact source field unchanged.
+
+An advisory effect step must not be `validation_required`. Required and
+qualification jobs may not declare the overlay and continue to reject every
+failure-masking step. Job-level `continue_on_error` remains forbidden.
+Successful job completion is not evidence that an advisory effect occurred.
+`allowed_effects` remains a permission boundary, not a claim that every
+allowed effect was performed.
+
 `./scripts/validate` is source-only by default. Installed-state checks and
 mcporter configuration checks require the explicit
 `./scripts/validate --installed-state` mode.

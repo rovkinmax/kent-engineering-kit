@@ -1384,6 +1384,7 @@ class JobContractTable:
                 _validate_contract_row(
                     row,
                     f"{set_kind}_jobs_v1.jobs[{index}]",
+                    set_kind,
                 )
             )
         keys = [row["contract_key"] for row in rows]
@@ -1408,7 +1409,11 @@ class JobContractTable:
         return {"schema": self.schema, "jobs": list(self.jobs)}
 
 
-def _validate_contract_row(row: Mapping[str, Any], label: str) -> dict[str, Any]:
+def _validate_contract_row(
+    row: Mapping[str, Any],
+    label: str,
+    set_kind: str,
+) -> dict[str, Any]:
     _require_keys(row, JOB_ROW_KEYS, label)
     contract_key = _string(row["contract_key"], f"{label}.contract_key")
     if not NORMALIZED_KEY_RE.fullmatch(contract_key):
@@ -1424,9 +1429,12 @@ def _validate_contract_row(row: Mapping[str, Any], label: str) -> dict[str, Any]
     overlays = []
     for index, step in enumerate(declared_steps):
         step_label = f"{label}.steps[{index}]"
+        overlay_keys = STEP_KEYS | {"validation_required"}
+        if set_kind == "effect":
+            overlay_keys.add("advisory_effect")
         step_data = _closed(
             step,
-            STEP_KEYS | {"validation_required"},
+            overlay_keys,
             step_label,
         )
         _require_keys(step_data, STEP_KEYS | {"validation_required"}, step_label)
@@ -1434,7 +1442,16 @@ def _validate_contract_row(row: Mapping[str, Any], label: str) -> dict[str, Any]
             step_data["validation_required"],
             f"{step_label}.validation_required",
         )
-        overlays.append(overlay)
+        overlay_data: dict[str, Any] = {"validation_required": overlay}
+        if "advisory_effect" in step_data:
+            advisory_effect = _bool(
+                step_data["advisory_effect"],
+                f"{step_label}.advisory_effect",
+            )
+            if not advisory_effect:
+                _error(f"{step_label}.advisory_effect must be true")
+            overlay_data["advisory_effect"] = True
+        overlays.append(overlay_data)
         source_steps.append({key: step_data[key] for key in STEP_KEYS})
     source = {key: row[key] for key in JOB_KEYS}
     source["steps"] = source_steps
@@ -1470,7 +1487,7 @@ def _validate_contract_row(row: Mapping[str, Any], label: str) -> dict[str, Any]
     normalized["steps"] = [
         {
             **step,
-            "validation_required": overlays[index],
+            **overlays[index],
         }
         for index, step in enumerate(normalized_job.as_dict()["steps"])
     ]
@@ -2490,7 +2507,11 @@ def _find_contract_job(
     return workflow, canonical_selector, matching_events[0], matches[0]
 
 
-def _contract_steps(row: Mapping[str, Any], job: NormalizedGitHubJobV1) -> tuple[dict[str, Any], ...]:
+def _contract_steps(
+    row: Mapping[str, Any],
+    job: NormalizedGitHubJobV1,
+    set_kind: str,
+) -> tuple[dict[str, Any], ...]:
     if "steps" not in row:
         return tuple(
             {"step_index": index, "validation_required": False}
@@ -2502,19 +2523,35 @@ def _contract_steps(row: Mapping[str, Any], job: NormalizedGitHubJobV1) -> tuple
     overlays = []
     for index, step in enumerate(declared):
         data = _mapping(step, f"contract {row['contract_key']}.steps[{index}]")
+        overlay_keys = STEP_KEYS | {"validation_required"}
+        if set_kind == "effect":
+            overlay_keys.add("advisory_effect")
         data = _closed(
             data,
-            STEP_KEYS | {"validation_required"},
+            overlay_keys,
             f"contract {row['contract_key']}.steps[{index}]",
         )
         if "validation_required" not in data:
             _error(f"contract {row['contract_key']!r} is missing validation_required")
-        overlays.append(
-            {"step_index": index, "validation_required": _bool(
+        overlay: dict[str, Any] = {
+            "step_index": index,
+            "validation_required": _bool(
                 data["validation_required"],
                 f"contract {row['contract_key']}.steps[{index}].validation_required",
-            )}
-        )
+            ),
+        }
+        if "advisory_effect" in data:
+            advisory_effect = _bool(
+                data["advisory_effect"],
+                f"contract {row['contract_key']}.steps[{index}].advisory_effect",
+            )
+            if not advisory_effect:
+                _error(
+                    f"contract {row['contract_key']!r}.steps[{index}]."
+                    "advisory_effect must be true"
+                )
+            overlay["advisory_effect"] = True
+        overlays.append(overlay)
     return tuple(overlays)
 
 
@@ -2599,8 +2636,21 @@ def _validate_job_policy(
         _error(f"{set_kind} job {job.job_key!r} does not assert its runner environment")
     if set_kind in {"required", "qualification"} and "self-hosted" in job.runs_on.lower():
         _error(f"{set_kind} job {job.job_key!r} must use a GitHub-hosted runner")
-    if any(step.continue_on_error for step in job.steps):
-        _error(f"{set_kind} job {job.job_key!r} contains a failure-masking step")
+    for index, step in enumerate(job.steps):
+        advisory_effect = overlays[index].get("advisory_effect", False)
+        if advisory_effect:
+            if not step.continue_on_error:
+                _error(
+                    f"{set_kind} job {job.job_key!r} step {index} advisory_effect "
+                    "requires continue_on_error"
+                )
+            if overlays[index]["validation_required"]:
+                _error(
+                    f"{set_kind} job {job.job_key!r} step {index} advisory_effect "
+                    "may not be validation_required"
+                )
+        elif step.continue_on_error:
+            _error(f"{set_kind} job {job.job_key!r} contains a failure-masking step")
     runner_trust = row["runner_trust"]
     trust_class = _runner_trust_class(
         runner_trust,
@@ -2697,7 +2747,7 @@ def _validate_job_sources(
     for row in rows:
         workflow, event_selector, event, job = _find_contract_job(workflows, row)
         _compare_contract_job(row, job)
-        overlays = _contract_steps(row, job)
+        overlays = _contract_steps(row, job, set_kind)
         _validate_job_policy(set_kind, row, job, overlays, event)
         bindings.append(
             ValidatedJobBinding(
