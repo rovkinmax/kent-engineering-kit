@@ -186,10 +186,15 @@ def normalized_workflow(
     return NormalizedGitHubWorkflowSourceV1.from_dict(raw)
 
 
-def event_record(name: str = "pull_request", *, tags: list[str] | None = None) -> dict:
+def event_record(
+    name: str = "pull_request",
+    *,
+    branches: list[str] | None = None,
+    tags: list[str] | None = None,
+) -> dict:
     return {
         "name": name,
-        "branches": [],
+        "branches": branches or [],
         "branches_ignore": [],
         "tags": tags or [],
         "tags_ignore": [],
@@ -1933,13 +1938,17 @@ class ReleaseSpecTest(unittest.TestCase):
             event_name: str,
             source_job: dict,
             *,
+            branches: list[str] | None = None,
+            tags: list[str] | None = None,
             workflow_environment: dict | None = None,
         ) -> NormalizedGitHubWorkflowSourceV1:
             raw = normalized_workflow(
                 environment=workflow_environment,
                 jobs=[source_job],
             ).as_dict()
-            raw["events"] = [event_record(event_name)]
+            raw["events"] = [
+                event_record(event_name, branches=branches, tags=tags)
+            ]
             return NormalizedGitHubWorkflowSourceV1.from_dict(raw)
 
         def row_for(
@@ -1947,6 +1956,8 @@ class ReleaseSpecTest(unittest.TestCase):
             source_job: dict,
             *,
             event_name: str = "pull_request",
+            branches: list[str] | None = None,
+            tags: list[str] | None = None,
             effects: list[str] | None = None,
             credential_profile: str = profile,
             scope: bool = True,
@@ -1955,7 +1966,11 @@ class ReleaseSpecTest(unittest.TestCase):
                 set_kind,
                 f"{set_kind}-{source_job['job_key']}-{event_name}",
                 source_job,
-                event_selector=event_record(event_name),
+                event_selector=event_record(
+                    event_name,
+                    branches=branches,
+                    tags=tags,
+                ),
                 credential_profile=credential_profile,
                 allowed_effects=effects or required_effects,
             )
@@ -1985,11 +2000,12 @@ class ReleaseSpecTest(unittest.TestCase):
             ),
             1,
         )
-        for event_name in (
-            "pull_request",
-            "push",
-            "deployment",
-            "workflow_dispatch",
+        for event_name, branches, tags in (
+            ("pull_request", None, None),
+            ("push", ["main"], None),
+            ("push", None, ["v*.*.*"]),
+            ("deployment", None, None),
+            ("workflow_dispatch", None, None),
         ):
             qualification_job = package_read_job("unit_tests")
             qualification_table = {
@@ -1999,13 +2015,20 @@ class ReleaseSpecTest(unittest.TestCase):
                         "qualification",
                         qualification_job,
                         event_name=event_name,
+                        branches=branches,
+                        tags=tags,
                     )
                 ],
             }
             self.assertEqual(
                 len(
                     validate_qualification_job_sources(
-                        source_for(event_name, qualification_job),
+                        source_for(
+                            event_name,
+                            qualification_job,
+                            branches=branches,
+                            tags=tags,
+                        ),
                         qualification_table,
                     )
                 ),
