@@ -225,27 +225,25 @@ Runtime v2 is atomic.
 
 ## Release source and publication contracts
 
-- Schema 3 `manual-package-publish-after-main` retains its approval-gated
-  `Publish Package` node, requires `procedures.publish` and
-  `roles.package_release`, exact merged source, and authorized package,
-  version, destination, and tag policy. Credentials resolve just in time;
-  remote pre/poststate is checked, overwrite/deletion is forbidden, and Cleanup
-  requires `publication_report`.
-- Schema 4 adds no publication node. Its spec, tracked manifest,
-  snapshot, and optional executable builder are validated from the selected
-  commit. Preflight derives profile/job sources, expands only regular files,
-  records raw digests, and emits a read-only source preview; runtime
-  attestation and activation stay false.
-- Required and qualification jobs are credential-safe; effect jobs are explicit.
-  Normalized adapters expose effective permissions/env/defaults,
-  matrices, ordered steps/inputs, conditions, secrets, and failure masking.
-- `github-packages-classic-pat-step-read`: job-local any source ref -> fixed
-  `GITHUB_PACKAGES_TOKEN` env; run-only empty `uses`/`with`; cache-read iff
-  full-SHA restore; ops scope/SSO/expiry/rotate; default secretless.
-- Publication variants use concrete or runtime-bound template authority,
-  derived job-manifest digests, canonical bytes, and optional Script-owned
-  Russian approval. Runtime proofs bind selected sources; no migration, apply,
-  publication, or default change is automatic.
+- Schema 3 manual-package-publish-after-main: approval-gated Publish Package;
+  procedures.publish/roles.package_release, exact merged source, authorized
+  package/version/destination/tag-policy, JIT credentials, remote
+  pre/poststate, no overwrite/deletion, Cleanup publication_report.
+- Schema 4 no publication node; selected-commit checks
+  spec/manifest/snapshot/optional builder; regular-file preflight, raw
+  digests/read-only preview; runtime attestation/activation false.
+- Required/qualification credential-safe; effects explicit. Normalized adapters
+  expose permissions/env/defaults, matrices, ordered steps/inputs, conditions,
+  secrets, failure masking.
+- github-packages-classic-pat-step-read: job-local; arbitrary source secret ref
+  -> fixed env GITHUB_PACKAGES_TOKEN; one unconditional run-only recipient;
+  empty uses/with; cache-read iff full-SHA restore-only; default secretless;
+  ops: scope/account/SSO/expiry/rotation.
+  pull_request/push/deployment/workflow_dispatch source-policy rows; Kit
+  stores none.
+- Variants bind template authority, job-manifest digests, canonical
+  bytes, optional Script-owned Russian approval, runtime proofs;
+  migration/apply/publication/default changes manual.
 
 ## Execution targets
 
