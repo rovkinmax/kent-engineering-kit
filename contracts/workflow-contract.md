@@ -236,6 +236,9 @@ Runtime v2 is atomic.
   commit. Preflight derives profile/job sources, expands only regular files,
   records raw digests, and emits a read-only source preview; runtime
   attestation and activation stay false.
+- Required and qualification jobs are credential-safe; effect jobs are explicit.
+  Normalized adapters expose effective permissions/env/defaults,
+  matrices, ordered steps/inputs, conditions, secrets, and failure masking.
 - `github-packages-classic-pat-step-read`: job-local any source ref -> fixed
   `GITHUB_PACKAGES_TOKEN` env; run-only empty `uses`/`with`; cache-read iff
   full-SHA restore; ops scope/SSO/expiry/rotate; default secretless.
