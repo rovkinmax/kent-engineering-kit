@@ -42,6 +42,10 @@ from workflowkit.runtime import (
     capture_runtime_execution_context,
 )
 
+PACKAGE_READ_SECRET = "GITHUB_PACKAGES_TOKEN"
+PACKAGE_READ_SECRET_EXPRESSION = "${{ secrets.GITHUB_PACKAGES_TOKEN }}"
+CACHE_RESTORE_ACTION = "actions/cache/restore@" + "a" * 40
+
 
 def source_manifest() -> dict:
     return {
@@ -122,6 +126,7 @@ def job(
     runs_on: str = "ubuntu-latest",
     continue_on_error: bool = False,
     checkout_persist_credentials: bool = False,
+    effective_environment: dict | None = None,
     steps: list[dict] | None = None,
 ) -> dict:
     refs = secret_refs or []
@@ -144,7 +149,7 @@ def job(
         "container": None,
         "checkout_persist_credentials": checkout_persist_credentials,
         "secret_refs": refs,
-        "effective_environment": {},
+        "effective_environment": effective_environment or {},
         "steps": steps or [step(run=default_run, secret_refs=refs)],
     }
 
@@ -152,6 +157,7 @@ def job(
 def normalized_workflow(
     *,
     path: str = ".github/workflows/release.yml",
+    environment: dict | None = None,
     jobs: list[dict] | None = None,
 ) -> NormalizedGitHubWorkflowSourceV1:
     raw = {
@@ -172,7 +178,7 @@ def normalized_workflow(
             }
         ],
         "permissions": {"contents": "read"},
-        "environment": {},
+        "environment": environment or {},
         "defaults_run": {"shell": "", "working_directory": ""},
         "jobs": jobs or [job("required_release", validation_required=True)],
     }
@@ -239,6 +245,31 @@ def contract_row(
         for item in row["steps"]
     ]
     return row
+
+
+def package_read_job(
+    key: str,
+    *,
+    extra_steps: list[dict] | None = None,
+    permissions: dict[str, str] | None = None,
+    runs_on: str = "ubuntu-latest",
+    effective_environment: dict | None = None,
+) -> dict:
+    recipient = step(
+        run="python -m pip install package",
+        secret_refs=[PACKAGE_READ_SECRET],
+        effective_environment={
+            PACKAGE_READ_SECRET: PACKAGE_READ_SECRET_EXPRESSION,
+        },
+    )
+    return job(
+        key,
+        permissions=permissions or {"contents": "read", "packages": "read"},
+        runs_on=runs_on,
+        secret_refs=[PACKAGE_READ_SECRET],
+        effective_environment=effective_environment,
+        steps=[recipient, *(extra_steps or [])],
+    )
 
 
 def tables() -> tuple[dict, dict]:
@@ -1882,6 +1913,530 @@ class ReleaseSpecTest(unittest.TestCase):
                 {
                     "schema": "effect_jobs_v1",
                     "jobs": [job_continue_contract],
+                },
+            )
+
+    def test_package_read_profile_and_cache_binding(self) -> None:
+        profile = "github-packages-classic-pat-step-read"
+        required_effects = ["dependency-downloads", "github-package-read"]
+        cache_effects = [
+            "dependency-downloads",
+            "github-actions-cache-read",
+            "github-package-read",
+        ]
+
+        def source_for(
+            event_name: str,
+            source_job: dict,
+            *,
+            workflow_environment: dict | None = None,
+        ) -> NormalizedGitHubWorkflowSourceV1:
+            raw = normalized_workflow(
+                environment=workflow_environment,
+                jobs=[source_job],
+            ).as_dict()
+            raw["events"] = [event_record(event_name)]
+            return NormalizedGitHubWorkflowSourceV1.from_dict(raw)
+
+        def row_for(
+            set_kind: str,
+            source_job: dict,
+            *,
+            event_name: str = "pull_request",
+            effects: list[str] | None = None,
+            credential_profile: str = profile,
+            scope: bool = True,
+        ) -> dict:
+            row = contract_row(
+                set_kind,
+                f"{set_kind}-{source_job['job_key']}-{event_name}",
+                source_job,
+                event_selector=event_record(event_name),
+                credential_profile=credential_profile,
+                allowed_effects=effects or required_effects,
+            )
+            row["credential_scope_is_job_local"] = scope
+            return row
+
+        required_job = package_read_job("required_release")
+        required_table = {
+            "schema": "required_jobs_v1",
+            "jobs": [row_for("required", required_job)],
+        }
+        self.assertEqual(
+            len(
+                validate_required_job_sources(
+                    source_for("pull_request", required_job),
+                    required_table,
+                )
+            ),
+            1,
+        )
+        for event_name in (
+            "pull_request",
+            "push",
+            "deployment",
+            "workflow_dispatch",
+        ):
+            qualification_job = package_read_job("unit_tests")
+            qualification_table = {
+                "schema": "qualification_jobs_v1",
+                "jobs": [
+                    row_for(
+                        "qualification",
+                        qualification_job,
+                        event_name=event_name,
+                    )
+                ],
+            }
+            self.assertEqual(
+                len(
+                    validate_qualification_job_sources(
+                        source_for(event_name, qualification_job),
+                        qualification_table,
+                    )
+                ),
+                1,
+            )
+        for event_name in ("push", "deployment", "workflow_dispatch"):
+            broken_required = package_read_job("required_release")
+            with self.assertRaisesRegex(
+                ReleaseSpecError,
+                "pull_request or merge_group",
+            ):
+                validate_required_job_sources(
+                    source_for(event_name, broken_required),
+                    {
+                        "schema": "required_jobs_v1",
+                        "jobs": [
+                            row_for(
+                                "required",
+                                broken_required,
+                                event_name=event_name,
+                            )
+                        ],
+                    },
+                )
+
+        old_profile_job = package_read_job("required_release")
+        with self.assertRaisesRegex(ReleaseSpecError, "may not use secrets"):
+            validate_required_job_sources(
+                source_for("pull_request", old_profile_job),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [
+                        row_for(
+                            "required",
+                            old_profile_job,
+                            credential_profile="github-platform-contents-read",
+                            scope=False,
+                        )
+                    ],
+                },
+            )
+
+        secret_free = job(
+            "required_release",
+            permissions={"contents": "read", "packages": "read"},
+        )
+        with self.assertRaisesRegex(ReleaseSpecError, "exactly one secret"):
+            validate_required_job_sources(
+                source_for("pull_request", secret_free),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [row_for("required", secret_free)],
+                },
+            )
+        missing_scope = package_read_job("required_release")
+        with self.assertRaisesRegex(ReleaseSpecError, "must be job-local"):
+            validate_required_job_sources(
+                source_for("pull_request", missing_scope),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [
+                        row_for(
+                            "required",
+                            missing_scope,
+                            scope=False,
+                        )
+                    ],
+                },
+            )
+
+        with self.assertRaises(ReleaseSpecError):
+            source_for(
+                "pull_request",
+                package_read_job("required_release"),
+                workflow_environment={
+                    "GITHUB_PACKAGES_TOKEN": PACKAGE_READ_SECRET_EXPRESSION,
+                },
+            )
+        job_environment = package_read_job(
+            "required_release",
+            effective_environment={
+                "PACKAGE_TOKEN": PACKAGE_READ_SECRET_EXPRESSION,
+            },
+        )
+        with self.assertRaisesRegex(ReleaseSpecError, "step-scoped"):
+            validate_required_job_sources(
+                source_for("pull_request", job_environment),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [row_for("required", job_environment)],
+                },
+            )
+
+        forbidden_fields = {
+            "name": lambda item: item.__setitem__(
+                "name",
+                PACKAGE_READ_SECRET_EXPRESSION,
+            ),
+            "condition": lambda item: item.__setitem__(
+                "condition",
+                PACKAGE_READ_SECRET_EXPRESSION,
+            ),
+            "run": lambda item: item.__setitem__(
+                "run",
+                f"echo {PACKAGE_READ_SECRET_EXPRESSION}",
+            ),
+            "effective_shell": lambda item: item.__setitem__(
+                "effective_shell",
+                PACKAGE_READ_SECRET_EXPRESSION,
+            ),
+            "effective_working_directory": lambda item: item.__setitem__(
+                "effective_working_directory",
+                PACKAGE_READ_SECRET_EXPRESSION,
+            ),
+            "with": lambda item: item.__setitem__(
+                "with",
+                {"token": PACKAGE_READ_SECRET_EXPRESSION},
+            ),
+        }
+        for field_name, mutate in forbidden_fields.items():
+            broken = package_read_job("unit_tests")
+            mutate(broken["steps"][0])
+            with self.subTest(field=field_name):
+                with self.assertRaisesRegex(
+                    ReleaseSpecError,
+                    "outside its environment recipient",
+                ):
+                    validate_qualification_job_sources(
+                        source_for("pull_request", broken),
+                        {
+                            "schema": "qualification_jobs_v1",
+                            "jobs": [row_for("qualification", broken)],
+                        },
+                    )
+
+        another_environment_key = package_read_job("required_release")
+        another_environment_key["steps"][0]["effective_environment"][
+            "OTHER_TOKEN"
+        ] = PACKAGE_READ_SECRET_EXPRESSION
+        with self.assertRaisesRegex(ReleaseSpecError, "invalid package-read"):
+            validate_required_job_sources(
+                source_for("pull_request", another_environment_key),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [row_for("required", another_environment_key)],
+                },
+            )
+
+        another_step = package_read_job(
+            "required_release",
+            extra_steps=[
+                step(
+                    run="echo second",
+                    secret_refs=[PACKAGE_READ_SECRET],
+                    effective_environment={
+                        PACKAGE_READ_SECRET: PACKAGE_READ_SECRET_EXPRESSION,
+                    },
+                )
+            ],
+        )
+        with self.assertRaisesRegex(ReleaseSpecError, "exactly one recipient"):
+            validate_required_job_sources(
+                source_for("pull_request", another_step),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [row_for("required", another_step)],
+                },
+            )
+
+        multiple_secrets = package_read_job("required_release")
+        multiple_secrets["steps"][0]["effective_environment"]["OTHER_TOKEN"] = (
+            "${{ secrets.OTHER_TOKEN }}"
+        )
+        multiple_secrets["steps"][0]["secret_refs"] = [
+            "GITHUB_PACKAGES_TOKEN",
+            "OTHER_TOKEN",
+        ]
+        multiple_secrets["secret_refs"] = [
+            "GITHUB_PACKAGES_TOKEN",
+            "OTHER_TOKEN",
+        ]
+        with self.assertRaisesRegex(ReleaseSpecError, "exactly one secret"):
+            validate_required_job_sources(
+                source_for("pull_request", multiple_secrets),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [row_for("required", multiple_secrets)],
+                },
+            )
+
+        uses_recipient = package_read_job("required_release")
+        uses_recipient["steps"][0] = step(
+            uses="actions/checkout@" + "b" * 40,
+            secret_refs=[PACKAGE_READ_SECRET],
+            effective_environment={
+                PACKAGE_READ_SECRET: PACKAGE_READ_SECRET_EXPRESSION,
+            },
+        )
+        with self.assertRaisesRegex(ReleaseSpecError, "first-party recipient"):
+            validate_required_job_sources(
+                source_for("pull_request", uses_recipient),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [row_for("required", uses_recipient)],
+                },
+            )
+
+        action_input_secret = package_read_job(
+            "unit_tests",
+            extra_steps=[
+                step(
+                    uses="actions/checkout@" + "d" * 40,
+                    with_values={"token": PACKAGE_READ_SECRET_EXPRESSION},
+                    secret_refs=[PACKAGE_READ_SECRET],
+                )
+            ],
+        )
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "outside its environment recipient",
+        ):
+            validate_qualification_job_sources(
+                source_for("pull_request", action_input_secret),
+                {
+                    "schema": "qualification_jobs_v1",
+                    "jobs": [row_for("qualification", action_input_secret)],
+                },
+            )
+
+        effect_job = package_read_job("publish_release")
+        with self.assertRaisesRegex(ReleaseSpecError, "only valid"):
+            validate_effect_job_sources(
+                source_for("workflow_dispatch", effect_job),
+                {
+                    "schema": "effect_jobs_v1",
+                    "jobs": [
+                        row_for(
+                            "effect",
+                            effect_job,
+                            event_name="workflow_dispatch",
+                            effects=["publish"],
+                        )
+                    ],
+                },
+            )
+
+        inherited_policy_cases = (
+            (
+                "self-hosted",
+                lambda item: item.__setitem__("runs_on", "self-hosted"),
+                "GitHub-hosted runner",
+            ),
+            (
+                "write permission",
+                lambda item: item.__setitem__(
+                    "effective_permissions",
+                    {"contents": "write", "packages": "read"},
+                ),
+                "non-read permission",
+            ),
+            (
+                "needs",
+                lambda item: item.__setitem__("needs", ["other"]),
+                "may not have needs",
+            ),
+            (
+                "fixture",
+                lambda item: item.__setitem__(
+                    "container",
+                    {
+                        "image": "ubuntu@sha256:" + "a" * 64,
+                        "environment": {},
+                        "ports": [],
+                        "options": "",
+                    },
+                ),
+                "forbidden runtime fixtures",
+            ),
+            (
+                "persisted credentials",
+                lambda item: item.__setitem__(
+                    "checkout_persist_credentials",
+                    True,
+                ),
+                "persists checkout credentials",
+            ),
+        )
+        for case_name, mutate, message in inherited_policy_cases:
+            broken = package_read_job("required_release")
+            mutate(broken)
+            with self.subTest(policy=case_name):
+                with self.assertRaisesRegex(ReleaseSpecError, message):
+                    validate_required_job_sources(
+                        source_for("pull_request", broken),
+                        {
+                            "schema": "required_jobs_v1",
+                            "jobs": [row_for("required", broken)],
+                        },
+                    )
+
+        source_drift_job = package_read_job("required_release")
+        source_drift_row = row_for("required", source_drift_job)
+        source_drift = source_for("pull_request", source_drift_job).as_dict()
+        source_drift["jobs"][0]["steps"][0]["run"] = "echo drift"
+        with self.assertRaisesRegex(ReleaseSpecError, "normalized source drift"):
+            validate_required_job_sources(
+                NormalizedGitHubWorkflowSourceV1.from_dict(source_drift),
+                {"schema": "required_jobs_v1", "jobs": [source_drift_row]},
+            )
+
+        cache_job = package_read_job(
+            "required_release",
+            extra_steps=[step(uses=CACHE_RESTORE_ACTION)],
+        )
+        self.assertEqual(
+            len(
+                validate_required_job_sources(
+                    source_for("pull_request", cache_job),
+                    {
+                        "schema": "required_jobs_v1",
+                        "jobs": [
+                            row_for(
+                                "required",
+                                cache_job,
+                                effects=cache_effects,
+                            )
+                        ],
+                    },
+                )
+            ),
+            1,
+        )
+
+        old_cache_job = job(
+            "required_release",
+            permissions={"contents": "read", "packages": "read"},
+            steps=[step(uses=CACHE_RESTORE_ACTION)],
+        )
+        self.assertEqual(
+            len(
+                validate_required_job_sources(
+                    source_for("pull_request", old_cache_job),
+                    {
+                        "schema": "required_jobs_v1",
+                        "jobs": [
+                            row_for(
+                                "required",
+                                old_cache_job,
+                                effects=[
+                                    "dependency-downloads",
+                                    "github-actions-cache-read",
+                                    "github-actions-logs",
+                                    "github-package-read",
+                                ],
+                                credential_profile=(
+                                    "github-platform-contents-packages-read"
+                                ),
+                                scope=False,
+                            )
+                        ],
+                    },
+                )
+            ),
+            1,
+        )
+
+        cache_absent = package_read_job("required_release")
+        with self.assertRaisesRegex(ReleaseSpecError, "requires a cache restore"):
+            validate_required_job_sources(
+                source_for("pull_request", cache_absent),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [
+                        row_for(
+                            "required",
+                            cache_absent,
+                            effects=cache_effects,
+                        )
+                    ],
+                },
+            )
+        restore_without_effect = package_read_job(
+            "required_release",
+            extra_steps=[step(uses=CACHE_RESTORE_ACTION)],
+        )
+        with self.assertRaisesRegex(ReleaseSpecError, "requires"):
+            validate_required_job_sources(
+                source_for("pull_request", restore_without_effect),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [
+                        row_for(
+                            "required",
+                            restore_without_effect,
+                            effects=required_effects,
+                        )
+                    ],
+                },
+            )
+
+        cache_shapes = (
+            "actions/cache/save@" + "c" * 40,
+            "actions/cache@" + "c" * 40,
+            "actions/cache/restore/other@" + "c" * 40,
+            "actions/cache/restore@v4",
+        )
+        for cache_shape in cache_shapes:
+            broken_cache = package_read_job(
+                "required_release",
+                extra_steps=[step(uses=cache_shape)],
+            )
+            with self.subTest(cache_shape=cache_shape):
+                with self.assertRaises(ReleaseSpecError):
+                    validate_required_job_sources(
+                        source_for("pull_request", broken_cache),
+                        {
+                            "schema": "required_jobs_v1",
+                            "jobs": [
+                                row_for(
+                                    "required",
+                                    broken_cache,
+                                    effects=cache_effects,
+                                )
+                            ],
+                        },
+                    )
+
+        disallowed_cache_effect = package_read_job("required_release")
+        with self.assertRaisesRegex(ReleaseSpecError, "unsupported effect"):
+            validate_required_job_sources(
+                source_for("pull_request", disallowed_cache_effect),
+                {
+                    "schema": "required_jobs_v1",
+                    "jobs": [
+                        row_for(
+                            "required",
+                            disallowed_cache_effect,
+                            effects=[
+                                "dependency-downloads",
+                                "github-actions-cache-read-write",
+                                "github-package-read",
+                            ],
+                        )
+                    ],
                 },
             )
 

@@ -235,8 +235,24 @@ POLICY_FIELDS = {
     "control_plane_fixtures_forbidden",
     "credential_scope_is_job_local",
 }
+PACKAGE_READ_CREDENTIAL_PROFILE = "github-packages-classic-pat-step-read"
+PACKAGE_READ_SECRET = "GITHUB_PACKAGES_TOKEN"
+PACKAGE_READ_SECRET_EXPRESSION = "${{ secrets.GITHUB_PACKAGES_TOKEN }}"
+PACKAGE_READ_ALLOWED_EFFECTS = {
+    "dependency-downloads",
+    "github-actions-cache-read",
+    "github-actions-logs",
+    "github-package-read",
+    "test",
+    "verify",
+}
+PACKAGE_READ_REQUIRED_EFFECTS = {
+    "dependency-downloads",
+    "github-package-read",
+}
 NON_PRODUCTION_EFFECTS = {
     "dependency-downloads",
+    "github-actions-cache-read",
     "github-actions-cache-read-write",
     "github-actions-logs",
     "github-package-read",
@@ -251,9 +267,14 @@ REQUIRED_CREDENTIAL_PROFILES = {
     "credential-free",
     "github-platform-contents-packages-read",
     "github-platform-contents-read",
+    PACKAGE_READ_CREDENTIAL_PROFILE,
     "none",
 }
-QUALIFICATION_CREDENTIAL_PROFILES = {"credential-free", "none"}
+QUALIFICATION_CREDENTIAL_PROFILES = {
+    PACKAGE_READ_CREDENTIAL_PROFILE,
+    "credential-free",
+    "none",
+}
 SKIP_POLICIES = {"condition-gated", "event-gated", "never"}
 SUMMARY_SECTIONS = (
     "Нужно от вас",
@@ -280,6 +301,7 @@ ACTION_REF_RE = re.compile(
     r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
     r"(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}"
 )
+CACHE_RESTORE_ACTION_RE = re.compile(r"^actions/cache/restore@[0-9a-f]{40}$")
 GITHUB_HOSTED_TRUST_RE = re.compile(
     r"^github-hosted-[a-z0-9]+(?:-[a-z0-9]+)*-ephemeral(?:-effect)?$"
 )
@@ -2611,6 +2633,93 @@ class ValidatedJobBinding:
         }
 
 
+def _validate_package_read_credential(
+    set_kind: str,
+    job: NormalizedGitHubJobV1,
+) -> None:
+    if job.secret_refs != (PACKAGE_READ_SECRET,):
+        _error(
+            f"{set_kind} job {job.job_key!r} package-read profile requires "
+            "exactly one secret"
+        )
+    if _secret_reference_names(job.effective_environment):
+        _error(
+            f"{set_kind} job {job.job_key!r} package-read secret must be "
+            "step-scoped"
+        )
+    recipients = []
+    for index, step in enumerate(job.steps):
+        environment = step.effective_environment
+        secret_environment = {
+            key: value
+            for key, value in environment.items()
+            if _secret_reference_names(key) or _secret_reference_names(value)
+        }
+        step_without_environment = step.as_dict()
+        step_without_environment.pop("effective_environment")
+        if _secret_reference_names(step_without_environment):
+            _error(
+                f"{set_kind} job {job.job_key!r} step {index} contains a "
+                "secret outside its environment recipient"
+            )
+        if not secret_environment:
+            continue
+        if secret_environment != {
+            PACKAGE_READ_SECRET: PACKAGE_READ_SECRET_EXPRESSION
+        }:
+            _error(
+                f"{set_kind} job {job.job_key!r} step {index} has an invalid "
+                "package-read secret environment"
+            )
+        if (
+            step.kind != "run"
+            or step.condition
+            or step.continue_on_error
+            or step.secret_refs != (PACKAGE_READ_SECRET,)
+        ):
+            _error(
+                f"{set_kind} job {job.job_key!r} step {index} is not an "
+                "unconditional first-party recipient"
+            )
+        recipients.append(index)
+    if len(recipients) != 1:
+        _error(
+            f"{set_kind} job {job.job_key!r} package-read profile requires "
+            "exactly one recipient"
+        )
+
+
+def _validate_cache_read_binding(
+    set_kind: str,
+    row: Mapping[str, Any],
+    job: NormalizedGitHubJobV1,
+) -> None:
+    effects = set(row["allowed_effects"])
+    restore_steps = []
+    for index, step in enumerate(job.steps):
+        if step.kind != "uses":
+            continue
+        uses = step.uses
+        if uses == "actions/cache" or uses.startswith("actions/cache/"):
+            if not CACHE_RESTORE_ACTION_RE.fullmatch(uses):
+                _error(
+                    f"{set_kind} job {job.job_key!r} step {index} has an "
+                    "unsupported actions/cache source"
+                )
+            restore_steps.append(index)
+    has_effect = "github-actions-cache-read" in effects
+    if bool(restore_steps) != has_effect:
+        if restore_steps:
+            _error(
+                f"{set_kind} job {job.job_key!r} cache restore requires "
+                "github-actions-cache-read"
+            )
+        _error(
+            f"{set_kind} job {job.job_key!r} github-actions-cache-read "
+            "requires a cache restore step"
+        )
+
+
 def _validate_job_policy(
     set_kind: str,
     row: Mapping[str, Any],
@@ -2618,11 +2727,13 @@ def _validate_job_policy(
     overlays: Sequence[Mapping[str, Any]],
     event: Mapping[str, Any],
 ) -> None:
+    package_profile = row["credential_profile"] == PACKAGE_READ_CREDENTIAL_PROFILE
+    if package_profile and set_kind == "effect":
+        _error("package-read credential profile is only valid for required or qualification jobs")
     if job.continue_on_error:
         _error(f"{set_kind} job {job.job_key!r} may not continue on error")
-    if job.secret_refs:
-        if set_kind != "effect":
-            _error(f"{set_kind} job {job.job_key!r} may not use secrets")
+    if job.secret_refs and set_kind != "effect" and not package_profile:
+        _error(f"{set_kind} job {job.job_key!r} may not use secrets")
     if job.container or job.services or job.github_environment:
         _error(f"{set_kind} job {job.job_key!r} has forbidden runtime fixtures")
     if set_kind in {"required", "qualification"} and job.checkout_persist_credentials:
@@ -2651,6 +2762,7 @@ def _validate_job_policy(
                 )
         elif step.continue_on_error:
             _error(f"{set_kind} job {job.job_key!r} contains a failure-masking step")
+    _validate_cache_read_binding(set_kind, row, job)
     runner_trust = row["runner_trust"]
     trust_class = _runner_trust_class(
         runner_trust,
@@ -2696,12 +2808,30 @@ def _validate_job_policy(
             _error("required jobs must use a credential-safe profile")
         if not row["control_plane_fixtures_forbidden"]:
             _error("required jobs must forbid control-plane fixtures")
-        if row["credential_scope_is_job_local"]:
+        if package_profile:
+            if not row["credential_scope_is_job_local"]:
+                _error("package-read credential profile must be job-local")
+            effects = set(row["allowed_effects"])
+            if not effects <= PACKAGE_READ_ALLOWED_EFFECTS:
+                _error("package-read credential profile has an unsupported effect")
+            if not PACKAGE_READ_REQUIRED_EFFECTS <= effects:
+                _error("package-read credential profile lacks a required effect")
+            _validate_package_read_credential(set_kind, job)
+        elif row["credential_scope_is_job_local"]:
             _error("required jobs may not use job-local credentials")
     elif set_kind == "qualification":
         if row["branch_protection_required"]:
             _error("qualification jobs may not require branch protection")
-        if row["credential_scope_is_job_local"]:
+        if package_profile:
+            if not row["credential_scope_is_job_local"]:
+                _error("package-read credential profile must be job-local")
+            effects = set(row["allowed_effects"])
+            if not effects <= PACKAGE_READ_ALLOWED_EFFECTS:
+                _error("package-read credential profile has an unsupported effect")
+            if not PACKAGE_READ_REQUIRED_EFFECTS <= effects:
+                _error("package-read credential profile lacks a required effect")
+            _validate_package_read_credential(set_kind, job)
+        elif row["credential_scope_is_job_local"]:
             _error("qualification jobs must be credential-free")
         if row["credential_profile"] not in QUALIFICATION_CREDENTIAL_PROFILES:
             _error("qualification jobs must be credential-free")
