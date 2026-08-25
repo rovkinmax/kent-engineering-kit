@@ -236,8 +236,7 @@ POLICY_FIELDS = {
     "credential_scope_is_job_local",
 }
 PACKAGE_READ_CREDENTIAL_PROFILE = "github-packages-classic-pat-step-read"
-PACKAGE_READ_SECRET = "GITHUB_PACKAGES_TOKEN"
-PACKAGE_READ_SECRET_EXPRESSION = "${{ secrets.GITHUB_PACKAGES_TOKEN }}"
+PACKAGE_READ_ENVIRONMENT_KEY = "GITHUB_PACKAGES_TOKEN"
 PACKAGE_READ_ALLOWED_EFFECTS = {
     "dependency-downloads",
     "github-actions-cache-read",
@@ -2637,16 +2636,21 @@ def _validate_package_read_credential(
     set_kind: str,
     job: NormalizedGitHubJobV1,
 ) -> None:
-    if job.secret_refs != (PACKAGE_READ_SECRET,):
+    if len(job.secret_refs) != 1:
         _error(
             f"{set_kind} job {job.job_key!r} package-read profile requires "
             "exactly one secret"
         )
-    if _secret_reference_names(job.effective_environment):
+    secret_ref = job.secret_refs[0]
+    job_without_steps = job.as_dict()
+    job_without_steps.pop("steps")
+    job_without_steps.pop("secret_refs")
+    if _secret_reference_names(job_without_steps):
         _error(
             f"{set_kind} job {job.job_key!r} package-read secret must be "
-            "step-scoped"
+            "step-scoped and may not appear in job fields"
         )
+    expected_expression = f"${{{{ secrets.{secret_ref} }}}}"
     recipients = []
     for index, step in enumerate(job.steps):
         environment = step.effective_environment
@@ -2665,7 +2669,7 @@ def _validate_package_read_credential(
         if not secret_environment:
             continue
         if secret_environment != {
-            PACKAGE_READ_SECRET: PACKAGE_READ_SECRET_EXPRESSION
+            PACKAGE_READ_ENVIRONMENT_KEY: expected_expression
         }:
             _error(
                 f"{set_kind} job {job.job_key!r} step {index} has an invalid "
@@ -2675,11 +2679,13 @@ def _validate_package_read_credential(
             step.kind != "run"
             or step.condition
             or step.continue_on_error
-            or step.secret_refs != (PACKAGE_READ_SECRET,)
+            or step.uses
+            or step.with_values
+            or step.secret_refs != (secret_ref,)
         ):
             _error(
                 f"{set_kind} job {job.job_key!r} step {index} is not an "
-                "unconditional first-party recipient"
+                "unconditional run-only recipient"
             )
         recipients.append(index)
     if len(recipients) != 1:
@@ -2700,7 +2706,11 @@ def _validate_cache_read_binding(
         if step.kind != "uses":
             continue
         uses = step.uses
-        if uses == "actions/cache" or uses.startswith("actions/cache/"):
+        if (
+            uses == "actions/cache"
+            or uses.startswith("actions/cache@")
+            or uses.startswith("actions/cache/")
+        ):
             if not CACHE_RESTORE_ACTION_RE.fullmatch(uses):
                 _error(
                     f"{set_kind} job {job.job_key!r} step {index} has an "
@@ -2762,7 +2772,6 @@ def _validate_job_policy(
                 )
         elif step.continue_on_error:
             _error(f"{set_kind} job {job.job_key!r} contains a failure-masking step")
-    _validate_cache_read_binding(set_kind, row, job)
     runner_trust = row["runner_trust"]
     trust_class = _runner_trust_class(
         runner_trust,
@@ -2817,6 +2826,7 @@ def _validate_job_policy(
             if not PACKAGE_READ_REQUIRED_EFFECTS <= effects:
                 _error("package-read credential profile lacks a required effect")
             _validate_package_read_credential(set_kind, job)
+            _validate_cache_read_binding(set_kind, row, job)
         elif row["credential_scope_is_job_local"]:
             _error("required jobs may not use job-local credentials")
     elif set_kind == "qualification":
@@ -2831,6 +2841,7 @@ def _validate_job_policy(
             if not PACKAGE_READ_REQUIRED_EFFECTS <= effects:
                 _error("package-read credential profile lacks a required effect")
             _validate_package_read_credential(set_kind, job)
+            _validate_cache_read_binding(set_kind, row, job)
         elif row["credential_scope_is_job_local"]:
             _error("qualification jobs must be credential-free")
         if row["credential_profile"] not in QUALIFICATION_CREDENTIAL_PROFILES:

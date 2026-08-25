@@ -42,8 +42,9 @@ from workflowkit.runtime import (
     capture_runtime_execution_context,
 )
 
-PACKAGE_READ_SECRET = "GITHUB_PACKAGES_TOKEN"
-PACKAGE_READ_SECRET_EXPRESSION = "${{ secrets.GITHUB_PACKAGES_TOKEN }}"
+PACKAGE_READ_ENVIRONMENT_KEY = "GITHUB_PACKAGES_TOKEN"
+PACKAGE_READ_SECRET_NAME = "OSOME_BOT_TOKEN"
+PACKAGE_READ_SECRET_EXPRESSION = "${{ secrets.OSOME_BOT_TOKEN }}"
 CACHE_RESTORE_ACTION = "actions/cache/restore@" + "a" * 40
 
 
@@ -250,6 +251,7 @@ def contract_row(
 def package_read_job(
     key: str,
     *,
+    secret_name: str = PACKAGE_READ_SECRET_NAME,
     extra_steps: list[dict] | None = None,
     permissions: dict[str, str] | None = None,
     runs_on: str = "ubuntu-latest",
@@ -257,16 +259,18 @@ def package_read_job(
 ) -> dict:
     recipient = step(
         run="python -m pip install package",
-        secret_refs=[PACKAGE_READ_SECRET],
+        secret_refs=[secret_name],
         effective_environment={
-            PACKAGE_READ_SECRET: PACKAGE_READ_SECRET_EXPRESSION,
+            PACKAGE_READ_ENVIRONMENT_KEY: (
+                f"${{{{ secrets.{secret_name} }}}}"
+            ),
         },
     )
     return job(
         key,
         permissions=permissions or {"contents": "read", "packages": "read"},
         runs_on=runs_on,
-        secret_refs=[PACKAGE_READ_SECRET],
+        secret_refs=[secret_name],
         effective_environment=effective_environment,
         steps=[recipient, *(extra_steps or [])],
     )
@@ -1959,6 +1963,15 @@ class ReleaseSpecTest(unittest.TestCase):
             return row
 
         required_job = package_read_job("required_release")
+        self.assertEqual(required_job["secret_refs"], [PACKAGE_READ_SECRET_NAME])
+        self.assertEqual(
+            required_job["steps"][0]["effective_environment"],
+            {
+                PACKAGE_READ_ENVIRONMENT_KEY: PACKAGE_READ_SECRET_EXPRESSION,
+            },
+        )
+        self.assertEqual(required_job["steps"][0]["uses"], "")
+        self.assertEqual(required_job["steps"][0]["with"], {})
         required_table = {
             "schema": "required_jobs_v1",
             "jobs": [row_for("required", required_job)],
@@ -2063,21 +2076,22 @@ class ReleaseSpecTest(unittest.TestCase):
                 },
             )
 
-        with self.assertRaises(ReleaseSpecError):
+        with self.assertRaises(ReleaseSpecError) as context:
             source_for(
                 "pull_request",
                 package_read_job("required_release"),
                 workflow_environment={
-                    "GITHUB_PACKAGES_TOKEN": PACKAGE_READ_SECRET_EXPRESSION,
+                    PACKAGE_READ_ENVIRONMENT_KEY: PACKAGE_READ_SECRET_EXPRESSION,
                 },
             )
+        self.assertNotIn(PACKAGE_READ_SECRET_NAME, str(context.exception))
         job_environment = package_read_job(
             "required_release",
             effective_environment={
                 "PACKAGE_TOKEN": PACKAGE_READ_SECRET_EXPRESSION,
             },
         )
-        with self.assertRaisesRegex(ReleaseSpecError, "step-scoped"):
+        with self.assertRaises(ReleaseSpecError) as context:
             validate_required_job_sources(
                 source_for("pull_request", job_environment),
                 {
@@ -2085,6 +2099,76 @@ class ReleaseSpecTest(unittest.TestCase):
                     "jobs": [row_for("required", job_environment)],
                 },
             )
+        self.assertNotIn(PACKAGE_READ_SECRET_NAME, str(context.exception))
+
+        job_forbidden_fields = {
+            "condition": lambda item: item.__setitem__(
+                "condition",
+                PACKAGE_READ_SECRET_EXPRESSION,
+            ),
+            "job_display_name": lambda item: item.__setitem__(
+                "job_display_name",
+                PACKAGE_READ_SECRET_EXPRESSION,
+            ),
+            "matrix": lambda item: item.__setitem__(
+                "matrix",
+                {"os": PACKAGE_READ_SECRET_EXPRESSION},
+            ),
+            "runs_on": lambda item: item.__setitem__(
+                "runs_on",
+                PACKAGE_READ_SECRET_EXPRESSION,
+            ),
+            "effective_defaults_run": lambda item: item.__setitem__(
+                "effective_defaults_run",
+                {
+                    "shell": PACKAGE_READ_SECRET_EXPRESSION,
+                    "working_directory": "",
+                },
+            ),
+            "github_environment": lambda item: item.__setitem__(
+                "github_environment",
+                PACKAGE_READ_SECRET_EXPRESSION,
+            ),
+            "services": lambda item: item.__setitem__(
+                "services",
+                {
+                    "database": {
+                        "image": "postgres@sha256:" + "a" * 64,
+                        "environment": {
+                            "TOKEN": PACKAGE_READ_SECRET_EXPRESSION,
+                        },
+                        "ports": [],
+                        "options": "",
+                    }
+                },
+            ),
+            "container": lambda item: item.__setitem__(
+                "container",
+                {
+                    "image": "ubuntu@sha256:" + "a" * 64,
+                    "environment": {},
+                    "ports": [],
+                    "options": PACKAGE_READ_SECRET_EXPRESSION,
+                },
+            ),
+            "effective_environment": lambda item: item.__setitem__(
+                "effective_environment",
+                {"PACKAGE_TOKEN": PACKAGE_READ_SECRET_EXPRESSION},
+            ),
+        }
+        for field_name, mutate in job_forbidden_fields.items():
+            broken = package_read_job("unit_tests")
+            mutate(broken)
+            with self.subTest(job_field=field_name):
+                with self.assertRaises(ReleaseSpecError) as context:
+                    validate_qualification_job_sources(
+                        source_for("pull_request", broken),
+                        {
+                            "schema": "qualification_jobs_v1",
+                            "jobs": [row_for("qualification", broken)],
+                        },
+                    )
+                self.assertNotIn(PACKAGE_READ_SECRET_NAME, str(context.exception))
 
         forbidden_fields = {
             "name": lambda item: item.__setitem__(
@@ -2116,10 +2200,7 @@ class ReleaseSpecTest(unittest.TestCase):
             broken = package_read_job("unit_tests")
             mutate(broken["steps"][0])
             with self.subTest(field=field_name):
-                with self.assertRaisesRegex(
-                    ReleaseSpecError,
-                    "outside its environment recipient",
-                ):
+                with self.assertRaises(ReleaseSpecError) as context:
                     validate_qualification_job_sources(
                         source_for("pull_request", broken),
                         {
@@ -2127,12 +2208,13 @@ class ReleaseSpecTest(unittest.TestCase):
                             "jobs": [row_for("qualification", broken)],
                         },
                     )
+                self.assertNotIn(PACKAGE_READ_SECRET_NAME, str(context.exception))
 
         another_environment_key = package_read_job("required_release")
         another_environment_key["steps"][0]["effective_environment"][
             "OTHER_TOKEN"
         ] = PACKAGE_READ_SECRET_EXPRESSION
-        with self.assertRaisesRegex(ReleaseSpecError, "invalid package-read"):
+        with self.assertRaises(ReleaseSpecError) as context:
             validate_required_job_sources(
                 source_for("pull_request", another_environment_key),
                 {
@@ -2140,15 +2222,16 @@ class ReleaseSpecTest(unittest.TestCase):
                     "jobs": [row_for("required", another_environment_key)],
                 },
             )
+        self.assertNotIn(PACKAGE_READ_SECRET_NAME, str(context.exception))
 
         another_step = package_read_job(
             "required_release",
             extra_steps=[
                 step(
                     run="echo second",
-                    secret_refs=[PACKAGE_READ_SECRET],
+                    secret_refs=[PACKAGE_READ_SECRET_NAME],
                     effective_environment={
-                        PACKAGE_READ_SECRET: PACKAGE_READ_SECRET_EXPRESSION,
+                        PACKAGE_READ_ENVIRONMENT_KEY: PACKAGE_READ_SECRET_EXPRESSION,
                     },
                 )
             ],
@@ -2167,11 +2250,11 @@ class ReleaseSpecTest(unittest.TestCase):
             "${{ secrets.OTHER_TOKEN }}"
         )
         multiple_secrets["steps"][0]["secret_refs"] = [
-            "GITHUB_PACKAGES_TOKEN",
+            PACKAGE_READ_SECRET_NAME,
             "OTHER_TOKEN",
         ]
         multiple_secrets["secret_refs"] = [
-            "GITHUB_PACKAGES_TOKEN",
+            PACKAGE_READ_SECRET_NAME,
             "OTHER_TOKEN",
         ]
         with self.assertRaisesRegex(ReleaseSpecError, "exactly one secret"):
@@ -2186,12 +2269,12 @@ class ReleaseSpecTest(unittest.TestCase):
         uses_recipient = package_read_job("required_release")
         uses_recipient["steps"][0] = step(
             uses="actions/checkout@" + "b" * 40,
-            secret_refs=[PACKAGE_READ_SECRET],
+            secret_refs=[PACKAGE_READ_SECRET_NAME],
             effective_environment={
-                PACKAGE_READ_SECRET: PACKAGE_READ_SECRET_EXPRESSION,
+                PACKAGE_READ_ENVIRONMENT_KEY: PACKAGE_READ_SECRET_EXPRESSION,
             },
         )
-        with self.assertRaisesRegex(ReleaseSpecError, "first-party recipient"):
+        with self.assertRaises(ReleaseSpecError) as context:
             validate_required_job_sources(
                 source_for("pull_request", uses_recipient),
                 {
@@ -2199,6 +2282,7 @@ class ReleaseSpecTest(unittest.TestCase):
                     "jobs": [row_for("required", uses_recipient)],
                 },
             )
+        self.assertNotIn(PACKAGE_READ_SECRET_NAME, str(context.exception))
 
         action_input_secret = package_read_job(
             "unit_tests",
@@ -2206,14 +2290,11 @@ class ReleaseSpecTest(unittest.TestCase):
                 step(
                     uses="actions/checkout@" + "d" * 40,
                     with_values={"token": PACKAGE_READ_SECRET_EXPRESSION},
-                    secret_refs=[PACKAGE_READ_SECRET],
+                    secret_refs=[PACKAGE_READ_SECRET_NAME],
                 )
             ],
         )
-        with self.assertRaisesRegex(
-            ReleaseSpecError,
-            "outside its environment recipient",
-        ):
+        with self.assertRaises(ReleaseSpecError) as context:
             validate_qualification_job_sources(
                 source_for("pull_request", action_input_secret),
                 {
@@ -2221,6 +2302,7 @@ class ReleaseSpecTest(unittest.TestCase):
                     "jobs": [row_for("qualification", action_input_secret)],
                 },
             )
+        self.assertNotIn(PACKAGE_READ_SECRET_NAME, str(context.exception))
 
         effect_job = package_read_job("publish_release")
         with self.assertRaisesRegex(ReleaseSpecError, "only valid"):
@@ -2343,7 +2425,7 @@ class ReleaseSpecTest(unittest.TestCase):
                                 old_cache_job,
                                 effects=[
                                     "dependency-downloads",
-                                    "github-actions-cache-read",
+                                    "github-actions-cache-read-write",
                                     "github-actions-logs",
                                     "github-package-read",
                                 ],

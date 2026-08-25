@@ -225,25 +225,24 @@ Runtime v2 is atomic.
 
 ## Release source and publication contracts
 
-- Schema 3 retains approval-gated `Publish Package`, package policy,
-  pre/poststate, no overwrite, and Cleanup evidence; Schema 4 has no
-  publication node; selected-commit closure/digest preflight; runtime
-  attestation/activation false.
-- Jobs retain source/policy/secrets/failure facts; variants bind authority,
-  digests/canonical bytes/approval. Migration/apply/publication/default changes
-  are manual.
-- Required/qualification jobs are secret-free by default. The sole
-  `github-packages-classic-pat-step-read` exception is job-local and has
-  exactly one `GITHUB_PACKAGES_TOKEN`, passed only as complete value of one
-  unconditional, non-failure-masking first-party run step's same-named env
-  entry; effects/old profiles cannot use it. Operators own scope, SSO, expiry,
-  rotation.
-- `github-actions-cache-read` is a typed non-production effect bound
-  bidirectionally to full-SHA `actions/cache/restore@<sha>` steps; other cache
-  shapes/one-sided bindings are invalid. Package vocabulary is exact;
-  requires dependency-downloads and github-package-read.
-- pull_request, push, deployment, and workflow_dispatch events use rows with
-  source/policy; Kit stores none; old profiles stay secret-free.
+- Schema 3 `manual-package-publish-after-main` retains its approval-gated
+  `Publish Package` node, requires `procedures.publish` and
+  `roles.package_release`, exact merged source, and authorized package,
+  version, destination, and tag policy. Credentials resolve just in time;
+  remote pre/poststate is checked, overwrite/deletion is forbidden, and Cleanup
+  requires `publication_report`.
+- Schema 4 adds no publication node. Its spec, tracked manifest,
+  snapshot, and optional executable builder are validated from the selected
+  commit. Preflight derives profile/job sources, expands only regular files,
+  records raw digests, and emits a read-only source preview; runtime
+  attestation and activation stay false.
+- `github-packages-classic-pat-step-read`: job-local any source ref -> fixed
+  `GITHUB_PACKAGES_TOKEN` env; run-only empty `uses`/`with`; cache-read iff
+  full-SHA restore; ops scope/SSO/expiry/rotate; default secretless.
+- Publication variants use concrete or runtime-bound template authority,
+  derived job-manifest digests, canonical bytes, and optional Script-owned
+  Russian approval. Runtime proofs bind selected sources; no migration, apply,
+  publication, or default change is automatic.
 
 ## Execution targets
 
