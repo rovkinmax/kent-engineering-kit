@@ -55,11 +55,24 @@ jobs:
                 copied_root,
                 ignore=shutil.ignore_patterns(".git", "__pycache__"),
             )
-            (copied_root / "tests" / "test_ci_contract.py").write_text(
-                "import unittest\n"
+            copied_tests_root = copied_root / "tests"
+            temporary_test_files = sorted(copied_tests_root.rglob("test_*.py"))
+            for test_file in temporary_test_files:
+                self.assertFalse(test_file.is_symlink(), test_file)
+                self.assertTrue(test_file.is_file(), test_file)
+            for test_file in temporary_test_files:
+                test_file.unlink()
+            probe = copied_tests_root / "test_source_validation_probe.py"
+            probe.write_text(
+                "import unittest\n\n"
                 "class SourceValidationProbe(unittest.TestCase):\n"
                 "    def test_probe(self):\n"
-                "        pass\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                sorted(copied_tests_root.rglob("test_*.py")),
+                [probe],
             )
             result = subprocess.run(
                 [str(copied_root / "scripts" / "validate")],
