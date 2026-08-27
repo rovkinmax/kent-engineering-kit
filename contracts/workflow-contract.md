@@ -511,6 +511,24 @@ Bounded canonical encoder: sorted-key compact UTF-8 parity(ensure_ascii=false,al
 - Completed and canceled task history may be discarded when the user accepts
   that consequence; it is not by itself a retirement blocker.
 
+### Release-live portfolio operation
+
+The `release-live-portfolio-plan-v1` is one closed, immutable plan for the fixed
+`<state_dir>/release-live-portfolio.journal.json` receipt and ordered members.
+`preview` is read-only; `prepare` captures the complete pre-D9 canonical receipt.
+`retire` revalidates all remaining preimages before every confirmed delete.
+`apply` revalidates complete D9 and each canonical stage before every effect.
+Effects settle only at exact preimage or postimage; ambiguous or foreign state
+blocks, and only one in-flight effect may exist.
+
+D9 is irreversible after the first confirmed delete. Rollback from `prepared`
+only records `rolled_back` without a live effect. Canonical rollback is a
+separately confirmed forward restore using the same journal; it never rewinds a
+revision, accepts an unjournaled postimage, or completes with an unresolved
+effect. `complete` requires all members and effects verified and a new restore
+plan is required for any later reversal. No create, replacement, Task move,
+link/default change, direct database edit, or caller-supplied effect is allowed.
+
 ## Task-owned cleanup
 
 - Cleanup is a report-first resource-owning agent stage. It never removes its

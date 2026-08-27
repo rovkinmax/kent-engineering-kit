@@ -36,6 +36,7 @@ python3 -m py_compile \
   "$repo_root/workflowkit/operations.py" \
   "$repo_root/scripts/activate-primary-checkout" \
   "$repo_root/scripts/reconcile-canonical-workflows" \
+  "$repo_root/scripts/reconcile-release-portfolio" \
   "$repo_root/scripts/retire-workflow-batch" \
   "$repo_root/scripts/verify-release-portfolio" \
   "$repo_root/templates/project/android-apk-install-preserve" \
@@ -162,6 +163,7 @@ done
 for operations_script in \
   activate-primary-checkout \
   reconcile-canonical-workflows \
+  reconcile-release-portfolio \
   retire-workflow-batch \
   verify-release-portfolio; do
   [[ -x "$repo_root/scripts/$operations_script" ]] || {

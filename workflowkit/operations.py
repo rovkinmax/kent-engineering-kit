@@ -36,10 +36,25 @@ EXEC_FD_DECIMAL_RESERVE = 20
 EXEC_WRITE_CHUNK = 65536
 SETUP_KILL_REAP_GRACE = 2.0
 JOURNAL_SCHEMA = 'kit-operation-journal-v1'
-PHASES = {'prepared', 'in_progress', 'complete', 'verified', 'activation_committed', 'primary_promoted', 'role_adopted',
-        'rolled_back'}
-JOURNAL_FIELDS = {'schema', 'operation', 'plan_sha256', 'phase', 'effects', 'members', 'preimage', 'inventory',
-        'inventory_sha256', 'preflight'}
+PHASES = {
+    'prepared', 'in_progress', 'complete', 'verified', 'activation_committed', 'primary_promoted', 'role_adopted',
+    'rolled_back',
+}
+JOURNAL_FIELDS = {
+    'schema', 'operation', 'plan_sha256', 'phase', 'effects', 'members', 'preimage', 'inventory',
+    'inventory_sha256', 'preflight',
+}
+RELEASE_LIVE_PORTFOLIO_SCHEMA = 'release-live-portfolio-plan-v1'
+RELEASE_LIVE_PORTFOLIO_OPERATION = 'release-live-portfolio'
+RELEASE_LIVE_PORTFOLIO_REPORT = 'release-live-portfolio-report-v1'
+PORTFOLIO_PHASES = {
+    'prepared', 'retirement_in_progress', 'd9_complete', 'canonical_in_progress', 'complete', 'rolled_back',
+}
+PORTFOLIO_MEMBER_STATUSES = {'pending', 'graph_verified', 'metadata_verified', 'verified', 'rolled_back'}
+PORTFOLIO_JOURNAL_FIELDS = {
+    'schema', 'operation', 'plan_sha256', 'phase', 'retirement_preimage', 'canonical_preimage',
+    'retirement_targets', 'canonical_targets', 'members', 'effects',
+}
 
 class OperationError(RuntimeError):
     """Base class for deterministic operational failures."""
@@ -203,6 +218,10 @@ class OperationJournal:
         if not re.fullmatch('[a-z0-9-]{1,64}', self.operation):
             raise JournalError('operation name is not a safe journal stem')
         self.plan = plan
+        self.allowed_phases = PORTFOLIO_PHASES if operation == RELEASE_LIVE_PORTFOLIO_OPERATION else PHASES
+        self.allowed_fields = (
+            PORTFOLIO_JOURNAL_FIELDS if operation == RELEASE_LIVE_PORTFOLIO_OPERATION else JOURNAL_FIELDS
+        )
         self.lock_path = self.state_dir / '.operations.lock'
         self.path = self.state_dir / f'{self.operation}.journal.json'
         self.temp_path = self.state_dir / f'{self.operation}.journal.tmp'
@@ -249,9 +268,9 @@ class OperationJournal:
             raise JournalError('journal operation is invalid')
         if state.get('plan_sha256') != self.plan.sha256:
             raise JournalError('journal plan digest is invalid')
-        if state.get('phase') not in PHASES:
+        if state.get('phase') not in self.allowed_phases:
             raise JournalError('journal phase is invalid')
-        if set(state) - JOURNAL_FIELDS:
+        if set(state) - self.allowed_fields:
             raise JournalError('journal contains unknown fields')
         if canonical_bytes(state) + b'\n' != raw:
             raise JournalError('journal readback is not canonical')
@@ -262,9 +281,9 @@ class OperationJournal:
             raise JournalError('journal lock is not held')
         data = dict(state)
         data.update({'schema': JOURNAL_SCHEMA, 'operation': self.operation, 'plan_sha256': self.plan.sha256})
-        if set(data) - JOURNAL_FIELDS:
+        if set(data) - self.allowed_fields:
             raise JournalError('journal contains unknown fields')
-        if data.get('phase') not in PHASES:
+        if data.get('phase') not in self.allowed_phases:
             raise JournalError('journal phase is not closed')
         encoded = canonical_bytes(data) + b'\n'
         if self.temp_path.exists():
@@ -860,7 +879,10 @@ def recover_effect(journal: OperationJournal, *, effect_key: str, command: Seque
     if not callable(current_sha256):
         raise PlanValidationError('effect recovery requires an exact readback')
     _, _, _, _, identity = _effect_inputs(command, cwd, extra_env, stdin_bytes, preimage_sha256, postimage_sha256)
-    state = journal.require_phase({'prepared', 'in_progress', 'activation_committed'})
+    recovery_phases = {'prepared', 'in_progress', 'activation_committed'}
+    if journal.operation == RELEASE_LIVE_PORTFOLIO_OPERATION:
+        recovery_phases.update({'retirement_in_progress', 'd9_complete', 'canonical_in_progress'})
+    state = journal.require_phase(recovery_phases)
     entry = (state.get('effects') or {}).get(effect_key)
     if not isinstance(entry, dict):
         raise JournalError(f'effect {effect_key!r} is not awaiting settlement')
@@ -2211,6 +2233,1464 @@ def reconcile_canonical_workflows(plan: LoadedPlan, *, mode: str, confirm: bool 
             _canonical_assert_expected(parsed, item, expected)
         journal.persist({**journal.state, 'phase': 'complete'})
         return _canonical_report(plan, 'complete', journal)
+
+
+
+def _portfolio_sequence(value: Any, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise PlanValidationError(f'{label} must be a non-negative integer')
+    return value
+
+
+def _portfolio_root(value: Any, label: str) -> Path:
+    root = _absolute_path(value, label)
+    if not root.exists() or not root.is_dir():
+        raise PlanValidationError(f'{label} must be an existing directory')
+    resolved = root.resolve(strict=True)
+    if not resolved.is_dir():
+        raise PlanValidationError(f'{label} must resolve to a directory')
+    return resolved
+
+
+def _portfolio_member(value: Any, index: int, project_id: str) -> dict[str, Any]:
+    label = f'retirement_members[{index}]'
+    item = _closed(value, {
+        'sequence', 'project_id', 'project_root', 'workflow_id', 'revision', 'links', 'default', 'tasks',
+        'sessions', 'worktrees', 'retained', 'absent', 'delete_preview',
+    }, label)
+    if _uuid(_required(item, 'project_id', label), f'{label}.project_id') != project_id:
+        raise PlanValidationError('retirement member project identity is inconsistent')
+    root = _portfolio_root(_required(item, 'project_root', label), f'{label}.project_root')
+    member = dict(_typed_member({key: item[key] for key in item if key not in {
+        'sequence', 'project_id', 'project_root',
+    }}, index, project_id))
+    member.update({
+        'sequence': _portfolio_sequence(_required(item, 'sequence', label), f'{label}.sequence'),
+        'project_id': project_id,
+        'project_root': root,
+    })
+    return member
+
+
+def _portfolio_canonical(value: Any, index: int) -> dict[str, Any]:
+    label = f'canonical_workflows[{index}]'
+    item = _closed(value, {
+        'sequence', 'project_id', 'project_root', 'workflow_id', 'expected_version', 'intent', 'graph', 'metadata',
+        'terminal_tasks', 'terminal_anchors', 'links', 'default',
+    }, label)
+    project_id = _uuid(_required(item, 'project_id', label), f'{label}.project_id')
+    root = _portfolio_root(_required(item, 'project_root', label), f'{label}.project_root')
+    workflow_id = _uuid(_required(item, 'workflow_id', label), f'{label}.workflow_id')
+    version = _required(item, 'expected_version', label)
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        raise PlanValidationError(f'{label}.expected_version is invalid')
+    intent = _string(_required(item, 'intent', label), f'{label}.intent')
+    if intent not in {'graph-only', 'metadata-only', 'graph-and-metadata'}:
+        raise PlanValidationError('canonical intent is unsupported')
+    tasks = []
+    raw_tasks = _bounded_list(_required(item, 'terminal_tasks', label), f'{label}.terminal_tasks')
+    for task_index, raw in enumerate(raw_tasks):
+        task_label = f'{label}.terminal_tasks[{task_index}]'
+        task = _closed(raw, {'id', 'status'}, task_label)
+        tasks.append({
+            'id': _string(_required(task, 'id', task_label), f'{task_label}.id'),
+            'status': _string(_required(task, 'status', task_label), f'{task_label}.status'),
+        })
+    tasks.sort(key=lambda row: row['id'])
+    _unique([row['id'] for row in tasks], f'{label}.terminal_tasks')
+    anchors = []
+    raw_anchors = _bounded_list(_required(item, 'terminal_anchors', label), f'{label}.terminal_anchors')
+    for anchor_index, raw in enumerate(raw_anchors):
+        anchor_label = f'{label}.terminal_anchors[{anchor_index}]'
+        anchor = _closed(raw, {'id', 'kind'}, anchor_label)
+        anchors.append({
+            'id': _string(_required(anchor, 'id', anchor_label), f'{anchor_label}.id'),
+            'kind': _string(_required(anchor, 'kind', anchor_label), f'{anchor_label}.kind'),
+        })
+    anchors.sort(key=lambda row: row['id'])
+    _unique([row['id'] for row in anchors], f'{label}.terminal_anchors')
+    links = []
+    for link_index, raw in enumerate(_bounded_list(_required(item, 'links', label), f'{label}.links')):
+        link_label = f'{label}.links[{link_index}]'
+        link = _closed(raw, {'project_id', 'workflow_id', 'is_default'}, link_label)
+        parsed = {
+            'project_id': _uuid(_required(link, 'project_id', link_label), f'{link_label}.project_id'),
+            'workflow_id': _uuid(_required(link, 'workflow_id', link_label), f'{link_label}.workflow_id'),
+            'is_default': _required(link, 'is_default', link_label),
+        }
+        if parsed['project_id'] != project_id or parsed['workflow_id'] != workflow_id:
+            raise PlanValidationError('canonical link identity drifted')
+        if not isinstance(parsed['is_default'], bool):
+            raise PlanValidationError('canonical link default flag is invalid')
+        links.append(parsed)
+    links.sort(key=lambda row: (row['project_id'], row['workflow_id']))
+    default_raw = _required(item, 'default', label)
+    default = _uuid(default_raw, f'{label}.default') if default_raw is not None else None
+    expected_default = workflow_id if any(row['is_default'] for row in links) else None
+    if default != expected_default:
+        raise PlanValidationError('canonical default does not match the project link')
+    result: dict[str, Any] = {
+        'sequence': _portfolio_sequence(_required(item, 'sequence', label), f'{label}.sequence'),
+        'project_id': project_id,
+        'project_root': root,
+        'workflow_id': workflow_id,
+        'expected_version': version,
+        'intent': intent,
+        'terminal_tasks': tasks,
+        'terminal_anchors': anchors,
+        'links': links,
+        'default': default,
+    }
+    if intent in {'graph-only', 'graph-and-metadata'}:
+        graph = dict(_closed(_required(item, 'graph', label), {
+            'version', 'nodes', 'edges', 'node_groups', 'transition_groups',
+        }, f'{label}.graph'))
+        if graph.get('version') != version + 1:
+            raise PlanValidationError('canonical target graph must advance exactly one version')
+        for key in ('nodes', 'edges', 'node_groups', 'transition_groups'):
+            _bounded_list(_required(graph, key, f'{label}.graph'), f'{label}.graph.{key}')
+        kinds = {
+            node.get('id', node.get('node_id')): node.get('kind')
+            for node in graph['nodes'] if isinstance(node, dict)
+        }
+        if any(kinds.get(anchor['id']) != anchor['kind'] for anchor in anchors):
+            raise PlanValidationError('canonical target graph does not preserve terminal anchors')
+        result['graph'] = graph
+    elif 'graph' in item:
+        raise PlanValidationError('metadata-only workflow cannot carry graph')
+    if intent in {'metadata-only', 'graph-and-metadata'}:
+        metadata = _closed(
+            _required(item, 'metadata', label),
+            {'name', 'description', 'execution_target'},
+            f'{label}.metadata',
+        )
+        result['metadata'] = {
+            'name': _string(_required(metadata, 'name', f'{label}.metadata'), 'metadata.name'),
+            'description': _string(
+                _required(metadata, 'description', f'{label}.metadata'),
+                'metadata.description',
+                nonempty=False,
+            ),
+            'execution_target': _string(
+                _required(metadata, 'execution_target', f'{label}.metadata'),
+                'metadata.execution_target',
+            ),
+        }
+    elif 'metadata' in item:
+        raise PlanValidationError('graph-only workflow cannot carry metadata')
+    return result
+
+
+def _validate_release_live_portfolio_plan(plan: LoadedPlan) -> dict[str, Any]:
+    data = _closed(plan.value, {
+        'schema', 'state_dir', 'kent', 'database', 'retirement_members', 'canonical_workflows',
+    }, 'release-live-portfolio plan')
+    if data.get('schema') != RELEASE_LIVE_PORTFOLIO_SCHEMA:
+        raise PlanValidationError('release-live-portfolio schema is invalid')
+    state_dir = _absolute_path(_required(data, 'state_dir', 'release-live-portfolio plan'), 'state_dir')
+    if state_dir.exists() and state_dir.is_symlink():
+        raise PlanValidationError('state_dir must not be a symlink')
+    kent_data = _closed(_required(data, 'kent', 'release-live-portfolio plan'), {'path', 'sha256'}, 'kent')
+    kent = _kent_path(_required(kent_data, 'path', 'kent'), 'kent.path')
+    kent_sha256 = _sha256(_required(kent_data, 'sha256', 'kent'), 'kent.sha256')
+    _verify_executable(kent, kent_sha256)
+    database_data = _closed(_required(data, 'database', 'release-live-portfolio plan'), {
+        'path', 'schema', 'session_roots',
+    }, 'database')
+    database = _absolute_path(_required(database_data, 'path', 'database'), 'database.path')
+    schema = _string(_required(database_data, 'schema', 'database'), 'database.schema')
+    if schema != KENT_SCHEMA_IDENTITY:
+        raise PlanValidationError('unsupported Kent persistence schema')
+    session_roots = sorted({
+        _absolute_path(root, 'database.session_root')
+        for root in _bounded_list(_required(database_data, 'session_roots', 'database'), 'database.session_roots')
+    }, key=str)
+    raw_retirement = _bounded_list(
+        _required(data, 'retirement_members', 'release-live-portfolio plan'), 'retirement_members'
+    )
+    raw_canonical = _bounded_list(
+        _required(data, 'canonical_workflows', 'release-live-portfolio plan'), 'canonical_workflows'
+    )
+    if len(raw_retirement) != 6 or len(raw_canonical) != 4:
+        raise PlanValidationError('release-live-portfolio requires six retirement and four canonical Workflows')
+    project_ids: set[str] = set()
+    project_roots: dict[str, Path] = {}
+    physical_roots: dict[Path, str] = {}
+    retirement: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_retirement):
+        project_id = _uuid(_required(raw, 'project_id', f'retirement_members[{index}]'), 'project_id')
+        member = _portfolio_member(raw, index, project_id)
+        project_ids.add(project_id)
+        root = member['project_root']
+        if project_id in project_roots and project_roots[project_id] != root:
+            raise PlanValidationError('project ID maps to multiple roots')
+        if root in physical_roots and physical_roots[root] != project_id:
+            raise PlanValidationError('project roots resolve to multiple project IDs')
+        project_roots[project_id] = root
+        physical_roots[root] = project_id
+        retirement.append(member)
+    canonical: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_canonical):
+        item = _portfolio_canonical(raw, index)
+        project_ids.add(item['project_id'])
+        if item['project_id'] in project_roots and project_roots[item['project_id']] != item['project_root']:
+            raise PlanValidationError('project ID maps to multiple roots')
+        if item['project_root'] in physical_roots and physical_roots[item['project_root']] != item['project_id']:
+            raise PlanValidationError('project roots resolve to multiple project IDs')
+        project_roots[item['project_id']] = item['project_root']
+        physical_roots[item['project_root']] = item['project_id']
+        canonical.append(item)
+    for label, rows in (('retirement_members', retirement), ('canonical_workflows', canonical)):
+        sequences = [row['sequence'] for row in rows]
+        _unique([str(value) for value in sequences], f'{label}.sequence')
+        if sequences != sorted(sequences):
+            raise PlanValidationError(f'{label} must be ordered by sequence')
+    retirement_ids = [row['workflow_id'] for row in retirement]
+    canonical_ids = [row['workflow_id'] for row in canonical]
+    _unique(retirement_ids, 'retirement Workflow identities')
+    _unique(canonical_ids, 'canonical Workflow identities')
+    if set(retirement_ids) & set(canonical_ids):
+        raise PlanValidationError('canonical and retirement Workflow identities overlap')
+    task_ids = [task['id'] for row in retirement for task in row['tasks']]
+    task_ids.extend(task['id'] for row in canonical for task in row['terminal_tasks'])
+    _unique(task_ids, 'Task identities')
+    session_ids = [session['id'] for row in retirement for session in row['sessions']]
+    _unique(session_ids, 'Session identities')
+    worktree_paths = [row['path'] for member in retirement for row in member['worktrees']]
+    _unique(worktree_paths, 'worktree identities')
+    resource_ids = [resource['id'] for member in retirement for resource in [*member['retained'], *member['absent']]]
+    _unique(resource_ids, 'resource identities')
+    if len({row['project_id'] for row in retirement}) != 2:
+        raise PlanValidationError('retirement set must cover exactly two projects')
+    if len({str(root) for root in project_roots.values()}) != len(project_roots):
+        raise PlanValidationError('project root maps to multiple project IDs')
+    if len({row['project_id'] for row in canonical}) != 4:
+        raise PlanValidationError('canonical set must cover exactly four projects')
+    if len(task_ids) != 12 + sum(len(row['terminal_tasks']) for row in canonical):
+        raise PlanValidationError('retirement Task count is not representable')
+    allowed_roots = {str(root) for root in session_roots}
+    for member in retirement:
+        for session in member['sessions']:
+            if session['root'] not in allowed_roots:
+                raise PlanValidationError('Session root is not in the portfolio allowlist')
+    return {
+        'state_dir': state_dir, 'kent': kent, 'kent_sha256': kent_sha256, 'database': database, 'schema': schema,
+        'session_roots': session_roots, 'project_ids': sorted(project_ids), 'project_roots': project_roots,
+        'retirement_members': retirement, 'canonical_workflows': canonical,
+    }
+
+
+def _portfolio_project_rows(parsed: Mapping[str, Any]) -> list[dict[str, str]]:
+    rows: dict[str, dict[str, str]] = {}
+    roots = {Path(row['project_root']) for row in [*parsed['retirement_members'], *parsed['canonical_workflows']]}
+    for root in sorted(roots, key=str):
+        for row in _project_rows(parsed['kent'], root):
+            old = rows.get(row['id'])
+            if old is not None and old != row:
+                raise EffectBlocked('portfolio project identity/root mapping is ambiguous')
+            rows[row['id']] = row
+    expected = {project_id: str(parsed['project_roots'][project_id]) for project_id in parsed['project_ids']}
+    actual: dict[str, str] = {}
+    for project_id, row in rows.items():
+        if project_id not in expected:
+            continue
+        try:
+            actual[project_id] = str(_portfolio_root(row['path'], f'project {project_id}.path'))
+        except (PlanValidationError, OSError) as error:
+            raise EffectBlocked('portfolio project root is not a canonical directory') from error
+    if actual != expected:
+        raise EffectBlocked('portfolio project identity/root mapping drifted')
+    normalized = {project_id: {**rows[project_id], 'path': actual[project_id]} for project_id in expected}
+    return sorted((normalized[project_id] for project_id in expected), key=lambda row: row['id'])
+
+
+def _portfolio_d9_parsed(parsed: Mapping[str, Any], member: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        'project_id': member['project_id'], 'state_dir': parsed['state_dir'], 'kent': parsed['kent'],
+        'kent_sha256': parsed['kent_sha256'], 'database': parsed['database'], 'schema': parsed['schema'],
+        'project_root': member['project_root'], 'session_roots': parsed['session_roots'], 'members': [member],
+    }
+
+
+def _portfolio_read_state(parsed: Mapping[str, Any]) -> dict[str, Any]:
+    projects = _portfolio_project_rows(parsed)
+    retirement: dict[str, Any] = {}
+    for member in parsed['retirement_members']:
+        inventory = _d9_read_inventory(_portfolio_d9_parsed(parsed, member))
+        retirement[member['workflow_id']] = inventory['members'][member['workflow_id']]
+    canonical: dict[str, Any] = {}
+    for item in parsed['canonical_workflows']:
+        canonical_parsed = {
+            'project_root': item['project_root'], 'kent': parsed['kent'], 'd9': None,
+        }
+        canonical[item['workflow_id']] = _canonical_read(canonical_parsed, item)
+    all_task_ids = [task['id'] for member in parsed['retirement_members'] for task in member['tasks']]
+    all_session_ids = [session['id'] for member in parsed['retirement_members'] for session in member['sessions']]
+    sqlite_state = _sqlite_snapshot(parsed['database'], parsed['schema'], all_session_ids, all_task_ids)
+    return {
+        'projects': projects, 'database_schema': parsed['schema'], 'retirement': retirement,
+        'canonical': canonical, 'sqlite': sqlite_state,
+    }
+
+
+def _portfolio_preimage_gate(parsed: Mapping[str, Any], state: Mapping[str, Any]) -> None:
+    expected_projects = {row['id']: row['path'] for row in _portfolio_project_rows(parsed)}
+    actual_projects = {row['id']: row['path'] for row in state.get('projects', [])}
+    if actual_projects != expected_projects or state.get('database_schema') != parsed['schema']:
+        raise EffectBlocked('portfolio project or database preimage drifted')
+    for member in parsed['retirement_members']:
+        live = state['retirement'].get(member['workflow_id'])
+        if not isinstance(live, dict):
+            raise EffectBlocked('retirement preimage member is missing')
+        _d9_member_live_gate(member, live)
+    for item in parsed['canonical_workflows']:
+        live = state['canonical'].get(item['workflow_id'])
+        if not isinstance(live, dict):
+            raise EffectBlocked('canonical preimage member is missing')
+        _canonical_gate(item, live, item['expected_version'])
+
+
+def _portfolio_expected_post(parsed: Mapping[str, Any], preimage: Mapping[str, Any]) -> dict[str, Any]:
+    retirement = {}
+    for member in parsed['retirement_members']:
+        wid = member['workflow_id']
+        retirement[wid] = _d9_expected_post(member, preimage['retirement'][wid])
+    sqlite = preimage['sqlite']
+    task_ids = {task['id'] for member in parsed['retirement_members'] for task in member['tasks']}
+    sessions = []
+    for value in sqlite['sessions']:
+        row = dict(value['row']) if value['row'] is not None else None
+        if row is not None:
+            row['task_id'] = None
+        sessions.append({**value, 'row': row})
+    associations = [row for row in sqlite['associations'] if row.get('task_id') not in task_ids]
+    return {
+        'projects': preimage['projects'], 'database_schema': preimage['database_schema'], 'retirement': retirement,
+        'canonical': preimage['canonical'], 'sqlite': {
+            'schema_fingerprints': sqlite['schema_fingerprints'], 'sessions': sessions, 'associations': associations,
+        },
+    }
+
+
+def _portfolio_state_matches(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> bool:
+    return canonical_sha256(expected) == canonical_sha256(actual)
+
+
+def _portfolio_retirement_progress(
+    parsed: Mapping[str, Any],
+    preimage: Mapping[str, Any],
+    statuses: Mapping[str, str],
+    settling: str | None = None,
+) -> dict[str, Any]:
+    verified = {
+        member['workflow_id'] for member in parsed['retirement_members']
+        if statuses.get(member['workflow_id']) == 'verified'
+    }
+    if settling is not None:
+        verified.add(settling)
+    retirement = dict(preimage['retirement'])
+    task_ids = set()
+    session_ids = set()
+    for member in parsed['retirement_members']:
+        wid = member['workflow_id']
+        if wid in verified:
+            retirement[wid] = _d9_expected_post(member, preimage['retirement'][wid])
+            task_ids.update(task['id'] for task in member['tasks'])
+            session_ids.update(session['id'] for session in member['sessions'])
+    sqlite = preimage['sqlite']
+    sessions = []
+    for value in sqlite['sessions']:
+        row = dict(value['row']) if value['row'] is not None else None
+        if row is not None and value['session_id'] in session_ids:
+            row['task_id'] = None
+        sessions.append({**value, 'row': row})
+    associations = [row for row in sqlite['associations'] if row.get('task_id') not in task_ids]
+    return {
+        'projects': preimage['projects'], 'database_schema': preimage['database_schema'],
+        'retirement': retirement, 'canonical': preimage['canonical'],
+        'sqlite': {
+            'schema_fingerprints': sqlite['schema_fingerprints'],
+            'sessions': sessions, 'associations': associations,
+        },
+    }
+
+
+def _portfolio_retirement_gate(
+    parsed: Mapping[str, Any],
+    live: Mapping[str, Any],
+    preimage: Mapping[str, Any],
+    statuses: Mapping[str, str],
+    settling: str | None = None,
+) -> None:
+    expected = _portfolio_retirement_progress(parsed, preimage, statuses, settling)
+    if _portfolio_state_matches(expected, live):
+        return
+    if settling is not None:
+        expected_pre = _portfolio_retirement_progress(parsed, preimage, statuses)
+        if _portfolio_state_matches(expected_pre, live):
+            return
+    raise EffectBlocked('retirement portfolio state drifted before the next delete')
+
+
+def _portfolio_d9_post_gate(
+    parsed: Mapping[str, Any],
+    live: Mapping[str, Any],
+    preimage: Mapping[str, Any],
+) -> None:
+    expected = _portfolio_expected_post(parsed, preimage)
+    expected['canonical'] = live.get('canonical')
+    if not _portfolio_state_matches(expected, live):
+        raise EffectBlocked('complete D9 poststate is absent or drifted')
+
+
+def _portfolio_canonical_state_gate(
+    parsed: Mapping[str, Any],
+    live: Mapping[str, Any],
+    journal: OperationJournal,
+    in_flight: tuple[str, str] | None = None,
+) -> None:
+    effects = journal.state.get('effects') or {}
+    for item in parsed['canonical_workflows']:
+        wid = item['workflow_id']
+        current = live['canonical'].get(wid)
+        if not isinstance(current, dict):
+            raise EffectBlocked('canonical Workflow is missing before the next effect')
+        before = journal.state['canonical_preimage']['members'][wid]
+        stages = _canonical_progress(
+            {'kent': parsed['kent'], 'project_root': item['project_root']}, item, before
+        )
+        status = _portfolio_member_status(journal.state, wid)
+        stage_statuses = [stage['status'] for stage in stages]
+        if status == 'pending':
+            status_index = -1
+        elif status == 'verified':
+            status_index = len(stages)
+        elif status in stage_statuses:
+            status_index = stage_statuses.index(status)
+        else:
+            raise JournalError(f'canonical member status is invalid: {status!r}')
+        if status_index < 0:
+            expected = before
+        elif status_index == len(stages):
+            expected = stages[-1]['after'] if stages else before
+        else:
+            expected = stages[status_index]['after']
+        allowed = {canonical_sha256(expected)}
+        if in_flight is not None and in_flight[0] == wid:
+            requested_name = in_flight[1]
+            requested = next((stage for stage in stages if stage['name'] == requested_name), None)
+            if requested is None:
+                raise EffectBlocked('canonical requested stage is not in the plan')
+            requested_index = stages.index(requested)
+            if requested_index > status_index + 1:
+                raise EffectBlocked('canonical requested stage is ahead of the journal')
+            if requested_index == status_index + 1:
+                effect = effects.get(f'apply:{wid}:{requested_name}')
+                if isinstance(effect, dict) and effect.get('status') in {
+                    'attempted', 'unresolved', 'ambiguous', 'verified',
+                }:
+                    allowed.update({
+                        canonical_sha256(requested['before']), canonical_sha256(requested['after'])
+                    })
+                elif effect is not None and isinstance(effect, dict) and effect.get('status') == 'settled_preimage':
+                    allowed.add(canonical_sha256(requested['before']))
+        if canonical_sha256(current) not in allowed:
+            raise EffectBlocked('canonical Workflow state drifted before the next effect')
+
+
+def _portfolio_forward_progress(
+    parsed: Mapping[str, Any], item: Mapping[str, Any], preimage: Mapping[str, Any], journal: OperationJournal,
+) -> tuple[list[Mapping[str, Any]], int]:
+    stages = _canonical_progress(
+        {'kent': parsed['kent'], 'project_root': item['project_root']}, item, preimage
+    )
+    effects = journal.state.get('effects') or {}
+    count = 0
+    for stage in stages:
+        effect = effects.get(f'apply:{item["workflow_id"]}:{stage["name"]}')
+        if not isinstance(effect, dict) or effect.get('status') != 'verified':
+            break
+        count += 1
+    if any(
+        isinstance(effects.get(f'apply:{item["workflow_id"]}:{stage["name"]}'), dict)
+        and effects[f'apply:{item["workflow_id"]}:{stage["name"]}'].get('status') == 'verified'
+        for stage in stages[count:]
+    ):
+        raise JournalError('canonical apply effects are not an exact prefix')
+    return stages, count
+
+
+def _portfolio_forward_state(
+    parsed: Mapping[str, Any], item: Mapping[str, Any], preimage: Mapping[str, Any], journal: OperationJournal
+) -> Mapping[str, Any]:
+    stages, count = _portfolio_forward_progress(parsed, item, preimage, journal)
+    return preimage if count == 0 else stages[count - 1]['after']
+
+
+def _portfolio_restore_stages(
+    parsed: Mapping[str, Any], item: Mapping[str, Any], preimage: Mapping[str, Any],
+    start: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if start is None:
+        forward = _canonical_progress(
+            {'kent': parsed['kent'], 'project_root': item['project_root']}, item, preimage
+        )
+        start = forward[-1]['after'] if forward else preimage
+    return _canonical_restore_progress(
+        {'kent': parsed['kent'], 'project_root': item['project_root']}, item, preimage, start
+    )
+
+
+def _portfolio_restore_state_gate(
+    parsed: Mapping[str, Any],
+    live: Mapping[str, Any],
+    journal: OperationJournal,
+    in_flight: tuple[str, str] | None = None,
+) -> None:
+    effects = journal.state.get('effects') or {}
+    for item in parsed['canonical_workflows']:
+        wid = item['workflow_id']
+        current = live['canonical'].get(wid)
+        if not isinstance(current, dict):
+            raise EffectBlocked('canonical Workflow is missing during rollback')
+        preimage = journal.state['canonical_preimage']['members'][wid]
+        expected_forward = _portfolio_forward_state(parsed, item, preimage, journal)
+        restore_stages = _portfolio_restore_stages(parsed, item, preimage, expected_forward)
+        expected = expected_forward
+        allowed = {canonical_sha256(expected)}
+        for stage in restore_stages:
+            effect_key = f'restore:{wid}:{stage["name"]}'
+            effect = effects.get(effect_key)
+            if isinstance(effect, dict) and effect.get('status') == 'verified':
+                expected = stage['after']
+                allowed = {canonical_sha256(expected)}
+                continue
+            if isinstance(effect, dict) and effect.get('status') == 'settled_preimage':
+                allowed = {canonical_sha256(stage['before'])}
+                break
+            if isinstance(effect, dict) and effect.get('status') in {'attempted', 'unresolved', 'ambiguous'}:
+                allowed.update({canonical_sha256(stage['before']), canonical_sha256(stage['after'])})
+                break
+            if in_flight == (wid, stage['name']):
+                allowed.update({canonical_sha256(stage['before']), canonical_sha256(stage['after'])})
+                break
+            break
+        if canonical_sha256(current) not in allowed:
+            raise EffectBlocked('canonical rollback state drifted')
+
+
+def _portfolio_member_status(state: Mapping[str, Any], key: str) -> str:
+    rows = state.get('members')
+    if not isinstance(rows, list):
+        raise JournalError('release-live-portfolio journal members are invalid')
+    matches = [row for row in rows if isinstance(row, dict) and row.get('workflow_id') == key]
+    if len(matches) != 1 or not isinstance(matches[0].get('status'), str):
+        raise JournalError('release-live-portfolio journal member identity is invalid')
+    return matches[0]['status']
+
+
+def _portfolio_set_status(journal: OperationJournal, key: str, status: str) -> None:
+    state = journal.state or {}
+    rows = []
+    for row in state.get('members', []):
+        if not isinstance(row, dict):
+            raise JournalError('release-live-portfolio journal members are invalid')
+        rows.append({**row, 'status': status if row.get('workflow_id') == key else row.get('status')})
+    journal.persist({**state, 'members': rows})
+
+
+def _release_live_report(plan: LoadedPlan, phase: str, journal: OperationJournal | None = None) -> dict[str, Any]:
+    effects = _effect_attempts(journal.state) if journal is not None else 0
+    return {
+        'schema': RELEASE_LIVE_PORTFOLIO_REPORT, 'operation': RELEASE_LIVE_PORTFOLIO_OPERATION,
+        'plan_sha256': plan.sha256, 'phase': phase, 'effects_released': effects,
+    }
+
+
+def _portfolio_journal_preimage(parsed: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        'projects': state['projects'], 'database_schema': state['database_schema'],
+        'sqlite': state['sqlite'], 'members': state['retirement'],
+    }
+
+
+def _portfolio_canonical_preimage(state: Mapping[str, Any]) -> dict[str, Any]:
+    return {'projects': state['projects'], 'members': state['canonical']}
+
+
+def _portfolio_canonical_targets(parsed: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
+    targets = {}
+    for item in parsed['canonical_workflows']:
+        before = state['canonical'][item['workflow_id']]
+        stages = _canonical_progress({
+            'kent': parsed['kent'], 'project_root': item['project_root'],
+        }, item, before)
+        targets[item['workflow_id']] = {
+            'preimage_sha256': canonical_sha256(before),
+            'target_sha256': canonical_sha256(stages[-1]['after'] if stages else before),
+            'stages': [
+                {
+                    'name': stage['name'],
+                    'before_sha256': canonical_sha256(stage['before']),
+                    'after_sha256': canonical_sha256(stage['after']),
+                }
+                for stage in stages
+            ],
+        }
+    return targets
+
+
+def _portfolio_validate_projects(value: Any, label: str) -> None:
+    rows = _bounded_list(value, label)
+    seen: set[str] = set()
+    roots: dict[Path, str] = {}
+    for index, raw in enumerate(rows):
+        item_label = f'{label}[{index}]'
+        item = _closed(raw, {'id', 'name', 'path'}, item_label)
+        project_id = _uuid(_required(item, 'id', item_label), f'{item_label}.id')
+        _string(_required(item, 'name', item_label), f'{item_label}.name')
+        try:
+            root = _portfolio_root(_required(item, 'path', item_label), f'{item_label}.path')
+        except PlanValidationError as error:
+            raise JournalError(str(error)) from error
+        if project_id in seen:
+            raise JournalError(f'{label} contains duplicate project identities')
+        if root in roots and roots[root] != project_id:
+            raise JournalError(f'{label} contains aliased project roots')
+        roots[root] = project_id
+        seen.add(project_id)
+
+
+def _portfolio_validate_sqlite(value: Any, label: str) -> None:
+    snapshot = _closed(value, {'schema_fingerprints', 'sessions', 'associations'}, label)
+    fingerprints = snapshot['schema_fingerprints']
+    if not isinstance(fingerprints, dict) or set(fingerprints) != set(SQLITE_SCHEMA_FINGERPRINTS):
+        raise JournalError(f'{label}.schema_fingerprints is not closed')
+    for table, fingerprint in fingerprints.items():
+        _sha256(fingerprint, f'{label}.schema_fingerprints[{table}]')
+        if fingerprint != SQLITE_SCHEMA_FINGERPRINTS[table]:
+            raise JournalError(f'{label}.schema_fingerprints drifted')
+    session_columns = {
+        'id', 'project_id', 'workspace_id', 'worktree_id', 'artifact_relpath', 'name', 'first_prompt_preview',
+        'input_draft', 'category', 'created_at_unix_ms', 'updated_at_unix_ms', 'last_sequence',
+        'model_request_count', 'launch_visible', 'cwd_relpath', 'continuation_json', 'locked_json',
+        'usage_state_json', 'metadata_json', 'previous_session_id', 'parent_agent_session_id', 'task_id',
+        'completed_compaction_count', 'manual_compact_eligible',
+    }
+    association_columns = {
+        'task_id', 'session_id', 'node_id', 'transition_branch_key', 'association_status', 'source_session_id',
+        'associated_at_unix_ms',
+    }
+    for index, raw in enumerate(_bounded_list(snapshot['sessions'], f'{label}.sessions')):
+        row_label = f'{label}.sessions[{index}]'
+        row = _closed(raw, {'session_id', 'present', 'row'}, row_label)
+        _string(_required(row, 'session_id', row_label), f'{row_label}.session_id')
+        if not isinstance(row['present'], bool):
+            raise JournalError(f'{row_label}.present is invalid')
+        if row['row'] is not None:
+            value_row = _closed(row['row'], session_columns, f'{row_label}.row')
+            if set(value_row) != session_columns:
+                raise JournalError(f'{row_label}.row is incomplete')
+    for index, raw in enumerate(_bounded_list(snapshot['associations'], f'{label}.associations')):
+        row_label = f'{label}.associations[{index}]'
+        row = _closed(raw, association_columns, row_label)
+        if set(row) != association_columns:
+            raise JournalError(f'{row_label} is incomplete')
+        node_id = row['node_id']
+        if not isinstance(node_id, dict) or set(node_id) != {'bytes_hex'}:
+            raise JournalError(f'{row_label}.node_id is invalid')
+        if not isinstance(node_id['bytes_hex'], str) or len(node_id['bytes_hex']) % 2:
+            raise JournalError(f'{row_label}.node_id is invalid')
+
+
+def _portfolio_validate_d9_snapshot(value: Any, label: str) -> None:
+    snapshot = _closed(value, {
+        'workflow', 'links', 'default', 'graph_sha256', 'validation_sha256', 'tasks', 'task_details', 'sessions',
+        'session_manifests', 'sqlite', 'worktrees', 'retained', 'absent', 'preview_sha256',
+    }, label)
+    workflow = _closed(snapshot['workflow'], {'present', 'workflow_id', 'revision'}, f'{label}.workflow')
+    if not isinstance(workflow['present'], bool):
+        raise JournalError(f'{label}.workflow.present is invalid')
+    _uuid(workflow['workflow_id'], f'{label}.workflow.workflow_id')
+    if workflow['revision'] is not None and (not isinstance(workflow['revision'], int) or isinstance(
+            workflow['revision'], bool)):
+        raise JournalError(f'{label}.workflow.revision is invalid')
+    for key in ('graph_sha256', 'validation_sha256', 'preview_sha256'):
+        if snapshot[key] is not None:
+            _sha256(snapshot[key], f'{label}.{key}')
+    if not isinstance(snapshot['default'], (str, type(None))):
+        raise JournalError(f'{label}.default is invalid')
+    for index, raw in enumerate(_bounded_list(snapshot['links'], f'{label}.links')):
+        row_label = f'{label}.links[{index}]'
+        row = _closed(raw, {'project_id', 'workflow_id', 'is_default'}, row_label)
+        _uuid(row['project_id'], f'{row_label}.project_id')
+        _uuid(row['workflow_id'], f'{row_label}.workflow_id')
+        if not isinstance(row['is_default'], bool):
+            raise JournalError(f'{row_label}.is_default is invalid')
+    for key in ('tasks', 'task_details'):
+        for index, raw in enumerate(_bounded_list(snapshot[key], f'{label}.{key}')):
+            row_label = f'{label}.{key}[{index}]'
+            row = _closed(raw, {'id', 'status', 'terminal', 'current_node', 'approval_pending'}, row_label)
+            _string(row['id'], f'{row_label}.id')
+            _string(row['status'], f'{row_label}.status')
+            if not isinstance(row['terminal'], bool) or not isinstance(row['approval_pending'], bool):
+                raise JournalError(f'{row_label} terminal state is invalid')
+    for index, raw in enumerate(_bounded_list(snapshot['sessions'], f'{label}.sessions')):
+        row_label = f'{label}.sessions[{index}]'
+        row = _closed(raw, {'id', 'status', 'task_id', 'retained', 'live_owner'}, row_label)
+        _string(row['id'], f'{row_label}.id')
+        _string(row['status'], f'{row_label}.status')
+        if not isinstance(row['retained'], bool):
+            raise JournalError(f'{row_label}.retained is invalid')
+    for index, raw in enumerate(_bounded_list(snapshot['session_manifests'], f'{label}.session_manifests')):
+        row_label = f'{label}.session_manifests[{index}]'
+        row = _closed(raw, {'id', 'manifest'}, row_label)
+        _string(row['id'], f'{row_label}.id')
+        for manifest_index, manifest_raw in enumerate(_bounded_list(row['manifest'], f'{row_label}.manifest')):
+            manifest_label = f'{row_label}.manifest[{manifest_index}]'
+            manifest = _closed(manifest_raw, {'path', 'type', 'mode', 'bytes', 'sha256'}, manifest_label)
+            _string(manifest['path'], f'{manifest_label}.path')
+            if manifest['type'] not in {'file', 'directory'}:
+                raise JournalError(f'{manifest_label}.type is invalid')
+            if not isinstance(manifest['mode'], int) or isinstance(manifest['mode'], bool):
+                raise JournalError(f'{manifest_label}.mode is invalid')
+            if not isinstance(manifest['bytes'], int) or isinstance(manifest['bytes'], bool):
+                raise JournalError(f'{manifest_label}.bytes is invalid')
+            if manifest['type'] == 'file':
+                _sha256(manifest['sha256'], f'{manifest_label}.sha256')
+            elif manifest['sha256'] is not None:
+                raise JournalError(f'{manifest_label}.sha256 is invalid')
+    _portfolio_validate_sqlite(snapshot['sqlite'], f'{label}.sqlite')
+    for key in ('worktrees', 'retained', 'absent'):
+        for index, raw in enumerate(_bounded_list(snapshot[key], f'{label}.{key}')):
+            row_label = f'{label}.{key}[{index}]'
+            row = _closed(raw, {'path', 'branch', 'head', 'dirty', 'owner_session', 'registered', 'retained'}
+                          if key == 'worktrees' else {'kind', 'id', 'path', 'sha256', 'present'}, row_label)
+            if key == 'worktrees':
+                _absolute_path(row['path'], f'{row_label}.path')
+                if not isinstance(row['dirty'], bool) or not isinstance(row['registered'], bool) or not isinstance(
+                        row['retained'], bool):
+                    raise JournalError(f'{row_label} state is invalid')
+            else:
+                if row['kind'] not in {'file', 'directory'}:
+                    raise JournalError(f'{row_label}.kind is invalid')
+                _string(row['id'], f'{row_label}.id')
+                _absolute_path(row['path'], f'{row_label}.path')
+                if not isinstance(row['present'], bool):
+                    raise JournalError(f'{row_label}.present is invalid')
+                if row['sha256'] is not None:
+                    _sha256(row['sha256'], f'{row_label}.sha256')
+
+
+def _portfolio_validate_canonical_snapshot(value: Any, label: str) -> None:
+    snapshot = _closed(value, {
+        'workflow_id', 'project_id', 'version', 'metadata', 'graph', 'tasks', 'task_details', 'terminal_anchors',
+        'links', 'default', 'valid',
+    }, label)
+    _uuid(snapshot['workflow_id'], f'{label}.workflow_id')
+    _uuid(snapshot['project_id'], f'{label}.project_id')
+    if not isinstance(snapshot['version'], int) or isinstance(snapshot['version'], bool):
+        raise JournalError(f'{label}.version is invalid')
+    metadata = _closed(snapshot['metadata'], {'name', 'description', 'execution_target'}, f'{label}.metadata')
+    _string(metadata['name'], f'{label}.metadata.name')
+    _string(metadata['description'], f'{label}.metadata.description', nonempty=False)
+    _string(metadata['execution_target'], f'{label}.metadata.execution_target')
+    graph = _closed(
+        snapshot['graph'], {'version', 'nodes', 'edges', 'node_groups', 'transition_groups'}, f'{label}.graph'
+    )
+    if not isinstance(graph['version'], int) or isinstance(graph['version'], bool):
+        raise JournalError(f'{label}.graph.version is invalid')
+    for key in ('nodes', 'edges', 'node_groups', 'transition_groups'):
+        _bounded_list(graph[key], f'{label}.graph.{key}')
+    for key in ('tasks', 'task_details'):
+        for index, raw in enumerate(_bounded_list(snapshot[key], f'{label}.{key}')):
+            row_label = f'{label}.{key}[{index}]'
+            row = _closed(raw, {'id', 'status', 'terminal', 'current_node', 'approval_pending'}, row_label)
+            _string(row['id'], f'{row_label}.id')
+            _string(row['status'], f'{row_label}.status')
+            if not isinstance(row['terminal'], bool) or not isinstance(row['approval_pending'], bool):
+                raise JournalError(f'{row_label} terminal state is invalid')
+    for index, raw in enumerate(_bounded_list(snapshot['terminal_anchors'], f'{label}.terminal_anchors')):
+        row_label = f'{label}.terminal_anchors[{index}]'
+        row = _closed(raw, {'id', 'kind'}, row_label)
+        _string(row['id'], f'{row_label}.id')
+        _string(row['kind'], f'{row_label}.kind')
+    for index, raw in enumerate(_bounded_list(snapshot['links'], f'{label}.links')):
+        row_label = f'{label}.links[{index}]'
+        row = _closed(raw, {'project_id', 'workflow_id', 'is_default'}, row_label)
+        _uuid(row['project_id'], f'{row_label}.project_id')
+        _uuid(row['workflow_id'], f'{row_label}.workflow_id')
+        if not isinstance(row['is_default'], bool):
+            raise JournalError(f'{row_label}.is_default is invalid')
+    if not isinstance(snapshot['valid'], bool):
+        raise JournalError(f'{label}.valid is invalid')
+
+
+def _portfolio_effect_prefix(
+    effects: Mapping[str, Any], order: Sequence[str], label: str,
+) -> tuple[int, str | None]:
+    pending = {'attempted', 'unresolved', 'ambiguous', 'settled_preimage'}
+    prefix = 0
+    current: str | None = None
+    for key in order:
+        if key not in effects:
+            break
+        raw = effects[key]
+        status = raw.get('status') if isinstance(raw, dict) else None
+        if status == 'verified':
+            prefix += 1
+            continue
+        if status in pending:
+            current = key
+            break
+        raise JournalError(f'{label} has an invalid effect status')
+    tail = prefix + (1 if current is not None else 0)
+    if any(key in effects for key in order[tail:]):
+        raise JournalError(f'{label} is not an exact ordered prefix')
+    return prefix, current
+
+
+def _portfolio_effect_identity(
+    parsed: Mapping[str, Any], key: str, retirement_preimage: Mapping[str, Any],
+    canonical_preimage: Mapping[str, Any], stages_by_workflow: Mapping[str, Sequence[Mapping[str, Any]]],
+    restore_stages_by_workflow: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, Any]:
+    if key.startswith('delete:'):
+        wid = key.removeprefix('delete:')
+        member = next(row for row in parsed['retirement_members'] if row['workflow_id'] == wid)
+        before = retirement_preimage['members'][wid]
+        command = _kent_delete_command(parsed['kent'], wid, True)
+        cwd = member['project_root']
+        stdin = None
+        after = _d9_expected_post(member, before)
+    else:
+        prefix, wid, stage_name = key.split(':', 2)
+        if prefix == 'apply':
+            stages = stages_by_workflow[wid]
+        elif prefix == 'restore':
+            stages = restore_stages_by_workflow[wid]
+        else:
+            raise JournalError(f'unknown portfolio effect key: {key}')
+        stage = next((row for row in stages if row['name'] == stage_name), None)
+        if stage is None:
+            raise JournalError(f'portfolio effect {key} is not in the exact stage plan')
+        command = stage['command']
+        cwd = next(row['project_root'] for row in parsed['canonical_workflows'] if row['workflow_id'] == wid)
+        stdin = stage['stdin']
+        before = stage['before']
+        after = stage['after']
+    return _effect_inputs(
+        command, cwd, None, stdin, canonical_sha256(before), canonical_sha256(after),
+    )[4]
+
+
+def _portfolio_forward_status_count(status: str, stages: Sequence[Mapping[str, Any]]) -> int:
+    if status == 'pending':
+        return 0
+    if status == 'verified':
+        return len(stages)
+    for index, stage in enumerate(stages):
+        if status == stage['status']:
+            return index + 1
+    raise JournalError(f'canonical member status is invalid: {status!r}')
+
+
+def _portfolio_validate_effects(
+    parsed: Mapping[str, Any], value: Any, *, phase: str,
+    retirement_statuses: Mapping[str, str], canonical_statuses: Mapping[str, str],
+    retirement_preimage: Mapping[str, Any], canonical_preimage: Mapping[str, Any],
+    stages_by_workflow: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> None:
+    if not isinstance(value, dict):
+        raise JournalError('release-live-portfolio journal effects are invalid')
+    delete_order = [f'delete:{row["workflow_id"]}' for row in parsed['retirement_members']]
+    apply_order = [
+        f'apply:{wid}:{stage["name"]}'
+        for item in parsed['canonical_workflows']
+        for wid in [item['workflow_id']]
+        for stage in stages_by_workflow[wid]
+    ]
+    apply_prefix, apply_current = _portfolio_effect_prefix(value, apply_order, 'canonical apply effects')
+    apply_counts = {wid: 0 for wid in stages_by_workflow}
+    for key in apply_order[:apply_prefix]:
+        _, wid, _ = key.split(':', 2)
+        apply_counts[wid] += 1
+    restore_stages_by_workflow: dict[str, list[dict[str, Any]]] = {}
+    for item in parsed['canonical_workflows']:
+        wid = item['workflow_id']
+        before = canonical_preimage['members'][wid]
+        if apply_counts[wid]:
+            start = stages_by_workflow[wid][apply_counts[wid] - 1]['after']
+            restore_stages_by_workflow[wid] = _canonical_restore_progress(
+                {'kent': parsed['kent'], 'project_root': item['project_root']}, item, before, start,
+            )
+        else:
+            restore_stages_by_workflow[wid] = []
+    restore_order = [
+        f'restore:{wid}:{stage["name"]}'
+        for item in parsed['canonical_workflows']
+        for wid in [item['workflow_id']]
+        for stage in restore_stages_by_workflow[wid]
+    ]
+    apply_segment = apply_order
+    if restore_order:
+        apply_segment = apply_order[:apply_prefix] + ([apply_current] if apply_current is not None else [])
+    order = delete_order + apply_segment + restore_order
+    delete_prefix, delete_current = _portfolio_effect_prefix(value, delete_order, 'retirement effects')
+    restore_prefix, restore_current = _portfolio_effect_prefix(value, restore_order, 'restore effects')
+    if set(value) - set(order):
+        raise JournalError('release-live-portfolio journal effect identity is invalid')
+    active_current = []
+    if delete_current is not None:
+        active_current.append(delete_current)
+    if apply_current is not None and value[apply_current].get('status') != 'settled_preimage':
+        active_current.append(apply_current)
+    if restore_current is not None:
+        active_current.append(restore_current)
+    if len(active_current) > 1:
+        raise JournalError('portfolio effect prefix has multiple active receipts')
+    if delete_current is not None and (apply_prefix or restore_prefix or apply_current or restore_current):
+        raise JournalError('retirement current receipt cannot precede canonical effects')
+    if apply_current is not None and (restore_prefix or restore_current):
+        if value[apply_current].get('status') != 'settled_preimage':
+            raise JournalError('canonical restore cannot follow an unresolved apply effect')
+    in_flight = [
+        key for key, effect in value.items()
+        if isinstance(effect, dict) and effect.get('status') in {'attempted', 'unresolved', 'ambiguous'}
+    ]
+    if len(in_flight) > 1:
+        raise JournalError('release-live-portfolio has multiple in-flight effects')
+    fields = {
+        'command_digest', 'cwd', 'environment_sha256', 'stdin_sha256', 'preimage_sha256', 'postimage_sha256',
+        'status', 'attempt', 'child', 'result', 'settled_invocation',
+    }
+    required = {
+        'command_digest', 'cwd', 'environment_sha256', 'stdin_sha256', 'preimage_sha256', 'postimage_sha256',
+        'status', 'attempt', 'child',
+    }
+    for key, raw in value.items():
+        label = f'journal.effects[{key}]'
+        effect = _closed(raw, fields, label)
+        missing = sorted(required - set(effect))
+        if missing:
+            raise JournalError(f'{label} is missing required fields: {missing}')
+        expected = _portfolio_effect_identity(
+            parsed, key, retirement_preimage, canonical_preimage, stages_by_workflow,
+            restore_stages_by_workflow,
+        )
+        _verify_effect_identity(effect, expected)
+        if effect['status'] not in {'attempted', 'unresolved', 'ambiguous', 'verified', 'settled_preimage'}:
+            raise JournalError(f'{label}.status is invalid')
+        if not isinstance(effect['attempt'], int) or isinstance(effect['attempt'], bool) or effect['attempt'] < 1:
+            raise JournalError(f'{label}.attempt is invalid')
+        child = effect['child']
+        if child is not None:
+            child = _closed(child, {'guardian_pid', 'child_pid'}, f'{label}.child')
+            for pid_key in ('guardian_pid', 'child_pid'):
+                if not isinstance(child[pid_key], int) or isinstance(child[pid_key], bool) or child[pid_key] <= 0:
+                    raise JournalError(f'{label}.child.{pid_key} is invalid')
+        result = effect.get('result')
+        if result is not None:
+            if not isinstance(result, dict):
+                raise JournalError(f'{label}.result is invalid')
+            if set(result) == {'timed_out'}:
+                if result['timed_out'] is not True:
+                    raise JournalError(f'{label}.result.timed_out is invalid')
+            elif set(result) == {'returncode', 'stdout_sha256', 'stderr_sha256'}:
+                if not isinstance(result['returncode'], int) or isinstance(result['returncode'], bool):
+                    raise JournalError(f'{label}.result.returncode is invalid')
+                _sha256(result['stdout_sha256'], f'{label}.result.stdout_sha256')
+                _sha256(result['stderr_sha256'], f'{label}.result.stderr_sha256')
+            else:
+                raise JournalError(f'{label}.result is not closed')
+        if effect.get('settled_invocation') is not None:
+            _sha256(effect['settled_invocation'], f'{label}.settled_invocation')
+    if restore_prefix:
+        lag_key = restore_order[restore_prefix - 1]
+    elif apply_prefix:
+        lag_key = apply_order[apply_prefix - 1]
+    elif delete_prefix:
+        lag_key = delete_order[delete_prefix - 1]
+    else:
+        lag_key = None
+    apply_lag_key = apply_order[apply_prefix - 1] if apply_prefix else None
+    retirement_values = [retirement_statuses[row['workflow_id']] for row in parsed['retirement_members']]
+    if any(status not in {'pending', 'verified'} for status in retirement_values):
+        raise JournalError('retirement member status is invalid')
+    retirement_count = sum(status == 'verified' for status in retirement_values)
+    if retirement_values != ['verified'] * retirement_count + ['pending'] * (len(retirement_values) - retirement_count):
+        raise JournalError('retirement member status order drifted')
+    if delete_current is not None:
+        if retirement_count != delete_prefix:
+            raise JournalError('retirement status/effect bijection is invalid')
+    elif retirement_count not in {delete_prefix, delete_prefix - 1}:
+        raise JournalError('retirement status/effect bijection is invalid')
+    elif retirement_count == delete_prefix - 1 and lag_key != delete_order[delete_prefix - 1]:
+        raise JournalError('retirement verified effect acknowledgement is out of order')
+    if phase == 'prepared':
+        if value or retirement_count or any(status != 'pending' for status in canonical_statuses.values()):
+            raise JournalError('prepared release-live-portfolio member state is impossible')
+        return
+    if phase == 'retirement_in_progress':
+        if apply_prefix or restore_prefix or apply_current or restore_current:
+            raise JournalError('retirement_in_progress contains canonical effects')
+        if any(status != 'pending' for status in canonical_statuses.values()):
+            raise JournalError('retirement_in_progress requires pending canonical members')
+        return
+    if phase == 'rolled_back' and not value and not retirement_count and all(
+        status == 'pending' for status in canonical_statuses.values()
+    ):
+        return
+    if delete_prefix != len(delete_order) or delete_current is not None or retirement_count != len(delete_order):
+        raise JournalError(f'{phase} requires a settled retirement prefix')
+    if phase == 'd9_complete':
+        if apply_prefix or restore_prefix or apply_current or restore_current:
+            raise JournalError('d9_complete contains canonical effects')
+        if any(status != 'pending' for status in canonical_statuses.values()):
+            raise JournalError('d9_complete requires pending canonical members')
+        return
+    if phase not in {'canonical_in_progress', 'complete', 'rolled_back'}:
+        raise JournalError(f'unsupported portfolio phase: {phase}')
+    if phase == 'complete' and any(key.startswith('restore:') for key in value):
+        raise JournalError('complete cannot contain restore effects')
+    if apply_current is not None and (restore_prefix or restore_current is not None):
+        if value[apply_current].get('status') != 'settled_preimage':
+            raise JournalError('canonical restore cannot follow an unresolved apply effect')
+    for item in parsed['canonical_workflows']:
+        wid = item['workflow_id']
+        stages = stages_by_workflow[wid]
+        count = apply_counts[wid]
+        status = canonical_statuses[wid]
+        status_count = None if status == 'rolled_back' else _portfolio_forward_status_count(status, stages)
+        last_key = apply_lag_key
+        lag_allowed = bool(
+            status_count is not None and count and status_count == count - 1
+            and last_key == f'apply:{wid}:{stages[count - 1]["name"]}'
+        )
+        if status_count is not None and status_count != count and not lag_allowed:
+            raise JournalError('canonical status/effect bijection is invalid')
+        restore_stages = restore_stages_by_workflow[wid]
+        restore_keys = [f'restore:{wid}:{stage["name"]}' for stage in restore_stages]
+        restore_count = sum(value[key].get('status') == 'verified' for key in restore_keys if key in value)
+        restore_current_for_member = restore_current is not None and restore_current.startswith(f'restore:{wid}:')
+        if count == 0 and (restore_keys or status != 'pending'):
+            raise JournalError('canonical pending member has restore effects')
+        if restore_count or restore_current_for_member:
+            if count == 0:
+                raise JournalError('canonical restore has no applied stage prefix')
+            if restore_count < len(restore_stages) and status == 'rolled_back':
+                raise JournalError('canonical member is rolled_back before restore completion')
+            if restore_count == len(restore_stages) and status not in {
+                'rolled_back', 'pending', 'verified', *[stage['status'] for stage in stages],
+            }:
+                raise JournalError('canonical restore acknowledgement state is invalid')
+        if phase == 'complete':
+            if status != 'verified' or count != len(stages) or restore_keys:
+                raise JournalError('complete requires all canonical apply effects and no restore effects')
+        elif phase == 'rolled_back':
+            if count == 0:
+                if status != 'pending' or restore_keys:
+                    raise JournalError('rolled_back contains an untouched canonical member effect')
+            elif status != 'rolled_back' or restore_count != len(restore_stages) or restore_current_for_member:
+                raise JournalError('rolled_back restore/status bijection is invalid')
+    if phase == 'complete':
+        if apply_prefix != len(apply_order) or restore_prefix or restore_current is not None:
+            raise JournalError('complete requires all planned apply effects and no restore effects')
+        return
+    if phase == 'rolled_back':
+        if apply_current is not None and value[apply_current].get('status') != 'settled_preimage':
+            raise JournalError('rolled_back cannot contain an unresolved apply effect')
+        if restore_current is not None:
+            raise JournalError('rolled_back cannot contain an unresolved restore effect')
+        if not value:
+            if any(status != 'pending' for status in retirement_values + list(canonical_statuses.values())):
+                raise JournalError('empty rolled_back journal has impossible member state')
+        return
+    if any(status == 'rolled_back' for status in canonical_statuses.values()):
+        if restore_prefix == 0 and restore_current is None:
+            raise JournalError('rolled_back canonical status requires restore effects')
+
+
+def _portfolio_validate_journal_inner(parsed: Mapping[str, Any], state: Mapping[str, Any]) -> None:
+    required = {
+        'schema', 'operation', 'plan_sha256', 'phase', 'retirement_preimage', 'canonical_preimage',
+        'retirement_targets', 'canonical_targets', 'members', 'effects',
+    }
+    if set(state) != required:
+        raise JournalError('release-live-portfolio journal fields are not closed')
+    if state['operation'] != RELEASE_LIVE_PORTFOLIO_OPERATION:
+        raise JournalError('release-live-portfolio journal operation is invalid')
+    if not isinstance(state['members'], list) or len(state['members']) != 10:
+        raise JournalError('release-live-portfolio journal members are incomplete')
+    expected = [row['workflow_id'] for row in [*parsed['retirement_members'], *parsed['canonical_workflows']]]
+    ids = []
+    for index, raw in enumerate(state['members']):
+        member = _closed(raw, {'workflow_id', 'status'}, f'journal.members[{index}]')
+        label = f'journal.members[{index}]'
+        ids.append(_uuid(_required(member, 'workflow_id', label), f'{label}.workflow_id'))
+        status = _string(_required(member, 'status', label), f'{label}.status')
+        if status not in PORTFOLIO_MEMBER_STATUSES:
+            raise JournalError('release-live-portfolio journal member status is invalid')
+    if ids != expected:
+        raise JournalError('release-live-portfolio journal member order drifted')
+    status_by_workflow = {row['workflow_id']: row['status'] for row in state['members']}
+    retirement_ids = {row['workflow_id'] for row in parsed['retirement_members']}
+    retirement_statuses = {wid: status_by_workflow[wid] for wid in retirement_ids}
+    canonical_statuses = {wid: status_by_workflow[wid] for wid in {
+        row['workflow_id'] for row in parsed['canonical_workflows']
+    }}
+    if any(status not in {'pending', 'verified'} for status in retirement_statuses.values()):
+        raise JournalError('retirement member status is invalid')
+    canonical_ids = {row['workflow_id'] for row in parsed['canonical_workflows']}
+    retirement_targets = state['retirement_targets']
+    if not isinstance(retirement_targets, dict) or set(retirement_targets) != retirement_ids:
+        raise JournalError('retirement target identities drifted')
+    canonical_targets = state['canonical_targets']
+    if not isinstance(canonical_targets, dict) or set(canonical_targets) != canonical_ids:
+        raise JournalError('canonical target identities drifted')
+    retirement_preimage = _closed(
+        state['retirement_preimage'], {'projects', 'database_schema', 'sqlite', 'members'},
+        'journal.retirement_preimage',
+    )
+    canonical_preimage = _closed(
+        state['canonical_preimage'], {'projects', 'members'}, 'journal.canonical_preimage'
+    )
+    if canonical_preimage['projects'] != retirement_preimage['projects']:
+        raise JournalError('canonical and retirement project preimages differ')
+    _portfolio_validate_projects(retirement_preimage['projects'], 'journal.retirement_preimage.projects')
+    _portfolio_validate_projects(canonical_preimage['projects'], 'journal.canonical_preimage.projects')
+    expected_project_paths = {project_id: str(root) for project_id, root in parsed['project_roots'].items()}
+    actual_project_paths = {row['id']: row['path'] for row in retirement_preimage['projects']}
+    if actual_project_paths != expected_project_paths:
+        raise JournalError('journal projects do not match the plan mapping')
+    if retirement_preimage['database_schema'] != parsed['schema']:
+        raise JournalError('retirement preimage database schema drifted')
+    _portfolio_validate_sqlite(retirement_preimage['sqlite'], 'journal.retirement_preimage.sqlite')
+    retirement_members = retirement_preimage.get('members')
+    canonical_members = canonical_preimage.get('members')
+    if not isinstance(retirement_members, dict) or set(retirement_members) != retirement_ids:
+        raise JournalError('retirement preimage identities drifted')
+    if not isinstance(canonical_members, dict) or set(canonical_members) != canonical_ids:
+        raise JournalError('canonical preimage identities drifted')
+    stages_by_workflow: dict[str, list[dict[str, Any]]] = {}
+    for member in parsed['retirement_members']:
+        wid = member['workflow_id']
+        _portfolio_validate_d9_snapshot(retirement_members[wid], f'journal.retirement_preimage.members[{wid}]')
+        target = retirement_targets.get(wid)
+        _sha256(target, f'retirement_targets[{wid}]')
+        expected_target = _d9_expected_post(member, retirement_members[wid])
+        if target != canonical_sha256(expected_target):
+            raise JournalError('retirement target preimage drifted')
+    for item in parsed['canonical_workflows']:
+        wid = item['workflow_id']
+        _portfolio_validate_canonical_snapshot(
+            canonical_members[wid], f'journal.canonical_preimage.members[{wid}]'
+        )
+        target = _closed(
+            canonical_targets.get(wid),
+            {'preimage_sha256', 'target_sha256', 'stages'},
+            f'canonical_targets[{wid}]',
+        )
+        _sha256(target['preimage_sha256'], f'canonical_targets[{wid}].preimage_sha256')
+        _sha256(target['target_sha256'], f'canonical_targets[{wid}].target_sha256')
+        if target['preimage_sha256'] != canonical_sha256(canonical_members[wid]):
+            raise JournalError('canonical target preimage drifted')
+        stages = _canonical_progress(
+            {'kent': parsed['kent'], 'project_root': item['project_root']}, item, canonical_members[wid]
+        )
+        expected_stages = [
+            {
+                'name': stage['name'],
+                'before_sha256': canonical_sha256(stage['before']),
+                'after_sha256': canonical_sha256(stage['after']),
+            }
+            for stage in stages
+        ]
+        if target['stages'] != expected_stages:
+            raise JournalError('canonical stage target digests drifted')
+        if target['target_sha256'] != canonical_sha256(stages[-1]['after'] if stages else canonical_members[wid]):
+            raise JournalError('canonical final target digest drifted')
+        stages_by_workflow[wid] = stages
+    _portfolio_validate_effects(
+        parsed,
+        state['effects'],
+        phase=state['phase'],
+        retirement_statuses=retirement_statuses,
+        canonical_statuses=canonical_statuses,
+        retirement_preimage=retirement_preimage,
+        canonical_preimage=canonical_preimage,
+        stages_by_workflow=stages_by_workflow,
+    )
+
+
+def _portfolio_validate_journal(parsed: Mapping[str, Any], state: Mapping[str, Any]) -> None:
+    try:
+        _portfolio_validate_journal_inner(parsed, state)
+    except PlanValidationError as error:
+        raise JournalError(str(error)) from error
+
+
+def _portfolio_apply_direction_guard(parsed: Mapping[str, Any], state: Mapping[str, Any]) -> None:
+    effects = state.get('effects') or {}
+    if any(key.startswith('restore:') for key in effects):
+        raise JournalError('apply is forbidden after canonical rollback has started')
+    canonical_ids = {row['workflow_id'] for row in parsed['canonical_workflows']}
+    if any(
+        isinstance(row, dict) and row.get('workflow_id') in canonical_ids and row.get('status') == 'rolled_back'
+        for row in state.get('members', [])
+    ):
+        raise JournalError('apply is forbidden for a rolled_back canonical member')
+
+
+def reconcile_release_live_portfolio(
+    plan: LoadedPlan,
+    *,
+    mode: str,
+    kent: str | Path | None = None,
+    confirm: str | None = None,
+) -> dict[str, Any]:
+    parsed = _validate_release_live_portfolio_plan(plan)
+    if kent is None:
+        kent = parsed['kent']
+    if mode not in {'preview', 'prepare', 'retire', 'apply', 'rollback'}:
+        raise PlanValidationError('release-live-portfolio mode is unsupported')
+    if str(kent) != str(parsed['kent']):
+        raise PlanValidationError('runtime --kent differs from the plan-bound executable')
+    if mode in {'retire', 'apply', 'rollback'} and confirm != plan.sha256:
+        raise PlanValidationError('release-live-portfolio mutation requires confirmation')
+    if mode == 'preview':
+        state = _portfolio_read_state(parsed)
+        _portfolio_preimage_gate(parsed, state)
+        return _release_live_report(plan, 'preview')
+    if mode == 'prepare':
+        state = _portfolio_read_state(parsed)
+        _portfolio_preimage_gate(parsed, state)
+        with OperationJournal(parsed['state_dir'], RELEASE_LIVE_PORTFOLIO_OPERATION, plan) as journal:
+            if journal.state is not None:
+                raise JournalError('release-live-portfolio prepare refuses an existing journal')
+            members = [
+                {'workflow_id': member['workflow_id'], 'status': 'pending'}
+                for member in [*parsed['retirement_members'], *parsed['canonical_workflows']]
+            ]
+            journal.persist({
+                'phase': 'prepared', 'retirement_preimage': _portfolio_journal_preimage(parsed, state),
+                'canonical_preimage': _portfolio_canonical_preimage(state),
+                'retirement_targets': {
+                    member['workflow_id']: canonical_sha256(
+                        _d9_expected_post(member, state['retirement'][member['workflow_id']])
+                    )
+                    for member in parsed['retirement_members']
+                },
+                'canonical_targets': _portfolio_canonical_targets(parsed, state),
+                'members': members, 'effects': {},
+            })
+            return _release_live_report(plan, 'prepared', journal)
+    with OperationJournal(parsed['state_dir'], RELEASE_LIVE_PORTFOLIO_OPERATION, plan) as journal:
+        state = journal.require_phase({
+            'prepared', 'retirement_in_progress', 'd9_complete', 'canonical_in_progress', 'complete', 'rolled_back',
+        })
+        _portfolio_validate_journal(parsed, state)
+        if mode == 'rollback':
+            if state['phase'] == 'prepared':
+                current = _portfolio_read_state(parsed)
+                _portfolio_preimage_gate(parsed, current)
+                journal.persist({**state, 'phase': 'rolled_back'})
+                return _release_live_report(plan, 'rolled_back', journal)
+            if state['phase'] in {'retirement_in_progress', 'd9_complete'}:
+                raise JournalError('D9 is irreversible after the first retirement effect')
+            if state['phase'] == 'complete':
+                raise JournalError('complete requires a new separately approved restore plan')
+            d9_preimage = {
+                'projects': state['retirement_preimage']['projects'],
+                'database_schema': state['retirement_preimage']['database_schema'],
+                'sqlite': state['retirement_preimage']['sqlite'],
+                'retirement': state['retirement_preimage']['members'],
+                'canonical': state['canonical_preimage']['members'],
+            }
+            if state['phase'] == 'rolled_back':
+                current = _portfolio_read_state(parsed)
+                if not journal.state.get('effects'):
+                    _portfolio_preimage_gate(parsed, current)
+                else:
+                    _portfolio_d9_post_gate(parsed, current, d9_preimage)
+                    _portfolio_restore_state_gate(parsed, current, journal)
+                    for item in parsed['canonical_workflows']:
+                        wid = item['workflow_id']
+                        preimage = state['canonical_preimage']['members'][wid]
+                        start = _portfolio_forward_state(parsed, item, preimage, journal)
+                        restore_stages = _portfolio_restore_stages(parsed, item, preimage, start)
+                        expected = restore_stages[-1]['after'] if restore_stages else start
+                        if canonical_sha256(current['canonical'][wid]) != canonical_sha256(expected):
+                            raise EffectBlocked('rolled_back canonical restore state drifted')
+                return _release_live_report(plan, 'rolled_back', journal)
+            current = _portfolio_read_state(parsed)
+            _portfolio_d9_post_gate(parsed, current, d9_preimage)
+            for item in parsed['canonical_workflows']:
+                wid = item['workflow_id']
+                before = state['canonical_preimage']['members'][wid]
+                forward, applied_count = _portfolio_forward_progress(parsed, item, before, journal)
+                if applied_count == 0:
+                    continue
+                start = forward[applied_count - 1]['after']
+                stages = _portfolio_restore_stages(parsed, item, before, start)
+                for stage in stages:
+                    effect_key = f'restore:{wid}:{stage["name"]}'
+                    effect = (journal.state.get('effects') or {}).get(effect_key)
+                    if isinstance(effect, dict) and effect.get('status') == 'verified':
+                        continue
+                    current_live = _portfolio_read_state(parsed)
+                    _portfolio_d9_post_gate(parsed, current_live, d9_preimage)
+                    _portfolio_restore_state_gate(
+                        parsed, current_live, journal, (wid, stage['name'])
+                    )
+                    current_hash = canonical_sha256(current_live['canonical'][wid])
+                    before_hash = canonical_sha256(stage['before'])
+                    after_hash = canonical_sha256(stage['after'])
+                    if current_hash == after_hash:
+                        if not isinstance(effect, dict) or effect.get('status') == 'settled_preimage':
+                            raise EffectBlocked('canonical rollback postimage lacks a journaled restore effect')
+                        if effect.get('status') == 'verified':
+                            continue
+                    elif current_hash != before_hash:
+                        raise EffectBlocked('canonical rollback source state drifted')
+                    current_fn = lambda item=item: canonical_sha256(
+                        _portfolio_read_state(parsed)['canonical'][item['workflow_id']]
+                    )
+                    settled = _settle_or_run(
+                        journal, effect_key=effect_key,
+                        command=stage['command'], cwd=item['project_root'],
+                        preimage_sha256=before_hash, postimage_sha256=after_hash,
+                        current_sha256=current_fn, stdin_bytes=stage['stdin'],
+                    )
+                    if settled == 'preimage':
+                        return {
+                            **_release_live_report(plan, 'canonical_in_progress', journal),
+                            'settled': 'preimage',
+                        }
+                    if canonical_sha256(_portfolio_read_state(parsed)['canonical'][wid]) != after_hash:
+                        raise EffectBlocked('canonical rollback postimage drifted')
+                _portfolio_set_status(journal, wid, 'rolled_back')
+            final = _portfolio_read_state(parsed)
+            _portfolio_d9_post_gate(parsed, final, d9_preimage)
+            _portfolio_restore_state_gate(parsed, final, journal)
+            for item in parsed['canonical_workflows']:
+                wid = item['workflow_id']
+                preimage = state['canonical_preimage']['members'][wid]
+                start = _portfolio_forward_state(parsed, item, preimage, journal)
+                restore_stages = _portfolio_restore_stages(parsed, item, preimage, start)
+                expected = restore_stages[-1]['after'] if restore_stages else start
+                if canonical_sha256(final['canonical'][wid]) != canonical_sha256(expected):
+                    raise EffectBlocked('canonical rollback did not reach the forward-restore target')
+            journal.persist({**journal.state, 'phase': 'rolled_back'})
+            return _release_live_report(plan, 'rolled_back', journal)
+        if mode == 'retire':
+            if state['phase'] not in {'prepared', 'retirement_in_progress'}:
+                raise JournalError('retire requires a prepared or retirement-in-progress journal')
+            if state['phase'] == 'prepared':
+                live = _portfolio_read_state(parsed)
+                _portfolio_preimage_gate(parsed, live)
+                journal.persist({**state, 'phase': 'retirement_in_progress'})
+            preimage = {
+                'projects': state['retirement_preimage']['projects'],
+                'database_schema': state['retirement_preimage']['database_schema'],
+                'sqlite': state['retirement_preimage']['sqlite'],
+                'retirement': state['retirement_preimage']['members'],
+                'canonical': state['canonical_preimage']['members'],
+            }
+            for member in parsed['retirement_members']:
+                wid = member['workflow_id']
+                if _portfolio_member_status(journal.state, wid) == 'verified':
+                    continue
+                live = _portfolio_read_state(parsed)
+                statuses = {
+                    row['workflow_id']: _portfolio_member_status(journal.state, row['workflow_id'])
+                    for row in parsed['retirement_members']
+                }
+                existing = (journal.state.get('effects') or {}).get(f'delete:{wid}')
+                settling = wid if isinstance(existing, dict) else None
+                _portfolio_retirement_gate(parsed, live, preimage, statuses, settling)
+                before = preimage['retirement'][wid]
+                after = _d9_expected_post(member, before)
+                command = _kent_delete_command(parsed['kent'], wid, True)
+                current = lambda member=member: _portfolio_read_state(parsed)['retirement'][member['workflow_id']]
+                settled = _settle_or_run(
+                    journal, effect_key=f'delete:{wid}', command=command, cwd=member['project_root'],
+                    preimage_sha256=canonical_sha256(before), postimage_sha256=canonical_sha256(after),
+                    current_sha256=lambda: canonical_sha256(current()),
+                )
+                if settled == 'preimage':
+                    return {**_release_live_report(plan, 'retirement_in_progress', journal), 'settled': 'preimage'}
+                if canonical_sha256(current()) != canonical_sha256(after):
+                    raise EffectBlocked('retirement member postimage drifted')
+                _portfolio_set_status(journal, wid, 'verified')
+            final = _portfolio_read_state(parsed)
+            expected = _portfolio_expected_post(parsed, preimage)
+            if not _portfolio_state_matches(final, expected):
+                raise EffectBlocked('D9 complete poststate is not exact')
+            journal.persist({**journal.state, 'phase': 'd9_complete'})
+            return _release_live_report(plan, 'd9_complete', journal)
+        if mode == 'apply':
+            if state['phase'] not in {'d9_complete', 'canonical_in_progress'}:
+                raise JournalError('apply requires d9_complete or canonical_in_progress')
+            _portfolio_apply_direction_guard(parsed, state)
+            d9_preimage = {
+                'projects': state['retirement_preimage']['projects'],
+                'database_schema': state['retirement_preimage']['database_schema'],
+                'sqlite': state['retirement_preimage']['sqlite'], 'retirement': state['retirement_preimage']['members'],
+                'canonical': state['canonical_preimage']['members'],
+            }
+            _portfolio_d9_post_gate(parsed, _portfolio_read_state(parsed), d9_preimage)
+            journal.persist({**state, 'phase': 'canonical_in_progress'})
+            for item in parsed['canonical_workflows']:
+                wid = item['workflow_id']
+                before = state['canonical_preimage']['members'][wid]
+                stages = _canonical_progress(
+                    {'kent': parsed['kent'], 'project_root': item['project_root']}, item, before
+                )
+                status = _portfolio_member_status(journal.state, wid)
+                stage_statuses = [stage['status'] for stage in stages]
+                status_index = stage_statuses.index(status) if status in stage_statuses else -1
+                for stage_index, stage in enumerate(stages):
+                    if status == 'verified' or stage_index <= status_index:
+                        continue
+                    current_state = _portfolio_read_state(parsed)
+                    _portfolio_d9_post_gate(parsed, current_state, d9_preimage)
+                    _portfolio_canonical_state_gate(parsed, current_state, journal, (wid, stage['name']))
+                    live = current_state['canonical'][wid]
+                    expected_before = stage['before']
+                    existing = (journal.state.get('effects') or {}).get(f'apply:{wid}:{stage["name"]}')
+                    if canonical_sha256(live) not in {
+                        canonical_sha256(expected_before),
+                        canonical_sha256(stage['after']) if isinstance(existing, dict) else '',
+                    }:
+                        raise EffectBlocked('canonical pre-effect state drifted')
+                    current_fn = lambda item=item: canonical_sha256(
+                        _portfolio_read_state(parsed)['canonical'][item['workflow_id']]
+                    )
+                    settled = _settle_or_run(
+                        journal, effect_key=f'apply:{wid}:{stage["name"]}',
+                        command=stage['command'], cwd=item['project_root'],
+                        preimage_sha256=canonical_sha256(stage['before']),
+                        postimage_sha256=canonical_sha256(stage['after']),
+                        current_sha256=current_fn, stdin_bytes=stage['stdin'],
+                    )
+                    if settled == 'preimage':
+                        return {**_release_live_report(plan, 'canonical_in_progress', journal), 'settled': 'preimage'}
+                    if not _portfolio_state_matches(_portfolio_read_state(parsed)['canonical'][wid], stage['after']):
+                        raise EffectBlocked('canonical stage postimage drifted')
+                    _portfolio_set_status(journal, wid, stage['status'])
+                    status = stage['status']
+                _portfolio_set_status(journal, wid, 'verified')
+            final = _portfolio_read_state(parsed)
+            _portfolio_d9_post_gate(parsed, final, d9_preimage)
+            for item in parsed['canonical_workflows']:
+                live = final['canonical'][item['workflow_id']]
+                target = state['canonical_targets'][item['workflow_id']]['target_sha256']
+                if canonical_sha256(live) != target:
+                    raise EffectBlocked('canonical target postimage is not exact')
+            journal.persist({**journal.state, 'phase': 'complete'})
+            return _release_live_report(plan, 'complete', journal)
+        raise OperationError('unreachable release-live-portfolio mode')
 
 def _activation_lstat(path: Path) -> dict[str, Any]:
     if path.is_symlink():

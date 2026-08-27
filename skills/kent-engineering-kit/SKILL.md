@@ -67,3 +67,27 @@ Use `.kent/scripts/workflow-verify` or the repository profile command.
 Generated workflows declare an explicit Kent 2.6.1 execution-target policy.
 Run `./scripts/validate` for source-only deterministic verification; use
 `--installed-state` only when that separate effect is authorized.
+
+## Release-live portfolio operation
+
+`release-live-portfolio` is a separate portfolio-only operation. Its closed
+`release-live-portfolio-plan-v1` binds one absolute state directory, the exact
+Kent executable bytes, the read-only Kent database and Session roots, six
+ordered retirement members, and four ordered canonical members. The driver
+constructs no commands, SQL, probes, shells, or caller-supplied journal/report
+paths.
+
+Use `scripts/reconcile-release-portfolio` only with the exact plan digest and
+absolute Kent path:
+
+```text
+preview -> prepare -> retire -> apply -> complete
+```
+
+`prepare` writes the fixed
+`<state_dir>/release-live-portfolio.journal.json` receipt before any D9 effect.
+`retire` is irreversible after its first confirmed delete. `apply` requires the
+exact D9 poststate before every canonical graph or metadata effect. `rollback`
+is a separately confirmed forward restore during canonical progression; it
+cannot undo D9 or rewind a completed operation. Existing single-project v1
+operation plans and CLIs are unchanged.

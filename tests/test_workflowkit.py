@@ -414,7 +414,7 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertLessEqual(
             (REPO_ROOT / "contracts" / "workflow-contract.md").stat().st_size,
-            35000,
+            36500,
         )
         self.assertNotIn(
             "The runner has received a shutdown signal",

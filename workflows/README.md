@@ -105,3 +105,21 @@ Only the user confirms deletion with `--confirm`. Workflow deletion removes
 the definition, links, and task database rows but leaves repositories and
 managed worktrees for separate inspection. Never repair workflow state by
 editing Kent's database.
+
+## Portfolio retirement and canonical reconciliation
+
+The Kit also provides the separate `release-live-portfolio-plan-v1` operation
+for one approved cross-project envelope. It owns the fixed journal
+`<state_dir>/release-live-portfolio.journal.json` and the ordered
+`preview -> prepare -> retire -> apply -> complete` sequence. The plan binds
+six retirement Workflows and four protected canonical Workflows, their exact
+projects, terminal Tasks, Session manifests, worktrees, resources, links,
+defaults, revisions, and target graphs/metadata.
+
+`prepare` captures the canonical preimage before D9. `retire` uses only the
+fixed `workflow delete <uuid> --confirm --json` effect and has no rollback after
+the first delete. `apply` revalidates the complete D9 poststate and every
+canonical pre/post stage before each effect. Canonical rollback is a confirmed
+forward restore inside the same operation; completed operations require a new
+restore plan. The existing single-project retirement and canonical CLIs remain
+v1-compatible and are not replaced by this operation.
