@@ -116,7 +116,9 @@ six retirement Workflows and four protected canonical Workflows, their exact
 projects, terminal Tasks, Session manifests, worktrees, resources, links,
 defaults, revisions, and target graphs/metadata.
 
-`prepare` captures the canonical preimage before D9. `retire` uses only the
+`prepare` is a separately confirmed durable local journal mutation: it requires
+exact `--confirm` equal to the plan SHA-256 before the fixed pre-D9 receipt and
+performs no D9 or Workflow effect. `retire` uses only the
 fixed `workflow delete <uuid> --confirm --json` effect and has no rollback after
 the first delete. `apply` revalidates the complete D9 poststate and every
 canonical pre/post stage before each effect. Canonical rollback is a confirmed

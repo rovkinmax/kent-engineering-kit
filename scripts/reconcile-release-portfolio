@@ -13,18 +13,16 @@ sys.path.insert(0, str(ROOT))
 
 from workflowkit.operations import (  # noqa: E402
     OperationError,
+    RELEASE_LIVE_PORTFOLIO_MODES,
+    RELEASE_LIVE_PORTFOLIO_MUTATION_MODES,
     load_plan,
     reconcile_release_live_portfolio,
 )
 
 
-MODES = ("preview", "prepare", "retire", "apply", "rollback")
-MUTATION_MODES = {"retire", "apply", "rollback"}
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(prog="scripts/reconcile-release-portfolio")
-    parser.add_argument("mode", choices=MODES)
+    parser.add_argument("mode", choices=RELEASE_LIVE_PORTFOLIO_MODES)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--expect-plan-sha256", required=True)
     parser.add_argument("--kent", required=True)
@@ -35,16 +33,16 @@ def main() -> int:
     kent = Path(args.kent)
     if not kent.is_absolute():
         parser.error("--kent must be an absolute path")
-    if args.mode not in MUTATION_MODES and args.confirm is not None:
+    if args.mode not in RELEASE_LIVE_PORTFOLIO_MUTATION_MODES and args.confirm is not None:
         parser.error("--confirm is only valid for mutation modes")
-    if args.mode in MUTATION_MODES and args.confirm is None:
+    if args.mode in RELEASE_LIVE_PORTFOLIO_MUTATION_MODES and args.confirm is None:
         parser.error(f"{args.mode} requires --confirm")
     try:
         plan = load_plan(
             args.plan,
             schema="release-live-portfolio-plan-v1",
             expected_sha256=args.expect_plan_sha256,
-            mutation=args.mode in MUTATION_MODES,
+            mutation=args.mode in RELEASE_LIVE_PORTFOLIO_MUTATION_MODES,
             confirm=args.confirm,
         )
         report = reconcile_release_live_portfolio(

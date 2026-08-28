@@ -47,6 +47,8 @@ JOURNAL_FIELDS = {
 RELEASE_LIVE_PORTFOLIO_SCHEMA = 'release-live-portfolio-plan-v1'
 RELEASE_LIVE_PORTFOLIO_OPERATION = 'release-live-portfolio'
 RELEASE_LIVE_PORTFOLIO_REPORT = 'release-live-portfolio-report-v1'
+RELEASE_LIVE_PORTFOLIO_MODES = ('preview', 'prepare', 'retire', 'apply', 'rollback')
+RELEASE_LIVE_PORTFOLIO_MUTATION_MODES = frozenset({'prepare', 'retire', 'apply', 'rollback'})
 PORTFOLIO_PHASES = {
     'prepared', 'retirement_in_progress', 'd9_complete', 'canonical_in_progress', 'complete', 'rolled_back',
 }
@@ -3449,15 +3451,15 @@ def reconcile_release_live_portfolio(
     kent: str | Path | None = None,
     confirm: str | None = None,
 ) -> dict[str, Any]:
+    if mode not in RELEASE_LIVE_PORTFOLIO_MODES:
+        raise PlanValidationError('release-live-portfolio mode is unsupported')
+    if mode in RELEASE_LIVE_PORTFOLIO_MUTATION_MODES and confirm != plan.sha256:
+        raise PlanValidationError('release-live-portfolio mutation requires confirmation')
     parsed = _validate_release_live_portfolio_plan(plan)
     if kent is None:
         kent = parsed['kent']
-    if mode not in {'preview', 'prepare', 'retire', 'apply', 'rollback'}:
-        raise PlanValidationError('release-live-portfolio mode is unsupported')
     if str(kent) != str(parsed['kent']):
         raise PlanValidationError('runtime --kent differs from the plan-bound executable')
-    if mode in {'retire', 'apply', 'rollback'} and confirm != plan.sha256:
-        raise PlanValidationError('release-live-portfolio mutation requires confirmation')
     if mode == 'preview':
         state = _portfolio_read_state(parsed)
         _portfolio_preimage_gate(parsed, state)

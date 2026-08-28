@@ -396,7 +396,9 @@ class ReleaseLivePortfolioTest(unittest.TestCase):
             mock.patch.object(operations, '_portfolio_read_state', return_value=live),
             mock.patch.object(operations, '_portfolio_project_rows', return_value=live['projects']),
         ):
-            reconcile_release_live_portfolio(fixture['plan'], mode='prepare', kent=fixture['kent'])
+            reconcile_release_live_portfolio(
+                fixture['plan'], mode='prepare', kent=fixture['kent'], confirm=fixture['plan'].sha256
+            )
         return fixture['root'] / 'state' / 'release-live-portfolio.journal.json'
 
     def _load_journal(self, fixture: dict) -> tuple[Path, dict]:
@@ -476,6 +478,10 @@ class ReleaseLivePortfolioTest(unittest.TestCase):
                 [*command, '--report', 'report.json'], check=False, capture_output=True, text=True,
             )
             self.assertNotEqual(unknown.returncode, 0)
+            valid = subprocess.run(command, check=False, capture_output=True, text=True)
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertEqual(json.loads(valid.stdout)['phase'], 'preview')
+            self.assertFalse((fixture['root'] / 'state').exists())
             parsed, live = self._read_fixture(fixture)
             with (
                 mock.patch.object(operations, '_portfolio_read_state', return_value=live),
@@ -486,6 +492,101 @@ class ReleaseLivePortfolioTest(unittest.TestCase):
             self.assertFalse((fixture['root'] / 'state').exists())
             self.assertEqual(parsed['schema'], 'kent-2.6.1')
 
+    def test_portfolio_mode_contract_has_only_read_only_preview(self) -> None:
+        self.assertEqual(
+            operations.RELEASE_LIVE_PORTFOLIO_MODES,
+            ('preview', 'prepare', 'retire', 'apply', 'rollback'),
+        )
+        self.assertEqual(
+            operations.RELEASE_LIVE_PORTFOLIO_MUTATION_MODES,
+            frozenset({'prepare', 'retire', 'apply', 'rollback'}),
+        )
+        self.assertEqual(
+            set(operations.RELEASE_LIVE_PORTFOLIO_MODES)
+            - operations.RELEASE_LIVE_PORTFOLIO_MUTATION_MODES,
+            {'preview'},
+        )
+
+    def test_prepare_confirmation_is_required_before_any_state_or_effect_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_fixture(Path(temporary))
+            state_dir = fixture['root'] / 'state'
+            for confirmation in (None, '0' * 64):
+                with self.subTest(confirmation=confirmation), \
+                        mock.patch.object(operations, '_portfolio_read_state') as read_state, \
+                        mock.patch.object(operations, '_portfolio_preimage_gate') as preimage_gate, \
+                        mock.patch.object(operations, 'OperationJournal') as journal:
+                    with self.assertRaises(PlanValidationError):
+                        reconcile_release_live_portfolio(
+                            fixture['plan'], mode='prepare', kent=fixture['kent'], confirm=confirmation
+                        )
+                read_state.assert_not_called()
+                preimage_gate.assert_not_called()
+                journal.assert_not_called()
+                self.assertFalse(state_dir.exists())
+                self.assertFalse((state_dir / '.operations.lock').exists())
+                self.assertFalse((state_dir / 'release-live-portfolio.journal.json').exists())
+                self.assertFalse((state_dir / 'release-live-portfolio.journal.tmp').exists())
+                self.assertEqual(read_log(fixture), [])
+
+    def test_exact_prepare_confirmation_writes_only_prepared_journal_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_fixture(Path(temporary))
+            _parsed, live = self._read_fixture(fixture)
+            with (
+                mock.patch.object(operations, '_portfolio_read_state', return_value=live),
+                mock.patch.object(operations, '_portfolio_project_rows', return_value=live['projects']),
+            ):
+                report = reconcile_release_live_portfolio(
+                    fixture['plan'], mode='prepare', kent=fixture['kent'], confirm=fixture['plan'].sha256
+                )
+            journal_path = fixture['root'] / 'state' / 'release-live-portfolio.journal.json'
+            journal = json.loads(journal_path.read_text())
+            self.assertEqual(report['phase'], 'prepared')
+            self.assertEqual(journal['phase'], 'prepared')
+            self.assertEqual(journal['effects'], {})
+            self.assertFalse((fixture['root'] / 'state' / 'release-live-portfolio.journal.tmp').exists())
+
+    def test_cli_prepare_confirmation_contract_and_preview_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_fixture(Path(temporary))
+            command = [
+                str(Path('scripts/reconcile-release-portfolio')), 'prepare',
+                '--plan', str(fixture['root'] / 'plan.json'),
+                '--expect-plan-sha256', fixture['plan'].sha256, '--kent', str(fixture['kent']),
+            ]
+            missing = subprocess.run(command, check=False, capture_output=True, text=True)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertFalse((fixture['root'] / 'state').exists())
+            self.assertEqual(read_log(fixture), [])
+
+            mismatched = subprocess.run(
+                [*command, '--confirm', '0' * 64], check=False, capture_output=True, text=True,
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertFalse((fixture['root'] / 'state').exists())
+            self.assertEqual(read_log(fixture), [])
+
+            exact = subprocess.run(
+                [*command, '--confirm', fixture['plan'].sha256],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(exact.returncode, 0, exact.stderr)
+            self.assertEqual(json.loads(exact.stdout)['phase'], 'prepared')
+            journal_path = fixture['root'] / 'state' / 'release-live-portfolio.journal.json'
+            self.assertEqual(json.loads(journal_path.read_text())['effects'], {})
+
+            preview = [
+                str(Path('scripts/reconcile-release-portfolio')), 'preview',
+                '--plan', str(fixture['root'] / 'plan.json'),
+                '--expect-plan-sha256', fixture['plan'].sha256, '--kent', str(fixture['kent']),
+            ]
+            preview_with_confirm = subprocess.run(
+                [*preview, '--confirm', fixture['plan'].sha256],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertNotEqual(preview_with_confirm.returncode, 0)
+
     def test_prepare_persists_pre_d9_receipt_and_retire_needs_effect_settlement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = make_fixture(Path(temporary))
@@ -495,7 +596,7 @@ class ReleaseLivePortfolioTest(unittest.TestCase):
                 mock.patch.object(operations, '_portfolio_project_rows', return_value=live['projects']),
             ):
                 prepared = reconcile_release_live_portfolio(
-                    fixture['plan'], mode='prepare', kent=fixture['kent']
+                    fixture['plan'], mode='prepare', kent=fixture['kent'], confirm=fixture['plan'].sha256
                 )
             self.assertEqual(prepared['phase'], 'prepared')
             journal_path = fixture['root'] / 'state' / 'release-live-portfolio.journal.json'
@@ -646,7 +747,9 @@ class ReleaseLivePortfolioTest(unittest.TestCase):
                 mock.patch.object(operations, '_portfolio_read_state', return_value=live),
                 mock.patch.object(operations, '_portfolio_project_rows', return_value=live['projects']),
             ):
-                reconcile_release_live_portfolio(fixture['plan'], mode='prepare', kent=fixture['kent'])
+                reconcile_release_live_portfolio(
+                    fixture['plan'], mode='prepare', kent=fixture['kent'], confirm=fixture['plan'].sha256
+                )
             journal_path = fixture['root'] / 'state' / 'release-live-portfolio.journal.json'
             journal = json.loads(journal_path.read_text())
             journal['members'][0]['status'] = 'foreign'
@@ -662,7 +765,7 @@ class ReleaseLivePortfolioTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = make_fixture(Path(temporary))
             prepared = reconcile_release_live_portfolio(
-                fixture['plan'], mode='prepare', kent=fixture['kent']
+                fixture['plan'], mode='prepare', kent=fixture['kent'], confirm=fixture['plan'].sha256
             )
             self.assertEqual(prepared['phase'], 'prepared')
             retired = reconcile_release_live_portfolio(
@@ -754,7 +857,9 @@ class ReleaseLivePortfolioTest(unittest.TestCase):
                 mock.patch.object(operations, '_portfolio_read_state', return_value=live),
                 mock.patch.object(operations, '_portfolio_project_rows', return_value=live['projects']),
             ):
-                reconcile_release_live_portfolio(fixture['plan'], mode='prepare', kent=fixture['kent'])
+                reconcile_release_live_portfolio(
+                    fixture['plan'], mode='prepare', kent=fixture['kent'], confirm=fixture['plan'].sha256
+                )
             journal_path = fixture['root'] / 'state' / 'release-live-portfolio.journal.json'
             journal = json.loads(journal_path.read_text())
             journal['canonical_preimage']['members'][CANONICAL_IDS[0]]['metadata']['foreign'] = True
@@ -1197,7 +1302,9 @@ class ReleaseLivePortfolioTest(unittest.TestCase):
                 mock.patch.object(operations, '_portfolio_read_state', return_value=preimage),
                 mock.patch.object(operations, '_portfolio_project_rows', return_value=preimage['projects']),
             ):
-                reconcile_release_live_portfolio(fixture['plan'], mode='prepare', kent=fixture['kent'])
+                reconcile_release_live_portfolio(
+                    fixture['plan'], mode='prepare', kent=fixture['kent'], confirm=fixture['plan'].sha256
+                )
             journal_path = fixture['root'] / 'state' / 'release-live-portfolio.journal.json'
             journal = json.loads(journal_path.read_text())
             journal['phase'] = 'canonical_in_progress'
@@ -1323,7 +1430,9 @@ class ReleaseLivePortfolioTest(unittest.TestCase):
     def test_prepared_rollback_has_no_live_effect_and_complete_needs_new_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = make_fixture(Path(temporary))
-            reconcile_release_live_portfolio(fixture['plan'], mode='prepare', kent=fixture['kent'])
+            reconcile_release_live_portfolio(
+                fixture['plan'], mode='prepare', kent=fixture['kent'], confirm=fixture['plan'].sha256
+            )
             report = reconcile_release_live_portfolio(
                 fixture['plan'], mode='rollback', kent=fixture['kent'], confirm=fixture['plan'].sha256
             )

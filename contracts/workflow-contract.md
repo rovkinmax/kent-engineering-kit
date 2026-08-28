@@ -515,7 +515,9 @@ Bounded canonical encoder: sorted-key compact UTF-8 parity(ensure_ascii=false,al
 
 The `release-live-portfolio-plan-v1` is one closed, immutable plan for the fixed
 `<state_dir>/release-live-portfolio.journal.json` receipt and ordered members.
-`preview` is read-only; `prepare` captures the complete pre-D9 canonical receipt.
+`preview` is read-only; `prepare` is a separately confirmed durable local
+journal mutation that requires exact `--confirm` equal to the plan SHA-256
+before the fixed pre-D9 receipt, and performs no D9 or Workflow effect.
 `retire` revalidates all remaining preimages before every confirmed delete.
 `apply` revalidates complete D9 and each canonical stage before every effect.
 Effects settle only at exact preimage or postimage; ambiguous or foreign state

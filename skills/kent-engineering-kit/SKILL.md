@@ -84,8 +84,10 @@ absolute Kent path:
 preview -> prepare -> retire -> apply -> complete
 ```
 
-`prepare` writes the fixed
-`<state_dir>/release-live-portfolio.journal.json` receipt before any D9 effect.
+`prepare` is a separately confirmed durable local journal mutation: it requires
+exact `--confirm` equal to the plan SHA-256 before writing the fixed
+`<state_dir>/release-live-portfolio.journal.json` pre-D9 receipt, and performs
+no D9 or Workflow effect.
 `retire` is irreversible after its first confirmed delete. `apply` requires the
 exact D9 poststate before every canonical graph or metadata effect. `rollback`
 is a separately confirmed forward restore during canonical progression; it
