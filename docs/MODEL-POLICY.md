@@ -3,27 +3,48 @@
 ## Current Source Policy — September 5, 2026
 
 [`config/subagents.toml`](../config/subagents.toml) is the authoritative managed
-configuration fragment. It selects `gpt-6-astra` for the root, the disabled
-built-in reviewer, and all 15 subagent roles. The root and fast role explicitly
-set `model_context_window = 872000`. These are operator-chosen configuration
-values, not independently verified provider context capacities.
+configuration fragment and the single source of truth for role allocation.
+The mixed policy restores `gpt-5.6-luna` for eight subagent roles and retains
+`gpt-6-astra` for the root, the disabled built-in reviewer, and the remaining
+seven roles: eight Luna and nine Astra selectors in total. Former Sol and
+Terra assignments use Astra; the historical July policy below is not the
+current allocation.
+
+### Model Selection, Reasoning, and Budgets
+
+This split is an operator choice, not a claim of measured Kent quota savings.
+Evaluate it against task quality, provider failures, retries, latency, context
+growth, and review/Fix-loop counts. Model selection and `thinking_level` are
+separate settings; changing the model does not authorize changing reasoning.
+Do not attribute an observed outcome to model selection without accounting
+for the reasoning setting and workflow behavior.
+
+The root retains `model_context_window = 872000`; the fast role restores
+`model_context_window = 372000` alongside its Luna selector. These are
+intentional operator-chosen harness budgets, not statements about provider
+maximum context capacity. No other role receives an explicit window.
 
 This bounded change preserves every other setting: per-role reasoning,
 low verbosity, tools, prompts, callability, priority mode, the disabled
 built-in reviewer, workflow concurrency of 4, and maximum subagent depth of 1.
-It adds no compaction keys and does not change compaction policy or thresholds.
+It adds no compaction keys and preserves operator-owned root compaction
+settings. Role-derived context budgets and compaction thresholds follow Kent's
+derivation rules when a role's model or explicit window changes; those derived
+thresholds are not promised to remain unchanged.
 
-### Configuration Inventory and Runtime Evidence
+### Configuration Adoption and Runtime Evidence
 
-The approved configuration inventory covers six primary roots:
-AppsomeAndroid, Puber, agent-default, Kit, SDK, and Slack. Each is configured
-for Astra or inherits the global Astra configuration. Historical attached
-workspaces are excluded from this inventory; they can retain overrides that
-select older models.
+Configuration adoption is a separately approved reconciliation of the managed
+fragment with global and project settings. Check each intended launch root
+for explicit overrides and declared inheritance, preserving unrelated user
+settings. Historical attached workspaces and retained worktrees can keep
+older overrides; do not assume they inherit this policy.
 
-This is configuration inventory, not evidence of six runtime canaries.
-Existing and resumed sessions retain their locked settings; this source
-change does not refresh those locks or establish runtime adoption.
+File-level adoption is not effective-runtime evidence. Existing and resumed
+sessions retain their locked settings; neither a source patch nor a
+configuration-file update refreshes those locks or establishes runtime
+activation. New-session verification and the documented service/GUI restart
+require a separate gate that accounts for active work.
 
 ### Validation, Rollout, and Rollback Boundaries
 
@@ -31,8 +52,9 @@ Source validation checks the managed policy and its regression tests. This
 package has no workflow graph delta and does not authorize installation,
 global or project configuration edits, restart, or a runtime canary.
 
-Any later rollout requires separate approval for its installation and
-configuration effects, Kent restart, and new-session verification.
+Approve installation/configuration effects and restart/new-session
+verification explicitly; approval for file changes alone is not restart or
+runtime-canary authority.
 `scripts/install` creates links for Kit assets; it does not merge
 `config/subagents.toml` into the effective configuration. Preserve user changes
 when reconciling configuration and verify effective settings separately.
@@ -44,6 +66,28 @@ patch, preserving unrelated changes. It is not a global model downgrade and
 must not undo the separately delivered hotfix. After installation, rollback
 requires a separately approved operational plan that accounts for linked
 assets and effective configuration; a source-only inverse is insufficient.
+
+### Sources and Evaluation
+
+- [OpenAI model selection](https://developers.openai.com/api/docs/guides/model-selection)
+  recommends establishing an accuracy target and a strong baseline, then
+  evaluating cheaper or faster models that still meet the quality target.
+- [OpenAI Astra migration guidance](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra)
+  recommends preserving effective reasoning effort during the initial
+  migration before tuning it separately.
+- [OpenAI Codex subagents](https://learn.chatgpt.com/codex/agent-configuration/subagents)
+  includes Luna Medium examples for `docs_researcher` and `code_mapper`.
+  These illustrate task-specific model/effort choices; they do not override
+  the managed role settings.
+- [Artificial Analysis: Benchmarking GPT-6 Astra](https://artificialanalysis.ai/articles/benchmarking-gpt-6-astra)
+  distinguishes Coding Agent and Intelligence Index outcomes, output-token
+  usage, and API cost. Those benchmark-specific measures are not Kent
+  subscription quota measurements.
+
+These sources inform the operator's choice; they do not prove actual Kent
+quota savings. Evaluate the mixed policy on comparable tasks using observed
+quality, retries, latency, context growth, and provider pressure before
+claiming an improvement.
 
 ## HISTORICAL — July 2026 Experiment (Not Current Advice)
 

@@ -15,15 +15,15 @@ thinking_level = "medium"
 model_verbosity = "low"
 
 [subagents.fast]
-model = "gpt-6-astra"
+model = "gpt-5.6-luna"
 thinking_level = "high"
 model_verbosity = "low"
 priority_request_mode = false
-model_context_window = 872000
+model_context_window = 372000
 
 [subagents.compliance_reviewer]
 description = "Agent for reviewing code, plans, documents, diffs, or other scopes only for compliance with applicable specifications and AGENTS.md rules. Cannot edit files."
-model = "gpt-6-astra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/compliance_reviewer.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -54,7 +54,7 @@ edit = false
 
 [subagents.standards-reviewer]
 description = "Read-only review against repository instructions, architecture, and engineering standards."
-model = "gpt-6-astra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/standards-reviewer.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -96,7 +96,7 @@ edit = false
 
 [subagents.implementation-worker]
 description = "Single-writer implementation slices governed by the approved project plan."
-model = "gpt-6-astra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/implementation-worker.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -138,7 +138,7 @@ edit = false
 
 [subagents.workflow-gate]
 description = "Low-noise synthesis of structured verification evidence into workflow routing."
-model = "gpt-6-astra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/workflow-gate.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -180,7 +180,7 @@ edit = false
 
 [subagents.delivery-operator]
 description = "Conservative PR preparation, branch delivery, and recoverability-aware cleanup."
-model = "gpt-6-astra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/delivery-operator.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -194,7 +194,7 @@ edit = false
 
 [subagents.ci-monitor]
 description = "Bounded CI, pull-request, and release-automation monitoring without mutations."
-model = "gpt-6-astra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/ci-monitor.md"
 thinking_level = "low"
 model_verbosity = "low"
@@ -209,7 +209,7 @@ edit = false
 
 [subagents.release-decision]
 description = "Tool-less human decision gate for deterministic release state."
-model = "gpt-6-astra"
+model = "gpt-5.6-luna"
 system_prompt_file = "agents/release-decision.md"
 thinking_level = "low"
 model_verbosity = "low"

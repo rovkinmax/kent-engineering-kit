@@ -242,7 +242,7 @@ class WorkflowKitTest(unittest.TestCase):
             check=False,
         )
 
-    def test_astra_model_policy_preserves_operating_settings(self) -> None:
+    def test_mixed_model_policy_preserves_operating_settings(self) -> None:
         config = tomllib.loads(
             (REPO_ROOT / "config" / "subagents.toml").read_text()
         )
@@ -267,6 +267,29 @@ class WorkflowKitTest(unittest.TestCase):
         roles = config["subagents"]
         self.assertEqual(set(roles), set(expected_roles))
         selectors = {"root": config, "reviewer": config["reviewer"], **roles}
+        expected_models = {
+            "root": "gpt-6-astra",
+            "reviewer": "gpt-6-astra",
+            "fast": "gpt-5.6-luna",
+            "compliance_reviewer": "gpt-5.6-luna",
+            "researcher": "gpt-6-astra",
+            "standards-reviewer": "gpt-5.6-luna",
+            "spec-reviewer": "gpt-6-astra",
+            "architecture-designer": "gpt-6-astra",
+            "implementation-worker": "gpt-5.6-luna",
+            "fix-worker": "gpt-6-astra",
+            "build-doctor": "gpt-6-astra",
+            "workflow-gate": "gpt-5.6-luna",
+            "runtime-smoke-tester": "gpt-6-astra",
+            "release-manager": "gpt-6-astra",
+            "delivery-operator": "gpt-5.6-luna",
+            "ci-monitor": "gpt-5.6-luna",
+            "release-decision": "gpt-5.6-luna",
+        }
+        self.assertEqual(
+            {name: selector["model"] for name, selector in selectors.items()},
+            expected_models,
+        )
         expected_reasoning = {
             "root": "medium",
             "reviewer": "medium",
@@ -278,7 +301,6 @@ class WorkflowKitTest(unittest.TestCase):
         )
         for name, selector in selectors.items():
             with self.subTest(selector=name):
-                self.assertEqual(selector["model"], "gpt-6-astra")
                 self.assertEqual(selector["model_verbosity"], "low")
         self.assertEqual(
             {
@@ -286,7 +308,7 @@ class WorkflowKitTest(unittest.TestCase):
                 for name, selector in selectors.items()
                 if "model_context_window" in selector
             },
-            {"root": 872000, "fast": 872000},
+            {"root": 872000, "fast": 372000},
         )
         self.assertEqual(
             {
