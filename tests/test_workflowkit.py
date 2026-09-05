@@ -242,6 +242,87 @@ class WorkflowKitTest(unittest.TestCase):
             check=False,
         )
 
+    def test_astra_model_policy_preserves_operating_settings(self) -> None:
+        config = tomllib.loads(
+            (REPO_ROOT / "config" / "subagents.toml").read_text()
+        )
+        # reasoning, agent callability, workflow callability, shell, patch
+        expected_roles = {
+            "fast": ("high", None, None, None, None),
+            "compliance_reviewer": ("high", False, False, True, False),
+            "researcher": ("medium", True, True, True, False),
+            "standards-reviewer": ("high", False, False, True, False),
+            "spec-reviewer": ("medium", False, False, True, False),
+            "architecture-designer": ("high", True, True, True, False),
+            "implementation-worker": ("high", True, True, True, True),
+            "fix-worker": ("medium", True, True, True, True),
+            "build-doctor": ("medium", True, True, True, True),
+            "workflow-gate": ("high", False, False, True, False),
+            "runtime-smoke-tester": ("medium", True, False, True, False),
+            "release-manager": ("medium", False, False, True, True),
+            "delivery-operator": ("high", False, False, True, False),
+            "ci-monitor": ("low", True, False, True, False),
+            "release-decision": ("low", False, False, False, False),
+        }
+        roles = config["subagents"]
+        self.assertEqual(set(roles), set(expected_roles))
+        selectors = {"root": config, "reviewer": config["reviewer"], **roles}
+        expected_reasoning = {
+            "root": "medium",
+            "reviewer": "medium",
+            **{name: policy[0] for name, policy in expected_roles.items()},
+        }
+        self.assertEqual(
+            {name: selector["thinking_level"] for name, selector in selectors.items()},
+            expected_reasoning,
+        )
+        for name, selector in selectors.items():
+            with self.subTest(selector=name):
+                self.assertEqual(selector["model"], "gpt-6-astra")
+                self.assertEqual(selector["model_verbosity"], "low")
+        self.assertEqual(
+            {
+                name: selector["model_context_window"]
+                for name, selector in selectors.items()
+                if "model_context_window" in selector
+            },
+            {"root": 872000, "fast": 872000},
+        )
+        self.assertEqual(
+            {
+                name: selector["priority_request_mode"]
+                for name, selector in selectors.items()
+                if "priority_request_mode" in selector
+            },
+            {"fast": False, "ci-monitor": False},
+        )
+        for name, (_, callable_, workflow_callable, shell, patch) in expected_roles.items():
+            role = roles[name]
+            with self.subTest(role=name):
+                if name == "fast":
+                    for key in ("agent_callable", "workflow_subagent", "tools"):
+                        self.assertNotIn(key, role)
+                else:
+                    self.assertIs(role["agent_callable"], callable_)
+                    self.assertIs(role["workflow_subagent"], workflow_callable)
+                    self.assertEqual(
+                        role["tools"],
+                        {"shell": shell, "patch": patch, "edit": False},
+                    )
+                    self.assertEqual(role["system_prompt_file"], f"agents/{name}.md")
+        self.assertEqual(roles["compliance_reviewer"]["skills"], {"planning": False})
+        self.assertEqual(config["reviewer"]["frequency"], "off")
+        self.assertEqual(config["workflow"], {"subagents": True, "concurrency": 4})
+        self.assertEqual(config["max_subagent_depth"], 1)
+
+        def assert_no_compaction_keys(table: dict) -> None:
+            for key, value in table.items():
+                self.assertNotIn("compact", key.lower())
+                if isinstance(value, dict):
+                    assert_no_compaction_keys(value)
+
+        assert_no_compaction_keys(config)
+
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
         config = tomllib.loads(
             (REPO_ROOT / "config" / "subagents.toml").read_text()

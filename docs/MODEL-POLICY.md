@@ -1,4 +1,58 @@
-# Model Policy Experiment
+# Model Policy
+
+## Current Source Policy — September 5, 2026
+
+[`config/subagents.toml`](../config/subagents.toml) is the authoritative managed
+configuration fragment. It selects `gpt-6-astra` for the root, the disabled
+built-in reviewer, and all 15 subagent roles. The root and fast role explicitly
+set `model_context_window = 872000`. These are operator-chosen configuration
+values, not independently verified provider context capacities.
+
+This bounded change preserves every other setting: per-role reasoning,
+low verbosity, tools, prompts, callability, priority mode, the disabled
+built-in reviewer, workflow concurrency of 4, and maximum subagent depth of 1.
+It adds no compaction keys and does not change compaction policy or thresholds.
+
+### Configuration Inventory and Runtime Evidence
+
+The approved configuration inventory covers six primary roots:
+AppsomeAndroid, Puber, agent-default, Kit, SDK, and Slack. Each is configured
+for Astra or inherits the global Astra configuration. Historical attached
+workspaces are excluded from this inventory; they can retain overrides that
+select older models.
+
+This is configuration inventory, not evidence of six runtime canaries.
+Existing and resumed sessions retain their locked settings; this source
+change does not refresh those locks or establish runtime adoption.
+
+### Validation, Rollout, and Rollback Boundaries
+
+Source validation checks the managed policy and its regression tests. This
+package has no workflow graph delta and does not authorize installation,
+global or project configuration edits, restart, or a runtime canary.
+
+Any later rollout requires separate approval for its installation and
+configuration effects, Kent restart, and new-session verification.
+`scripts/install` creates links for Kit assets; it does not merge
+`config/subagents.toml` into the effective configuration. Preserve user changes
+when reconciling configuration and verify effective settings separately.
+Confirm model and reasoning in newly created sessions after the approved
+restart; existing or resumed sessions are not rollout canaries.
+
+Before installation, source rollback is the inverse of this bounded package's
+patch, preserving unrelated changes. It is not a global model downgrade and
+must not undo the separately delivered hotfix. After installation, rollback
+requires a separately approved operational plan that accounts for linked
+assets and effective configuration; a source-only inverse is insufficient.
+
+## HISTORICAL — July 2026 Experiment (Not Current Advice)
+
+The entire July text is retained below with subordinate headings for historical
+context only. Its then-active routing, schema and canary claims, candidate
+values, merge instructions, and restart guidance are not current operational
+advice and do not override the current source policy above.
+
+### Model Policy Experiment
 
 This is an iterative operating policy, not a versioned compatibility promise.
 The July 31 candidate routes well-specified implementation and bounded
@@ -7,7 +61,7 @@ specification fidelity, and verified Fix work. Existing sessions retain the
 settings with which they were created. The candidate requires a Kent restart
 and newly created sessions before it is considered active.
 
-## Optimization Target
+#### Optimization Target
 
 The current environment uses a subscription rather than separately billed API
 tokens. Model selection therefore optimizes:
@@ -21,7 +75,7 @@ tokens. Model selection therefore optimizes:
 
 Dollar-denominated API pricing is not a decision criterion.
 
-## Kent 2.4 Schema Verification
+#### Kent 2.4 Schema Verification
 
 The candidate below was checked on July 24, 2026 against Kent 2.4.0 source and
 the official configuration reference:
@@ -45,7 +99,7 @@ These values are schema-validated in the managed and effective configuration.
 Do not restart Kent until the user confirms that other active sessions may
 stop.
 
-## Balanced Candidate
+#### Balanced Candidate
 
 | Capability | Candidate |
 | --- | --- |
@@ -90,7 +144,7 @@ One subagent level is sufficient for a workflow node to delegate a bounded
 implementation, research, diagnosis, or platform-reference slice. A delegated
 role must not create another delegation tree during this experiment.
 
-## Staged First-Rollout Configuration
+#### Staged First-Rollout Configuration
 
 Merge these values into the existing global configuration; do not replace
 unrelated hooks, tools, worktree settings, or role descriptions:
@@ -180,7 +234,7 @@ model_verbosity = "low"
 priority_request_mode = false
 ```
 
-## Active Direct-Role Routing
+#### Active Direct-Role Routing
 
 The kit now defines global fallbacks for:
 
@@ -219,7 +273,7 @@ defaults it to `edits`; leaving the key unset can add hidden model calls after
 edit turns. The configured reviewer model is only a canary-ready override for a
 separate experiment.
 
-## Dogfood Baseline
+#### Dogfood Baseline
 
 The July 24, 2026 PUB-26 Delivery v5 run reached Smoke after these graph-level
 agent counts:
@@ -283,7 +337,7 @@ badge is observed after the relevant restart; otherwise report Sol with
 reasoning unverified. Resuming the same session also retains its locked prompt,
 so resumed work is not a prompt-rollout canary.
 
-## Evaluation
+#### Evaluation
 
 Compare new tasks against recent Delivery runs:
 
