@@ -187,6 +187,21 @@ def workflow_state(workflow_id: str, task_ids: list[str], sessions: list[dict], 
 def member_plan(sequence: int, project_id: str, project_root: Path, workflow_id: str,
                 task_ids: list[str], sessions: list[dict], *, version: int) -> dict:
     status = "done"
+    delete_preview = {
+        "deleted": False,
+        "impact": {
+            "workflow_id": workflow_id,
+            "version": version,
+            "project_count": 1,
+            "link_count": 1,
+            "task_count": len(task_ids),
+            "current_node_count": 0,
+            "pending_approval_count": 0,
+            "blocked_task_count": 0,
+            "default_replacement_project_count": 0,
+        },
+        "blockers": [],
+    }
     return {
         "sequence": sequence, "project_id": project_id, "project_root": str(project_root),
         "workflow_id": workflow_id, "revision": version,
@@ -195,7 +210,10 @@ def member_plan(sequence: int, project_id: str, project_root: Path, workflow_id:
         "tasks": [{"id": task_id, "status": status, "terminal": True, "current_node": None,
                     "approval_pending": False} for task_id in task_ids],
         "sessions": sessions, "worktrees": [], "retained": [], "absent": [],
-        "delete_preview": {"workflow_id": workflow_id, "sha256": "a" * 64},
+        "delete_preview": {
+            "workflow_id": workflow_id,
+            "sha256": hashlib.sha256(canonical_bytes(delete_preview)).hexdigest(),
+        },
     }
 
 
@@ -229,6 +247,15 @@ state = json.loads(STATE.read_text())
 def option(name, default=None):
     return args[args.index(name) + 1] if name in args else default
 
+def execution_target_policy(value):
+    if value.startswith("ref:"):
+        return {"mode": "custom_ref", "custom_ref": value[4:]}
+    if value == "ask-on-first-execution":
+        return {"mode": "ask_on_first_execution"}
+    if value == "default-branch":
+        return {"mode": "default_branch"}
+    return {"mode": value}
+
 def emit(rows, key):
     offset = int(option("--offset", "0")); limit = int(option("--limit", "100"))
     page = rows[offset:offset + limit]
@@ -254,7 +281,7 @@ elif args[:2] == ["workflow", "list"]:
         if item.get("present", True) and item["project_id"] == project_id:
             rows.append({"id": wid, "name": item["metadata"]["name"], "description": item["metadata"]["description"],
                          "version": item["version"],
-                         "execution_target_policy": {"mode": item["metadata"]["execution_target"]},
+                         "execution_target_policy": execution_target_policy(item["metadata"]["execution_target"]),
                          "project_link": {"default": item["default"]}})
     emit(rows, "workflows")
 elif args == ["worktree", "list", "--json"]:
@@ -265,13 +292,13 @@ elif args[:2] == ["workflow", "inspect"]:
         print("workflow not found", file=sys.stderr); raise SystemExit(1)
     print(json.dumps({"workflow": {"id": wid, "name": item["metadata"]["name"],
         "description": item["metadata"]["description"],
-        "version": item["version"],
-        "execution_target_policy": {"mode": item["metadata"]["execution_target"]}}}, sort_keys=True))
+        "revision": item["version"],
+        "execution_target_policy": execution_target_policy(item["metadata"]["execution_target"])}}, sort_keys=True))
 elif args[:3] == ["workflow", "graph", "inspect"]:
     wid = args[3]; item = state["workflows"][wid]
     print(json.dumps({"workflow_id": wid, "expected_version": item["version"], "graph": item["graph"]}, sort_keys=True))
 elif args[:2] == ["workflow", "validate"]:
-    print(json.dumps({"valid": True}, sort_keys=True))
+    print(json.dumps(state.get("validation", {"valid": True}), sort_keys=True))
 elif args[:2] == ["task", "list"]:
     item = state["workflows"][option("--workflow")]
     emit(item.get("tasks", []) if item.get("present", True) else [], "tasks")
@@ -284,7 +311,24 @@ elif args[:2] == ["task", "sessions"]:
 elif args[:2] == ["workflow", "delete"]:
     wid = args[2]; item = state["workflows"][wid]
     if "--confirm" not in args:
-        print(json.dumps({"workflow_id": wid, "sha256": "a" * 64}))
+        print(json.dumps({
+            "deleted": False,
+            "impact": {
+                "workflow_id": wid,
+                "version": item["version"],
+                "project_count": 1,
+                "link_count": 1,
+                "task_count": len(item.get("tasks", [])),
+                "current_node_count": 0,
+                "pending_approval_count": 0,
+                "blocked_task_count": 0,
+                "default_replacement_project_count": 0,
+            },
+            "blockers": [],
+        }, sort_keys=True, separators=(",", ":")))
+        print("Workflow deletion was not confirmed. Rerun with --confirm to delete it.",
+              file=sys.stderr)
+        raise SystemExit(1)
     else:
         task_ids = [row["task_id"] for row in item.get("tasks", [])]
         connection = sqlite3.connect(state["database"])

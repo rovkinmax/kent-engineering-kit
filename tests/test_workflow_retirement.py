@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import sqlite3
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -82,6 +84,16 @@ def option(name, default=None):
     return args[args.index(name) + 1] if name in args else default
 
 
+def execution_target_policy(value):
+    if value.startswith("ref:"):
+        return {{"mode": "custom_ref", "custom_ref": value[4:]}}
+    if value == "ask-on-first-execution":
+        return {{"mode": "ask_on_first_execution"}}
+    if value == "default-branch":
+        return {{"mode": "default_branch"}}
+    return {{"mode": value}}
+
+
 def emit(rows, key):
     offset = int(option("--offset", "0"))
     limit = int(option("--limit", "100"))
@@ -110,7 +122,7 @@ elif args[:2] == ["workflow", "list"]:
                 "name": workflow["metadata"]["name"],
                 "description": workflow["metadata"]["description"],
                 "version": workflow["version"],
-                "execution_target_policy": {{"mode": workflow["metadata"]["execution_target"]}},
+                "execution_target_policy": execution_target_policy(workflow["metadata"]["execution_target"]),
                 "project_link": {{"default": workflow["default"]}},
             }})
     emit(rows, "workflows")
@@ -126,8 +138,8 @@ elif args[:2] == ["workflow", "inspect"]:
         "id": workflow_id,
         "name": workflow["metadata"]["name"],
         "description": workflow["metadata"]["description"],
-        "version": workflow["version"],
-        "execution_target_policy": {{"mode": workflow["metadata"]["execution_target"]}},
+        "revision": workflow["version"],
+        "execution_target_policy": execution_target_policy(workflow["metadata"]["execution_target"]),
     }}}}, sort_keys=True))
 elif args[:3] == ["workflow", "graph", "inspect"]:
     workflow_id = args[3]
@@ -138,7 +150,7 @@ elif args[:3] == ["workflow", "graph", "inspect"]:
         "graph": workflow["graph"],
     }}, sort_keys=True))
 elif args[:2] == ["workflow", "validate"]:
-    print(json.dumps({{"valid": True}}, sort_keys=True))
+    print(json.dumps(state.get("validation", {{"valid": True}}), sort_keys=True))
 elif args[:2] == ["task", "list"]:
     workflow_id = option("--workflow")
     workflow = state["workflows"][workflow_id]
@@ -155,7 +167,21 @@ elif args[:2] == ["workflow", "delete"]:
     workflow_id = args[2]
     workflow = state["workflows"][workflow_id]
     if "--confirm" not in args:
-        print(json.dumps({{"workflow_id": workflow_id, "sha256": workflow["preview_sha256"]}}))
+        print(json.dumps({{
+            "deleted": False,
+            "impact": {{
+                "workflow_id": workflow_id,
+                "version": workflow["version"],
+                "project_count": 1,
+                "link_count": 1,
+                "task_count": len(workflow.get("tasks", [])),
+                "current_node_count": 0,
+                "pending_approval_count": 0,
+                "blocked_task_count": 0,
+                "default_replacement_project_count": 0,
+            }},
+            "blockers": [],
+        }}))
     else:
         task_ids = [row["task_id"] for row in workflow.get("tasks", [])]
         if not state.get("delete_noop"):
@@ -323,7 +349,21 @@ def make_d9_fixture(root: Path, count: int = 1) -> dict:
             "sessions": {
                 task_id: [{"session_id": session_id, "status": "idle"}]
             },
-            "preview_sha256": chr(ord("c") + index) * 64,
+            "preview_sha256": canonical_sha256({
+                "deleted": False,
+                "impact": {
+                    "workflow_id": wid,
+                    "version": 1,
+                    "project_count": 1,
+                    "link_count": 1,
+                    "task_count": 1,
+                    "current_node_count": 0,
+                    "pending_approval_count": 0,
+                    "blocked_task_count": 0,
+                    "default_replacement_project_count": 0,
+                },
+                "blockers": [],
+            }),
         }
         members.append(
             {
@@ -555,6 +595,479 @@ class WorkflowRetirementTest(unittest.TestCase):
         self.assertEqual(entry["status"], "unresolved")
         self.assertIsNone(entry["child"])
         self.assertFalse(marker.exists())
+
+    def test_delete_preview_accepts_kent_272_exit_codes_without_confirm(self) -> None:
+        workflow = workflow_id(0)
+        impact = {
+            "workflow_id": workflow,
+            "version": 7,
+            "project_count": 1,
+            "link_count": 1,
+            "task_count": 0,
+            "current_node_count": 0,
+            "pending_approval_count": 0,
+            "blocked_task_count": 0,
+            "default_replacement_project_count": 0,
+        }
+        payload = json.dumps(
+            {"deleted": False, "impact": impact, "blockers": []},
+            separators=(",", ":"),
+        ).encode()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kent = root / "kent"
+            for code, stderr in (
+                (1, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+                (0, b""),
+            ):
+                with self.subTest(code=code), mock.patch.object(
+                    operations,
+                    "_run",
+                    return_value=(code, payload, stderr),
+                ) as run:
+                    result = operations._kent_delete_preview(kent, workflow, cwd=root)
+                self.assertEqual(result["impact"], impact)
+                self.assertEqual(
+                    run.call_args.args[0],
+                    [str(kent), "workflow", "delete", workflow, "--json"],
+                )
+                self.assertNotIn("--confirm", run.call_args.args[0])
+
+    def test_delete_preview_rejection_matrix_is_closed(self) -> None:
+        workflow = workflow_id(0)
+        impact = {
+            "workflow_id": workflow,
+            "version": 1,
+            "project_count": 1,
+            "link_count": 1,
+            "task_count": 0,
+            "current_node_count": 0,
+            "pending_approval_count": 0,
+            "blocked_task_count": 0,
+            "default_replacement_project_count": 0,
+        }
+        valid = {"deleted": False, "impact": impact, "blockers": []}
+        cases = [
+            (2, valid, b""),
+            (1, b"not-json", operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, b"[]", operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, valid, b"wrong\n"),
+            (0, {"workflow_id": workflow, "sha256": "a" * 64}, b""),
+            (0, valid, b"unexpected\n"),
+            (1, {**valid, "unknown": True}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "deleted": True}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "blockers": [{"code": "blocked"}]}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "impact": {**impact, "workflow_id": workflow_id(1)}},
+             operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "impact": []}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "impact": {**impact, "unknown": 0}},
+             operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "impact": {**impact, "task_count": -1}},
+             operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "impact": {**impact, "task_count": "0"}},
+             operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "impact": {**impact, "task_count": True}},
+             operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, valid, b""),
+            (1, {**valid, "impact": {key: value for key, value in impact.items() if key != "version"}},
+             operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, (code, value, stderr) in enumerate(cases):
+                with self.subTest(index=index), mock.patch.object(
+                    operations,
+                    "_run",
+                    return_value=(
+                        code,
+                        value if isinstance(value, bytes) else canonical_bytes(value),
+                        stderr,
+                    ),
+                ):
+                    with self.assertRaises(EffectBlocked):
+                        operations._kent_delete_preview(root / "kent", workflow, cwd=root)
+            with mock.patch.object(
+                operations,
+                "_run",
+                return_value=(1, b'{"deleted":false,"deleted":false}', operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            ):
+                with self.assertRaises(EffectBlocked):
+                    operations._kent_delete_preview(root / "kent", workflow, cwd=root)
+
+    def test_session_manifest_streams_large_files_under_session_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "nested").mkdir()
+            payload = b"session" * (operations.MAX_OUTPUT // 7 + 1)
+            (root / "nested" / "events.jsonl").write_bytes(payload)
+            reads: list[int] = []
+            real_read = operations.os.read
+
+            def checked_read(fd: int, size: int) -> bytes:
+                reads.append(size)
+                return real_read(fd, size)
+
+            with (
+                mock.patch.object(operations.Path, "read_bytes", side_effect=AssertionError("read_bytes used")),
+                mock.patch.object(operations.os, "read", side_effect=checked_read),
+            ):
+                manifest = operations._session_manifest(root)
+            self.assertEqual(max(reads), operations.MANIFEST_READ_CHUNK)
+            self.assertEqual(
+                next(row for row in manifest if row["type"] == "file")["bytes"],
+                len(payload),
+            )
+            self.assertNotIn(
+                "sha256",
+                next(row for row in manifest if row["type"] == "directory"),
+            )
+
+    def test_session_and_resource_manifest_limits_reject_before_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            oversized = root / "oversized"
+            oversized.touch()
+            os.truncate(oversized, operations.SESSION_MANIFEST_FILE_LIMIT + 1)
+            with mock.patch.object(operations.os, "open", side_effect=AssertionError("file opened")):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
+
+            aggregate = root / "aggregate"
+            aggregate.mkdir()
+            for name in ("one", "two"):
+                path = aggregate / name
+                path.touch()
+                os.truncate(path, operations.SESSION_MANIFEST_TOTAL_LIMIT // 2 + 1)
+            with mock.patch.object(operations.os, "open", side_effect=AssertionError("file opened")):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(aggregate)
+
+            retained = root / "retained"
+            retained.mkdir()
+            retained_file = retained / "file"
+            retained_file.touch()
+            os.truncate(retained_file, operations.MAX_OUTPUT + 1)
+            with mock.patch.object(operations.os, "open", side_effect=AssertionError("file opened")):
+                with self.assertRaises(operations.OperationError):
+                    operations._resource_state({
+                        "kind": "directory",
+                        "id": "retained",
+                        "path": str(retained),
+                        "sha256": "a" * 64,
+                    })
+
+    def test_session_and_retained_resource_wrappers_use_distinct_bounds(self) -> None:
+        root = Path("/tmp/manifest-wrapper-test")
+        with mock.patch.object(operations, "_directory_manifest", return_value=[]) as engine:
+            self.assertEqual(operations._session_manifest(root), [])
+            self.assertEqual(operations._retained_resource_manifest(root), [])
+        self.assertEqual(
+            engine.call_args_list,
+            [
+                mock.call(
+                    root,
+                    file_limit=operations.SESSION_MANIFEST_FILE_LIMIT,
+                    total_limit=operations.SESSION_MANIFEST_TOTAL_LIMIT,
+                    label="Session",
+                ),
+                mock.call(
+                    root,
+                    file_limit=operations.MAX_OUTPUT,
+                    total_limit=operations.MAX_OUTPUT,
+                    label="retained resource",
+                ),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            retained = Path(temporary) / "retained"
+            retained.mkdir()
+            with mock.patch.object(
+                operations,
+                "_retained_resource_manifest",
+                return_value=[],
+            ) as wrapper:
+                result = operations._resource_state({
+                    "kind": "directory",
+                    "id": "retained",
+                    "path": str(retained),
+                    "sha256": "a" * 64,
+                })
+            wrapper.assert_called_once_with(retained)
+            self.assertEqual(result["sha256"], canonical_sha256([]))
+
+    def test_manifest_opens_preflighted_files_nonblocking_before_fifo_swap(self) -> None:
+        if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+            self.skipTest("FIFO or nonblocking open is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "events.jsonl"
+            target.write_text("events")
+            real_open = operations.os.open
+            observed_flags: list[int] = []
+
+            def swap_before_open(path, flags, *args):
+                if Path(path) == target:
+                    target.unlink()
+                    os.mkfifo(target)
+                    observed_flags.append(flags)
+                return real_open(path, flags, *args)
+
+            with mock.patch.object(operations.os, "open", side_effect=swap_before_open):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
+            self.assertEqual(len(observed_flags), 1)
+            self.assertNotEqual(observed_flags[0] & os.O_NONBLOCK, 0)
+
+    def test_manifest_bounds_synthetic_siblings_before_sort_stat_open_or_read(self) -> None:
+        class SyntheticEntry:
+            def __init__(self, index: int) -> None:
+                self._index = index
+                self.name_reads = 0
+                self.stat_calls = 0
+
+            @property
+            def name(self) -> str:
+                self.name_reads += 1
+                return f"entry-{self._index:04d}"
+
+            def stat(self, *, follow_symlinks: bool) -> os.stat_result:
+                self.stat_calls += 1
+                raise AssertionError("synthetic entry was statted")
+
+        class SyntheticStream:
+            def __init__(self, entries: list[SyntheticEntry]) -> None:
+                self.entries = entries
+                self.consumed = 0
+
+            def __enter__(self) -> "SyntheticStream":
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+            def __iter__(self):
+                for entry in self.entries:
+                    self.consumed += 1
+                    yield entry
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            entries = [
+                SyntheticEntry(index)
+                for index in range(operations.MAX_LIST + 8)
+            ]
+            stream = SyntheticStream(entries)
+            with (
+                mock.patch.object(operations.os, "scandir", return_value=stream),
+                mock.patch.object(
+                    operations.os,
+                    "open",
+                    side_effect=AssertionError("file opened"),
+                ) as open_mock,
+                mock.patch.object(
+                    operations.os,
+                    "read",
+                    side_effect=AssertionError("file read"),
+                ) as read_mock,
+            ):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
+            self.assertEqual(stream.consumed, operations.MAX_LIST + 1)
+            self.assertEqual(sum(entry.name_reads for entry in entries), 0)
+            self.assertEqual(sum(entry.stat_calls for entry in entries), 0)
+            open_mock.assert_not_called()
+            read_mock.assert_not_called()
+
+    def test_manifest_bounds_nested_directories_before_overbudget_recursion(self) -> None:
+        temporary = Path(tempfile.mkdtemp())
+        created: list[Path] = []
+        try:
+            root = temporary
+            current = root
+            for _ in range(operations.MAX_LIST + 1):
+                current = current / "d"
+                current.mkdir()
+                created.append(current)
+            scanned: list[Path] = []
+            real_scandir = operations.os.scandir
+
+            def counted_scandir(path):
+                scanned.append(Path(path))
+                return real_scandir(path)
+
+            with (
+                mock.patch.object(
+                    operations.os,
+                    "scandir",
+                    side_effect=counted_scandir,
+                ),
+                mock.patch.object(
+                    operations.os,
+                    "open",
+                    side_effect=AssertionError("file opened"),
+                ) as open_mock,
+                mock.patch.object(
+                    operations.os,
+                    "read",
+                    side_effect=AssertionError("file read"),
+                ) as read_mock,
+            ):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
+            self.assertEqual(len(scanned), operations.MAX_LIST + 1)
+            self.assertEqual(
+                len(scanned[-1].relative_to(root).parts),
+                operations.MAX_LIST,
+            )
+            open_mock.assert_not_called()
+            read_mock.assert_not_called()
+        finally:
+            for directory in reversed(created):
+                directory.rmdir()
+            temporary.rmdir()
+
+    def test_manifest_rejects_first_enumeration_directory_snapshot_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "events.jsonl").write_text("events")
+            entries, snapshot = operations._manifest_entries(root, "Session")
+            altered = dict(snapshot)
+            kind, fingerprint = altered["nested"]
+            altered["nested"] = (
+                kind,
+                (*fingerprint[:5], fingerprint[5] + 1, *fingerprint[6:]),
+            )
+            with (
+                mock.patch.object(
+                    operations,
+                    "_manifest_entries",
+                    return_value=(entries, altered),
+                ),
+                mock.patch.object(
+                    operations.os,
+                    "open",
+                    side_effect=AssertionError("file opened after enumeration drift"),
+                ),
+            ):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
+
+    def test_manifest_rejects_symlink_fifo_and_socket_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.write_text("target")
+            (root / "link").symlink_to(target)
+            with self.assertRaises(operations.OperationError):
+                operations._session_manifest(root)
+
+        if hasattr(os, "mkfifo"):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                os.mkfifo(root / "pipe")
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
+
+        if hasattr(socket, "AF_UNIX"):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                endpoint = root / "socket"
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    listener.bind(str(endpoint))
+                    with self.assertRaises(operations.OperationError):
+                        operations._session_manifest(root)
+                finally:
+                    listener.close()
+
+    def test_manifest_rejects_file_mutation_and_replacement_during_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "events.jsonl"
+            path.write_bytes(b"x" * (operations.MANIFEST_READ_CHUNK + 1))
+            real_read = operations.os.read
+            calls = 0
+
+            def mutate_after_read(fd: int, size: int) -> bytes:
+                nonlocal calls
+                chunk = real_read(fd, size)
+                calls += 1
+                if calls == 1:
+                    path.write_bytes(b"mutation")
+                return chunk
+
+            with mock.patch.object(operations.os, "read", side_effect=mutate_after_read):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "events.jsonl"
+            path.write_bytes(b"x" * (operations.MANIFEST_READ_CHUNK + 1))
+            real_read = operations.os.read
+            calls = 0
+
+            def replace_after_read(fd: int, size: int) -> bytes:
+                nonlocal calls
+                chunk = real_read(fd, size)
+                calls += 1
+                if calls == 1:
+                    path.unlink()
+                    path.write_bytes(b"replacement")
+                return chunk
+
+            with mock.patch.object(operations.os, "read", side_effect=replace_after_read):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
+
+    def test_manifest_compares_complete_second_file_and_directory_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nested = root / "nested"
+            nested.mkdir()
+            path = nested / "events.jsonl"
+            path.write_text("events")
+            entries, snapshot = operations._manifest_entries(root, "Session")
+            altered = dict(snapshot)
+            kind, fingerprint = altered["nested/events.jsonl"]
+            altered["nested/events.jsonl"] = (
+                kind,
+                (*fingerprint[:-1], fingerprint[-1] + 1),
+            )
+            with mock.patch.object(
+                operations,
+                "_manifest_entries",
+                side_effect=[(entries, snapshot), (entries, altered)],
+            ):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
+            topology = dict(snapshot)
+            topology["nested/new-file"] = (
+                "file",
+                (0, 0, stat.S_IFREG, 0o644, 0, 0, 0, 1),
+            )
+            with mock.patch.object(
+                operations,
+                "_manifest_entries",
+                side_effect=[(entries, snapshot), (entries, topology)],
+            ):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
+            directory_mutation = dict(snapshot)
+            kind, fingerprint = directory_mutation["nested"]
+            directory_mutation["nested"] = (
+                kind,
+                (*fingerprint[:5], fingerprint[5] + 1, *fingerprint[6:]),
+            )
+            with mock.patch.object(
+                operations,
+                "_manifest_entries",
+                side_effect=[(entries, snapshot), (entries, directory_mutation)],
+            ):
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
 
     def test_plan_rejects_nonterminal_and_raw_protocol_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
