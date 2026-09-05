@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import ExitStack, contextmanager
 import errno
 import hashlib
 import json
@@ -129,18 +130,19 @@ elif args[:2] == ["workflow", "list"]:
 elif args == ["worktree", "list", "--json"]:
     print(json.dumps({{"worktrees": state.get("worktrees", [])}}, sort_keys=True))
 elif args[:2] == ["workflow", "inspect"]:
+    assert args[3:] == ["--summary", "--json"], "summary invocation required"
     workflow_id = args[2]
     workflow = state["workflows"][workflow_id]
     if not workflow.get("present", True):
         print("workflow not found", file=sys.stderr)
         raise SystemExit(1)
-    print(json.dumps({{"workflow": {{
+    print(json.dumps({{
         "id": workflow_id,
         "name": workflow["metadata"]["name"],
         "description": workflow["metadata"]["description"],
-        "revision": workflow["version"],
+        "version": workflow["version"],
         "execution_target_policy": execution_target_policy(workflow["metadata"]["execution_target"]),
-    }}}}, sort_keys=True))
+    }}, sort_keys=True))
 elif args[:3] == ["workflow", "graph", "inspect"]:
     workflow_id = args[3]
     workflow = state["workflows"][workflow_id]
@@ -180,7 +182,6 @@ elif args[:2] == ["workflow", "delete"]:
                 "blocked_task_count": 0,
                 "default_replacement_project_count": 0,
             }},
-            "blockers": [],
         }}))
     else:
         task_ids = [row["task_id"] for row in workflow.get("tasks", [])]
@@ -362,7 +363,6 @@ def make_d9_fixture(root: Path, count: int = 1) -> dict:
                     "blocked_task_count": 0,
                     "default_replacement_project_count": 0,
                 },
-                "blockers": [],
             }),
         }
         members.append(
@@ -552,6 +552,74 @@ def assert_fds_closed(test: unittest.TestCase, fds: list[int]) -> None:
             test.fail(f'descriptor {fd} remains open')
 
 
+class ManifestIOCapture:
+    """Observe owned FDs/content reads without disabling platform capabilities."""
+
+    def __init__(self, *, forbid_content: bool = False) -> None:
+        self.real_open = os.open
+        self.real_dup = os.dup
+        self.real_close = os.close
+        self.real_read = os.read
+        self.forbid_content = forbid_content
+        self.before_open = None
+        self.after_open = None
+        self.opened: list[int] = []
+        self.active: set[int] = set()
+        self.peak = 0
+        self.content_opens: list[str] = []
+        self.reads: list[tuple[tuple[int, int], int]] = []
+        self.stack = ExitStack()
+
+    def track(self, descriptor: int) -> int:
+        self.opened.append(descriptor)
+        self.active.add(descriptor)
+        self.peak = max(self.peak, len(self.active))
+        return descriptor
+
+    def open(self, path, flags, *args, **kwargs):
+        if path != "/" and (Path(path).name != path or kwargs.get("dir_fd") not in self.active):
+            raise AssertionError("manifest open was not relative to an owned directory")
+        if not flags & os.O_NOFOLLOW or not flags & os.O_NONBLOCK:
+            raise AssertionError("manifest open omitted safety flags")
+        if not flags & os.O_DIRECTORY:
+            self.content_opens.append(str(path))
+            if self.forbid_content:
+                raise AssertionError("file content opened")
+        if self.before_open is not None:
+            self.before_open(path, flags, kwargs.get("dir_fd"))
+        descriptor = self.track(self.real_open(path, flags, *args, **kwargs))
+        if self.after_open is not None:
+            self.after_open(descriptor)
+        return descriptor
+
+    def dup(self, descriptor: int) -> int:
+        return self.track(self.real_dup(descriptor))
+
+    def close(self, descriptor: int) -> None:
+        self.real_close(descriptor)
+        self.active.remove(descriptor)
+
+    def read(self, descriptor: int, size: int) -> bytes:
+        info = os.fstat(descriptor)
+        result = self.real_read(descriptor, size)
+        self.reads.append(((info.st_dev, info.st_ino), len(result)))
+        return result
+
+    def __enter__(self) -> "ManifestIOCapture":
+        for name in ("open", "dup", "close", "read"):
+            self.stack.enter_context(mock.patch.object(operations.os, name, side_effect=getattr(self, name)))
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.stack.__exit__(*args)
+
+    def assert_closed(self, test: unittest.TestCase) -> None:
+        test.assertEqual(self.active, set())
+        test.assertGreater(len(self.opened), 0)
+        test.assertLessEqual(self.peak, 3)
+        assert_fds_closed(test, self.opened)
+
+
 class WorkflowRetirementTest(unittest.TestCase):
     def assert_recoverable_preimage(
         self,
@@ -609,29 +677,28 @@ class WorkflowRetirementTest(unittest.TestCase):
             "blocked_task_count": 0,
             "default_replacement_project_count": 0,
         }
-        payload = json.dumps(
-            {"deleted": False, "impact": impact, "blockers": []},
-            separators=(",", ":"),
-        ).encode()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             kent = root / "kent"
-            for code, stderr in (
-                (1, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
-                (0, b""),
-            ):
-                with self.subTest(code=code), mock.patch.object(
-                    operations,
-                    "_run",
-                    return_value=(code, payload, stderr),
-                ) as run:
-                    result = operations._kent_delete_preview(kent, workflow, cwd=root)
-                self.assertEqual(result["impact"], impact)
-                self.assertEqual(
-                    run.call_args.args[0],
-                    [str(kent), "workflow", "delete", workflow, "--json"],
-                )
-                self.assertNotIn("--confirm", run.call_args.args[0])
+            for optional in ({}, {"blockers": []}):
+                body = {"deleted": False, "impact": impact, **optional}
+                for code, stderr in (
+                    (1, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+                    (0, b""),
+                ):
+                    with self.subTest(code=code, optional=optional), mock.patch.object(
+                        operations,
+                        "_run",
+                        return_value=(code, canonical_bytes(body), stderr),
+                    ) as run:
+                        result = operations._kent_delete_preview(kent, workflow, cwd=root)
+                    self.assertEqual(result, body)
+                    self.assertEqual(canonical_sha256(result), canonical_sha256(body))
+                    self.assertEqual(
+                        run.call_args.args[0],
+                        [str(kent), "workflow", "delete", workflow, "--json"],
+                    )
+                    self.assertNotIn("--confirm", run.call_args.args[0])
 
     def test_delete_preview_rejection_matrix_is_closed(self) -> None:
         workflow = workflow_id(0)
@@ -657,6 +724,10 @@ class WorkflowRetirementTest(unittest.TestCase):
             (1, {**valid, "unknown": True}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
             (1, {**valid, "deleted": True}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
             (1, {**valid, "blockers": [{"code": "blocked"}]}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "blockers": None}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "blockers": {}}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "blockers": ""}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
+            (1, {**valid, "blockers": False}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
             (1, {**valid, "impact": {**impact, "workflow_id": workflow_id(1)}},
              operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
             (1, {**valid, "impact": []}, operations.DELETE_PREVIEW_DIAGNOSTIC.encode()),
@@ -728,33 +799,40 @@ class WorkflowRetirementTest(unittest.TestCase):
             oversized = root / "oversized"
             oversized.touch()
             os.truncate(oversized, operations.SESSION_MANIFEST_FILE_LIMIT + 1)
-            with mock.patch.object(operations.os, "open", side_effect=AssertionError("file opened")):
-                with self.assertRaises(operations.OperationError):
+            with ManifestIOCapture(forbid_content=True) as capture:
+                with self.assertRaisesRegex(operations.OperationError, "file exceeds the bound"):
                     operations._session_manifest(root)
+            self.assertEqual(capture.content_opens, [])
+            capture.assert_closed(self)
 
             aggregate = root / "aggregate"
             aggregate.mkdir()
-            for name in ("one", "two"):
+            for name in ("one", "two", "three"):
                 path = aggregate / name
                 path.touch()
-                os.truncate(path, operations.SESSION_MANIFEST_TOTAL_LIMIT // 2 + 1)
-            with mock.patch.object(operations.os, "open", side_effect=AssertionError("file opened")):
-                with self.assertRaises(operations.OperationError):
+                os.truncate(path, 24 * 1024 * 1024)
+            with ManifestIOCapture(forbid_content=True) as capture:
+                with self.assertRaisesRegex(operations.OperationError, "manifest exceeds the byte bound"):
                     operations._session_manifest(aggregate)
+            self.assertEqual(capture.content_opens, [])
+            self.assertEqual(capture.reads, [])
+            capture.assert_closed(self)
 
             retained = root / "retained"
             retained.mkdir()
             retained_file = retained / "file"
             retained_file.touch()
             os.truncate(retained_file, operations.MAX_OUTPUT + 1)
-            with mock.patch.object(operations.os, "open", side_effect=AssertionError("file opened")):
-                with self.assertRaises(operations.OperationError):
+            with ManifestIOCapture(forbid_content=True) as capture:
+                with self.assertRaisesRegex(operations.OperationError, "file exceeds the bound"):
                     operations._resource_state({
                         "kind": "directory",
                         "id": "retained",
                         "path": str(retained),
                         "sha256": "a" * 64,
                     })
+            self.assertEqual(capture.content_opens, [])
+            capture.assert_closed(self)
 
     def test_session_and_retained_resource_wrappers_use_distinct_bounds(self) -> None:
         root = Path("/tmp/manifest-wrapper-test")
@@ -805,12 +883,12 @@ class WorkflowRetirementTest(unittest.TestCase):
             real_open = operations.os.open
             observed_flags: list[int] = []
 
-            def swap_before_open(path, flags, *args):
-                if Path(path) == target:
+            def swap_before_open(path, flags, *args, **kwargs):
+                if path == target.name and kwargs.get("dir_fd") is not None:
                     target.unlink()
                     os.mkfifo(target)
                     observed_flags.append(flags)
-                return real_open(path, flags, *args)
+                return real_open(path, flags, *args, **kwargs)
 
             with mock.patch.object(operations.os, "open", side_effect=swap_before_open):
                 with self.assertRaises(operations.OperationError):
@@ -859,24 +937,16 @@ class WorkflowRetirementTest(unittest.TestCase):
             stream = SyntheticStream(entries)
             with (
                 mock.patch.object(operations.os, "scandir", return_value=stream),
-                mock.patch.object(
-                    operations.os,
-                    "open",
-                    side_effect=AssertionError("file opened"),
-                ) as open_mock,
-                mock.patch.object(
-                    operations.os,
-                    "read",
-                    side_effect=AssertionError("file read"),
-                ) as read_mock,
+                ManifestIOCapture(forbid_content=True) as capture,
             ):
-                with self.assertRaises(operations.OperationError):
+                with self.assertRaisesRegex(operations.OperationError, "manifest is too large"):
                     operations._session_manifest(root)
             self.assertEqual(stream.consumed, operations.MAX_LIST + 1)
             self.assertEqual(sum(entry.name_reads for entry in entries), 0)
             self.assertEqual(sum(entry.stat_calls for entry in entries), 0)
-            open_mock.assert_not_called()
-            read_mock.assert_not_called()
+            self.assertEqual(capture.content_opens, [])
+            self.assertEqual(capture.reads, [])
+            capture.assert_closed(self)
 
     def test_manifest_bounds_nested_directories_before_overbudget_recursion(self) -> None:
         temporary = Path(tempfile.mkdtemp())
@@ -888,11 +958,12 @@ class WorkflowRetirementTest(unittest.TestCase):
                 current = current / "d"
                 current.mkdir()
                 created.append(current)
-            scanned: list[Path] = []
+            scanned: list[tuple[int, int]] = []
             real_scandir = operations.os.scandir
 
             def counted_scandir(path):
-                scanned.append(Path(path))
+                info = os.fstat(path)
+                scanned.append((info.st_dev, info.st_ino))
                 return real_scandir(path)
 
             with (
@@ -901,26 +972,16 @@ class WorkflowRetirementTest(unittest.TestCase):
                     "scandir",
                     side_effect=counted_scandir,
                 ),
-                mock.patch.object(
-                    operations.os,
-                    "open",
-                    side_effect=AssertionError("file opened"),
-                ) as open_mock,
-                mock.patch.object(
-                    operations.os,
-                    "read",
-                    side_effect=AssertionError("file read"),
-                ) as read_mock,
+                ManifestIOCapture(forbid_content=True) as capture,
             ):
-                with self.assertRaises(operations.OperationError):
+                with self.assertRaisesRegex(operations.OperationError, "manifest is too large"):
                     operations._session_manifest(root)
             self.assertEqual(len(scanned), operations.MAX_LIST + 1)
-            self.assertEqual(
-                len(scanned[-1].relative_to(root).parts),
-                operations.MAX_LIST,
-            )
-            open_mock.assert_not_called()
-            read_mock.assert_not_called()
+            expected_last = created[operations.MAX_LIST - 1].stat()
+            self.assertEqual(scanned[-1], (expected_last.st_dev, expected_last.st_ino))
+            self.assertEqual(capture.content_opens, [])
+            self.assertEqual(capture.reads, [])
+            capture.assert_closed(self)
         finally:
             for directory in reversed(created):
                 directory.rmdir()
@@ -932,7 +993,8 @@ class WorkflowRetirementTest(unittest.TestCase):
             nested = root / "nested"
             nested.mkdir()
             (nested / "events.jsonl").write_text("events")
-            entries, snapshot = operations._manifest_entries(root, "Session")
+            with operations._manifest_root(root, "Session") as (descriptor, _):
+                entries, snapshot = operations._manifest_entries(descriptor, "Session")
             altered = dict(snapshot)
             kind, fingerprint = altered["nested"]
             altered["nested"] = (
@@ -945,14 +1007,12 @@ class WorkflowRetirementTest(unittest.TestCase):
                     "_manifest_entries",
                     return_value=(entries, altered),
                 ),
-                mock.patch.object(
-                    operations.os,
-                    "open",
-                    side_effect=AssertionError("file opened after enumeration drift"),
-                ),
+                ManifestIOCapture(forbid_content=True) as capture,
             ):
-                with self.assertRaises(operations.OperationError):
+                with self.assertRaisesRegex(operations.OperationError, "entry changed during enumeration"):
                     operations._session_manifest(root)
+            self.assertEqual(capture.content_opens, [])
+            capture.assert_closed(self)
 
     def test_manifest_rejects_symlink_fifo_and_socket_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -981,6 +1041,492 @@ class WorkflowRetirementTest(unittest.TestCase):
                         operations._session_manifest(root)
                 finally:
                     listener.close()
+
+    def test_manifest_directory_swaps_never_read_outside_and_close_owned_descriptors(self) -> None:
+        cases = [
+            (location, milestone, replacement)
+            for location in ("ancestor", "root", "child")
+            for milestone in ("stat", "open", "opened", "enumerate", "enumerated")
+            for replacement in ("symlink", "directory")
+        ] + [
+            (location, "final_open", replacement)
+            for location in ("ancestor", "root")
+            for replacement in ("symlink", "directory")
+        ]
+        for manifest in (operations._session_manifest, operations._retained_resource_manifest):
+            for location, milestone, replacement in cases:
+                with self.subTest(wrapper=manifest.__name__, location=location,
+                                  milestone=milestone, replacement=replacement):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        fixture = Path(temporary).resolve()
+                        ancestor = fixture / "ancestor"
+                        root = ancestor / "root"
+                        child = root / "child"
+                        child.mkdir(parents=True)
+                        local_files = [root / "events", child / "events"]
+                        for path in local_files:
+                            path.write_bytes(b"local fixture")
+                        target = {"ancestor": ancestor, "root": root, "child": child}[location]
+                        outside = fixture / "outside"
+                        outside.mkdir()
+                        sentinels = []
+                        for path in local_files:
+                            if path.is_relative_to(target):
+                                relative = path.relative_to(target)
+                                sentinel = outside / relative
+                                sentinel.parent.mkdir(parents=True, exist_ok=True)
+                                sentinel.write_bytes(b"external disposable sentinel")
+                                sentinels.append(relative)
+                        outside_ids = {
+                            (info.st_dev, info.st_ino)
+                            for info in ((outside / relative).stat() for relative in sentinels)
+                        }
+                        target_info = target.stat()
+                        target_id = (target_info.st_dev, target_info.st_ino)
+                        parent_info = target.parent.stat()
+                        parent_id = (parent_info.st_dev, parent_info.st_ino)
+                        scan_info = (root if location == "ancestor" else target).stat()
+                        scan_id = (scan_info.st_dev, scan_info.st_ino)
+                        real_stat, real_scandir = os.stat, os.scandir
+                        real_entries = operations._manifest_entries
+                        swapped = False
+                        enumerations = 0
+                        final_check = False
+
+                        def swap() -> None:
+                            nonlocal swapped
+                            target.rename(fixture / "retained")
+                            if replacement == "symlink":
+                                target.symlink_to(outside, target_is_directory=True)
+                            else:
+                                outside.rename(target)
+                            swapped = True
+
+                        def swapped_stat(path, *args, **kwargs):
+                            info = real_stat(path, *args, **kwargs)
+                            if (
+                                milestone == "stat" and not swapped
+                                and kwargs.get("dir_fd") is not None
+                                and (info.st_dev, info.st_ino) == target_id
+                            ):
+                                swap()
+                            return info
+
+                        def before_open(path, flags, parent):
+                            if milestone not in {"open", "final_open"} or swapped:
+                                return
+                            if milestone == "final_open" and not final_check:
+                                return
+                            if parent is not None and path == target.name:
+                                info = os.fstat(parent)
+                                if (info.st_dev, info.st_ino) == parent_id:
+                                    swap()
+
+                        def after_open(descriptor):
+                            info = os.fstat(descriptor)
+                            if milestone == "opened" and not swapped and (info.st_dev, info.st_ino) == target_id:
+                                swap()
+
+                        @contextmanager
+                        def swapped_scandir(descriptor):
+                            self.assertIsInstance(descriptor, int)
+                            info = os.fstat(descriptor)
+                            chosen = (info.st_dev, info.st_ino) == scan_id
+                            if milestone == "enumerate" and not swapped and chosen:
+                                swap()
+                            with real_scandir(descriptor) as stream:
+                                yield stream
+                            if milestone == "enumerated" and not swapped and chosen:
+                                swap()
+
+                        def counted_entries(*args):
+                            nonlocal enumerations, final_check
+                            result = real_entries(*args)
+                            enumerations += 1
+                            final_check = enumerations == 2
+                            return result
+
+                        capture = ManifestIOCapture()
+                        capture.before_open = before_open
+                        capture.after_open = after_open
+                        with (
+                            capture,
+                            mock.patch.object(operations.os, "stat", side_effect=swapped_stat),
+                            mock.patch.object(operations.os, "scandir", side_effect=swapped_scandir),
+                            mock.patch.object(operations, "_manifest_entries", side_effect=counted_entries),
+                            mock.patch.object(operations, "_run", side_effect=AssertionError("live call")) as run,
+                            mock.patch.object(operations, "run_effect", side_effect=AssertionError("effect")) as effect,
+                        ):
+                            with self.assertRaises(operations.OperationError):
+                                manifest(root)
+                        self.assertTrue(swapped, "the intended race milestone was not exercised")
+                        self.assertEqual(sum(size for identity, size in capture.reads if identity in outside_ids), 0)
+                        self.assertFalse(any(identity in outside_ids for identity, _ in capture.reads))
+                        capture.assert_closed(self)
+                        run.assert_not_called()
+                        effect.assert_not_called()
+                        sentinel_root = outside if replacement == "symlink" else target
+                        for relative in sentinels:
+                            self.assertEqual((sentinel_root / relative).read_bytes(), b"external disposable sentinel")
+
+    def test_manifest_accepts_stable_ancestor_aliases_but_not_symlink_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary).resolve()
+            physical = fixture / "physical"
+            root = physical / "root"
+            root.mkdir(parents=True)
+            (root / "events").write_text("events")
+            holder = fixture / "holder"
+            holder.mkdir()
+            for index, target in enumerate((physical, Path("../physical"))):
+                alias = holder / f"alias-{index}"
+                alias.symlink_to(target, target_is_directory=True)
+                for manifest in (operations._session_manifest, operations._retained_resource_manifest):
+                    with self.subTest(target=target, wrapper=manifest.__name__):
+                        with ManifestIOCapture() as capture:
+                            result = manifest(alias / "root")
+                        capture.assert_closed(self)
+                        self.assertEqual(result, manifest(root))
+            link = fixture / "root-link"
+            link.symlink_to(root, target_is_directory=True)
+            for manifest in (operations._session_manifest, operations._retained_resource_manifest):
+                with ManifestIOCapture(forbid_content=True) as capture:
+                    with self.assertRaisesRegex(operations.OperationError, "symlink root"):
+                        manifest(link)
+                capture.assert_closed(self)
+
+    def test_manifest_resolves_nested_alias_parent_segments_in_filesystem_order(self) -> None:
+        for bridge_kind in ("absolute", "relative", "nested-absolute", "nested-relative"):
+            for alias_kind in ("absolute", "relative", "leading-parent", "repeated-parent"):
+                with self.subTest(bridge=bridge_kind, alias=alias_kind), tempfile.TemporaryDirectory() as temporary:
+                    fixture = Path(temporary).resolve()
+                    deep = fixture / "inside" / "deep"
+                    deep.mkdir(parents=True)
+                    correct = fixture / "inside" / "root"
+                    incorrect = fixture / "root"
+                    correct.mkdir()
+                    incorrect.mkdir()
+                    correct_bytes = b"correct-os-resolved-root"
+                    incorrect_bytes = b"incorrect-lexically-resolved-root"
+                    (correct / "sentinel").write_bytes(correct_bytes)
+                    (incorrect / "sentinel").write_bytes(incorrect_bytes)
+                    bridge = fixture / "bridge"
+                    if bridge_kind.startswith("nested-"):
+                        middle = fixture / "middle"
+                        middle.symlink_to(
+                            "inside/deep" if bridge_kind == "nested-absolute" else deep,
+                            target_is_directory=True,
+                        )
+                        bridge.symlink_to(
+                            middle if bridge_kind == "nested-absolute" else "middle",
+                            target_is_directory=True,
+                        )
+                        self.assertTrue(middle.is_symlink())
+                    else:
+                        bridge.symlink_to(
+                            deep if bridge_kind == "absolute" else "inside/deep",
+                            target_is_directory=True,
+                        )
+                    alias = fixture / "alias"
+                    if alias_kind == "leading-parent":
+                        holder = fixture / "holder"
+                        holder.mkdir()
+                        alias = holder / "alias"
+                    target = {
+                        "absolute": str(bridge / ".."),
+                        "relative": "bridge/..",
+                        "leading-parent": "../bridge/..",
+                        "repeated-parent": "bridge/../deep/..",
+                    }[alias_kind]
+                    alias.symlink_to(target, target_is_directory=True)
+                    selected = alias / "root"
+                    self.assertTrue(bridge.is_symlink())
+                    self.assertTrue(alias.is_symlink())
+                    self.assertEqual(os.readlink(alias), target)
+                    self.assertEqual(selected.resolve(strict=True), correct)
+                    correct_info = (correct / "sentinel").stat()
+                    incorrect_info = (incorrect / "sentinel").stat()
+                    correct_id = (correct_info.st_dev, correct_info.st_ino)
+                    incorrect_id = (incorrect_info.st_dev, incorrect_info.st_ino)
+                    self.assertNotEqual(correct_id, incorrect_id)
+                    for manifest in (operations._session_manifest, operations._retained_resource_manifest):
+                        with self.subTest(wrapper=manifest.__name__):
+                            parent_steps = 0
+
+                            def before_open(path, flags, parent):
+                                nonlocal parent_steps
+                                if path == "..":
+                                    parent_steps += 1
+                                    self.assertIsNotNone(parent)
+                                    self.assertTrue(flags & os.O_DIRECTORY)
+
+                            capture = ManifestIOCapture()
+                            capture.before_open = before_open
+                            with capture:
+                                result = manifest(selected)
+                            capture.assert_closed(self)
+                            self.assertGreater(parent_steps, 0)
+                            self.assertEqual(result, [{
+                                "path": "sentinel", "type": "file",
+                                "mode": stat.S_IMODE(correct_info.st_mode),
+                                "bytes": len(correct_bytes),
+                                "sha256": hashlib.sha256(correct_bytes).hexdigest(),
+                            }])
+                            self.assertEqual(
+                                sum(size for identity, size in capture.reads if identity == correct_id),
+                                len(correct_bytes),
+                            )
+                            self.assertFalse(any(identity == incorrect_id for identity, _ in capture.reads))
+
+    def test_manifest_parent_segment_directory_moves_cannot_read_the_new_parent_tree(self) -> None:
+        for milestone in (
+            "before_stat", "after_stat", "before_open", "after_open", "verified", "final_open",
+        ):
+            for manifest in (operations._session_manifest, operations._retained_resource_manifest):
+                with self.subTest(milestone=milestone, wrapper=manifest.__name__):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        fixture = Path(temporary).resolve()
+                        inside = fixture / "inside"
+                        deep = inside / "deep"
+                        deep.mkdir(parents=True)
+                        outside = fixture / "outside"
+                        outside.mkdir()
+                        for parent in (inside, outside):
+                            (parent / "root").mkdir()
+                            (parent / "root" / "sentinel").write_bytes(parent.name.encode())
+                        (fixture / "bridge").symlink_to(deep, target_is_directory=True)
+                        (fixture / "alias").symlink_to("bridge/..", target_is_directory=True)
+                        selected = fixture / "alias" / "root"
+                        self.assertEqual(selected.resolve(strict=True), inside / "root")
+                        deep_info = deep.stat()
+                        deep_id = (deep_info.st_dev, deep_info.st_ino)
+                        outside_info = (outside / "root" / "sentinel").stat()
+                        outside_id = (outside_info.st_dev, outside_info.st_ino)
+                        real_stat, real_fstat = os.stat, os.fstat
+                        swapped = False
+                        opening_parent = False
+                        parent_opens = 0
+
+                        def is_parent_step(path, parent):
+                            if path != ".." or parent is None:
+                                return False
+                            info = real_fstat(parent)
+                            return (info.st_dev, info.st_ino) == deep_id
+
+                        def swap() -> None:
+                            nonlocal swapped
+                            deep.rename(outside / "deep")
+                            swapped = True
+
+                        def swapped_stat(path, *args, **kwargs):
+                            chosen = is_parent_step(path, kwargs.get("dir_fd"))
+                            if chosen and not swapped and milestone == "before_stat":
+                                swap()
+                            info = real_stat(path, *args, **kwargs)
+                            if chosen and not swapped and milestone == "after_stat":
+                                swap()
+                            return info
+
+                        def before_open(path, flags, parent):
+                            nonlocal opening_parent, parent_opens
+                            opening_parent = is_parent_step(path, parent)
+                            if opening_parent:
+                                parent_opens += 1
+                                if not swapped and (
+                                    milestone == "before_open"
+                                    or (milestone == "final_open" and parent_opens == 2)
+                                ):
+                                    swap()
+
+                        def after_open(descriptor):
+                            if opening_parent and not swapped and milestone == "after_open":
+                                swap()
+
+                        def swapped_fstat(descriptor):
+                            info = real_fstat(descriptor)
+                            if opening_parent and not swapped and milestone == "verified":
+                                swap()
+                            return info
+
+                        capture = ManifestIOCapture()
+                        capture.before_open = before_open
+                        capture.after_open = after_open
+                        with (
+                            capture,
+                            mock.patch.object(operations.os, "stat", side_effect=swapped_stat),
+                            mock.patch.object(operations.os, "fstat", side_effect=swapped_fstat),
+                        ):
+                            with self.assertRaises(operations.OperationError):
+                                manifest(selected)
+                        self.assertTrue(swapped, "the intended parent-segment race was not exercised")
+                        self.assertFalse(any(identity == outside_id for identity, _ in capture.reads))
+                        capture.assert_closed(self)
+                        self.assertEqual((outside / "root" / "sentinel").read_bytes(), b"outside")
+
+    def test_manifest_alias_cycles_and_expansion_budget_close_descriptors(self) -> None:
+        for target in ("alias", "../" * (operations.MAX_LIST + 1) + "inside"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                fixture = Path(temporary)
+                alias = fixture / "alias"
+                alias.symlink_to(target, target_is_directory=True)
+                self.assertEqual(os.readlink(alias), target)
+                for manifest in (operations._session_manifest, operations._retained_resource_manifest):
+                    with ManifestIOCapture(forbid_content=True) as capture:
+                        with self.assertRaisesRegex(operations.OperationError, "manifest root path is too large"):
+                            manifest(alias / "root")
+                    self.assertEqual(capture.content_opens, [])
+                    capture.assert_closed(self)
+
+    def test_manifest_ancestor_alias_swaps_are_bound_before_content_reads(self) -> None:
+        for milestone in ("before_readlink", "after_readlink", "verified"):
+            for manifest in (operations._session_manifest, operations._retained_resource_manifest):
+                with self.subTest(milestone=milestone, wrapper=manifest.__name__):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        fixture = Path(temporary).resolve()
+                        for name in ("inside", "outside"):
+                            (fixture / name / "root").mkdir(parents=True)
+                            (fixture / name / "root" / "events").write_text(name)
+                        alias = fixture / "alias"
+                        alias.symlink_to("inside", target_is_directory=True)
+                        real_readlink, real_stat = os.readlink, os.stat
+                        observed_link = False
+                        swapped = False
+                        external = (fixture / "outside" / "root" / "events").stat()
+
+                        def swap() -> None:
+                            nonlocal swapped
+                            alias.rename(fixture / "retained-alias")
+                            alias.symlink_to("outside", target_is_directory=True)
+                            swapped = True
+
+                        def swapped_readlink(path, *args, **kwargs):
+                            nonlocal observed_link
+                            chosen = path == "alias" and kwargs.get("dir_fd") is not None and not swapped
+                            if chosen and milestone == "before_readlink":
+                                swap()
+                            result = real_readlink(path, *args, **kwargs)
+                            if chosen:
+                                observed_link = True
+                                if milestone == "after_readlink":
+                                    swap()
+                            return result
+
+                        def swapped_stat(path, *args, **kwargs):
+                            info = real_stat(path, *args, **kwargs)
+                            if (
+                                milestone == "verified" and observed_link and not swapped
+                                and path == "alias" and kwargs.get("dir_fd") is not None
+                            ):
+                                swap()
+                            return info
+
+                        with (
+                            ManifestIOCapture() as capture,
+                            mock.patch.object(operations.os, "readlink", side_effect=swapped_readlink),
+                            mock.patch.object(operations.os, "stat", side_effect=swapped_stat),
+                        ):
+                            with self.assertRaises(operations.OperationError):
+                                manifest(alias / "root")
+                        self.assertTrue(observed_link)
+                        self.assertTrue(swapped)
+                        self.assertFalse(any(
+                            identity == (external.st_dev, external.st_ino) for identity, _ in capture.reads
+                        ))
+                        capture.assert_closed(self)
+
+    def test_manifest_missing_required_primitives_fails_before_acquiring_descriptors(self) -> None:
+        for name, value in (
+            ("supports_dir_fd", set()),
+            ("supports_fd", set()),
+            ("supports_follow_symlinks", set()),
+            ("O_NOFOLLOW", 0),
+            ("O_DIRECTORY", 0),
+            ("O_NONBLOCK", 0),
+        ):
+            with self.subTest(primitive=name), mock.patch.object(operations.os, name, value):
+                with mock.patch.object(operations.os, "open", side_effect=AssertionError("opened")) as opened:
+                    with self.assertRaisesRegex(operations.OperationError, "primitives are unavailable"):
+                        operations._session_manifest(Path("/unused"))
+                opened.assert_not_called()
+
+    def test_manifest_io_errors_release_root_directory_and_content_descriptors(self) -> None:
+        for stage in ("root_fstat", "directory_fstat", "file_fstat", "scandir", "read"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                nested = root / "nested"
+                nested.mkdir()
+                payload = nested / "events"
+                payload.write_text("events")
+                identities = {
+                    "root_fstat": root.stat().st_ino,
+                    "directory_fstat": nested.stat().st_ino,
+                    "file_fstat": payload.stat().st_ino,
+                }
+                real_fstat = os.fstat
+                injected = False
+
+                def failed_fstat(descriptor):
+                    nonlocal injected
+                    info = real_fstat(descriptor)
+                    if not injected and info.st_ino == identities.get(stage):
+                        injected = True
+                        raise OSError(errno.EIO, "injected fstat error")
+                    return info
+
+                def failed_io(*args):
+                    nonlocal injected
+                    injected = True
+                    raise OSError(errno.EIO, "injected I/O error")
+
+                with ManifestIOCapture() as capture, ExitStack() as patches:
+                    patches.enter_context(mock.patch.object(operations.os, "fstat", side_effect=failed_fstat))
+                    if stage in {"scandir", "read"}:
+                        patches.enter_context(mock.patch.object(operations.os, stage, side_effect=failed_io))
+                    with self.assertRaisesRegex(operations.OperationError, "cannot be accessed safely"):
+                        operations._session_manifest(root)
+                self.assertTrue(injected)
+                capture.assert_closed(self)
+
+    def test_manifest_file_symlink_swap_and_growth_are_rejected_with_closed_descriptors(self) -> None:
+        for stage in ("symlink", "growth"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                fixture = Path(temporary)
+                root = fixture / "root"
+                root.mkdir()
+                target = root / "events"
+                target.write_bytes(b"inside")
+                outside = fixture / "external"
+                outside.write_bytes(b"external sentinel")
+                external = outside.stat()
+                mutated = False
+                capture = ManifestIOCapture()
+                real_read = os.read
+
+                def before_open(path, flags, parent):
+                    nonlocal mutated
+                    if stage == "symlink" and not mutated and path == "events":
+                        target.unlink()
+                        target.symlink_to(outside)
+                        mutated = True
+
+                def grown_read(descriptor, size):
+                    nonlocal mutated
+                    if stage == "growth" and not mutated:
+                        # Path writes are confined to the disposable fixture.
+                        target.write_bytes(b"inside" * 4)
+                        mutated = True
+                    return real_read(descriptor, size)
+
+                capture.before_open = before_open
+                capture.real_read = grown_read
+                with capture:
+                    with self.assertRaises(operations.OperationError):
+                        operations._session_manifest(root)
+                self.assertTrue(mutated)
+                self.assertFalse(any(
+                    identity == (external.st_dev, external.st_ino) for identity, _ in capture.reads
+                ))
+                capture.assert_closed(self)
 
     def test_manifest_rejects_file_mutation_and_replacement_during_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1029,7 +1575,8 @@ class WorkflowRetirementTest(unittest.TestCase):
             nested.mkdir()
             path = nested / "events.jsonl"
             path.write_text("events")
-            entries, snapshot = operations._manifest_entries(root, "Session")
+            with operations._manifest_root(root, "Session") as (descriptor, _):
+                entries, snapshot = operations._manifest_entries(descriptor, "Session")
             altered = dict(snapshot)
             kind, fingerprint = altered["nested/events.jsonl"]
             altered["nested/events.jsonl"] = (

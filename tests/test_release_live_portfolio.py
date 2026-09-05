@@ -200,7 +200,6 @@ def member_plan(sequence: int, project_id: str, project_root: Path, workflow_id:
             "blocked_task_count": 0,
             "default_replacement_project_count": 0,
         },
-        "blockers": [],
     }
     return {
         "sequence": sequence, "project_id": project_id, "project_root": str(project_root),
@@ -287,13 +286,14 @@ elif args[:2] == ["workflow", "list"]:
 elif args == ["worktree", "list", "--json"]:
     print(json.dumps({"worktrees": []}))
 elif args[:2] == ["workflow", "inspect"]:
+    assert args[3:] == ["--summary", "--json"], "summary invocation required"
     wid = args[2]; item = state["workflows"][wid]
     if not item.get("present", True):
         print("workflow not found", file=sys.stderr); raise SystemExit(1)
-    print(json.dumps({"workflow": {"id": wid, "name": item["metadata"]["name"],
+    print(json.dumps({"id": wid, "name": item["metadata"]["name"],
         "description": item["metadata"]["description"],
-        "revision": item["version"],
-        "execution_target_policy": execution_target_policy(item["metadata"]["execution_target"])}}, sort_keys=True))
+        "version": item["version"],
+        "execution_target_policy": execution_target_policy(item["metadata"]["execution_target"])}, sort_keys=True))
 elif args[:3] == ["workflow", "graph", "inspect"]:
     wid = args[3]; item = state["workflows"][wid]
     print(json.dumps({"workflow_id": wid, "expected_version": item["version"], "graph": item["graph"]}, sort_keys=True))
@@ -324,7 +324,6 @@ elif args[:2] == ["workflow", "delete"]:
                 "blocked_task_count": 0,
                 "default_replacement_project_count": 0,
             },
-            "blockers": [],
         }, sort_keys=True, separators=(",", ":")))
         print("Workflow deletion was not confirmed. Rerun with --confirm to delete it.",
               file=sys.stderr)

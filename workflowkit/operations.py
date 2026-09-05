@@ -5,6 +5,7 @@ constructed here from typed plan values; a plan can never smuggle in a shell,
 an executable, or an arbitrary probe.
 """
 from __future__ import annotations
+from contextlib import contextmanager
 from dataclasses import dataclass
 import base64
 import fcntl
@@ -19,7 +20,7 @@ import subprocess
 import sys
 import time
 import sqlite3
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from .release import canonical_bytes as release_canonical_bytes
 from .release import ReleaseSpec
 from .profile import ProjectProfile
@@ -1131,82 +1132,206 @@ def _manifest_fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int
     )
 
 
+def _manifest_require_primitives() -> None:
+    # Check capabilities by name so instrumentation of these functions does not
+    # change the platform's advertised support.
+    if (
+        not {'open', 'stat', 'readlink'} <= {
+            function.__name__ for function in getattr(os, 'supports_dir_fd', ())
+        }
+        or 'scandir' not in {function.__name__ for function in getattr(os, 'supports_fd', ())}
+        or 'stat' not in {function.__name__ for function in getattr(os, 'supports_follow_symlinks', ())}
+        or any(not getattr(os, name, 0) for name in ('O_NOFOLLOW', 'O_DIRECTORY', 'O_NONBLOCK'))
+    ):
+        raise OperationError('descriptor-relative manifest primitives are unavailable')
+
+
+def _manifest_open(
+    parent: int | None,
+    name: str,
+    expected: os.stat_result,
+    *,
+    directory: bool,
+    label: str,
+) -> int:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if directory:
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(name, flags, dir_fd=parent)
+    try:
+        opened = os.fstat(descriptor)
+        valid_type = stat.S_ISDIR(opened.st_mode) if directory else stat.S_ISREG(opened.st_mode)
+        if not valid_type or _manifest_fingerprint(opened) != _manifest_fingerprint(expected):
+            raise OperationError(f'{label} manifest entry changed before opening')
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _manifest_root(
+    path: Path,
+    label: str,
+    expected: Mapping[str, tuple[int, ...]] | None = None,
+) -> Iterator[tuple[int, dict[str, tuple[int, ...]]]]:
+    """Acquire every root component relative to a verified owned descriptor.
+
+    Existing ancestor aliases (including platform temporary-directory aliases)
+    are resolved with readlinkat and retained in the anchor preimage. The root
+    itself and all manifest descendants must be real directories/files.
+    """
+    _manifest_require_primitives()
+    if '..' in path.parts:
+        raise OperationError(f'invalid {label} manifest root path')
+    pending = list(path.absolute().parts[1:])
+    physical = Path('/')
+    anchors: dict[str, tuple[int, ...]] = {}
+    descriptor: int | None = None
+
+    def remember(location: Path, info: os.stat_result) -> None:
+        # Unrelated siblings can change ancestor timestamps. Bind directory
+        # identity/mode here; the manifest root has a full snapshot below.
+        identity = (
+            _manifest_fingerprint(info) if stat.S_ISLNK(info.st_mode)
+            else (info.st_dev, info.st_ino, info.st_mode)
+        )
+        key = location.as_posix()
+        if (
+            (key in anchors and anchors[key] != identity)
+            or (expected is not None and expected.get(key) != identity)
+        ):
+            raise OperationError(f'{label} manifest root path changed')
+        anchors[key] = identity
+
+    try:
+        root_info = os.stat('/', follow_symlinks=False)
+        remember(Path('/'), root_info)
+        descriptor = _manifest_open(None, '/', root_info, directory=True, label=label)
+        traversed = 0
+        while pending:
+            traversed += 1
+            if traversed > MAX_LIST or len(pending) > MAX_LIST:
+                raise OperationError(f'{label} manifest root path is too large')
+            name, *pending = pending
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if name == '..':
+                replacement = _manifest_open(descriptor, name, info, directory=True, label=label)
+                os.close(descriptor)
+                descriptor = replacement
+                physical = physical.parent
+                remember(physical, info)
+                continue
+            location = physical / name
+            remember(location, info)
+            if stat.S_ISLNK(info.st_mode):
+                if not pending:
+                    raise OperationError(f'{label} manifest refuses a symlink root')
+                target = os.readlink(name, dir_fd=descriptor)
+                after = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if _manifest_fingerprint(after) != _manifest_fingerprint(info):
+                    raise OperationError(f'{label} manifest ancestor alias changed')
+                # Resolve target components in order: a preceding symlink can
+                # change which pinned directory a later '..' must ascend from.
+                target_path = Path(target)
+                target_parts = target_path.parts
+                if not target_path.is_absolute():
+                    pending = list(target_parts) + pending
+                    continue
+                pending = list(target_parts[1:]) + pending
+                physical = Path('/')
+                remember(physical, root_info)
+                replacement = _manifest_open(None, '/', root_info, directory=True, label=label)
+            else:
+                replacement = _manifest_open(descriptor, name, info, directory=True, label=label)
+                physical = location
+            os.close(descriptor)
+            descriptor = replacement
+        if expected is not None and anchors != expected:
+            raise OperationError(f'{label} manifest root path changed')
+        yield descriptor, anchors
+    except OSError as error:
+        raise OperationError(f'{label} manifest directory or entry cannot be accessed safely') from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+@contextmanager
+def _manifest_directory(
+    root: int,
+    relative: Path,
+    snapshot: Mapping[str, tuple[str, tuple[int, ...]]],
+    label: str,
+) -> Iterator[int]:
+    # Rewalk from the pinned root instead of retaining one FD per entry/depth.
+    # At most root, current directory, and its next child are open here.
+    descriptor = os.dup(root)
+    try:
+        current = Path()
+        if snapshot['.'] != ('directory', _manifest_fingerprint(os.fstat(descriptor))):
+            raise OperationError(f'{label} manifest root changed')
+        for name in relative.parts:
+            current /= name
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if snapshot.get(current.as_posix()) != ('directory', _manifest_fingerprint(info)):
+                raise OperationError(f'{label} manifest directory changed')
+            replacement = _manifest_open(descriptor, name, info, directory=True, label=label)
+            os.close(descriptor)
+            descriptor = replacement
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
 def _manifest_entries(
-    root: Path,
+    root: int,
     label: str,
 ) -> tuple[list[tuple[Path, str, os.stat_result]], dict[str, tuple[str, tuple[int, ...]]]]:
-    if root.is_symlink() or not root.is_dir():
-        raise OperationError(f'{label} directory is absent or unsafe')
     entries: list[tuple[Path, str, os.stat_result]] = []
-    snapshot: dict[str, tuple[str, tuple[int, ...]]] = {}
-
-    def visit(
-        directory: Path,
-        relative: Path,
-        expected_fingerprint: tuple[int, ...] | None = None,
-    ) -> None:
-        try:
-            directory_info = directory.lstat()
-        except OSError as error:
-            raise OperationError(f'{label} directory cannot be inspected') from error
-        directory_fingerprint = _manifest_fingerprint(directory_info)
-        if expected_fingerprint is not None and directory_fingerprint != expected_fingerprint:
-            raise OperationError(f'{label} manifest directory changed during enumeration')
-        if not stat.S_ISDIR(directory_info.st_mode) or stat.S_ISLNK(directory_info.st_mode):
-            raise OperationError(f'{label} manifest refuses an unsafe directory')
-        snapshot[relative.as_posix()] = ('directory', directory_fingerprint)
-        remaining = MAX_LIST - len(entries)
-        children: list[os.DirEntry[str]] = []
-        try:
+    snapshot = {'.': ('directory', _manifest_fingerprint(os.fstat(root)))}
+    pending = [Path()]
+    while pending:
+        relative = pending.pop()
+        with _manifest_directory(root, relative, snapshot, label) as directory:
+            remaining = MAX_LIST - len(entries)
+            children: list[os.DirEntry[str]] = []
             with os.scandir(directory) as stream:
                 for entry in stream:
                     children.append(entry)
                     if len(children) > remaining:
                         raise OperationError(f'{label} manifest is too large')
-        except OSError as error:
-            raise OperationError(f'{label} directory cannot be enumerated') from error
-        children.sort(key=lambda entry: entry.name)
-        child_directories: list[tuple[Path, Path, tuple[int, ...]]] = []
-        for entry in children:
-            child_relative = relative / entry.name
-            if any(part in {'.', '..'} for part in child_relative.parts):
-                raise OperationError(f'invalid {label} manifest path')
-            try:
-                info = entry.stat(follow_symlinks=False)
-            except OSError as error:
-                raise OperationError(f'{label} manifest entry cannot be inspected') from error
-            mode = info.st_mode
-            if stat.S_ISLNK(mode):
-                raise OperationError(f'{label} manifest refuses symlinks')
-            if stat.S_ISDIR(mode):
-                kind = 'directory'
-            elif stat.S_ISREG(mode):
-                kind = 'file'
-            else:
-                raise OperationError(f'{label} manifest refuses non-regular files')
-            if len(entries) >= MAX_LIST:
-                raise OperationError(f'{label} manifest is too large')
-            fingerprint = _manifest_fingerprint(info)
-            entry_path = directory / entry.name
-            entries.append((entry_path, kind, info))
-            snapshot[child_relative.as_posix()] = (kind, fingerprint)
-            if kind == 'directory':
-                child_directories.append((entry_path, child_relative, fingerprint))
-        del children
-        for child, child_relative, fingerprint in child_directories:
-            visit(child, child_relative, fingerprint)
-
-    visit(root, Path())
+            children.sort(key=lambda entry: entry.name)
+            child_directories: list[Path] = []
+            for entry in children:
+                name = entry.name
+                if not name or name in {'.', '..'} or Path(name).name != name:
+                    raise OperationError(f'invalid {label} manifest path')
+                child_relative = relative / name
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    raise OperationError(f'{label} manifest refuses symlinks')
+                if stat.S_ISDIR(info.st_mode):
+                    kind = 'directory'
+                    child_directories.append(child_relative)
+                elif stat.S_ISREG(info.st_mode):
+                    kind = 'file'
+                else:
+                    raise OperationError(f'{label} manifest refuses non-regular files')
+                entries.append((child_relative, kind, info))
+                snapshot[child_relative.as_posix()] = (kind, _manifest_fingerprint(info))
+            if snapshot[relative.as_posix()] != ('directory', _manifest_fingerprint(os.fstat(directory))):
+                raise OperationError(f'{label} manifest directory changed during enumeration')
+            pending.extend(reversed(child_directories))
     return entries, snapshot
 
 
-def _directory_manifest(path: Path, *, file_limit: int, total_limit: int, label: str) -> list[dict[str, Any]]:
-    entries, snapshot = _manifest_entries(path, label)
+def _manifest_records(root: int, *, file_limit: int, total_limit: int, label: str) -> list[dict[str, Any]]:
+    entries, snapshot = _manifest_entries(root, label)
     total_bytes = 0
     records: list[dict[str, Any]] = []
-    file_entries: list[tuple[Path, str, os.stat_result]] = []
-    for entry, kind, info in entries:
-        relative = entry.relative_to(path)
+    file_entries: list[tuple[Path, os.stat_result]] = []
+    for relative, kind, info in entries:
         if snapshot.get(relative.as_posix()) != (
             kind,
             _manifest_fingerprint(info),
@@ -1225,59 +1350,54 @@ def _directory_manifest(path: Path, *, file_limit: int, total_limit: int, label:
         total_bytes += info.st_size
         if total_bytes > total_limit:
             raise OperationError(f'{label} manifest exceeds the byte bound')
-        file_entries.append((entry, relative.as_posix(), info))
+        file_entries.append((relative, info))
 
-    for entry, relative, expected in file_entries:
-        flags = (
-            os.O_RDONLY
-            | getattr(os, 'O_NOFOLLOW', 0)
-            | getattr(os, 'O_NONBLOCK', 0)
-        )
-        descriptor: int | None = None
-        try:
+    for relative, expected in file_entries:
+        with _manifest_directory(root, relative.parent, snapshot, label) as parent:
+            descriptor = _manifest_open(parent, relative.name, expected, directory=False, label=label)
             try:
-                descriptor = os.open(entry, flags)
-            except OSError as error:
-                raise OperationError(f'{label} manifest file cannot be opened') from error
-            opened = os.fstat(descriptor)
-            if _manifest_fingerprint(opened) != _manifest_fingerprint(expected):
-                raise OperationError(f'{label} manifest file changed before hashing')
-            digest = hashlib.sha256()
-            bytes_read = 0
-            while True:
-                chunk = os.read(descriptor, MANIFEST_READ_CHUNK)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                bytes_read += len(chunk)
-                if bytes_read > expected.st_size:
-                    raise OperationError(f'{label} manifest file grew while hashing')
-            after = os.fstat(descriptor)
-            try:
-                path_info = entry.lstat()
-            except OSError as error:
-                raise OperationError(f'{label} manifest file disappeared while hashing') from error
-            if (
-                bytes_read != expected.st_size
-                or _manifest_fingerprint(after) != _manifest_fingerprint(expected)
-                or _manifest_fingerprint(path_info) != _manifest_fingerprint(after)
-            ):
-                raise OperationError(f'{label} manifest file changed while hashing')
-        finally:
-            if descriptor is not None:
+                digest = hashlib.sha256()
+                bytes_read = 0
+                while True:
+                    chunk = os.read(descriptor, MANIFEST_READ_CHUNK)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    bytes_read += len(chunk)
+                    if bytes_read > expected.st_size:
+                        raise OperationError(f'{label} manifest file grew while hashing')
+                after = os.fstat(descriptor)
+                path_info = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
+                if (
+                    bytes_read != expected.st_size
+                    or _manifest_fingerprint(after) != _manifest_fingerprint(expected)
+                    or _manifest_fingerprint(path_info) != _manifest_fingerprint(after)
+                ):
+                    raise OperationError(f'{label} manifest file changed while hashing')
+            finally:
                 os.close(descriptor)
         records.append({
-            'path': relative,
+            'path': relative.as_posix(),
             'type': 'file',
             'mode': stat.S_IMODE(expected.st_mode),
             'bytes': expected.st_size,
             'sha256': digest.hexdigest(),
         })
 
-    _, snapshot_after = _manifest_entries(path, label)
+    _, snapshot_after = _manifest_entries(root, label)
     if snapshot_after != snapshot:
         raise OperationError(f'{label} manifest state changed')
     return sorted(records, key=lambda record: record['path'])
+
+
+def _directory_manifest(path: Path, *, file_limit: int, total_limit: int, label: str) -> list[dict[str, Any]]:
+    with _manifest_root(path, label) as (root, anchors):
+        before = _manifest_fingerprint(os.fstat(root))
+        records = _manifest_records(root, file_limit=file_limit, total_limit=total_limit, label=label)
+        with _manifest_root(path, label, anchors) as (verified, _):
+            if _manifest_fingerprint(os.fstat(verified)) != before:
+                raise OperationError(f'{label} manifest root changed')
+        return records
 
 
 def _session_manifest(path: Path) -> list[dict[str, Any]]:
@@ -1621,15 +1741,13 @@ def _live_execution_target(policy: Any, label: str) -> str:
 
 
 def _summary_source(value: Mapping[str, Any], workflow_id: str) -> dict[str, Any]:
-    if set(value) != {'workflow'} or not isinstance(value.get('workflow'), dict):
+    expected_fields = {'id', 'version', 'name', 'description', 'execution_target_policy'}
+    if not isinstance(value, dict) or set(value) != expected_fields:
         raise EffectBlocked('Workflow summary is malformed')
-    source = value['workflow']
-    expected_fields = {'id', 'revision', 'name', 'description', 'execution_target_policy'}
-    if set(source) != expected_fields:
-        raise EffectBlocked('Workflow summary is malformed')
+    source = value
     if source['id'] != workflow_id:
         raise EffectBlocked('Workflow inspect identity is malformed')
-    if not isinstance(source['revision'], int) or isinstance(source['revision'], bool):
+    if not isinstance(source['version'], int) or isinstance(source['version'], bool) or source['version'] < 0:
         raise EffectBlocked('Workflow inspect revision is malformed')
     try:
         _string(source['name'], 'Workflow name')
@@ -1642,7 +1760,7 @@ def _summary_source(value: Mapping[str, Any], workflow_id: str) -> dict[str, Any
 
 def _workflow_summary(value: Mapping[str, Any], workflow_id: str) -> dict[str, Any]:
     source = _summary_source(value, workflow_id)
-    return {'present': True, 'workflow_id': workflow_id, 'revision': source['revision']}
+    return {'present': True, 'workflow_id': workflow_id, 'revision': source['version']}
 
 
 DELETE_PREVIEW_DIAGNOSTIC = 'Workflow deletion was not confirmed. Rerun with --confirm to delete it.\n'
@@ -1669,7 +1787,7 @@ def _kent_delete_preview(
         raise EffectBlocked('Workflow delete preview is malformed') from error
     if not isinstance(value, dict):
         raise EffectBlocked('Workflow delete preview is malformed')
-    if set(value) != {'deleted', 'impact', 'blockers'}:
+    if set(value) not in ({'deleted', 'impact'}, {'deleted', 'impact', 'blockers'}):
         raise EffectBlocked('Workflow delete preview is malformed')
     if value['deleted'] is not False:
         raise EffectBlocked('Workflow delete preview deleted flag is invalid')
@@ -1683,7 +1801,7 @@ def _kent_delete_preview(
             continue
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise EffectBlocked('Workflow delete preview impact is malformed')
-    if value['blockers'] != []:
+    if value.get('blockers', []) != []:
         raise EffectBlocked('Workflow delete preview has blockers')
     if code == 1:
         if err != DELETE_PREVIEW_DIAGNOSTIC.encode('utf-8'):
@@ -2206,10 +2324,13 @@ def _validate_canonical_plan(plan: LoadedPlan) -> dict[str, Any]:
             'workflows': workflows}
 
 def _canonical_metadata(value: Mapping[str, Any]) -> dict[str, str]:
-    workflow = value.get('workflow')
-    if not isinstance(workflow, dict):
+    if not isinstance(value, dict):
         raise EffectBlocked('Workflow summary is malformed')
-    source = _summary_source(value, _string(workflow.get('id'), 'Workflow summary identity'))
+    try:
+        workflow_id = _string(value.get('id'), 'Workflow summary identity')
+    except PlanValidationError as error:
+        raise EffectBlocked('Workflow inspect identity is malformed') from error
+    source = _summary_source(value, workflow_id)
     return {
         'name': _string(source['name'], 'Workflow name'),
         'description': _string(source['description'], 'Workflow description', nonempty=False),

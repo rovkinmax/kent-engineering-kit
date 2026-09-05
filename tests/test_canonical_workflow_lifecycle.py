@@ -165,58 +165,77 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 if mode == "custom_ref":
                     policy["custom_ref"] = "refs/tags/v1"
                 summary = {
-                    "workflow": {
-                        "id": wid,
-                        "revision": 1,
-                        "name": "Workflow",
-                        "description": "Description",
-                        "execution_target_policy": policy,
-                    }
+                    "id": wid,
+                    "version": 1,
+                    "name": "Workflow",
+                    "description": "Description",
+                    "execution_target_policy": policy,
                 }
                 self.assertEqual(
-                    operations._workflow_summary(summary, wid)["revision"],
-                    1,
+                    operations._workflow_summary(summary, wid),
+                    {"present": True, "workflow_id": wid, "revision": 1},
                 )
                 self.assertEqual(
                     operations._canonical_metadata(summary)["execution_target"],
                     expected,
                 )
         invalid = [
-            {"version": 1},
-            {"revision": True},
-            {"revision": 1, "extra": True},
-            {"revision": 1, "execution_target_policy": {"mode": "unknown"}},
-            {"revision": 1, "execution_target_policy": {"mode": "custom_ref"}},
+            {"revision": 1},
+            {"version": True},
+            {"version": -1},
+            {"version": 1, "extra": True},
+            {"version": 1, "execution_target_policy": {"mode": "unknown"}},
+            {"version": 1, "execution_target_policy": {"mode": "custom_ref"}},
         ]
         for fields in invalid:
             with self.subTest(fields=fields):
                 source = {
                     "id": wid,
-                    "revision": 1,
+                    "version": 1,
                     "name": "Workflow",
                     "description": "Description",
                     "execution_target_policy": {"mode": "none"},
                 }
                 source.update(fields)
                 with self.assertRaises(EffectBlocked):
-                    operations._workflow_summary({"workflow": source}, wid)
-        with self.assertRaises(EffectBlocked):
-            operations._workflow_summary(
-                {"workflow": {
-                    "id": wid,
-                    "version": 1,
-                    "name": "Workflow",
-                    "description": "Description",
-                    "execution_target_policy": {"mode": "none"},
-                }},
-                wid,
-            )
+                    operations._workflow_summary(source, wid)
+                with self.assertRaises(EffectBlocked):
+                    operations._canonical_metadata(source)
+        flat = {
+            "id": wid,
+            "version": 1,
+            "name": "Workflow",
+            "description": "",
+            "execution_target_policy": {"mode": "none"},
+        }
+        self.assertEqual(operations._canonical_metadata(flat)["description"], "")
+        wrapped_revision = {key: value for key, value in flat.items() if key != "version"}
+        wrapped_revision["revision"] = 1
+        invalid_shapes = [
+            None, [], {"workflow": flat}, {"workflow": wrapped_revision},
+            *({key: value for key, value in flat.items() if key != missing} for missing in flat),
+        ]
+        for body in invalid_shapes:
+            with self.subTest(shape=body):
+                with self.assertRaises(EffectBlocked):
+                    operations._workflow_summary(body, wid)
+                with self.assertRaises(EffectBlocked):
+                    operations._canonical_metadata(body)
         invalid_summaries = [
             {
                 "id": workflow_id(1),
             },
             {
-                "revision": "1",
+                "version": "1",
+            },
+            {
+                "id": None,
+            },
+            {
+                "id": "",
+            },
+            {
+                "id": "\x00",
             },
             {
                 "name": None,
@@ -244,14 +263,17 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             with self.subTest(summary_mutation=mutation):
                 source = {
                     "id": wid,
-                    "revision": 1,
+                    "version": 1,
                     "name": "Workflow",
                     "description": "Description",
                     "execution_target_policy": {"mode": "none"},
                 }
                 source.update(mutation)
                 with self.assertRaises(EffectBlocked):
-                    operations._workflow_summary({"workflow": source}, wid)
+                    operations._workflow_summary(source, wid)
+                if "id" not in mutation or mutation["id"] != workflow_id(1):
+                    with self.assertRaises(EffectBlocked):
+                        operations._canonical_metadata(source)
 
     def test_plan_accepts_only_public_execution_target_selectors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
