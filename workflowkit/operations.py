@@ -5,6 +5,7 @@ constructed here from typed plan values; a plan can never smuggle in a shell,
 an executable, or an arbitrary probe.
 """
 from __future__ import annotations
+from contextlib import contextmanager
 from dataclasses import dataclass
 import base64
 import fcntl
@@ -19,11 +20,13 @@ import subprocess
 import sys
 import time
 import sqlite3
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from .release import canonical_bytes as release_canonical_bytes
 from .release import ReleaseSpec
 from .profile import ProjectProfile
 from .revision import RevisionPreflightError, preflight_project_revision
+from .kent import execution_target_from_policy
+from .model import SpecError, validate_execution_target
 SHA1_RE = '^[0-9a-f]{40}$'
 SHA256_RE = '^[0-9a-f]{64}$'
 UUID_RE = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
@@ -34,6 +37,9 @@ EXEC_ENTRY_LIMIT = 128 * 1024
 EXEC_AGGREGATE_LIMIT = 512 * 1024
 EXEC_FD_DECIMAL_RESERVE = 20
 EXEC_WRITE_CHUNK = 65536
+MANIFEST_READ_CHUNK = 64 * 1024
+SESSION_MANIFEST_FILE_LIMIT = 32 * 1024 * 1024
+SESSION_MANIFEST_TOTAL_LIMIT = 64 * 1024 * 1024
 SETUP_KILL_REAP_GRACE = 2.0
 JOURNAL_SCHEMA = 'kit-operation-journal-v1'
 PHASES = {
@@ -1113,33 +1119,304 @@ def _reject_raw_protocol_fields(value: Mapping[str, Any], label: str) -> None:
     if found:
         raise PlanValidationError(f'{label} contains forbidden protocol fields: {found}')
 
-def _session_manifest(path: Path) -> list[dict[str, Any]]:
-    root = path
-    if not root.is_dir() or root.is_symlink():
-        raise OperationError('retained Session directory is absent or unsafe')
-    result: list[dict[str, Any]] = []
+def _manifest_fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IFMT(info.st_mode),
+        stat.S_IMODE(info.st_mode),
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_nlink,
+    )
+
+
+def _manifest_require_primitives() -> None:
+    # Check capabilities by name so instrumentation of these functions does not
+    # change the platform's advertised support.
+    if (
+        not {'open', 'stat', 'readlink'} <= {
+            function.__name__ for function in getattr(os, 'supports_dir_fd', ())
+        }
+        or 'scandir' not in {function.__name__ for function in getattr(os, 'supports_fd', ())}
+        or 'stat' not in {function.__name__ for function in getattr(os, 'supports_follow_symlinks', ())}
+        or any(not getattr(os, name, 0) for name in ('O_NOFOLLOW', 'O_DIRECTORY', 'O_NONBLOCK'))
+    ):
+        raise OperationError('descriptor-relative manifest primitives are unavailable')
+
+
+def _manifest_open(
+    parent: int | None,
+    name: str,
+    expected: os.stat_result,
+    *,
+    directory: bool,
+    label: str,
+) -> int:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if directory:
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(name, flags, dir_fd=parent)
+    try:
+        opened = os.fstat(descriptor)
+        valid_type = stat.S_ISDIR(opened.st_mode) if directory else stat.S_ISREG(opened.st_mode)
+        if not valid_type or _manifest_fingerprint(opened) != _manifest_fingerprint(expected):
+            raise OperationError(f'{label} manifest entry changed before opening')
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _manifest_root(
+    path: Path,
+    label: str,
+    expected: Mapping[str, tuple[int, ...]] | None = None,
+) -> Iterator[tuple[int, dict[str, tuple[int, ...]]]]:
+    """Acquire every root component relative to a verified owned descriptor.
+
+    Existing ancestor aliases (including platform temporary-directory aliases)
+    are resolved with readlinkat and retained in the anchor preimage. The root
+    itself and all manifest descendants must be real directories/files.
+    """
+    _manifest_require_primitives()
+    if '..' in path.parts:
+        raise OperationError(f'invalid {label} manifest root path')
+    pending = list(path.absolute().parts[1:])
+    physical = Path('/')
+    anchors: dict[str, tuple[int, ...]] = {}
+    descriptor: int | None = None
+
+    def remember(location: Path, info: os.stat_result) -> None:
+        # Unrelated siblings can change ancestor timestamps. Bind directory
+        # identity/mode here; the manifest root has a full snapshot below.
+        identity = (
+            _manifest_fingerprint(info) if stat.S_ISLNK(info.st_mode)
+            else (info.st_dev, info.st_ino, info.st_mode)
+        )
+        key = location.as_posix()
+        if (
+            (key in anchors and anchors[key] != identity)
+            or (expected is not None and expected.get(key) != identity)
+        ):
+            raise OperationError(f'{label} manifest root path changed')
+        anchors[key] = identity
+
+    try:
+        root_info = os.stat('/', follow_symlinks=False)
+        remember(Path('/'), root_info)
+        descriptor = _manifest_open(None, '/', root_info, directory=True, label=label)
+        traversed = 0
+        while pending:
+            traversed += 1
+            if traversed > MAX_LIST or len(pending) > MAX_LIST:
+                raise OperationError(f'{label} manifest root path is too large')
+            name, *pending = pending
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if name == '..':
+                replacement = _manifest_open(descriptor, name, info, directory=True, label=label)
+                os.close(descriptor)
+                descriptor = replacement
+                physical = physical.parent
+                remember(physical, info)
+                continue
+            location = physical / name
+            remember(location, info)
+            if stat.S_ISLNK(info.st_mode):
+                if not pending:
+                    raise OperationError(f'{label} manifest refuses a symlink root')
+                target = os.readlink(name, dir_fd=descriptor)
+                after = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if _manifest_fingerprint(after) != _manifest_fingerprint(info):
+                    raise OperationError(f'{label} manifest ancestor alias changed')
+                # Resolve target components in order: a preceding symlink can
+                # change which pinned directory a later '..' must ascend from.
+                target_path = Path(target)
+                target_parts = target_path.parts
+                if not target_path.is_absolute():
+                    pending = list(target_parts) + pending
+                    continue
+                pending = list(target_parts[1:]) + pending
+                physical = Path('/')
+                remember(physical, root_info)
+                replacement = _manifest_open(None, '/', root_info, directory=True, label=label)
+            else:
+                replacement = _manifest_open(descriptor, name, info, directory=True, label=label)
+                physical = location
+            os.close(descriptor)
+            descriptor = replacement
+        if expected is not None and anchors != expected:
+            raise OperationError(f'{label} manifest root path changed')
+        yield descriptor, anchors
+    except OSError as error:
+        raise OperationError(f'{label} manifest directory or entry cannot be accessed safely') from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+@contextmanager
+def _manifest_directory(
+    root: int,
+    relative: Path,
+    snapshot: Mapping[str, tuple[str, tuple[int, ...]]],
+    label: str,
+) -> Iterator[int]:
+    # Rewalk from the pinned root instead of retaining one FD per entry/depth.
+    # At most root, current directory, and its next child are open here.
+    descriptor = os.dup(root)
+    try:
+        current = Path()
+        if snapshot['.'] != ('directory', _manifest_fingerprint(os.fstat(descriptor))):
+            raise OperationError(f'{label} manifest root changed')
+        for name in relative.parts:
+            current /= name
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if snapshot.get(current.as_posix()) != ('directory', _manifest_fingerprint(info)):
+                raise OperationError(f'{label} manifest directory changed')
+            replacement = _manifest_open(descriptor, name, info, directory=True, label=label)
+            os.close(descriptor)
+            descriptor = replacement
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _manifest_entries(
+    root: int,
+    label: str,
+) -> tuple[list[tuple[Path, str, os.stat_result]], dict[str, tuple[str, tuple[int, ...]]]]:
+    entries: list[tuple[Path, str, os.stat_result]] = []
+    snapshot = {'.': ('directory', _manifest_fingerprint(os.fstat(root)))}
+    pending = [Path()]
+    while pending:
+        relative = pending.pop()
+        with _manifest_directory(root, relative, snapshot, label) as directory:
+            remaining = MAX_LIST - len(entries)
+            children: list[os.DirEntry[str]] = []
+            with os.scandir(directory) as stream:
+                for entry in stream:
+                    children.append(entry)
+                    if len(children) > remaining:
+                        raise OperationError(f'{label} manifest is too large')
+            children.sort(key=lambda entry: entry.name)
+            child_directories: list[Path] = []
+            for entry in children:
+                name = entry.name
+                if not name or name in {'.', '..'} or Path(name).name != name:
+                    raise OperationError(f'invalid {label} manifest path')
+                child_relative = relative / name
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    raise OperationError(f'{label} manifest refuses symlinks')
+                if stat.S_ISDIR(info.st_mode):
+                    kind = 'directory'
+                    child_directories.append(child_relative)
+                elif stat.S_ISREG(info.st_mode):
+                    kind = 'file'
+                else:
+                    raise OperationError(f'{label} manifest refuses non-regular files')
+                entries.append((child_relative, kind, info))
+                snapshot[child_relative.as_posix()] = (kind, _manifest_fingerprint(info))
+            if snapshot[relative.as_posix()] != ('directory', _manifest_fingerprint(os.fstat(directory))):
+                raise OperationError(f'{label} manifest directory changed during enumeration')
+            pending.extend(reversed(child_directories))
+    return entries, snapshot
+
+
+def _manifest_records(root: int, *, file_limit: int, total_limit: int, label: str) -> list[dict[str, Any]]:
+    entries, snapshot = _manifest_entries(root, label)
     total_bytes = 0
-    for entry in sorted(root.rglob('*')):
-        relative = entry.relative_to(root)
-        if any((part in {'.', '..'} for part in relative.parts)):
-            raise OperationError('invalid Session manifest path')
-        info = entry.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise OperationError('Session manifest refuses symlinks')
-        kind = 'directory' if stat.S_ISDIR(info.st_mode) else 'file'
-        record: dict[str, Any] = {'path': relative.as_posix(), 'type': kind, 'mode': stat.S_IMODE(info.st_mode),
-                'bytes': info.st_size if kind == 'file' else 0}
-        if kind == 'file':
-            if info.st_size > MAX_OUTPUT:
-                raise OperationError('Session manifest file exceeds the bound')
-            total_bytes += info.st_size
-            if total_bytes > MAX_OUTPUT:
-                raise OperationError('Session manifest exceeds the byte bound')
-            record['sha256'] = sha256_bytes(entry.read_bytes())
-        result.append(record)
-    if len(result) > MAX_LIST:
-        raise OperationError('Session manifest is too large')
-    return result
+    records: list[dict[str, Any]] = []
+    file_entries: list[tuple[Path, os.stat_result]] = []
+    for relative, kind, info in entries:
+        if snapshot.get(relative.as_posix()) != (
+            kind,
+            _manifest_fingerprint(info),
+        ):
+            raise OperationError(f'{label} manifest entry changed during enumeration')
+        if kind == 'directory':
+            records.append({
+                'path': relative.as_posix(),
+                'type': 'directory',
+                'mode': stat.S_IMODE(info.st_mode),
+                'bytes': 0,
+            })
+            continue
+        if info.st_size > file_limit:
+            raise OperationError(f'{label} manifest file exceeds the bound')
+        total_bytes += info.st_size
+        if total_bytes > total_limit:
+            raise OperationError(f'{label} manifest exceeds the byte bound')
+        file_entries.append((relative, info))
+
+    for relative, expected in file_entries:
+        with _manifest_directory(root, relative.parent, snapshot, label) as parent:
+            descriptor = _manifest_open(parent, relative.name, expected, directory=False, label=label)
+            try:
+                digest = hashlib.sha256()
+                bytes_read = 0
+                while True:
+                    chunk = os.read(descriptor, MANIFEST_READ_CHUNK)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    bytes_read += len(chunk)
+                    if bytes_read > expected.st_size:
+                        raise OperationError(f'{label} manifest file grew while hashing')
+                after = os.fstat(descriptor)
+                path_info = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
+                if (
+                    bytes_read != expected.st_size
+                    or _manifest_fingerprint(after) != _manifest_fingerprint(expected)
+                    or _manifest_fingerprint(path_info) != _manifest_fingerprint(after)
+                ):
+                    raise OperationError(f'{label} manifest file changed while hashing')
+            finally:
+                os.close(descriptor)
+        records.append({
+            'path': relative.as_posix(),
+            'type': 'file',
+            'mode': stat.S_IMODE(expected.st_mode),
+            'bytes': expected.st_size,
+            'sha256': digest.hexdigest(),
+        })
+
+    _, snapshot_after = _manifest_entries(root, label)
+    if snapshot_after != snapshot:
+        raise OperationError(f'{label} manifest state changed')
+    return sorted(records, key=lambda record: record['path'])
+
+
+def _directory_manifest(path: Path, *, file_limit: int, total_limit: int, label: str) -> list[dict[str, Any]]:
+    with _manifest_root(path, label) as (root, anchors):
+        before = _manifest_fingerprint(os.fstat(root))
+        records = _manifest_records(root, file_limit=file_limit, total_limit=total_limit, label=label)
+        with _manifest_root(path, label, anchors) as (verified, _):
+            if _manifest_fingerprint(os.fstat(verified)) != before:
+                raise OperationError(f'{label} manifest root changed')
+        return records
+
+
+def _session_manifest(path: Path) -> list[dict[str, Any]]:
+    return _directory_manifest(
+        path,
+        file_limit=SESSION_MANIFEST_FILE_LIMIT,
+        total_limit=SESSION_MANIFEST_TOTAL_LIMIT,
+        label='Session',
+    )
+
+
+def _retained_resource_manifest(path: Path) -> list[dict[str, Any]]:
+    return _directory_manifest(
+        path,
+        file_limit=MAX_OUTPUT,
+        total_limit=MAX_OUTPUT,
+        label='retained resource',
+    )
+
 
 def _session_path(session: Mapping[str, Any], roots: Sequence[Path]) -> Path:
     if session.get('relative') is not None:
@@ -1437,13 +1714,104 @@ def _workflow_link_state(rows: Sequence[Mapping[str, Any]], project_id: str, wor
     links = [{'project_id': project_id, 'workflow_id': workflow_id, 'is_default': link['default']}]
     return (links, workflow_id if link['default'] else None, version)
 
+def _live_execution_target(policy: Any, label: str) -> str:
+    if not isinstance(policy, dict):
+        raise EffectBlocked(f'{label} execution-target policy is malformed')
+    mode = policy.get('mode')
+    if not isinstance(mode, str):
+        raise EffectBlocked(f'{label} execution-target policy is malformed')
+    if mode in {'ask_on_first_execution', 'none', 'head', 'default_branch'}:
+        if set(policy) != {'mode'}:
+            raise EffectBlocked(f'{label} execution-target policy is malformed')
+    elif mode == 'custom_ref':
+        if set(policy) != {'mode', 'custom_ref'}:
+            raise EffectBlocked(f'{label} execution-target policy is malformed')
+        if not isinstance(policy.get('custom_ref'), str) or not policy['custom_ref'] or any(
+            character.isspace() for character in policy['custom_ref']
+        ):
+            raise EffectBlocked(f'{label} execution-target policy is malformed')
+    else:
+        raise EffectBlocked(f'{label} execution-target policy is unsupported')
+    try:
+        target = execution_target_from_policy(policy)
+        validate_execution_target(target)
+    except (SpecError, TypeError, ValueError) as error:
+        raise EffectBlocked(f'{label} execution-target policy is malformed') from error
+    return target
+
+
+def _summary_source(value: Mapping[str, Any], workflow_id: str) -> dict[str, Any]:
+    expected_fields = {'id', 'version', 'name', 'description', 'execution_target_policy'}
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise EffectBlocked('Workflow summary is malformed')
+    source = value
+    if source['id'] != workflow_id:
+        raise EffectBlocked('Workflow inspect identity is malformed')
+    if not isinstance(source['version'], int) or isinstance(source['version'], bool) or source['version'] < 0:
+        raise EffectBlocked('Workflow inspect revision is malformed')
+    try:
+        _string(source['name'], 'Workflow name')
+        _string(source['description'], 'Workflow description', nonempty=False)
+    except PlanValidationError as error:
+        raise EffectBlocked('Workflow summary metadata is malformed') from error
+    _live_execution_target(source['execution_target_policy'], 'Workflow')
+    return source
+
+
 def _workflow_summary(value: Mapping[str, Any], workflow_id: str) -> dict[str, Any]:
-    source = value.get('workflow') if isinstance(value.get('workflow'), dict) else value
-    actual_id = source.get('id', source.get('workflow_id', workflow_id))
-    version = source.get('version', source.get('revision'))
-    if actual_id != workflow_id or not isinstance(version, int) or isinstance(version, bool):
-        raise EffectBlocked('Workflow inspect identity/revision is malformed')
-    return {'present': True, 'workflow_id': workflow_id, 'revision': version}
+    source = _summary_source(value, workflow_id)
+    return {'present': True, 'workflow_id': workflow_id, 'revision': source['version']}
+
+
+DELETE_PREVIEW_DIAGNOSTIC = 'Workflow deletion was not confirmed. Rerun with --confirm to delete it.\n'
+DELETE_IMPACT_FIELDS = {
+    'workflow_id', 'version', 'project_count', 'link_count', 'task_count',
+    'current_node_count', 'pending_approval_count', 'blocked_task_count',
+    'default_replacement_project_count',
+}
+
+
+def _kent_delete_preview(
+    kent: Path,
+    workflow_id: str,
+    *,
+    cwd: Path,
+) -> dict[str, Any]:
+    code, out, err = _run(
+        [str(kent), 'workflow', 'delete', workflow_id, '--json'],
+        cwd=cwd,
+    )
+    try:
+        value = json.loads(out.decode('utf-8'), object_pairs_hook=_duplicate_free)
+    except (PlanValidationError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EffectBlocked('Workflow delete preview is malformed') from error
+    if not isinstance(value, dict):
+        raise EffectBlocked('Workflow delete preview is malformed')
+    if set(value) not in ({'deleted', 'impact'}, {'deleted', 'impact', 'blockers'}):
+        raise EffectBlocked('Workflow delete preview is malformed')
+    if value['deleted'] is not False:
+        raise EffectBlocked('Workflow delete preview deleted flag is invalid')
+    impact = value['impact']
+    if not isinstance(impact, dict) or set(impact) != DELETE_IMPACT_FIELDS:
+        raise EffectBlocked('Workflow delete preview impact is malformed')
+    if impact['workflow_id'] != workflow_id:
+        raise EffectBlocked('Workflow delete preview identity drifted')
+    for key, count in impact.items():
+        if key == 'workflow_id':
+            continue
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise EffectBlocked('Workflow delete preview impact is malformed')
+    if value.get('blockers', []) != []:
+        raise EffectBlocked('Workflow delete preview has blockers')
+    if code == 1:
+        if err != DELETE_PREVIEW_DIAGNOSTIC.encode('utf-8'):
+            raise EffectBlocked('Workflow delete preview diagnostic drifted')
+    elif code == 0:
+        if err:
+            raise EffectBlocked('Workflow delete preview unexpectedly wrote stderr')
+    else:
+        raise EffectBlocked('Workflow delete preview exit code is invalid')
+    return value
 
 def _worktree_state(raw: Mapping[str, Any], expected: Mapping[str, Any]) -> dict[str, Any] | None:
     topology = raw.get('topology')
@@ -1483,7 +1851,7 @@ def _resource_state(resource: Mapping[str, Any]) -> dict[str, Any]:
             raise EffectBlocked('D9 retained file changed kind')
         digest = sha256_bytes(path.read_bytes())
     elif resource['kind'] == 'directory':
-        digest = canonical_sha256(_session_manifest(path))
+        digest = canonical_sha256(_retained_resource_manifest(path))
     else:
         raise EffectBlocked('D9 resource kind is unsupported')
     return {**resource, 'present': True, 'sha256': digest}
@@ -1518,7 +1886,7 @@ def _d9_read_inventory(parsed: Mapping[str, Any], reference: Mapping[str, Any] |
     for member in parsed['members']:
         wid = member['workflow_id']
         links, default, listed_version = _workflow_link_state(workflow_rows, project_id, wid)
-        inspect = _kent_optional(kent, ['workflow', 'inspect', wid, '--json'], cwd=cwd)
+        inspect = _kent_optional(kent, ['workflow', 'inspect', wid, '--summary', '--json'], cwd=cwd)
         present = bool(links)
         if present != (inspect.get('present') is not False):
             raise EffectBlocked('Workflow list and inspect disagree on presence')
@@ -1536,10 +1904,10 @@ def _d9_read_inventory(parsed: Mapping[str, Any], reference: Mapping[str, Any] |
             validation = _kent_json(kent, ['workflow', 'validate', wid, '--json'], cwd=cwd)
             graph_sha = canonical_sha256(graph)
             validation_sha = canonical_sha256(validation)
-            if validation.get('valid') is False:
+            if validation.get('valid') is not True:
                 raise EffectBlocked('Workflow validation failed')
-            preview = _kent_json(kent, ['workflow', 'delete', wid, '--json'], cwd=cwd)
-            preview_sha = preview.get('sha256') or canonical_sha256(preview)
+            preview = _kent_delete_preview(kent, wid, cwd=cwd)
+            preview_sha = canonical_sha256(preview)
             for task in list_tasks:
                 detail = _kent_json(kent, ['task', 'show', task['id'], '--project', project_id, '--json'], cwd=cwd)
                 details.append(_task_state(detail, task['id']))
@@ -1555,6 +1923,27 @@ def _d9_read_inventory(parsed: Mapping[str, Any], reference: Mapping[str, Any] |
                 if count is not None and count != len(task_sessions):
                     raise EffectBlocked('Task retained Session pagination is incomplete')
                 sessions.extend(task_sessions)
+            impact = preview['impact']
+            expected_impact = {
+                'workflow_id': wid,
+                'version': listed_version,
+                'project_count': 1,
+                'link_count': len(links),
+                'task_count': len(list_tasks),
+                'current_node_count': sum(
+                    task['current_node'] is not None for task in details
+                ),
+                'pending_approval_count': sum(
+                    task['approval_pending'] for task in details
+                ),
+                'blocked_task_count': sum(
+                    task['current_node'] is not None or task['approval_pending']
+                    for task in details
+                ),
+                'default_replacement_project_count': 0,
+            }
+            if impact != expected_impact:
+                raise EffectBlocked('Workflow delete preview impact drifted')
         elif task_rows:
             raise EffectBlocked('absent Workflow still has Tasks')
         details.sort(key=lambda row: row['id'])
@@ -1811,6 +2200,15 @@ def retire_workflow_batch(plan: LoadedPlan, *, mode: str, kent: str | Path | Non
         return {'schema': 'workflow-retirement-batch-report-v2', 'plan_sha256': plan.sha256, 'phase': 'complete',
                 'members_verified': len(workflow_ids), 'effects_released': _effect_attempts(journal.state)}
 
+def _plan_execution_target(value: Any, label: str) -> str:
+    target = _string(value, label)
+    try:
+        validate_execution_target(target)
+    except SpecError as error:
+        raise PlanValidationError(f'{label} is unsupported') from error
+    return target
+
+
 def _validate_canonical_plan(plan: LoadedPlan) -> dict[str, Any]:
     data = _closed(plan.value, {'schema', 'state_dir', 'project_root', 'kent', 'd9', 'workflows'}, 'canonical plan')
     state_dir = _absolute_path(_required(data, 'state_dir', 'canonical plan'), 'state_dir')
@@ -1909,6 +2307,10 @@ def _validate_canonical_plan(plan: LoadedPlan) -> dict[str, Any]:
                     'description': _string(_required(metadata, 'description', 'metadata'), 'metadata.description',
                     nonempty=False), 'execution_target': _string(_required(metadata, 'execution_target', 'metadata'),
                     'metadata.execution_target')}
+            item['metadata']['execution_target'] = _plan_execution_target(
+                item['metadata']['execution_target'],
+                'metadata.execution_target',
+            )
         elif 'metadata' in item:
             raise PlanValidationError('graph-only workflow cannot carry metadata')
         workflows.append(item)
@@ -1922,13 +2324,18 @@ def _validate_canonical_plan(plan: LoadedPlan) -> dict[str, Any]:
             'workflows': workflows}
 
 def _canonical_metadata(value: Mapping[str, Any]) -> dict[str, str]:
-    source = value.get('workflow') if isinstance(value.get('workflow'), dict) else value
-    target = source.get('execution_target')
-    policy = source.get('execution_target_policy')
-    if target is None and isinstance(policy, dict):
-        target = policy.get('mode')
-    return {'name': _string(source.get('name'), 'Workflow name'), 'description': _string(source.get('description', ''),
-            'Workflow description', nonempty=False), 'execution_target': _string(target, 'Workflow execution target')}
+    if not isinstance(value, dict):
+        raise EffectBlocked('Workflow summary is malformed')
+    try:
+        workflow_id = _string(value.get('id'), 'Workflow summary identity')
+    except PlanValidationError as error:
+        raise EffectBlocked('Workflow inspect identity is malformed') from error
+    source = _summary_source(value, workflow_id)
+    return {
+        'name': _string(source['name'], 'Workflow name'),
+        'description': _string(source['description'], 'Workflow description', nonempty=False),
+        'execution_target': _live_execution_target(source['execution_target_policy'], 'Workflow'),
+    }
 
 def _canonical_graph(value: Mapping[str, Any], version: int) -> dict[str, Any]:
     body = value.get('graph')
@@ -1955,14 +2362,14 @@ def _canonical_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> dict[
     links, default, listed_version = _workflow_link_state(_page_rows(pages, ('items', 'workflows')), project_id, wid)
     if listed_version is None:
         raise EffectBlocked('canonical Workflow is absent from the project')
-    inspect = _kent_json(kent, ['workflow', 'inspect', wid, '--json'], cwd=root)
+    inspect = _kent_json(kent, ['workflow', 'inspect', wid, '--summary', '--json'], cwd=root)
     summary = _workflow_summary(inspect, wid)
     if summary['revision'] != listed_version:
         raise EffectBlocked('canonical list/inspect revisions disagree')
     graph_raw = _kent_json(kent, ['workflow', 'graph', 'inspect', wid, '--json'], cwd=root)
     graph = _canonical_graph(graph_raw, listed_version)
     validation = _kent_json(kent, ['workflow', 'validate', wid, '--json'], cwd=root)
-    if validation.get('valid') is False or validation.get('errors'):
+    if validation.get('valid') is not True:
         raise EffectBlocked('canonical Workflow validation failed')
     task_pages = _kent_pages(kent, ['task', 'list', '--project', project_id, '--workflow', wid], cwd=root)
     task_rows = _page_rows(task_pages, ('items', 'tasks'))
@@ -2378,6 +2785,10 @@ def _portfolio_canonical(value: Any, index: int) -> dict[str, Any]:
                 'metadata.execution_target',
             ),
         }
+        result['metadata']['execution_target'] = _plan_execution_target(
+            result['metadata']['execution_target'],
+            f'{label}.metadata.execution_target',
+        )
     elif 'metadata' in item:
         raise PlanValidationError('graph-only workflow cannot carry metadata')
     return result
@@ -2950,7 +3361,12 @@ def _portfolio_validate_d9_snapshot(value: Any, label: str) -> None:
         _string(row['id'], f'{row_label}.id')
         for manifest_index, manifest_raw in enumerate(_bounded_list(row['manifest'], f'{row_label}.manifest')):
             manifest_label = f'{row_label}.manifest[{manifest_index}]'
-            manifest = _closed(manifest_raw, {'path', 'type', 'mode', 'bytes', 'sha256'}, manifest_label)
+            if not isinstance(manifest_raw, dict):
+                raise JournalError(f'{manifest_label} is invalid')
+            manifest_fields = {'path', 'type', 'mode', 'bytes'}
+            if manifest_raw.get('type') == 'file':
+                manifest_fields.add('sha256')
+            manifest = _closed(manifest_raw, manifest_fields, manifest_label)
             _string(manifest['path'], f'{manifest_label}.path')
             if manifest['type'] not in {'file', 'directory'}:
                 raise JournalError(f'{manifest_label}.type is invalid')
@@ -2960,8 +3376,6 @@ def _portfolio_validate_d9_snapshot(value: Any, label: str) -> None:
                 raise JournalError(f'{manifest_label}.bytes is invalid')
             if manifest['type'] == 'file':
                 _sha256(manifest['sha256'], f'{manifest_label}.sha256')
-            elif manifest['sha256'] is not None:
-                raise JournalError(f'{manifest_label}.sha256 is invalid')
     _portfolio_validate_sqlite(snapshot['sqlite'], f'{label}.sqlite')
     for key in ('worktrees', 'retained', 'absent'):
         for index, raw in enumerate(_bounded_list(snapshot[key], f'{label}.{key}')):

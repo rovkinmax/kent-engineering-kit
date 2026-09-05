@@ -1,4 +1,5 @@
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
+model_context_window = 872000
 thinking_level = "medium"
 model_verbosity = "low"
 max_subagent_depth = 1
@@ -9,7 +10,7 @@ concurrency = 4
 
 [reviewer]
 frequency = "off"
-model = "gpt-5.6-terra"
+model = "gpt-6-astra"
 thinking_level = "medium"
 model_verbosity = "low"
 
@@ -39,7 +40,7 @@ planning = false
 
 [subagents.researcher]
 description = "Read-only primary-source research for technical and product questions."
-model = "gpt-5.6-terra"
+model = "gpt-6-astra"
 system_prompt_file = "agents/researcher.md"
 thinking_level = "medium"
 model_verbosity = "low"
@@ -67,7 +68,7 @@ edit = false
 
 [subagents.spec-reviewer]
 description = "Read-only review of a change against its specification and acceptance criteria."
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 system_prompt_file = "agents/spec-reviewer.md"
 thinking_level = "medium"
 model_verbosity = "low"
@@ -81,7 +82,7 @@ edit = false
 
 [subagents.architecture-designer]
 description = "Read-only design of alternative module interfaces, seams, and migration strategies."
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 system_prompt_file = "agents/architecture-designer.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -109,7 +110,7 @@ edit = false
 
 [subagents.fix-worker]
 description = "Single-writer repair of verified task-scoped findings and failed implementation slices."
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 system_prompt_file = "agents/fix-worker.md"
 thinking_level = "medium"
 model_verbosity = "low"
@@ -123,7 +124,7 @@ edit = false
 
 [subagents.build-doctor]
 description = "Deterministic build and test failure diagnosis with optional bounded fixes."
-model = "gpt-5.6-terra"
+model = "gpt-6-astra"
 system_prompt_file = "agents/build-doctor.md"
 thinking_level = "medium"
 model_verbosity = "low"
@@ -151,7 +152,7 @@ edit = false
 
 [subagents.runtime-smoke-tester]
 description = "Platform-neutral runtime smoke execution through project procedures and adapters."
-model = "gpt-5.6-terra"
+model = "gpt-6-astra"
 system_prompt_file = "agents/runtime-smoke-tester.md"
 thinking_level = "medium"
 model_verbosity = "low"
@@ -165,7 +166,7 @@ edit = false
 
 [subagents.release-manager]
 description = "Conservative release preparation, publication, tagging, and external release-state management."
-model = "gpt-5.6-terra"
+model = "gpt-6-astra"
 system_prompt_file = "agents/release-manager.md"
 thinking_level = "medium"
 model_verbosity = "low"

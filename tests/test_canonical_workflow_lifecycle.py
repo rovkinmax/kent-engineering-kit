@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import workflowkit.operations as operations
 from workflowkit.operations import (
@@ -69,7 +70,7 @@ def canonical_plan(
         item["metadata"] = metadata or {
             "name": "Canonical Workflow",
             "description": "Canonical description",
-            "execution_target": "ask_on_first_execution",
+            "execution_target": "ask-on-first-execution",
         }
     value = {
         "schema": "canonical-workflow-reconcile-plan-v1",
@@ -103,6 +104,7 @@ def install_effect(
     *,
     member_status: str,
     effect_status: str,
+    stage_name: str = "graph",
 ) -> dict:
     parsed = operations._validate_canonical_plan(plan)
     wid = workflow_id(0)
@@ -112,7 +114,15 @@ def install_effect(
         plan,
     ) as journal:
         prepared = journal.state["preimage"][0]
-        stage = operations._canonical_progress(parsed, parsed["workflows"][0], prepared)[0]
+        stage = next(
+            stage
+            for stage in operations._canonical_progress(
+                parsed,
+                parsed["workflows"][0],
+                prepared,
+            )
+            if stage["name"] == stage_name
+        )
         identity = operations._effect_inputs(
             stage["command"],
             fixture["root"],
@@ -127,7 +137,7 @@ def install_effect(
                 "phase": "in_progress",
                 "members": [{"workflow_id": wid, "status": member_status}],
                 "effects": {
-                    f"apply:{wid}:graph": {
+                    f"apply:{wid}:{stage_name}": {
                         **identity,
                         "status": effect_status,
                         "attempt": 1,
@@ -140,6 +150,363 @@ def install_effect(
 
 
 class CanonicalWorkflowLifecycleTest(unittest.TestCase):
+    def test_workflow_summary_requires_closed_metadata_and_normalizes_live_targets(self) -> None:
+        wid = workflow_id(0)
+        policies = {
+            "ask_on_first_execution": "ask-on-first-execution",
+            "none": "none",
+            "head": "head",
+            "default_branch": "default-branch",
+            "custom_ref": "ref:refs/tags/v1",
+        }
+        for mode, expected in policies.items():
+            with self.subTest(mode=mode):
+                policy = {"mode": mode}
+                if mode == "custom_ref":
+                    policy["custom_ref"] = "refs/tags/v1"
+                summary = {
+                    "id": wid,
+                    "version": 1,
+                    "name": "Workflow",
+                    "description": "Description",
+                    "execution_target_policy": policy,
+                }
+                self.assertEqual(
+                    operations._workflow_summary(summary, wid),
+                    {"present": True, "workflow_id": wid, "revision": 1},
+                )
+                self.assertEqual(
+                    operations._canonical_metadata(summary)["execution_target"],
+                    expected,
+                )
+        invalid = [
+            {"revision": 1},
+            {"version": True},
+            {"version": -1},
+            {"version": 1, "extra": True},
+            {"version": 1, "execution_target_policy": {"mode": "unknown"}},
+            {"version": 1, "execution_target_policy": {"mode": "custom_ref"}},
+        ]
+        for fields in invalid:
+            with self.subTest(fields=fields):
+                source = {
+                    "id": wid,
+                    "version": 1,
+                    "name": "Workflow",
+                    "description": "Description",
+                    "execution_target_policy": {"mode": "none"},
+                }
+                source.update(fields)
+                with self.assertRaises(EffectBlocked):
+                    operations._workflow_summary(source, wid)
+                with self.assertRaises(EffectBlocked):
+                    operations._canonical_metadata(source)
+        flat = {
+            "id": wid,
+            "version": 1,
+            "name": "Workflow",
+            "description": "",
+            "execution_target_policy": {"mode": "none"},
+        }
+        self.assertEqual(operations._canonical_metadata(flat)["description"], "")
+        wrapped_revision = {key: value for key, value in flat.items() if key != "version"}
+        wrapped_revision["revision"] = 1
+        invalid_shapes = [
+            None, [], {"workflow": flat}, {"workflow": wrapped_revision},
+            *({key: value for key, value in flat.items() if key != missing} for missing in flat),
+        ]
+        for body in invalid_shapes:
+            with self.subTest(shape=body):
+                with self.assertRaises(EffectBlocked):
+                    operations._workflow_summary(body, wid)
+                with self.assertRaises(EffectBlocked):
+                    operations._canonical_metadata(body)
+        invalid_summaries = [
+            {
+                "id": workflow_id(1),
+            },
+            {
+                "version": "1",
+            },
+            {
+                "id": None,
+            },
+            {
+                "id": "",
+            },
+            {
+                "id": "\x00",
+            },
+            {
+                "name": None,
+            },
+            {
+                "description": 7,
+            },
+            {
+                "execution_target_policy": None,
+            },
+            {
+                "execution_target_policy": [],
+            },
+            {
+                "execution_target_policy": {"mode": "none", "extra": True},
+            },
+            {
+                "execution_target_policy": {"mode": "custom_ref", "custom_ref": ""},
+            },
+            {
+                "execution_target_policy": {"mode": "custom_ref", "custom_ref": "refs/tags/v 1"},
+            },
+        ]
+        for mutation in invalid_summaries:
+            with self.subTest(summary_mutation=mutation):
+                source = {
+                    "id": wid,
+                    "version": 1,
+                    "name": "Workflow",
+                    "description": "Description",
+                    "execution_target_policy": {"mode": "none"},
+                }
+                source.update(mutation)
+                with self.assertRaises(EffectBlocked):
+                    operations._workflow_summary(source, wid)
+                if "id" not in mutation or mutation["id"] != workflow_id(1):
+                    with self.assertRaises(EffectBlocked):
+                        operations._canonical_metadata(source)
+
+    def test_plan_accepts_only_public_execution_target_selectors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            targets = (
+                "ask-on-first-execution",
+                "none",
+                "head",
+                "default-branch",
+                "ref:refs/tags/v1",
+            )
+            for index, target in enumerate(targets):
+                with self.subTest(target=target):
+                    plan, _ = canonical_plan(
+                        fixture,
+                        intent="metadata-only",
+                        metadata={
+                            "name": "Canonical",
+                            "description": "Description",
+                            "execution_target": target,
+                        },
+                        name=f"target-{index}.json",
+                    )
+                    parsed = operations._validate_canonical_plan(plan)
+                    self.assertEqual(
+                        parsed["workflows"][0]["metadata"]["execution_target"],
+                        target,
+                    )
+            for index, target in enumerate((
+                "ask_on_first_execution",
+                "default_branch",
+                "ref:",
+                "ref:refs/tags/v 1",
+                "local",
+            )):
+                with self.subTest(invalid_target=target):
+                    plan, _ = canonical_plan(
+                        fixture,
+                        intent="metadata-only",
+                        metadata={
+                            "name": "Canonical",
+                            "description": "Description",
+                            "execution_target": target,
+                        },
+                        name=f"invalid-{index}.json",
+                    )
+                    with self.assertRaises(PlanValidationError):
+                        operations._validate_canonical_plan(plan)
+
+    def test_public_execution_target_selectors_cover_metadata_stage_contract(self) -> None:
+        targets = (
+            "ask-on-first-execution",
+            "none",
+            "head",
+            "default-branch",
+            "ref:refs/tags/v1",
+        )
+        for index, target in enumerate(targets):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_d9_fixture(Path(temporary))
+                metadata = {
+                    "name": f"Metadata {index}",
+                    "description": "Selector contract",
+                    "execution_target": target,
+                }
+                plan, _ = canonical_plan(
+                    fixture,
+                    intent="metadata-only",
+                    metadata=metadata,
+                    name="metadata-plan.json",
+                )
+                parsed = operations._validate_canonical_plan(plan)
+                item = parsed["workflows"][0]
+                self.assertEqual(item["metadata"]["execution_target"], target)
+                reconcile_canonical_workflows(plan, mode="prepare")
+                with OperationJournal(
+                    fixture["root"] / "canonical-state",
+                    "canonical-workflow-reconcile",
+                    plan,
+                ) as journal:
+                    prepared = journal.state["preimage"][0]
+                    stage = operations._canonical_progress(parsed, item, prepared)[0]
+                    before_sha = canonical_sha256(stage["before"])
+                    after_sha = canonical_sha256(stage["after"])
+                    expected_identity = operations._effect_inputs(
+                        stage["command"],
+                        fixture["root"],
+                        None,
+                        stage["stdin"],
+                        before_sha,
+                        after_sha,
+                    )[4]
+                    self.assertEqual(
+                        stage["command"],
+                        [
+                            str(fixture["kent"]),
+                            "workflow",
+                            "update",
+                            workflow_id(0),
+                            "--name",
+                            metadata["name"],
+                            "--description",
+                            metadata["description"],
+                            "--execution-target",
+                            target,
+                            "--json",
+                        ],
+                    )
+                    self.assertEqual(
+                        journal.state["inventory"]["targets"][workflow_id(0)],
+                        {
+                            "preimage_sha256": before_sha,
+                            "target_sha256": after_sha,
+                        },
+                    )
+                report = reconcile_canonical_workflows(plan, mode="apply", confirm=True)
+                self.assertEqual(report["phase"], "complete")
+                self.assertIn(
+                    [
+                        "workflow",
+                        "update",
+                        workflow_id(0),
+                        "--name",
+                        metadata["name"],
+                        "--description",
+                        metadata["description"],
+                        "--execution-target",
+                        target,
+                        "--json",
+                    ],
+                    read_log(fixture),
+                )
+                with OperationJournal(
+                    fixture["root"] / "canonical-state",
+                    "canonical-workflow-reconcile",
+                    plan,
+                ) as journal:
+                    effect = journal.state["effects"][f"apply:{workflow_id(0)}:metadata"]
+                    for key, value in expected_identity.items():
+                        self.assertEqual(effect[key], value)
+                final = operations._canonical_read(parsed, item)
+                self.assertEqual(final["metadata"], metadata)
+                self.assertEqual(canonical_sha256(final), after_sha)
+
+            with self.subTest(recovery_target=target), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_d9_fixture(Path(temporary))
+                metadata = {
+                    "name": f"Recovery metadata {index}",
+                    "description": "Recovery selector contract",
+                    "execution_target": target,
+                }
+                plan, _ = canonical_plan(
+                    fixture,
+                    intent="metadata-only",
+                    metadata=metadata,
+                    name="recovery-plan.json",
+                )
+                parsed = operations._validate_canonical_plan(plan)
+                item = parsed["workflows"][0]
+                reconcile_canonical_workflows(plan, mode="prepare")
+                state = read_state(fixture)
+                state["workflows"][workflow_id(0)]["metadata"] = metadata
+                write_state(fixture, state)
+                stage = install_effect(
+                    fixture,
+                    plan,
+                    member_status="prepared",
+                    effect_status="unresolved",
+                    stage_name="metadata",
+                )
+                expected_identity = operations._effect_inputs(
+                    stage["command"],
+                    fixture["root"],
+                    None,
+                    stage["stdin"],
+                    canonical_sha256(stage["before"]),
+                    canonical_sha256(stage["after"]),
+                )[4]
+                report = reconcile_canonical_workflows(plan, mode="apply", confirm=True)
+                self.assertEqual(report["phase"], "complete")
+                self.assertEqual(
+                    [row for row in read_log(fixture) if row[:2] == ["workflow", "update"]],
+                    [],
+                )
+                with OperationJournal(
+                    fixture["root"] / "canonical-state",
+                    "canonical-workflow-reconcile",
+                    plan,
+                ) as journal:
+                    effect = journal.state["effects"][f"apply:{workflow_id(0)}:metadata"]
+                    for key, value in expected_identity.items():
+                        self.assertEqual(effect[key], value)
+                    self.assertEqual(effect["status"], "verified")
+                    self.assertEqual(effect["attempt"], 1)
+                final = operations._canonical_read(parsed, item)
+                self.assertEqual(final["metadata"], metadata)
+                self.assertEqual(
+                    canonical_sha256(final),
+                    canonical_sha256(stage["after"]),
+                )
+
+    def test_validation_requires_true_but_ignores_nonblocking_diagnostics(self) -> None:
+        cases = (
+            {"valid": True, "errors": [{"code": "script_path_relative_check_skipped"}]},
+            {"valid": False},
+            {},
+            {"valid": "true"},
+        )
+        for validation in cases:
+            with self.subTest(validation=validation), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_d9_fixture(Path(temporary))
+                state = read_state(fixture)
+                state["validation"] = validation
+                write_state(fixture, state)
+                plan, _ = canonical_plan(fixture)
+                if validation.get("valid") is True:
+                    report = reconcile_canonical_workflows(plan, mode="prepare")
+                    self.assertEqual(report["phase"], "prepared")
+                    with OperationJournal(
+                        fixture["root"] / "canonical-state",
+                        "canonical-workflow-reconcile",
+                        plan,
+                    ) as journal:
+                        persisted = canonical_bytes(journal.state)
+                    evidence = canonical_bytes(report)
+                    self.assertNotIn(b"script_path_relative_check_skipped", persisted)
+                    self.assertNotIn(b"script_path_relative_check_skipped", evidence)
+                    self.assertNotIn(b"errors", persisted)
+                    self.assertNotIn(b"errors", evidence)
+                else:
+                    with self.assertRaises(EffectBlocked):
+                        reconcile_canonical_workflows(plan, mode="prepare")
+
     def test_raw_fields_and_nonterminal_plan_state_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = make_d9_fixture(Path(temporary))
@@ -311,7 +678,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             metadata = {
                 "name": "Canonical v2",
                 "description": "All metadata fields",
-                "execution_target": "local",
+                "execution_target": "head",
             }
             plan, value = canonical_plan(
                 fixture,
