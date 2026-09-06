@@ -1,6 +1,6 @@
 # Model Policy
 
-## Current Source Policy — September 5, 2026
+## Current Source Policy — September 6, 2026
 
 [`config/subagents.toml`](../config/subagents.toml) is the authoritative managed
 configuration fragment and the single source of truth for role allocation.
@@ -19,32 +19,49 @@ separate settings; changing the model does not authorize changing reasoning.
 Do not attribute an observed outcome to model selection without accounting
 for the reasoning setting and workflow behavior.
 
-The root retains `model_context_window = 872000`; the fast role restores
-`model_context_window = 372000` alongside its Luna selector. These are
-intentional operator-chosen harness budgets, not statements about provider
-maximum context capacity. No other role receives an explicit window.
+The root retains `model_context_window = 872000`. Each of the eight Luna roles
+explicitly pairs `model_context_window = 372000` with
+`context_compaction_threshold_tokens = 353400`. Fast retains its existing
+window and gains the matching threshold; the other seven roles gain both
+fields. No Astra role receives an explicit role budget. These are intentional
+operator-chosen harness budgets, not statements about provider maximum
+context capacity.
 
 This bounded change preserves every other setting: per-role reasoning,
 low verbosity, tools, prompts, callability, priority mode, the disabled
 built-in reviewer, workflow concurrency of 4, and maximum subagent depth of 1.
-It adds no compaction keys and preserves operator-owned root compaction
-settings. Role-derived context budgets and compaction thresholds follow Kent's
-derivation rules when a role's model or explicit window changes; those derived
-thresholds are not promised to remain unchanged.
+Only the eight role threshold keys are added; no root compaction key is added
+to the managed fragment. Operator-owned root compaction settings, including
+the global threshold 828400 and mode `native`, remain unchanged.
+
+Kent 2.7.2 derives Luna's 372000/353400 pair on a fresh role launch but skips
+that derivation under a model lock. Without explicit pairs, continuation can
+inherit root budgets; fast's smaller explicit window can instead conflict
+with the inherited root threshold. The paired overrides keep the intended
+working budget in fresh and model-locked projections without changing the
+locked model.
 
 ### Configuration Adoption and Runtime Evidence
 
 Configuration adoption is a separately approved reconciliation of the managed
-fragment with global and project settings. Check each intended launch root
-for explicit overrides and declared inheritance, preserving unrelated user
-settings. Historical attached workspaces and retained worktrees can keep
-older overrides; do not assume they inherit this policy.
+fragment with global and project settings. A project-defined role replaces
+the entire global role definition in Kent 2.7.2; its fields are not merged
+individually. Therefore every project-defined override of one of these Luna
+roles needs the same explicit budget pair. Projects without such overrides
+inherit the global definition. Check each intended launch root and preserve
+unrelated user settings. Historical attached workspaces and retained
+worktrees can keep older overrides; do not assume they inherit this policy.
 
-File-level adoption is not effective-runtime evidence. Existing and resumed
-sessions retain their locked settings; neither a source patch nor a
-configuration-file update refreshes those locks or establishes runtime
-activation. New-session verification and the documented service/GUI restart
-require a separate gate that accounts for active work.
+File-level adoption is not a runtime canary. Existing model and prompt locks
+are preserved, but they do not freeze every runtime setting: fresh and
+continuation paths can re-read working budgets without a restart. An existing
+Astra-locked session assigned one of these now-Luna roles retains Astra while
+using the smaller 372000/353400 pair and can compact earlier. Restart is not
+an isolation barrier for configuration-file adoption.
+
+Do not resume large historical sessions to test these budgets. Their
+continuation/compaction, any actual fresh/continue runtime canary, and any
+service/GUI restart require separate decisions accounting for active work.
 
 ### Validation, Rollout, and Rollback Boundaries
 
@@ -58,14 +75,19 @@ runtime-canary authority.
 `scripts/install` creates links for Kit assets; it does not merge
 `config/subagents.toml` into the effective configuration. Preserve user changes
 when reconciling configuration and verify effective settings separately.
-Confirm model and reasoning in newly created sessions after the approved
-restart; existing or resumed sessions are not rollout canaries.
+In a separately approved runtime canary, confirm the effective model,
+reasoning, window, and threshold. A fresh launch does not verify continuation
+behavior; neither source tests nor preserved model/prompt locks prove that
+all runtime settings stayed fixed.
 
 Before installation, source rollback is the inverse of this bounded package's
 patch, preserving unrelated changes. It is not a global model downgrade and
 must not undo the separately delivered hotfix. After installation, rollback
 requires a separately approved operational plan that accounts for linked
 assets and effective configuration; a source-only inverse is insufficient.
+Reversing the paired-budget correction removes eight thresholds and seven
+new windows while retaining fast's pre-existing window. That restores the
+known continuation bug, so an inverse is not automatically safe recovery.
 
 ### Sources and Evaluation
 
