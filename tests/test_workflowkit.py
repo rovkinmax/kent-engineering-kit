@@ -290,6 +290,9 @@ class WorkflowKitTest(unittest.TestCase):
             {name: selector["model"] for name, selector in selectors.items()},
             expected_models,
         )
+        luna_roles = {
+            name for name, model in expected_models.items() if model == "gpt-5.6-luna"
+        }
         expected_reasoning = {
             "root": "medium",
             "reviewer": "medium",
@@ -308,7 +311,7 @@ class WorkflowKitTest(unittest.TestCase):
                 for name, selector in selectors.items()
                 if "model_context_window" in selector
             },
-            {"root": 872000, "fast": 372000},
+            {"root": 872000, **{name: 372000 for name in luna_roles}},
         )
         self.assertEqual(
             {
@@ -337,13 +340,27 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(config["workflow"], {"subagents": True, "concurrency": 4})
         self.assertEqual(config["max_subagent_depth"], 1)
 
-        def assert_no_compaction_keys(table: dict) -> None:
-            for key, value in table.items():
-                self.assertNotIn("compact", key.lower())
-                if isinstance(value, dict):
-                    assert_no_compaction_keys(value)
+        compaction_settings = {}
 
-        assert_no_compaction_keys(config)
+        def collect_compaction_keys(value, path=()) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    child_path = (*path, key)
+                    if "compact" in key.lower():
+                        compaction_settings[child_path] = child
+                    collect_compaction_keys(child, child_path)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    collect_compaction_keys(child, (*path, index))
+
+        collect_compaction_keys(config)
+        self.assertEqual(
+            compaction_settings,
+            {
+                ("subagents", name, "context_compaction_threshold_tokens"): 353400
+                for name in luna_roles
+            },
+        )
 
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
         config = tomllib.loads(
