@@ -535,8 +535,8 @@ link/default change, direct database edit, or caller-supplied effect is allowed.
 
 ## Task-owned cleanup
 
-- Cleanup is a report-first resource-owning agent stage. It never removes its
-  own Kent-managed worktree.
+- Cleanup is report-first and resource-owning; it never removes its own
+  Kent-managed worktree.
 - Cleanup always emits the exact non-empty `git branch --show-current` value,
   including `no_pr` and `report_only` paths. Sentinel or inferred task-ID
   branch values are invalid and route Janitor back to Cleanup instead of
@@ -560,9 +560,9 @@ link/default change, direct database edit, or caller-supplied effect is allowed.
 - Janitor treats `kind=scheduled` as non-terminal and accepts deletion only
   after Kent returns `kind=completed` and both the worktree path and Git
   registration are absent.
-- Safety preservation is a successful cleanup result and must be explicit in
-  `cleanup_report`. Infrastructure failure returns to Cleanup with the resource
-  untouched.
+- Preservation succeeds explicitly in `cleanup_report`; infrastructure failure
+  returns to Cleanup without touching the resource.
+- CI bounds, recovery and Git binding: `workflow-task-janitor` docstring.
 
 ## Project adapter boundary
 
