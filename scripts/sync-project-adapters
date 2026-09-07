@@ -40,6 +40,10 @@ class CommandTemplate:
 
 
 COMMAND_TEMPLATES = {
+    "prepare_ci": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-prepare-github-ci",
+        "1.0.0",
+    ),
     "runtime_contracts": CommandTemplate(
         REPO_ROOT / "workflowkit" / "runtime.py",
         "2.0.0",

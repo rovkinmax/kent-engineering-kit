@@ -1865,6 +1865,50 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
                 self.assertEqual(report["code"], code)
                 self.assertEqual(report["exit_code"], 0)
 
+    def test_verify_default_environment_never_writes_bytecode(self) -> None:
+        for raw_input, expected_code in (
+            ('{"workspace_path":', "input_invalid"),
+            (None, "passed"),
+        ):
+            with self.subTest(expected_code=expected_code):
+                root = self.create_repository()
+                scripts = self.install_verify_fixture(
+                    root,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"transition\":\"passed\"}'\n",
+                )
+                environment = dict(os.environ)
+                environment.pop("PYTHONDONTWRITEBYTECODE", None)
+
+                def bytecode_paths() -> list[Path]:
+                    return sorted(
+                        path.relative_to(scripts)
+                        for path in scripts.rglob("*")
+                        if path.name == "__pycache__"
+                        or path.suffix in {".pyc", ".pyo"}
+                    )
+
+                self.assertEqual(bytecode_paths(), [])
+                result = subprocess.run(
+                    [sys.executable, str(scripts / "workflow-verify-report")],
+                    cwd=root,
+                    input=(
+                        raw_input
+                        if raw_input is not None
+                        else json.dumps({"workspace_path": str(root)})
+                    ),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = self.parse_verification_report(
+                    json.loads(result.stdout)
+                )
+                self.assertEqual(report["code"], expected_code)
+                self.assertEqual(bytecode_paths(), [])
+
     def test_verify_input_workspace_and_verifier_failures_are_safe(self) -> None:
         root = self.create_repository()
         scripts = self.install_verify_fixture(
@@ -2017,6 +2061,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             "LC_ALL": "override",
             "GIT_TERMINAL_PROMPT": "override",
             "GCM_INTERACTIVE": "override",
+            "PYTHONDONTWRITEBYTECODE": "0",
             **{name: str(path) for name, path in optional.items()},
             **invalid_optional,
             "KENT_SECRET": "forbidden",
@@ -2041,6 +2086,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             "LC_ALL",
             "GIT_TERMINAL_PROMPT",
             "GCM_INTERACTIVE",
+            "PYTHONDONTWRITEBYTECODE",
             "TMPDIR",
             "PATH",
             *(set(optional) - set(invalid_optional)),
@@ -2053,6 +2099,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         self.assertEqual(captured["env"]["CI"], "1")
         self.assertEqual(captured["env"]["LANG"], "C")
         self.assertEqual(captured["env"]["LC_ALL"], "C")
+        self.assertEqual(captured["env"]["PYTHONDONTWRITEBYTECODE"], "1")
         for name in (
             "GIT_TERMINAL_PROMPT",
             "GCM_INTERACTIVE",
@@ -2124,6 +2171,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             "LC_ALL",
             "GIT_TERMINAL_PROMPT",
             "GCM_INTERACTIVE",
+            "PYTHONDONTWRITEBYTECODE",
             "TMPDIR",
             "PATH",
             "HOME",
@@ -2131,6 +2179,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         }
         self.assertEqual(set(environment), expected_keys)
         self.assertEqual(environment["TMPDIR"], "/private/verify-tmp")
+        self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
         self.assertEqual(environment["PATH"].split(os.pathsep)[0], str(java / "bin"))
         self.assertNotIn("KENT_SECRET", environment)
         self.assertNotIn("PYTHONHOME", environment)
@@ -2865,7 +2914,9 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         child.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os\n"
-            "print(json.dumps({k: os.environ[k] for k in ('TMPDIR', 'PWD') if k in os.environ}))\n"
+            "print(json.dumps({k: os.environ[k] for k in "
+            "('TMPDIR', 'PWD', 'PYTHONDONTWRITEBYTECODE') "
+            "if k in os.environ}))\n"
         )
         child.chmod(0o755)
         module = load_template_module(
@@ -2881,6 +2932,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         self.assertIsNone(failure)
         environment = json.loads(stdout)
         self.assertTrue(environment["TMPDIR"].startswith("/dev/fd/"))
+        self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
         self.assertNotIn("PWD", environment)
 
 
@@ -3371,6 +3423,7 @@ class GitHubCiWatchTest(GitRepositoryTest):
         query_timeout: int = 60,
         ready_file: Path | None = None,
         pid_file: Path | None = None,
+        source_contract: dict[str, object] | None = None,
     ) -> dict[str, object]:
         (root / "pr-state.json").write_text(json.dumps(pr_state))
         (root / "checks.json").write_text(json.dumps(checks))
@@ -4940,6 +4993,7 @@ class GitHubPrWatchTest(GitRepositoryTest):
                 "#!/bin/sh\n"
                 'case "$1 $2" in\n'
                 '  "pr view") cat "$KENT_TEST_PR_STATE" ;;\n'
+                '  "pr checks") cat "$KENT_TEST_SOURCE_CHECKS" ;;\n'
                 '  "api graphql") cat "$KENT_TEST_GRAPHQL" ;;\n'
                 '  "api "*)\n'
                 '    case "$*" in\n'
@@ -4969,6 +5023,7 @@ class GitHubPrWatchTest(GitRepositoryTest):
         query_timeout: int = 60,
         ready_file: Path | None = None,
         pid_file: Path | None = None,
+        source_contract: dict[str, object] | None = None,
     ) -> dict[str, object]:
         scripts = root / ".kent" / "scripts"
         scripts.mkdir(parents=True, exist_ok=True)
@@ -5018,6 +5073,16 @@ class GitHubPrWatchTest(GitRepositoryTest):
             state,
             feedback_script=feedback_script,
         )
+        (root / "source-checks.json").write_text(json.dumps([
+            {
+                "name": item.get("name", ""), "workflow": item.get("workflow", ""),
+                "state": item.get("conclusion", item.get("state", "UNKNOWN")),
+                "bucket": {
+                    "SUCCESS": "pass", "FAILURE": "fail", "SKIPPED": "skipping",
+                }.get(item.get("conclusion"), "pending"),
+                "link": None,
+            } for item in state.get("statusCheckRollup", [])
+        ]))
         workflow_input = {
             "workspace_path": str(root),
             "pr_url": "https://github.com/example/repo/pull/1",
@@ -5030,11 +5095,13 @@ class GitHubPrWatchTest(GitRepositoryTest):
                 if cursor is not None
                 else {}
             ),
+            **(source_contract or {}),
         }
         environment = {
             **os.environ,
             "PATH": f"{root}:{os.environ.get('PATH', '')}",
             "KENT_TEST_PR_STATE": str(root / "pr-state.json"),
+            "KENT_TEST_SOURCE_CHECKS": str(root / "source-checks.json"),
             "KENT_TEST_ISSUES": str(root / "issues.json"),
             "KENT_TEST_REVIEWS": str(root / "reviews.json"),
             "KENT_TEST_COMMENTS": str(root / "comments.json"),
@@ -5087,6 +5154,140 @@ class GitHubPrWatchTest(GitRepositoryTest):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
+
+    def test_source_contract_extra_failed_check_does_not_wake_waiting_pr(
+        self,
+    ) -> None:
+        root = self.create_repository()
+        runtime = load_template_module(
+            REPO_ROOT / "workflowkit" / "runtime.py",
+            "pr_source_contract_runtime",
+        )
+        expected = {
+            "schema": "github-ci-expected-checks-v1",
+            "repository": "example/repo",
+            "project_commit": "a" * 40,
+            "runtime_source_envelope_digest": "c" * 64,
+            "checks": [
+                {
+                    "workflow_name": "PR",
+                    "check_name": "Build",
+                    "allow_skipped": False,
+                }
+            ],
+        }
+        policy = runtime.make_ci_policy_snapshot("b" * 40, expected)
+        result = self.watch(
+            root,
+            {
+                "state": "OPEN",
+                "mergedAt": None,
+                "mergeCommit": None,
+                "headRefName": "TASK-1",
+                "headRefOid": "a" * 40,
+                "baseRefName": "main",
+                "baseRefOid": "b" * 40,
+                "reviewDecision": "APPROVED",
+                "mergeStateStatus": "CLEAN",
+                "statusCheckRollup": [
+                    {
+                        "workflow": "PR",
+                        "name": "Build",
+                        "conclusion": "SUCCESS",
+                    },
+                    {
+                        "workflow": "PR",
+                        "name": "Lint",
+                        "conclusion": "FAILURE",
+                    }
+                ],
+                "url": "https://github.com/example/repo/pull/1",
+            },
+            head="a" * 40,
+            base="b" * 40,
+            source_contract={
+                "expected_ci_checks": runtime.canonical_bytes(expected).decode(
+                    "utf-8"
+                ),
+                "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(
+                    expected
+                ),
+                "runtime_source_envelope_digest": "c" * 64,
+                "ci_policy_snapshot": runtime.canonical_bytes(policy).decode(
+                    "utf-8"
+                ),
+            },
+        )
+        self.assertEqual(result["transition"], "merge_watch_still_waiting")
+
+    def test_source_contract_missing_or_skipped_mandatory_check_wakes_waiting_pr(
+        self,
+    ) -> None:
+        runtime = load_template_module(
+            REPO_ROOT / "workflowkit" / "runtime.py",
+            "pr_source_contract_missing_runtime",
+        )
+        expected = {
+            "schema": "github-ci-expected-checks-v1",
+            "repository": "example/repo",
+            "project_commit": "a" * 40,
+            "runtime_source_envelope_digest": "c" * 64,
+            "checks": [
+                {
+                    "workflow_name": "PR",
+                    "check_name": "Build",
+                    "allow_skipped": False,
+                }
+            ],
+        }
+        policy = runtime.make_ci_policy_snapshot("b" * 40, expected)
+        source_contract = {
+            "expected_ci_checks": runtime.canonical_bytes(expected).decode(
+                "utf-8"
+            ),
+            "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(
+                expected
+            ),
+            "runtime_source_envelope_digest": "c" * 64,
+            "ci_policy_snapshot": runtime.canonical_bytes(policy).decode(
+                "utf-8"
+            ),
+        }
+        base_state = {
+            "state": "OPEN",
+            "mergedAt": None,
+            "mergeCommit": None,
+            "headRefName": "TASK-1",
+            "headRefOid": "a" * 40,
+            "baseRefName": "main",
+            "baseRefOid": "b" * 40,
+            "reviewDecision": "APPROVED",
+            "mergeStateStatus": "CLEAN",
+            "url": "https://github.com/example/repo/pull/1",
+        }
+        for checks in (
+            [],
+            [
+                {
+                    "workflow": "PR",
+                    "name": "Build",
+                    "conclusion": "SKIPPED",
+                }
+            ],
+        ):
+            with self.subTest(checks=checks):
+                root = self.create_repository()
+                result = self.watch(
+                    root,
+                    {**base_state, "statusCheckRollup": checks},
+                    head="a" * 40,
+                    base="b" * 40,
+                    source_contract=source_contract,
+                )
+                self.assertEqual(
+                    result["transition"],
+                    "merge_watch_state_changed",
+                )
 
     def test_unicode_feedback_cursor_round_trips_through_pr_consumer(
         self,

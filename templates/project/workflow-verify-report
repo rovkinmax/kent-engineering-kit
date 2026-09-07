@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import hashlib
 import errno
 import json
@@ -12,7 +15,6 @@ import selectors
 import signal
 import stat
 import subprocess
-import sys
 import time
 from typing import Any
 
@@ -379,6 +381,7 @@ def replacement_environment(tmp_fd: int) -> dict[str, str]:
         "LC_ALL": "C",
         "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "never",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "TMPDIR": _fd_path(tmp_fd),
     }
     valid: dict[str, str] = {}

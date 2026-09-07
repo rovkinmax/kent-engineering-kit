@@ -18,6 +18,7 @@ bash -n "$repo_root/scripts/audit-mobile-schema"
 bash -n "$repo_root/scripts/configure-mcporter"
 bash -n "$repo_root/scripts/kent-worktree"
 bash -n "$repo_root/scripts/preflight-revision"
+bash -n "$repo_root/templates/project/workflow-prepare-github-ci"
 bash -n "$repo_root/scripts/resolve-github-merge-strategy"
 bash -n "$repo_root/adapters/mcp/kent-mcp-call"
 bash -n "$repo_root/adapters/mcp/kent-mcp-list"
@@ -33,6 +34,12 @@ bash -n "$repo_root/templates/project/workflow-plan-contract-continue"
 bash -n "$repo_root/templates/project/workflow-plan-contract-fix-continue"
 bash -n "$repo_root/templates/project/workflow-plan-contract-verify"
 python3 -m py_compile \
+  "$repo_root/workflowkit/ci_contract.py" \
+  "$repo_root/workflowkit/delivery.py" \
+  "$repo_root/workflowkit/profile.py" \
+  "$repo_root/workflowkit/revision.py" \
+  "$repo_root/workflowkit/runtime.py" \
+  "$repo_root/scripts/prepare-github-ci" \
   "$repo_root/workflowkit/operations.py" \
   "$repo_root/scripts/activate-primary-checkout" \
   "$repo_root/scripts/reconcile-canonical-workflows" \
@@ -116,6 +123,16 @@ done
   echo "GitHub CI watcher template is not executable" >&2
   exit 1
 }
+[[ -x "$repo_root/templates/project/workflow-prepare-github-ci" ]] || {
+  echo "GitHub CI preparation template is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/scripts/prepare-github-ci" ]] || {
+  echo "GitHub CI preparation CLI is not executable" >&2
+  exit 1
+}
+ruby -ryaml -rjson -e 'exit 0' >/dev/null
+git --no-replace-objects --no-lazy-fetch --version >/dev/null
 [[ -x "$repo_root/templates/project/workflow-branch-identity" ]] || {
   echo "workflow branch-identity template is not executable" >&2
   exit 1

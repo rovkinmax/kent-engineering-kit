@@ -166,6 +166,7 @@ Runtime v2 is atomic.
 - `merge_strategy`
 - `pr_report`
 - `ci_report`
+- `expected_ci_checks`, `expected_ci_checks_sha256`, `runtime_source_envelope_digest`, `ci_policy_snapshot`
 - `merge_report`
 - `publication_report`
 - `closure_reason`
@@ -444,6 +445,7 @@ defined by `contracts/plan-contract.md`.
 ### CI limit
 Authority(repo/head/envelope/digest)>projection/grammar/encode; mismatch→ordinary/null; pending waits; late→Cleanup; open→diff; receipt=projected_rows×5; unexpected=sorted−expected; >10,000 before duplicate/terminal.
 Bounded canonical encoder: sorted-key compact UTF-8 parity(ensure_ascii=false,allow_nan=false); strings emitted in escaped pieces; no complete oversized token/string kept; nesting=100; RecursionError→RuntimeContractError; hash 4 MiB+1→hard_limit, not wire; observation_limit=report_invalid/[]/null,count+digest≤2147483647; hard_limit=zero count/empty digests; child≤4 MiB+1→terminate/reap groups; >48 KiB→convert; history bounded.
+Source CI (`prepare_ci=1.0.0`): `workflowkit/ci_contract.py` owns producer, diagnosis, cycle and evidence wire details.
 
 ## Smoke policy
 
