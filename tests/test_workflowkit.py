@@ -2269,70 +2269,18 @@ class WorkflowKitTest(unittest.TestCase):
             {node.key for node in build_delivery_workflow(profile, 1).nodes},
         )
 
-    def test_schema_four_runtime_v2_requires_complete_conditional_adoption(
+    def test_schema_four_runtime_v2_requires_prepare_ci_producer_adoption(
         self,
     ) -> None:
         profile = self.load_schema4_profile(
             lambda _: self.schema4_runtime_v2_contents()
         )
         self.assertTrue(profile.runtime_contracts_v2())
-        workflow = build_delivery_workflow(profile, 1)
-        cursor_edges = [
-            edge for edge in workflow.edges
-            if any(
-                parameter.key == "pr_feedback_cursor"
-                for parameter in edge.parameters
-            )
-        ]
-        self.assertTrue(cursor_edges)
-        expected_cursor_edges = {
-            "prepare_pr_ci_watch",
-            "ci_watch_waiting_pr",
-            "ci_watch_diagnose",
-            "ci_monitor_waiting_pr",
-            "ci_monitor_watch",
-            "ci_monitor_needs_user_action",
-            "waiting_pr_watch_merge",
-            "merge_watch_still_waiting",
-            "merge_watch_state_changed",
-            "waiting_pr_needs_user_action",
-            "waiting_pr_fix",
-            "waiting_pr_ci_monitor",
-        }
-        self.assertEqual(
-            {
-                edge.key
-                for edge in cursor_edges
-            },
-            expected_cursor_edges,
-        )
-        self.assertIn(
-            "uninitialized",
-            "\n".join(
-                edge.prompt or ""
-                for edge in workflow.edges
-            ),
-        )
-        self.assertIn(
-            "{{.Params.pr_feedback_cursor}}",
-            "\n".join(edge.prompt or "" for edge in workflow.edges),
-        )
-        delivery_prompts = "\n".join(
-            edge.prompt or ""
-            for edge in workflow.edges
-            if edge.prompt
-        )
-        normalized_delivery_prompts = " ".join(delivery_prompts.split())
-        self.assertIn("deterministic PR watcher", delivery_prompts)
-        self.assertIn("pull_request_feedback_invalid", delivery_prompts)
-        self.assertIn(
-            "delivery preserves supplied cursors",
-            normalized_delivery_prompts,
-        )
-        self.assertIn(
-            "never synthesizes materialized cursors",
-            normalized_delivery_prompts,
-        )
+        with self.assertRaisesRegex(
+            SpecError,
+            "requires prepare_ci 1.0.0",
+        ):
+            build_delivery_workflow(profile, 1)
 
         coexist = self.schema4_runtime_v2_contents().replace(
             '"wait_ci"]',
@@ -2361,6 +2309,74 @@ class WorkflowKitTest(unittest.TestCase):
                     'evidence = "1.0.0"',
                 )
             )
+
+    def test_source_ci_contract_adds_preparation_and_distinct_cycle_edges(
+        self,
+    ) -> None:
+        contents = (
+            self.schema4_runtime_v2_contents()
+            .replace('"wait_ci"]', '"wait_ci", "prepare_ci"]')
+            .replace(
+                'wait_ci = "2.0.0"\n',
+                'wait_ci = "2.0.0"\nprepare_ci = "1.0.0"\n',
+            )
+            .replace(
+                'wait_ci = ".kent/scripts/workflow-wait-github-ci"',
+                'wait_ci = ".kent/scripts/workflow-wait-github-ci"\n'
+                'prepare_ci = ".kent/scripts/workflow-prepare-github-ci"',
+            )
+        )
+        profile = self.load_schema4_profile(lambda _: contents)
+        self.assertTrue(profile.source_ci_contract())
+        spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
+        self.assertIn("ci_prepare", {node.key for node in spec.nodes})
+        self.assertEqual(by_key["prepare_pr_ci_prepare"].target, "ci_prepare")
+        initial = tuple(
+            parameter.key for parameter in by_key["ci_prepare_ready_initial"].parameters
+        )
+        retry = tuple(
+            parameter.key for parameter in by_key["ci_prepare_ready_retry"].parameters
+        )
+        self.assertNotIn("ci_report", initial)
+        self.assertIn("ci_report", retry)
+        self.assertNotIn("ci_monitor_waiting_pr", by_key)
+        self.assertEqual(by_key["ci_monitor_watch"].target, "ci_prepare")
+        cursor_edges = {
+            edge.key for edge in spec.edges
+            if any(parameter.key == "pr_feedback_cursor" for parameter in edge.parameters)
+        }
+        self.assertEqual(cursor_edges, {
+            "prepare_pr_ci_prepare", "ci_prepare_ready_initial", "ci_prepare_ready_retry",
+            "ci_prepare_failed", "ci_watch_waiting_pr", "ci_watch_diagnose",
+            "ci_watch_source_changed", "ci_monitor_watch", "ci_monitor_needs_user_action",
+            "waiting_pr_watch_merge", "merge_watch_still_waiting", "merge_watch_state_changed",
+            "waiting_pr_needs_user_action", "waiting_pr_fix", "waiting_pr_ci_monitor",
+        })
+        prompts = " ".join((edge.prompt or "") for edge in spec.edges)
+        self.assertIn("uninitialized", prompts)
+        self.assertIn("{{.Params.pr_feedback_cursor}}", prompts)
+        self.assertIn("deterministic PR watcher", prompts)
+        self.assertIn("pull_request_feedback_invalid", prompts)
+        self.assertIn("delivery preserves supplied cursors", " ".join(prompts.split()))
+        self.assertIn("never synthesizes materialized cursors", " ".join(prompts.split()))
+        for key in ("ci_prepare_failed", "ci_monitor_watch", "ci_monitor_needs_user_action"):
+            self.assertTrue({
+                "task_short_id", "ci_report", "ci_policy_snapshot",
+                "expected_ci_checks", "expected_ci_checks_sha256", "runtime_source_envelope_digest",
+            } <= {parameter.key for parameter in by_key[key].parameters}, key)
+
+    def test_ci_disabled_schema_four_keeps_pr_tail_without_ci_packets(self) -> None:
+        profile = self.load_schema4_profile(
+            lambda _: self.schema4_runtime_v2_contents().replace(
+                "ci_monitoring = true", "ci_monitoring = false",
+            ).replace(', "wait_ci"]', ']').replace('wait_ci = "2.0.0"\n', '')
+        )
+        spec = build_delivery_workflow(profile, 1)
+        self.assertNotIn("ci_prepare", {node.key for node in spec.nodes})
+        self.assertNotIn("ci_watch", {node.key for node in spec.nodes})
+        merge_watch = next(edge for edge in spec.edges if edge.target == "merge_watch")
+        self.assertNotIn("expected_ci_checks", {p.key for p in merge_watch.parameters})
 
     def test_schema_four_variants_remain_valid_without_legacy_publish(
         self,

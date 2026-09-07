@@ -69,6 +69,9 @@ link_item \
   "$repo_root/scripts/preflight-revision" \
   "$kent_root/bin/kent-preflight-revision"
 link_item \
+  "$repo_root/scripts/prepare-github-ci" \
+  "$kent_root/bin/kent-prepare-github-ci"
+link_item \
   "$repo_root/scripts/resolve-github-merge-strategy" \
   "$kent_root/bin/kent-resolve-github-merge-strategy"
 link_item \

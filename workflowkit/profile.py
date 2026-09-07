@@ -38,6 +38,7 @@ RELEASE_TOPOLOGY_ADOPTIONS = {
 WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 RUNTIME_CONTRACT_VERSION = "2.0.0"
+PREPARE_CI_VERSION = "1.0.0"
 RUNTIME_CONTRACT_COMMANDS = {
     "runtime_contracts",
     "verify",
@@ -488,11 +489,27 @@ class ProjectProfile:
             "wait_pr",
             "wait_ci",
         }
+        if "prepare_ci" in runtime_keys:
+            raise SpecError(
+                "prepare_ci is not a runtime-contract command; declare it "
+                "as a source-contract command"
+            )
+        if "prepare_ci" in managed_commands and (
+            self.command_versions.get("prepare_ci") != PREPARE_CI_VERSION
+        ):
+            raise SpecError(
+                "prepare_ci adoption requires command_versions.prepare_ci = "
+                f"{PREPARE_CI_VERSION!r}"
+            )
         runtime_versions = {
             key for key, value in self.command_versions.items()
             if key in runtime_keys and value == RUNTIME_CONTRACT_VERSION
         }
         v2_adoption = "runtime_contracts" in runtime_keys
+        if "prepare_ci" in managed_commands and not v2_adoption:
+            raise SpecError(
+                "prepare_ci adoption requires runtime-contract v2 support"
+            )
         if v2_adoption:
             if self.command_versions.get("runtime_contracts") != RUNTIME_CONTRACT_VERSION:
                 raise SpecError(
@@ -669,6 +686,14 @@ class ProjectProfile:
             and "runtime_contracts" in self.kit_managed_commands
             and self.command_versions.get("runtime_contracts")
             == RUNTIME_CONTRACT_VERSION
+        )
+
+    def source_ci_contract(self) -> bool:
+        """Whether this profile opted into source-derived CI preparation."""
+        return (
+            self.schema_version == 4
+            and "prepare_ci" in self.kit_managed_commands
+            and self.command_versions.get("prepare_ci") == PREPARE_CI_VERSION
         )
 
     def command(self, key: str) -> str:

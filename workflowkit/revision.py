@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
+import re
+import selectors
+import signal
 import subprocess
+import time
 from typing import Any, Iterable
 
 from .model import SpecError
@@ -17,6 +24,8 @@ from .release import (
     render_release_preview,
 )
 from .runtime import (
+    MAX_EXTERNAL_ROOT_BYTES,
+    MAX_EXTERNAL_TOTAL_BYTES,
     RuntimeExternalRoot,
     SelectedRuntimeSourceInputs,
     _make_selected_runtime_source_inputs,
@@ -27,6 +36,61 @@ PROFILE_PATH = ".kent/workflow-profile.toml"
 PROJECT_CONTRACT_PATH = ".kent/project-contract.md"
 ALLOWED_FILE_MODES = {"100644", "100755"}
 TREE_MODE = "040000"
+GIT_COMMAND_TIMEOUT_SECONDS = 30.0
+GIT_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
+SOURCE_READ_TIMEOUT_SECONDS = 60.0
+SOURCE_READ_TOTAL_BYTES = 32 * 1024 * 1024
+
+
+@dataclass
+class _SourceReadBudget:
+    deadline: float
+    remaining_bytes: int
+
+
+_SOURCE_READ_BUDGET: ContextVar[_SourceReadBudget | None] = ContextVar(
+    "revision_source_read_budget", default=None,
+)
+
+
+def selected_git_environment() -> dict[str, str]:
+    """Select the caller's explicit root, never inherited repository routing."""
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+    environment.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+    })
+    return environment
+
+
+def selected_git_command(root: Path, *args: str) -> list[str]:
+    return [
+        "git", "--no-replace-objects", "--no-lazy-fetch", "-C", str(root),
+        "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false",
+        "-c", "maintenance.auto=false", "-c", "gc.auto=0", *args,
+    ]
+
+
+@contextmanager
+def source_read_budget():
+    """One cumulative budget for the selected-revision read, including preflight."""
+    if _SOURCE_READ_BUDGET.get() is not None:
+        yield
+        return
+    token = _SOURCE_READ_BUDGET.set(_SourceReadBudget(
+        time.monotonic() + SOURCE_READ_TIMEOUT_SECONDS, SOURCE_READ_TOTAL_BYTES,
+    ))
+    try:
+        yield
+    finally:
+        _SOURCE_READ_BUDGET.reset(token)
 
 
 class RevisionPreflightError(RuntimeError):
@@ -84,6 +148,14 @@ class _TreeEntry:
 
 
 def preflight_project_revision(
+    project_root: Path,
+    revision: str,
+) -> RevisionPreflightResult:
+    with source_read_budget():
+        return _preflight_project_revision(project_root, revision)
+
+
+def _preflight_project_revision(
     project_root: Path,
     revision: str,
 ) -> RevisionPreflightResult:
@@ -742,13 +814,29 @@ def read_blob_bytes(
     path: str,
     *,
     label: str,
+    byte_limit: int = GIT_COMMAND_OUTPUT_BYTES,
 ) -> bytes:
-    result = run_git_bytes(
+    size_result = run_git_bytes(
+        root, "cat-file", "-s", f"{commit_oid}:{path}", check=False,
+    )
+    if size_result.returncode != 0:
+        raise RevisionPreflightError(f"{label} not found at {commit_oid}: {path}")
+    try:
+        size = int(size_result.stdout)
+    except ValueError as error:
+        raise RevisionPreflightError("invalid Git blob size") from error
+    budget = _SOURCE_READ_BUDGET.get()
+    if size < 0 or size > byte_limit or (
+        budget is not None and size > budget.remaining_bytes
+    ):
+        raise RevisionPreflightError("source blob exceeds byte limit")
+    result = _run_git_bounded(
         root,
         "cat-file",
         "blob",
         f"{commit_oid}:{path}",
         check=False,
+        output_limit=byte_limit,
     )
     if result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip() or "no output"
@@ -756,6 +844,92 @@ def read_blob_bytes(
             f"{label} not found at {commit_oid}: {path}: {detail}"
         )
     return result.stdout
+
+
+def collect_runtime_external_captures(
+    root: Path,
+    inputs: SelectedRuntimeSourceInputs,
+) -> tuple[tuple[str, str, bytes], ...]:
+    with source_read_budget():
+        return _collect_runtime_external_captures(root, inputs)
+
+
+def _collect_runtime_external_captures(
+    root: Path,
+    inputs: SelectedRuntimeSourceInputs,
+) -> tuple[tuple[str, str, bytes], ...]:
+    """Read the declared source captures from the selected Git revision.
+
+    Builder keys are digests; their path is H's profile.release.builder_path.
+    Source keys are path=digest. Digests are either lowercase hex64 (SDK, Slack,
+    Puber) or exactly sha256:<eight colon-separated lowercase hex8 groups>
+    (Appsome). Keys/order remain unchanged in captures and the runtime envelope.
+    """
+    if not isinstance(inputs, SelectedRuntimeSourceInputs):
+        raise RevisionPreflightError("external captures require proven selected inputs")
+    captures: list[tuple[str, str, bytes]] = []
+    total_bytes = 0
+    builder_path: str | None = None
+    for descriptor in inputs.external_roots:
+        if descriptor.kind not in {"builder-sha256", "source-sha256"}:
+            raise RevisionPreflightError(
+                f"unsupported runtime external capture kind: {descriptor.kind}"
+            )
+        if descriptor.kind == "builder-sha256":
+            expected = _external_source_digest(descriptor.key)
+            if builder_path is None:
+                if tree_mode(root, inputs.project_commit, PROFILE_PATH) not in ALLOWED_FILE_MODES:
+                    raise RevisionPreflightError("selected builder profile must be a regular Git blob")
+                raw_profile = read_blob_bytes(
+                    root, inputs.project_commit, PROFILE_PATH, label="selected builder profile",
+                )
+                try:
+                    profile = ProjectProfile.from_toml(
+                        root, decode_text(raw_profile, PROFILE_PATH),
+                        source=f"{inputs.project_commit}:{PROFILE_PATH}", check_files=False,
+                    )
+                except SpecError as error:
+                    raise RevisionPreflightError("selected builder profile is invalid") from error
+                if profile.release is None or not profile.release.builder_path:
+                    raise RevisionPreflightError("selected builder profile has no builder_path")
+                builder_path = profile.release.builder_path
+            path = builder_path
+        else:
+            path, separator, encoded = descriptor.key.partition("=")
+            if not separator or not path:
+                raise RevisionPreflightError("source capture descriptor must be path=digest")
+            expected = _external_source_digest(encoded)
+        normalized = normalize_project_path(
+            path,
+            f"external capture {descriptor.kind}",
+        )
+        if tree_mode(root, inputs.project_commit, normalized) not in ALLOWED_FILE_MODES:
+            raise RevisionPreflightError("external capture must be a regular Git blob")
+        contents = read_blob_bytes(
+            root,
+            inputs.project_commit,
+            normalized,
+            label="runtime external capture",
+            byte_limit=min(MAX_EXTERNAL_ROOT_BYTES, MAX_EXTERNAL_TOTAL_BYTES - total_bytes),
+        )
+        total_bytes += len(contents)
+        actual = digest(contents)
+        if actual != expected:
+            raise RevisionPreflightError(
+                f"runtime external capture digest mismatch for {normalized}"
+            )
+        captures.append((descriptor.kind, descriptor.key, contents))
+    return tuple(captures)
+
+
+def _external_source_digest(encoded: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", encoded):
+        return encoded
+    if re.fullmatch(r"sha256:(?:[0-9a-f]{8}:){7}[0-9a-f]{8}", encoded):
+        # Match the existing Appsome codec before decoding; no tolerant
+        # colon-stripping, whitespace, case-folding or alternate delimiters.
+        return "".join(encoded.split(":")[1:])
+    raise RevisionPreflightError("external capture digest encoding is invalid")
 
 
 def read_blob(root: Path, commit_oid: str, path: str, *, label: str) -> str:
@@ -783,12 +957,12 @@ def run_git(
     *args: str,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        ["git", "-C", str(root), *args],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+    raw = _run_git_bounded(root, *args, check=check)
+    result = subprocess.CompletedProcess(
+        raw.args,
+        raw.returncode,
+        raw.stdout.decode("utf-8", errors="replace"),
+        raw.stderr.decode("utf-8", errors="replace"),
     )
     if check and result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
@@ -803,11 +977,146 @@ def run_git_bytes(
     *args: str,
     check: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
-    result = subprocess.run(
-        ["git", "-C", str(root), *args],
+    result = _run_git_bounded(root, *args, check=check)
+    if check and result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip() or "no output"
+        raise RevisionPreflightError(
+            f"git {' '.join(args)} failed with exit {result.returncode}: {detail}"
+        )
+    return result
+
+
+def _terminate_git_process(
+    process: subprocess.Popen[bytes],
+    process_group_id: int,
+) -> None:
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=0.25)
+    except subprocess.TimeoutExpired:
+        pass
+    # A reaped leader does not prove its TERM-ignoring descendants have exited.
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def owned_process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _run_git_bounded(
+    root: Path,
+    *args: str,
+    check: bool,
+    output_limit: int | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    budget = _SOURCE_READ_BUDGET.get()
+    now = time.monotonic()
+    deadline = min(
+        now + GIT_COMMAND_TIMEOUT_SECONDS,
+        budget.deadline if budget is not None else float("inf"),
+    )
+    if deadline <= now:
+        raise RevisionPreflightError("source read timed out")
+    if budget is not None and budget.remaining_bytes <= 0:
+        raise RevisionPreflightError("source read output exceeded limit")
+    output_limit = min(
+        GIT_COMMAND_OUTPUT_BYTES,
+        output_limit if output_limit is not None else GIT_COMMAND_OUTPUT_BYTES,
+    )
+    command = selected_git_command(root, *args)
+    process = subprocess.Popen(
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        check=False,
+        start_new_session=True,
+        env=selected_git_environment(),
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    process_group_id = process.pid
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    outputs = {"stdout": bytearray(), "stderr": bytearray()}
+    failure: str | None = None
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = "timed out"
+                break
+            events = selector.select(remaining)
+            if not events:
+                failure = "timed out"
+                break
+            for key, _ in events:
+                data = os.read(key.fileobj.fileno(), 65536)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                buffer = outputs[key.data]
+                if len(buffer) + len(data) > output_limit or (
+                    budget is not None and len(data) > budget.remaining_bytes
+                ):
+                    failure = "output exceeded limit"
+                    break
+                if budget is not None:
+                    budget.remaining_bytes -= len(data)
+                buffer.extend(data)
+            if failure:
+                break
+    except BaseException:
+        _terminate_git_process(process, process_group_id)
+        process.stdout.close()
+        process.stderr.close()
+        raise
+    finally:
+        selector.close()
+    if failure:
+        _terminate_git_process(process, process_group_id)
+        process.stdout.close()
+        process.stderr.close()
+        raise RevisionPreflightError(
+            f"git {' '.join(args)} {failure}"
+        )
+    try:
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        _terminate_git_process(process, process_group_id)
+        process.stdout.close()
+        process.stderr.close()
+        raise RevisionPreflightError(
+            f"git {' '.join(args)} timed out"
+        )
+    stdout = bytes(outputs["stdout"])
+    stderr = bytes(outputs["stderr"])
+    process.stdout.close()
+    process.stderr.close()
+    if owned_process_group_exists(process_group_id):
+        _terminate_git_process(process, process_group_id)
+        raise RevisionPreflightError("git reader left owned descendants")
+    result = subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout,
+        stderr,
     )
     if check and result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip() or "no output"

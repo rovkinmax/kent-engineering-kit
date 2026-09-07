@@ -9,11 +9,17 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from workflowkit.revision import (
+    GIT_COMMAND_TIMEOUT_SECONDS,
     RevisionPreflightError,
+    collect_runtime_external_captures,
     preflight_project_revision,
+    run_git_bytes,
+    read_blob_bytes,
 )
+from workflowkit import revision as revision_module
 from workflowkit.runtime import (
     RuntimeAuthorityBinding,
     RuntimeContractError,
@@ -398,6 +404,319 @@ def source_manifest_contents(
 
 
 class RevisionPreflightTest(unittest.TestCase):
+    def test_selected_source_ignores_replace_refs_and_inherited_git_routing(self) -> None:
+        root = self.create_project(schema4=True)
+        selected = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+        path = ".kent/release/spec.toml"
+        original = (root / path).read_bytes()
+        (root / path).write_text("# replaced policy\n")
+        self.commit_all(root, "Replacement policy")
+        replacement = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+        self.run_git(root, "replace", selected, replacement)
+        self.assertEqual(read_blob_bytes(root, selected, path, label="policy"), original)
+        foreign = self.create_project(schema4=True)
+        with mock.patch.dict(os.environ, {
+            "GIT_DIR": str(foreign / ".git"),
+            "GIT_WORK_TREE": str(foreign),
+            "GIT_COMMON_DIR": str(foreign / ".git"),
+            "GIT_OBJECT_DIRECTORY": str(foreign / ".git/objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(foreign / ".git/objects"),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.worktree",
+            "GIT_CONFIG_VALUE_0": str(foreign),
+            "GIT_CONFIG_PARAMETERS": "'core.bare=true'",
+            "GIT_REPLACE_REF_BASE": "refs/replace/",
+            "GIT_NO_REPLACE_OBJECTS": "0",
+            "GIT_NO_LAZY_FETCH": "0",
+        }):
+            self.assertEqual(read_blob_bytes(root, selected, path, label="policy"), original)
+            self.assertEqual(preflight_project_revision(root, selected).commit_oid, selected)
+
+    def test_selected_reads_never_lazily_fetch_missing_objects(self) -> None:
+        root = self.create_project(schema4=True)
+        commit = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+        path = ".kent/release/spec.toml"
+        oid = self.run_git(root, "rev-parse", f"{commit}:{path}").stdout.strip()
+        self.run_git(root, "config", "remote.origin.url", "https://github.com/invalid/missing.git")
+        self.run_git(root, "config", "remote.origin.promisor", "true")
+        self.run_git(root, "config", "remote.origin.partialclonefilter", "blob:none")
+        loose = root / ".git/objects" / oid[:2] / oid[2:]
+        loose.rename(loose.with_name(loose.name + ".unavailable"))
+        process = subprocess.Popen
+        child_envs = []
+
+        def launch(*args, **kwargs):
+            child_envs.append(kwargs.get("env"))
+            return process(*args, **kwargs)
+
+        with mock.patch.object(revision_module.subprocess, "Popen", side_effect=launch):
+            with self.assertRaisesRegex(RevisionPreflightError, "not found"):
+                read_blob_bytes(root, commit, path, label="policy")
+        self.assertTrue(child_envs)
+        self.assertTrue(all(env["GIT_NO_LAZY_FETCH"] == "1" for env in child_envs))
+
+    def test_external_collector_reads_real_selected_blobs_and_rejects_digest_drift(self) -> None:
+        root = self.create_project(schema4=True)
+        capture_path = ".kent/release/build.sh"
+        contents = (root / capture_path).read_bytes()
+        key = hashlib.sha256(contents).hexdigest()
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["external_roots"] = [{
+            "kind": "builder-sha256", "key": key, "runtime_digest_required": True,
+        }]
+        manifest_path.write_text(json.dumps(manifest))
+        self.commit_all(root, "Declare selected capture")
+        inputs = preflight_project_revision(root, "HEAD").selected_runtime_source_inputs
+        self.assertIsNotNone(inputs)
+        (root / capture_path).write_text("#!/bin/sh\nexit 42\n")
+        captures = collect_runtime_external_captures(root, inputs)
+        self.assertEqual(captures, (("builder-sha256", key, contents),))
+        envelope = capture_runtime_source_envelope(inputs, captures)
+        self.assertEqual(envelope["project_commit"], inputs.project_commit)
+        self.commit_all(root, "Change capture without its descriptor")
+        changed = preflight_project_revision(root, "HEAD").selected_runtime_source_inputs
+        with self.assertRaisesRegex(RevisionPreflightError, "digest mismatch"):
+            collect_runtime_external_captures(root, changed)
+
+    def test_existing_external_formats_preserve_complete_ordered_capture_keys(self) -> None:
+        root = self.create_project(schema4=True)
+        builder_contents = (root / ".kent/release/build.sh").read_bytes()
+        source_path = ".github/workflows/fixture.yml"
+        (root / source_path).parent.mkdir(parents=True, exist_ok=True)
+        source_contents = b"name: fixture\non: pull_request\n"
+        (root / source_path).write_bytes(source_contents)
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        for grouped in (False, True):
+            def encode(contents):
+                digest = hashlib.sha256(contents).hexdigest()
+                return (
+                    "sha256:" + ":".join(digest[index:index + 8] for index in range(0, 64, 8))
+                    if grouped else digest
+                )
+
+            builder_key = encode(builder_contents)
+            source_key = source_path + "=" + encode(source_contents)
+            manifest["external_roots"] = [
+                {"kind": "builder-sha256", "key": builder_key, "runtime_digest_required": True},
+                {"kind": "source-sha256", "key": source_key, "runtime_digest_required": True},
+            ]
+            manifest_path.write_text(json.dumps(manifest))
+            self.commit_all(root, "Declare existing external descriptor formats")
+            with self.subTest(grouped=grouped):
+                inputs = preflight_project_revision(root, "HEAD").selected_runtime_source_inputs
+                captures = collect_runtime_external_captures(root, inputs)
+                self.assertEqual(captures, (
+                    ("builder-sha256", builder_key, builder_contents),
+                    ("source-sha256", source_key, source_contents),
+                ))
+                self.assertEqual(len(captures), len(inputs.external_roots))
+                envelope = capture_runtime_source_envelope(inputs, captures)
+                self.assertEqual(
+                    [entry["key"] for entry in envelope["runtime_source_envelope"]["external_roots"]],
+                    [builder_key, source_key],
+                )
+                for incomplete in (captures[:-1], captures[::-1], (*captures, captures[-1])):
+                    with self.assertRaises(RuntimeContractError):
+                        capture_runtime_source_envelope(inputs, incomplete)
+
+    def test_builder_capture_path_comes_from_selected_head_profile(self) -> None:
+        root = self.create_project(schema4=True)
+        original_path = ".kent/release/build.sh"
+        moved_path = ".kent/release/moved.sh"
+        original = (root / original_path).read_bytes()
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["external_roots"] = [{
+            "kind": "builder-sha256", "key": hashlib.sha256(original).hexdigest(),
+            "runtime_digest_required": True,
+        }]
+        manifest_path.write_text(json.dumps(manifest))
+        self.commit_all(root, "Declare builder digest")
+        selected = preflight_project_revision(root, "HEAD").selected_runtime_source_inputs
+        profile_path = root / ".kent/workflow-profile.toml"
+        profile_path.write_text(profile_path.read_text().replace(original_path, moved_path))
+        moved = b"#!/bin/sh\nexit 7\n"
+        (root / moved_path).write_bytes(moved)
+        (root / moved_path).chmod(0o755)
+        self.assertEqual(collect_runtime_external_captures(root, selected)[0][2], original)
+        self.commit_all(root, "Move selected builder without updating declared digest")
+        current = preflight_project_revision(root, "HEAD").selected_runtime_source_inputs
+        with self.assertRaisesRegex(RevisionPreflightError, "digest mismatch"):
+            collect_runtime_external_captures(root, current)
+        manifest["external_roots"][0]["key"] = hashlib.sha256(moved).hexdigest()
+        manifest_path.write_text(json.dumps(manifest))
+        self.commit_all(root, "Bind moved builder")
+        current = preflight_project_revision(root, "HEAD").selected_runtime_source_inputs
+        self.assertEqual(collect_runtime_external_captures(root, current)[0][2], moved)
+        (root / moved_path).rename(root / ".kent/release/saved.sh")
+        (root / moved_path).symlink_to("saved.sh")
+        self.commit_all(root, "Make selected builder a symlink")
+        with self.assertRaisesRegex(RevisionPreflightError, "not a regular tracked file"):
+            preflight_project_revision(root, "HEAD")
+
+    def test_builder_descriptor_cannot_supply_a_missing_profile_builder_path(self) -> None:
+        root = self.create_project(
+            schema4=True, topology_kind="sdk-merged-main-publication",
+            adoption_mode="metadata-only", builder_path="",
+        )
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["external_roots"] = [{
+            "kind": "builder-sha256", "key": "a" * 64, "runtime_digest_required": True,
+        }]
+        manifest_path.write_text(json.dumps(manifest))
+        self.commit_all(root, "Declare a builder capture without a selected builder")
+        selected = preflight_project_revision(root, "HEAD").selected_runtime_source_inputs
+        with self.assertRaisesRegex(RevisionPreflightError, "no builder_path"):
+            collect_runtime_external_captures(root, selected)
+
+    def test_external_descriptor_grammar_rejects_ambiguous_or_invented_encodings(self) -> None:
+        root = self.create_project(schema4=True)
+        path = ".kent/release/build.sh"
+        digest = hashlib.sha256((root / path).read_bytes()).hexdigest()
+        grouped = "sha256:" + ":".join(digest[index:index + 8] for index in range(0, 64, 8))
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        malformed = [
+            ("builder-sha256", path + "=" + digest),
+            ("builder-sha256", path + "#" + digest),
+            ("builder-sha256", path + "@" + digest),
+            ("builder-sha256", "sha256:" + digest),
+            ("builder-sha256", grouped.replace(":", "", 1)),
+            ("builder-sha256", grouped + ":"),
+            ("builder-sha256", grouped.upper()),
+            ("source-sha256", digest),
+            ("source-sha256", path + "#" + digest),
+            ("source-sha256", path + "@" + digest),
+            ("source-sha256", path + "==" + digest),
+            ("source-sha256", "=" + digest),
+            ("source-sha256", "../escape=" + digest),
+            ("source-sha256", "/absolute=" + digest),
+            ("source-sha256", path + "=sha256:" + digest),
+        ]
+        for kind, key in malformed:
+            manifest["external_roots"] = [{
+                "kind": kind, "key": key, "runtime_digest_required": True,
+            }]
+            manifest_path.write_text(json.dumps(manifest))
+            self.commit_all(root, "Declare invalid descriptor encoding")
+            with self.subTest(kind=kind, key=key):
+                selected = preflight_project_revision(root, "HEAD").selected_runtime_source_inputs
+                with self.assertRaises(RevisionPreflightError):
+                    collect_runtime_external_captures(root, selected)
+
+    def test_external_collector_rejects_symlinks_and_unsupported_kinds(self) -> None:
+        root = self.create_project(schema4=True)
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        link = root / "capture-link"
+        link.symlink_to(".kent/release/build.sh")
+        for kind in ("source-sha256", "principal-policy-sha256"):
+            manifest["external_roots"] = [{
+                "kind": kind, "key": "capture-link=" + "a" * 64, "runtime_digest_required": True,
+            }]
+            manifest_path.write_text(json.dumps(manifest))
+            self.commit_all(root, "Declare unsupported capture")
+            inputs = preflight_project_revision(root, "HEAD").selected_runtime_source_inputs
+            with self.assertRaisesRegex(RevisionPreflightError, "regular Git blob|unsupported"):
+                collect_runtime_external_captures(root, inputs)
+
+    def test_external_collector_checks_root_and_aggregate_limits_before_reading(self) -> None:
+        root = self.create_project(schema4=True)
+        manifest_path = root / ".kent/release/source-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        for size, count in ((1024 * 1024 + 1, 1), (1024 * 1024, 5)):
+            descriptors = []
+            for index in range(count):
+                path = f"capture-{index}"
+                content = b"x" * size
+                (root / path).write_bytes(content)
+                descriptors.append({
+                    "kind": "source-sha256", "key": path + "=" + hashlib.sha256(content).hexdigest(),
+                    "runtime_digest_required": True,
+                })
+            manifest["external_roots"] = descriptors
+            manifest_path.write_text(json.dumps(manifest))
+            self.commit_all(root, "Declare bounded captures")
+            inputs = preflight_project_revision(root, "HEAD").selected_runtime_source_inputs
+            with self.assertRaisesRegex(RevisionPreflightError, "byte limit"):
+                collect_runtime_external_captures(root, inputs)
+
+    def test_preflight_budget_covers_all_selected_revision_reads(self) -> None:
+        root = self.create_project(schema4=True)
+        with mock.patch.object(revision_module, "SOURCE_READ_TOTAL_BYTES", 256):
+            with self.assertRaisesRegex(RevisionPreflightError, "limit"):
+                preflight_project_revision(root, "HEAD")
+        clock = [0.0]
+        original = revision_module._run_git_bounded
+
+        def advancing_read(*args, **kwargs):
+            clock[0] += 1.0
+            return original(*args, **kwargs)
+
+        with (
+            mock.patch.object(revision_module, "SOURCE_READ_TIMEOUT_SECONDS", 2.5),
+            mock.patch.object(revision_module.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(revision_module, "_run_git_bounded", side_effect=advancing_read),
+            self.assertRaisesRegex(RevisionPreflightError, "timed out"),
+        ):
+            preflight_project_revision(root, "HEAD")
+        # The context is reset after either failure; it cannot poison retries.
+        self.assertTrue(preflight_project_revision(root, "HEAD").checked_paths)
+
+    def test_blob_size_is_checked_before_content_is_read(self) -> None:
+        root = self.create_project(schema4=True)
+        with mock.patch.object(
+            revision_module, "_run_git_bounded", wraps=revision_module._run_git_bounded,
+        ) as reader:
+            with self.assertRaisesRegex(RevisionPreflightError, "byte limit"):
+                read_blob_bytes(
+                    root, "HEAD", ".kent/workflow-profile.toml",
+                    label="profile", byte_limit=1,
+                )
+        self.assertEqual(len(reader.call_args_list), 1)
+        self.assertEqual(reader.call_args.args[1:3], ("cat-file", "-s"))
+
+    def test_git_reader_bounds_output_and_reaps_hanging_children(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            pid_file = root / "pid"
+            fake_git.write_text(
+                "#!/bin/sh\n"
+                f"echo $$ > {pid_file}\n"
+                'case "$*" in\n'
+                "  *overflow*) dd if=/dev/zero bs=1048576 count=9 2>/dev/null ;;\n"
+                "  *) sleep 5 ;;\n"
+                "esac\n"
+            )
+            fake_git.chmod(0o755)
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+            ):
+                with self.assertRaisesRegex(
+                    RevisionPreflightError,
+                    "output exceeded limit",
+                ):
+                    run_git_bytes(root, "overflow")
+                with mock.patch(
+                    "workflowkit.revision.GIT_COMMAND_TIMEOUT_SECONDS",
+                    0.1,
+                ):
+                    with self.assertRaisesRegex(
+                        RevisionPreflightError,
+                        "timed out",
+                    ):
+                        run_git_bytes(root, "hang")
+            pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
     def create_project(
         self,
         *,

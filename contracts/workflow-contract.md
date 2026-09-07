@@ -166,6 +166,7 @@ Runtime v2 is atomic.
 - `merge_strategy`
 - `pr_report`
 - `ci_report`
+- `expected_ci_checks`, `expected_ci_checks_sha256`, `runtime_source_envelope_digest`, `ci_policy_snapshot`
 - `merge_report`
 - `publication_report`
 - `closure_reason`
@@ -245,10 +246,10 @@ Runtime v2 is atomic.
   non-Git workspaces and small local jobs that do not need isolation.
 - A task-level start, approval, or move override may select a concrete target
   without mutating the workflow policy.
-- Verification dispatch deterministically compares `workspace_path` with the
-  canonical current execution root. Artifact subdirectories, nested paths, and
-  foreign repositories are rejected before fan-out and routed through a
-  metadata-only Fix slice.
+- Verification dispatch compares `workspace_path` with the canonical execution
+  root. Artifact subdirectories, nested paths and foreign repositories route
+  to metadata-only Fix before fan-out.
+- Interpreter dispatch: `workflow-verify-report` docstring.
 
 ## Work-kind routing
 
@@ -444,6 +445,7 @@ defined by `contracts/plan-contract.md`.
 ### CI limit
 Authority(repo/head/envelope/digest)>projection/grammar/encode; mismatch→ordinary/null; pending waits; late→Cleanup; open→diff; receipt=projected_rows×5; unexpected=sorted−expected; >10,000 before duplicate/terminal.
 Bounded canonical encoder: sorted-key compact UTF-8 parity(ensure_ascii=false,allow_nan=false); strings emitted in escaped pieces; no complete oversized token/string kept; nesting=100; RecursionError→RuntimeContractError; hash 4 MiB+1→hard_limit, not wire; observation_limit=report_invalid/[]/null,count+digest≤2147483647; hard_limit=zero count/empty digests; child≤4 MiB+1→terminate/reap groups; >48 KiB→convert; history bounded.
+Source CI (`prepare_ci=1.0.0`): `workflowkit/ci_contract.py` owns producer, diagnosis, cycle and evidence wire details.
 
 ## Smoke policy
 
@@ -533,8 +535,8 @@ link/default change, direct database edit, or caller-supplied effect is allowed.
 
 ## Task-owned cleanup
 
-- Cleanup is a report-first resource-owning agent stage. It never removes its
-  own Kent-managed worktree.
+- Cleanup is report-first and resource-owning; it never removes its own
+  Kent-managed worktree.
 - Cleanup always emits the exact non-empty `git branch --show-current` value,
   including `no_pr` and `report_only` paths. Sentinel or inferred task-ID
   branch values are invalid and route Janitor back to Cleanup instead of
@@ -558,9 +560,9 @@ link/default change, direct database edit, or caller-supplied effect is allowed.
 - Janitor treats `kind=scheduled` as non-terminal and accepts deletion only
   after Kent returns `kind=completed` and both the worktree path and Git
   registration are absent.
-- Safety preservation is a successful cleanup result and must be explicit in
-  `cleanup_report`. Infrastructure failure returns to Cleanup with the resource
-  untouched.
+- Preservation succeeds explicitly in `cleanup_report`; infrastructure failure
+  returns to Cleanup without touching the resource.
+- CI bounds, recovery and Git binding: `workflow-task-janitor` docstring.
 
 ## Project adapter boundary
 

@@ -1,7 +1,29 @@
 #!/usr/bin/env python3
-"""Run the project verifier and emit a bounded, content-addressed report."""
+"""Run the project verifier and emit a bounded, content-addressed report.
+
+FD-backed script dispatch admits exactly four complete shebang lines:
+#!/bin/sh -> /bin/sh; #!/bin/bash and #!/usr/bin/env bash -> /bin/bash;
+#!/usr/bin/env python3 -> the current absolute sys.executable.
+Known scripts always use that interpreter plus the validated script FD path,
+never env, caller PATH, a script copy or the mutable project pathname.
+Native non-shebang FD dispatch remains separate.
+
+Read at most 257 bytes without moving the FD offset. The first line must end
+with LF within 256 bytes; NUL/CR, unknown forms and extra arguments are unsafe.
+Validate the fixed interpreter's canonical regular, executable, non-group/
+other-writable target, accepting trusted installation symlinks and system
+ownership. Missing interpreters are verification_blocked; unsafe forms or
+targets are verifier_unsafe. Existing stdin, fixed environment, bytecode,
+source FD validation and process/output bounds remain unchanged.
+
+Actual Linux validation in the existing Ubuntu PR job is required before
+merge/installation; macOS source validation is not Linux runtime acceptance.
+"""
 
 from __future__ import annotations
+
+import sys
+sys.dont_write_bytecode = True
 
 import hashlib
 import errno
@@ -12,7 +34,6 @@ import selectors
 import signal
 import stat
 import subprocess
-import sys
 import time
 from typing import Any
 
@@ -379,6 +400,7 @@ def replacement_environment(tmp_fd: int) -> dict[str, str]:
         "LC_ALL": "C",
         "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "never",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "TMPDIR": _fd_path(tmp_fd),
     }
     valid: dict[str, str] = {}
@@ -456,21 +478,51 @@ def _terminate_group(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
-def _child_command(child_path: str, child_fd: int) -> list[str]:
+def _validated_interpreter(interpreter: str) -> str:
+    if not interpreter or not Path(interpreter).is_absolute():
+        raise VerificationFailure("verifier_unsafe")
     try:
-        sample = os.pread(child_fd, 128, 0)
-    except OSError:
-        sample = b""
-    if os.access(child_path, os.X_OK):
-        return [child_path]
-    if sample.startswith(b"#!") and b"python" in sample.splitlines()[0]:
-        return [sys.executable, child_path]
-    if sample.startswith(b"#!") and any(
-        shell in sample.splitlines()[0]
-        for shell in (b"/sh", b"/bash", b"/zsh")
+        target = Path(interpreter).resolve(strict=True)
+        metadata = os.stat(target, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise VerificationFailure("verification_blocked") from error
+    except RuntimeError as error:
+        raise VerificationFailure("verifier_unsafe") from error
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENOTDIR}:
+            raise VerificationFailure("verifier_unsafe") from error
+        raise
+    # System interpreters need not be owned by the project-script owner or
+    # have one link. Symlink permissions are not target permissions.
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or not metadata.st_mode & 0o111
+        or metadata.st_mode & 0o022
+        or not os.access(target, os.X_OK)
     ):
-        return ["/bin/sh", child_path]
-    return [child_path]
+        raise VerificationFailure("verifier_unsafe")
+    return interpreter
+
+
+def _child_command(child_path: str, child_fd: int) -> list[str]:
+    sample = os.pread(child_fd, 257, 0)
+    if not sample.startswith(b"#!"):
+        return [child_path]
+    end = sample.find(b"\n")
+    if end < 0 or end >= 256:
+        raise VerificationFailure("verifier_unsafe")
+    header = sample[:end]
+    if b"\x00" in header or b"\r" in header:
+        raise VerificationFailure("verifier_unsafe")
+    interpreter = {
+        b"#!/bin/sh": "/bin/sh",
+        b"#!/bin/bash": "/bin/bash",
+        b"#!/usr/bin/env bash": "/bin/bash",
+        b"#!/usr/bin/env python3": sys.executable,
+    }.get(header)
+    if interpreter is None:
+        raise VerificationFailure("verifier_unsafe")
+    return [_validated_interpreter(interpreter), child_path]
 
 
 def _child_descriptor(descriptor: int) -> int:

@@ -145,6 +145,22 @@ TASK_SHORT_ID = ParameterSpec(
     "task_short_id",
     "Stable human-readable Kent task short ID.",
 )
+EXPECTED_CI_CHECKS = ParameterSpec(
+    "expected_ci_checks",
+    "Canonical source-derived mandatory CI check contract for the current cycle.",
+)
+EXPECTED_CI_CHECKS_SHA256 = ParameterSpec(
+    "expected_ci_checks_sha256",
+    "SHA-256 digest of the canonical expected CI check contract.",
+)
+RUNTIME_SOURCE_ENVELOPE_DIGEST = ParameterSpec(
+    "runtime_source_envelope_digest",
+    "Digest of the real selected-head runtime source envelope.",
+)
+CI_POLICY_SNAPSHOT = ParameterSpec(
+    "ci_policy_snapshot",
+    "Canonical target-branch policy snapshot for the current CI cycle.",
+)
 
 
 def build_delivery_workflow(
@@ -185,7 +201,30 @@ def build_delivery_workflow(
         "immediate_source" if fresh_writers else "previous_target_or_new"
     )
     runtime_v2 = profile.runtime_contracts_v2()
+    source_ci = profile.source_ci_contract() and profile.capability("ci_monitoring")
+    if (
+        profile.schema_version == 4 and runtime_v2
+        and profile.capability("ci_monitoring") and not source_ci
+    ):
+        raise SpecError(
+            "schema-4 runtime-contract v2 delivery requires "
+            "prepare_ci 1.0.0 source-contract adoption"
+        )
     pr_cursor_parameters = (PR_FEEDBACK_CURSOR,) if runtime_v2 else ()
+    ci_contract_parameters = (
+        (
+            EXPECTED_CI_CHECKS,
+            EXPECTED_CI_CHECKS_SHA256,
+            RUNTIME_SOURCE_ENVELOPE_DIGEST,
+            CI_POLICY_SNAPSHOT,
+            TASK_SHORT_ID,
+        )
+        if source_ci
+        else ()
+    )
+    ci_contract_retry_parameters = ci_contract_parameters + (
+        (CI_REPORT,) if source_ci else ()
+    )
     writer_recovery_context = (
         "new_session" if fresh_writers else "compact_and_continue_session"
     )
@@ -336,6 +375,15 @@ def build_delivery_workflow(
                 )
             )
     if profile.capability("ci_monitoring"):
+        if source_ci:
+            nodes.append(
+                NodeSpec(
+                    "ci_prepare",
+                    "script",
+                    "Prepare CI Contract",
+                    script_path=profile.command("prepare_ci"),
+                )
+            )
         nodes.append(
             NodeSpec(
                 "ci_watch",
@@ -1157,16 +1205,17 @@ def build_delivery_workflow(
         created_target = (
             "ci_watch" if profile.capability("ci_monitoring") else "waiting_pr"
         )
+        ci_entry_target = "ci_prepare" if source_ci else created_target
         edges.extend(
             [
                 EdgeSpec(
-                    key=f"prepare_pr_{created_target}",
+                    key=f"prepare_pr_{ci_entry_target}",
                     source="prepare_pr",
                     transition="monitor_ci",
-                    target=created_target,
+                    target=ci_entry_target,
                     prompt=(
                         None
-                        if created_target == "ci_watch"
+                        if ci_entry_target in {"ci_watch", "ci_prepare"}
                         else waiting_pr_prompt(profile)
                     ),
                     transition_description=(
@@ -1177,7 +1226,7 @@ def build_delivery_workflow(
                         PR_URL,
                         BRANCH_NAME,
                         MERGE_STRATEGY,
-                    ) + pr_cursor_parameters,
+                    ) + pr_cursor_parameters + ((TASK_SHORT_ID,) if source_ci else ()),
                 ),
                 EdgeSpec(
                     key="prepare_pr_no_pr",
@@ -1216,6 +1265,81 @@ def build_delivery_workflow(
         )
 
         if profile.capability("ci_monitoring"):
+            if source_ci:
+                edges.extend(
+                    [
+                        EdgeSpec(
+                            key="ci_prepare_ready_initial",
+                            source="ci_prepare",
+                            transition="ready_initial",
+                            target="ci_watch",
+                            transition_description=(
+                                "The source-derived initial CI contract is complete; "
+                                "watch this exact head and policy cycle."
+                            ),
+                            parameters=(
+                                WORKSPACE,
+                                PR_URL,
+                                BRANCH_NAME,
+                                MERGE_STRATEGY,
+                                *ci_contract_parameters,
+                            ) + pr_cursor_parameters,
+                        ),
+                        EdgeSpec(
+                            key="ci_prepare_ready_retry",
+                            source="ci_prepare",
+                            transition="ready_retry",
+                            target="ci_watch",
+                            transition_description=(
+                                "The unchanged source-derived CI cycle is ready "
+                                "for another deterministic observation."
+                            ),
+                            parameters=(
+                                WORKSPACE,
+                                PR_URL,
+                                BRANCH_NAME,
+                                MERGE_STRATEGY,
+                                *ci_contract_retry_parameters,
+                            ) + pr_cursor_parameters,
+                        ),
+                        EdgeSpec(
+                            key="ci_prepare_failed",
+                            source="ci_prepare",
+                            transition="failed",
+                            target="ci_monitor",
+                            prompt=ci_prompt(profile),
+                            transition_description=(
+                                "CI preparation could not prove the target policy, "
+                                "head sources, or runtime envelope."
+                            ),
+                            parameters=(
+                                WORKSPACE,
+                                PR_URL,
+                                BRANCH_NAME,
+                                MERGE_STRATEGY,
+                                CI_REPORT,
+                                *ci_contract_parameters,
+                            ) + pr_cursor_parameters,
+                        ),
+                        EdgeSpec(
+                            key="ci_prepare_merged",
+                            source="ci_prepare",
+                            transition="pr_merged",
+                            target=merged_target,
+                            prompt=merged_prompt,
+                            requires_approval=package_publish,
+                            transition_description=(
+                                "The pull request merged during CI preparation."
+                            ),
+                            parameters=(
+                                WORKSPACE,
+                                PR_URL,
+                                BRANCH_NAME,
+                                MERGE_REPORT,
+                            ),
+                        ),
+                    ]
+                )
             edges.extend(
                 [
                     EdgeSpec(
@@ -1234,6 +1358,7 @@ def build_delivery_workflow(
                             BRANCH_NAME,
                             MERGE_STRATEGY,
                             CI_REPORT,
+                            *ci_contract_parameters,
                         ) + pr_cursor_parameters,
                     ),
                     EdgeSpec(
@@ -1252,7 +1377,32 @@ def build_delivery_workflow(
                             BRANCH_NAME,
                             MERGE_STRATEGY,
                             CI_REPORT,
+                            *ci_contract_parameters,
                         ) + pr_cursor_parameters,
+                    ),
+                    *(
+                        [
+                            EdgeSpec(
+                                key="ci_watch_source_changed",
+                                source="ci_watch",
+                                transition="source_changed",
+                                target="ci_prepare",
+                                transition_description=(
+                                    "The target policy changed during observation; "
+                                    "recompute a fresh CI cycle from immutable sources."
+                                ),
+                                parameters=(
+                                    WORKSPACE,
+                                    PR_URL,
+                                    BRANCH_NAME,
+                                    MERGE_STRATEGY,
+                                    *ci_contract_parameters,
+                                    CI_REPORT,
+                                ) + pr_cursor_parameters,
+                            )
+                        ]
+                        if source_ci
+                        else []
                     ),
                     EdgeSpec(
                         key="ci_watch_merged",
@@ -1273,30 +1423,13 @@ def build_delivery_workflow(
                         ),
                     ),
                     EdgeSpec(
-                        key="ci_monitor_waiting_pr",
-                        source="ci_monitor",
-                        transition="waiting_pr",
-                        target="waiting_pr",
-                        prompt=waiting_pr_prompt(profile),
-                        transition_description=(
-                            "Required CI checks passed; wait for an actual merge."
-                        ),
-                        parameters=(
-                            WORKSPACE,
-                            PR_URL,
-                            BRANCH_NAME,
-                            MERGE_STRATEGY,
-                            CI_REPORT,
-                        ) + pr_cursor_parameters,
-                    ),
-                    EdgeSpec(
                         key="ci_monitor_watch",
                         source="ci_monitor",
                         transition="watch_ci",
-                        target="ci_watch",
+                        target="ci_prepare" if source_ci else "ci_watch",
                         transition_description=(
                             "A bounded infrastructure retry or refreshed CI "
-                            "run is ready for deterministic watching."
+                            "run is ready for deterministic preparation."
                         ),
                         parameters=(
                             WORKSPACE,
@@ -1304,6 +1437,7 @@ def build_delivery_workflow(
                             BRANCH_NAME,
                             MERGE_STRATEGY,
                             CI_REPORT,
+                            *ci_contract_parameters,
                         ) + pr_cursor_parameters,
                     ),
                     EdgeSpec(
@@ -1346,6 +1480,7 @@ def build_delivery_workflow(
                             BRANCH_NAME,
                             MERGE_STRATEGY,
                             CI_REPORT,
+                            *ci_contract_parameters,
                         ) + pr_cursor_parameters,
                         extra_prompt=(
                             "Preserve the exact PR, branch, merge strategy, "
@@ -1354,6 +1489,26 @@ def build_delivery_workflow(
                     ),
                 ]
             )
+            if not source_ci:
+                edges.append(
+                    EdgeSpec(
+                        key="ci_monitor_waiting_pr",
+                        source="ci_monitor",
+                        transition="waiting_pr",
+                        target="waiting_pr",
+                        prompt=waiting_pr_prompt(profile),
+                        transition_description=(
+                            "Required CI checks passed; wait for an actual merge."
+                        ),
+                        parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_STRATEGY,
+                            CI_REPORT,
+                        ) + pr_cursor_parameters,
+                    )
+                )
 
         edges.extend(
             [
@@ -1399,6 +1554,7 @@ def build_delivery_workflow(
                         MERGE_STRATEGY,
                         PR_HEAD_OID,
                         PR_BASE_OID,
+                        *ci_contract_retry_parameters,
                     ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
@@ -1417,6 +1573,7 @@ def build_delivery_workflow(
                         MERGE_STRATEGY,
                         PR_HEAD_OID,
                         PR_BASE_OID,
+                        *ci_contract_retry_parameters,
                     ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
@@ -1437,6 +1594,7 @@ def build_delivery_workflow(
                         BRANCH_NAME,
                         MERGE_STRATEGY,
                         PR_REPORT,
+                        *ci_contract_retry_parameters,
                     ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
@@ -1469,6 +1627,7 @@ def build_delivery_workflow(
                         BRANCH_NAME,
                         MERGE_STRATEGY,
                         BLOCKER,
+                        *ci_contract_retry_parameters,
                     ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
@@ -1489,6 +1648,7 @@ def build_delivery_workflow(
                         WORKSPACE,
                         MERGE_STRATEGY,
                         PR_REPORT,
+                        *ci_contract_retry_parameters,
                     ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
@@ -1511,7 +1671,7 @@ def build_delivery_workflow(
                     key="waiting_pr_ci_monitor",
                     source="waiting_pr",
                     transition="ci_required",
-                    target="ci_watch",
+                    target="ci_prepare" if source_ci else "ci_watch",
                     transition_description=(
                         "The PR head changed or checks restarted; wait "
                         "deterministically for terminal CI state."
@@ -1521,6 +1681,7 @@ def build_delivery_workflow(
                         PR_URL,
                         BRANCH_NAME,
                         MERGE_STRATEGY,
+                        *ci_contract_retry_parameters,
                     ) + pr_cursor_parameters,
                 )
             )
@@ -2696,7 +2857,10 @@ branch, or ambiguous branch owner must route to `needs_user_action`; never push
 through that ambiguity.
 
 Complete through `monitor_ci` and provide `workspace_path`, `pr_url`, and
-`branch_name`, plus the resolved `merge_strategy`. If no PR is genuinely
+`branch_name`, plus the resolved `merge_strategy`.
+{("Source-contract CI also requires `task_short_id={{.TaskShortId}}`."
+  if profile.source_ci_contract() and profile.capability("ci_monitoring") else "")}
+If no PR is genuinely
 applicable, choose `no_pr` and provide `pr_report`; this path requires
 approval. Use `needs_changes` with `workspace_path` and `blocker_reason` for
 recoverable PR/branch issues; this path also requires approval. Use
@@ -2714,6 +2878,35 @@ def ci_prompt(profile: ProjectProfile) -> str:
         if profile.runtime_contracts_v2()
         else ""
     )
+    source_cycle = (
+        """In the source-contract mode, mandatory identities come only from the
+target-branch source-derived expected contract. Unexpected failed checks are
+diagnostics and do not independently block delivery. When a retry is allowed,
+choose `watch_ci` with the complete expected-check fields, policy snapshot,
+unchanged `ci_report`, and cursor; do not choose `waiting_pr` directly."""
+        if profile.source_ci_contract()
+        else ""
+    )
+    source_values = (
+        """Expected checks: {{.Params.expected_ci_checks}}
+Expected checks digest: {{.Params.expected_ci_checks_sha256}}
+Runtime source envelope digest: {{.Params.runtime_source_envelope_digest}}
+Policy snapshot: {{.Params.ci_policy_snapshot}}
+Task: {{.Params.task_short_id}}"""
+        if profile.source_ci_contract()
+        else ""
+    )
+    preparation_diagnosis = (
+        """A `ci_prepare_failed` entry is preparation diagnosis, not a terminal CI
+observation. Missing packets are represented by empty strings only on this
+diagnostic route. Never parse an empty `ci_report` as a report, invent a report
+or expected contract, or infer green CI. Preserve all supplied packet strings,
+including empty values, cursor and `task_short_id` when choosing `watch_ci`;
+this always re-enters deterministic preparation, never the watcher directly.
+Only a bounded retry or a proven task-scoped fix/external blocker is allowed."""
+        if profile.source_ci_contract()
+        else ""
+    )
     return f"""Monitor CI for {{{{.TaskShortId}}}} without editing files.
 
 {context_instruction(profile, "delivery", "ci_monitor", "delivery")}
@@ -2726,8 +2919,11 @@ Deterministic CI report: {{{{.Params.ci_report}}}}
 {cursor}
 
 {procedure_instruction(profile, "ci")}
+{source_cycle}
+{source_values}
+{preparation_diagnosis}
 
-Apply the `ci-monitor` role contract to this exact terminal watcher report.
+Apply the `ci-monitor` role contract to the exact terminal watcher report when present.
 Do not start another polling loop or ask for approval merely to wait. Re-read
 only the exact PR/run/job metadata and bounded failed-job logs. If the role's
 bounded exact-job retry policy applies, perform one permitted retry and choose
@@ -2742,8 +2938,11 @@ with `pr_merged` and provide `workspace_path`, `pr_url`, `branch_name`, and a
 `merge_report` that includes merge proof plus the late CI state. Any actionable
 post-merge regression belongs in a separate follow-up task.
 
-While the PR remains open, complete with `waiting_pr` only when all required
-checks are green and the resolved method remains feasible. Provide
+{("In source-contract mode there is no direct `waiting_pr` transition; the "
+  "deterministic watcher must prove green after preparation."
+  if profile.source_ci_contract() else
+  "While the PR remains open, complete with `waiting_pr` only when all required "
+  "checks are green and the resolved method remains feasible. Provide")}
 `workspace_path`, `pr_url`, `branch_name`, `merge_strategy`, and `ci_report`.
 Use `needs_changes` with `workspace_path` and `fix_context` only for a proven
 task-differential code or history failure. After retry exhaustion, use
@@ -2765,6 +2964,20 @@ def waiting_pr_prompt(profile: ProjectProfile) -> str:
         else """If the PR head changed, revalidate the available checks and
 method in this node before starting another deterministic merge watch."""
     )
+    source_contract = (
+        """Source-derived CI contract:
+Expected mandatory checks: {{.Params.expected_ci_checks}}
+Expected-check digest: {{.Params.expected_ci_checks_sha256}}
+Runtime source envelope digest: {{.Params.runtime_source_envelope_digest}}
+Target policy snapshot: {{.Params.ci_policy_snapshot}}
+CI report: {{.Params.ci_report}}
+Task: {{.Params.task_short_id}}
+Use the exact source-declared mandatory identities for blocking. An extra
+failed check is diagnostic feedback and does not independently block or wake
+this wait. Preserve the contract and CI report through every watcher re-entry."""
+        if profile.source_ci_contract()
+        else ""
+    )
     return f"""Check delivery state for {{{{.TaskShortId}}}}.
 
 {context_instruction(profile, "delivery", "waiting_pr", "delivery")}
@@ -2776,6 +2989,7 @@ Workspace: {{{{.Params.workspace_path}}}}
 {cursor}
 
 {procedure_instruction(profile, "waiting_pr")}
+{source_contract}
 
 Apply the `ci-monitor` role contract. Do not merge or push. Revalidate the
 resolved method using method-specific evidence; investigate contradictory

@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+
+source_path = Path(__file__).resolve()
+repo_root = source_path.parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from workflowkit.ci_contract import (
+    CiContractError, prepare_ci_payload, preparation_failure, read_preparation_input,
+    archive_ci_report, parse_preparation_json, validate_preparation_identity,
+)
+
+
+def main() -> int:
+    payload: dict[str, object] = {}
+    try:
+        payload = read_preparation_input(sys.stdin.buffer)
+        if payload.get("operation") == "archive_ci_report":
+            validate_preparation_identity(payload)
+            from workflowkit.runtime import validate_ci_report
+
+            report = validate_ci_report(parse_preparation_json(payload["ci_report"]))
+            if (
+                report["repository"] != payload["pr_url"].split("/pull/")[0].removeprefix("https://github.com/")
+                or report["pull_number"] != int(payload["pr_url"].rsplit("/", 1)[1])
+            ):
+                raise CiContractError("report_identity_invalid")
+            artifact = archive_ci_report(
+                Path(payload["workspace_path"]).resolve(), payload["task_short_id"], report,
+            )
+            print(json.dumps({"ci_report_artifact": artifact}))
+            return 0
+        if "operation" in payload:
+            raise CiContractError("input_invalid")
+        output = prepare_ci_payload(payload)
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+        # No raw source, Ruby exception, Git stderr, or authenticated response
+        # enters Script stdout/stderr. Invalid identity cannot invent a route.
+        if "operation" in payload:
+            print('{"error":"ci_report_archive_failed"}')
+            return 2
+        try:
+            output = preparation_failure(payload)
+        except (CiContractError, ValueError):
+            print('{"error":"ci_prepare_input_invalid"}')
+            return 2
+    print(json.dumps(output, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1865,6 +1865,333 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
                 self.assertEqual(report["code"], code)
                 self.assertEqual(report["exit_code"], 0)
 
+    def test_verify_default_environment_never_writes_bytecode(self) -> None:
+        for raw_input, expected_code in (
+            ('{"workspace_path":', "input_invalid"),
+            (None, "passed"),
+        ):
+            with self.subTest(expected_code=expected_code):
+                root = self.create_repository()
+                scripts = self.install_verify_fixture(
+                    root,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"transition\":\"passed\"}'\n",
+                )
+                environment = dict(os.environ)
+                environment.pop("PYTHONDONTWRITEBYTECODE", None)
+
+                def bytecode_paths() -> list[Path]:
+                    return sorted(
+                        path.relative_to(scripts)
+                        for path in scripts.rglob("*")
+                        if path.name == "__pycache__"
+                        or path.suffix in {".pyc", ".pyo"}
+                    )
+
+                self.assertEqual(bytecode_paths(), [])
+                result = subprocess.run(
+                    [sys.executable, str(scripts / "workflow-verify-report")],
+                    cwd=root,
+                    input=(
+                        raw_input
+                        if raw_input is not None
+                        else json.dumps({"workspace_path": str(root)})
+                    ),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = self.parse_verification_report(
+                    json.loads(result.stdout)
+                )
+                self.assertEqual(report["code"], expected_code)
+                self.assertEqual(bytecode_paths(), [])
+
+    def test_verify_finite_shebangs_preserve_exact_interpreter_fd_and_stdin(self):
+        for header, interpreter in (
+            ("#!/bin/sh", "/bin/sh"),
+            ("#!/bin/bash", "/bin/bash"),
+            ("#!/usr/bin/env bash", "/bin/bash"),
+            ("#!/usr/bin/env python3", sys.executable),
+        ):
+            for fd_executable in (False, True):
+                with self.subTest(header=header, fd_executable=fd_executable):
+                    root = self.create_repository()
+                    capture = root / "stdin.json"
+                    if "python3" in header:
+                        body = (
+                            "import os, sys\n"
+                            "from pathlib import Path\n"
+                            f"Path({str(capture)!r}).write_bytes(sys.stdin.buffer.read())\n"
+                            "assert os.environ['PYTHONDONTWRITEBYTECODE'] == '1'\n"
+                            "print('{\"transition\":\"passed\"}')\n"
+                        )
+                    else:
+                        body = (
+                            f"cat > {str(capture)!r}\n"
+                            + (
+                                "values=(passed)\n"
+                                '[[ "${values[0]}" == passed ]] || exit 2\n'
+                                if "bash" in header else ""
+                            )
+                            + "printf '%s\\n' '{\"transition\":\"passed\"}'\n"
+                        )
+                    scripts = self.install_verify_fixture(root, header + "\n" + body)
+                    module = load_template_module(scripts / "workflow-verify-report", "verify_finite_shebang")
+                    real_access = os.access
+                    real_command = module._child_command
+                    selected = []
+
+                    def access(path, mode, *args, **kwargs):
+                        if str(path).startswith("/dev/fd/"):
+                            return fd_executable
+                        return real_access(path, mode, *args, **kwargs)
+
+                    def command(path, fd):
+                        argv = real_command(path, fd)
+                        self.assertEqual(argv, [interpreter, path])
+                        self.assertEqual(path, f"/dev/fd/{fd}")
+                        selected.append(argv)
+                        return argv
+
+                    payload = {"workspace_path": str(root), "unicode": "é", "items": [1, "two"]}
+                    previous = Path.cwd()
+                    try:
+                        os.chdir(root)
+                        with mock.patch.object(os, "access", side_effect=access), \
+                             mock.patch.object(module, "_child_command", side_effect=command), \
+                             mock.patch.dict(os.environ, {"PYTHONDONTWRITEBYTECODE": "0"}):
+                            emitted = module.run_verification(payload)
+                    finally:
+                        os.chdir(previous)
+                    self.assertEqual(emitted["code"], "passed")
+                    self.assertEqual(len(selected), 1)
+                    self.assertEqual(
+                        capture.read_bytes(),
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(),
+                    )
+                    self.assertEqual(list(scripts.rglob("*.pyc")), [])
+                    self.assertEqual(list((root / "build/kent-workflow").glob(".verify-tmp-*")), [])
+
+    def test_verify_unsupported_shebang_forms_fail_before_child_launch(self):
+        headers = (
+            b"#!/bin/zsh\n", b"#!/usr/bin/python3\n", b"#!/bin/python3\n",
+            b"#!/usr/bin/env sh\n", b"#!/usr/bin/env /bin/bash\n",
+            b"#!/bin/bash -e\n", b"#!/bin/sh -eu\n",
+            b"#!/usr/bin/env bash -e\n", b"#!/usr/bin/env python3 -B\n",
+            b"#!/usr/bin/env -S bash\n", b"#!/usr/bin/env NAME=value bash\n",
+            b"#!/usr/bin/env bash \n", b"#!/usr/bin/env  bash\n",
+            b"#! /bin/bash\n", b"#!/bin/bash\t\n",
+            b"#!/tmp/not-bash\n", b"#!/tmp/python-bash\n",
+            b"#!/bin/bashx\n", b"#!/usr/bin/env not-python3\n",
+            b"#!/bin/bash\r\n", b"#!/bin/bash\x00\n",
+            b"#!/bin/bash", b"#!/usr/bin/env python3", b"#!",
+            b"#!" + b"x" * 253 + b"\n",
+            b"#!" + b"x" * 254 + b"\n",
+            b"#!" + b"x" * 4096 + b"\n",
+        )
+        for header in headers:
+            for fd_executable in (False, True):
+                with self.subTest(header=header[:60], length=len(header), fd_executable=fd_executable):
+                    root = self.create_repository()
+                    scripts = self.install_verify_fixture(root, "#!/bin/sh\n")
+                    (scripts / "workflow-compile-verify").write_bytes(
+                        header + b"echo '{\"transition\":\"passed\"}'\n"
+                    )
+                    module = load_template_module(scripts / "workflow-verify-report", "verify_rejected_shebang")
+                    real_access = os.access
+                    real_popen = subprocess.Popen
+                    launches = []
+
+                    def access(path, mode, *args, **kwargs):
+                        if str(path).startswith("/dev/fd/"):
+                            return fd_executable
+                        return real_access(path, mode, *args, **kwargs)
+
+                    def popen(argv, *args, **kwargs):
+                        if kwargs.get("pass_fds"):
+                            launches.append(argv)
+                        return real_popen(argv, *args, **kwargs)
+
+                    with mock.patch.object(os, "access", side_effect=access), \
+                         mock.patch.object(subprocess, "Popen", side_effect=popen):
+                        emitted = self.run_module_in_workspace(module, root)
+                    report = emitted
+                    self.assertEqual(report["code"], "verifier_unsafe", report)
+                    self.assertEqual(launches, [])
+                    self.assertEqual(list((root / "build/kent-workflow").glob(".verify-tmp-*")), [])
+
+    def test_verify_header_read_is_capped_offset_preserving_and_failures_explicit(self):
+        module = load_template_module(VERIFY_REPORT, "verify_shebang_read_bounds")
+        root = self.create_repository()
+        script = root / "header"
+        script.write_bytes(b"#!/bin/bash\n" + b"x" * 4096)
+        descriptor = os.open(script, os.O_RDONLY)
+        try:
+            os.lseek(descriptor, 7, os.SEEK_SET)
+            with mock.patch.object(os, "pread", wraps=os.pread) as reads:
+                argv = module._child_command(f"/dev/fd/{descriptor}", descriptor)
+            self.assertEqual(argv, ["/bin/bash", f"/dev/fd/{descriptor}"])
+            reads.assert_called_once_with(descriptor, 257, 0)
+            self.assertEqual(os.lseek(descriptor, 0, os.SEEK_CUR), 7)
+            with mock.patch.object(os, "pread", side_effect=OSError(errno.EIO, "read failure")), \
+                 self.assertRaises(OSError):
+                module._child_command(f"/dev/fd/{descriptor}", descriptor)
+        finally:
+            os.close(descriptor)
+        for raw in (b"#!/bin/bash", b"#!/usr/bin/env bash", b"#!/bin/sh", b"#!/usr/bin/env python3"):
+            with tempfile.TemporaryFile() as stream:
+                stream.write(raw)
+                stream.flush()
+                with self.assertRaises(module.VerificationFailure) as raised:
+                    module._child_command(f"/dev/fd/{stream.fileno()}", stream.fileno())
+                self.assertEqual(raised.exception.code, "verifier_unsafe")
+
+    def test_verify_native_non_shebang_dispatch_has_no_interpreter_fallback(self):
+        module = load_template_module(VERIFY_REPORT, "verify_native_fd_dispatch")
+        with tempfile.TemporaryFile() as stream:
+            for raw in (b"\x7fELF\x00native", b"\xcf\xfa\xed\xfe\x00native", b"plain executable bytes"):
+                stream.seek(0)
+                stream.truncate()
+                stream.write(raw)
+                stream.flush()
+                fd_path = f"/dev/fd/{stream.fileno()}"
+                with mock.patch.object(module, "_validated_interpreter") as interpreter, \
+                     mock.patch.object(os, "access", return_value=False):
+                    self.assertEqual(module._child_command(fd_path, stream.fileno()), [fd_path])
+                interpreter.assert_not_called()
+
+    def test_verify_interpreter_canonical_targets_permissions_and_symlinks(self):
+        module = load_template_module(VERIFY_REPORT, "verify_trusted_interpreter")
+        root = self.create_repository()
+        target = root / "trusted-runtime"
+        target.write_bytes(b"fixture executable")
+        target.chmod(0o755)
+        alias = root / "trusted-installation-link"
+        alias.symlink_to(target)
+        self.assertEqual(module._validated_interpreter(str(alias)), str(alias))
+        real_stat = os.stat
+
+        def system_owned(path, *args, **kwargs):
+            metadata = real_stat(path, *args, **kwargs)
+            if Path(path) == target:
+                fields = list(metadata)
+                fields[3] = 2  # Trusted installations may have multiple links.
+                fields[4] = 0  # System ownership differs from a non-root project owner.
+                return os.stat_result(fields)
+            return metadata
+
+        with mock.patch.object(os, "stat", side_effect=system_owned):
+            self.assertEqual(module._validated_interpreter(str(alias)), str(alias))
+        for mode in (0o644, 0o775, 0o757, 0o777):
+            with self.subTest(mode=oct(mode)):
+                target.chmod(mode)
+                with self.assertRaises(module.VerificationFailure) as raised:
+                    module._validated_interpreter(str(alias))
+                self.assertEqual(raised.exception.code, "verifier_unsafe")
+        target.chmod(0o755)
+        for path, code in (
+            (str(root / "missing"), "verification_blocked"),
+            (str(root), "verifier_unsafe"),
+            ("python3", "verifier_unsafe"),
+            ("", "verifier_unsafe"),
+        ):
+            with self.subTest(path=path), self.assertRaises(module.VerificationFailure) as raised:
+                module._validated_interpreter(path)
+            self.assertEqual(raised.exception.code, code)
+        with mock.patch.object(os, "access", return_value=False), \
+             self.assertRaises(module.VerificationFailure) as raised:
+            module._validated_interpreter(str(alias))
+        self.assertEqual(raised.exception.code, "verifier_unsafe")
+        loop = root / "interpreter-loop"
+        loop.symlink_to(loop)
+        with self.assertRaises(module.VerificationFailure) as raised:
+            module._validated_interpreter(str(loop))
+        self.assertEqual(raised.exception.code, "verifier_unsafe")
+
+    def test_verify_interpreter_low_level_failures_remain_explicit_without_launch(self):
+        for failure in ("pread", "interpreter_stat"):
+            with self.subTest(failure=failure):
+                root = self.create_repository()
+                scripts = self.install_verify_fixture(
+                    root, "#!/usr/bin/env python3\nprint('{\"transition\":\"passed\"}')\n",
+                )
+                module = load_template_module(scripts / "workflow-verify-report", "verify_dispatch_io_error")
+                real_popen = subprocess.Popen
+                real_stat = os.stat
+                python_target = Path(sys.executable).resolve()
+                launched = []
+
+                def popen(argv, *args, **kwargs):
+                    if kwargs.get("pass_fds"):
+                        launched.append(argv)
+                    return real_popen(argv, *args, **kwargs)
+
+                def interpreter_stat(path, *args, **kwargs):
+                    if Path(path) == python_target and kwargs.get("follow_symlinks") is False:
+                        raise OSError(errno.EIO, "interpreter stat failure")
+                    return real_stat(path, *args, **kwargs)
+
+                failing = (
+                    mock.patch.object(os, "pread", side_effect=OSError(errno.EIO, "script pread failure"))
+                    if failure == "pread"
+                    else mock.patch.object(os, "stat", side_effect=interpreter_stat)
+                )
+                with failing, mock.patch.object(subprocess, "Popen", side_effect=popen):
+                    report = self.run_module_in_workspace(module, root)
+                self.assertEqual(report["code"], "internal_error", report)
+                self.assertEqual(launched, [])
+                self.assertEqual(list((root / "build/kent-workflow").glob(".verify-tmp-*")), [])
+
+    def test_verify_missing_or_unsafe_interpreter_uses_existing_report_codes(self):
+        for state in ("missing", "nonexecutable", "writable", "directory", "relative"):
+            with self.subTest(state=state):
+                root = self.create_repository()
+                scripts = self.install_verify_fixture(root, "#!/usr/bin/env python3\nprint('unused')\n")
+                interpreter = root / "test-interpreter"
+                if state == "directory":
+                    interpreter.mkdir()
+                elif state != "missing":
+                    interpreter.write_bytes(b"fixture interpreter")
+                    interpreter.chmod(0o644 if state == "nonexecutable" else 0o777 if state == "writable" else 0o755)
+                module = load_template_module(scripts / "workflow-verify-report", "verify_interpreter_failure")
+                with mock.patch.object(module, "sys", types.SimpleNamespace(
+                    executable="relative-python" if state == "relative" else str(interpreter),
+                )):
+                    emitted = self.run_module_in_workspace(module, root)
+                report = emitted
+                self.assertEqual(report["code"], "verification_blocked" if state == "missing" else "verifier_unsafe")
+                self.assertIsNone(report["exit_code"])
+                self.assertIsNone(report["log_path"])
+                self.assertEqual(list((root / "build/kent-workflow").glob(".verify-tmp-*")), [])
+
+    def test_verify_shebang_never_selects_interpreter_from_path_or_env(self):
+        for header in ("#!/usr/bin/env bash", "#!/usr/bin/env python3"):
+            with self.subTest(header=header):
+                root = self.create_repository()
+                marker = root / "interpreter-hijacked"
+                java = root / "fake-java"
+                (java / "bin").mkdir(parents=True)
+                for name in ("env", "bash", "python3"):
+                    fake = java / "bin" / name
+                    fake.write_text(f"#!/bin/sh\ntouch {str(marker)!r}\nexit 99\n")
+                    fake.chmod(0o755)
+                body = (
+                    "values=(passed)\n[[ ${values[0]} == passed ]] || exit 2\n"
+                    "printf '%s\\n' '{\"transition\":\"passed\"}'\n"
+                    if "bash" in header else "print('{\"transition\":\"passed\"}')\n"
+                )
+                self.install_verify_fixture(root, header + "\n" + body)
+                emitted = self.run_verify_command(root, environment={
+                    **os.environ, "PATH": str(java / "bin"), "JAVA_HOME": str(java),
+                    "BASH_ENV": str(java / "bin/bash"),
+                    "ENV": str(java / "bin/env"), "PYTHONDONTWRITEBYTECODE": "0",
+                })
+                self.assertEqual(self.parse_verification_report(emitted)["code"], "passed")
+                self.assertFalse(marker.exists())
+
     def test_verify_input_workspace_and_verifier_failures_are_safe(self) -> None:
         root = self.create_repository()
         scripts = self.install_verify_fixture(
@@ -2017,6 +2344,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             "LC_ALL": "override",
             "GIT_TERMINAL_PROMPT": "override",
             "GCM_INTERACTIVE": "override",
+            "PYTHONDONTWRITEBYTECODE": "0",
             **{name: str(path) for name, path in optional.items()},
             **invalid_optional,
             "KENT_SECRET": "forbidden",
@@ -2041,6 +2369,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             "LC_ALL",
             "GIT_TERMINAL_PROMPT",
             "GCM_INTERACTIVE",
+            "PYTHONDONTWRITEBYTECODE",
             "TMPDIR",
             "PATH",
             *(set(optional) - set(invalid_optional)),
@@ -2053,6 +2382,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         self.assertEqual(captured["env"]["CI"], "1")
         self.assertEqual(captured["env"]["LANG"], "C")
         self.assertEqual(captured["env"]["LC_ALL"], "C")
+        self.assertEqual(captured["env"]["PYTHONDONTWRITEBYTECODE"], "1")
         for name in (
             "GIT_TERMINAL_PROMPT",
             "GCM_INTERACTIVE",
@@ -2124,6 +2454,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             "LC_ALL",
             "GIT_TERMINAL_PROMPT",
             "GCM_INTERACTIVE",
+            "PYTHONDONTWRITEBYTECODE",
             "TMPDIR",
             "PATH",
             "HOME",
@@ -2131,6 +2462,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         }
         self.assertEqual(set(environment), expected_keys)
         self.assertEqual(environment["TMPDIR"], "/private/verify-tmp")
+        self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
         self.assertEqual(environment["PATH"].split(os.pathsep)[0], str(java / "bin"))
         self.assertNotIn("KENT_SECRET", environment)
         self.assertNotIn("PYTHONHOME", environment)
@@ -2865,7 +3197,9 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         child.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os\n"
-            "print(json.dumps({k: os.environ[k] for k in ('TMPDIR', 'PWD') if k in os.environ}))\n"
+            "print(json.dumps({k: os.environ[k] for k in "
+            "('TMPDIR', 'PWD', 'PYTHONDONTWRITEBYTECODE') "
+            "if k in os.environ}))\n"
         )
         child.chmod(0o755)
         module = load_template_module(
@@ -2881,6 +3215,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         self.assertIsNone(failure)
         environment = json.loads(stdout)
         self.assertTrue(environment["TMPDIR"].startswith("/dev/fd/"))
+        self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
         self.assertNotIn("PWD", environment)
 
 
@@ -3371,6 +3706,7 @@ class GitHubCiWatchTest(GitRepositoryTest):
         query_timeout: int = 60,
         ready_file: Path | None = None,
         pid_file: Path | None = None,
+        source_contract: dict[str, object] | None = None,
     ) -> dict[str, object]:
         (root / "pr-state.json").write_text(json.dumps(pr_state))
         (root / "checks.json").write_text(json.dumps(checks))
@@ -4940,6 +5276,7 @@ class GitHubPrWatchTest(GitRepositoryTest):
                 "#!/bin/sh\n"
                 'case "$1 $2" in\n'
                 '  "pr view") cat "$KENT_TEST_PR_STATE" ;;\n'
+                '  "pr checks") cat "$KENT_TEST_SOURCE_CHECKS" ;;\n'
                 '  "api graphql") cat "$KENT_TEST_GRAPHQL" ;;\n'
                 '  "api "*)\n'
                 '    case "$*" in\n'
@@ -4969,6 +5306,7 @@ class GitHubPrWatchTest(GitRepositoryTest):
         query_timeout: int = 60,
         ready_file: Path | None = None,
         pid_file: Path | None = None,
+        source_contract: dict[str, object] | None = None,
     ) -> dict[str, object]:
         scripts = root / ".kent" / "scripts"
         scripts.mkdir(parents=True, exist_ok=True)
@@ -5018,6 +5356,16 @@ class GitHubPrWatchTest(GitRepositoryTest):
             state,
             feedback_script=feedback_script,
         )
+        (root / "source-checks.json").write_text(json.dumps([
+            {
+                "name": item.get("name", ""), "workflow": item.get("workflow", ""),
+                "state": item.get("conclusion", item.get("state", "UNKNOWN")),
+                "bucket": {
+                    "SUCCESS": "pass", "FAILURE": "fail", "SKIPPED": "skipping",
+                }.get(item.get("conclusion"), "pending"),
+                "link": None,
+            } for item in state.get("statusCheckRollup", [])
+        ]))
         workflow_input = {
             "workspace_path": str(root),
             "pr_url": "https://github.com/example/repo/pull/1",
@@ -5030,11 +5378,13 @@ class GitHubPrWatchTest(GitRepositoryTest):
                 if cursor is not None
                 else {}
             ),
+            **(source_contract or {}),
         }
         environment = {
             **os.environ,
             "PATH": f"{root}:{os.environ.get('PATH', '')}",
             "KENT_TEST_PR_STATE": str(root / "pr-state.json"),
+            "KENT_TEST_SOURCE_CHECKS": str(root / "source-checks.json"),
             "KENT_TEST_ISSUES": str(root / "issues.json"),
             "KENT_TEST_REVIEWS": str(root / "reviews.json"),
             "KENT_TEST_COMMENTS": str(root / "comments.json"),
@@ -5087,6 +5437,140 @@ class GitHubPrWatchTest(GitRepositoryTest):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
+
+    def test_source_contract_extra_failed_check_does_not_wake_waiting_pr(
+        self,
+    ) -> None:
+        root = self.create_repository()
+        runtime = load_template_module(
+            REPO_ROOT / "workflowkit" / "runtime.py",
+            "pr_source_contract_runtime",
+        )
+        expected = {
+            "schema": "github-ci-expected-checks-v1",
+            "repository": "example/repo",
+            "project_commit": "a" * 40,
+            "runtime_source_envelope_digest": "c" * 64,
+            "checks": [
+                {
+                    "workflow_name": "PR",
+                    "check_name": "Build",
+                    "allow_skipped": False,
+                }
+            ],
+        }
+        policy = runtime.make_ci_policy_snapshot("b" * 40, expected)
+        result = self.watch(
+            root,
+            {
+                "state": "OPEN",
+                "mergedAt": None,
+                "mergeCommit": None,
+                "headRefName": "TASK-1",
+                "headRefOid": "a" * 40,
+                "baseRefName": "main",
+                "baseRefOid": "b" * 40,
+                "reviewDecision": "APPROVED",
+                "mergeStateStatus": "CLEAN",
+                "statusCheckRollup": [
+                    {
+                        "workflow": "PR",
+                        "name": "Build",
+                        "conclusion": "SUCCESS",
+                    },
+                    {
+                        "workflow": "PR",
+                        "name": "Lint",
+                        "conclusion": "FAILURE",
+                    }
+                ],
+                "url": "https://github.com/example/repo/pull/1",
+            },
+            head="a" * 40,
+            base="b" * 40,
+            source_contract={
+                "expected_ci_checks": runtime.canonical_bytes(expected).decode(
+                    "utf-8"
+                ),
+                "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(
+                    expected
+                ),
+                "runtime_source_envelope_digest": "c" * 64,
+                "ci_policy_snapshot": runtime.canonical_bytes(policy).decode(
+                    "utf-8"
+                ),
+            },
+        )
+        self.assertEqual(result["transition"], "merge_watch_still_waiting")
+
+    def test_source_contract_missing_or_skipped_mandatory_check_wakes_waiting_pr(
+        self,
+    ) -> None:
+        runtime = load_template_module(
+            REPO_ROOT / "workflowkit" / "runtime.py",
+            "pr_source_contract_missing_runtime",
+        )
+        expected = {
+            "schema": "github-ci-expected-checks-v1",
+            "repository": "example/repo",
+            "project_commit": "a" * 40,
+            "runtime_source_envelope_digest": "c" * 64,
+            "checks": [
+                {
+                    "workflow_name": "PR",
+                    "check_name": "Build",
+                    "allow_skipped": False,
+                }
+            ],
+        }
+        policy = runtime.make_ci_policy_snapshot("b" * 40, expected)
+        source_contract = {
+            "expected_ci_checks": runtime.canonical_bytes(expected).decode(
+                "utf-8"
+            ),
+            "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(
+                expected
+            ),
+            "runtime_source_envelope_digest": "c" * 64,
+            "ci_policy_snapshot": runtime.canonical_bytes(policy).decode(
+                "utf-8"
+            ),
+        }
+        base_state = {
+            "state": "OPEN",
+            "mergedAt": None,
+            "mergeCommit": None,
+            "headRefName": "TASK-1",
+            "headRefOid": "a" * 40,
+            "baseRefName": "main",
+            "baseRefOid": "b" * 40,
+            "reviewDecision": "APPROVED",
+            "mergeStateStatus": "CLEAN",
+            "url": "https://github.com/example/repo/pull/1",
+        }
+        for checks in (
+            [],
+            [
+                {
+                    "workflow": "PR",
+                    "name": "Build",
+                    "conclusion": "SKIPPED",
+                }
+            ],
+        ):
+            with self.subTest(checks=checks):
+                root = self.create_repository()
+                result = self.watch(
+                    root,
+                    {**base_state, "statusCheckRollup": checks},
+                    head="a" * 40,
+                    base="b" * 40,
+                    source_contract=source_contract,
+                )
+                self.assertEqual(
+                    result["transition"],
+                    "merge_watch_state_changed",
+                )
 
     def test_unicode_feedback_cursor_round_trips_through_pr_consumer(
         self,
@@ -5823,6 +6307,889 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         self.assertEqual(seal.returncode, 0, seal.stderr)
         return scripts, json.loads(seal.stdout)["terminal_marker"]
+
+    def make_ci_terminal_state(
+        self, *, count=2, mutate_records=None, report_size=None, linked=False,
+    ):
+        """Real archive producer -> actual ledger append/seal -> Janitor."""
+        from workflowkit import ci_contract, runtime
+        from tests.test_revision import schema4_profile_contents
+        from tests.test_runtime_contracts import ci_report
+
+        root = self.create_repository()
+        context = root / ".kent/context"
+        context.mkdir(parents=True)
+        (context / "delivery.md").write_text("CI delivery fixture\n")
+        (root / ".kent/workflow-profile.toml").write_text(schema4_profile_contents())
+        self.run_git(root, "add", ".")
+        self.run_git(root, "commit", "-q", "-m", "CI archive context")
+        if linked:
+            linked_root = root / "linked-worktree"
+            self.run_git(root, "worktree", "add", "-q", "-b", "ci-linked", str(linked_root))
+            root = linked_root
+        head = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+        scripts = self.install_v2_runtime_commands(root)
+        environment = dict(os.environ)
+        environment.pop("KENT_RUN_ID", None)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        artifacts = []
+        with mock.patch.dict(os.environ, environment, clear=True):
+            for index in range(count):
+                report = ci_report()
+                report["pull_number"] = index + 1
+                report["attempts"][0]["head_oid"] = head
+                if index % 2:
+                    attempt = report["attempts"][0]
+                    attempt["reason"] = "expected_check_failed"
+                    attempt["watcher_exit_code"] = 1
+                    attempt["expected_checks"][0].update(bucket="fail", state="FAILURE")
+                if report_size is not None:
+                    attempt = report["attempts"][0]
+                    report["attempts"] = [
+                        {
+                            **attempt, "sequence": sequence,
+                            "expected_checks": [
+                                {**attempt["expected_checks"][0],
+                                 "check_name": f"check-{index:02d}",
+                                 "link": "https://github.com/owner/repository/actions/runs/"}
+                                for index in range(15)
+                            ],
+                        }
+                        for sequence in (1, 2)
+                    ]
+                    for attempt in report["attempts"]:
+                        for check in attempt["expected_checks"]:
+                            gap = report_size - len(runtime.canonical_bytes(report))
+                            self.assertGreaterEqual(gap, 0)
+                            check["link"] += "x" * min(gap, 2048 - len(check["link"]))
+                    self.assertEqual(len(runtime.canonical_bytes(report)), report_size)
+                artifact = ci_contract.archive_ci_report(root, "TASK-1", report)
+                # Actual producer deduplication must preserve the same archive.
+                self.assertEqual(
+                    ci_contract.archive_ci_report(root, "TASK-1", report), artifact,
+                )
+                artifacts.append(artifact)
+        ledger = root / ".kent/runtime/TASK-1/evidence-ledger.jsonl"
+        records = [json.loads(line) for line in ledger.read_text().splitlines()]
+        self.assertEqual(len(records), count)
+        self.assertEqual([row["artifacts"][0] for row in records], artifacts)
+        if mutate_records is not None:
+            mutate_records(records)
+            previous = ""
+            for index, record in enumerate(records, 1):
+                record.pop("event_hash", None)
+                record.update(sequence=index, previous_hash=previous)
+                record["event_hash"] = runtime.canonical_sha256(record)
+                previous = record["event_hash"]
+            ledger.write_bytes(b"".join(runtime.canonical_bytes(row) + b"\n" for row in records))
+        seal = subprocess.run(
+            [str(scripts / "workflow-evidence-ledger"), "seal",
+             "--task", "TASK-1", "--workspace", str(root)],
+            input=json.dumps({
+                "schema": "terminal-evidence-seal-request-v1",
+                "operation_report_digests": [],
+                "redaction": {"status": "passed", "report_sha256": "a" * 64},
+                "retention_class": "cleanup_report_only",
+            }),
+            text=True, capture_output=True, env=environment, timeout=30,
+        )
+        self.assertEqual(seal.returncode, 0, seal.stderr)
+        marker_line = json.loads(seal.stdout)["terminal_marker"]
+        marker = runtime.validate_cleanup_report(marker_line)
+        active = ledger.parent
+        tombstone = active.parent / (".evidence-cleanup-" + runtime.canonical_sha256(marker))
+        janitor = load_template_module(scripts / "workflow-task-janitor", "ci_janitor_test")
+        return root, janitor, marker_line, active, tombstone, [Path(p).name for p in artifacts]
+
+    def ci_cleanup(self, fixture, *, managed=False, hook=None):
+        root, janitor, marker, _, _, _ = fixture
+        operation = (
+            janitor._prepare_v2_managed_runtime_state if managed
+            else janitor._remove_v2_runtime_state
+        )
+        return operation(root, "TASK-1", cleanup_report=marker, _phase_hook=hook)
+
+    def test_ci_archive_ledger_seal_primary_and_managed_vertical(self):
+        for managed in (False, True):
+            with self.subTest(managed=managed):
+                fixture = self.make_ci_terminal_state(
+                    mutate_records=lambda rows: rows[0]["artifacts"].extend(rows[0]["artifacts"] * 2),
+                )
+                _, _, _, active, tombstone, names = fixture
+                for name in ("fix-checkpoint.json", "smoke-checkpoint.json"):
+                    self._write_valid_runtime_file(active / name, "{}\n")
+                before = {p.name: p.read_bytes() for p in active.iterdir()}
+                phases = []
+                result = self.ci_cleanup(fixture, managed=managed, hook=phases.append)
+                self.assertTrue(result[0], result)
+                self.assertFalse(active.exists())
+                if managed:
+                    self.assertEqual({p.name: p.read_bytes() for p in tombstone.iterdir()}, before)
+                    repeated = self.ci_cleanup(fixture, managed=True)
+                    self.assertTrue(repeated[0], repeated)
+                    self.assertEqual({p.name: p.read_bytes() for p in tombstone.iterdir()}, before)
+                else:
+                    self.assertFalse(tombstone.exists())
+                    self.assertLess(phases.index("after_smoke_checkpoint_unlink_fsync"),
+                                    phases.index("before_ci_report_unlink"))
+                    self.assertEqual(phases.count("after_ci_report_unlink_fsync"), len(names))
+                    self.assertLess(max(i for i, phase in enumerate(phases)
+                                        if phase == "after_ci_report_unlink_fsync"),
+                                    phases.index("before_ledger_unlink"))
+
+    def test_ci_invalid_artifacts_block_before_namespace_mutation(self):
+        cases = (
+            "unknown", "prefix", "noncanonical", "duplicate", "schema", "digest",
+            "oversize", "symlink", "hardlink", "mode", "tracked_logical",
+            "tracked_physical", "not_ignored_logical", "not_ignored_physical",
+            "missing", "fifo", "directory", "owner",
+        )
+        for managed in (False, True):
+            for case in cases:
+                with self.subTest(managed=managed, case=case):
+                    fixture = self.make_ci_terminal_state(count=1)
+                    root, janitor, _, active, tombstone, names = fixture
+                    report = active / names[0]
+                    original = report.read_bytes()
+                    if case in ("unknown", "prefix"):
+                        self._write_valid_runtime_file(
+                            active / ("unrelated" if case == "unknown" else "ci-report-fake.json"),
+                            original,
+                        )
+                    elif case == "noncanonical":
+                        report.write_bytes(original + b"\n")
+                    elif case == "duplicate":
+                        report.write_bytes(b'{"schema":"github-ci-report-v2",' + original[1:])
+                    elif case == "schema":
+                        report.write_bytes(b"{}")
+                    elif case == "digest":
+                        value = json.loads(original)
+                        value["pull_number"] += 1
+                        from workflowkit.runtime import canonical_bytes
+                        report.write_bytes(canonical_bytes(value))
+                    elif case == "oversize":
+                        report.write_bytes(b"x" * (64 * 1024 + 1))
+                    elif case == "symlink":
+                        report.unlink()
+                        report.symlink_to(root / "tracked.txt")
+                    elif case == "hardlink":
+                        os.link(report, root / "retained-report")
+                    elif case == "mode":
+                        report.chmod(0o644)
+                    elif case == "tracked_logical":
+                        self.run_git(root, "add", "-f", str(report.relative_to(root)))
+                    elif case == "tracked_physical":
+                        tombstone.mkdir()
+                        self._write_valid_runtime_file(tombstone / report.name, original)
+                        self.run_git(root, "add", "-f", str((tombstone / report.name).relative_to(root)))
+                        (tombstone / report.name).unlink()
+                        tombstone.rmdir()
+                    elif case.startswith("not_ignored"):
+                        # Only the other namespace is ignored: both must pass.
+                        ignored = tombstone.name if case.endswith("logical") else active.name
+                        (root / ".gitignore").write_text(f"/.kent/runtime/{ignored}/\n")
+                    elif case in ("missing", "fifo", "directory"):
+                        report.unlink()
+                        if case == "fifo":
+                            os.mkfifo(report, 0o600)
+                        elif case == "directory":
+                            report.mkdir()
+                    ledger_before = (active / "evidence-ledger.jsonl").read_bytes()
+                    real_fstat = janitor.os.fstat
+                    report_inode = report.lstat().st_ino if report.exists() else None
+
+                    def changed_owner(fd):
+                        metadata = real_fstat(fd)
+                        if case == "owner" and metadata.st_ino == report_inode:
+                            fields = list(metadata)
+                            fields[4] = os.getuid() + 1
+                            return os.stat_result(fields)
+                        return metadata
+
+                    with mock.patch.object(janitor.os, "fstat", side_effect=changed_owner):
+                        result = self.ci_cleanup(fixture, managed=managed)
+                    self.assertFalse(result[0], result)
+                    self.assertTrue(active.is_dir(), result)
+                    self.assertFalse(tombstone.exists())
+                    self.assertEqual((active / "evidence-ledger.jsonl").read_bytes(), ledger_before)
+
+    def test_ci_references_are_sealed_logical_task_paths(self):
+        for case in ("unreferenced", "foreign", "tombstone", "absolute", "malformed", "too_many"):
+            with self.subTest(case=case):
+                def mutate(rows):
+                    artifact = rows[0]["artifacts"][0]
+                    if case == "unreferenced":
+                        rows[0]["artifacts"] = []
+                    elif case == "foreign":
+                        rows[0]["artifacts"] = [artifact.replace("/TASK-1/", "/OTHER/")]
+                    elif case == "tombstone":
+                        rows[0]["artifacts"] = [artifact.replace("/TASK-1/", "/.evidence-cleanup-" + "a" * 64 + "/")]
+                    elif case == "absolute":
+                        rows[0]["artifacts"] = ["/" + artifact]
+                    elif case == "malformed":
+                        rows[0]["artifacts"] = [artifact.replace("ci-report-", "ci-report-X")]
+                    else:
+                        rows[0]["artifacts"] = [
+                            f".kent/runtime/TASK-1/ci-report-{index:064x}.json"
+                            for index in range(65)
+                        ]
+                fixture = self.make_ci_terminal_state(count=1, mutate_records=mutate)
+                for managed in (False, True):
+                    result = self.ci_cleanup(fixture, managed=managed)
+                    self.assertFalse(result[0], result)
+                    self.assertTrue(fixture[3].exists())
+                    self.assertFalse(fixture[4].exists())
+
+    def test_ci_crash_boundaries_preserve_ledger_until_last_and_resume(self):
+        phases = (
+            "after_evidence_admission", "after_tombstone_rename",
+            "after_terminal_sentinel_create",
+            "before_fix_checkpoint_unlink", "after_fix_checkpoint_unlink_before_fsync",
+            "after_fix_checkpoint_unlink_fsync",
+            "before_smoke_checkpoint_unlink", "after_smoke_checkpoint_unlink_before_fsync",
+            "after_smoke_checkpoint_unlink_fsync",
+            "before_ci_report_unlink", "after_ci_report_unlink_before_fsync",
+            "after_ci_report_unlink_fsync", "before_ledger_unlink",
+            "after_ledger_unlink_before_fsync", "after_ledger_unlink_fsync",
+            "before_tombstone_removal",
+        )
+        boundaries = [(phase, 1) for phase in phases] + [
+            (phase, 2) for phase in (
+                "before_ci_report_unlink", "after_ci_report_unlink_before_fsync",
+                "after_ci_report_unlink_fsync",
+            )
+        ]
+        for boundary, occurrence in boundaries:
+            with self.subTest(boundary=boundary, occurrence=occurrence):
+                fixture = self.make_ci_terminal_state()
+                _, _, _, active, tombstone, names = fixture
+                for name in ("fix-checkpoint.json", "smoke-checkpoint.json"):
+                    self._write_valid_runtime_file(active / name, "{}\n")
+                before = {p.name: p.read_bytes() for p in active.iterdir()}
+                fired = False
+                calls = 0
+
+                def hook(phase):
+                    nonlocal fired, calls
+                    if phase == boundary:
+                        calls += 1
+                        if calls == occurrence:
+                            fired = True
+                            raise OSError("injected CI cleanup boundary")
+
+                result = self.ci_cleanup(fixture, hook=hook)
+                self.assertFalse(result[0], result)
+                self.assertTrue(fired)
+                remaining = active if active.exists() else tombstone
+                after = {p.name: p.read_bytes() for p in remaining.iterdir()}
+                self.assertTrue(all(before[name] == raw for name, raw in after.items()))
+                if any(name in after for name in names):
+                    self.assertIn("evidence-ledger.jsonl", after)
+                if boundary.startswith("after_ci_report_unlink"):
+                    self.assertEqual(sorted(set(names) - after.keys()), sorted(names)[:occurrence])
+                retry = self.ci_cleanup(fixture)
+                self.assertTrue(retry[0], retry)
+                self.assertFalse(tombstone.exists())
+
+    def test_ci_report_unlink_and_directory_fsync_failures_resume_ledger_last(self):
+        for failure in ("unlink", "fsync"):
+            for occurrence in (1, 2):
+                with self.subTest(failure=failure, occurrence=occurrence):
+                    fixture = self.make_ci_terminal_state()
+                    _, janitor, _, _, tombstone, names = fixture
+                    real_unlink, real_fsync = os.unlink, os.fsync
+                    calls = 0
+                    pending = False
+                    fired = False
+
+                    def unlink(name, *args, **kwargs):
+                        nonlocal calls, pending, fired
+                        if name in names:
+                            calls += 1
+                            if calls == occurrence:
+                                if failure == "unlink":
+                                    fired = True
+                                    raise OSError("CI unlink failure")
+                                pending = True
+                        return real_unlink(name, *args, **kwargs)
+
+                    def fsync(fd):
+                        nonlocal pending, fired
+                        if pending and stat.S_ISDIR(os.fstat(fd).st_mode):
+                            pending = False
+                            fired = True
+                            raise OSError("CI directory fsync failure")
+                        real_fsync(fd)
+
+                    with mock.patch.object(janitor.os, "unlink", side_effect=unlink), \
+                         mock.patch.object(janitor.os, "fsync", side_effect=fsync):
+                        result = self.ci_cleanup(fixture)
+                    self.assertFalse(result[0], result)
+                    self.assertTrue(fired)
+                    self.assertTrue((tombstone / "evidence-ledger.jsonl").exists())
+                    missing = occurrence - (failure == "unlink")
+                    self.assertEqual(
+                        sorted(set(names) - {p.name for p in tombstone.iterdir()}),
+                        sorted(names)[:missing],
+                    )
+                    retry = self.ci_cleanup(fixture)
+                    self.assertTrue(retry[0], retry)
+                    self.assertFalse(tombstone.exists())
+
+    def test_ci_missing_subset_requires_verified_deletion_resume(self):
+        for state in ("active", "tombstone", "resume", "managed_resume"):
+            with self.subTest(state=state):
+                fixture = self.make_ci_terminal_state()
+                _, janitor, _, active, tombstone, names = fixture
+                if state != "active":
+                    active.rename(tombstone)
+                current = active if state == "active" else tombstone
+                (current / names[0]).unlink()
+                if "resume" in state:
+                    self._write_valid_runtime_file(
+                        current.parent / janitor.runtime_state_names("TASK-1")[1],
+                    )
+                before = {p.name: p.read_bytes() for p in current.iterdir()}
+                result = self.ci_cleanup(fixture, managed=state == "managed_resume")
+                self.assertEqual(result[0], state == "resume", result)
+                if state != "resume":
+                    self.assertEqual({p.name: p.read_bytes() for p in current.iterdir()}, before)
+
+    def test_ci_managed_crash_reentry_and_post_admission_drift_retain_raw_bytes(self):
+        for boundary in ("after_evidence_admission", "after_tombstone_rename",
+                         "after_terminal_sentinel_create"):
+            with self.subTest(boundary=boundary):
+                fixture = self.make_ci_terminal_state()
+                _, _, _, active, tombstone, _ = fixture
+                before = {p.name: p.read_bytes() for p in active.iterdir()}
+
+                def crash(phase):
+                    if phase == boundary:
+                        raise OSError("managed retention interruption")
+
+                result = self.ci_cleanup(fixture, managed=True, hook=crash)
+                self.assertFalse(result[0], result)
+                current = active if active.exists() else tombstone
+                self.assertEqual({p.name: p.read_bytes() for p in current.iterdir()}, before)
+                retry = self.ci_cleanup(fixture, managed=True)
+                self.assertTrue(retry[0], retry)
+                self.assertEqual({p.name: p.read_bytes() for p in tombstone.iterdir()}, before)
+        for boundary in ("after_evidence_admission", "after_terminal_sentinel_create"):
+            with self.subTest(drift=boundary):
+                fixture = self.make_ci_terminal_state()
+                _, _, _, active, tombstone, names = fixture
+
+                def mutate(phase):
+                    if phase == boundary:
+                        current = active if active.exists() else tombstone
+                        path = current / names[0]
+                        raw = path.read_bytes()
+                        inode = path.stat().st_ino
+                        path.write_bytes(raw[:-1] + b" ")
+                        self.assertEqual(path.stat().st_ino, inode)
+
+                result = self.ci_cleanup(fixture, managed=True, hook=mutate)
+                self.assertFalse(result[0], result)
+                current = active if active.exists() else tombstone
+                self.assertEqual(len(list(current.iterdir())), len(names) + 1)
+                self.assertFalse(self.ci_cleanup(fixture, managed=True)[0])
+
+    def test_ci_partial_cleanup_rejects_new_or_tampered_remaining_evidence(self):
+        for case in ("new", "report", "ledger", "missing_ledger"):
+            with self.subTest(case=case):
+                fixture = self.make_ci_terminal_state()
+                _, _, _, _, tombstone, names = fixture
+
+                def fail_after_report(phase):
+                    if phase == "after_ci_report_unlink_fsync":
+                        raise OSError("partial report deletion")
+
+                self.assertFalse(self.ci_cleanup(fixture, hook=fail_after_report)[0])
+                remaining = tombstone / sorted(names)[1]
+                self.assertTrue(remaining.exists())
+                if case == "new":
+                    self._write_valid_runtime_file(tombstone / "ci-report-unknown.json", "{}")
+                elif case == "report":
+                    remaining.write_bytes(remaining.read_bytes() + b" ")
+                elif case == "ledger":
+                    (tombstone / "evidence-ledger.jsonl").write_text("{}\n")
+                else:
+                    (tombstone / "evidence-ledger.jsonl").unlink()
+                before = {p.name: p.read_bytes() for p in tombstone.iterdir()}
+                result = self.ci_cleanup(fixture)
+                self.assertFalse(result[0], result)
+                self.assertEqual({p.name: p.read_bytes() for p in tombstone.iterdir()}, before)
+
+    def test_ci_fd_and_directory_drift_blocks_without_further_loss(self):
+        cases = ("file_swap", "same_inode_report", "same_inode_ledger", "mode",
+                 "task_swap", "runtime_swap", "new", "sentinel")
+        for boundary in ("after_evidence_admission", "after_tombstone_rename",
+                         "before_ci_report_unlink"):
+            for case in cases:
+                if case == "sentinel" and boundary != "before_ci_report_unlink":
+                    continue
+                with self.subTest(boundary=boundary, case=case):
+                    fixture = self.make_ci_terminal_state()
+                    root, janitor, _, active, tombstone, names = fixture
+                    saved = None
+                    fired = False
+
+                    def hook(phase):
+                        nonlocal saved, fired
+                        if phase != boundary or fired:
+                            return
+                        fired = True
+                        directory = active if active.exists() else tombstone
+                        target = directory / names[0]
+                        if case == "file_swap":
+                            raw = target.read_bytes()
+                            target.rename(root / "saved-report")
+                            self._write_valid_runtime_file(target, raw)
+                        elif case.startswith("same_inode"):
+                            if case.endswith("ledger"):
+                                target = directory / "evidence-ledger.jsonl"
+                            raw = target.read_bytes()
+                            inode = target.stat().st_ino
+                            target.write_bytes(raw[:-1] + b" ")
+                            self.assertEqual(target.stat().st_ino, inode)
+                        elif case == "mode":
+                            target.chmod(0o400)
+                        elif case == "task_swap":
+                            directory.rename(root / "saved-evidence")
+                            directory.mkdir(mode=0o700)
+                            for source in (root / "saved-evidence").iterdir():
+                                self._write_valid_runtime_file(directory / source.name, source.read_bytes())
+                        elif case == "runtime_swap":
+                            directory.parent.rename(root / "saved-runtime")
+                            (root / ".kent/runtime").mkdir(mode=0o700)
+                            directory = root / "saved-runtime" / directory.name
+                        elif case == "new":
+                            self._write_valid_runtime_file(directory / "new-entry")
+                        elif case == "sentinel":
+                            sentinel = directory.parent / janitor.runtime_state_names("TASK-1")[1]
+                            sentinel.write_bytes(b"x")
+                        saved = (directory, {p.name: p.read_bytes() for p in directory.iterdir()})
+
+                    result = self.ci_cleanup(fixture, hook=hook)
+                    self.assertFalse(result[0], result)
+                    self.assertTrue(fired)
+                    directory, before = saved
+                    self.assertEqual({p.name: p.read_bytes() for p in directory.iterdir()}, before)
+
+    def test_ci_ledger_duplicate_chain_and_byte_limits_preserve_evidence(self):
+        for case in ("duplicate", "chain", "oversize", "exact_bytes"):
+            with self.subTest(case=case):
+                fixture = self.make_ci_terminal_state(count=1)
+                _, janitor, _, active, tombstone, _ = fixture
+                ledger = active / "evidence-ledger.jsonl"
+                raw = ledger.read_bytes()
+                if case == "duplicate":
+                    raw = b'{"sequence":1,' + raw[1:]
+                elif case == "chain":
+                    changed = raw.replace(b'"previous_hash":""', b'"previous_hash":"x"', 1)
+                    self.assertNotEqual(changed, raw)
+                    raw = changed
+                else:
+                    length = janitor.MAX_LEDGER_BYTES + (case == "oversize")
+                    raw = b" " * (length - len(raw)) + raw
+                ledger.write_bytes(raw)
+                result = self.ci_cleanup(fixture)
+                self.assertEqual(result[0], case == "exact_bytes", result)
+                if case != "exact_bytes":
+                    self.assertTrue(active.exists())
+                    self.assertFalse(tombstone.exists())
+                    self.assertEqual(ledger.read_bytes(), raw)
+
+    def test_ci_ledger_record_limit_is_inclusive_and_bounded(self):
+        for count in (8192, 8193):
+            with self.subTest(count=count):
+                def records(rows):
+                    prototype = {
+                        "schema_version": 1, "task_short_id": "TASK-1",
+                        "artifacts": rows[0]["artifacts"],
+                    }
+                    rows[:] = [dict(prototype) for _ in range(count - 1)]
+                fixture = self.make_ci_terminal_state(count=1, mutate_records=records)
+                result = self.ci_cleanup(fixture)
+                self.assertEqual(result[0], count == 8192, result)
+                if count == 8193:
+                    self.assertTrue(fixture[3].exists())
+                    self.assertFalse(fixture[4].exists())
+
+    def test_ci_resume_requires_exact_marker_tombstone_chain_and_safe_sentinel(self):
+        from workflowkit import runtime
+
+        for case in ("marker", "tombstone", "chain", "sentinel_bytes", "sentinel_mode"):
+            with self.subTest(case=case):
+                fixture = self.make_ci_terminal_state()
+                root, janitor, marker, active, tombstone, names = fixture
+                active.rename(tombstone)
+                (tombstone / names[0]).unlink()
+                sentinel = tombstone.parent / janitor.runtime_state_names("TASK-1")[1]
+                self._write_valid_runtime_file(sentinel)
+                if case == "marker":
+                    value = runtime.validate_cleanup_report(marker)
+                    value["task_short_id"] = "OTHER"
+                    marker = "TERMINAL_EVIDENCE_V1 " + runtime.canonical_bytes(value).decode()
+                    fixture = (root, janitor, marker, active, tombstone, names)
+                elif case == "tombstone":
+                    moved = tombstone.with_name(".evidence-cleanup-" + "b" * 64)
+                    tombstone.rename(moved)
+                    tombstone = moved
+                elif case == "chain":
+                    ledger = tombstone / "evidence-ledger.jsonl"
+                    raw = ledger.read_bytes()
+                    changed = raw.replace(b'"previous_hash":""', b'"previous_hash":"x"', 1)
+                    self.assertNotEqual(changed, raw)
+                    ledger.write_bytes(changed)
+                elif case == "sentinel_bytes":
+                    sentinel.write_bytes(b"x")
+                else:
+                    sentinel.chmod(0o644)
+                before = {p.name: p.read_bytes() for p in tombstone.iterdir()}
+                result = self.ci_cleanup(fixture)
+                self.assertFalse(result[0], result)
+                self.assertEqual({p.name: p.read_bytes() for p in tombstone.iterdir()}, before)
+
+    def test_ci_declared_v2_never_falls_back_when_runtime_or_support_disappears(self):
+        for managed in (False, True):
+            for case in ("support_missing", "support_symlink", "runtime_missing",
+                         "runtime_empty", "ledger_missing"):
+                with self.subTest(managed=managed, case=case):
+                    fixture = self.make_ci_terminal_state(count=1)
+                    root, _, _, active, _, names = fixture
+                    current = active
+                    if case.startswith("support"):
+                        support = root / ".kent/scripts/workflow_runtime_contracts.py"
+                        saved = root / "retained-support.py"
+                        support.rename(saved)
+                        if case == "support_symlink":
+                            support.symlink_to(saved)
+                    elif case in ("runtime_missing", "runtime_empty"):
+                        moved = root / "retained-runtime"
+                        active.parent.rename(moved)
+                        current = moved / active.name
+                        if case == "runtime_empty":
+                            active.parent.mkdir(mode=0o700)
+                    else:
+                        (active / "evidence-ledger.jsonl").unlink()
+                    before = {name: (current / name).read_bytes() for name in names}
+                    result = self.ci_cleanup(fixture, managed=managed)
+                    self.assertIsNotNone(result, "declared v2 must never select legacy cleanup")
+                    self.assertFalse(result[0], result)
+                    self.assertEqual({name: (current / name).read_bytes() for name in names}, before)
+
+    def test_ci_inventory_is_bounded_during_enumeration(self):
+        janitor = load_template_module(JANITOR, "ci_inventory_bounds")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index in range(256):
+                (root / str(index)).touch()
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                self.assertEqual(len(janitor._bounded_inventory(descriptor)), 256)
+                (root / "overflow").touch()
+                with self.assertRaisesRegex(ValueError, "entry limit"):
+                    janitor._bounded_inventory(descriptor)
+            finally:
+                os.close(descriptor)
+        fixture = self.make_ci_terminal_state(count=1)
+        for index in range(255):
+            self._write_valid_runtime_file(fixture[3] / f"unknown-{index}")
+        result = self.ci_cleanup(fixture)
+        self.assertFalse(result[0], result)
+        self.assertIn("entry limit", result[1])
+        self.assertTrue(fixture[3].exists())
+
+    def test_ci_report_reference_and_present_byte_bounds(self):
+        fixture = self.make_ci_terminal_state(count=64, report_size=64 * 1024)
+        result = self.ci_cleanup(fixture, managed=True)
+        self.assertTrue(result[0], result)
+        self.assertEqual(len(list(fixture[4].glob("ci-report-*.json"))), 64)
+        self.assertEqual(
+            sum(p.stat().st_size for p in fixture[4].glob("ci-report-*.json")),
+            4 * 1024 * 1024,
+        )
+        fixture = self.make_ci_terminal_state()
+        _, janitor, _, active, _, names = fixture
+        total = sum((active / name).stat().st_size for name in names)
+        # The real aggregate check is exercised at its inclusive boundary.
+        # The declared production bound is separately asserted, not weakened.
+        self.assertEqual(janitor.MAX_CI_ARTIFACT_BYTES, 4 * 1024 * 1024)
+        self.assertEqual(janitor.MAX_CI_ARTIFACTS, 64)
+        with mock.patch.object(janitor, "MAX_CI_ARTIFACT_BYTES", total - 1):
+            result = self.ci_cleanup(fixture, managed=True)
+        self.assertFalse(result[0], result)
+        with mock.patch.object(janitor, "MAX_CI_ARTIFACT_BYTES", total):
+            result = self.ci_cleanup(fixture, managed=True)
+        self.assertTrue(result[0], result)
+        with tempfile.TemporaryFile() as stream:
+            stream.write(b"x" * (64 * 1024))
+            stream.flush()
+            self.assertEqual(len(janitor._bounded_file_bytes(stream.fileno(), 64 * 1024)), 64 * 1024)
+            stream.seek(0, os.SEEK_END)
+            stream.write(b"x")
+            stream.flush()
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                janitor._bounded_file_bytes(stream.fileno(), 64 * 1024)
+            # Even a stale size observation cannot bypass the capped read.
+            fields = list(os.fstat(stream.fileno()))
+            fields[6] = 0
+            with mock.patch.object(os, "fstat", return_value=os.stat_result(fields)), \
+                 self.assertRaisesRegex(ValueError, "byte or record limit"):
+                janitor._bounded_file_bytes(stream.fileno(), 64 * 1024)
+
+    def test_ci_scoped_admission_closes_every_descriptor_on_success_and_failure(self):
+        for case in ("success", "unknown", "fsync", "managed"):
+            with self.subTest(case=case):
+                fixture = self.make_ci_terminal_state(count=1)
+                _, janitor, _, active, _, _ = fixture
+                if case == "unknown":
+                    self._write_valid_runtime_file(active / "unknown")
+                opened = set()
+                real_open, real_dup, real_close = os.open, os.dup, os.close
+
+                def remember_open(*args, **kwargs):
+                    fd = real_open(*args, **kwargs)
+                    opened.add(fd)
+                    return fd
+
+                def remember_dup(*args, **kwargs):
+                    fd = real_dup(*args, **kwargs)
+                    opened.add(fd)
+                    return fd
+
+                def remember_close(fd):
+                    real_close(fd)
+                    opened.discard(fd)
+
+                real_fsync = os.fsync
+                def fsync(fd):
+                    if case == "fsync":
+                        raise OSError("injected descriptor ownership failure")
+                    real_fsync(fd)
+
+                with mock.patch.object(os, "open", side_effect=remember_open), \
+                     mock.patch.object(os, "dup", side_effect=remember_dup), \
+                     mock.patch.object(os, "close", side_effect=remember_close), \
+                     mock.patch.object(os, "fsync", side_effect=fsync):
+                    result = self.ci_cleanup(fixture, managed=case == "managed")
+                self.assertEqual(result[0], case in ("success", "managed"), result)
+                self.assertEqual(opened, set())
+
+    def test_ci_git_admission_rejects_actual_tracked_reports_under_foreign_routing(self):
+        for managed in (False, True):
+            for injection in ("control", "repository", "index", "objects",
+                              "namespace", "config_count", "config_parameters",
+                              "config_files", "discovery"):
+                with self.subTest(managed=managed, injection=injection):
+                    fixture = self.make_ci_terminal_state(count=1)
+                    root, janitor, _, active, tombstone, names = fixture
+                    report = active / names[0]
+                    self.run_git(root, "add", "-f", str(report.relative_to(root)))
+                    git_dir = Path(self.run_git(root, "rev-parse", "--absolute-git-dir").stdout.strip()).resolve()
+                    foreign = self.create_repository()
+                    foreign_dir = foreign / ".git"
+                    foreign_config = foreign / "injected-config"
+                    foreign_config.write_text(f"[core]\nworktree = {foreign}\n")
+                    overrides = {
+                        "control": {},
+                        "repository": {"GIT_DIR": str(foreign_dir), "GIT_WORK_TREE": str(foreign)},
+                        "index": {"GIT_INDEX_FILE": str(foreign_dir / "index")},
+                        "objects": {
+                            "GIT_COMMON_DIR": str(foreign_dir),
+                            "GIT_OBJECT_DIRECTORY": str(foreign_dir / "objects"),
+                            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(foreign_dir / "objects"),
+                        },
+                        "namespace": {
+                            "GIT_NAMESPACE": "foreign",
+                            "GIT_REPLACE_REF_BASE": "refs/foreign/",
+                        },
+                        "config_count": {
+                            "GIT_CONFIG_COUNT": "1",
+                            "GIT_CONFIG_KEY_0": "core.worktree",
+                            "GIT_CONFIG_VALUE_0": str(foreign),
+                        },
+                        "config_parameters": {
+                            "GIT_CONFIG_PARAMETERS": f"'core.worktree={foreign}'",
+                        },
+                        "config_files": {
+                            "GIT_CONFIG": str(foreign_config),
+                            "GIT_CONFIG_GLOBAL": str(foreign_config),
+                            "GIT_CONFIG_SYSTEM": str(foreign_config),
+                        },
+                        "discovery": {
+                            "GIT_CEILING_DIRECTORIES": str(root),
+                            "GIT_DISCOVERY_ACROSS_FILESYSTEM": "0",
+                            "GIT_PREFIX": "foreign/",
+                        },
+                    }[injection]
+                    before = {p.name: p.read_bytes() for p in active.iterdir()}
+                    protected = {
+                        path: path.read_bytes() for path in (
+                            git_dir / "index", git_dir / "config",
+                            foreign_dir / "index", foreign_dir / "config",
+                        )
+                    }
+                    with mock.patch.dict(os.environ, overrides), \
+                         mock.patch.object(janitor, "run", wraps=janitor.run) as probes:
+                        result = self.ci_cleanup(fixture, managed=managed)
+                    self.assertFalse(result[0], result)
+                    self.assertFalse(tombstone.exists())
+                    self.assertEqual({p.name: p.read_bytes() for p in active.iterdir()}, before)
+                    self.assertEqual({p: p.read_bytes() for p in protected}, protected)
+                    self.assertGreater(len(probes.call_args_list), 1)
+                    for probe in probes.call_args_list:
+                        environment = probe.kwargs["environment"]
+                        self.assertLessEqual(
+                            {key for key in environment if key.startswith("GIT_")},
+                            {"GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT", "GIT_INDEX_FILE"},
+                        )
+                        self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
+                        if "rev-parse" not in probe.args[0]:
+                            self.assertEqual(environment["GIT_INDEX_FILE"], str(git_dir / "index"))
+                            self.assertIn(f"--git-dir={git_dir}", probe.args[0])
+                            self.assertIn(f"--work-tree={root.resolve()}", probe.args[0])
+
+    def test_ci_git_admission_binds_linked_worktree_index_not_common_index(self):
+        for managed in (False, True):
+            for tracked in (False, True):
+                with self.subTest(managed=managed, tracked=tracked):
+                    fixture = self.make_ci_terminal_state(count=1, linked=True)
+                    root, _, _, active, tombstone, names = fixture
+                    self.assertTrue((root / ".git").is_file())
+                    if tracked:
+                        self.run_git(root, "add", "-f", str((active / names[0]).relative_to(root)))
+                    git_dir = Path(self.run_git(root, "rev-parse", "--absolute-git-dir").stdout.strip())
+                    common = Path(self.run_git(root, "rev-parse", "--git-common-dir").stdout.strip())
+                    self.assertNotEqual(git_dir, common)
+                    protected = {
+                        path: path.read_bytes() for path in (
+                            git_dir / "index", common / "index", common / "config",
+                        )
+                    }
+                    foreign = self.create_repository()
+                    before = {p.name: p.read_bytes() for p in active.iterdir()}
+                    with mock.patch.dict(os.environ, {
+                        "GIT_DIR": str(foreign / ".git"), "GIT_WORK_TREE": str(foreign),
+                        "GIT_INDEX_FILE": str(common / "index"),
+                    }):
+                        result = self.ci_cleanup(fixture, managed=managed)
+                    self.assertEqual(result[0], not tracked, result)
+                    self.assertEqual({p: p.read_bytes() for p in protected}, protected)
+                    if tracked:
+                        self.assertTrue(active.exists())
+                        self.assertFalse(tombstone.exists())
+                    elif managed:
+                        self.assertEqual({p.name: p.read_bytes() for p in tombstone.iterdir()}, before)
+                    else:
+                        self.assertFalse(active.exists())
+                        self.assertFalse(tombstone.exists())
+
+    def test_ci_git_admission_honors_ordinary_user_and_repository_exclusions(self):
+        for source in ("user", "repository"):
+            for managed in (False, True):
+                with self.subTest(source=source, managed=managed):
+                    fixture = self.make_ci_terminal_state(count=1)
+                    root, _, _, active, tombstone, _ = fixture
+                    (root / ".gitignore").write_text("")
+                    home = root / "fixture-home"
+                    home.mkdir()
+                    environment = {key: value for key, value in os.environ.items()
+                                   if not key.startswith("GIT_")}
+                    environment.update(HOME=str(home), XDG_CONFIG_HOME=str(home / "xdg"))
+                    if source == "user":
+                        ignore = home / "global-ignore"
+                        ignore.write_text("/.kent/runtime/\n")
+                        (home / ".gitconfig").write_text(f"[core]\nexcludesFile = {ignore}\n")
+                    else:
+                        (root / ".git/info/exclude").write_text("/.kent/runtime/\n")
+                    with mock.patch.dict(os.environ, environment, clear=True):
+                        result = self.ci_cleanup(fixture, managed=managed)
+                    self.assertTrue(result[0], result)
+                    self.assertFalse(active.exists())
+                    self.assertEqual(tombstone.exists(), managed)
+                    self.assertEqual((root / ".gitignore").read_text(), "")
+
+    def test_ci_git_admission_does_not_accept_injected_ignore_configuration(self):
+        for managed in (False, True):
+            fixture = self.make_ci_terminal_state(count=1)
+            root, _, _, active, tombstone, _ = fixture
+            (root / ".gitignore").write_text("")
+            foreign_ignore = root / "injected-ignore"
+            foreign_ignore.write_text("/.kent/runtime/\n")
+            before = {p.name: p.read_bytes() for p in active.iterdir()}
+            with mock.patch.dict(os.environ, {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.excludesFile",
+                "GIT_CONFIG_VALUE_0": str(foreign_ignore),
+            }):
+                result = self.ci_cleanup(fixture, managed=managed)
+            self.assertFalse(result[0], result)
+            self.assertFalse(tombstone.exists())
+            self.assertEqual({p.name: p.read_bytes() for p in active.iterdir()}, before)
+
+    def test_ci_git_policy_drift_blocks_before_rename_or_unlink_and_preserves_staging(self):
+        for linked in (False, True):
+            for managed in (False, True):
+                boundaries = ("after_evidence_admission", "after_terminal_sentinel_create") if managed else (
+                    "after_evidence_admission", "before_ci_report_unlink",
+                )
+                for boundary in boundaries:
+                    for drift in ("index", "ignore"):
+                        with self.subTest(linked=linked, managed=managed,
+                                          boundary=boundary, drift=drift):
+                            fixture = self.make_ci_terminal_state(count=1, linked=linked)
+                            root, _, _, active, tombstone, names = fixture
+                            git_dir = Path(self.run_git(root, "rev-parse", "--absolute-git-dir").stdout.strip())
+                            saved = None
+
+                            def change_policy(phase):
+                                nonlocal saved
+                                if phase != boundary or saved is not None:
+                                    return
+                                current = active if active.exists() else tombstone
+                                if drift == "index":
+                                    self.run_git(
+                                        root, "add", "-f", str((current / names[0]).relative_to(root)),
+                                    )
+                                else:
+                                    (root / ".gitignore").write_text("")
+                                saved = (
+                                    current,
+                                    {p.name: p.read_bytes() for p in current.iterdir()},
+                                    (git_dir / "index").read_bytes(),
+                                    (root / ".gitignore").read_bytes(),
+                                )
+
+                            result = self.ci_cleanup(fixture, managed=managed, hook=change_policy)
+                            self.assertIsNotNone(saved)
+                            self.assertFalse(result[0], result)
+                            current, evidence, index, ignore = saved
+                            self.assertEqual({p.name: p.read_bytes() for p in current.iterdir()}, evidence)
+                            self.assertEqual((git_dir / "index").read_bytes(), index)
+                            self.assertEqual((root / ".gitignore").read_bytes(), ignore)
+                            if boundary == "after_evidence_admission":
+                                self.assertTrue(active.exists())
+                                self.assertFalse(tombstone.exists())
+
+    def test_ci_git_revalidation_batches_all_remaining_reports(self):
+        fixture = self.make_ci_terminal_state(count=64)
+        _, janitor, _, _, _, _ = fixture
+        with mock.patch.object(janitor, "run", wraps=janitor.run) as probes:
+            result = self.ci_cleanup(fixture)
+        self.assertTrue(result[0], result)
+        calls = probes.call_args_list
+        # At most two probes per revalidation boundary, not 64 per boundary.
+        self.assertLessEqual(len(calls), 2 * (64 + 8) + 1)
+        ignored = [call for call in calls if "check-ignore" in call.args[0]]
+        tracked = [call for call in calls if "ls-files" in call.args[0]]
+        self.assertEqual(len(ignored), len(tracked))
+        self.assertGreater(len(ignored), 64)
+        for call in ignored:
+            paths = call.kwargs["input_text"].split("\0")[:-1]
+            self.assertLessEqual(len(paths), 3 * (64 + 3))
+            self.assertEqual(paths, sorted(set(paths)))
 
     def janitor_input(self, root: Path, **overrides: str) -> str:
         payload = {
