@@ -246,10 +246,10 @@ Runtime v2 is atomic.
   non-Git workspaces and small local jobs that do not need isolation.
 - A task-level start, approval, or move override may select a concrete target
   without mutating the workflow policy.
-- Verification dispatch deterministically compares `workspace_path` with the
-  canonical current execution root. Artifact subdirectories, nested paths, and
-  foreign repositories are rejected before fan-out and routed through a
-  metadata-only Fix slice.
+- Verification dispatch compares `workspace_path` with the canonical execution
+  root. Artifact subdirectories, nested paths and foreign repositories route
+  to metadata-only Fix before fan-out.
+- Interpreter dispatch: `workflow-verify-report` docstring.
 
 ## Work-kind routing
 

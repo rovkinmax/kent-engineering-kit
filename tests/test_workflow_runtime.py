@@ -1909,6 +1909,289 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
                 self.assertEqual(report["code"], expected_code)
                 self.assertEqual(bytecode_paths(), [])
 
+    def test_verify_finite_shebangs_preserve_exact_interpreter_fd_and_stdin(self):
+        for header, interpreter in (
+            ("#!/bin/sh", "/bin/sh"),
+            ("#!/bin/bash", "/bin/bash"),
+            ("#!/usr/bin/env bash", "/bin/bash"),
+            ("#!/usr/bin/env python3", sys.executable),
+        ):
+            for fd_executable in (False, True):
+                with self.subTest(header=header, fd_executable=fd_executable):
+                    root = self.create_repository()
+                    capture = root / "stdin.json"
+                    if "python3" in header:
+                        body = (
+                            "import os, sys\n"
+                            "from pathlib import Path\n"
+                            f"Path({str(capture)!r}).write_bytes(sys.stdin.buffer.read())\n"
+                            "assert os.environ['PYTHONDONTWRITEBYTECODE'] == '1'\n"
+                            "print('{\"transition\":\"passed\"}')\n"
+                        )
+                    else:
+                        body = (
+                            f"cat > {str(capture)!r}\n"
+                            + (
+                                "values=(passed)\n"
+                                '[[ "${values[0]}" == passed ]] || exit 2\n'
+                                if "bash" in header else ""
+                            )
+                            + "printf '%s\\n' '{\"transition\":\"passed\"}'\n"
+                        )
+                    scripts = self.install_verify_fixture(root, header + "\n" + body)
+                    module = load_template_module(scripts / "workflow-verify-report", "verify_finite_shebang")
+                    real_access = os.access
+                    real_command = module._child_command
+                    selected = []
+
+                    def access(path, mode, *args, **kwargs):
+                        if str(path).startswith("/dev/fd/"):
+                            return fd_executable
+                        return real_access(path, mode, *args, **kwargs)
+
+                    def command(path, fd):
+                        argv = real_command(path, fd)
+                        self.assertEqual(argv, [interpreter, path])
+                        self.assertEqual(path, f"/dev/fd/{fd}")
+                        selected.append(argv)
+                        return argv
+
+                    payload = {"workspace_path": str(root), "unicode": "é", "items": [1, "two"]}
+                    previous = Path.cwd()
+                    try:
+                        os.chdir(root)
+                        with mock.patch.object(os, "access", side_effect=access), \
+                             mock.patch.object(module, "_child_command", side_effect=command), \
+                             mock.patch.dict(os.environ, {"PYTHONDONTWRITEBYTECODE": "0"}):
+                            emitted = module.run_verification(payload)
+                    finally:
+                        os.chdir(previous)
+                    self.assertEqual(emitted["code"], "passed")
+                    self.assertEqual(len(selected), 1)
+                    self.assertEqual(
+                        capture.read_bytes(),
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(),
+                    )
+                    self.assertEqual(list(scripts.rglob("*.pyc")), [])
+                    self.assertEqual(list((root / "build/kent-workflow").glob(".verify-tmp-*")), [])
+
+    def test_verify_unsupported_shebang_forms_fail_before_child_launch(self):
+        headers = (
+            b"#!/bin/zsh\n", b"#!/usr/bin/python3\n", b"#!/bin/python3\n",
+            b"#!/usr/bin/env sh\n", b"#!/usr/bin/env /bin/bash\n",
+            b"#!/bin/bash -e\n", b"#!/bin/sh -eu\n",
+            b"#!/usr/bin/env bash -e\n", b"#!/usr/bin/env python3 -B\n",
+            b"#!/usr/bin/env -S bash\n", b"#!/usr/bin/env NAME=value bash\n",
+            b"#!/usr/bin/env bash \n", b"#!/usr/bin/env  bash\n",
+            b"#! /bin/bash\n", b"#!/bin/bash\t\n",
+            b"#!/tmp/not-bash\n", b"#!/tmp/python-bash\n",
+            b"#!/bin/bashx\n", b"#!/usr/bin/env not-python3\n",
+            b"#!/bin/bash\r\n", b"#!/bin/bash\x00\n",
+            b"#!/bin/bash", b"#!/usr/bin/env python3", b"#!",
+            b"#!" + b"x" * 253 + b"\n",
+            b"#!" + b"x" * 254 + b"\n",
+            b"#!" + b"x" * 4096 + b"\n",
+        )
+        for header in headers:
+            for fd_executable in (False, True):
+                with self.subTest(header=header[:60], length=len(header), fd_executable=fd_executable):
+                    root = self.create_repository()
+                    scripts = self.install_verify_fixture(root, "#!/bin/sh\n")
+                    (scripts / "workflow-compile-verify").write_bytes(
+                        header + b"echo '{\"transition\":\"passed\"}'\n"
+                    )
+                    module = load_template_module(scripts / "workflow-verify-report", "verify_rejected_shebang")
+                    real_access = os.access
+                    real_popen = subprocess.Popen
+                    launches = []
+
+                    def access(path, mode, *args, **kwargs):
+                        if str(path).startswith("/dev/fd/"):
+                            return fd_executable
+                        return real_access(path, mode, *args, **kwargs)
+
+                    def popen(argv, *args, **kwargs):
+                        if kwargs.get("pass_fds"):
+                            launches.append(argv)
+                        return real_popen(argv, *args, **kwargs)
+
+                    with mock.patch.object(os, "access", side_effect=access), \
+                         mock.patch.object(subprocess, "Popen", side_effect=popen):
+                        emitted = self.run_module_in_workspace(module, root)
+                    report = emitted
+                    self.assertEqual(report["code"], "verifier_unsafe", report)
+                    self.assertEqual(launches, [])
+                    self.assertEqual(list((root / "build/kent-workflow").glob(".verify-tmp-*")), [])
+
+    def test_verify_header_read_is_capped_offset_preserving_and_failures_explicit(self):
+        module = load_template_module(VERIFY_REPORT, "verify_shebang_read_bounds")
+        root = self.create_repository()
+        script = root / "header"
+        script.write_bytes(b"#!/bin/bash\n" + b"x" * 4096)
+        descriptor = os.open(script, os.O_RDONLY)
+        try:
+            os.lseek(descriptor, 7, os.SEEK_SET)
+            with mock.patch.object(os, "pread", wraps=os.pread) as reads:
+                argv = module._child_command(f"/dev/fd/{descriptor}", descriptor)
+            self.assertEqual(argv, ["/bin/bash", f"/dev/fd/{descriptor}"])
+            reads.assert_called_once_with(descriptor, 257, 0)
+            self.assertEqual(os.lseek(descriptor, 0, os.SEEK_CUR), 7)
+            with mock.patch.object(os, "pread", side_effect=OSError(errno.EIO, "read failure")), \
+                 self.assertRaises(OSError):
+                module._child_command(f"/dev/fd/{descriptor}", descriptor)
+        finally:
+            os.close(descriptor)
+        for raw in (b"#!/bin/bash", b"#!/usr/bin/env bash", b"#!/bin/sh", b"#!/usr/bin/env python3"):
+            with tempfile.TemporaryFile() as stream:
+                stream.write(raw)
+                stream.flush()
+                with self.assertRaises(module.VerificationFailure) as raised:
+                    module._child_command(f"/dev/fd/{stream.fileno()}", stream.fileno())
+                self.assertEqual(raised.exception.code, "verifier_unsafe")
+
+    def test_verify_native_non_shebang_dispatch_has_no_interpreter_fallback(self):
+        module = load_template_module(VERIFY_REPORT, "verify_native_fd_dispatch")
+        with tempfile.TemporaryFile() as stream:
+            for raw in (b"\x7fELF\x00native", b"\xcf\xfa\xed\xfe\x00native", b"plain executable bytes"):
+                stream.seek(0)
+                stream.truncate()
+                stream.write(raw)
+                stream.flush()
+                fd_path = f"/dev/fd/{stream.fileno()}"
+                with mock.patch.object(module, "_validated_interpreter") as interpreter, \
+                     mock.patch.object(os, "access", return_value=False):
+                    self.assertEqual(module._child_command(fd_path, stream.fileno()), [fd_path])
+                interpreter.assert_not_called()
+
+    def test_verify_interpreter_canonical_targets_permissions_and_symlinks(self):
+        module = load_template_module(VERIFY_REPORT, "verify_trusted_interpreter")
+        root = self.create_repository()
+        target = root / "trusted-runtime"
+        target.write_bytes(b"fixture executable")
+        target.chmod(0o755)
+        alias = root / "trusted-installation-link"
+        alias.symlink_to(target)
+        self.assertEqual(module._validated_interpreter(str(alias)), str(alias))
+        real_stat = os.stat
+
+        def system_owned(path, *args, **kwargs):
+            metadata = real_stat(path, *args, **kwargs)
+            if Path(path) == target:
+                fields = list(metadata)
+                fields[3] = 2  # Trusted installations may have multiple links.
+                fields[4] = 0  # System ownership differs from a non-root project owner.
+                return os.stat_result(fields)
+            return metadata
+
+        with mock.patch.object(os, "stat", side_effect=system_owned):
+            self.assertEqual(module._validated_interpreter(str(alias)), str(alias))
+        for mode in (0o644, 0o775, 0o757, 0o777):
+            with self.subTest(mode=oct(mode)):
+                target.chmod(mode)
+                with self.assertRaises(module.VerificationFailure) as raised:
+                    module._validated_interpreter(str(alias))
+                self.assertEqual(raised.exception.code, "verifier_unsafe")
+        target.chmod(0o755)
+        for path, code in (
+            (str(root / "missing"), "verification_blocked"),
+            (str(root), "verifier_unsafe"),
+            ("python3", "verifier_unsafe"),
+            ("", "verifier_unsafe"),
+        ):
+            with self.subTest(path=path), self.assertRaises(module.VerificationFailure) as raised:
+                module._validated_interpreter(path)
+            self.assertEqual(raised.exception.code, code)
+        with mock.patch.object(os, "access", return_value=False), \
+             self.assertRaises(module.VerificationFailure) as raised:
+            module._validated_interpreter(str(alias))
+        self.assertEqual(raised.exception.code, "verifier_unsafe")
+        loop = root / "interpreter-loop"
+        loop.symlink_to(loop)
+        with self.assertRaises(module.VerificationFailure) as raised:
+            module._validated_interpreter(str(loop))
+        self.assertEqual(raised.exception.code, "verifier_unsafe")
+
+    def test_verify_interpreter_low_level_failures_remain_explicit_without_launch(self):
+        for failure in ("pread", "interpreter_stat"):
+            with self.subTest(failure=failure):
+                root = self.create_repository()
+                scripts = self.install_verify_fixture(
+                    root, "#!/usr/bin/env python3\nprint('{\"transition\":\"passed\"}')\n",
+                )
+                module = load_template_module(scripts / "workflow-verify-report", "verify_dispatch_io_error")
+                real_popen = subprocess.Popen
+                real_stat = os.stat
+                python_target = Path(sys.executable).resolve()
+                launched = []
+
+                def popen(argv, *args, **kwargs):
+                    if kwargs.get("pass_fds"):
+                        launched.append(argv)
+                    return real_popen(argv, *args, **kwargs)
+
+                def interpreter_stat(path, *args, **kwargs):
+                    if Path(path) == python_target and kwargs.get("follow_symlinks") is False:
+                        raise OSError(errno.EIO, "interpreter stat failure")
+                    return real_stat(path, *args, **kwargs)
+
+                failing = (
+                    mock.patch.object(os, "pread", side_effect=OSError(errno.EIO, "script pread failure"))
+                    if failure == "pread"
+                    else mock.patch.object(os, "stat", side_effect=interpreter_stat)
+                )
+                with failing, mock.patch.object(subprocess, "Popen", side_effect=popen):
+                    report = self.run_module_in_workspace(module, root)
+                self.assertEqual(report["code"], "internal_error", report)
+                self.assertEqual(launched, [])
+                self.assertEqual(list((root / "build/kent-workflow").glob(".verify-tmp-*")), [])
+
+    def test_verify_missing_or_unsafe_interpreter_uses_existing_report_codes(self):
+        for state in ("missing", "nonexecutable", "writable", "directory", "relative"):
+            with self.subTest(state=state):
+                root = self.create_repository()
+                scripts = self.install_verify_fixture(root, "#!/usr/bin/env python3\nprint('unused')\n")
+                interpreter = root / "test-interpreter"
+                if state == "directory":
+                    interpreter.mkdir()
+                elif state != "missing":
+                    interpreter.write_bytes(b"fixture interpreter")
+                    interpreter.chmod(0o644 if state == "nonexecutable" else 0o777 if state == "writable" else 0o755)
+                module = load_template_module(scripts / "workflow-verify-report", "verify_interpreter_failure")
+                with mock.patch.object(module, "sys", types.SimpleNamespace(
+                    executable="relative-python" if state == "relative" else str(interpreter),
+                )):
+                    emitted = self.run_module_in_workspace(module, root)
+                report = emitted
+                self.assertEqual(report["code"], "verification_blocked" if state == "missing" else "verifier_unsafe")
+                self.assertIsNone(report["exit_code"])
+                self.assertIsNone(report["log_path"])
+                self.assertEqual(list((root / "build/kent-workflow").glob(".verify-tmp-*")), [])
+
+    def test_verify_shebang_never_selects_interpreter_from_path_or_env(self):
+        for header in ("#!/usr/bin/env bash", "#!/usr/bin/env python3"):
+            with self.subTest(header=header):
+                root = self.create_repository()
+                marker = root / "interpreter-hijacked"
+                java = root / "fake-java"
+                (java / "bin").mkdir(parents=True)
+                for name in ("env", "bash", "python3"):
+                    fake = java / "bin" / name
+                    fake.write_text(f"#!/bin/sh\ntouch {str(marker)!r}\nexit 99\n")
+                    fake.chmod(0o755)
+                body = (
+                    "values=(passed)\n[[ ${values[0]} == passed ]] || exit 2\n"
+                    "printf '%s\\n' '{\"transition\":\"passed\"}'\n"
+                    if "bash" in header else "print('{\"transition\":\"passed\"}')\n"
+                )
+                self.install_verify_fixture(root, header + "\n" + body)
+                emitted = self.run_verify_command(root, environment={
+                    **os.environ, "PATH": str(java / "bin"), "JAVA_HOME": str(java),
+                    "BASH_ENV": str(java / "bin/bash"),
+                    "ENV": str(java / "bin/env"), "PYTHONDONTWRITEBYTECODE": "0",
+                })
+                self.assertEqual(self.parse_verification_report(emitted)["code"], "passed")
+                self.assertFalse(marker.exists())
+
     def test_verify_input_workspace_and_verifier_failures_are_safe(self) -> None:
         root = self.create_repository()
         scripts = self.install_verify_fixture(
