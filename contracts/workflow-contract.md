@@ -249,7 +249,7 @@ Runtime v2 is atomic.
 - Verification dispatch compares `workspace_path` with the canonical execution
   root. Artifact subdirectories, nested paths and foreign repositories route
   to metadata-only Fix before fan-out.
-- Interpreter dispatch: `workflow-verify-report` docstring.
+- Verifier execution: `workflow-verify-report` docstring.
 
 ## Work-kind routing
 
