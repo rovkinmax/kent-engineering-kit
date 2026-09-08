@@ -1735,6 +1735,477 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
     def test_repository_verify_report_template_is_executable(self) -> None:
         self.assertEqual(VERIFY_REPORT.stat().st_mode & 0o777, 0o755)
 
+    def test_verify_private_tmp_survives_grandchild_close_fds_and_exec(self):
+        for bounded in (False, True):
+            with self.subTest(bounded=bounded):
+                root = self.create_repository()
+                leaf = (
+                    "import json, os, tempfile; from pathlib import Path; "
+                    "tmp = Path(os.environ['TMPDIR']); "
+                    "capture = {'tmp': str(tmp), 'mode': tmp.stat().st_mode & 0o777}; "
+                    "scratch = tempfile.TemporaryDirectory(dir=tmp); "
+                    "nested = Path(scratch.name) / 'nested'; nested.mkdir(); "
+                    "(nested / 'data').write_bytes(b'grandchild'); "
+                    "assert (nested / 'data').read_bytes() == b'grandchild'; "
+                    "scratch.cleanup(); "
+                    "Path('tmp-capture.json').write_text(json.dumps(capture))"
+                )
+                grandchild = (
+                    "import os, sys; "
+                    f"os.execv(sys.executable, [sys.executable, '-c', {leaf!r}])"
+                )
+                scripts = self.install_verify_fixture(
+                    root,
+                    "#!/usr/bin/env python3\n"
+                    "import subprocess, sys\n"
+                    f"subprocess.run([sys.executable, '-c', {grandchild!r}], "
+                    "close_fds=True, check=True)\n"
+                    "print('{\"transition\":\"passed\"}')\n",
+                )
+                if bounded:
+                    module = load_template_module(
+                        scripts / "workflow-verify-report",
+                        "verify_grandchild_bounded",
+                    )
+                    exit_code, stdout, stderr, failure = module.bounded_child(
+                        scripts / "workflow-compile-verify", root, b"{}",
+                    )
+                    self.assertEqual((exit_code, failure), (0, None), stderr)
+                    self.assertEqual(json.loads(stdout), {"transition": "passed"})
+                else:
+                    report = self.parse_verification_report(self.run_verify_command(root))
+                    self.assertEqual(report["code"], "passed", report)
+                capture = json.loads((root / "tmp-capture.json").read_text())
+                tmp = Path(capture["tmp"])
+                self.assertEqual(tmp.parent, root.resolve() / "build" / "kent-workflow")
+                self.assertTrue(tmp.name.startswith(".verify-tmp-"))
+                self.assertEqual(capture["mode"], 0o700)
+                self.assertFalse(tmp.exists(), "empty private root must be removed")
+
+    def test_verify_nonempty_tmp_retains_product_pass_and_digest_diagnostic(self):
+        for bounded in (False, True):
+            with self.subTest(bounded=bounded):
+                root = self.create_repository()
+                scripts = self.install_verify_fixture(
+                    root,
+                    "#!/usr/bin/env python3\n"
+                    "import os, sys\nfrom pathlib import Path\n"
+                    "tmp = Path(os.environ['TMPDIR'])\n"
+                    "Path('tmp-capture.txt').write_text(str(tmp))\n"
+                    "(tmp / 'nested').mkdir()\n"
+                    "(tmp / 'nested' / 'PRIVATE_CHILD_NAME').write_bytes(b'PRIVATE_CONTENT')\n"
+                    "sys.stderr.write('product stderr\\n')\n"
+                    "print('{\"transition\":\"passed\"}')\n",
+                )
+                workflow = root / "build" / "kent-workflow"
+                unrelated = workflow / ".verify-tmp-another-invocation"
+                unrelated.mkdir(parents=True, mode=0o700)
+                (unrelated / "keep").write_bytes(b"other invocation")
+                module = load_template_module(
+                    scripts / "workflow-verify-report", "verify_tmp_retention",
+                )
+                if bounded:
+                    exit_code, stdout, stderr, failure = module.bounded_child(
+                        scripts / "workflow-compile-verify", root, b"{}",
+                    )
+                    self.assertEqual((exit_code, failure), (0, None))
+                    self.assertEqual(json.loads(stdout), {"transition": "passed"})
+                else:
+                    report = self.run_module_in_workspace(module, root)
+                    self.assertEqual(report["code"], "passed", report)
+                    content = (root / report["log_path"]).read_bytes()
+                    self.assertEqual(hashlib.sha256(content).hexdigest(), report["log_sha256"])
+                    self.assertIn(report["log_sha256"], report["log_path"])
+                    stdout, stderr = self.parse_framed_output(content)
+                    self.assertEqual(json.loads(stdout), {"transition": "passed"})
+                tmp = Path((root / "tmp-capture.txt").read_text())
+                self.assertEqual((tmp / "nested" / "PRIVATE_CHILD_NAME").read_bytes(), b"PRIVATE_CONTENT")
+                self.assertFalse((tmp / ".verification-input").exists())
+                self.assertEqual((unrelated / "keep").read_bytes(), b"other invocation")
+                diagnostic = stderr.removeprefix(b"product stderr\n")
+                self.assertIn(b"Verifier temporary files retained:", diagnostic)
+                self.assertIn(str(tmp.relative_to(root.resolve())).encode(), diagnostic)
+                self.assertLessEqual(len(diagnostic), 512)
+                for forbidden in (b"PRIVATE_CHILD_NAME", b"PRIVATE_CONTENT", str(root.resolve()).encode()):
+                    self.assertNotIn(forbidden, diagnostic)
+
+    def test_verify_retention_diagnostic_does_not_create_output_overflow(self):
+        module = load_template_module(VERIFY_REPORT, "verify_retention_frame")
+        stdout = b'{"transition":"passed"}\n'
+        diagnostic = b"\nVerifier temporary files retained: build/kent-workflow/.verify-tmp-123-456\n"
+        for limit in (64, 128, 1024):
+            for excess in (False, True):
+                with self.subTest(limit=limit, excess=excess):
+                    lengths = [
+                        length for length in range(limit)
+                        if not module._frame(stdout, b"x" * length, limit)[1]
+                    ]
+                    stderr = b"x" * (max(lengths) + int(excess))
+                    frame, overflow = module._frame(stdout, stderr, limit, diagnostic)
+                    self.assertEqual(overflow, excess)
+                    self.assertLessEqual(len(frame), limit)
+                    out, err = self.parse_framed_output(frame)
+                    if limit >= 128:
+                        self.assertEqual(out, stdout)
+                        self.assertTrue(err.endswith(diagnostic))
+        root = self.create_repository()
+        limit = 1024
+        stderr_length = max(
+            length for length in range(limit)
+            if not module._frame(stdout, b"x" * length, limit)[1]
+        )
+        scripts = self.install_verify_fixture(
+            root,
+            "#!/usr/bin/env python3\n"
+            "import os, sys\nfrom pathlib import Path\n"
+            "(Path(os.environ['TMPDIR']) / 'keep').touch()\n"
+            f"sys.stdout.buffer.write({stdout!r})\n"
+            f"sys.stderr.buffer.write(b'x' * {stderr_length})\n",
+        )
+        module = load_template_module(scripts / "workflow-verify-report", "verify_retention_limit")
+        module.OUTPUT_LIMIT = limit
+        report = self.run_module_in_workspace(module, root)
+        self.assertEqual(report["code"], "passed", report)
+        content = (root / report["log_path"]).read_bytes()
+        self.assertLessEqual(len(content), limit)
+        self.assertEqual(hashlib.sha256(content).hexdigest(), report["log_sha256"])
+        self.assertIn(b"Verifier temporary files retained:", self.parse_framed_output(content)[1])
+
+    def test_bounded_retention_at_capacity_preserves_raw_streams_and_outcome(self):
+        limit = 1024
+        for stderr_length in (0, 257):
+            for exit_code in (0, 7):
+                with self.subTest(stderr_length=stderr_length, exit_code=exit_code):
+                    root = self.create_repository()
+                    raw_stdout = b'{"transition":"passed"}'
+                    raw_stdout += b" " * (limit - stderr_length - len(raw_stdout))
+                    raw_stderr = b"E" * stderr_length
+                    scripts = self.install_verify_fixture(
+                        root,
+                        "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
+                        "(Path(os.environ['TMPDIR']) / 'keep').touch()\n"
+                        f"sys.stdout.buffer.write({raw_stdout!r})\n"
+                        f"sys.stderr.buffer.write({raw_stderr!r})\n"
+                        f"sys.exit({exit_code})\n",
+                    )
+                    module = load_template_module(
+                        scripts / "workflow-verify-report", "bounded_retention_raw_capacity",
+                    )
+                    module.OUTPUT_LIMIT = limit
+                    code, stdout, stderr, failure = module.bounded_child(
+                        scripts / "workflow-compile-verify", root, b"{}",
+                    )
+                    self.assertEqual((code, failure), (exit_code, None))
+                    self.assertEqual(stdout, raw_stdout)
+                    self.assertEqual(stderr, raw_stderr)
+                    self.assertEqual(json.loads(stdout), {"transition": "passed"})
+                    self.assertEqual(len(stdout) + len(stderr), limit)
+                    self.assertEqual(
+                        len(list((root / "build" / "kent-workflow").glob(".verify-tmp-*/keep"))), 1,
+                    )
+
+    def test_bounded_retention_appends_whole_notice_only_when_it_fits(self):
+        for spare in (0, -1):
+            with self.subTest(spare=spare):
+                root = self.create_repository()
+                raw_stdout = b'{"transition":"passed"}\n'
+                raw_stderr = b"unmodified product stderr"
+                scripts = self.install_verify_fixture(
+                    root,
+                    "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
+                    "(Path(os.environ['TMPDIR']) / 'keep').touch()\n"
+                    f"sys.stdout.buffer.write({raw_stdout!r})\n"
+                    f"sys.stderr.buffer.write({raw_stderr!r})\n",
+                )
+                module = load_template_module(
+                    scripts / "workflow-verify-report", "bounded_retention_complete_fit",
+                )
+                notices = []
+
+                def set_exact_capacity(phase):
+                    if phase != "after_verifier_open_before_child":
+                        return
+                    # One invocation in this isolated fixture; production uses
+                    # its known basename and never discovers directories by glob.
+                    tmp = next((root / "build" / "kent-workflow").glob(".verify-tmp-*"))
+                    notice = (
+                        f"\nVerifier temporary files retained: build/kent-workflow/{tmp.name}\n"
+                    ).encode()
+                    self.assertLessEqual(len(notice), 512)
+                    notices.append(notice)
+                    module.OUTPUT_LIMIT = len(raw_stdout) + len(raw_stderr) + len(notice) + spare
+
+                code, stdout, stderr, failure = module.bounded_child(
+                    scripts / "workflow-compile-verify", root, b"{}",
+                    _phase_hook=set_exact_capacity,
+                )
+                self.assertEqual((code, failure), (0, None))
+                self.assertEqual(len(notices), 1)
+                self.assertEqual(stdout, raw_stdout)
+                self.assertEqual(stderr, raw_stderr + (notices[0] if spare == 0 else b""))
+                self.assertLessEqual(len(stdout) + len(stderr), module.OUTPUT_LIMIT)
+                if spare == 0:
+                    self.assertEqual(len(stdout) + len(stderr), module.OUTPUT_LIMIT)
+                self.assertEqual(
+                    len(list((root / "build" / "kent-workflow").glob(".verify-tmp-*/keep"))), 1,
+                )
+
+    def test_verify_failed_child_retention_notice_remains_in_bounded_digest(self):
+        for transition, exit_code, expected in (
+            ("failed", 0, "verification_failed"),
+            ("passed", 7, "child_exit_nonzero"),
+        ):
+            with self.subTest(transition=transition, exit_code=exit_code):
+                root = self.create_repository()
+                module = load_template_module(VERIFY_REPORT, "retention_failed_frame_capacity")
+                limit = 1024
+                raw_stdout = json.dumps({"transition": transition}).encode() + b"\n"
+                stderr_length = max(
+                    length for length in range(limit)
+                    if not module._frame(raw_stdout, b"E" * length, limit)[1]
+                )
+                scripts = self.install_verify_fixture(
+                    root,
+                    "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
+                    "(Path(os.environ['TMPDIR']) / 'keep').touch()\n"
+                    f"sys.stdout.buffer.write({raw_stdout!r})\n"
+                    f"sys.stderr.buffer.write(b'E' * {stderr_length})\n"
+                    f"sys.exit({exit_code})\n",
+                )
+                module = load_template_module(
+                    scripts / "workflow-verify-report", "retention_failed_report",
+                )
+                module.OUTPUT_LIMIT = limit
+                report = self.run_module_in_workspace(module, root)
+                self.assertEqual(report["code"], expected, report)
+                self.assertEqual(report["exit_code"], exit_code)
+                content = (root / report["log_path"]).read_bytes()
+                self.assertLessEqual(len(content), limit)
+                self.assertEqual(hashlib.sha256(content).hexdigest(), report["log_sha256"])
+                self.assertIn(report["log_sha256"], report["log_path"])
+                out, err = self.parse_framed_output(content)
+                self.assertEqual(out, raw_stdout)
+                private = next((root / "build" / "kent-workflow").glob(".verify-tmp-*"))
+                notice = (
+                    f"\nVerifier temporary files retained: build/kent-workflow/{private.name}\n"
+                ).encode()
+                self.assertTrue(err.endswith(notice))
+                self.assertTrue((private / "keep").exists())
+
+    def test_verify_private_tmp_prelaunch_drift_blocks_execution_and_cleanup(self):
+        for bounded in (False, True):
+            for kind in ("directory", "symlink", "mode", "build", "workspace"):
+                with self.subTest(bounded=bounded, kind=kind):
+                    root = self.create_repository()
+                    scripts = self.install_verify_fixture(
+                        root,
+                        "#!/usr/bin/env python3\nfrom pathlib import Path\n"
+                        "Path('child-ran').touch()\nprint('{\"transition\":\"passed\"}')\n",
+                    )
+                    module = load_template_module(scripts / "workflow-verify-report", "verify_tmp_prelaunch")
+                    outside = root / "external"
+                    outside.mkdir()
+                    (outside / "keep").write_bytes(b"external")
+                    selected = []
+
+                    def swap(phase):
+                        if phase != "after_verifier_open_before_child":
+                            return
+                        tmp = next((root / "build" / "kent-workflow").glob(".verify-tmp-*"))
+                        selected.append(tmp)
+                        if kind == "mode":
+                            tmp.chmod(0o755)
+                        elif kind == "build":
+                            (root / "build").rename(root / "moved-build")
+                            (root / "build").mkdir(mode=0o700)
+                        elif kind == "workspace":
+                            moved = root.with_name(root.name + "-moved")
+                            root.rename(moved)
+                            self.addCleanup(shutil.rmtree, moved)
+                            root.mkdir(mode=0o700)
+                        else:
+                            tmp.rename(tmp.with_name("moved-private"))
+                            if kind == "symlink":
+                                tmp.symlink_to(outside, target_is_directory=True)
+                            else:
+                                tmp.mkdir(mode=0o700)
+
+                    if bounded:
+                        with self.assertRaises(module.VerificationFailure) as raised:
+                            module.bounded_child(scripts / "workflow-compile-verify", root, b"{}", _phase_hook=swap)
+                        self.assertEqual(raised.exception.code, "log_path_unsafe")
+                    else:
+                        report = self.run_module_in_workspace(module, root, hook=swap)
+                        self.assertEqual(report["code"], "log_path_unsafe", report)
+                    self.assertEqual(len(selected), 1)
+                    self.assertFalse((root / "child-ran").exists())
+                    if kind == "workspace":
+                        moved = root.with_name(root.name + "-moved")
+                        self.assertFalse((moved / "child-ran").exists())
+                        self.assertEqual((moved / "external" / "keep").read_bytes(), b"external")
+                    else:
+                        self.assertEqual((outside / "keep").read_bytes(), b"external")
+                    if kind in {"directory", "symlink", "mode"}:
+                        self.assertTrue(selected[0].exists(), "do not remove the unsafe replacement")
+
+    def test_verify_private_tmp_postlaunch_swap_preserves_replacements(self):
+        for kind in ("directory", "symlink", "input"):
+            with self.subTest(kind=kind):
+                root = self.create_repository()
+                outside = root / "external"
+                outside.mkdir()
+                (outside / "keep").write_bytes(b"external")
+                swap = {
+                    "directory": "tmp.rename(moved)\ntmp.mkdir(mode=0o700)\n",
+                    "symlink": "tmp.rename(moved)\ntmp.symlink_to(Path.cwd() / 'external', target_is_directory=True)\n",
+                    "input": (
+                        "(tmp / '.verification-input').rename(tmp / 'saved-input')\n"
+                        "(tmp / '.verification-input').write_bytes(b'replacement')\n"
+                        "(tmp / '.verification-input').chmod(0o600)\n"
+                    ),
+                }[kind]
+                scripts = self.install_verify_fixture(
+                    root,
+                    "#!/usr/bin/env python3\nimport os\nfrom pathlib import Path\n"
+                    "tmp = Path(os.environ['TMPDIR'])\n"
+                    "Path('tmp-capture.txt').write_text(str(tmp))\n"
+                    "moved = tmp.with_name('moved-private')\n"
+                    + swap + "print('{\"transition\":\"passed\"}')\n",
+                )
+                module = load_template_module(scripts / "workflow-verify-report", "verify_tmp_postlaunch")
+                report = self.run_module_in_workspace(module, root)
+                self.assertEqual(report["code"], "log_path_unsafe", report)
+                self.assertIsNone(report["log_path"])
+                tmp = Path((root / "tmp-capture.txt").read_text())
+                self.assertTrue(tmp.exists())
+                self.assertEqual((outside / "keep").read_bytes(), b"external")
+                if kind == "input":
+                    self.assertEqual((tmp / ".verification-input").read_bytes(), b"replacement")
+                else:
+                    self.assertTrue((tmp.with_name("moved-private") / ".verification-input").exists())
+
+    def test_verify_private_tmp_revalidates_before_empty_delete(self):
+        root = self.create_repository()
+        scripts = self.install_verify_fixture(root, "#!/bin/sh\necho '{\"transition\":\"passed\"}'\n")
+        module = load_template_module(scripts / "workflow-verify-report", "verify_tmp_delete_gate")
+        cleanup = module._cleanup_private_tmp
+        replacements = []
+
+        def swap_then_cleanup(*args):
+            tmp = Path(module._private_tmp_path(*args))
+            tmp.rename(tmp.with_name("moved-private"))
+            tmp.mkdir(mode=0o700)
+            replacements.append(tmp)
+            return cleanup(*args)
+
+        with mock.patch.object(module, "_cleanup_private_tmp", swap_then_cleanup):
+            report = self.run_module_in_workspace(module, root)
+        self.assertEqual(report["code"], "log_path_unsafe")
+        self.assertEqual(len(replacements), 1)
+        self.assertTrue(replacements[0].is_dir())
+
+    def test_verify_private_tmp_checks_owner_and_held_inode(self):
+        root = self.create_repository().resolve()
+        module = load_template_module(VERIFY_REPORT, "verify_tmp_owner_inode")
+        workflow = root / "build" / "kent-workflow"
+        private = workflow / ".verify-tmp-test"
+        private.mkdir(parents=True, mode=0o700)
+        descriptors = [
+            os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            for path in (root, root / "build", workflow, private)
+        ]
+        try:
+            args = (root, *descriptors[:3], private.name, descriptors[3])
+            self.assertEqual(module._private_tmp_path(*args), str(private))
+            real_stat, real_fstat = os.stat, os.fstat
+
+            def wrong_owner(path, *args, **kwargs):
+                result = real_stat(path, *args, **kwargs)
+                if path == private.name and kwargs.get("dir_fd") == descriptors[2]:
+                    values = list(result)
+                    values[stat.ST_UID] = os.getuid() + 1
+                    return os.stat_result(values)
+                return result
+
+            def wrong_inode(fd):
+                result = real_fstat(fd)
+                if fd == descriptors[3]:
+                    values = list(result)
+                    values[stat.ST_INO] += 1
+                    return os.stat_result(values)
+                return result
+
+            for attribute, replacement in (("stat", wrong_owner), ("fstat", wrong_inode)):
+                with self.subTest(attribute=attribute):
+                    with mock.patch.object(module.os, attribute, replacement):
+                        with self.assertRaises(module.VerificationFailure) as raised:
+                            module._private_tmp_path(*args)
+                    self.assertEqual(raised.exception.code, "log_path_unsafe")
+            self.assertTrue(private.is_dir())
+        finally:
+            for fd in reversed(descriptors):
+                os.close(fd)
+
+    def test_verify_private_tmp_cleanup_io_errors_are_observable_without_retry(self):
+        for operation in ("rmdir", "input-unlink", "fsync"):
+            with self.subTest(operation=operation):
+                root = self.create_repository()
+                scripts = self.install_verify_fixture(root, "#!/bin/sh\necho '{\"transition\":\"passed\"}'\n")
+                module = load_template_module(scripts / "workflow-verify-report", "verify_tmp_cleanup_io")
+                rmdir, unlink, fsync = module.os.rmdir, module.os.unlink, module.os.fsync
+                attempts = []
+                removed = []
+
+                def fail_rmdir(name, *args, **kwargs):
+                    if str(name).startswith(".verify-tmp-"):
+                        attempts.append(name)
+                        if operation == "rmdir":
+                            raise OSError(errno.EIO, "private diagnostic")
+                        result = rmdir(name, *args, **kwargs)
+                        removed.append(name)
+                        return result
+                    return rmdir(name, *args, **kwargs)
+
+                def fail_unlink(name, *args, **kwargs):
+                    if name == ".verification-input" and operation == "input-unlink":
+                        raise OSError(errno.EIO, "private diagnostic")
+                    return unlink(name, *args, **kwargs)
+
+                def fail_fsync(fd):
+                    if removed and operation == "fsync":
+                        raise OSError(errno.EIO, "private diagnostic")
+                    return fsync(fd)
+
+                with mock.patch.object(module.os, "rmdir", fail_rmdir), mock.patch.object(
+                    module.os, "unlink", fail_unlink
+                ), mock.patch.object(module.os, "fsync", fail_fsync):
+                    report = self.run_module_in_workspace(module, root)
+                self.assertEqual(report["code"], "internal_error", report)
+                self.assertEqual(len(attempts), 1)
+                self.assertNotIn("private diagnostic", json.dumps(report))
+
+    def test_verify_private_tmp_finally_preserves_original_failure_and_ownership(self):
+        for drift in (False, True):
+            with self.subTest(drift=drift):
+                root = self.create_repository()
+                scripts = self.install_verify_fixture(root, "#!/usr/bin/env unknown\n")
+                module = load_template_module(scripts / "workflow-verify-report", "verify_tmp_error_finally")
+                cleanup = module._cleanup_private_tmp
+                selected = []
+
+                def inspect_cleanup(*args):
+                    selected.append(Path(module._private_tmp_path(*args)))
+                    if drift:
+                        selected[-1].rename(selected[-1].with_name("moved-private"))
+                        selected[-1].mkdir(mode=0o700)
+                    return cleanup(*args)
+
+                with mock.patch.object(module, "_cleanup_private_tmp", inspect_cleanup):
+                    report = self.run_module_in_workspace(module, root)
+                self.assertEqual(report["code"], "verifier_unsafe")
+                self.assertEqual(len(selected), 1)
+                self.assertEqual(selected[0].exists(), drift)
+
     def install_verify_fixture(
         self,
         root: Path,
@@ -2362,7 +2833,10 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         self.assertEqual(report["code"], "passed")
         captured = json.loads(capture_path.read_text())
         self.assertFalse((REPO_ROOT / "verify-env.json").exists())
-        self.assertTrue(captured["tmp"].startswith("/dev/fd/"))
+        private_tmp = Path(captured["tmp"])
+        self.assertEqual(private_tmp.parent, root.resolve() / "build" / "kent-workflow")
+        self.assertTrue(private_tmp.name.startswith(".verify-tmp-"))
+        self.assertFalse(private_tmp.exists())
         expected_keys = {
             "CI",
             "LANG",
@@ -2431,7 +2905,6 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             "verify_report_environment_boundary_test",
         )
         original_os = module.os
-        original_fd_path = module._fd_path
         module.os = types.SimpleNamespace(
             environ={
                 "HOME": str(home),
@@ -2442,12 +2915,10 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             },
             pathsep=os.pathsep,
         )
-        module._fd_path = lambda _descriptor: "/private/verify-tmp"
         try:
-            environment = module.replacement_environment(99)
+            environment = module.replacement_environment("/private/verify-tmp")
         finally:
             module.os = original_os
-            module._fd_path = original_fd_path
         expected_keys = {
             "CI",
             "LANG",
@@ -3191,7 +3662,7 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             module.write_log(root, b"must stay inside", _phase_hook=swap_directory)
         self.assertEqual(list(outside.iterdir()), [])
 
-    def test_child_uses_replacement_environment_and_private_tmp_fd(self) -> None:
+    def test_child_uses_replacement_environment_and_private_tmp_path(self) -> None:
         root = self.create_repository()
         child = root / "child.py"
         child.write_text(
@@ -3214,7 +3685,10 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         self.assertEqual(exit_code, 0, stderr.decode("utf-8", "replace"))
         self.assertIsNone(failure)
         environment = json.loads(stdout)
-        self.assertTrue(environment["TMPDIR"].startswith("/dev/fd/"))
+        private_tmp = Path(environment["TMPDIR"])
+        self.assertEqual(private_tmp.parent, root.resolve() / "build" / "kent-workflow")
+        self.assertTrue(private_tmp.name.startswith(".verify-tmp-"))
+        self.assertFalse(private_tmp.exists())
         self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
         self.assertNotIn("PWD", environment)
 
