@@ -262,6 +262,86 @@ execution settings; a rollback therefore governs new sessions and explicit
 recovery re-entry, while active sessions follow the normal
 interruption/recovery contract.
 
+## Planned: Delivery Process Efficiency
+
+This section is a roadmap proposal, not an active authority override. Current
+governance remains in force until the corresponding contracts are separately
+reviewed, approved, implemented, and validated.
+
+The September 3, 2026 release-process postmortem established this bounded
+baseline:
+
+- The Release Publication v2 lineage remained open for 21 calendar days from
+  August 13 through September 3. The corrected release-base portfolio remained
+  open for 15 calendar days from August 19 through September 3.
+- At the postmortem cutoff, a bounded sample contained 83 explicit revisions;
+  at least 47, or 57%, concerned governance, coordination, or installation
+  mechanics. This is a lower bound and not a global revision count.
+- Three approved installed-adoption attempts failed closed on September 3
+  because a custom control protocol rejected a production-valid pathful
+  manifest, launcher spelling, or file descriptor before the intended Git and
+  prompt operations.
+- The cycle also produced valuable product, security, and runtime findings.
+  These metrics identify avoidable process amplification; they do not justify
+  weakening required safety review.
+
+### P0 lifecycle changes
+
+1. Classify work before planning:
+   - **T0:** read-only inspection; no approval.
+   - **T1:** ordinary reversible product source; branch, PR, and tests.
+   - **T2:** Kit interfaces, installation, and remote merge; compact preview,
+     two independent reviews, and explicit approval.
+   - **T3:** publication, defaults, destructive state, and credentials;
+     separate approval, canary, and rollback readiness.
+2. Prefer standard tools. Introduce a custom executor only after a
+   deterministic reproduction proves that standard primitives cannot enforce
+   a required invariant.
+3. Run production-shaped evaluation before the first review. Seed the
+   regression corpus from actual failures, including `fd=10`, pathful
+   manifests, relative and absolute launcher forms, Linux locale behavior,
+   `/dev/fd` races, moving targets, and installed symlink surfaces.
+4. Keep two independent reviews for T2 and T3. Reuse the same reviewers for a
+   bounded correction. A third material blocker requires a scope split or an
+   explicit architecture decision, not an automatic reissue or review bypass.
+   Editorial findings do not invalidate an otherwise safe package.
+5. Bind approval to the intended effect and its invariants. A proven
+   pre-effect/no-effect failure may receive only explicitly designed bounded
+   recovery; ambiguous, external, destructive, or non-idempotent effects
+   require reconciliation and a fresh decision.
+6. Prefer one structured evidence ledger plus native execution traces over
+   parallel manifests, narrative receipts, and duplicated event records.
+
+### Pilot and acceptance
+
+1. Complete the active release portfolio under its existing authority; do not
+   retrofit the new lifecycle into work already in flight.
+2. Build a regression corpus from the observed path, argv, descriptor, Linux,
+   GitHub, and installed-link failures.
+3. Govern the risk-tier and approval-contract changes separately from this
+   roadmap entry.
+4. Pilot the lifecycle on one reversible Kit change, then expand only after
+   two successful cycles.
+5. Use one canary per change class plus contract tests for every affected
+   consumer. Preserve immutable history and return to the prior lifecycle on
+   approval bypass, repeated effects, evidence loss, escaped Critical/High
+   defects, or material quality regression.
+
+Track at least:
+
+- time from approved scope to the first production-shaped evaluation;
+- median review cycles per slice, with a target of at most two;
+- product/runtime blockers versus protocol/evidence blockers;
+- standard-command versus custom-executor effects;
+- approvals per coherent outcome;
+- governance bytes per changed source line;
+- known production failures represented in the regression corpus;
+- blocked work age, handoffs, and compactions;
+- protocol-induced failed applies, with a target of zero;
+- scope-to-merge and merge-to-installed/canary lead time;
+- change failure rate, MTTR, escaped Critical/High findings, canary rollback
+  rate, and terminal portfolio completion rate.
+
 ## Next
 
 1. Observe the first real tasks created on the Kent 2.6.1 defaults and compare
