@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import select
+import stat
+import subprocess
+import sys
+import time
+from typing import Any, Dict, List, Optional
+
+
+TASK_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+NODE_KEY = re.compile(r"^[a-z][a-z0-9_]*$")
+JSON_INPUT_TIMEOUT_SECONDS = 2.0
+MAX_JSON_INPUT_BYTES = 1024 * 1024
+
+
+def runtime_state_names(task: str) -> tuple[str, str]:
+    digest = hashlib.sha256(task.encode("utf-8")).hexdigest()
+    return (
+        ".evidence-lock-{}".format(digest),
+        ".evidence-terminal-{}".format(digest),
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Append and validate task-local workflow evidence."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for command in ("append", "read", "validate", "summary"):
+        subparser = subparsers.add_parser(command)
+        subparser.add_argument("--task", required=True)
+        subparser.add_argument("--workspace", type=Path, default=Path.cwd())
+    seal_parser = subparsers.add_parser("seal")
+    seal_parser.add_argument("--task", required=True)
+    seal_parser.add_argument("--workspace", type=Path, default=Path.cwd())
+    return parser.parse_args()
+
+
+def run_git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise ValueError("git {} failed: {}".format(" ".join(args), detail))
+    return result
+
+
+def repository_root(workspace: Path) -> Path:
+    resolved = workspace.expanduser().resolve()
+    result = run_git(resolved, "rev-parse", "--show-toplevel")
+    root = Path(result.stdout.strip()).resolve()
+    if root != resolved:
+        raise ValueError(
+            "workspace must be the repository root: {}; found {}".format(
+                resolved,
+                root,
+            )
+        )
+    return root
+
+
+def ledger_path(root: Path, task: str) -> Path:
+    if not TASK_KEY.fullmatch(task):
+        raise ValueError("invalid task key: {!r}".format(task))
+    return root / ".kent" / "runtime" / task / "evidence-ledger.jsonl"
+
+
+def require_ignored(root: Path, path: Path) -> None:
+    relative = path.relative_to(root)
+    result = run_git(root, "check-ignore", "-q", "--", str(relative), check=False)
+    if result.returncode != 0:
+        raise ValueError(
+            "evidence ledger is not ignored by Git: {}; "
+            "add /.kent/runtime/ to .gitignore".format(relative)
+        )
+
+
+def require_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("{} must be a non-empty string".format(label))
+    return value.strip()
+
+
+def require_string_list(value: Any, label: str) -> List[str]:
+    if not isinstance(value, list):
+        raise ValueError("{} must be an array".format(label))
+    result = []
+    for item in value:
+        result.append(require_string(item, "{} item".format(label)))
+    return result
+
+
+def optional_count(value: Any, label: str) -> Optional[int]:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("{} must be null or a non-negative integer".format(label))
+    return value
+
+
+def read_json_input(label: str) -> Any:
+    if sys.stdin.isatty():
+        raise ValueError(
+            "{} input requires one JSON object on stdin; pipe the payload "
+            "instead of starting the command interactively".format(label)
+        )
+    descriptor = sys.stdin.fileno()
+    deadline = time.monotonic() + JSON_INPUT_TIMEOUT_SECONDS
+    raw = bytearray()
+    decoder = json.JSONDecoder()
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            detail = "one JSON object" if not raw else "a complete JSON object"
+            raise ValueError(
+                "{} input timed out waiting for {} on stdin".format(
+                    label,
+                    detail,
+                )
+            )
+        readable, _, _ = select.select([descriptor], [], [], remaining)
+        if not readable:
+            continue
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            if not raw:
+                raise ValueError(
+                    "{} input requires one JSON object on stdin".format(label)
+                )
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    "{} input is invalid JSON: {}".format(label, error)
+                ) from error
+        raw.extend(chunk)
+        if len(raw) > MAX_JSON_INPUT_BYTES:
+            raise ValueError(
+                "{} input exceeds {} bytes".format(
+                    label,
+                    MAX_JSON_INPUT_BYTES,
+                )
+            )
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            if error.reason == "unexpected end of data":
+                continue
+            raise ValueError(
+                "{} input is not valid UTF-8".format(label)
+            ) from error
+        candidate = text.lstrip()
+        if not candidate:
+            continue
+        try:
+            payload, end = decoder.raw_decode(candidate)
+        except json.JSONDecodeError:
+            continue
+        if candidate[end:].strip():
+            raise ValueError(
+                "{} input must contain exactly one JSON object".format(label)
+            )
+        return payload
+
+
+def resolve_instruction_file(root: Path, configured_path: str, label: str) -> Path:
+    relative = Path(configured_path)
+    if relative.is_absolute():
+        raise ValueError("{} must be project-relative".format(label))
+    candidate = root
+    for part in relative.parts:
+        if part in ("", "."):
+            continue
+        candidate /= part
+        if candidate.is_symlink():
+            raise ValueError("{} must not contain symlinks".format(label))
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError("{} escapes the workspace".format(label))
+    if not resolved.is_file():
+        raise ValueError("{} does not exist: {}".format(label, configured_path))
+    return resolved
+
+
+def context_metrics(root: Path, raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("context must be an object")
+    manifest_path = require_string(raw.get("manifest_path"), "context.manifest_path")
+    configured_files = require_string_list(
+        raw.get("files_read", []),
+        "context.files_read",
+    )
+    manifest = resolve_instruction_file(
+        root,
+        manifest_path,
+        "context.manifest_path",
+    )
+    manifest_relative = str(manifest.relative_to(root))
+    resolved_files = []
+    instruction_bytes = manifest.stat().st_size
+    seen = {manifest_relative}
+    repeated = set()
+    for configured_path in configured_files:
+        resolved = resolve_instruction_file(
+            root,
+            configured_path,
+            "context.files_read",
+        )
+        relative = str(resolved.relative_to(root))
+        if relative == manifest_relative:
+            continue
+        resolved_files.append(relative)
+        if relative in seen:
+            repeated.add(relative)
+            continue
+        seen.add(relative)
+        instruction_bytes += resolved.stat().st_size
+    return {
+        "manifest_path": manifest_relative,
+        "files_read": resolved_files,
+        "instruction_bytes": instruction_bytes,
+        "repeated_file_count": len(repeated),
+        "repeated_files": sorted(repeated),
+        "model_calls": optional_count(raw.get("model_calls"), "context.model_calls"),
+        "compaction_count": optional_count(
+            raw.get("compaction_count"),
+            "context.compaction_count",
+        ),
+        "repeated_questions": optional_count(
+            raw.get("repeated_questions", 0),
+            "context.repeated_questions",
+        ),
+        "verification_loops": optional_count(
+            raw.get("verification_loops", 0),
+            "context.verification_loops",
+        ),
+    }
+
+
+def canonical_bytes(payload: Dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def entry_hash(payload: Dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_bytes(payload)).hexdigest()
+
+
+def validate_entry(
+    entry: Any,
+    *,
+    task: str,
+    sequence: int,
+    previous_hash: str,
+) -> str:
+    if not isinstance(entry, dict):
+        raise ValueError("ledger line {} is not an object".format(sequence))
+    if entry.get("schema_version") != 1:
+        raise ValueError("ledger line {} has unsupported schema".format(sequence))
+    if entry.get("sequence") != sequence:
+        raise ValueError("ledger line {} has invalid sequence".format(sequence))
+    if entry.get("task_short_id") != task:
+        raise ValueError("ledger line {} has a different task".format(sequence))
+    if entry.get("previous_hash") != previous_hash:
+        raise ValueError("ledger line {} breaks the hash chain".format(sequence))
+    supplied_hash = require_string(entry.get("event_hash"), "event_hash")
+    unsigned = dict(entry)
+    del unsigned["event_hash"]
+    calculated_hash = entry_hash(unsigned)
+    if supplied_hash != calculated_hash:
+        raise ValueError("ledger line {} has an invalid hash".format(sequence))
+    return supplied_hash
+
+
+def load_entries(stream: Any, *, task: str) -> List[Dict[str, Any]]:
+    stream.seek(0)
+    entries = []
+    previous_hash = ""
+    for line_number, line in enumerate(stream, start=1):
+        if not line.strip():
+            raise ValueError("ledger contains an empty line at {}".format(line_number))
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "ledger line {} is invalid JSON: {}".format(line_number, error)
+            ) from error
+        previous_hash = validate_entry(
+            entry,
+            task=task,
+            sequence=line_number,
+            previous_hash=previous_hash,
+        )
+        entries.append(entry)
+    return entries
+
+
+def _open_directory(parent: int, name: str, *, create: bool = False) -> int:
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+            os.fsync(parent)
+        except FileExistsError:
+            pass
+    descriptor = os.open(name, flags, dir_fd=parent)
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o022
+    ):
+        os.close(descriptor)
+        raise ValueError("runtime directory is unsafe: {}".format(name))
+    return descriptor
+
+
+def _open_runtime_file(
+    parent: int,
+    name: str,
+    *,
+    create: bool,
+    append: bool = False,
+) -> int:
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    if create:
+        flags |= os.O_CREAT
+    if append:
+        flags |= os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    created = False
+    if create:
+        flags |= getattr(os, "O_EXCL", 0)
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=parent)
+            created = True
+        except FileExistsError:
+            flags &= ~getattr(os, "O_EXCL", 0)
+            descriptor = os.open(name, flags, 0o600, dir_fd=parent)
+    else:
+        descriptor = os.open(name, flags, 0o600, dir_fd=parent)
+    if created:
+        os.fsync(parent)
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        os.close(descriptor)
+        raise ValueError("runtime file is unsafe: {}".format(name))
+    return descriptor
+
+
+def _revalidate_directory_link(parent: int, name: str, descriptor: int) -> None:
+    opened = os.fstat(descriptor)
+    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != opened.st_dev
+        or current.st_ino != opened.st_ino
+        or current.st_uid != os.getuid()
+        or current.st_mode & 0o022
+    ):
+        raise ValueError("runtime directory changed during admission")
+
+
+def _revalidate_file_link(parent: int, name: str, descriptor: int) -> None:
+    opened = os.fstat(descriptor)
+    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_dev != opened.st_dev
+        or current.st_ino != opened.st_ino
+        or current.st_uid != os.getuid()
+        or current.st_nlink != 1
+        or current.st_mode & 0o077
+    ):
+        raise ValueError("runtime file changed during admission")
+
+
+def _runtime_conflicts(runtime_fd: int, task: str) -> list[str]:
+    _, sentinel_name = runtime_state_names(task)
+    names = os.listdir(runtime_fd)
+    conflicts = [
+        name for name in names
+        if name.startswith(".evidence-cleanup-") or name == sentinel_name
+    ]
+    return sorted(conflicts)
+
+
+def _open_runtime_fds(
+    root: Path,
+    task: str,
+    *,
+    create_task: bool,
+    lock_operation: int = fcntl.LOCK_EX,
+    _phase_hook=None,
+) -> tuple[list[int], int, int, int, int]:
+    root_fd = os.open(
+        root,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    descriptors = [root_fd]
+    try:
+        kent_fd = _open_directory(root_fd, ".kent")
+        descriptors.append(kent_fd)
+        runtime_fd = _open_directory(kent_fd, "runtime", create=True)
+        descriptors.append(runtime_fd)
+        if _phase_hook is not None:
+            _phase_hook("after_runtime_fd_before_lock_open")
+        _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+        lock_name, sentinel_name = runtime_state_names(task)
+        lock_fd = _open_runtime_file(
+            runtime_fd,
+            lock_name,
+            create=True,
+        )
+        descriptors.append(lock_fd)
+        fcntl.flock(lock_fd, lock_operation)
+        if _phase_hook is not None:
+            _phase_hook("after_lock_before_state_read")
+        _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+        _revalidate_file_link(runtime_fd, lock_name, lock_fd)
+        conflicts = _runtime_conflicts(runtime_fd, task)
+        if conflicts:
+            if sentinel_name in conflicts:
+                raise ValueError("evidence ledger is sealed")
+            if any(name.startswith(".evidence-cleanup-") for name in conflicts):
+                raise ValueError(
+                    "terminal cleanup tombstone conflicts with active ledger"
+                )
+        try:
+            sentinel_fd = _open_runtime_file(
+                runtime_fd,
+                sentinel_name,
+                create=False,
+            )
+        except FileNotFoundError:
+            sentinel_fd = -1
+        else:
+            _revalidate_file_link(runtime_fd, sentinel_name, sentinel_fd)
+            if os.read(sentinel_fd, 1):
+                os.close(sentinel_fd)
+                raise ValueError("terminal sentinel is unsafe")
+            os.close(sentinel_fd)
+            raise ValueError("evidence ledger is sealed")
+        try:
+            task_fd = _open_directory(runtime_fd, task, create=False)
+        except FileNotFoundError:
+            if not create_task:
+                raise
+            try:
+                os.mkdir(task, 0o700, dir_fd=runtime_fd)
+            except FileExistsError:
+                pass
+            os.fsync(runtime_fd)
+            task_fd = _open_directory(runtime_fd, task)
+        descriptors.append(task_fd)
+        if _phase_hook is not None:
+            _phase_hook("after_task_fd_before_link_revalidation")
+        _revalidate_directory_link(runtime_fd, task, task_fd)
+        return descriptors, root_fd, runtime_fd, lock_fd, task_fd
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def kent_identity(name: str) -> str:
+    return os.environ.get(name, "").strip() or "unknown"
+
+
+def append_entry(
+    root: Path,
+    path: Path,
+    *,
+    task: str,
+    _phase_hook=None,
+) -> tuple[Dict[str, Any], bool]:
+    raw = read_json_input("evidence")
+    if not isinstance(raw, dict):
+        raise ValueError("evidence input must be one JSON object")
+    node_key = require_string(raw.get("node_key"), "node_key")
+    if not NODE_KEY.fullmatch(node_key):
+        raise ValueError("node_key must be a stable lower-case model key")
+    evidence_type = require_string(raw.get("evidence_type"), "evidence_type")
+    summary = require_string(raw.get("summary"), "summary")
+    artifacts = require_string_list(raw.get("artifacts", []), "artifacts")
+    checks = require_string_list(raw.get("checks", []), "checks")
+    decisions = require_string_list(raw.get("decisions", []), "decisions")
+    metrics = context_metrics(root, raw.get("context"))
+    git_head = run_git(root, "rev-parse", "HEAD").stdout.strip()
+    session_id = kent_identity("KENT_SESSION_ID")
+    run_id = kent_identity("KENT_RUN_ID")
+    step_id = kent_identity("KENT_STEP_ID")
+
+    descriptors, _, _, _, task_fd = _open_runtime_fds(
+        root,
+        task,
+        create_task=True,
+        _phase_hook=_phase_hook,
+    )
+    try:
+        ledger_fd = _open_runtime_file(
+            task_fd,
+            "evidence-ledger.jsonl",
+            create=True,
+            append=True,
+        )
+        descriptors.append(ledger_fd)
+        with os.fdopen(os.dup(ledger_fd), "r+", encoding="utf-8") as stream:
+            entries = load_entries(stream, task=task)
+            if entries and entries[-1].get("record_kind") == (
+                "terminal_evidence_seal_v1"
+            ):
+                raise ValueError("evidence ledger is sealed")
+            if run_id != "unknown":
+                for existing in reversed(entries):
+                    if existing.get("run_id") == run_id:
+                        return existing, True
+            previous_hash = entries[-1]["event_hash"] if entries else ""
+            entry = {
+                "schema_version": 1,
+                "sequence": len(entries) + 1,
+                "task_short_id": task,
+                "node_key": node_key,
+                "evidence_type": evidence_type,
+                "summary": summary,
+                "artifacts": artifacts,
+                "checks": checks,
+                "decisions": decisions,
+                "context": metrics,
+                "workspace_path": str(root),
+                "git_head": git_head,
+                "session_id": session_id,
+                "run_id": run_id,
+                "step_id": step_id,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "previous_hash": previous_hash,
+            }
+            entry["event_hash"] = entry_hash(entry)
+            line = (
+                json.dumps(
+                    entry,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            view = memoryview(line)
+            while view:
+                written = os.write(ledger_fd, view)
+                view = view[written:]
+            os.fsync(ledger_fd)
+            return entry, False
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def read_entries(path: Path, *, task: str) -> List[Dict[str, Any]]:
+    root = repository_root(path.parents[3])
+    descriptors, _, _, _, task_fd = _open_runtime_fds(
+        root,
+        task,
+        create_task=False,
+        lock_operation=fcntl.LOCK_SH,
+    )
+    try:
+        lock_fd = descriptors[3]
+        ledger_fd = _open_runtime_file(
+            task_fd,
+            "evidence-ledger.jsonl",
+            create=False,
+        )
+        descriptors.append(ledger_fd)
+        with os.fdopen(os.dup(ledger_fd), "r+", encoding="utf-8") as stream:
+            return load_entries(stream, task=task)
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def summarize(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "entry_count": len(entries),
+        "instruction_bytes": sum(
+            entry["context"]["instruction_bytes"] for entry in entries
+        ),
+        "repeated_file_count": sum(
+            entry["context"]["repeated_file_count"] for entry in entries
+        ),
+        "known_model_calls": sum(
+            entry["context"]["model_calls"] or 0 for entry in entries
+        ),
+        "unknown_model_call_entries": sum(
+            entry["context"]["model_calls"] is None for entry in entries
+        ),
+        "known_compactions": sum(
+            entry["context"]["compaction_count"] or 0 for entry in entries
+        ),
+        "unknown_compaction_entries": sum(
+            entry["context"]["compaction_count"] is None for entry in entries
+        ),
+        "repeated_questions": sum(
+            entry["context"]["repeated_questions"] for entry in entries
+        ),
+        "verification_loops": sum(
+            entry["context"]["verification_loops"] for entry in entries
+        ),
+        "last_event_hash": entries[-1]["event_hash"] if entries else "",
+    }
+
+
+def _runtime_module():
+    import importlib.util
+
+    sibling = Path(__file__).with_name("workflow_runtime_contracts.py")
+    if sibling.is_symlink() or not sibling.is_file():
+        raise ValueError("runtime contract support module is unsafe")
+    spec = importlib.util.spec_from_file_location(
+        "workflow_runtime_contracts",
+        sibling,
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("runtime contract support module is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _open_runtime_component(parent: int, name: str, *, directory: bool) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    if directory:
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags, dir_fd=parent)
+    metadata = os.fstat(descriptor)
+    if directory and (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o022
+    ):
+        os.close(descriptor)
+        raise ValueError("runtime component is not a directory: {}".format(name))
+    if not directory and not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise ValueError("runtime component is not a regular file: {}".format(name))
+    if not directory and (
+        metadata.st_nlink != 1
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        os.close(descriptor)
+        raise ValueError("runtime component is unsafe: {}".format(name))
+    if not directory:
+        _revalidate_file_link(parent, name, descriptor)
+    return descriptor
+
+
+def seal_terminal(
+    root: Path,
+    *,
+    task: str,
+    _phase_hook=None,
+) -> Dict[str, Any]:
+    """Append a terminal seal and install its sentinel under one stable lock."""
+
+    request = read_json_input("terminal seal")
+    if not isinstance(request, dict):
+        raise ValueError("terminal seal input must be one JSON object")
+    runtime = _runtime_module()
+    descriptors: list[int] = []
+    try:
+        descriptors, root_fd, runtime_fd, lock_fd, task_fd = _open_runtime_fds(
+            root,
+            task,
+            create_task=False,
+            lock_operation=fcntl.LOCK_EX,
+            _phase_hook=_phase_hook,
+        )
+        lock_name, sentinel_name = runtime_state_names(task)
+        sentinel_present = False
+        try:
+            sentinel_fd = _open_runtime_component(
+                runtime_fd,
+                sentinel_name,
+                directory=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            os.close(sentinel_fd)
+            sentinel_present = True
+        ledger_fd = _open_runtime_file(
+            task_fd,
+            "evidence-ledger.jsonl",
+            create=False,
+            append=True,
+        )
+        descriptors.append(ledger_fd)
+        _revalidate_file_link(task_fd, "evidence-ledger.jsonl", ledger_fd)
+        original_end = os.lseek(ledger_fd, 0, os.SEEK_END)
+        os.lseek(ledger_fd, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(ledger_fd), "r+", encoding="utf-8") as stream:
+            entries = load_entries(stream, task=task)
+        if not entries:
+            raise ValueError("terminal seal requires an ordinary ledger entry")
+        if any(
+            entry.get("record_kind") == runtime.TERMINAL_SEAL_SCHEMA
+            for entry in entries[:-1]
+        ):
+            raise ValueError("terminal seal is not the final ledger record")
+        last = entries[-1]
+        if last.get("record_kind") == runtime.TERMINAL_SEAL_SCHEMA:
+            marker = runtime.validate_terminal_chain(
+                entries,
+                task_short_id=task,
+            )
+            supplied = runtime.validate_terminal_seal_request(request)
+            recorded = {
+                "schema": runtime.TERMINAL_SEAL_REQUEST_SCHEMA,
+                "operation_report_digests": last["operation_report_digests"],
+                "redaction": last["redaction"],
+                "retention_class": last["retention_class"],
+            }
+            if supplied != runtime.validate_terminal_seal_request(recorded):
+                raise ValueError("terminal seal request conflicts with existing seal")
+            return {
+                "ledger_path": str(
+                    root / ".kent" / "runtime" / task / "evidence-ledger.jsonl"
+                ),
+                "terminal_marker": runtime.terminal_marker_line(marker),
+                "event_hash": last["event_hash"],
+            }
+        if sentinel_present:
+            raise ValueError("terminal sentinel has no valid terminal seal")
+        seal = runtime.build_terminal_seal_record(
+            request,
+            sequence=len(entries) + 1,
+            task_short_id=task,
+            previous_hash=entries[-1]["event_hash"],
+        )
+        line = json.dumps(
+            seal,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        try:
+            view = memoryview(line)
+            while view:
+                written = os.write(ledger_fd, view)
+                if written <= 0:
+                    raise OSError("terminal seal write made no progress")
+                view = view[written:]
+            os.fsync(ledger_fd)
+            os.lseek(ledger_fd, 0, os.SEEK_SET)
+            with os.fdopen(os.dup(ledger_fd), "r+", encoding="utf-8") as stream:
+                reread = load_entries(stream, task=task)
+            if not reread or reread[-1].get("record_kind") != runtime.TERMINAL_SEAL_SCHEMA:
+                raise ValueError("terminal seal reread is not terminal")
+            marker = runtime.validate_terminal_chain(
+                reread,
+                task_short_id=task,
+            )
+        except BaseException:
+            os.ftruncate(ledger_fd, original_end)
+            os.fsync(ledger_fd)
+            os.lseek(ledger_fd, 0, os.SEEK_SET)
+            with os.fdopen(os.dup(ledger_fd), "r+", encoding="utf-8") as stream:
+                load_entries(stream, task=task)
+            raise
+        seal = reread[-1]
+        marker_line = runtime.terminal_marker_line(marker)
+        return {
+            "ledger_path": str(root / ".kent" / "runtime" / task / "evidence-ledger.jsonl"),
+            "terminal_marker": marker_line,
+            "event_hash": seal["event_hash"],
+        }
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def main() -> int:
+    args = parse_args()
+    root = repository_root(args.workspace)
+    path = ledger_path(root, args.task)
+    require_ignored(root, path)
+    if args.command == "append":
+        entry, duplicate_suppressed = append_entry(root, path, task=args.task)
+        print(
+            json.dumps(
+                {
+                    "ledger_path": str(path),
+                    "sequence": entry["sequence"],
+                    "event_hash": entry["event_hash"],
+                    "duplicate_suppressed": duplicate_suppressed,
+                }
+            )
+        )
+        return 0
+    if args.command == "seal":
+        result = seal_terminal(root, task=args.task)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    entries = read_entries(path, task=args.task)
+    if args.command == "read":
+        print(json.dumps(entries, indent=2, ensure_ascii=False))
+        return 0
+    if args.command == "validate":
+        print(
+            json.dumps(
+                {
+                    "valid": True,
+                    "ledger_path": str(path),
+                    "entry_count": len(entries),
+                }
+            )
+        )
+        return 0
+    if args.command == "summary":
+        print(json.dumps(summarize(entries), indent=2, ensure_ascii=False))
+        return 0
+    raise AssertionError("unsupported command: {}".format(args.command))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError) as error:
+        print("workflow-evidence-ledger: {}".format(error), file=sys.stderr)
+        raise SystemExit(1)

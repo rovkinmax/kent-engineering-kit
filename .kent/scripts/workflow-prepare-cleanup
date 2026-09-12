@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Retain one accepted-plan cache and prepare the existing terminal ledger.
+
+The caller owns quiescence, Task-record readback, authority and redaction truth.
+This is cooperative single-owner recovery, not a hostile same-UID filesystem CAS.
+"""
+from __future__ import annotations
+
+import hashlib
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+sys.dont_write_bytecode = True
+
+LIMIT = 4 * 1024 * 1024
+SNAPSHOT_KEYS = {
+    "schema_version", "task_short_id", "plan_path", "work_kind",
+    "normalized_sha256", "normalized_plan",
+}
+REQUEST_KEYS = {
+    "workspace_path", "task_short_id", "snapshot_sha256", "scope_sha256",
+    "retention_receipt", "final_event", "seal_request", "cleanup_report_prefix",
+}
+EVENT_KEYS = {
+    "node_key", "evidence_type", "summary", "artifacts", "checks", "decisions", "context",
+}
+
+
+def unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def parse(raw):
+    return json.loads(raw, object_pairs_hook=unique_pairs)
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def closed(value, keys, label):
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError(f"{label} must contain exactly {sorted(keys)}")
+    return value
+
+
+def text(value, label):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be non-empty text")
+    return value
+
+
+def sha(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError("expected a lowercase SHA-256")
+    return value
+
+
+def safe_path(root, relative, *, create_parents=False):
+    path = Path(relative)
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise ValueError("path must be contained and relative")
+    current = root
+    for part in path.parts[:-1]:
+        current /= part
+        if create_parents and not current.exists():
+            current.mkdir(mode=0o700)
+        mode = current.lstat()
+        if (not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.getuid()
+                or mode.st_mode & 0o022):
+            raise ValueError(f"unsafe path component: {current}")
+    target = current / path.name
+    if target.is_symlink():
+        raise ValueError(f"symlink is not admitted: {target}")
+    return target
+
+
+def read_file(path, *, private=True, limit=LIMIT):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1 or metadata.st_size > limit
+                or metadata.st_mode & (0o077 if private else 0o022)):
+            raise ValueError(f"unsafe or oversized regular file: {path}")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            raw = stream.read(limit + 1)
+        identity = file_identity(metadata)
+        if len(raw) > limit or file_identity(path.lstat()) != identity:
+            raise ValueError(f"file identity changed: {path}")
+        return raw, identity
+    finally:
+        os.close(descriptor)
+
+
+def file_identity(metadata):
+    return (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
+        metadata.st_nlink, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+
+
+def load_command(root, name):
+    path = safe_path(root, f".kent/scripts/{name}")
+    read_file(path, private=False)
+    loader = SourceFileLoader(f"kit_cleanup_{name.replace('-', '_')}", str(path))
+    spec = spec_from_loader(loader.name, loader)
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def write_private(path, raw, *, replace=False):
+    if not replace:
+        try:
+            existing, _ = read_file(path)
+        except FileNotFoundError:
+            pass
+        else:
+            if existing != raw:
+                raise ValueError(f"conflicting retained bytes: {path}")
+            return
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if not replace and path.exists():
+            raise ValueError(f"retained target appeared: {path}")
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+        if read_file(path)[0] != raw:
+            raise ValueError("retained write readback differs")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def git_output(command, environment, *args):
+    result = subprocess.run(
+        [*command, *args], env=environment, capture_output=True, timeout=30,
+        check=False,
+    )
+    if result.returncode != 0 or len(result.stdout) > LIMIT:
+        raise ValueError(f"Git preflight failed: {args[0]}")
+    return result.stdout
+
+
+def require_ignored(command, environment, path):
+    git_output(command, environment, "check-ignore", "-q", "--", path)
+    if git_output(command, environment, "ls-files", "-z", "--", path):
+        raise ValueError(f"retirement/retention path is tracked: {path}")
+
+
+def snapshot_from_receipt(request, root, plan_contract):
+    receipt = closed(request["retention_receipt"], {
+        "task_short_id", "record_ref", "readback_sha256", "data",
+    }, "retention receipt")
+    text(receipt["record_ref"], "retained Task record reference")
+    if receipt["record_ref"].startswith(("/", "file:")):
+        raise ValueError("retention reference must identify a Task record, not a local file")
+    data = closed(receipt["data"], {
+        "snapshot_utf8", "snapshot_sha256", "scope_sha256", "review_refs", "approval_ref",
+    }, "retained Task data")
+    if (receipt["task_short_id"] != request["task_short_id"]
+            or sha(receipt["readback_sha256"]) != digest(canonical(data))
+            or data["snapshot_sha256"] != request["snapshot_sha256"]
+            or data["scope_sha256"] != request["scope_sha256"]):
+        raise ValueError("retention receipt does not match the requested task/scope/snapshot")
+    reviews = data["review_refs"]
+    if (not isinstance(reviews, list) or len(reviews) != 2
+            or any(not isinstance(item, str) or not item.strip() for item in reviews)
+            or len(set(reviews)) != 2):
+        raise ValueError("retention requires two distinct review references")
+    text(data["approval_ref"], "approval reference")
+    raw = text(data["snapshot_utf8"], "retained snapshot").encode()
+    if len(raw) > 1024 * 1024 or digest(raw) != sha(request["snapshot_sha256"]):
+        raise ValueError("retained raw snapshot digest differs")
+    snapshot = closed(parse(raw), SNAPSHOT_KEYS, "accepted snapshot")
+    if (type(snapshot["schema_version"]) is not int or snapshot["schema_version"] != 1
+            or snapshot["task_short_id"] != request["task_short_id"]):
+        raise ValueError("snapshot schema/task differs")
+    profile_path = safe_path(root, ".kent/workflow-profile.toml")
+    profile = tomllib.loads(read_file(profile_path, private=False)[0].decode())
+    if text(snapshot["work_kind"], "snapshot work kind") not in profile["work_kinds"]:
+        raise ValueError("snapshot work kind is not configured")
+    normalized = text(snapshot["normalized_plan"], "normalized plan")
+    if digest(normalized.encode()) != sha(snapshot["normalized_sha256"]):
+        raise ValueError("normalized plan digest differs")
+    configured = text(snapshot["plan_path"], "plan path")
+    plan = None
+    if configured != "not-applicable":
+        plan = safe_path(root, configured)
+        read_file(plan, private=False, limit=1024 * 1024)
+    if plan_contract.normalized_plan(plan) != normalized:
+        raise ValueError("current plan differs from accepted normalized plan")
+    return raw
+
+
+def event_projection(event, root, ledger):
+    closed(event, EVENT_KEYS, "final ordinary event")
+    if event["node_key"] != "cleanup" or event["evidence_type"] != "cleanup_preparation":
+        raise ValueError("final event must identify cleanup_preparation in cleanup")
+    projection = {key: event[key] for key in EVENT_KEYS - {"context"}}
+    ledger.require_string(event["summary"], "summary")
+    for key in ("artifacts", "checks", "decisions"):
+        ledger.require_string_list(event[key], key)
+    projection["context"] = ledger.context_metrics(root, event["context"])
+    return projection
+
+
+def records_at(path, task, ledger, janitor):
+    raw, _ = read_file(path, limit=8 * 1024 * 1024)
+    records = janitor._ledger_records(raw)
+    previous = ""
+    for index, record in enumerate(records, 1):
+        previous = ledger.validate_entry(
+            record, task=task, sequence=index, previous_hash=previous,
+        )
+    if not records:
+        raise ValueError("existing ordinary task evidence is required")
+    if any(record.get("record_kind") == "terminal_evidence_seal_v1" for record in records[:-1]):
+        raise ValueError("terminal seal is not the last ledger record")
+    return records
+
+
+def runtime_inventory(root, task, janitor):
+    directory = safe_path(root, f".kent/runtime/{task}/evidence-ledger.jsonl").parent
+    metadata = directory.lstat()
+    if metadata.st_mode & 0o077:
+        raise ValueError("task runtime directory is not private")
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        names = janitor._bounded_inventory(descriptor)
+    finally:
+        os.close(descriptor)
+    allowed = {
+        "plan-contract.json", "evidence-ledger.jsonl",
+        "fix-checkpoint.json", "smoke-checkpoint.json",
+    }
+    if set(names) - allowed:
+        raise ValueError(f"unknown restricted runtime entries: {sorted(set(names) - allowed)}")
+    for name in names:
+        read_file(directory / name, limit=8 * 1024 * 1024)
+
+
+def invoke_ledger(root, task, action, payload, environment):
+    result = subprocess.run(
+        [sys.executable, str(root / ".kent/scripts/workflow-evidence-ledger"),
+         action, "--task", task, "--workspace", str(root)],
+        input=canonical(payload), env=environment, capture_output=True, timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"ledger {action} failed: {result.stderr.decode(errors='replace')[:2000]}")
+    return parse(result.stdout)
+
+
+def assert_final_record(records, prepared):
+    ordinary = records[:-1] if records[-1].get("record_kind") == "terminal_evidence_seal_v1" else records
+    baseline = prepared["baseline"]
+    if len(ordinary) != baseline["sequence"] + 1:
+        raise ValueError("final ordinary event was not appended exactly once")
+    final = ordinary[-1]
+    if (final["previous_hash"] != baseline["event_hash"]
+            or any(final.get(key) != value for key, value in prepared["event"].items())
+            or final.get("workspace_path") != prepared["request"]["workspace_path"]
+            or final.get("task_short_id") != prepared["request"]["task_short_id"]
+            or final.get("git_head") != prepared["git_head"]
+            or any(not final.get(key) or final[key] == "unknown"
+                   for key in ("run_id", "session_id", "step_id"))):
+        raise ValueError("actual final ordinary event does not match preparation")
+
+
+def prepare(request):
+    closed(request, REQUEST_KEYS, "cleanup preparation request")
+    configured = text(request["workspace_path"], "workspace_path")
+    root = Path(configured)
+    if (not root.is_absolute() or str(root.resolve()) != configured
+            or root.lstat().st_uid != os.getuid() or root.lstat().st_mode & 0o022):
+        raise ValueError("workspace_path must be the canonical owned Git root")
+    task = text(request["task_short_id"], "task_short_id")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", task):
+        raise ValueError("invalid task identity")
+    sha(request["snapshot_sha256"])
+    sha(request["scope_sha256"])
+    prefix = text(request["cleanup_report_prefix"], "cleanup report prefix")
+    if "TERMINAL_EVIDENCE_V1" in prefix:
+        raise ValueError("cleanup report prefix already contains a terminal marker")
+    ledger = load_command(root, "workflow-evidence-ledger")
+    janitor = load_command(root, "workflow-task-janitor")
+    plan_contract = load_command(root, "workflow-plan-contract")
+    runtime = ledger._runtime_module()
+    seal_request = runtime.validate_terminal_seal_request(request["seal_request"])
+    command, environment = janitor._evidence_git_workspace(root)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    head = git_output(command, environment, "rev-parse", "HEAD").decode().strip()
+    for relative in (f".kent/runtime/{task}", f"build/kent-workflow/{task}"):
+        require_ignored(command, environment, relative)
+    raw = snapshot_from_receipt(request, root, plan_contract)
+    projection = event_projection(request["final_event"], root, ledger)
+    store_relative = f"build/kent-workflow/{task}"
+    # Existing unsafe components are never repaired or chmod-normalized.
+    receipt_path = safe_path(root, f"{store_relative}/cleanup-preparation.json",
+                             create_parents=True)
+    if receipt_path.parent.stat().st_mode & 0o077:
+        raise ValueError("preparation directory is not private")
+    archive = receipt_path.with_name(f"plan-contract-{request['snapshot_sha256']}.json")
+    try:
+        prepared = parse(read_file(receipt_path)[0])
+    except FileNotFoundError:
+        prepared = None
+    if prepared is not None:
+        closed(prepared, {
+            "schema_version", "request", "git_head", "event", "baseline", "state", "cleanup_report",
+        }, "preparation receipt")
+        if (prepared["schema_version"] != 1 or prepared["request"] != request
+                or prepared["git_head"] != head or prepared["event"] != projection
+                or prepared["state"] not in {"prepared", "completed"}):
+            raise ValueError("preparation receipt conflicts with frozen request")
+        baseline = closed(prepared["baseline"], {"sequence", "event_hash"}, "ledger baseline")
+        if type(baseline["sequence"]) is not int or baseline["sequence"] < 1:
+            raise ValueError("preparation has an invalid ordinary ledger baseline")
+        sha(baseline["event_hash"])
+        if prepared["state"] == "prepared" and prepared["cleanup_report"] is not None:
+            raise ValueError("unfinished preparation claims a completed report")
+        if read_file(archive)[0] != raw:
+            raise ValueError("archive differs from retained snapshot")
+
+    task_directory = root / ".kent/runtime" / task
+    if not task_directory.exists():
+        if prepared is None or prepared["state"] != "completed":
+            raise ValueError("missing runtime requires a completed preparation receipt")
+        marker = runtime.validate_cleanup_report(prepared["cleanup_report"])
+        recorded_request = {
+            "schema": runtime.TERMINAL_SEAL_REQUEST_SCHEMA,
+            **{key: marker[key] for key in
+               ("operation_report_digests", "redaction", "retention_class")},
+        }
+        if (marker["task_short_id"] != task
+                or marker["event_count"] != prepared["baseline"]["sequence"] + 2
+                or runtime.validate_terminal_seal_request(recorded_request) != seal_request
+                or prepared["cleanup_report"] != prefix.rstrip() + "\n" + runtime.terminal_marker_line(marker)):
+            raise ValueError("completed marker/report conflicts with the frozen request")
+        expected = ".evidence-cleanup-" + runtime.canonical_sha256(marker)
+        tombstone = safe_path(root, f".kent/runtime/{expected}/evidence-ledger.jsonl")
+        if not tombstone.parent.is_dir():
+            raise ValueError("completed preparation has no retained Janitor tombstone")
+        # Janitor freshly validates its retained ledger and sentinel itself.
+        return {"cleanup_report": prepared["cleanup_report"],
+                "receipt_path": str(receipt_path.relative_to(root))}
+
+    runtime_inventory(root, task, janitor)
+    source = safe_path(root, f".kent/runtime/{task}/plan-contract.json")
+    evidence_path = source.with_name("evidence-ledger.jsonl")
+    records = records_at(evidence_path, task, ledger, janitor)
+    if prepared is None:
+        if records[-1].get("record_kind") == runtime.TERMINAL_SEAL_SCHEMA:
+            raise ValueError("an existing seal requires its preparation receipt")
+        source_raw, source_identity = read_file(source)
+        if source_raw != raw:
+            raise ValueError("source snapshot differs from verified retained bytes")
+        prepared = {
+            "schema_version": 1, "request": request, "git_head": head,
+            "event": projection,
+            "baseline": {"sequence": len(records), "event_hash": records[-1]["event_hash"]},
+            "state": "prepared", "cleanup_report": None,
+        }
+        write_private(archive, raw)
+        write_private(receipt_path, canonical(prepared))
+    elif source.exists():
+        source_raw, source_identity = read_file(source)
+        if source_raw != raw or prepared["state"] == "completed":
+            raise ValueError("source snapshot conflicts with preparation state")
+    else:
+        source_identity = None
+    if source_identity is not None:
+        runtime_inventory(root, task, janitor)
+        current_raw, current_identity = read_file(source)
+        if current_identity != source_identity or current_raw != raw:
+            raise ValueError("snapshot identity changed before retirement")
+        source.unlink()
+        fsync_directory(source.parent)
+    baseline = prepared["baseline"]
+    if (len(records) == baseline["sequence"]
+            and records[-1]["event_hash"] == baseline["event_hash"]):
+        if prepared["state"] == "completed":
+            raise ValueError("completed preparation lost its terminal evidence")
+        for identity in ("KENT_RUN_ID", "KENT_SESSION_ID", "KENT_STEP_ID"):
+            if not os.environ.get(identity) or os.environ[identity] == "unknown":
+                raise ValueError("real current Kent event identities are required")
+        invoke_ledger(root, task, "append", request["final_event"], environment)
+        records = records_at(evidence_path, task, ledger, janitor)
+    assert_final_record(records, prepared)
+    sealed = invoke_ledger(root, task, "seal", seal_request, environment)
+    records = records_at(evidence_path, task, ledger, janitor)
+    assert_final_record(records, prepared)
+    marker = runtime.validate_terminal_chain(records, task_short_id=task)
+    line = runtime.terminal_marker_line(marker)
+    if sealed["terminal_marker"] != line:
+        raise ValueError("seal output does not match actual terminal ledger")
+    report = prefix.rstrip() + "\n" + line
+    runtime.validate_cleanup_report(report)
+    if prepared["state"] == "completed" and prepared["cleanup_report"] != report:
+        raise ValueError("completed cleanup report differs")
+    prepared.update(state="completed", cleanup_report=report)
+    write_private(receipt_path, canonical(prepared), replace=True)
+    return {"cleanup_report": report, "receipt_path": str(receipt_path.relative_to(root))}
+
+
+def main():
+    raw = sys.stdin.buffer.read(LIMIT + 1)
+    if len(raw) > LIMIT:
+        raise ValueError("cleanup preparation input exceeds limit")
+    print(json.dumps(prepare(parse(raw)), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"Cleanup preparation blocked: {error}", file=sys.stderr)
+        raise SystemExit(1)

@@ -14,6 +14,52 @@ The kit separates:
 Project repositories remain responsible for architecture rules, build commands,
 device details, release policy, and integration credentials.
 
+## Developing the Kit itself
+
+The checkout-local `.kent/workflow-profile.toml` and
+`.kent/project-contract.md` define **Kit Engineering Delivery v1**. Its
+project builder is `.kent/workflows/kit_development.py`; the generated
+`.kent/workflows/kit-engineering-delivery-v1.spec.json` is a semantic audit
+input, not evidence of a live workflow installation.
+
+This schema-3 development-only flow reuses the lite delivery graph with a
+continuous writer: Plan, two independent preview reviews, human approval,
+Implement, local verification and Standards review, PR delivery, and owned
+Cleanup/Janitor. There is no separate CI stage, Smoke, publication, or final
+Compliance layer. Existing GitHub checks and merge policy remain in force.
+Run `./scripts/validate` from the selected source worktree; do not use
+`--installed-state` for source development. Python 3.11+ must already exist.
+
+Source development is separate from installed Kit adoption. The installed
+primary checkout remains clean on
+`9363fa48f9f21d2742a41841ab97b18cc4c4e521`; preserve its index, local `main`,
+symlinks, global configuration, consumer pins and workflows. Do not run the
+installation instructions below as part of self-development.
+
+Before starting a future Task, explicitly acquire the approved source with
+`git fetch origin`, inspect `git symbolic-ref refs/remotes/origin/HEAD` and
+`git rev-parse refs/remotes/origin/HEAD`, and verify the complete `.kent`
+profile, procedures and executable command closure at that exact commit.
+Kent's `default-branch` policy resolves **local tracking refs**, locks the
+commit before execution and does not implicitly fetch. A first Task Script
+cannot repair stale source selection. Use normal Kent-managed worktrees;
+do not create a second source workspace or change setup hooks.
+
+After an approved merged delivery, explicitly refresh remote tracking and
+repeat that preflight before another Task starts. Do not check out or
+fast-forward installed local `main`. Bootstrap qualification instead selects
+the exact published candidate SHA under separate effect approval. Keep its
+published branch intact through qualification; report-only cleanup requires
+exact HEAD equality with a current published branch tip, not mere ancestry.
+
+Source approval permits only its named source changes and local checks.
+Commit/push/PR, live create/apply/link/default, qualification Task execution,
+consumer rollout and installed adoption each need their applicable explicit
+authority. Future authorized delivery commits and pushes the task branch
+only; never push directly to `main` or merge the PR. Cleanup runs through the
+existing post-session Janitor, and acceptance checks actual worktree-path
+and Git/Kent-registration absence, not just Task Done.
+
 ## Runtime contract v2
 
 Schema-4 projects adopt runtime v2 atomically through
