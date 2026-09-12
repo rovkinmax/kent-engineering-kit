@@ -1,0 +1,1899 @@
+#!/usr/bin/env python3
+"""Terminal evidence admission under the existing cooperative POSIX lock.
+
+One scoped admission owns the directory and file descriptors through rename,
+retention or deletion. CI names are not an allowlist: canonical validated bytes,
+their digest and an exact logical Task reference in the sealed chain authorize
+each report. Tombstone paths never become logical artifact identities.
+Admission Git probes resolve and bind the selected workspace's own Git directory,
+worktree and index, including linked worktrees. Inherited GIT_* routing, object,
+namespace and config injection are removed; ordinary on-disk Git exclusions
+remain effective. Probes are read-only, with optional locks, hooks, fsmonitor,
+automatic maintenance, replacement objects and lazy fetch disabled.
+Two bounded batched probes revalidate the remaining logical/physical inventory
+at each admission/namespace boundary, so observed index or ignore-policy drift
+blocks further cleanup without rewriting user staging or configuration.
+
+Initial and managed admission require every referenced report. Only a matching
+tombstone with a verified durable sentinel and matching ledger/report marker may
+resume with already-absent reports; that checkpoint cannot distinguish prior
+deletion from unrelated loss. No absent bytes are claimed to have been verified.
+Managed cleanup retains all raw bytes. Primary cleanup removes fix, smoke,
+lexically ordered reports, then the ledger last, fsyncing after each unlink.
+FD/link/byte checks detect cooperative drift, not hostile same-UID stat/unlink
+races: POSIX unlink is not an atomic inode compare-and-swap.
+"""
+from __future__ import annotations
+
+import json
+import fcntl
+import hashlib
+import io
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import time
+from urllib.parse import urlparse
+
+
+TASK_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+GITHUB_LOOKUP_ATTEMPTS = 3
+CI_REPORT_NAME = re.compile(r"ci-report-([0-9a-f]{64})\.json")
+MAX_RUNTIME_ENTRIES = 256
+MAX_CI_ARTIFACTS = 64
+MAX_CI_ARTIFACT_BYTES = 4 * 1024 * 1024
+MAX_LEDGER_BYTES = 8 * 1024 * 1024
+MAX_LEDGER_RECORDS = 8192
+
+
+def runtime_state_names(task: str) -> tuple[str, str]:
+    digest = hashlib.sha256(task.encode("utf-8")).hexdigest()
+    return (
+        ".evidence-lock-{}".format(digest),
+        ".evidence-terminal-{}".format(digest),
+    )
+
+
+def runtime_contracts():
+    import importlib.util
+
+    sibling = Path(__file__).with_name("workflow_runtime_contracts.py")
+    if sibling.is_symlink() or not sibling.is_file():
+        raise RuntimeError("runtime contract support module is unsafe")
+    spec = importlib.util.spec_from_file_location(
+        "workflow_runtime_contracts",
+        sibling,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("runtime contract support module is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def run(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int = 60,
+    check: bool = True,
+    environment: dict[str, str] | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        args,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+        env=environment,
+        input=input_text,
+    )
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise RuntimeError(f"{' '.join(args)} failed: {detail}")
+    return result
+
+
+def require_string(payload: dict[str, object], key: str, *, empty: bool = False) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    value = value.strip()
+    if not empty and not value:
+        raise ValueError(f"{key} must be a non-empty string")
+    return value
+
+
+def primary_root(workspace: Path) -> Path:
+    result = run(["git", "worktree", "list", "--porcelain"], cwd=workspace)
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            return Path(line.removeprefix("worktree ")).resolve()
+    raise RuntimeError("cannot determine the primary Git worktree")
+
+
+def json_object(output: str, label: str) -> dict[str, object]:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{label} returned invalid JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{label} returned a non-object JSON payload")
+    return payload
+
+
+def cleanup_session_uses_workspace(
+    wrapper: str,
+    primary: Path,
+    cleanup_session_id: str,
+    workspace: Path,
+) -> bool:
+    result = run(
+        [
+            wrapper,
+            "status",
+            "--session",
+            cleanup_session_id,
+            "--json",
+        ],
+        cwd=primary,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise RuntimeError(f"Kent worktree status failed: {detail}")
+    payload = json_object(result.stdout, "Kent worktree status")
+    target = payload.get("target")
+    worktree = payload.get("worktree")
+    candidates: list[object] = []
+    if isinstance(target, dict):
+        candidates.append(target.get("EffectiveWorkdir"))
+    if isinstance(worktree, dict):
+        candidates.extend(
+            (
+                worktree.get("recorded_root"),
+                worktree.get("observed_root"),
+            )
+        )
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        candidate_path = Path(candidate).expanduser().resolve()
+        if candidate_path == workspace or candidate_path.is_relative_to(workspace):
+            return True
+    return False
+
+
+def git_registers_worktree(primary: Path, workspace: Path) -> bool:
+    result = run(["git", "worktree", "list", "--porcelain"], cwd=primary)
+    for line in result.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        registered = Path(line.removeprefix("worktree ")).expanduser().resolve()
+        if registered == workspace:
+            return True
+    return False
+
+
+def github_pull_number(pr_url: str) -> str:
+    parsed = urlparse(pr_url)
+    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"}:
+        raise ValueError("pr_url must be an https://github.com URL")
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) != 4 or parts[2] != "pull" or not parts[3].isdigit():
+        raise ValueError("pr_url must identify one GitHub pull request")
+    return parts[3]
+
+
+def github_pr(workspace: Path, pr_url: str) -> dict[str, object]:
+    github_pull_number(pr_url)
+    retry_delay = float(
+        os.environ.get("KENT_JANITOR_GH_RETRY_DELAY_SECONDS", "2")
+    )
+    if retry_delay < 0:
+        raise ValueError("KENT_JANITOR_GH_RETRY_DELAY_SECONDS must be non-negative")
+
+    last_error: Exception | None = None
+    for attempt in range(1, GITHUB_LOOKUP_ATTEMPTS + 1):
+        try:
+            result = run(
+                [
+                    os.environ.get("KENT_GH_BIN", "gh"),
+                    "pr",
+                    "view",
+                    pr_url,
+                    "--json",
+                    "state,mergedAt,headRefName,headRefOid,isCrossRepository,url",
+                ],
+                cwd=workspace,
+            )
+            payload = json.loads(result.stdout)
+            if not isinstance(payload, dict):
+                raise RuntimeError("gh returned a non-object PR payload")
+            return payload
+        except (
+            OSError,
+            RuntimeError,
+            json.JSONDecodeError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            last_error = error
+            if attempt < GITHUB_LOOKUP_ATTEMPTS and retry_delay:
+                time.sleep(retry_delay)
+
+    raise RuntimeError(
+        "GitHub PR lookup failed after "
+        f"{GITHUB_LOOKUP_ATTEMPTS} attempts: {last_error}"
+    )
+
+
+def commit_available(repository: Path, oid: str) -> bool:
+    return (
+        run(
+            ["git", "cat-file", "-e", f"{oid}^{{commit}}"],
+            cwd=repository,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def merged_pr_contains_head(
+    primary: Path,
+    pr_url: str,
+    head: str,
+    pr_head: str,
+) -> bool:
+    if not pr_head:
+        return False
+    if head == pr_head:
+        return True
+    if not commit_available(primary, pr_head):
+        pr_number = github_pull_number(pr_url)
+        fetched = run(
+            [
+                "git",
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "origin",
+                f"refs/pull/{pr_number}/head",
+            ],
+            cwd=primary,
+            timeout=120,
+            check=False,
+        )
+        if fetched.returncode != 0:
+            detail = fetched.stderr.strip() or fetched.stdout.strip() or "no output"
+            raise RuntimeError(f"merged PR head fetch failed: {detail}")
+        if not commit_available(primary, pr_head):
+            raise RuntimeError(
+                f"merged PR head {pr_head} is unavailable after fetch"
+            )
+    ancestry = run(
+        ["git", "merge-base", "--is-ancestor", head, pr_head],
+        cwd=primary,
+        check=False,
+    )
+    if ancestry.returncode == 0:
+        return True
+    if ancestry.returncode == 1:
+        return False
+    detail = ancestry.stderr.strip() or ancestry.stdout.strip() or "no output"
+    raise RuntimeError(f"merged PR ancestry check failed: {detail}")
+
+
+def remote_branch_oid(primary: Path, branch: str) -> str:
+    result = run(
+        ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
+        cwd=primary,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    line = result.stdout.strip().splitlines()
+    return line[0].split()[0] if line else ""
+
+
+def head_matches_current_remote(primary: Path, head: str) -> bool:
+    result = run(
+        ["git", "ls-remote", "--heads", "origin"],
+        cwd=primary,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    return any(
+        fields and fields[0] == head
+        for fields in (
+            line.split()
+            for line in result.stdout.splitlines()
+        )
+    )
+
+
+def open_child_directory(parent_fd: int, name: str) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o022
+    ):
+        os.close(descriptor)
+        raise ValueError(f"runtime component is not a directory: {name}")
+    return descriptor
+
+
+def _revalidate_directory_link(parent_fd: int, name: str, descriptor: int) -> None:
+    opened = os.fstat(descriptor)
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != opened.st_dev
+        or current.st_ino != opened.st_ino
+        or current.st_uid != os.getuid()
+        or current.st_mode & 0o022
+    ):
+        raise ValueError("runtime directory changed during cleanup admission")
+
+
+def _revalidate_file_link(parent_fd: int, name: str, descriptor: int) -> None:
+    opened = os.fstat(descriptor)
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_dev != opened.st_dev
+        or current.st_ino != opened.st_ino
+        or current.st_uid != os.getuid()
+        or current.st_nlink != 1
+        or current.st_mode & 0o077
+    ):
+        raise ValueError("runtime file changed during cleanup admission")
+
+
+def close_descriptors(*descriptors: int) -> None:
+    for descriptor in reversed(descriptors):
+        os.close(descriptor)
+
+
+def _unique_json_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key in runtime evidence")
+        value[key] = item
+    return value
+
+
+def _invalid_json_constant(value):
+    raise ValueError("invalid JSON constant in runtime evidence")
+
+
+def _bounded_file_bytes(descriptor: int, limit: int, *, ledger=False) -> bytes:
+    if os.fstat(descriptor).st_size > limit:
+        raise ValueError("runtime evidence exceeds byte limit")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    size = rows = 0
+    while True:
+        chunk = os.read(descriptor, min(65536, limit - size + 1))
+        if not chunk:
+            break
+        size += len(chunk)
+        rows += chunk.count(b"\n")
+        if size > limit or (ledger and rows > MAX_LEDGER_RECORDS):
+            raise ValueError("runtime evidence exceeds byte or record limit")
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    if ledger and rows + bool(raw and not raw.endswith(b"\n")) > MAX_LEDGER_RECORDS:
+        raise ValueError("runtime ledger exceeds record limit")
+    return raw
+
+
+def _ledger_records(raw: bytes) -> list[dict[str, object]]:
+    records = []
+    # Keep the existing JSONL formatting/chain semantics, without duplicate keys.
+    for line in io.StringIO(raw.decode("utf-8"), newline=None):
+        if len(records) >= MAX_LEDGER_RECORDS:
+            raise ValueError("runtime ledger exceeds record limit")
+        try:
+            value = json.loads(
+                line, object_pairs_hook=_unique_json_pairs,
+                parse_constant=_invalid_json_constant,
+            )
+        except RecursionError as error:
+            raise ValueError("runtime ledger nesting exceeds limit") from error
+        if not isinstance(value, dict):
+            raise ValueError("ledger record is not an object")
+        records.append(value)
+    return records
+
+
+def _open_evidence_file(task_fd: int, name: str) -> int:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=task_fd,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise ValueError(f"runtime evidence is unsafe: {name}")
+        _revalidate_file_link(task_fd, name, descriptor)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_ledger_records(task_fd: int) -> list[dict[str, object]]:
+    descriptor = _open_evidence_file(task_fd, "evidence-ledger.jsonl")
+    try:
+        return _ledger_records(
+            _bounded_file_bytes(descriptor, MAX_LEDGER_BYTES, ledger=True)
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _bounded_inventory(directory_fd: int) -> list[str]:
+    names = []
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            if len(names) >= MAX_RUNTIME_ENTRIES:
+                raise ValueError("runtime directory exceeds entry limit")
+            names.append(entry.name)
+    return sorted(names)
+
+
+def _evidence_git_workspace(workspace: Path) -> tuple[list[str], dict[str, str]]:
+    """Bind local admission probes, without changing other Janitor commands."""
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+    environment.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    prefix = [
+        "git", "--no-replace-objects", "--no-lazy-fetch",
+        "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false",
+        "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+    ]
+    resolved = run(
+        [*prefix, "-C", str(workspace), "rev-parse",
+         "--show-toplevel", "--absolute-git-dir"],
+        cwd=workspace, environment=environment, check=False,
+    )
+    paths = resolved.stdout.splitlines()
+    if (
+        resolved.returncode != 0 or len(paths) != 2
+        or not all(Path(path).is_absolute() for path in paths)
+        or Path(paths[0]).resolve() != workspace.resolve()
+    ):
+        raise ValueError("evidence Git workspace does not match selected workspace")
+    git_directory = Path(paths[1]).resolve()
+    environment["GIT_INDEX_FILE"] = str(git_directory / "index")
+    return [
+        *prefix, f"--git-dir={git_directory}", f"--work-tree={workspace.resolve()}",
+    ], environment
+
+
+class _EvidenceAdmission:
+    """Janitor-local FD ownership; no caller-supplied recovery phase."""
+
+    def __init__(
+        self, workspace, runtime, runtime_fd, state_fd, state_name,
+        task_short_id, reported_marker,
+    ):
+        self.directory = os.dup(state_fd)
+        self.runtime_fd = runtime_fd
+        self.name = state_name
+        self.files = {}
+        self.references = set()
+        self.sentinel = -1
+        self.phase = "initial"
+        self.workspace = workspace
+        self.task_short_id = task_short_id
+        try:
+            entries = _bounded_inventory(self.directory)
+            ledger_fd = _open_evidence_file(self.directory, "evidence-ledger.jsonl")
+            self.files["evidence-ledger.jsonl"] = (ledger_fd, None, None)
+            raw = _bounded_file_bytes(ledger_fd, MAX_LEDGER_BYTES, ledger=True)
+            records = _ledger_records(raw)
+            self.marker = runtime.validate_terminal_chain(
+                records, task_short_id=task_short_id,
+            )
+            self.tombstone = ".evidence-cleanup-" + runtime.canonical_sha256(self.marker)
+            if state_name not in (task_short_id, self.tombstone):
+                raise ValueError("cleanup tombstone name does not match sealed ledger")
+            if reported_marker != self.marker:
+                raise ValueError("cleanup report marker does not match ledger")
+            self.files["evidence-ledger.jsonl"] = (
+                ledger_fd, os.fstat(ledger_fd), raw,
+            )
+            for record in records:
+                artifacts = record.get("artifacts", [])
+                if not isinstance(artifacts, list) or any(
+                    not isinstance(item, str) for item in artifacts
+                ):
+                    raise ValueError("ledger artifacts must be strings")
+                for artifact in artifacts:
+                    name = artifact.rsplit("/", 1)[-1]
+                    if not name.startswith("ci-report-"):
+                        continue
+                    if (
+                        not CI_REPORT_NAME.fullmatch(name)
+                        or artifact != f".kent/runtime/{task_short_id}/{name}"
+                    ):
+                        raise ValueError("CI report reference is not a logical Task artifact")
+                    self.references.add(name)
+                    if len(self.references) > MAX_CI_ARTIFACTS:
+                        raise ValueError("CI report reference count exceeds limit")
+            if state_name == self.tombstone:
+                _, self.sentinel_name = runtime_state_names(task_short_id)
+                try:
+                    self.sentinel = _open_evidence_file(runtime_fd, self.sentinel_name)
+                except FileNotFoundError:
+                    pass
+                else:
+                    if _bounded_file_bytes(self.sentinel, 0):
+                        raise ValueError("terminal sentinel is unsafe")
+                    os.fsync(self.sentinel)
+                    os.fsync(runtime_fd)
+                    _revalidate_file_link(runtime_fd, self.sentinel_name, self.sentinel)
+                    self.phase = "deletion-resume"
+            allowed = {
+                "evidence-ledger.jsonl", "fix-checkpoint.json", "smoke-checkpoint.json",
+            } | self.references
+            unknown = set(entries) - allowed
+            if unknown:
+                raise ValueError(f"unexpected tombstone entries: {sorted(unknown)}")
+            self.git_command, self.git_environment = _evidence_git_workspace(workspace)
+            total = 0
+            for name in entries:
+                if name != "evidence-ledger.jsonl":
+                    descriptor = _open_evidence_file(self.directory, name)
+                    self.files[name] = (descriptor, None, None)
+                    report_bytes = None
+                    if name in self.references:
+                        report_bytes = _bounded_file_bytes(descriptor, runtime.MAX_CI_REPORT_BYTES)
+                        total += len(report_bytes)
+                        if total > MAX_CI_ARTIFACT_BYTES:
+                            raise ValueError("total CI report bytes exceed limit")
+                        report = runtime.validate_ci_report(
+                            runtime.parse_canonical_json(
+                                report_bytes, label="CI artifact",
+                                max_bytes=runtime.MAX_CI_REPORT_BYTES,
+                            )
+                        )
+                        if (
+                            runtime.canonical_bytes(report) != report_bytes
+                            or hashlib.sha256(report_bytes).hexdigest()
+                            != CI_REPORT_NAME.fullmatch(name).group(1)
+                        ):
+                            raise ValueError("CI artifact bytes or filename digest do not match")
+                    self.files[name] = (descriptor, os.fstat(descriptor), report_bytes)
+            if self.phase != "deletion-resume":
+                self.require_complete()
+            self.revalidate()
+        except BaseException:
+            self.close()
+            raise
+
+    def require_complete(self):
+        if self.references - self.files.keys():
+            raise ValueError("referenced CI artifacts are missing")
+
+    def _revalidate_git(self):
+        # Check the complete remaining set twice, not once per remaining file.
+        # Bound input/output paths by the already admitted inventory.
+        paths = sorted(
+            f".kent/runtime/{parent}/{name}"
+            for parent in {self.task_short_id, self.name, self.tombstone}
+            for name in self.files
+        )
+        if not paths:
+            return
+        ignored = run(
+            [*self.git_command, "check-ignore", "-z", "--stdin"],
+            cwd=self.workspace, check=False, environment=self.git_environment,
+            input_text="".join(path + "\0" for path in paths),
+        )
+        tracked = run(
+            [*self.git_command, "--literal-pathspecs", "ls-files", "-z", "--", *paths],
+            cwd=self.workspace, check=False, environment=self.git_environment,
+        )
+        if (
+            ignored.returncode != 0 or not ignored.stdout.endswith("\0")
+            or ignored.stdout.split("\0")[:-1] != paths
+            or tracked.returncode != 0 or tracked.stdout
+        ):
+            raise ValueError("runtime entries are tracked or not ignored in selected workspace")
+
+    def revalidate(self):
+        _revalidate_directory_link(self.runtime_fd, self.name, self.directory)
+        if set(_bounded_inventory(self.directory)) != self.files.keys():
+            raise ValueError("runtime inventory changed after admission")
+        if self.sentinel >= 0:
+            _revalidate_file_link(self.runtime_fd, self.sentinel_name, self.sentinel)
+            _bounded_file_bytes(self.sentinel, 0)
+        for name, (descriptor, saved, raw) in self.files.items():
+            _revalidate_file_link(self.directory, name, descriptor)
+            current = os.fstat(descriptor)
+            if any(
+                getattr(current, key) != getattr(saved, key)
+                for key in ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink")
+            ):
+                raise ValueError("runtime file identity changed after admission")
+            if raw is not None and _bounded_file_bytes(
+                descriptor, len(raw), ledger=name == "evidence-ledger.jsonl",
+            ) != raw:
+                raise ValueError("runtime evidence bytes changed after admission")
+        self._revalidate_git()
+
+    def unlink(self, name):
+        self.revalidate()
+        if name == "evidence-ledger.jsonl" and set(self.files) != {name}:
+            raise ValueError("evidence ledger must be removed last")
+        os.unlink(name, dir_fd=self.directory)
+        descriptor, _, _ = self.files.pop(name)
+        os.close(descriptor)
+
+    def close(self):
+        for descriptor, _, _ in self.files.values():
+            os.close(descriptor)
+        self.files.clear()
+        if self.sentinel >= 0:
+            os.close(self.sentinel)
+            self.sentinel = -1
+        os.close(self.directory)
+
+
+def _open_stable_lock(runtime_fd: int, name: str) -> tuple[int, bool]:
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(
+            name,
+            flags | getattr(os, "O_EXCL", 0),
+            0o600,
+            dir_fd=runtime_fd,
+        )
+    except FileExistsError:
+        descriptor = os.open(name, flags, 0o600, dir_fd=runtime_fd)
+        created = False
+    else:
+        try:
+            os.fsync(runtime_fd)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        created = True
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        os.close(descriptor)
+        raise ValueError("stable evidence lock is unsafe")
+    return descriptor, created
+
+
+def _cleanup_marker(runtime, report: str, task_short_id: str) -> dict[str, object]:
+    marker = runtime.validate_cleanup_report(report)
+    if marker["task_short_id"] != task_short_id:
+        raise ValueError("cleanup report marker task does not match requested task")
+    return marker
+
+
+def _declares_terminal_evidence(report: str | None) -> bool:
+    return isinstance(report, str) and any(
+        line.startswith("TERMINAL_EVIDENCE_V1 ") for line in report.splitlines()
+    )
+
+
+def _validate_retained_tombstone(
+    workspace: Path,
+    runtime,
+    tombstone_fd: int,
+    tombstone_name: str,
+    task_short_id: str,
+    reported_marker: dict[str, object],
+    runtime_fd: int,
+) -> _EvidenceAdmission:
+    admission = _EvidenceAdmission(
+        workspace, runtime, runtime_fd, tombstone_fd, tombstone_name,
+        task_short_id, reported_marker,
+    )
+    try:
+        # A managed worktree never enters raw-file deletion recovery.
+        admission.require_complete()
+        admission.phase = "managed-retained"
+        return admission
+    except BaseException:
+        admission.close()
+        raise
+
+
+def _remove_v2_runtime_state(
+    workspace: Path,
+    task_short_id: str,
+    *,
+    cleanup_report: str | None = None,
+    _phase_hook=None,
+) -> tuple[bool, str] | None:
+    lock_name, sentinel_name = runtime_state_names(task_short_id)
+    support_module = Path(__file__).with_name("workflow_runtime_contracts.py")
+    v2_supported = support_module.is_file() and not support_module.is_symlink()
+    v2_declared = _declares_terminal_evidence(cleanup_report)
+    if v2_declared and not v2_supported:
+        return False, "declared v2 runtime support is missing or unsafe"
+    descriptors: list[int] = []
+    admission = None
+    try:
+        root_fd = os.open(
+            workspace,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        descriptors.append(root_fd)
+        kent_fd = open_child_directory(root_fd, ".kent")
+        descriptors.append(kent_fd)
+        try:
+            runtime_fd = open_child_directory(kent_fd, "runtime")
+        except FileNotFoundError:
+            if v2_declared:
+                return False, "sealed v2 runtime evidence is missing"
+            return None
+        descriptors.append(runtime_fd)
+        if _phase_hook is not None:
+            _phase_hook("after_runtime_fd_before_lock_open")
+        _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+        lock_fd, lock_created = _open_stable_lock(runtime_fd, lock_name)
+        descriptors.append(lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if _phase_hook is not None:
+            _phase_hook("after_lock_before_state_read")
+        _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+        _revalidate_file_link(runtime_fd, lock_name, lock_fd)
+        runtime = None
+        sentinel_present = False
+        try:
+            sentinel_fd = os.open(
+                sentinel_name,
+                os.O_RDONLY
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=runtime_fd,
+            )
+            descriptors.append(sentinel_fd)
+            sentinel_present = True
+            sentinel_metadata = os.fstat(sentinel_fd)
+            if (
+                not stat.S_ISREG(sentinel_metadata.st_mode)
+                or
+                sentinel_metadata.st_uid != os.getuid()
+                or sentinel_metadata.st_mode & 0o077
+                or sentinel_metadata.st_nlink != 1
+            ):
+                return False, "terminal sentinel is unsafe"
+            _revalidate_file_link(runtime_fd, sentinel_name, sentinel_fd)
+            if os.read(sentinel_fd, 1):
+                return False, "terminal sentinel is unsafe"
+            os.fsync(sentinel_fd)
+            _revalidate_file_link(runtime_fd, sentinel_name, sentinel_fd)
+            os.fsync(runtime_fd)
+        except FileNotFoundError:
+            pass
+        tombstones = sorted(
+            name
+            for name in os.listdir(runtime_fd)
+            if name.startswith(".evidence-cleanup-")
+        )
+        active_present = False
+        try:
+            task_fd = open_child_directory(runtime_fd, task_short_id)
+            descriptors.append(task_fd)
+            active_present = True
+        except FileNotFoundError:
+            task_fd = -1
+        if active_present:
+            if _phase_hook is not None:
+                _phase_hook("after_task_fd_before_link_revalidation")
+            _revalidate_directory_link(runtime_fd, task_short_id, task_fd)
+        if active_present:
+            ledger_error = None
+            try:
+                records = _read_ledger_records(task_fd)
+            except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+                records = []
+                ledger_error = "active v2 ledger is missing or invalid"
+            is_sealed = bool(
+                records
+                and records[-1].get("record_kind")
+                == "terminal_evidence_seal_v1"
+            )
+        else:
+            is_sealed = False
+            ledger_error = None
+        if not (sentinel_present or tombstones or is_sealed or active_present):
+            if v2_declared:
+                return False, "sealed v2 runtime evidence is missing"
+            os.unlink(lock_name, dir_fd=runtime_fd)
+            os.fsync(runtime_fd)
+            return None
+        if (
+            active_present
+            and not sentinel_present
+            and not tombstones
+            and not is_sealed
+        ):
+            if ledger_error:
+                if not v2_supported:
+                    if lock_created:
+                        os.close(lock_fd)
+                        descriptors.remove(lock_fd)
+                        os.unlink(lock_name, dir_fd=runtime_fd)
+                        os.fsync(runtime_fd)
+                    return None
+                if lock_created:
+                    os.close(lock_fd)
+                    descriptors.remove(lock_fd)
+                    os.unlink(lock_name, dir_fd=runtime_fd)
+                    os.fsync(runtime_fd)
+                return False, ledger_error
+            if not v2_supported:
+                if lock_created:
+                    os.close(lock_fd)
+                    descriptors.remove(lock_fd)
+                    os.unlink(lock_name, dir_fd=runtime_fd)
+                    os.fsync(runtime_fd)
+                return None
+            if lock_created:
+                os.close(lock_fd)
+                descriptors.remove(lock_fd)
+                os.unlink(lock_name, dir_fd=runtime_fd)
+                os.fsync(runtime_fd)
+            return False, "active runtime is not a sealed v2 ledger"
+        runtime = runtime_contracts()
+        try:
+            reported_marker = _cleanup_marker(
+                runtime,
+                cleanup_report,
+                task_short_id,
+            )
+        except (ValueError, json.JSONDecodeError) as error:
+            return False, str(error)
+        if sentinel_present and active_present:
+            return False, "active runtime conflicts with terminal sentinel"
+        if active_present and tombstones:
+            return False, "active runtime conflicts with cleanup tombstone"
+        tombstone_name = tombstones[0] if tombstones else ""
+        if len(tombstones) > 1:
+            return False, "multiple cleanup tombstones exist"
+        if active_present and not sentinel_present:
+            admission = _EvidenceAdmission(
+                workspace, runtime, runtime_fd, task_fd, task_short_id,
+                task_short_id, reported_marker,
+            )
+            tombstone_name = admission.tombstone
+            if _phase_hook is not None:
+                _phase_hook("after_evidence_admission")
+            _revalidate_directory_link(root_fd, ".kent", kent_fd)
+            _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+            admission.revalidate()
+            os.rename(
+                task_short_id,
+                tombstone_name,
+                src_dir_fd=runtime_fd,
+                dst_dir_fd=runtime_fd,
+            )
+            try:
+                os.fsync(runtime_fd)
+            except OSError:
+                os.rename(
+                    tombstone_name,
+                    task_short_id,
+                    src_dir_fd=runtime_fd,
+                    dst_dir_fd=runtime_fd,
+                )
+                os.fsync(runtime_fd)
+                raise
+            admission.name = tombstone_name
+            renamed_tombstone_fd = open_child_directory(
+                runtime_fd, tombstone_name
+            )
+            try:
+                if _phase_hook is not None:
+                    _phase_hook("after_tombstone_rename")
+                _revalidate_directory_link(
+                    runtime_fd,
+                    tombstone_name,
+                    renamed_tombstone_fd,
+                )
+                admission.revalidate()
+            finally:
+                os.close(renamed_tombstone_fd)
+            os.close(task_fd)
+            descriptors.remove(task_fd)
+            active_present = False
+            sentinel_fd = os.open(
+                sentinel_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=runtime_fd,
+            )
+            try:
+                os.fsync(sentinel_fd)
+                os.fsync(runtime_fd)
+                if _phase_hook is not None:
+                    _phase_hook("after_terminal_sentinel_create")
+                _revalidate_file_link(runtime_fd, sentinel_name, sentinel_fd)
+            finally:
+                os.close(sentinel_fd)
+            sentinel_present = True
+        if not tombstone_name:
+            if sentinel_present and not active_present:
+                _cleanup_marker(runtime, cleanup_report, task_short_id)
+                return True, "terminal acknowledgement was already recorded"
+            return False, "terminal cleanup tombstone is missing"
+        tombstone_fd = open_child_directory(runtime_fd, tombstone_name)
+        descriptors.append(tombstone_fd)
+        _revalidate_directory_link(runtime_fd, tombstone_name, tombstone_fd)
+        try:
+            if admission is None:
+                admission = _EvidenceAdmission(
+                    workspace, runtime, runtime_fd, tombstone_fd, tombstone_name,
+                    task_short_id, reported_marker,
+                )
+                if _phase_hook is not None:
+                    _phase_hook("after_evidence_admission")
+            admission.revalidate()
+        except FileNotFoundError:
+            if sentinel_present and not _bounded_inventory(tombstone_fd):
+                expected_empty = ".evidence-cleanup-{}".format(
+                    runtime.canonical_sha256(reported_marker)
+                )
+                if tombstone_name != expected_empty:
+                    return (
+                        False,
+                        "empty cleanup tombstone does not match "
+                        "cleanup report marker",
+                    )
+                if _phase_hook is not None:
+                    _phase_hook("before_tombstone_removal")
+                _revalidate_directory_link(root_fd, ".kent", kent_fd)
+                _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+                _revalidate_directory_link(runtime_fd, tombstone_name, tombstone_fd)
+                if _bounded_inventory(tombstone_fd):
+                    return False, "empty cleanup tombstone changed"
+                os.close(tombstone_fd)
+                descriptors.remove(tombstone_fd)
+                os.rmdir(tombstone_name, dir_fd=runtime_fd)
+                os.fsync(runtime_fd)
+                return True, "removed empty terminal cleanup tombstone"
+            raise
+        if not sentinel_present:
+            admission.revalidate()
+            sentinel_fd = os.open(
+                sentinel_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=runtime_fd,
+            )
+            try:
+                os.fsync(sentinel_fd)
+                os.fsync(runtime_fd)
+                if _phase_hook is not None:
+                    _phase_hook("after_terminal_sentinel_create")
+                _revalidate_file_link(runtime_fd, sentinel_name, sentinel_fd)
+            finally:
+                os.close(sentinel_fd)
+            sentinel_present = True
+        sentinel_fd = os.open(
+            sentinel_name,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=runtime_fd,
+        )
+        descriptors.append(sentinel_fd)
+        sentinel_metadata = os.fstat(sentinel_fd)
+        if (
+            not stat.S_ISREG(sentinel_metadata.st_mode)
+            or sentinel_metadata.st_uid != os.getuid()
+            or sentinel_metadata.st_mode & 0o077
+            or sentinel_metadata.st_nlink != 1
+        ):
+            return False, "terminal sentinel disappeared or is unsafe"
+        _revalidate_file_link(runtime_fd, sentinel_name, sentinel_fd)
+        if os.read(sentinel_fd, 1):
+            return False, "terminal sentinel disappeared or is unsafe"
+        if admission.sentinel < 0:
+            admission.sentinel = os.dup(sentinel_fd)
+            admission.sentinel_name = sentinel_name
+        order = ["fix-checkpoint.json", "smoke-checkpoint.json"]
+        order += sorted(admission.references & admission.files.keys())
+        order += ["evidence-ledger.jsonl"]
+        for name in order:
+            if name not in admission.files:
+                continue
+            phase = (
+                "ci_report" if CI_REPORT_NAME.fullmatch(name)
+                else "ledger" if name == "evidence-ledger.jsonl"
+                else name.removesuffix(".json").replace("-", "_")
+            )
+            if _phase_hook is not None:
+                _phase_hook(f"before_{phase}_unlink")
+            _revalidate_directory_link(root_fd, ".kent", kent_fd)
+            _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+            admission.unlink(name)
+            if _phase_hook is not None:
+                _phase_hook(f"after_{phase}_unlink_before_fsync")
+            os.fsync(admission.directory)
+            if _phase_hook is not None:
+                _phase_hook(f"after_{phase}_unlink_fsync")
+        if _phase_hook is not None:
+            _phase_hook("before_tombstone_removal")
+        _revalidate_directory_link(root_fd, ".kent", kent_fd)
+        _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+        admission.revalidate()
+        os.close(tombstone_fd)
+        descriptors.remove(tombstone_fd)
+        os.rmdir(tombstone_name, dir_fd=runtime_fd)
+        os.fsync(runtime_fd)
+        return True, "removed sealed task-local runtime state"
+    except FileNotFoundError:
+        return False, "terminal runtime state disappeared during cleanup"
+    except (NotADirectoryError, OSError, ValueError, json.JSONDecodeError) as error:
+        return False, str(error)
+    finally:
+        if admission is not None:
+            admission.close()
+        close_descriptors(*descriptors)
+
+
+def _prepare_v2_managed_runtime_state(
+    workspace: Path,
+    task_short_id: str,
+    *,
+    cleanup_report: str,
+    _phase_hook=None,
+) -> tuple[bool, str] | None:
+    """Seal and retain v2 raw evidence until Kent removes a worktree."""
+
+    sibling = Path(__file__).with_name("workflow_runtime_contracts.py")
+    v2_declared = _declares_terminal_evidence(cleanup_report)
+    if sibling.is_symlink() or not sibling.is_file():
+        if v2_declared:
+            return False, "declared v2 runtime support is missing or unsafe"
+        return None
+    runtime = runtime_contracts()
+    lock_name, sentinel_name = runtime_state_names(task_short_id)
+    descriptors: list[int] = []
+    admission = None
+    try:
+        root_fd = os.open(
+            workspace,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        descriptors.append(root_fd)
+        kent_fd = open_child_directory(root_fd, ".kent")
+        descriptors.append(kent_fd)
+        try:
+            runtime_fd = open_child_directory(kent_fd, "runtime")
+        except FileNotFoundError:
+            if v2_declared:
+                return False, "sealed v2 runtime evidence is missing"
+            return None
+        descriptors.append(runtime_fd)
+        if _phase_hook is not None:
+            _phase_hook("after_runtime_fd_before_lock_open")
+        _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+        lock_fd, _ = _open_stable_lock(runtime_fd, lock_name)
+        descriptors.append(lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if _phase_hook is not None:
+            _phase_hook("after_lock_before_state_read")
+        _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+        _revalidate_file_link(runtime_fd, lock_name, lock_fd)
+
+        sentinel_present = False
+        try:
+            sentinel_fd = os.open(
+                sentinel_name,
+                os.O_RDONLY
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=runtime_fd,
+            )
+            descriptors.append(sentinel_fd)
+            metadata = os.fstat(sentinel_fd)
+            sentinel_present = (
+                stat.S_ISREG(metadata.st_mode)
+                and metadata.st_uid == os.getuid()
+                and metadata.st_nlink == 1
+                and not metadata.st_mode & 0o077
+            )
+            if sentinel_present:
+                _revalidate_file_link(runtime_fd, sentinel_name, sentinel_fd)
+                sentinel_present = not os.read(sentinel_fd, 1)
+                os.fsync(sentinel_fd)
+                os.fsync(runtime_fd)
+            if not sentinel_present:
+                return False, "terminal sentinel is unsafe"
+        except FileNotFoundError:
+            pass
+
+        tombstones = sorted(
+            name
+            for name in os.listdir(runtime_fd)
+            if name.startswith(".evidence-cleanup-")
+        )
+        if len(tombstones) > 1:
+            return False, "multiple cleanup tombstones exist"
+        tombstone_name = tombstones[0] if tombstones else ""
+        task_fd = -1
+        try:
+            task_fd = open_child_directory(runtime_fd, task_short_id)
+            descriptors.append(task_fd)
+        except FileNotFoundError:
+            pass
+        if task_fd >= 0 and sentinel_present:
+            return False, "active runtime conflicts with terminal sentinel"
+        if task_fd >= 0 and tombstone_name:
+            return False, "active runtime conflicts with cleanup tombstone"
+        if task_fd >= 0 and not sentinel_present and not tombstone_name:
+            try:
+                candidate_records = _read_ledger_records(task_fd)
+            except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+                return False, "active v2 ledger is missing or invalid"
+            if (
+                not candidate_records
+                or candidate_records[-1].get("record_kind")
+                != runtime.TERMINAL_SEAL_SCHEMA
+            ):
+                return False, "active runtime is not a sealed v2 ledger"
+        if task_fd < 0 and not tombstone_name and not sentinel_present:
+            if v2_declared:
+                return False, "sealed v2 runtime evidence is missing"
+            return None
+        try:
+            reported_marker = _cleanup_marker(
+                runtime,
+                cleanup_report,
+                task_short_id,
+            )
+        except (ValueError, json.JSONDecodeError) as error:
+            return False, str(error)
+        if task_fd >= 0:
+            if _phase_hook is not None:
+                _phase_hook("after_task_fd_before_link_revalidation")
+            _revalidate_directory_link(runtime_fd, task_short_id, task_fd)
+            admission = _validate_retained_tombstone(
+                workspace, runtime, task_fd, task_short_id,
+                task_short_id, reported_marker, runtime_fd,
+            )
+            expected_name = admission.tombstone
+            if tombstone_name and tombstone_name != expected_name:
+                return False, "cleanup tombstone name does not match ledger"
+            if _phase_hook is not None:
+                _phase_hook("after_evidence_admission")
+            _revalidate_directory_link(root_fd, ".kent", kent_fd)
+            _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+            admission.revalidate()
+            os.rename(
+                task_short_id,
+                expected_name,
+                src_dir_fd=runtime_fd,
+                dst_dir_fd=runtime_fd,
+            )
+            try:
+                os.fsync(runtime_fd)
+            except OSError:
+                os.rename(
+                    expected_name,
+                    task_short_id,
+                    src_dir_fd=runtime_fd,
+                    dst_dir_fd=runtime_fd,
+                )
+                os.fsync(runtime_fd)
+                raise
+            admission.name = expected_name
+            renamed_tombstone_fd = open_child_directory(runtime_fd, expected_name)
+            try:
+                if _phase_hook is not None:
+                    _phase_hook("after_tombstone_rename")
+                _revalidate_directory_link(
+                    runtime_fd,
+                    expected_name,
+                    renamed_tombstone_fd,
+                )
+                admission.revalidate()
+            finally:
+                os.close(renamed_tombstone_fd)
+            os.close(task_fd)
+            descriptors.remove(task_fd)
+            task_fd = -1
+            tombstone_name = expected_name
+        if task_fd >= 0 and not tombstone_name:
+            return None
+        elif not tombstone_name:
+            if sentinel_present:
+                return False, "terminal sentinel exists without cleanup tombstone"
+            return False, "sealed v2 runtime evidence is missing"
+
+        tombstone_fd = open_child_directory(runtime_fd, tombstone_name)
+        descriptors.append(tombstone_fd)
+        _revalidate_directory_link(runtime_fd, tombstone_name, tombstone_fd)
+        if admission is None:
+            admission = _validate_retained_tombstone(
+                workspace, runtime, tombstone_fd, tombstone_name,
+                task_short_id, reported_marker, runtime_fd,
+            )
+            if _phase_hook is not None:
+                _phase_hook("after_evidence_admission")
+        admission.revalidate()
+        if not sentinel_present:
+            sentinel_fd = os.open(
+                sentinel_name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=runtime_fd,
+            )
+            try:
+                os.fsync(sentinel_fd)
+                os.fsync(runtime_fd)
+                if _phase_hook is not None:
+                    _phase_hook("after_terminal_sentinel_create")
+                _revalidate_file_link(runtime_fd, sentinel_name, sentinel_fd)
+                if admission.sentinel < 0:
+                    admission.sentinel = os.dup(sentinel_fd)
+                    admission.sentinel_name = sentinel_name
+            finally:
+                os.close(sentinel_fd)
+        _revalidate_directory_link(root_fd, ".kent", kent_fd)
+        _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+        admission.revalidate()
+        return True, "sealed evidence retained for managed worktree deletion"
+    except (FileNotFoundError, NotADirectoryError, OSError, ValueError) as error:
+        return False, str(error)
+    finally:
+        if admission is not None:
+            admission.close()
+        close_descriptors(*descriptors)
+
+
+def remove_runtime_state(
+    workspace: Path,
+    task_short_id: str,
+    *,
+    cleanup_report: str | None = None,
+    _phase_hook=None,
+) -> tuple[bool, str]:
+    if not TASK_KEY.fullmatch(task_short_id):
+        return False, "invalid task short ID"
+
+    v2_result = _remove_v2_runtime_state(
+        workspace,
+        task_short_id,
+        cleanup_report=cleanup_report,
+        _phase_hook=_phase_hook,
+    )
+    if v2_result is not None:
+        return v2_result
+
+    descriptors: list[int] = []
+    try:
+        root_fd = os.open(
+            workspace,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        descriptors.append(root_fd)
+        kent_fd = open_child_directory(root_fd, ".kent")
+        descriptors.append(kent_fd)
+        try:
+            runtime_fd = open_child_directory(kent_fd, "runtime")
+        except FileNotFoundError:
+            return True, "no task-local runtime state"
+        descriptors.append(runtime_fd)
+        if _phase_hook is not None:
+            _phase_hook("after_runtime_fd_before_lock_open")
+        try:
+            task_fd = open_child_directory(runtime_fd, task_short_id)
+        except FileNotFoundError:
+            return True, "no task-local runtime state"
+        descriptors.append(task_fd)
+        if _phase_hook is not None:
+            _phase_hook("after_task_fd_before_link_revalidation")
+
+        lock_fd = os.open(
+            "runtime.lock",
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=task_fd,
+        )
+        descriptors.append(lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        allowed = {
+            "evidence-ledger.jsonl",
+            "fix-checkpoint.json",
+            "smoke-checkpoint.json",
+            "runtime.lock",
+            "terminal-sentinel",
+        }
+        entries = os.listdir(task_fd)
+        if "terminal-sentinel" in entries:
+            runtime_contracts()
+        unexpected = sorted(
+            item for item in set(entries) - allowed
+            if not item.startswith(".evidence-cleanup-")
+        )
+        if unexpected:
+            return False, f"unexpected runtime entries: {unexpected}"
+        for entry in entries:
+            metadata = os.stat(entry, dir_fd=task_fd, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):
+                return False, f"runtime entry is not a regular file: {entry}"
+            if metadata.st_nlink != 1:
+                return False, f"runtime entry has multiple links: {entry}"
+            relative = f".kent/runtime/{task_short_id}/{entry}"
+            ignored = run(
+                ["git", "check-ignore", "-q", "--", relative],
+                cwd=workspace,
+                check=False,
+            ).returncode == 0
+            tracked = run(
+                ["git", "ls-files", "--error-unmatch", "--", relative],
+                cwd=workspace,
+                check=False,
+            ).returncode == 0
+            if not ignored or tracked:
+                return (
+                    False,
+                    f"runtime entry is tracked or not ignored: {relative}",
+                )
+        for entry in entries:
+            os.unlink(entry, dir_fd=task_fd)
+            os.fsync(task_fd)
+            if _phase_hook is not None:
+                if entry == "fix-checkpoint.json":
+                    _phase_hook("after_fix_checkpoint_unlink_fsync")
+                elif entry == "smoke-checkpoint.json":
+                    _phase_hook("after_smoke_checkpoint_unlink_fsync")
+                elif entry == "evidence-ledger.jsonl":
+                    _phase_hook("after_ledger_unlink_fsync")
+        os.close(task_fd)
+        descriptors.remove(task_fd)
+        os.rmdir(task_short_id, dir_fd=runtime_fd)
+        return True, "removed task-local runtime state"
+    except (NotADirectoryError, OSError, ValueError) as error:
+        return False, str(error)
+    finally:
+        close_descriptors(*descriptors)
+
+
+def complete(transition: str, report: str, blocker: str = "") -> None:
+    payload = {"transition": transition, "cleanup_report": report}
+    if blocker:
+        payload["blocker_reason"] = blocker
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def delete_managed_worktree(
+    wrapper: str,
+    primary: Path,
+    workspace: Path,
+    cleanup_session_id: str,
+    cleanup_report: str,
+) -> tuple[bool, str, str]:
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    primary_fd = os.open(primary, flags)
+    primary_opened = os.fstat(primary_fd)
+    workspace_fd = os.open(workspace, flags)
+    opened = os.fstat(workspace_fd)
+    expected_tombstone = None
+    support_module = Path(__file__).with_name("workflow_runtime_contracts.py")
+    if support_module.is_file() and not support_module.is_symlink():
+        runtime = runtime_contracts()
+        expected_tombstone = ".evidence-cleanup-{}".format(
+            runtime.canonical_sha256(
+                runtime.validate_cleanup_report(cleanup_report)
+            )
+        )
+    try:
+        primary_current = os.stat(primary, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(primary_current.st_mode)
+            or primary_current.st_dev != primary_opened.st_dev
+            or primary_current.st_ino != primary_opened.st_ino
+        ):
+            raise ValueError("primary checkout changed before deletion")
+        os.chdir(primary)
+        deletion = run(
+            [
+                wrapper,
+                "delete",
+                "--session",
+                cleanup_session_id,
+                "--delete-branch",
+                "--json",
+                str(workspace),
+            ],
+            cwd=primary,
+            timeout=120,
+            check=False,
+        )
+        if deletion.returncode != 0:
+            detail = deletion.stderr.strip() or deletion.stdout.strip() or "no output"
+            return (
+                False,
+                f"Janitor could not remove {workspace}: {detail}",
+                "Kent-managed worktree deletion failed after safety checks.",
+            )
+        try:
+            deletion_payload = json_object(deletion.stdout, "Kent worktree delete")
+        except RuntimeError as error:
+            return (
+                False,
+                f"Janitor could not confirm removal of {workspace}: {error}",
+                "Kent worktree deletion returned no trustworthy completion result.",
+            )
+        deletion_kind = str(deletion_payload.get("kind") or "")
+        if deletion_kind == "scheduled":
+            scheduled = deletion_payload.get("scheduled")
+            operation_id = (
+                str(scheduled.get("operation_id") or "")
+                if isinstance(scheduled, dict)
+                else ""
+            )
+            return (
+                False,
+                f"Janitor preserved {workspace}: Kent scheduled worktree "
+                f"deletion operation {operation_id or '<unknown>'} but did "
+                "not confirm completion.",
+                "Resume Cleanup so the session can leave the task worktree, "
+                "close task-owned background shells, and retry Janitor.",
+            )
+        if deletion_kind != "completed":
+            return (
+                False,
+                f"Janitor preserved {workspace}: unexpected Kent worktree "
+                f"delete result {deletion_kind or '<missing>'}.",
+                "Kent did not return a completed worktree deletion result.",
+            )
+        primary_current = os.stat(primary, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(primary_current.st_mode)
+            or primary_current.st_dev != primary_opened.st_dev
+            or primary_current.st_ino != primary_opened.st_ino
+        ):
+            return (
+                False,
+                f"Janitor preserved {workspace}: the primary checkout path "
+                "was replaced while Kent deletion was running.",
+                "Primary checkout identity changed; no branch or remote "
+                "cleanup was attempted.",
+            )
+        try:
+            current = os.stat(workspace, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (
+            not stat.S_ISDIR(current.st_mode)
+            or current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+        ):
+            return (
+                False,
+                f"Janitor preserved {workspace}: the managed worktree path "
+                "was replaced while Kent deletion was running.",
+                "The original managed worktree descriptor no longer matches "
+                "the path; no branch or remote cleanup was attempted.",
+            )
+        registered_after_delete = git_registers_worktree(primary, workspace)
+        if current is not None or registered_after_delete:
+            if current is not None:
+                runtime_path = workspace / ".kent" / "runtime"
+                tombstones = (
+                    sorted(
+                        path.name
+                        for path in runtime_path.iterdir()
+                        if path.name.startswith(".evidence-cleanup-")
+                    )
+                    if runtime_path.is_dir()
+                    else []
+                )
+                evidence_note = (
+                    "terminal cleanup tombstone remains; retry cleanup"
+                    if expected_tombstone and expected_tombstone in tombstones
+                    else "terminal cleanup tombstone is absent; evidence loss "
+                    "is ambiguous"
+                )
+            else:
+                evidence_note = "Git still registers the managed worktree"
+            return (
+                False,
+                f"Janitor preserved {workspace}: Kent reported completed "
+                "deletion but the worktree path or Git registration still "
+                f"exists ({evidence_note}).",
+                "Kent worktree deletion postconditions failed; no branch or "
+                "remote cleanup was attempted.",
+            )
+        return True, "", ""
+    finally:
+        os.close(workspace_fd)
+        os.close(primary_fd)
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"stdin is not valid JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("stdin must be one JSON object")
+
+    workspace = Path(require_string(payload, "workspace_path")).expanduser().resolve()
+    branch = require_string(payload, "branch_name", empty=True)
+    pr_url = require_string(payload, "pr_url", empty=True)
+    cleanup_mode = require_string(payload, "cleanup_mode")
+    cleanup_session_id = require_string(payload, "cleanup_session_id")
+    previous_report = require_string(payload, "cleanup_report")
+    task_short_id = require_string(payload, "task_short_id")
+
+    if not workspace.is_dir():
+        complete(
+            "task_janitor_blocked",
+            f"{previous_report}\nJanitor cannot infer deletion of missing workspace: {workspace}",
+            "Only the same cleanup invocation may acknowledge a deleted "
+            "managed workspace after verifying Git registration and evidence.",
+        )
+        return 0
+
+    git_root = Path(
+        run(["git", "rev-parse", "--show-toplevel"], cwd=workspace).stdout.strip()
+    ).resolve()
+    if git_root != workspace:
+        complete(
+            "task_janitor_done",
+            f"{previous_report}\nJanitor preserved non-root workspace: {workspace}",
+        )
+        return 0
+    primary = primary_root(workspace)
+    head = run(["git", "rev-parse", "HEAD"], cwd=workspace).stdout.strip()
+    actual_branch = run(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=workspace,
+        check=False,
+    ).stdout.strip()
+    if branch.lower() in {"null", "none", "not-applicable"}:
+        complete(
+            "task_janitor_blocked",
+            f"{previous_report}\nJanitor rejected missing branch identity: "
+            f"received {branch!r}, found {actual_branch or '<detached>'}.",
+            "Cleanup must re-emit the exact current Git branch before Janitor "
+            "can remove task-owned resources.",
+        )
+        return 0
+    if branch and actual_branch and branch != actual_branch:
+        complete(
+            "task_janitor_blocked",
+            f"{previous_report}\nJanitor preserved branch mismatch: "
+            f"expected {branch}, found {actual_branch}.",
+            "Cleanup branch identity does not match the managed worktree; "
+            "reconcile it before retrying Janitor.",
+        )
+        return 0
+    branch = branch or actual_branch
+
+    if workspace == primary:
+        runtime_removed, runtime_report = remove_runtime_state(
+            workspace,
+            task_short_id,
+            cleanup_report=previous_report,
+        )
+        runtime_action = "removed" if runtime_removed else "preserved"
+        complete(
+            "task_janitor_done" if runtime_removed else "task_janitor_blocked",
+            f"{previous_report}\nJanitor kept the primary checkout and "
+            f"{runtime_action} runtime state: {runtime_report}.",
+            "" if runtime_removed else runtime_report,
+        )
+        return 0
+
+    allowed_roots = (
+        (Path.home() / ".kent" / "worktrees").resolve(),
+        (primary / ".kent" / "worktrees").resolve(),
+    )
+    if not any(workspace.is_relative_to(root) for root in allowed_roots):
+        complete(
+            "task_janitor_done",
+            f"{previous_report}\nJanitor preserved worktree outside managed roots: "
+            f"{workspace}",
+        )
+        return 0
+
+    dirty = run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=workspace,
+    ).stdout.strip()
+    if dirty:
+        complete(
+            "task_janitor_done",
+            f"{previous_report}\nJanitor preserved dirty worktree {workspace}. "
+            f"Dirty entries: {dirty[:1000]}",
+        )
+        return 0
+
+    merged_pr: dict[str, object] | None = None
+    merged_head_oid = ""
+    recoverable = False
+    if cleanup_mode == "merged" and pr_url:
+        try:
+            merged_pr = github_pr(primary, pr_url)
+            merged_head_oid = str(merged_pr.get("headRefOid") or "")
+            recoverable = (
+                str(merged_pr.get("state") or "").upper() == "MERGED"
+                and str(merged_pr.get("headRefName") or "") == branch
+                and merged_pr.get("isCrossRepository") is False
+                and merged_pr_contains_head(
+                    primary,
+                    pr_url,
+                    head,
+                    merged_head_oid,
+                )
+            )
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            json.JSONDecodeError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            complete(
+                "task_janitor_blocked",
+                f"{previous_report}\nJanitor preserved {workspace}: "
+                f"merged PR evidence lookup failed: {error}",
+                "GitHub merge evidence could not be read after bounded retries. "
+                "Retry Cleanup; no worktree or branch was removed.",
+            )
+            return 0
+    elif cleanup_mode in {"no_pr", "report_only"}:
+        recoverable = head_matches_current_remote(primary, head)
+
+    if not recoverable:
+        complete(
+            "task_janitor_done",
+            f"{previous_report}\nJanitor preserved {workspace}: HEAD {head} is "
+            f"not conclusively recoverable for cleanup mode {cleanup_mode}.",
+        )
+        return 0
+
+    managed_v2 = _prepare_v2_managed_runtime_state(
+        workspace,
+        task_short_id,
+        cleanup_report=previous_report,
+    )
+    if managed_v2 is not None and not managed_v2[0]:
+        complete(
+            "task_janitor_blocked",
+            f"{previous_report}\nJanitor preserved {workspace}: "
+            f"{managed_v2[1]}.",
+            "Sealed terminal evidence could not be retained before Kent "
+            "worktree deletion; retry Cleanup without deleting the worktree.",
+        )
+        return 0
+
+    wrapper = os.environ.get(
+        "KENT_WORKTREE_WRAPPER",
+        str(Path.home() / ".kent" / "bin" / "kent-worktree"),
+    )
+    try:
+        session_uses_workspace = cleanup_session_uses_workspace(
+            wrapper,
+            primary,
+            cleanup_session_id,
+            workspace,
+        )
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+        complete(
+            "task_janitor_blocked",
+            f"{previous_report}\nJanitor preserved {workspace}: {error}",
+            "Cleanup session target could not be verified. Retry Cleanup; "
+            "no worktree or branch was removed.",
+        )
+        return 0
+    if session_uses_workspace:
+        complete(
+            "task_janitor_blocked",
+            f"{previous_report}\nJanitor preserved {workspace}: Cleanup session "
+            f"{cleanup_session_id} still targets the task worktree.",
+            "Run `kent worktree leave` from the retained Cleanup session, "
+            "close every task-owned background shell, then retry Janitor.",
+        )
+        return 0
+
+    remote_oid = remote_branch_oid(primary, branch) if branch else ""
+
+    deletion_ok, deletion_report, deletion_blocker = delete_managed_worktree(
+        wrapper,
+        primary,
+        workspace,
+        cleanup_session_id,
+        previous_report,
+    )
+    if not deletion_ok:
+        complete(
+            "task_janitor_blocked",
+            f"{previous_report}\n{deletion_report}",
+            deletion_blocker,
+        )
+        return 0
+
+    local_deleted = False
+    local_note = ""
+    if branch:
+        exists = run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=primary,
+            check=False,
+        ).returncode == 0
+        if exists and cleanup_mode == "merged":
+            current_local_oid = run(
+                ["git", "rev-parse", f"refs/heads/{branch}"],
+                cwd=primary,
+            ).stdout.strip()
+            worktree_path = run(
+                ["git", "branch", "--format=%(worktreepath)", "--list", branch],
+                cwd=primary,
+            ).stdout.strip()
+            if worktree_path:
+                local_note = (
+                    " Kent retained or scheduled removal of the checked-out "
+                    f"local branch at {worktree_path}."
+                )
+            elif current_local_oid == head:
+                branch_delete = run(
+                    [
+                        "git",
+                        "update-ref",
+                        "-d",
+                        f"refs/heads/{branch}",
+                        current_local_oid,
+                    ],
+                    cwd=primary,
+                    check=False,
+                )
+                local_deleted = branch_delete.returncode == 0
+                if not local_deleted:
+                    detail = (
+                        branch_delete.stderr.strip()
+                        or branch_delete.stdout.strip()
+                        or "no output"
+                    )
+                    local_note = f" Local branch deletion failed: {detail}"
+            else:
+                local_note = (
+                    " Local branch was preserved because its OID changed "
+                    "after cleanup preflight."
+                )
+        else:
+            local_deleted = not exists
+
+    remote_deleted = False
+    remote_note = ""
+    if merged_pr is not None and branch and remote_oid:
+        current_remote_oid = remote_branch_oid(primary, branch)
+        if not current_remote_oid:
+            remote_deleted = True
+            remote_note = " Remote branch was already absent after cleanup."
+        elif (
+            current_remote_oid != remote_oid
+            or current_remote_oid != merged_head_oid
+        ):
+            remote_note = (
+                f" Remote branch {branch} was preserved because its head "
+                "changed after cleanup preflight."
+            )
+        else:
+            remote_delete = run(
+                [
+                    "git",
+                    "push",
+                    f"--force-with-lease=refs/heads/{branch}:{remote_oid}",
+                    "origin",
+                    f":refs/heads/{branch}",
+                ],
+                cwd=primary,
+                timeout=120,
+                check=False,
+            )
+            remote_deleted = remote_delete.returncode == 0
+            if not remote_deleted:
+                detail = (
+                    remote_delete.stderr.strip()
+                    or remote_delete.stdout.strip()
+                    or "no output"
+                )
+                remote_note = (
+                    " Remote branch deletion failed safely and was preserved: "
+                    f"{detail}"
+                )
+
+    complete(
+        "task_janitor_done",
+        (
+            f"{previous_report}\nJanitor removed managed worktree {workspace}. "
+            f"Local branch removed: {str(local_deleted).lower()}. "
+            f"Remote branch removed: {str(remote_deleted).lower()}."
+            f"{local_note}{remote_note}"
+        ),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+        complete(
+            "task_janitor_blocked",
+            f"Janitor failed safely: {error}",
+            "Task cleanup infrastructure failed; the worktree was preserved.",
+        )

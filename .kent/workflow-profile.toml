@@ -1,0 +1,98 @@
+schema_version = 3
+minimum_kent_version = "2.7.2"
+project_name = "kent-engineering-kit"
+workflow_prefix = "Kit"
+delivery_profile = "lite"
+platforms = ["generic"]
+required_adapters = []
+kit_managed_adapters = []
+source_control = "github"
+issue_tracker = "none"
+release_topology = "none"
+
+[execution]
+default_target = "default-branch"
+
+[policies]
+smoke = "disabled"
+writer_sessions = "continuous"
+pr_merge_strategy = "rebase"
+branch_identity = "task"
+
+[capabilities]
+managed_worktrees = true
+pull_requests = true
+ci_monitoring = false
+standards_review = true
+compliance_review = false
+spec_review = false
+
+[commands]
+dispatch = ".kent/scripts/workflow-verification-dispatch"
+verify = ".kent/scripts/workflow-verify-report"
+compile_verify = ".kent/scripts/workflow-compile-verify"
+prepare_cleanup = ".kent/scripts/workflow-prepare-cleanup"
+runtime_contracts = ".kent/scripts/workflow_runtime_contracts.py"
+checkpoint = ".kent/scripts/workflow-checkpoint"
+evidence = ".kent/scripts/workflow-evidence-ledger"
+plan_contract = ".kent/scripts/workflow-plan-contract"
+plan_contract_accept = ".kent/scripts/workflow-plan-contract-accept"
+plan_contract_continue = ".kent/scripts/workflow-plan-contract-continue"
+plan_contract_verify = ".kent/scripts/workflow-plan-contract-verify"
+plan_contract_fix_continue = ".kent/scripts/workflow-plan-contract-fix-continue"
+wait_pr = ".kent/scripts/workflow-wait-github-pr"
+janitor = ".kent/scripts/workflow-task-janitor"
+
+[context_manifests]
+plan = ".kent/context/plan.md"
+implement = ".kent/context/implement.md"
+review = ".kent/context/review.md"
+smoke = ".kent/context/smoke.md"
+delivery = ".kent/context/delivery.md"
+
+[procedures]
+fix = ".kent/commands/fix.md"
+ship = ".kent/commands/ship-pr.md"
+waiting_pr = ".kent/commands/waiting-pr.md"
+cleanup = ".kent/commands/cleanup-task.md"
+
+[work_kinds.feature]
+description = "Add approved Kit workflow or tooling behavior."
+plan = ".kent/commands/plan.md"
+implement = ".kent/commands/implement.md"
+
+[work_kinds.bugfix]
+description = "Restore intended behavior for a reproducible Kit defect."
+plan = ".kent/commands/plan.md"
+implement = ".kent/commands/implement.md"
+
+[work_kinds.refactor]
+description = "Improve structure without intended behavior changes."
+plan = ".kent/commands/plan.md"
+implement = ".kent/commands/implement.md"
+
+[work_kinds.migration]
+description = "Migrate approved source contracts in independently verified slices."
+plan = ".kent/commands/plan.md"
+implement = ".kent/commands/implement.md"
+
+[work_kinds.dependency]
+description = "Audit or update approved tooling dependencies."
+plan = ".kent/commands/plan.md"
+implement = ".kent/commands/implement.md"
+
+[work_kinds.test]
+description = "Improve deterministic verification without product expansion."
+plan = ".kent/commands/plan.md"
+implement = ".kent/commands/implement.md"
+
+[roles]
+orchestrator = "default"
+plan_review = "spec-reviewer"
+gate = "workflow-gate"
+researcher = "researcher"
+implementation = "implementation-worker"
+fix = "fix-worker"
+standards_review = "standards-reviewer"
+release = "delivery-operator"
+ci = "ci-monitor"
