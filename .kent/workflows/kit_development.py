@@ -22,7 +22,7 @@ from workflowkit.model import SpecError, WorkflowSpec
 from workflowkit.profile import ProjectProfile
 
 
-SPEC_PATH = ".kent/workflows/kit-engineering-delivery-v1.spec.json"
+SPEC_PATH = ".kent/workflows/kit-engineering-delivery-v2.spec.json"
 PROJECT_COPIES = {
     "evidence": "templates/project/workflow-evidence-ledger",
     "verify": "templates/project/workflow-verify-report",
@@ -62,7 +62,7 @@ request a third routine preview review or claim the graph hashes receipts.
 
 
 def build_workflow(profile: ProjectProfile) -> WorkflowSpec:
-    base = build_delivery_workflow(profile, 1)
+    base = build_delivery_workflow(profile, 2)
     accepts = [edge for edge in base.edges if edge.key == "plan_review_accept"]
     if len(accepts) != 1 or accepts[0].requires_approval:
         raise SpecError("expected exactly one unapproved plan_review_accept edge")

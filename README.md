@@ -17,10 +17,14 @@ device details, release policy, and integration credentials.
 ## Developing the Kit itself
 
 The checkout-local `.kent/workflow-profile.toml` and
-`.kent/project-contract.md` define **Kit Engineering Delivery v1**. Its
+`.kent/project-contract.md` define **Kit Engineering Delivery v2**. Its
 project builder is `.kent/workflows/kit_development.py`; the generated
-`.kent/workflows/kit-engineering-delivery-v1.spec.json` is a semantic audit
+`.kent/workflows/kit-engineering-delivery-v2.spec.json` is a semantic audit
 input, not evidence of a live workflow installation.
+The v1 snapshot remains immutable historical evidence. A later approved
+rollout must create and qualify a new Workflow UUID for v2; existing failed
+qualification records and their task-backed graph must not be repaired or
+reused as successful evidence.
 
 This schema-3 development-only flow reuses the lite delivery graph with a
 continuous writer: Plan, two independent preview reviews, human approval,

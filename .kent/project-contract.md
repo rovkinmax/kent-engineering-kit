@@ -22,7 +22,10 @@ gap and use available evidence. Ask only for real decisions or external acts.
 
 `.kent/workflow-profile.toml` maps work kinds, procedures and commands.
 `.kent/workflows/kit_development.py` composes the existing lite graph; its
-semantic spec is `.kent/workflows/kit-engineering-delivery-v1.spec.json`.
+semantic candidate is Kit Engineering Delivery v2, with spec
+`.kent/workflows/kit-engineering-delivery-v2.spec.json`. Preserve the v1
+snapshot and task-backed Workflow unchanged; future live rollout requires
+a separately approved new Workflow UUID and fresh qualification.
 The flow has 21 nodes, 51 transition groups and 52 edges, with continuous
 writer sessions and task branch identity. Plan's callable read-only leaf and
 the separate Plan Review node provide the two preview reviews. Only
@@ -71,6 +74,15 @@ Generated transition prompts own parameter carriers and completion keys.
 For terminal Cleanup, the preparation helper owns the final ordinary event
 and invokes the existing append/seal commands. Do not duplicate that append
 or append after seal, including after leaving the source worktree.
+The configured `prepare_cleanup` opts Cleanup and its recovery into this
+single-owner contract. Do not append standalone evidence before the helper
+or merely to report a blocker; retain those observations in Task records.
+Use real current unmodified Kent Session/Run/Step identities; never generate,
+export or replace them to defeat deduplication. Preserve and block on
+conflicting/fabricated evidence, without reconstructing or resealing history.
+This behavioral prohibition does not provide native identity authentication:
+qualification must independently verify the final event's actual Kent
+Run/Session/Step records before admitting it as evidence.
 
 ## Source versus installed state
 

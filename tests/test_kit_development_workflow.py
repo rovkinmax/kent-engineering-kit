@@ -77,10 +77,10 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
 
     def test_exact_graph_and_approval_delta(self) -> None:
         profile = kit.profile_at(ROOT)
-        base = build_delivery_workflow(profile, 1)
+        base = build_delivery_workflow(profile, 2)
         spec = kit.build_workflow(profile)
         spec.validate()  # Includes context source and parameter topology.
-        self.assertEqual(spec.name, "Kit Engineering Delivery v1")
+        self.assertEqual(spec.name, "Kit Engineering Delivery v2")
         self.assertEqual(spec.nodes, base.nodes)
         self.assertEqual(len(spec.nodes), 21)
         self.assertEqual(len(spec.edges), 52)
@@ -113,6 +113,43 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
         for node in spec.nodes:
             if node.kind == "agent":
                 self.assertEqual(node.completion_mode, "shell_command")
+
+    def test_every_cleanup_entrance_delegates_single_terminal_owner(self) -> None:
+        spec = kit.build_workflow(kit.profile_at(ROOT))
+        entrances = [edge for edge in spec.edges if edge.target == "cleanup"]
+        self.assertEqual({edge.key for edge in entrances}, {
+            "prepare_pr_no_pr", "fix_pr_merged_cleanup", "waiting_pr_cleanup",
+            "merge_watch_cleanup", "waiting_pr_close_without_merge",
+            "task_janitor_blocked", "cleanup_needs_user_action",
+        })
+        for edge in entrances:
+            with self.subTest(edge=edge.key):
+                self.assertIn(".kent/scripts/workflow-prepare-cleanup", edge.prompt)
+                self.assertNotIn("workflow-evidence-ledger append", edge.prompt)
+                self.assertIn("unmodified", edge.prompt)
+                self.assertIn("KENT_RUN_ID", edge.prompt)
+
+    def test_v2_preserves_v1_except_cleanup_prompts_and_candidate_name(self) -> None:
+        import hashlib
+
+        historical = ROOT / ".kent/workflows/kit-engineering-delivery-v1.spec.json"
+        raw = historical.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            "3f586796ee574682251716f28eb38eb5abf475cb8bc0c2f04003bb0d9d41decc",
+        )
+        previous = json.loads(raw)
+        current = json.loads(kit.rendered_spec())
+        self.assertEqual(current["name"], "Kit Engineering Delivery v2")
+        changed = []
+        for old, new in zip(previous["edges"], current["edges"], strict=True):
+            if old["target"] == "cleanup":
+                self.assertNotEqual(new["prompt"], old["prompt"])
+                changed.append(new["key"])
+                new["prompt"] = old["prompt"]
+        self.assertEqual(len(changed), 7)
+        current["name"] = previous["name"]
+        self.assertEqual(current, previous)
 
     def test_snapshot_is_exact_and_check_is_read_only(self) -> None:
         snapshot = ROOT / kit.SPEC_PATH

@@ -13,6 +13,9 @@ Before `kent worktree leave`, freeze the original `workspace_path` and exact
 `branch_name` from the task worktree, prepare the complete outgoing carrier,
 and prepare final evidence through that worktree's configured command as
 described below. The helper owns the final ordinary append and seal.
+Do not issue any standalone ledger append before the helper, after seal,
+or merely to record a blocker. Keep preflight/blocker observations in retained
+Task records until terminal preparation can validly proceed.
 Then leave this session's managed worktree using the supported Kent operation
 before handing off; do not delete its own root or branch in this session.
 After leave, installed primary 9363 has no new `.kent` adapter: do not run
@@ -42,7 +45,11 @@ Invoke the profile's `prepare_cleanup` command with one JSON object on stdin:
   authenticity; the caller owns the real readback, authority and redaction.
 - `final_event`: the existing ordinary ledger payload with `node_key=cleanup`,
   `evidence_type=cleanup_preparation`, `summary`, `artifacts`, `checks`,
-  `decisions` and `context`. Use real current Kent Session/Run/Step identities.
+  `decisions` and `context`. Use real current unmodified `KENT_SESSION_ID`,
+  `KENT_RUN_ID`, and `KENT_STEP_ID`. Never generate, export, substitute or
+  replace identities to bypass deduplication. Non-empty identity strings
+  are not native authentication; qualification must read back the actual
+  Kent Run/Session/Step records for the final event.
 - `seal_request`: the existing `terminal-evidence-seal-request-v1` object
   containing actual `operation_report_digests`, passed `redaction` proof and
   `retention_class=cleanup_report_only`. Existing kinds are `approval`,
@@ -65,10 +72,17 @@ the existing seal protocol. Its returned `cleanup_report` ends with exactly
 one unchanged `TERMINAL_EVIDENCE_V1` marker. Preserve that report in the frozen
 outgoing carrier. Do not append final evidence again or append after seal.
 
-On interruption, retry with the exact frozen request and retention receipt.
+Only genuinely successful prior preparation permits the existing validated
+frozen-request/report recovery, without another ordinary append. On a safe
+interruption before completion, use the exact frozen request and retention
+receipt under the existing project recovery contract and real current IDs.
 Matching archive/prepared state can finish an absent-source retirement; an
 already appended matching final event is not appended again in a new Run.
 Conflicting requests/bytes or missing proof block without overwrite/restoration.
+Conflicting/fabricated evidence or any identity substitution also blocks:
+preserve the original history, never accept its seal as valid, reconstruct
+it, discard it or reseal it. A fresh Run alone does not legitimize an
+already-completed receipt containing invalid evidence.
 Completed receipt/marker reuse after Janitor tombstoning does not recreate
 runtime evidence: the unchanged Janitor must freshly validate its retained
 ledger. Preserve/report blockers; do not sweep unknown files to force success.

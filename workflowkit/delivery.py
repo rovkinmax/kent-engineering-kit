@@ -1781,6 +1781,7 @@ def build_delivery_workflow(
                 recovery_edge(
                     "cleanup",
                     context=non_writer_recovery_context,
+                    extra_prompt=cleanup_evidence_owner_instruction(profile),
                 ),
             ]
         )
@@ -1800,6 +1801,7 @@ def build_delivery_workflow(
                 recovery_edge(
                     "cleanup",
                     context=non_writer_recovery_context,
+                    extra_prompt=cleanup_evidence_owner_instruction(profile),
                 ),
             ]
         )
@@ -2085,6 +2087,33 @@ def procedure_instruction(profile: ProjectProfile, key: str) -> str:
     return "Follow the project contract and repository instructions."
 
 
+def cleanup_evidence_owner_instruction(profile: ProjectProfile) -> str:
+    helper = profile.command("prepare_cleanup")
+    if not helper:
+        return ""
+    return f"""Terminal Cleanup evidence has one project-owned owner: `{helper}`.
+Invoke it in the original Task root using the project Cleanup procedure.
+{procedure_instruction(profile, "cleanup")}
+The project command alone owns the final ordinary append and terminal seal.
+Preserve actual context metrics through its project-owned final-event contract;
+keep its payload and archive protocol in the project procedure.
+
+Do not issue a standalone ledger append before the helper, after seal, or
+merely to report a blocker. Until valid terminal preparation is possible,
+keep preflight and blocker observations in retained Task records.
+Use real current, unmodified `KENT_SESSION_ID`, `KENT_RUN_ID` and `KENT_STEP_ID`.
+Never generate, export, substitute or replace identities to bypass deduplication.
+If conflicting or fabricated evidence or substituted identities are present,
+preserve the evidence and block. Do not accept that seal as valid, overwrite
+its history, reconstruct it or discard-and-reseal.
+
+Only genuinely successful prior preparation may use the existing project-
+validated frozen-request/report recovery, without another ordinary append.
+Freeze the original root, branch and validated report before leaving the
+Task worktree. Do not call relative project adapters from pinned primary
+after leave or re-read its branch as the Task branch."""
+
+
 def context_instruction(
     profile: ProjectProfile,
     manifest_key: str,
@@ -2092,6 +2121,13 @@ def context_instruction(
     evidence_type: str,
 ) -> str:
     manifest = profile.context_manifest(manifest_key)
+    if node_key == "cleanup":
+        owner = cleanup_evidence_owner_instruction(profile)
+        if owner:
+            return f"""Read `{manifest}` first and stay inside its required and
+conditionally triggered sources.
+
+{owner}"""
     return f"""Read `{manifest}` first and stay inside its required and
 conditionally triggered sources.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,9 @@ from workflowkit.delivery import (
     build_canary_workflow,
     build_delivery_workflow,
     build_smoke_lab_workflow,
+    context_instruction,
+    cleanup_prompt,
+    published_cleanup_prompt,
 )
 from workflowkit.kent import (
     KentClient,
@@ -22,6 +26,7 @@ from workflowkit.kent import (
     context_source_string,
     edge_index,
     execution_target_from_policy,
+    spec_as_json,
 )
 from workflowkit.graph import graph_matches_spec, plan_workflow_graph
 from workflowkit.model import (
@@ -118,6 +123,79 @@ def schema4_with_managed_adapter(contents: str) -> str:
 
 
 class WorkflowKitTest(unittest.TestCase):
+    def cleanup_profile(self, *, managed: bool, published: bool) -> ProjectProfile:
+        profile = self.load_profile()
+        return replace(
+            profile,
+            capabilities={**profile.capabilities, "managed_worktrees": managed},
+            release_topology=(
+                "manual-package-publish-after-main" if published else "none"
+            ),
+            procedures={
+                **profile.procedures,
+                "publish": ".kent/commands/feature-start.md" if published else "",
+            },
+        )
+
+    def test_non_opt_in_cleanup_graphs_preserve_frozen_baseline_bytes(self) -> None:
+        # Captured from exact pre-amendment M2, before editing delivery.py.
+        expected = {
+            (False, False): "a720b3ad56754e3274abd3a7209bf425dc65d08536141fa617581b84cfc9cca3",
+            (False, True): "8b2dd5f2fc00688264001c350d25f1fcb3a1788b04c23ce825666697d13d16c1",
+            (True, False): "f480566f3124b61ece79fee9527e706d0ebb9be5d6b0084c817aa7ba88050906",
+            (True, True): "d0575152812c5b094434c506fd855e11468223c0ca0b4c44c004ec669fecc15a",
+        }
+        for (managed, published), baseline in expected.items():
+            for helper in (None, ""):
+                with self.subTest(managed=managed, published=published, helper=helper):
+                    profile = self.cleanup_profile(managed=managed, published=published)
+                    if helper is not None:
+                        profile = replace(profile, commands={**profile.commands, "prepare_cleanup": helper})
+                    raw = json.dumps(
+                        spec_as_json(build_delivery_workflow(profile, 1)),
+                        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                    ).encode()
+                    self.assertEqual(hashlib.sha256(raw).hexdigest(), baseline)
+
+    def test_opt_in_cleanup_variants_have_one_project_owned_event(self) -> None:
+        for managed in (False, True):
+            for published in (False, True):
+                with self.subTest(managed=managed, published=published):
+                    baseline_profile = self.cleanup_profile(managed=managed, published=published)
+                    profile = replace(baseline_profile, commands={
+                        **baseline_profile.commands,
+                        "prepare_cleanup": ".kent/scripts/project-terminal-preparation",
+                    })
+                    baseline = build_delivery_workflow(baseline_profile, 1)
+                    spec = build_delivery_workflow(profile, 1)
+                    self.assertEqual(spec.nodes, baseline.nodes)
+                    for previous, current in zip(baseline.edges, spec.edges, strict=True):
+                        if current.target != "cleanup":
+                            self.assertEqual(current, previous)
+                            continue
+                        self.assertEqual(replace(current, prompt=previous.prompt), previous)
+                        self.assertIn("project-terminal-preparation", current.prompt)
+                        self.assertNotIn("workflow-evidence-ledger append", current.prompt)
+                        for requirement in (
+                            "unmodified `KENT_SESSION_ID`, `KENT_RUN_ID` and `KENT_STEP_ID`",
+                            "merely to report a blocker", "retained Task records",
+                            "Never generate, export, substitute or replace identities",
+                            "conflicting or fabricated", "frozen-request/report recovery",
+                            "before leaving", "relative project adapters",
+                        ):
+                            self.assertIn(requirement, current.prompt)
+                    for mode in ({}, {"merged": True}, {"no_pr": True}, {"closed": True}):
+                        prompt = cleanup_prompt(profile, **mode)
+                        self.assertNotIn("workflow-evidence-ledger append", prompt)
+                        self.assertIn("project-terminal-preparation", prompt)
+                    self.assertIn(
+                        "project-terminal-preparation", published_cleanup_prompt(profile),
+                    )
+                    self.assertEqual(
+                        context_instruction(profile, "implement", "implement", "implementation"),
+                        context_instruction(baseline_profile, "implement", "implement", "implementation"),
+                    )
+
     def load_profile(self, transform=lambda value: value) -> ProjectProfile:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
