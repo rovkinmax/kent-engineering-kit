@@ -481,6 +481,72 @@ def command_module(path: Path, name: str):
     return module
 
 
+class VerifierEnvironmentFixtureTest(unittest.TestCase):
+    def test_source_copy_exclusions_are_rooted_and_preserve_working_source(self) -> None:
+        from tests import test_ci_contract
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "source"
+            destination = Path(temporary) / "copy"
+            preserved = (
+                "uncommitted-source.txt", "src/build/source.txt",
+                "src/.kent/runtime/source.txt", "runtime/source.txt",
+                ".kent/workflows/source.txt",
+            )
+            excluded = ("build/generated.txt", ".kent/runtime/private.txt")
+            for relative in preserved + excluded:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative)
+            with mock.patch.object(test_ci_contract, "ROOT", root):
+                shutil.copytree(
+                    root, destination, ignore=test_ci_contract.source_validation_copy_ignore,
+                )
+            for relative in preserved:
+                self.assertEqual((destination / relative).read_text(), relative)
+            self.assertFalse((destination / "build").exists())
+            self.assertFalse((destination / ".kent/runtime").exists())
+
+    def run_actual_method_with_contained_tmpdir(self, method: str) -> None:
+        build = ROOT / "build/kent-workflow"
+        build.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            dir=build, prefix="fixture-long-tmp-" + "x" * 80,
+        ) as temporary:
+            temporary_root = Path(temporary).resolve()
+            self.assertTrue(temporary_root.is_relative_to(ROOT))
+            self.assertGreater(len(os.fsencode(temporary_root / "socket")), 108)
+            result = subprocess.run(
+                [
+                    sys.executable, "-B", "-c",
+                    "import os, pathlib, sys, tempfile, unittest\n"
+                    "assert pathlib.Path(tempfile.gettempdir()).resolve() == "
+                    "pathlib.Path(os.environ['TMPDIR']).resolve()\n"
+                    "suite = unittest.defaultTestLoader.loadTestsFromName(sys.argv[1])\n"
+                    "result = unittest.TextTestRunner(verbosity=2).run(suite)\n"
+                    "raise SystemExit(not result.wasSuccessful())\n",
+                    method,
+                ],
+                cwd=ROOT,
+                env={**os.environ, "TMPDIR": str(temporary_root)},
+                text=True, capture_output=True, timeout=360, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(temporary_root.exists())
+
+    def test_actual_source_validation_copy_under_long_contained_tmpdir(self) -> None:
+        self.run_actual_method_with_contained_tmpdir(
+            "tests.test_ci_contract.CiContractTest."
+            "test_source_only_validation_does_not_create_installed_state",
+        )
+
+    def test_actual_socket_manifest_under_long_contained_tmpdir(self) -> None:
+        self.run_actual_method_with_contained_tmpdir(
+            "tests.test_workflow_retirement.WorkflowRetirementTest."
+            "test_manifest_rejects_symlink_fifo_and_socket_entries",
+        )
+
+
 class CleanupPreparationTest(unittest.TestCase):
     def fixture(self, *, plan: bool = False) -> Path:
         fixture_owner = KitDevelopmentWorkflowTest()
