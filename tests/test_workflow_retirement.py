@@ -1034,13 +1034,19 @@ class WorkflowRetirementTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 endpoint = root / "socket"
-                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                try:
-                    listener.bind(str(endpoint))
-                    with self.assertRaises(operations.OperationError):
-                        operations._session_manifest(root)
-                finally:
-                    listener.close()
+                created = subprocess.run(
+                    [
+                        sys.executable, "-c",
+                        "import socket\n"
+                        "with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:\n"
+                        "    listener.bind('socket')\n",
+                    ],
+                    cwd=root, capture_output=True, text=True, timeout=10, check=False,
+                )
+                self.assertEqual(created.returncode, 0, created.stderr)
+                self.assertTrue(stat.S_ISSOCK(endpoint.lstat().st_mode))
+                with self.assertRaises(operations.OperationError):
+                    operations._session_manifest(root)
 
     def test_manifest_directory_swaps_never_read_outside_and_close_owned_descriptors(self) -> None:
         cases = [
