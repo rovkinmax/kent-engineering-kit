@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 
 
 INSTALL_FAILED = re.compile(r"INSTALL_FAILED_([A-Z0-9_]+)")
@@ -19,6 +20,7 @@ CERT_DIGEST = re.compile(
     r"Signer #\d+ certificate SHA-256 digest:\s*([0-9a-f:]+)",
     re.IGNORECASE,
 )
+ANDROID_ATTRIBUTE = "{http://schemas.android.com/apk/res/android}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,6 +115,62 @@ def one_line(result: subprocess.CompletedProcess[str], label: str) -> str:
     return value
 
 
+def decoded_manifest(apk: Path, *, apkanalyzer: str) -> ET.Element:
+    contents = one_line(
+        run([apkanalyzer, "manifest", "print", str(apk)]),
+        "manifest",
+    )
+    try:
+        manifest = ET.fromstring(contents)
+    except ET.ParseError as error:
+        raise ValueError("APK manifest is not valid XML") from error
+    if manifest.tag != "manifest":
+        raise ValueError("APK manifest root is not manifest")
+    return manifest
+
+
+def instrumentation_target(manifest: ET.Element) -> str | None:
+    targets: set[str] = set()
+    for instrumentation in manifest.findall("instrumentation"):
+        name = instrumentation.get(ANDROID_ATTRIBUTE + "name")
+        target = instrumentation.get(ANDROID_ATTRIBUTE + "targetPackage")
+        if (
+            not name
+            or name != name.strip()
+            or not target
+            or target != target.strip()
+        ):
+            raise ValueError("Instrumentation runner and target package are required")
+        targets.add(target)
+    if len(targets) > 1:
+        raise ValueError("Instrumentation APK declares conflicting target packages")
+    return next(iter(targets)) if targets else None
+
+
+def manifest_integer(value: str, label: str) -> int:
+    try:
+        number = int(value, 16 if value.lower().startswith("0x") else 10)
+    except ValueError as error:
+        raise ValueError(f"APK {label} is not a non-negative integer") from error
+    if number < 0:
+        raise ValueError(f"APK {label} is not a non-negative integer")
+    return number
+
+
+def test_only_manifest(manifest: ET.Element) -> bool:
+    applications = manifest.findall("application")
+    if len(applications) > 1:
+        raise ValueError("APK manifest declares multiple applications")
+    value = (
+        applications[0].get(ANDROID_ATTRIBUTE + "testOnly")
+        if applications
+        else None
+    )
+    if value not in {None, "true", "false"}:
+        raise ValueError("APK testOnly is not a boolean")
+    return value == "true"
+
+
 def candidate_metadata(
     apk: Path,
     *,
@@ -126,15 +184,42 @@ def candidate_metadata(
         run([apkanalyzer, "manifest", "application-id", str(resolved)]),
         "application-id",
     )
-    version_code = int(
-        one_line(
-            run([apkanalyzer, "manifest", "version-code", str(resolved)]),
-            "version-code",
+    manifest = decoded_manifest(resolved, apkanalyzer=apkanalyzer)
+    if manifest.get("package") != application_id:
+        raise ValueError("APK manifest package does not match application-id")
+    target_package = instrumentation_target(manifest)
+    test_only = test_only_manifest(manifest)
+    declared_version = manifest.get(ANDROID_ATTRIBUTE + "versionCode")
+    if declared_version is None:
+        if target_package is None:
+            raise ValueError("Non-instrumentation APK is missing versionCode")
+        version_major = manifest_integer(
+            manifest.get(ANDROID_ATTRIBUTE + "versionCodeMajor", "0"),
+            "versionCodeMajor",
         )
-    )
-    version_name = one_line(
-        run([apkanalyzer, "manifest", "version-name", str(resolved)]),
-        "version-name",
+        if version_major != 0:
+            raise ValueError("Instrumentation APK has major version without versionCode")
+        # Android assigns zero when the instrumentation manifest omits both codes.
+        version_code = 0
+        version_code_source = "platform_default"
+    else:
+        manifest_integer(declared_version, "versionCode")
+        version_code = manifest_integer(
+            one_line(
+                run([apkanalyzer, "manifest", "version-code", str(resolved)]),
+                "version-code",
+            ),
+            "versionCode",
+        )
+        version_code_source = "declared"
+    version_name = (
+        None
+        if target_package is not None
+        and manifest.get(ANDROID_ATTRIBUTE + "versionName") is None
+        else one_line(
+            run([apkanalyzer, "manifest", "version-name", str(resolved)]),
+            "version-name",
+        )
     )
     certificates = run(
         [apksigner, "verify", "--print-certs", str(resolved)]
@@ -151,7 +236,10 @@ def candidate_metadata(
         "apk_sha256": digest.hexdigest(),
         "application_id": application_id,
         "version_code": version_code,
+        "version_code_source": version_code_source,
         "version_name": version_name,
+        "instrumentation_target_package": target_package,
+        "test_only": test_only,
         "signer_sha256": match.group(1).replace(":", "").lower(),
     }
 
@@ -220,7 +308,9 @@ def classify(
     if not installed["present"]:
         return "package_absent"
     installed_version = installed.get("version_code")
-    if isinstance(installed_version, int) and candidate["version_code"] < installed_version:
+    if not isinstance(installed_version, int):
+        return "installed_version_unknown"
+    if candidate["version_code"] < installed_version:
         return "downgrade_blocked"
     installed_signer = installed.get("signer_sha256")
     if (
@@ -292,8 +382,12 @@ def main() -> int:
         print(json.dumps(output, ensure_ascii=False))
         return 2
 
+    install_args = [adb, "-s", args.serial, "install", "-r"]
+    if candidate["instrumentation_target_package"] is not None or candidate["test_only"]:
+        install_args.append("-t")
+    install_args.append(str(candidate["apk_path"]))
     install = run(
-        [adb, "-s", args.serial, "install", "-r", str(candidate["apk_path"])],
+        install_args,
         check=False,
         timeout=180,
     )

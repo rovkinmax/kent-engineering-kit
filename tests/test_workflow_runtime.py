@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import shlex
 import shutil
 import stat
 import subprocess
@@ -17,6 +18,7 @@ import time
 import types
 import unittest
 from unittest import mock
+import xml.etree.ElementTree as ET
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -539,6 +541,36 @@ class WorkflowPlanContractTest(GitRepositoryTest):
 
 
 class AndroidApkInstallPreserveTest(GitRepositoryTest):
+    ANDROID = "{http://schemas.android.com/apk/res/android}"
+
+    def candidate_manifest(
+        self,
+        *,
+        version: str | None = "10",
+        name: str | None = "1.0",
+        major: str | None = None,
+        runners: tuple[tuple[str, str], ...] = (),
+        test_only: str | None = None,
+    ) -> str:
+        attributes = {"package": "com.example.app"}
+        for attribute, value in (
+            ("versionCode", version),
+            ("versionName", name),
+            ("versionCodeMajor", major),
+        ):
+            if value is not None:
+                attributes[self.ANDROID + attribute] = value
+        manifest = ET.Element("manifest", attributes)
+        for runner, target in runners:
+            ET.SubElement(manifest, "instrumentation", {
+                self.ANDROID + "name": runner,
+                self.ANDROID + "targetPackage": target,
+            })
+        application = ET.SubElement(manifest, "application")
+        if test_only is not None:
+            application.set(self.ANDROID + "testOnly", test_only)
+        return ET.tostring(manifest, encoding="unicode")
+
     def create_fake_tools(
         self,
         root: Path,
@@ -546,9 +578,18 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
         installed_version: int | None,
         installed_signer: str | None = "aa",
         install_failure: str = "",
+        installed_present: bool | None = None,
+        candidate_manifest: str | None = None,
+        candidate_version: str = "10",
+        candidate_name: str = "1.0",
+        candidate_signer: str | None = "aa",
     ) -> tuple[Path, dict[str, str]]:
+        present = installed_version is not None if installed_present is None else installed_present
+        manifest = self.candidate_manifest() if candidate_manifest is None else candidate_manifest
         tools = root / "fake-tools"
         tools.mkdir()
+        installed_apk = tools / "installed.apk"
+        installed_apk.write_bytes(b"installed-apk")
         log = root / "adb.log"
         adb = tools / "adb"
         adb.write_text(
@@ -560,7 +601,7 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
             "  'get-state ') echo device ;;\n"
             + (
                 "  'shell pm') echo package:/data/app/base.apk ;;\n"
-                if installed_version is not None
+                if present
                 else "  'shell pm') exit 1 ;;\n"
             )
             + (
@@ -569,8 +610,8 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
                 else "  'shell dumpsys') exit 1 ;;\n"
             )
             + (
-                "  'pull /data/app/base.apk') cp \"$2\" \"$3\" ;;\n"
-                if installed_version is not None
+                f"  'pull /data/app/base.apk') cp {shlex.quote(str(installed_apk))} \"$3\" ;;\n"
+                if present
                 else ""
             )
             + (
@@ -586,8 +627,9 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
             "#!/usr/bin/env bash\n"
             "case \"$2\" in\n"
             "  application-id) echo com.example.app ;;\n"
-            "  version-code) echo 10 ;;\n"
-            "  version-name) echo 1.0 ;;\n"
+            f"  version-code) echo {shlex.quote(candidate_version)} ;;\n"
+            f"  version-name) echo {shlex.quote(candidate_name)} ;;\n"
+            f"  print) printf '%s\\n' {shlex.quote(manifest)} ;;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -602,8 +644,12 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
                 else "    exit 1\n"
             )
             + "    ;;\n"
-            "  *) echo 'Signer #1 certificate SHA-256 digest: aa' ;;\n"
-            "esac\n"
+            + (
+                f"  *) echo 'Signer #1 certificate SHA-256 digest: {candidate_signer}' ;;\n"
+                if candidate_signer is not None
+                else "  *) exit 1 ;;\n"
+            )
+            + "esac\n"
         )
         for tool in (adb, apkanalyzer, apksigner):
             tool.chmod(0o755)
@@ -673,6 +719,223 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
         self.assertEqual(payload["outcome"], "blocked")
         self.assertEqual(payload["classification"], "signer_unknown")
         self.assertNotIn("install -r", log.read_text())
+
+    def test_compatible_ordinary_replacement_retains_install_arguments(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(root, installed_version=10)
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["classification"], "compatible_replace")
+        self.assertEqual(payload["candidate"]["version_code_source"], "declared")
+        self.assertIsNone(payload["candidate"]["instrumentation_target_package"])
+        self.assertIn("-s emulator-5554 install -r ", log.read_text())
+        self.assertNotIn(" -t", log.read_text())
+
+    def test_versionless_instrumentation_uses_platform_defaults(self) -> None:
+        for installed_version in (None, 0):
+            with self.subTest(installed_version=installed_version):
+                root = self.create_repository()
+                log, env = self.create_fake_tools(
+                    root,
+                    installed_version=installed_version,
+                    candidate_manifest=self.candidate_manifest(
+                        version=None,
+                        name=None,
+                        runners=(("com.example.Runner", "com.example.target"),),
+                    ),
+                    candidate_version="UNKNOWN",
+                    candidate_name="UNKNOWN",
+                )
+                result = self.run_installer(root, env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["outcome"], "installed")
+                self.assertFalse(payload["destructive_action"])
+                self.assertEqual(payload["candidate"]["version_code"], 0)
+                self.assertEqual(payload["candidate"]["version_code_source"], "platform_default")
+                self.assertIsNone(payload["candidate"]["version_name"])
+                self.assertEqual(
+                    payload["candidate"]["instrumentation_target_package"], "com.example.target"
+                )
+                commands = log.read_text()
+                self.assertIn("-s emulator-5554 install -r -t ", commands)
+                self.assertNotIn("uninstall", commands)
+                self.assertNotIn(" pm clear", commands)
+                self.assertNotIn(" -d", commands)
+
+    def test_versionless_instrumentation_cannot_downgrade(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(
+            root,
+            installed_version=1,
+            candidate_manifest=self.candidate_manifest(
+                version=None, name=None,
+                runners=(("com.example.Runner", "com.example.target"),),
+            ),
+            candidate_version="UNKNOWN",
+        )
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["classification"], "downgrade_blocked")
+        self.assertNotIn(" install ", log.read_text())
+
+    def test_versioned_instrumentation_retains_declared_metadata(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(
+            root,
+            installed_version=10,
+            candidate_manifest=self.candidate_manifest(
+                runners=(("com.example.Runner", "com.example.target"),),
+            ),
+        )
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        candidate = json.loads(result.stdout)["candidate"]
+        self.assertEqual(candidate["version_code"], 10)
+        self.assertEqual(candidate["version_code_source"], "declared")
+        self.assertEqual(candidate["version_name"], "1.0")
+        self.assertIn("install -r -t", log.read_text())
+
+    def test_unknown_declared_version_result_is_not_defaulted(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(
+            root,
+            installed_version=None,
+            candidate_manifest=self.candidate_manifest(
+                runners=(("com.example.Runner", "com.example.target"),),
+            ),
+            candidate_version="UNKNOWN",
+        )
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertFalse(log.exists())
+
+    def test_unknown_installed_version_blocks_all_artifact_kinds(self) -> None:
+        for instrumentation in (False, True):
+            with self.subTest(instrumentation=instrumentation):
+                root = self.create_repository()
+                log, env = self.create_fake_tools(
+                    root,
+                    installed_version=None,
+                    installed_present=True,
+                    candidate_manifest=self.candidate_manifest(
+                        version=None if instrumentation else "10",
+                        runners=(("com.example.Runner", "com.example.target"),)
+                        if instrumentation else (),
+                    ),
+                )
+                result = self.run_installer(root, env)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(
+                    json.loads(result.stdout)["classification"], "installed_version_unknown"
+                )
+                self.assertNotIn(" install ", log.read_text())
+
+    def test_mismatched_installed_signer_blocks_install_attempt(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(root, installed_version=10, installed_signer="bb")
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["classification"], "signer_mismatch")
+        self.assertNotIn(" install ", log.read_text())
+
+    def test_invalid_candidate_metadata_never_accesses_adb(self) -> None:
+        runner = (("com.example.Runner", "com.example.target"),)
+        invalid_manifests = {
+            "ordinary missing version": self.candidate_manifest(version=None),
+            "declared unknown version": self.candidate_manifest(version="UNKNOWN", runners=runner),
+            "declared negative version": self.candidate_manifest(version="-1", runners=runner),
+            "declared empty version": self.candidate_manifest(version="", runners=runner),
+            "absent minor nonzero major": self.candidate_manifest(version=None, major="1", runners=runner),
+            "absent minor malformed major": self.candidate_manifest(
+                version=None, major="UNKNOWN", runners=runner
+            ),
+            "invalid XML": "<manifest",
+            "invalid root": "<other/>",
+            "package mismatch": self.candidate_manifest().replace("com.example.app", "com.example.other"),
+            "empty runner": self.candidate_manifest(version=None, runners=(("", "com.example.target"),)),
+            "empty target": self.candidate_manifest(version=None, runners=(("com.example.Runner", ""),)),
+            "conflicting targets": self.candidate_manifest(
+                version=None,
+                runners=runner + (("com.example.OtherRunner", "com.example.other"),),
+            ),
+            "wrong namespace": self.candidate_manifest(version=None, runners=runner).replace(
+                "http://schemas.android.com/apk/res/android", "urn:wrong"
+            ),
+            "invalid testOnly": self.candidate_manifest(test_only="UNKNOWN"),
+            "empty testOnly": self.candidate_manifest(test_only=""),
+            "multiple applications": self.candidate_manifest().replace(
+                "</manifest>", "<application/></manifest>"
+            ),
+        }
+        for label, manifest in invalid_manifests.items():
+            with self.subTest(label=label):
+                root = self.create_repository()
+                log, env = self.create_fake_tools(
+                    root, installed_version=None, candidate_manifest=manifest
+                )
+                result = self.run_installer(root, env)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("android-apk-install-preserve:", result.stderr)
+                self.assertFalse(log.exists(), "Rejected metadata must not access a device")
+
+    def test_candidate_signature_failure_never_accesses_adb(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(
+            root, installed_version=None, candidate_signer=None
+        )
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertFalse(log.exists())
+
+    def test_multiple_runners_for_same_target_and_zero_major_are_supported(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(
+            root,
+            installed_version=0,
+            candidate_manifest=self.candidate_manifest(
+                version=None,
+                major="0",
+                runners=(
+                    ("com.example.Runner", "com.example.target"),
+                    ("com.example.OtherRunner", "com.example.target"),
+                ),
+            ),
+        )
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["candidate"]["instrumentation_target_package"], "com.example.target"
+        )
+        self.assertIn("install -r -t", log.read_text())
+
+    def test_test_only_flag_is_added_only_when_declared(self) -> None:
+        for test_only in ("true", "false", None):
+            with self.subTest(test_only=test_only):
+                root = self.create_repository()
+                log, env = self.create_fake_tools(
+                    root,
+                    installed_version=None,
+                    candidate_manifest=self.candidate_manifest(test_only=test_only),
+                )
+                result = self.run_installer(root, env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual("install -r -t" in log.read_text(), test_only == "true")
+
+    def test_install_failure_has_no_destructive_retry(self) -> None:
+        root = self.create_repository()
+        log, env = self.create_fake_tools(
+            root, installed_version=10, install_failure="VERSION_DOWNGRADE"
+        )
+        result = self.run_installer(root, env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["classification"], "downgrade_blocked")
+        commands = log.read_text()
+        self.assertEqual(commands.count("install -r"), 1)
+        self.assertNotIn("uninstall", commands)
+        self.assertNotIn(" pm clear", commands)
+        self.assertNotIn(" -d", commands)
 
 
 class WorkflowEvidenceLedgerTest(GitRepositoryTest):

@@ -19,10 +19,16 @@ that require explicit user authorization.
   separate explicit authorization naming that action. A general authorization
   to test, navigate, sign in, or exercise an external flow does not imply it.
 - The deterministic Android install adapter inspects the candidate and
-  installed package, then uses only `adb install -r` for compatible or absent
-  packages. It classifies package absence, downgrade, signer mismatch,
-  transport failure, and install failure. It never deletes package data or
-  retries destructively.
+  installed package, then uses preservation-only `adb install -r` for
+  compatible or absent packages. It adds `-t` only for manifest-declared
+  instrumentation or test-only APKs. A valid instrumentation manifest may omit
+  versionCode and versionName: an absent minor code with an absent or zero
+  major code uses Android's effective versionCode zero and an absent name is
+  reported as null. Malformed or ambiguous metadata is never defaulted.
+  Existing packages require a known installed version and compatible signer;
+  downgrade, unknown version, unknown or mismatched signer, transport failure,
+  and install failure block replacement. It never deletes package data,
+  grants downgrade permission, or retries destructively.
 - Before install, record only the app's authentication state as
   `authenticated`, `unauthenticated`, or `unknown`. Record the same state after
   launch. Never store credential values, authenticated content, or secret
