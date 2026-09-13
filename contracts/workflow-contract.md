@@ -179,27 +179,26 @@ Runtime v2 is atomic.
 
 ## Node context manifests and evidence ledger
 
-- Every generated project declares exactly five node context manifests:
-  `plan`, `implement`, `review`, `smoke`, and `delivery`.
-- The manifest is the node's context budget. It names required sources,
-  conditionally triggered sources, and material that must not be preloaded.
-  Incoming edge prompts carry dynamic task values instead of restating project
-  documentation.
-- Agent nodes append one non-empty event before every workflow transition
-  through the profile-owned evidence command. Evidence is JSONL, hash-chained,
-  Git-ignored, and append-only. A later slice never edits an earlier event.
-- Append is idempotent for the active `KENT_RUN_ID`. Provider recovery or
-  repeated completion of the same workflow run returns the original sequence
-  and hash instead of appending a second event.
-- Each event records task/node/Kent-run identity, Git HEAD, summary, artifacts,
-  checks, decisions, exact project instruction files read, instruction bytes,
-  repeated reads, repeated questions, and verification loops.
-- `model_calls` and `compaction_count` remain nullable until Kent exposes
-  stable session telemetry to workflow commands. Unknown values are recorded
-  as `null`, never inferred.
-- The ledger is concise metadata and evidence, not a transcript. It never
-  stores secrets, raw authenticated state, broad logs, or unredacted network
-  responses.
+- Five manifests: `plan`, `implement`, `review`, `smoke`, `delivery` budget
+  required/conditional/forbidden sources. Edges carry Task values, not docs.
+- Before Agent transitions: one nonempty event via profile evidence, Git-ignored,
+  hash-chained append-only JSONL. No rewrites; provider recovery/repeated
+  completion reuses active `KENT_RUN_ID` sequence/hash; no append.
+- Cleanup/recovery: nonempty `commands.prepare_cleanup` owns final
+  event/metrics/seal; no standalone append before/after it or for blockers.
+  Preflight/blockers stay in Task records; project-owned payload/archive
+  protocols. Missing/empty opt-in and other nodes are unchanged.
+  Real unmodified current Kent Session/Run/Step IDs; no dedup bypass.
+  Preserve/block invalid history; no acceptance, reconstruction or resealing.
+  Only genuine success permits validated frozen-request/report reuse
+  without append. Freeze original root/branch/report before leave; no relative
+  adapters from primary afterward. No native authentication added.
+- Events: Task/node/Kent-run IDs, HEAD, summary, artifacts, checks, decisions,
+  exact instruction files/bytes read, repeated reads/questions, verification
+  loops. `model_calls`/`compaction_count`: stable Kent telemetry or `null`;
+  never infer.
+- No transcripts, secrets, raw authenticated
+  state, broad logs or unredacted network responses.
 
 ## Branch identity
 

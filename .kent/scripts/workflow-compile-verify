@@ -1,0 +1,53 @@
+#!/bin/bash
+set -uo pipefail
+
+blocked() {
+  echo "$1" >&2
+  echo '{"transition":"blocked"}'
+  exit 0
+}
+
+compatible_python() {
+  [[ -n "$1" && -f "$1" && -x "$1" ]] &&
+    "$1" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' \
+      >/dev/null 2>&1
+}
+
+selected=""
+if [[ ${KENT_ENGINEERING_KIT_PYTHON+x} ]]; then
+  compatible_python "$KENT_ENGINEERING_KIT_PYTHON" ||
+    blocked "Explicit KENT_ENGINEERING_KIT_PYTHON is not usable Python 3.11+."
+  selected="$KENT_ENGINEERING_KIT_PYTHON"
+else
+  for candidate in "$(command -v python3 || true)" \
+    /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    if compatible_python "$candidate"; then
+      selected="$candidate"
+      break
+    fi
+  done
+fi
+[[ -n "$selected" ]] || blocked "An existing Python 3.11+ is required."
+
+"$selected" -c '
+import json, sys
+try:
+    raw = sys.stdin.buffer.read(1048577)
+    if len(raw) > 1048576 or not isinstance(json.loads(raw), dict):
+        raise ValueError("expected one bounded JSON object")
+except (ValueError, UnicodeError) as error:
+    print(f"Invalid verification input: {error}", file=sys.stderr)
+    raise SystemExit(1)
+' || blocked "Verification input is invalid."
+
+# The report wrapper launches this file by descriptor. Its cwd, not this
+# script pathname, identifies the selected source worktree.
+[[ -f ./scripts/validate && ! -L ./scripts/validate && -x ./scripts/validate ]] ||
+  blocked "Checkout-local scripts/validate is unavailable or unsafe."
+export PATH="${selected%/*}:$PATH"
+if ./scripts/validate >&2; then
+  echo '{"transition":"passed"}'
+else
+  echo '{"transition":"failed"}'
+fi
+exit 0

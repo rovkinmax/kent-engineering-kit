@@ -1996,7 +1996,9 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
 
 class WorkflowVerifyReportTest(GitRepositoryTest):
     def test_repository_verify_report_template_is_executable(self) -> None:
-        self.assertEqual(VERIFY_REPORT.stat().st_mode & 0o777, 0o755)
+        mode = VERIFY_REPORT.lstat().st_mode
+        self.assertTrue(stat.S_ISREG(mode))
+        self.assertTrue(mode & stat.S_IXUSR)
 
     def test_verify_private_tmp_survives_grandchild_close_fds_and_exec(self):
         for bounded in (False, True):

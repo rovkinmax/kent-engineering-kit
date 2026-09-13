@@ -31,6 +31,15 @@ from tests.test_revision import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def source_validation_copy_ignore(directory, names):
+    ignored = shutil.ignore_patterns(".git", "__pycache__")(directory, names)
+    if Path(directory) == ROOT:
+        ignored.add("build")
+    elif Path(directory) == ROOT / ".kent":
+        ignored.add("runtime")
+    return ignored
+
+
 class CiContractTest(unittest.TestCase):
     def test_runner_assertion_matches_supported_puber_bytes_only(self) -> None:
         assertion = 'test "${RUNNER_ENVIRONMENT:-github-hosted}" = github-hosted'
@@ -1005,7 +1014,7 @@ jobs:
             shutil.copytree(
                 ROOT,
                 copied_root,
-                ignore=shutil.ignore_patterns(".git", "__pycache__"),
+                ignore=source_validation_copy_ignore,
             )
             copied_tests_root = copied_root / "tests"
             temporary_test_files = sorted(copied_tests_root.rglob("test_*.py"))
