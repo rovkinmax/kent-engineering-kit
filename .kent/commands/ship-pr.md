@@ -5,6 +5,14 @@ explicit Git delivery authority. Source-only approval is insufficient.
 Inspect actual branch name, HEAD, immutable task baseline and current merge
 target; never reconstruct branch identity from the Task ID.
 
+Before preparing delivery, confirm the current typed verification report and
+retained log reference, plus matching before/after source and environment
+identity references for the exact source being delivered. Optional narrative
+handoffs reference the accepted preview and verifier artifacts rather than
+copying their complete contents. Missing, tampered or mismatched identity
+requires fresh verification through the existing Implement/verification path;
+do not run a second routine full validator in Delivery.
+
 When the applicable future workflow explicitly permits delivery, commit and
 push only the task branch and prepare its PR. Never commit unrelated changes,
 push directly to main, merge a PR, or bypass repository checks. Preserve the

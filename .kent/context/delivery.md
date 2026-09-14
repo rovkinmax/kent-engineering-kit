@@ -14,3 +14,9 @@ Conditional:
 
 Do not preload implementation recipes, disabled CI/Smoke, consumer rollout or
 installation instructions. Append evidence before each Agent transition.
+
+For Kit source delivery, read the source-verification ownership and identity
+contract in `.kent/project-contract.md`. Prepare delivery only with the
+current report/log and matching source/environment identity references for
+the exact source. Do not add a routine full validator run in Delivery;
+identity uncertainty routes back through the existing verification path.

@@ -16,7 +16,13 @@ otherwise record the gap and available deterministic evidence. Material
 scope/architecture changes return to reviewed Plan; external blockers use
 the existing decision gate with concrete proof required for resumption.
 
-Run affected tests and source-only validation, update the existing checkpoint
-and append new evidence without rewriting prior records. Return through
-plan-contract/verification routing with the generated carriers. Report-only
-qualification forbids tracked/staged repairs even when a defect is obvious.
+Run affected unit tests and focused production-shaped checks, including the
+configured wrapper and applicable terminal-helper admission fixtures. The
+configured verifier owns the one fresh full source validation after the
+repair; do not duplicate `./scripts/validate` in Fix. A carried report is
+usable only with matching source/environment identity and an unchanged
+approved scope; otherwise route fresh verification through the existing
+path. Update the existing checkpoint and append new evidence without
+rewriting prior records. Return through plan-contract/verification routing
+with the generated carriers. Report-only qualification forbids tracked/staged
+repairs even when a defect is obvious.

@@ -7,6 +7,11 @@ blocked() {
   exit 0
 }
 
+identity() {
+  "$selected" .kent/scripts/kit-verification-identity.py \
+    --workspace "$PWD" --python-executable "$selected"
+}
+
 compatible_python() {
   [[ -n "$1" && -f "$1" && -x "$1" ]] &&
     "$1" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' \
@@ -45,7 +50,31 @@ except (ValueError, UnicodeError) as error:
 [[ -f ./scripts/validate && ! -L ./scripts/validate && -x ./scripts/validate ]] ||
   blocked "Checkout-local scripts/validate is unavailable or unsafe."
 export PATH="${selected%/*}:$PATH"
+identity_before="$(identity)" ||
+  blocked "Verification source or environment identity is unavailable."
+echo "KENT_VERIFICATION_IDENTITY before ${identity_before}" >&2
 if ./scripts/validate >&2; then
+  validation_transition="passed"
+else
+  validation_transition="failed"
+fi
+identity_after="$(identity)" ||
+  if [[ "$validation_transition" == "failed" ]]; then
+    echo '{"transition":"failed"}'
+    exit 0
+  else
+    blocked "Verification source or environment identity is unavailable after validation."
+  fi
+echo "KENT_VERIFICATION_IDENTITY after ${identity_after}" >&2
+if [[ "$identity_before" != "$identity_after" ]]; then
+  if [[ "$validation_transition" == "failed" ]]; then
+    echo "Verification identity changed while validation failed." >&2
+    echo '{"transition":"failed"}'
+  else
+    echo "Verification identity changed during validation." >&2
+    echo '{"transition":"blocked"}'
+  fi
+elif [[ "$validation_transition" == "passed" ]]; then
   echo '{"transition":"passed"}'
 else
   echo '{"transition":"failed"}'

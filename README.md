@@ -31,8 +31,14 @@ continuous writer: Plan, two independent preview reviews, human approval,
 Implement, local verification and Standards review, PR delivery, and owned
 Cleanup/Janitor. There is no separate CI stage, Smoke, publication, or final
 Compliance layer. Existing GitHub checks and merge policy remain in force.
-Run `./scripts/validate` from the selected source worktree; do not use
-`--installed-state` for source development. Python 3.11+ must already exist.
+Run affected tests and focused production-shaped wrapper/helper checks from
+the selected source worktree. The configured verifier owns one fresh full
+`./scripts/validate` run after writer bookkeeping; carry its report/log and
+source/environment identity references through existing handoffs. Any
+identity or source drift requires fresh verification. Do not use
+`--installed-state` for source development. The authoritative ownership and
+identity limits are in `.kent/project-contract.md`; Python 3.11+ must already
+exist.
 
 Source development is separate from installed Kit adoption. The installed
 primary checkout remains clean on

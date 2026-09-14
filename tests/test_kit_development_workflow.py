@@ -23,6 +23,7 @@ from workflowkit.model import SpecError
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / ".kent/workflows/kit_development.py"
 CHILD = ROOT / ".kent/scripts/workflow-compile-verify"
+IDENTITY = ROOT / ".kent/scripts/kit-verification-identity.py"
 module_spec = importlib.util.spec_from_file_location("kit_development", BUILDER)
 assert module_spec is not None and module_spec.loader is not None
 kit = importlib.util.module_from_spec(module_spec)
@@ -414,6 +415,7 @@ class CompileVerifierTest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name).resolve()
+        (root / ".gitignore").write_text("/build/kent-workflow/\n")
         (root / "scripts").mkdir()
         validator = root / "scripts/validate"
         validator.write_text(
@@ -424,16 +426,40 @@ class CompileVerifierTest(unittest.TestCase):
             f"exit {exit_code}\n",
         )
         validator.chmod(0o755)
+        scripts = root / ".kent/scripts"
+        scripts.mkdir(parents=True)
+        for source in (
+            CHILD,
+            ROOT / ".kent/scripts/workflow-verify-report",
+            ROOT / ".kent/scripts/workflow_runtime_contracts.py",
+            IDENTITY,
+        ):
+            shutil.copy2(source, scripts / source.name)
+        subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(root), "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid",
+                "-c", "core.hooksPath=/dev/null",
+                "commit", "--quiet", "-m", "Fixture baseline",
+            ],
+            check=True,
+        )
         return root
 
     def run_child(self, root: Path, *, payload: str = "{}",
                   override: str | None = None) -> subprocess.CompletedProcess:
         environment = dict(os.environ)
         environment.pop("KENT_ENGINEERING_KIT_PYTHON", None)
+        private_tmpdir = root / "build/kent-workflow/.verify-tmp-fixture"
+        private_tmpdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        environment["TMPDIR"] = str(private_tmpdir)
         if override is not None:
             environment["KENT_ENGINEERING_KIT_PYTHON"] = override
         return subprocess.run(
-            [str(CHILD)], cwd=root, input=payload, env=environment,
+            [str(root / ".kent/scripts/workflow-compile-verify")],
+            cwd=root, input=payload, env=environment,
             text=True, capture_output=True, check=False,
         )
 
@@ -488,10 +514,11 @@ class CompileVerifierTest(unittest.TestCase):
                 )
                 (root / ".gitignore").write_text("/build/kent-workflow/\n")
                 scripts = root / ".kent/scripts"
-                scripts.mkdir(parents=True)
+                scripts.mkdir(parents=True, exist_ok=True)
                 for name in (
                     "workflow-compile-verify", "workflow-verify-report",
                     "workflow_runtime_contracts.py",
+                    "kit-verification-identity.py",
                 ):
                     shutil.copy2(ROOT / ".kent/scripts" / name, scripts / name)
                 result = subprocess.run(
