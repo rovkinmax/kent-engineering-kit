@@ -14,3 +14,10 @@ Conditional:
 
 Do not preload delivery, Smoke, consumer/device procedures or unrelated
 backlog. Preserve continuous-writer context and append slice evidence.
+
+For Kit self-development, use the source-verification ownership and identity
+contract in `.kent/project-contract.md`: run affected tests and focused
+production-shaped wrapper/helper checks, leave the one fresh full validator
+run to the configured verifier, and carry report/log/identity references
+through the existing handoff. Identity uncertainty requires fresh
+verification; it does not authorize a cache or a skipped verifier run.

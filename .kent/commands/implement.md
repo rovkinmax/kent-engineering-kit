@@ -12,9 +12,15 @@ require deterministic reproduction before production edits. Use authoritative
 template sources and explicit approved materialization for generated files;
 never patch generated copies.
 
-Run relevant local tests and `./scripts/validate` from this checkout with an
-existing Python 3.11+. No `--installed-state`, installs, global changes,
-Android/device operations or consumer rollout. Report failures truthfully.
+Run affected unit tests and focused production-shaped checks from this
+checkout, including the configured wrapper and any applicable terminal-helper
+admission fixtures. The configured verifier owns one fresh full
+`./scripts/validate` run after writer bookkeeping; the writer does not
+duplicate that full run. Carry the accepted preview, verification
+report/log and before/after identity references through the existing
+handoff. Missing or mismatched identity requires fresh verification.
+No `--installed-state`, installs, global changes, Android/device operations
+or consumer rollout. Report failures truthfully.
 Pass finished work to existing verification dispatch; deterministic checks
 and Standards review are read-only and return through Join/Gate.
 

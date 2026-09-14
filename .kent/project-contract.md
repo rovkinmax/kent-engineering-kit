@@ -57,14 +57,59 @@ materialization until their update has bounded source authority.
 
 ## Verification and evidence
 
-Run checkout-local `./scripts/validate` with an existing Python 3.11+.
-Never use `--installed-state`, install dependencies/interpreters, or change
-global PATH for this flow. The profile's compile verifier returns only
+The configured verifier runs checkout-local `./scripts/validate` with an
+existing Python 3.11+. Writer and Fix procedures run affected tests and
+focused production-shaped checks; they do not duplicate the verifier's one
+fresh full source run after writer bookkeeping. Never use `--installed-state`,
+install dependencies/interpreters, or change global PATH for this flow. The
+profile's compile verifier returns only
 `{"transition":"passed"}`, `{"transition":"failed"}` or
 `{"transition":"blocked"}` on stdout, with logs on stderr.
 Runtime checkpoints/evidence belong under ignored `.kent/runtime/`; verifier
 outputs and private temporary directories use ignored `build/kent-workflow/`.
 Normal `.todo` plans remain tracked.
+
+## Source verification ownership and identity
+
+The existing configured verifier is the sole owner of a fresh complete
+`./scripts/validate` run for an unchanged source slice. Its report and
+content-addressed log are carried forward through existing verification and
+delivery carriers. Targeted tests and production-shaped wrapper/helper
+fixtures are earlier bounded checks, not substitutes for that verifier.
+
+The compile child emits two stderr-only
+`KENT_VERIFICATION_IDENTITY` lines around validation. Each line contains the
+closed `kit-verification-identity-v1` object with exactly
+`schema`, `source_sha256`, `environment_sha256`, `head`, and
+`workspace_path`. The source digest covers the canonical workspace, HEAD,
+tracked working bytes/modes/deletions, nonignored untracked source bytes,
+in-root symlink targets, accepted plan/procedure inputs, and the actual
+child, wrapper, runtime, identity-reader and validator bytes. Git
+administrative data and generated ignored outputs are excluded; ignored
+external inputs and dependencies remain outside this cooperative freshness
+check.
+
+The environment digest records OS/architecture, the resolved selected Python
+version and executable bytes, validator-tool paths/versions/executable
+digests, and hashed effective environment values. It includes the replacement
+environment contract used by the report wrapper. A contained private
+`TMPDIR` is represented by its stable private-directory contract rather than
+the invocation-specific random basename; external or unvalidated paths do
+not become a reuse guarantee.
+
+The identity reader is bounded and read-only: at most 20,000 source entries
+and 256 MiB of source bytes, with chunked reads. Missing/unborn HEAD,
+unsupported or external source symlinks, unreadable or unstable inputs,
+tool/environment drift, missing or tampered report identity, and source
+mutation between the two lines invalidate a passing result. A validator
+failure remains failed; identity uncertainty never becomes success. This is
+a cooperative freshness check, not native identity authentication or
+permission isolation, and uncertainty requires a fresh verifier run.
+
+Evidence retains the complete typed report/log where the workflow contract
+requires it, including Gate `review_context` and terminal retention.
+Optional writer, PR and approval narratives reference the one accepted
+preview and verifier artifacts instead of copying their complete contents.
 
 Read the active context manifest first. Before each Agent transition append
 the required non-empty evidence event through the profile command, recording
