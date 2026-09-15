@@ -61,8 +61,9 @@ Commit/push/PR, live create/apply/link/default, qualification Task execution,
 consumer rollout and installed adoption each need their applicable explicit
 authority. Future authorized delivery commits and pushes the task branch
 only; never push directly to `main` or merge the PR. Cleanup runs through the
-existing post-session Janitor, and acceptance checks actual worktree-path
-and Git/Kent-registration absence, not just Task Done.
+existing post-session Janitor, and acceptance checks actual worktree-path and
+Git absence plus an absent Kent record or the exact original ID/root read back
+as missing retained restorative metadata, not just Task Done.
 
 ## Runtime contract v2
 

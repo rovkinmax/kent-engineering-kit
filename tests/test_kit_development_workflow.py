@@ -216,7 +216,9 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
         self.assertIn("`canBeRebased`", ship)
         self.assertIn("must be true", ship)
         cleanup = (ROOT / ".kent/commands/cleanup-task.md").read_text()
-        self.assertIn("actual worktree path absence AND absent Git and Kent", cleanup)
+        self.assertIn("actual worktree path absence and absent Git registration", cleanup)
+        self.assertIn("exact original managed record", cleanup)
+        self.assertIn("retained restorative metadata", cleanup)
         self.assertIn("Close only processes proven owned", cleanup)
         self.assertIn("cleanup_mode=no_pr", cleanup)
 

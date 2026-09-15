@@ -105,8 +105,12 @@ published branch tip, not merely be reachable from one. Preserve the source
 bootstrap branch through qualification; do not confuse its retained root
 with the qualification task's disposable worktree.
 
-Acceptance requires actual worktree path absence AND absent Git and Kent
-registration after Janitor, with the expected retained evidence/disposition.
-A `done` status or successful transition name alone proves neither deletion
-nor ownership release. Inspect the Janitor result/readbacks; if a resource
-remains, report it as retained/blocked rather than claiming cleanup complete.
+Acceptance requires actual worktree path absence and absent Git registration.
+Kent registration must be absent or the exact original managed record must be
+read back with the same ID/root in missing topology; report that record as
+retained restorative metadata and never call this full resource retirement.
+Verify every owned branch disposition, including exact-OID local deletion and
+retained report-only publication. A `done` status or successful transition
+name alone proves neither deletion nor ownership release. Inspect the Janitor
+result/readbacks; if a resource remains, report it as retained/blocked rather
+than claiming cleanup complete.

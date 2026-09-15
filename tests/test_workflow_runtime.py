@@ -7681,6 +7681,26 @@ class WorkflowJanitorTest(GitRepositoryTest):
         payload.update(overrides)
         return json.dumps(payload)
 
+    def add_origin_branch(self, root: Path, worktree: Path) -> Path:
+        remote_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(remote_temporary.cleanup)
+        remote = Path(remote_temporary.name)
+        self.run_git(remote, "init", "--bare", "-q")
+        self.run_git(root, "remote", "add", "origin", str(remote))
+        branch = self.run_git(
+            worktree,
+            "branch",
+            "--show-current",
+        ).stdout.strip()
+        self.run_git(
+            root,
+            "push",
+            "-q",
+            "origin",
+            f"refs/heads/{branch}:refs/heads/{branch}",
+        )
+        return remote
+
     def completed_wrapper(self, root: Path) -> Path:
         wrapper = root / "kent-worktree"
         wrapper.write_text(
@@ -7694,6 +7714,22 @@ class WorkflowJanitorTest(GitRepositoryTest):
             "\"observed_root\": root}, \"problems\": None}))'\n"
             "  exit 0\n"
             "fi\n"
+            "if [ \"$1\" = list ]; then\n"
+            "  python3 -c 'import json, os, subprocess; primary=os.environ[\"KENT_TEST_PRIMARY\"]; "
+            "state=os.path.join(primary, \".kent-test-record-root\"); done=os.path.join(primary, "
+            "\".kent-test-delete-done\"); root=(open(state).read().strip() if os.path.exists(state) "
+            "else next(line[9:] for line in subprocess.check_output([\"git\", \"-C\", primary, "
+            "\"worktree\", \"list\", \"--porcelain\"], text=True).splitlines() if line.startswith("
+            "\"worktree \") and os.path.realpath(line[9:]) != os.path.realpath(primary))); "
+            "open(state, \"w\").write(root); variant=\"missing\" if os.path.exists(done) else \"registered\"; "
+            "topology={\"variant\": variant, variant: {\"kent\": {\"worktree_id\": \"kent-test-record\", "
+            "\"canonical_root\": root, \"display_name\": \"TASK-1\", \"managed\": True}}}; "
+            "topology[variant].update({\"git\": {\"canonical_root\": root, \"head_object\": "
+            "subprocess.check_output([\"git\", \"-C\", root, \"rev-parse\", \"HEAD\"], text=True).strip(), "
+            "\"branch_ref\": \"refs/heads/TASK-1\", \"branch_name\": \"TASK-1\", \"path_available\": True}} "
+            "if variant == \"registered\" else {}); print(json.dumps({\"worktrees\": [{\"topology\": topology}]}))'\n"
+            "  exit 0\n"
+            "fi\n"
             "if [ -n \"${KENT_TEST_WRAPPER_LOG:-}\" ]; then\n"
             "  python3 -c 'import json, os, sys; "
             "open(os.environ[\"KENT_TEST_WRAPPER_LOG\"], \"w\").write("
@@ -7704,6 +7740,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             "fi\n"
             "for argument in \"$@\"; do target=\"$argument\"; done\n"
             "git -C \"$KENT_TEST_PRIMARY\" worktree remove --force \"$target\"\n"
+            "touch \"$KENT_TEST_PRIMARY/.kent-test-delete-done\"\n"
             "if [ -n \"${KENT_TEST_NEW_OID:-}\" ]; then\n"
             "  git -C \"$KENT_TEST_PRIMARY\" update-ref "
             "refs/heads/TASK-1 \"$KENT_TEST_NEW_OID\"\n"
@@ -7714,6 +7751,273 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         wrapper.chmod(0o755)
         return wrapper
+
+    def retained_kent_record_wrapper(self, root: Path) -> Path:
+        wrapper = root / "kent-worktree-retained-record"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "if [ \"$1\" = status ]; then\n"
+            "  python3 -c 'import json, os; root = "
+            "os.environ[\"KENT_TEST_PRIMARY\"]; print(json.dumps({"
+            "\"target\": {\"EffectiveWorkdir\": root}, "
+            "\"worktree\": {\"recorded_root\": root, "
+            "\"observed_root\": root}, \"problems\": None}))'\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [ \"$1\" = list ]; then\n"
+            "  if [ -e \"$KENT_TEST_DELETE_DONE\" ]; then\n"
+            "    cat \"$KENT_TEST_KENT_LIST_AFTER\"\n"
+            "  else\n"
+            "    cat \"$KENT_TEST_KENT_LIST_BEFORE\"\n"
+            "  fi\n"
+            "  exit 0\n"
+            "fi\n"
+            "for argument in \"$@\"; do target=\"$argument\"; done\n"
+            "git -C \"$KENT_TEST_PRIMARY\" worktree remove --force \"$target\"\n"
+            "touch \"$KENT_TEST_DELETE_DONE\"\n"
+            "printf '%s\\n' "
+            "'{\"kind\":\"completed\",\"completed\":{\"cleanup\":"
+            "{\"kind\":\"retained\"}}}'\n"
+        )
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def test_no_pr_cleanup_settles_local_branch_and_reports_retained_kent_record(
+        self,
+    ) -> None:
+        root = self.create_repository()
+        remote_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(remote_temporary.cleanup)
+        remote = Path(remote_temporary.name)
+        self.run_git(remote, "init", "--bare", "-q")
+        self.run_git(root, "remote", "add", "origin", str(remote))
+        worktrees = root / ".kent" / "worktrees"
+        worktrees.mkdir(parents=True)
+        worktree = worktrees / "TASK-1"
+        self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
+        head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        self.run_git(
+            root,
+            "push",
+            "-q",
+            "origin",
+            "refs/heads/TASK-1:refs/heads/TASK-1",
+        )
+
+        kent_record_id = "kent-record-task-1"
+        before = root / "kent-list-before.json"
+        before.write_text(
+            json.dumps(
+                {
+                    "worktrees": [
+                        {
+                            "topology": {
+                                "variant": "registered",
+                                "registered": {
+                                    "git": {
+                                        "canonical_root": str(worktree),
+                                        "head_object": head,
+                                        "branch_ref": "refs/heads/TASK-1",
+                                        "branch_name": "TASK-1",
+                                        "path_available": True,
+                                    },
+                                    "kent": {
+                                        "worktree_id": kent_record_id,
+                                        "canonical_root": str(worktree),
+                                        "display_name": "TASK-1",
+                                        "managed": True,
+                                    },
+                                },
+                            }
+                        }
+                    ]
+                }
+            )
+        )
+        after = root / "kent-list-after.json"
+        after.write_text(
+            json.dumps(
+                {
+                    "worktrees": [
+                        {
+                            "topology": {
+                                "variant": "missing",
+                                "missing": {
+                                    "kent": {
+                                        "worktree_id": kent_record_id,
+                                        "canonical_root": str(worktree),
+                                        "display_name": "TASK-1",
+                                        "managed": True,
+                                    }
+                                },
+                            }
+                        }
+                    ]
+                }
+            )
+        )
+        delete_done = root / "kent-delete-done"
+        fake_wrapper = self.retained_kent_record_wrapper(root)
+
+        result = subprocess.run(
+            [str(JANITOR)],
+            cwd=worktree,
+            input=self.janitor_input(
+                worktree,
+                branch_name="TASK-1",
+                cleanup_mode="no_pr",
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "KENT_WORKTREE_WRAPPER": str(fake_wrapper),
+                "KENT_TEST_PRIMARY": str(root),
+                "KENT_TEST_KENT_LIST_BEFORE": str(before),
+                "KENT_TEST_KENT_LIST_AFTER": str(after),
+                "KENT_TEST_DELETE_DONE": str(delete_done),
+            },
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["transition"], "task_janitor_done")
+        self.assertFalse(worktree.exists())
+        self.assertNotEqual(
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/TASK-1",
+                ],
+                check=False,
+            ).returncode,
+            0,
+        )
+        self.assertEqual(
+            subprocess.run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(remote),
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/TASK-1",
+                ],
+                check=False,
+            ).returncode,
+            0,
+        )
+        report = payload["cleanup_report"]
+        self.assertIn("retained restorative metadata", report)
+        self.assertIn(kent_record_id, report)
+        self.assertIn(str(worktree), report)
+        self.assertIn("Local branch removed: true", report)
+        self.assertIn("Remote branch retained: true", report)
+
+    def test_kent_topology_preflight_and_post_delete_matrix(self) -> None:
+        for phase in ("before", "after"):
+            for state in (
+                "absent", "missing", "registered", "changed_id", "changed_root",
+                "duplicate", "unreadable", "malformed", "external",
+            ):
+                with self.subTest(phase=phase, state=state):
+                    root, worktree, _, _ = self.make_managed_worktree(with_v2=False)
+                    kent = {
+                        "worktree_id": "kent-record-task-1",
+                        "canonical_root": str(worktree),
+                        "managed": True,
+                    }
+                    registered = {"topology": {
+                        "variant": "registered",
+                        "registered": {
+                            "kent": kent,
+                            "git": {"canonical_root": str(worktree)},
+                        },
+                    }}
+                    missing = {"topology": {
+                        "variant": "missing", "missing": {"kent": kent},
+                    }}
+                    entries = [missing]
+                    if state == "absent":
+                        entries = []
+                    elif state == "registered":
+                        entries = [registered]
+                    elif state in ("changed_id", "changed_root"):
+                        changed = dict(kent)
+                        changed["worktree_id" if state == "changed_id" else "canonical_root"] = (
+                            "another-record" if state == "changed_id" else str(root / "other")
+                        )
+                        entries = [{"topology": {
+                            "variant": "missing", "missing": {"kent": changed},
+                        }}]
+                    elif state == "duplicate":
+                        entries = [registered, registered] if phase == "before" else [missing, missing]
+                    elif state == "external":
+                        entries = [{"topology": {
+                            "variant": "external",
+                            "external": {"git": {"canonical_root": str(worktree)}},
+                        }}]
+                    before = root / "kent-before.json"
+                    after = root / "kent-after.json"
+                    before.write_text(json.dumps({"worktrees": [registered]}))
+                    after.write_text(json.dumps({"worktrees": [missing]}))
+                    selected = before if phase == "before" else after
+                    selected.write_text(
+                        '{"worktrees":[{"topology":{"variant":"missing","missing":{}}}]}'
+                        if state == "malformed" else json.dumps({"worktrees": entries})
+                    )
+                    if state == "unreadable":
+                        selected.unlink()
+                    deleted = root / "delete-done"
+                    wrapper = self.retained_kent_record_wrapper(root)
+                    result = subprocess.run(
+                        [str(JANITOR)], cwd=worktree,
+                        input=self.janitor_input(
+                            worktree, branch_name="TASK-1", cleanup_mode="no_pr",
+                        ),
+                        text=True, capture_output=True, check=False,
+                        env={
+                            **os.environ, "KENT_WORKTREE_WRAPPER": str(wrapper),
+                            "KENT_TEST_PRIMARY": str(root),
+                            "KENT_TEST_KENT_LIST_BEFORE": str(before),
+                            "KENT_TEST_KENT_LIST_AFTER": str(after),
+                            "KENT_TEST_DELETE_DONE": str(deleted),
+                        },
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = json.loads(result.stdout)
+                    accepted = (phase == "before" and state == "registered") or (
+                        phase == "after" and state in ("absent", "missing")
+                    )
+                    self.assertEqual(payload["transition"],
+                                     "task_janitor_done" if accepted else "task_janitor_blocked",
+                                     payload)
+                    native_deleted = phase == "after" or accepted
+                    self.assertEqual(deleted.exists(), native_deleted)
+                    self.assertEqual(worktree.exists(), not native_deleted)
+                    self.assertEqual(str(worktree) in self.run_git(
+                        root, "worktree", "list", "--porcelain",
+                    ).stdout, not native_deleted)
+                    local = subprocess.run(
+                        ["git", "-C", str(root), "show-ref", "--verify", "refs/heads/TASK-1"],
+                        capture_output=True, check=False,
+                    )
+                    self.assertEqual(local.returncode == 0, not accepted)
+                    self.assertIn("refs/heads/TASK-1", self.run_git(
+                        root, "ls-remote", "--heads", "origin", "refs/heads/TASK-1",
+                    ).stdout)
+                    if accepted and state != "absent":
+                        self.assertIn("retained restorative metadata", payload["cleanup_report"])
+                    if phase == "after" and not accepted:
+                        self.assertNotIn("Janitor preserved", payload["cleanup_report"])
 
     def make_managed_worktree(
         self,
@@ -7796,6 +8100,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             )
             self.assertEqual(seal.returncode, 0, seal.stderr)
             marker = json.loads(seal.stdout)["terminal_marker"]
+        self.add_origin_branch(root, worktree)
         return root, worktree, scripts, marker
 
     def managed_pr_environment(
@@ -7831,43 +8136,38 @@ class WorkflowJanitorTest(GitRepositoryTest):
         }
 
     def no_op_completed_wrapper(self, root: Path) -> Path:
-        wrapper = root / "kent-worktree-noop"
-        wrapper.write_text(
-            "#!/bin/sh\n"
-            "if [ \"$1\" = status ]; then\n"
-            "  python3 -c 'import json, os; root = "
-            "os.environ[\"KENT_TEST_PRIMARY\"]; print(json.dumps({"
-            "\"target\": {\"EffectiveWorkdir\": root}, "
-            "\"worktree\": {\"recorded_root\": root, "
-            "\"observed_root\": root}}))'\n"
+        wrapper = self.completed_wrapper(root)
+        content = wrapper.read_text()
+        content = content.replace(
+            "for argument in \"$@\"; do target=\"$argument\"; done\n",
+            "if [ \"$1\" = delete ]; then\n"
+            "  printf '%s\\n' '{\"kind\":\"completed\"}'\n"
             "  exit 0\n"
             "fi\n"
-            "printf '%s\\n' '{\"kind\":\"completed\"}'\n"
+            "for argument in \"$@\"; do target=\"$argument\"; done\n",
+            1,
         )
-        wrapper.chmod(0o755)
+        wrapper.write_text(content)
         return wrapper
 
     def fake_tombstone_completed_wrapper(self, root: Path) -> Path:
-        wrapper = root / "kent-worktree-fake-tombstone"
-        wrapper.write_text(
-            "#!/bin/sh\n"
-            "set -eu\n"
-            "if [ \"$1\" = status ]; then\n"
-            "  python3 -c 'import json, os; root = "
-            "os.environ[\"KENT_TEST_PRIMARY\"]; print(json.dumps({"
-            "\"target\": {\"EffectiveWorkdir\": root}, "
-            "\"worktree\": {\"recorded_root\": root, "
-            "\"observed_root\": root}}))'\n"
+        wrapper = self.completed_wrapper(root)
+        content = wrapper.read_text()
+        content = content.replace(
+            "for argument in \"$@\"; do target=\"$argument\"; done\n",
+            "if [ \"$1\" = delete ]; then\n"
+            "  for argument in \"$@\"; do target=\"$argument\"; done\n"
+            "  if [ -n \"${KENT_TEST_EXACT_TOMBSTONE:-}\" ]; then\n"
+            "    mv \"$target/.kent/runtime/$KENT_TEST_EXACT_TOMBSTONE\" "
+            "\"$target/.kent/runtime/.evidence-cleanup-fake\"\n"
+            "  fi\n"
+            "  printf '%s\\n' '{\"kind\":\"completed\"}'\n"
             "  exit 0\n"
             "fi\n"
-            "for argument in \"$@\"; do target=\"$argument\"; done\n"
-            "if [ -n \"${KENT_TEST_EXACT_TOMBSTONE:-}\" ]; then\n"
-            "  mv \"$target/.kent/runtime/$KENT_TEST_EXACT_TOMBSTONE\" "
-            "\"$target/.kent/runtime/.evidence-cleanup-fake\"\n"
-            "fi\n"
-            "printf '%s\\n' '{\"kind\":\"completed\"}'\n"
+            "for argument in \"$@\"; do target=\"$argument\"; done\n",
+            1,
         )
-        wrapper.chmod(0o755)
+        wrapper.write_text(content)
         return wrapper
 
     def test_managed_completed_wrapper_leaves_tombstone_and_blocks(self) -> None:
@@ -9435,11 +9735,23 @@ class WorkflowJanitorTest(GitRepositoryTest):
 
     def test_exact_merged_pr_invokes_kent_worktree_deletion(self) -> None:
         root = self.create_repository()
+        remote_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(remote_temporary.cleanup)
+        remote = Path(remote_temporary.name)
+        self.run_git(remote, "init", "--bare", "-q")
+        self.run_git(root, "remote", "add", "origin", str(remote))
         worktrees = root / ".kent" / "worktrees"
         worktrees.mkdir(parents=True)
         worktree = worktrees / "TASK-1"
         self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
         head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        self.run_git(
+            root,
+            "push",
+            "-q",
+            "origin",
+            "refs/heads/TASK-1:refs/heads/TASK-1",
+        )
 
         pr_state = root / "pr-state.json"
         pr_state.write_text(
@@ -9498,6 +9810,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         worktree = worktrees / "TASK-1"
         self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
         head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        self.add_origin_branch(root, worktree)
         pr_state = root / "pr-state.json"
         pr_state.write_text(
             json.dumps(
@@ -9514,24 +9827,16 @@ class WorkflowJanitorTest(GitRepositoryTest):
         fake_gh = root / "gh"
         fake_gh.write_text("#!/bin/sh\ncat \"$KENT_TEST_PR_STATE\"\n")
         fake_gh.chmod(0o755)
-        fake_wrapper = root / "kent-worktree"
+        fake_wrapper = self.completed_wrapper(root)
         fake_wrapper.write_text(
-            "#!/bin/sh\n"
-            "if [ \"$1\" = status ]; then\n"
-            "  python3 -c 'import json, os; root = "
-            "os.environ[\"KENT_TEST_PRIMARY\"]; print(json.dumps({"
-            "\"target\": {\"EffectiveWorkdir\": root}, "
-            "\"worktree\": {\"recorded_root\": root, "
-            "\"observed_root\": root}}))'\n"
-            "  exit 0\n"
-            "fi\n"
-            "for argument in \"$@\"; do target=\"$argument\"; done\n"
-            "git -C \"$KENT_TEST_PRIMARY\" worktree remove --force \"$target\"\n"
-            "mv \"$KENT_TEST_PRIMARY\" \"$KENT_TEST_PRIMARY.old\"\n"
-            "git init -q \"$KENT_TEST_PRIMARY\"\n"
-            "printf '%s\\n' '{\"kind\":\"completed\"}'\n"
+            fake_wrapper.read_text().replace(
+                "git -C \"$KENT_TEST_PRIMARY\" worktree remove --force \"$target\"\n",
+                "git -C \"$KENT_TEST_PRIMARY\" worktree remove --force \"$target\"\n"
+                "mv \"$KENT_TEST_PRIMARY\" \"$KENT_TEST_PRIMARY.old\"\n"
+                "git init -q \"$KENT_TEST_PRIMARY\"\n",
+                1,
+            )
         )
-        fake_wrapper.chmod(0o755)
         result = subprocess.run(
             [str(JANITOR)],
             cwd=worktree,
@@ -9568,6 +9873,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         worktree = worktrees / "TASK-1"
         self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
         head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        self.add_origin_branch(root, worktree)
 
         pr_state = root / "pr-state.json"
         pr_state.write_text(
@@ -9766,6 +10072,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         worktree = worktrees / "TASK-1"
         self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
         head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        self.add_origin_branch(root, worktree)
 
         pr_state = root / "pr-state.json"
         pr_state.write_text(
@@ -9783,22 +10090,17 @@ class WorkflowJanitorTest(GitRepositoryTest):
         fake_gh = root / "gh"
         fake_gh.write_text("#!/bin/sh\ncat \"$KENT_TEST_PR_STATE\"\n")
         fake_gh.chmod(0o755)
-        fake_wrapper = root / "kent-worktree"
+        fake_wrapper = self.completed_wrapper(root)
         fake_wrapper.write_text(
-            "#!/bin/sh\n"
-            "if [ \"$1\" = status ]; then\n"
-            "  python3 -c 'import json, os; root = "
-            "os.environ[\"KENT_TEST_PRIMARY\"]; print(json.dumps({"
-            "\"target\": {\"EffectiveWorkdir\": root}, "
-            "\"worktree\": {\"recorded_root\": root, "
-            "\"observed_root\": root}, \"problems\": None}))'\n"
-            "  exit 0\n"
-            "fi\n"
-            "printf '%s\\n' "
-            "'{\"kind\":\"scheduled\",\"scheduled\":"
-            "{\"operation_id\":\"operation-test\"}}'\n"
+            fake_wrapper.read_text().replace(
+                "for argument in \"$@\"; do target=\"$argument\"; done\n",
+                "printf '%s\\n' "
+                "'{\"kind\":\"scheduled\",\"scheduled\":"
+                "{\"operation_id\":\"operation-test\"}}'\n"
+                "exit 0\n",
+                1,
+            )
         )
-        fake_wrapper.chmod(0o755)
 
         result = subprocess.run(
             [str(JANITOR)],
@@ -9836,6 +10138,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         worktree = worktrees / "TASK-1"
         self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
         head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        self.add_origin_branch(root, worktree)
 
         pr_state = root / "pr-state.json"
         pr_state.write_text(
@@ -9853,22 +10156,17 @@ class WorkflowJanitorTest(GitRepositoryTest):
         fake_gh = root / "gh"
         fake_gh.write_text("#!/bin/sh\ncat \"$KENT_TEST_PR_STATE\"\n")
         fake_gh.chmod(0o755)
-        fake_wrapper = root / "kent-worktree"
+        fake_wrapper = self.completed_wrapper(root)
         fake_wrapper.write_text(
-            "#!/bin/sh\n"
-            "if [ \"$1\" = status ]; then\n"
-            "  python3 -c 'import json, os; root = "
-            "os.environ[\"KENT_TEST_PRIMARY\"]; print(json.dumps({"
-            "\"target\": {\"EffectiveWorkdir\": root}, "
-            "\"worktree\": {\"recorded_root\": root, "
-            "\"observed_root\": root}, \"problems\": None}))'\n"
-            "  exit 0\n"
-            "fi\n"
-            "printf '%s\\n' "
-            "'{\"kind\":\"completed\",\"completed\":"
-            "{\"cleanup\":{\"kind\":\"retained\"}}}'\n"
+            fake_wrapper.read_text().replace(
+                "for argument in \"$@\"; do target=\"$argument\"; done\n",
+                "printf '%s\\n' "
+                "'{\"kind\":\"completed\",\"completed\":"
+                "{\"cleanup\":{\"kind\":\"retained\"}}}'\n"
+                "exit 0\n",
+                1,
+            )
         )
-        fake_wrapper.chmod(0o755)
 
         result = subprocess.run(
             [str(JANITOR)],
@@ -9909,6 +10207,14 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.run_git(root, "add", "remote-only.txt")
         self.run_git(root, "commit", "-q", "-m", "User update")
         pr_head = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+        self.add_origin_branch(root, worktree)
+        self.run_git(
+            root,
+            "push",
+            "-q",
+            "origin",
+            f"{pr_head}:refs/heads/TASK-1",
+        )
         self.assertEqual(
             self.run_git(
                 root,
@@ -10031,6 +10337,100 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertIn("not conclusively recoverable", payload["cleanup_report"])
         self.assertFalse(wrapper_marker.exists())
         self.assertTrue(worktree.exists())
+
+    def test_initially_absent_merged_remote_requires_post_delete_readback(self) -> None:
+        for outcome in (
+            "absent", "appeared", "lookup_error",
+            "lease_lookup_error", "lease_retained", "lease_failure",
+        ):
+            with self.subTest(outcome=outcome):
+                root, worktree, _, _ = self.make_managed_worktree(with_v2=False)
+                head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+                remote = Path(self.run_git(root, "remote", "get-url", "origin").stdout.strip())
+                if not outcome.startswith("lease_"):
+                    self.run_git(remote, "update-ref", "-d", "refs/heads/TASK-1")
+                wrapper = self.completed_wrapper(root)
+                environment = self.managed_pr_environment(root, worktree, wrapper=wrapper)
+                # Change only the isolated remote after native worktree deletion.
+                effect = {
+                    "absent": ":",
+                    "appeared": 'git -C "$KENT_TEST_REMOTE" update-ref refs/heads/TASK-1 "$KENT_TEST_HEAD"',
+                    "lookup_error": 'mv "$KENT_TEST_REMOTE" "$KENT_TEST_REMOTE.offline"',
+                }.get(outcome, ":")
+                wrapper.write_text(wrapper.read_text().replace(
+                    'touch "$KENT_TEST_PRIMARY/.kent-test-delete-done"\n',
+                    'touch "$KENT_TEST_PRIMARY/.kent-test-delete-done"\n' + effect + "\n",
+                ))
+                environment.update(KENT_TEST_REMOTE=str(remote), KENT_TEST_HEAD=head)
+                if outcome.startswith("lease_"):
+                    bin_dir = root / "fake-bin"
+                    bin_dir.mkdir()
+                    git = bin_dir / "git"
+                    git.write_text(
+                        "#!/bin/sh\n"
+                        "for arg in \"$@\"; do\n"
+                        "  if [ \"$arg\" = :refs/heads/TASK-1 ]; then\n"
+                        + {
+                            "lease_failure": "    exit 1\n",
+                            "lease_retained": "    exit 0\n",
+                            "lease_lookup_error":
+                                '    "$KENT_TEST_REAL_GIT" "$@" || exit $?\n'
+                                '    mv "$KENT_TEST_REMOTE" "$KENT_TEST_REMOTE.offline"\n'
+                                "    exit 0\n",
+                        }[outcome]
+                        + "  fi\n"
+                        "done\n"
+                        'exec "$KENT_TEST_REAL_GIT" "$@"\n'
+                    )
+                    git.chmod(0o755)
+                    environment.update(
+                        KENT_TEST_REAL_GIT=shutil.which("git"),
+                        PATH=str(bin_dir) + os.pathsep + environment["PATH"],
+                    )
+                try:
+                    result = subprocess.run(
+                        [str(JANITOR)], cwd=worktree,
+                        input=self.janitor_input(
+                            worktree, branch_name="TASK-1", cleanup_mode="merged",
+                            pr_url="https://github.com/example/repo/pull/1",
+                            merge_report="merged",
+                        ),
+                        text=True, capture_output=True, env=environment, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = json.loads(result.stdout)
+                    self.assertFalse(worktree.exists())
+                    self.assertNotIn(str(worktree), self.run_git(
+                        root, "worktree", "list", "--porcelain",
+                    ).stdout)
+                    self.assertNotEqual(subprocess.run(
+                        ["git", "-C", str(root), "show-ref", "--verify", "refs/heads/TASK-1"],
+                        capture_output=True, check=False,
+                    ).returncode, 0)
+                    if outcome == "absent":
+                        self.assertEqual(payload["transition"], "task_janitor_done")
+                        self.assertIn("Remote branch removed: true", payload["cleanup_report"])
+                    else:
+                        self.assertEqual(payload["transition"], "task_janitor_blocked")
+                        self.assertNotIn("Remote branch removed: true", payload["cleanup_report"])
+                        self.assertIn(
+                            {
+                                "appeared": "changed",
+                                "lookup_error": "readback failed",
+                                "lease_lookup_error": "postcondition is unknown",
+                                "lease_retained": "remained after exact lease",
+                                "lease_failure": "deletion failed",
+                            }[outcome],
+                            payload["blocker_reason"],
+                        )
+                    if outcome in ("appeared", "lease_retained", "lease_failure"):
+                        self.assertEqual(self.run_git(
+                            remote, "rev-parse", "refs/heads/TASK-1",
+                        ).stdout.strip(), head)
+                finally:
+                    offline = remote.with_name(remote.name + ".offline")
+                    if offline.exists():
+                        offline.rename(remote)
 
     def test_remote_branch_deletion_uses_exact_lease(self) -> None:
         root = self.create_repository()
@@ -10244,11 +10644,23 @@ class WorkflowJanitorTest(GitRepositoryTest):
 
     def test_local_branch_oid_change_is_preserved_after_worktree_removal(self) -> None:
         root = self.create_repository()
+        remote_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(remote_temporary.cleanup)
+        remote = Path(remote_temporary.name)
+        self.run_git(remote, "init", "--bare", "-q")
+        self.run_git(root, "remote", "add", "origin", str(remote))
         worktrees = root / ".kent" / "worktrees"
         worktrees.mkdir(parents=True)
         worktree = worktrees / "TASK-1"
         self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
         task_head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        self.run_git(
+            root,
+            "push",
+            "-q",
+            "origin",
+            "refs/heads/TASK-1:refs/heads/TASK-1",
+        )
         (root / "tracked.txt").write_text("new main state\n")
         self.run_git(root, "add", "tracked.txt")
         self.run_git(root, "commit", "-q", "-m", "Advance main")
@@ -10297,6 +10709,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
+        self.assertEqual(payload["transition"], "task_janitor_blocked")
         self.assertIn("OID changed", payload["cleanup_report"])
         self.assertEqual(
             self.run_git(root, "rev-parse", "refs/heads/TASK-1").stdout.strip(),
