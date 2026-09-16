@@ -1,93 +1,140 @@
 # Model Policy
 
-## Current Source Policy — September 6, 2026
+## Current Source Policy — September 16, 2026
 
 [`config/subagents.toml`](../config/subagents.toml) is the authoritative managed
 configuration fragment and the single source of truth for role allocation.
-The mixed policy restores `gpt-5.6-luna` for eight subagent roles and retains
-`gpt-6-astra` for the root, the disabled built-in reviewer, and the remaining
-seven roles: eight Luna and nine Astra selectors in total. Former Sol and
-Terra assignments use Astra; the historical July policy below is not the
-current allocation.
+Use existing roles and explicit configuration; do not add a complexity router
+or duplicate coder roles. The historical July policy below is not current.
+
+### Allocation and Manual Selection
+
+- Main agent and planner: `gpt-6-astra`, medium.
+- Simple coder (`implementation-worker`): `gpt-5.6-luna`, xhigh.
+- Complex standalone coding: explicitly select Astra medium on the same role.
+- Runtime QA (`runtime-smoke-tester`): Luna high.
+- Code and specification review (`standards-reviewer`, `spec-reviewer`):
+  Astra medium.
+- Architecture design (`architecture-designer`): retain Astra high, by
+  explicit user choice.
+- Fast: Luna high.
+- Built-in reviewer/supervisor: Luna xhigh, enabled with `frequency = "edits"`.
+
+Research, Fix, build diagnosis, and release management retain Astra medium.
+Compliance review, Gate, and delivery retain Luna high; compliance is a
+rule-compliance leaf, not general code review. CI monitoring and the
+tool-less release decision retain Luna low.
+
+For an explicitly assigned standalone complex implementation slice:
+
+```bash
+kent run --agent implementation-worker \
+  --model gpt-6-astra --thinking-level medium \
+  "<bounded implementation assignment>"
+```
+
+This launches a separate manually selected session, not a workflow transition.
+Do not launch a competing writer for workflow-owned work. The role's explicit
+372000/353400 working budget remains in effect even with the Astra override;
+the override does not acquire the root's larger budget.
+
+Configured workflow Implement nodes continue to select `implementation-worker`
+with Luna xhigh for all tasks. Automatic complexity-based selection is deferred
+to **KEN-18**, not implemented by these configuration changes.
+
+### Optional Work and Mandatory Gates
+
+No workflow graph or role prompt changes accompany this allocation. Planning
+may omit inapplicable optional work with an explicit rationale, subject to the
+task and project contract. Workflow-stage skipping must use an existing
+authorized route: conditional Smoke is decided by Gate and its
+`smoke_rationale`, not by an arbitrary planner bypass. Mandatory verification,
+reviews, approvals, and single-writer ownership remain unchanged.
 
 ### Model Selection, Reasoning, and Budgets
 
 This split is an operator choice, not a claim of measured Kent quota savings.
 Evaluate it against task quality, provider failures, retries, latency, context
-growth, and review/Fix-loop counts. Model selection and `thinking_level` are
-separate settings; changing the model does not authorize changing reasoning.
-Do not attribute an observed outcome to model selection without accounting
-for the reasoning setting and workflow behavior.
+growth, and review/Fix-loop counts. Model and reasoning changes are explicitly
+paired above; do not attribute an outcome solely to the model.
 
-The root retains `model_context_window = 872000`. Each of the eight Luna roles
-explicitly pairs `model_context_window = 372000` with
-`context_compaction_threshold_tokens = 353400`. Fast retains its existing
-window and gains the matching threshold; the other seven roles gain both
-fields. No Astra role receives an explicit role budget. These are intentional
-operator-chosen harness budgets, not statements about provider maximum
-context capacity.
+The root retains `model_context_window = 872000`. Each of the eight Luna
+subagent roles explicitly pairs `model_context_window = 372000` with
+`context_compaction_threshold_tokens = 353400`. The supervisor has a separate
+372000 window; its schema does not provide a compaction-threshold setting.
+There are nine Luna selectors including the supervisor, and eight Astra
+selectors including the root. No Astra subagent receives an explicit role
+budget. Standards review now inherits the root budget; runtime QA receives
+the Luna pair. These are operator-chosen harness budgets, not claims about
+provider maximum capacity.
 
-This bounded change preserves every other setting: per-role reasoning,
-low verbosity, tools, prompts, callability, priority mode, the disabled
-built-in reviewer, workflow concurrency of 4, and maximum subagent depth of 1.
-Only the eight role threshold keys are added; no root compaction key is added
-to the managed fragment. Operator-owned root compaction settings, including
-the global threshold 828400 and mode `native`, remain unchanged.
+Preserve low verbosity, tools, prompts, callability, priority mode, workflow
+concurrency of 4, and maximum subagent depth of 1. No root compaction key is
+added to the managed fragment. Operator-owned root compaction settings,
+including the global threshold 828400 and mode `native`, remain unchanged.
 
 Kent 2.7.2 derives Luna's 372000/353400 pair on a fresh role launch but skips
 that derivation under a model lock. Without explicit pairs, continuation can
-inherit root budgets; fast's smaller explicit window can instead conflict
-with the inherited root threshold. The paired overrides keep the intended
-working budget in fresh and model-locked projections without changing the
-locked model.
+inherit root budgets or conflict with an inherited root threshold. Explicit
+pairs preserve the intended role budget without changing a locked model.
 
 ### Configuration Adoption and Runtime Evidence
 
-Configuration adoption is a separately approved reconciliation of the managed
-fragment with global and project settings. A project-defined role replaces
-the entire global role definition in Kent 2.7.2; its fields are not merged
-individually. Therefore every project-defined override of one of these Luna
-roles needs the same explicit budget pair. Projects without such overrides
-inherit the global definition. Check each intended launch root and preserve
-unrelated user settings. Historical attached workspaces and retained
-worktrees can keep older overrides; do not assume they inherit this policy.
+Reconcile global and project settings only with explicit adoption authority.
+A project-defined role replaces the entire global role definition in Kent
+2.7.2; fields are not merged individually. Project-defined Luna roles therefore
+need their own explicit budget pair. Preserve project prompts, tools,
+callability, and unrelated user settings.
+
+The September 16 adoption covers registered primary roots:
+
+- AppsomeAndroid: local coder becomes Luna xhigh, quality code review becomes
+  Astra medium, and both mobile/runtime smoke aliases become Luna high with
+  the explicit budget pair. The target branch is `release/4.30.0`, not master.
+- Puber: local coder becomes Luna xhigh; Compose, domain-model, and quality
+  code-review roles become Astra medium.
+- Kit, agent-default, OsomeAPI-SDK-generator, and osome-slack-reader inherit
+  global role definitions where no project override exists. Do not create
+  redundant configuration files.
+
+Retained worktrees and historical bootstrap templates are outside this
+adoption. Inspect their effective configuration before using them; do not
+assume they inherit the updated primary-root policy.
 
 File-level adoption is not a runtime canary. Existing model and prompt locks
-are preserved, but they do not freeze every runtime setting: fresh and
-continuation paths can re-read working budgets without a restart. An existing
-Astra-locked session assigned one of these now-Luna roles retains Astra while
-using the smaller 372000/353400 pair and can compact earlier. Restart is not
-an isolation barrier for configuration-file adoption.
+are preserved, but working budgets can be re-read on continuation before a
+restart. An Astra-locked QA session can compact earlier with its new smaller
+budget. Removing the Luna budget from standards review also changes that
+role's continuation budget. Restart is not an isolation boundary.
 
-Do not resume large historical sessions to test these budgets. Their
-continuation/compaction, any actual fresh/continue runtime canary, and any
-service/GUI restart require separate decisions accounting for active work.
+The enabled supervisor adds asynchronous review after successful first-class
+edits once the configuration is effective. It does not replace mandatory
+workflow review and may add model usage. Do not claim measured savings.
 
 ### Validation, Rollout, and Rollback Boundaries
 
-Source validation checks the managed policy and its regression tests. This
-package has no workflow graph delta and does not authorize installation,
-global or project configuration edits, restart, or a runtime canary.
+Run source-only `./scripts/validate` and parse the adopted TOML files. Compare
+only the approved key deltas against exact working preimages, not Git HEAD
+when a project already has uncommitted configuration changes. Static checks
+of global/project role resolution are not evidence of a launched model.
 
-Approve installation/configuration effects and restart/new-session
-verification explicitly; approval for file changes alone is not restart or
-runtime-canary authority.
 `scripts/install` creates links for Kit assets; it does not merge
-`config/subagents.toml` into the effective configuration. Preserve user changes
-when reconciling configuration and verify effective settings separately.
-In a separately approved runtime canary, confirm the effective model,
-reasoning, window, and threshold. A fresh launch does not verify continuation
-behavior; neither source tests nor preserved model/prompt locks prove that
-all runtime settings stayed fixed.
+`config/subagents.toml`. This update does not run the installer or change
+workflow graphs, role prompts, task execution, or project profile mappings.
+Source/configuration approval is not permission to restart Kent, start a
+runtime canary, commit, or push.
 
-Before installation, source rollback is the inverse of this bounded package's
-patch, preserving unrelated changes. It is not a global model downgrade and
-must not undo the separately delivered hotfix. After installation, rollback
-requires a separately approved operational plan that accounts for linked
-assets and effective configuration; a source-only inverse is insufficient.
-Reversing the paired-budget correction removes eight thresholds and seven
-new windows while retaining fast's pre-existing window. That restores the
-known continuation bug, so an inverse is not automatically safe recovery.
+Documented global activation requires a safe service/GUI restart and new
+sessions. Schedule that separately with active work accounted for. Do not
+resume historical sessions merely to test budgets. A separately authorized
+canary must check actual model, reasoning, window, and threshold; a fresh
+launch does not verify continuation behavior.
+
+Rollback is the inverse of only this package's approved key changes relative
+to retained working preimages. Preserve subsequent and pre-existing user
+changes; never reset whole files to Git HEAD. Operational rollback needs
+separate approval because restored budgets and reviewer frequency also have
+runtime effects.
 
 ### Sources and Evaluation
 

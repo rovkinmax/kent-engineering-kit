@@ -9,10 +9,11 @@ subagents = true
 concurrency = 4
 
 [reviewer]
-frequency = "off"
-model = "gpt-6-astra"
-thinking_level = "medium"
+frequency = "edits"
+model = "gpt-5.6-luna"
+thinking_level = "xhigh"
 model_verbosity = "low"
+model_context_window = 372000
 
 [subagents.fast]
 model = "gpt-5.6-luna"
@@ -57,11 +58,9 @@ edit = false
 
 [subagents.standards-reviewer]
 description = "Read-only review against repository instructions, architecture, and engineering standards."
-model = "gpt-5.6-luna"
-model_context_window = 372000
-context_compaction_threshold_tokens = 353400
+model = "gpt-6-astra"
 system_prompt_file = "agents/standards-reviewer.md"
-thinking_level = "high"
+thinking_level = "medium"
 model_verbosity = "low"
 agent_callable = false
 workflow_subagent = false
@@ -105,7 +104,7 @@ model = "gpt-5.6-luna"
 model_context_window = 372000
 context_compaction_threshold_tokens = 353400
 system_prompt_file = "agents/implementation-worker.md"
-thinking_level = "high"
+thinking_level = "xhigh"
 model_verbosity = "low"
 agent_callable = true
 workflow_subagent = true
@@ -161,9 +160,11 @@ edit = false
 
 [subagents.runtime-smoke-tester]
 description = "Platform-neutral runtime smoke execution through project procedures and adapters."
-model = "gpt-6-astra"
+model = "gpt-5.6-luna"
+model_context_window = 372000
+context_compaction_threshold_tokens = 353400
 system_prompt_file = "agents/runtime-smoke-tester.md"
-thinking_level = "medium"
+thinking_level = "high"
 model_verbosity = "low"
 agent_callable = true
 workflow_subagent = false
