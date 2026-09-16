@@ -329,14 +329,14 @@ class WorkflowKitTest(unittest.TestCase):
             "fast": ("high", None, None, None, None),
             "compliance_reviewer": ("high", False, False, True, False),
             "researcher": ("medium", True, True, True, False),
-            "standards-reviewer": ("high", False, False, True, False),
+            "standards-reviewer": ("medium", False, False, True, False),
             "spec-reviewer": ("medium", False, False, True, False),
             "architecture-designer": ("high", True, True, True, False),
-            "implementation-worker": ("high", True, True, True, True),
+            "implementation-worker": ("xhigh", True, True, True, True),
             "fix-worker": ("medium", True, True, True, True),
             "build-doctor": ("medium", True, True, True, True),
             "workflow-gate": ("high", False, False, True, False),
-            "runtime-smoke-tester": ("medium", True, False, True, False),
+            "runtime-smoke-tester": ("high", True, False, True, False),
             "release-manager": ("medium", False, False, True, True),
             "delivery-operator": ("high", False, False, True, False),
             "ci-monitor": ("low", True, False, True, False),
@@ -347,18 +347,18 @@ class WorkflowKitTest(unittest.TestCase):
         selectors = {"root": config, "reviewer": config["reviewer"], **roles}
         expected_models = {
             "root": "gpt-6-astra",
-            "reviewer": "gpt-6-astra",
+            "reviewer": "gpt-5.6-luna",
             "fast": "gpt-5.6-luna",
             "compliance_reviewer": "gpt-5.6-luna",
             "researcher": "gpt-6-astra",
-            "standards-reviewer": "gpt-5.6-luna",
+            "standards-reviewer": "gpt-6-astra",
             "spec-reviewer": "gpt-6-astra",
             "architecture-designer": "gpt-6-astra",
             "implementation-worker": "gpt-5.6-luna",
             "fix-worker": "gpt-6-astra",
             "build-doctor": "gpt-6-astra",
             "workflow-gate": "gpt-5.6-luna",
-            "runtime-smoke-tester": "gpt-6-astra",
+            "runtime-smoke-tester": "gpt-5.6-luna",
             "release-manager": "gpt-6-astra",
             "delivery-operator": "gpt-5.6-luna",
             "ci-monitor": "gpt-5.6-luna",
@@ -368,12 +368,13 @@ class WorkflowKitTest(unittest.TestCase):
             {name: selector["model"] for name, selector in selectors.items()},
             expected_models,
         )
-        luna_roles = {
+        luna_selectors = {
             name for name, model in expected_models.items() if model == "gpt-5.6-luna"
         }
+        luna_roles = luna_selectors.intersection(roles)
         expected_reasoning = {
             "root": "medium",
-            "reviewer": "medium",
+            "reviewer": "xhigh",
             **{name: policy[0] for name, policy in expected_roles.items()},
         }
         self.assertEqual(
@@ -389,7 +390,7 @@ class WorkflowKitTest(unittest.TestCase):
                 for name, selector in selectors.items()
                 if "model_context_window" in selector
             },
-            {"root": 872000, **{name: 372000 for name in luna_roles}},
+            {"root": 872000, **{name: 372000 for name in luna_selectors}},
         )
         self.assertEqual(
             {
@@ -414,7 +415,7 @@ class WorkflowKitTest(unittest.TestCase):
                     )
                     self.assertEqual(role["system_prompt_file"], f"agents/{name}.md")
         self.assertEqual(roles["compliance_reviewer"]["skills"], {"planning": False})
-        self.assertEqual(config["reviewer"]["frequency"], "off")
+        self.assertEqual(config["reviewer"]["frequency"], "edits")
         self.assertEqual(config["workflow"], {"subagents": True, "concurrency": 4})
         self.assertEqual(config["max_subagent_depth"], 1)
 
