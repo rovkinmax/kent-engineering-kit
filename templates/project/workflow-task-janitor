@@ -2,9 +2,11 @@
 """Terminal evidence admission under the existing cooperative POSIX lock.
 
 One scoped admission owns the directory and file descriptors through rename,
-retention or deletion. CI names are not an allowlist: canonical validated bytes,
-their digest and an exact logical Task reference in the sealed chain authorize
-each report. Tombstone paths never become logical artifact identities.
+retention or deletion. Any non-CI ordinary entry is admitted only as a private,
+owned regular file; its bytes remain opaque. CI names are reserved:
+canonical validated bytes, their digest and an exact logical Task reference in
+the sealed chain authorize each report. Tombstone paths never become logical
+artifact identities.
 Admission Git probes resolve and bind the selected workspace's own Git directory,
 worktree and index, including linked worktrees. Inherited GIT_* routing, object,
 namespace and config injection are removed; ordinary on-disk Git exclusions
@@ -18,8 +20,9 @@ Initial and managed admission require every referenced report. Only a matching
 tombstone with a verified durable sentinel and matching ledger/report marker may
 resume with already-absent reports; that checkpoint cannot distinguish prior
 deletion from unrelated loss. No absent bytes are claimed to have been verified.
-Managed cleanup retains all raw bytes. Primary cleanup removes fix, smoke,
-lexically ordered reports, then the ledger last, fsyncing after each unlink.
+Managed cleanup retains all admitted bytes. Primary cleanup removes ordinary
+opaque files, then lexically ordered validated reports, then the ledger last,
+fsyncing after each unlink.
 FD/link/byte checks detect cooperative drift, not hostile same-UID stat/unlink
 races: POSIX unlink is not an atomic inode compare-and-swap.
 """
@@ -41,12 +44,17 @@ from urllib.parse import urlparse
 
 TASK_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 GITHUB_LOOKUP_ATTEMPTS = 3
+CI_REPORT_PREFIX = "ci-report-"
 CI_REPORT_NAME = re.compile(r"ci-report-([0-9a-f]{64})\.json")
 MAX_RUNTIME_ENTRIES = 256
 MAX_CI_ARTIFACTS = 64
 MAX_CI_ARTIFACT_BYTES = 4 * 1024 * 1024
 MAX_LEDGER_BYTES = 8 * 1024 * 1024
 MAX_LEDGER_RECORDS = 8192
+RUNTIME_FILE_METADATA = (
+    "st_dev", "st_ino", "st_uid", "st_mode", "st_nlink",
+    "st_size", "st_mtime_ns", "st_ctime_ns",
+)
 
 
 def runtime_state_names(task: str) -> tuple[str, str]:
@@ -727,12 +735,6 @@ class _EvidenceAdmission:
                     os.fsync(runtime_fd)
                     _revalidate_file_link(runtime_fd, self.sentinel_name, self.sentinel)
                     self.phase = "deletion-resume"
-            allowed = {
-                "evidence-ledger.jsonl", "fix-checkpoint.json", "smoke-checkpoint.json",
-            } | self.references
-            unknown = set(entries) - allowed
-            if unknown:
-                raise ValueError(f"unexpected tombstone entries: {sorted(unknown)}")
             self.git_command, self.git_environment = _evidence_git_workspace(workspace)
             total = 0
             for name in entries:
@@ -740,7 +742,11 @@ class _EvidenceAdmission:
                     descriptor = _open_evidence_file(self.directory, name)
                     self.files[name] = (descriptor, None, None)
                     report_bytes = None
-                    if name in self.references:
+                    if name.startswith(CI_REPORT_PREFIX):
+                        if name not in self.references:
+                            raise ValueError(
+                                f"unreferenced CI artifact: {name}"
+                            )
                         report_bytes = _bounded_file_bytes(descriptor, runtime.MAX_CI_REPORT_BYTES)
                         total += len(report_bytes)
                         if total > MAX_CI_ARTIFACT_BYTES:
@@ -807,7 +813,7 @@ class _EvidenceAdmission:
             current = os.fstat(descriptor)
             if any(
                 getattr(current, key) != getattr(saved, key)
-                for key in ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink")
+                for key in RUNTIME_FILE_METADATA
             ):
                 raise ValueError("runtime file identity changed after admission")
             if raw is not None and _bounded_file_bytes(
@@ -1216,7 +1222,11 @@ def _remove_v2_runtime_state(
         if admission.sentinel < 0:
             admission.sentinel = os.dup(sentinel_fd)
             admission.sentinel_name = sentinel_name
-        order = ["fix-checkpoint.json", "smoke-checkpoint.json"]
+        order = sorted(
+            name for name in admission.files
+            if name != "evidence-ledger.jsonl"
+            and name not in admission.references
+        )
         order += sorted(admission.references & admission.files.keys())
         order += ["evidence-ledger.jsonl"]
         for name in order:
@@ -1225,7 +1235,11 @@ def _remove_v2_runtime_state(
             phase = (
                 "ci_report" if CI_REPORT_NAME.fullmatch(name)
                 else "ledger" if name == "evidence-ledger.jsonl"
-                else name.removesuffix(".json").replace("-", "_")
+                else (
+                    name.removesuffix(".json").replace("-", "_")
+                    if name in {"fix-checkpoint.json", "smoke-checkpoint.json"}
+                    else "opaque"
+                )
             )
             if _phase_hook is not None:
                 _phase_hook(f"before_{phase}_unlink")
@@ -1496,6 +1510,7 @@ def remove_runtime_state(
         return v2_result
 
     descriptors: list[int] = []
+    admitted: dict[str, tuple[int, os.stat_result]] = {}
     try:
         root_fd = os.open(
             workspace,
@@ -1533,47 +1548,81 @@ def remove_runtime_state(
         )
         descriptors.append(lock_fd)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        allowed = {
-            "evidence-ledger.jsonl",
-            "fix-checkpoint.json",
-            "smoke-checkpoint.json",
-            "runtime.lock",
-            "terminal-sentinel",
-        }
-        entries = os.listdir(task_fd)
+        entries = _bounded_inventory(task_fd)
         if "terminal-sentinel" in entries:
             runtime_contracts()
-        unexpected = sorted(
-            item for item in set(entries) - allowed
-            if not item.startswith(".evidence-cleanup-")
-        )
-        if unexpected:
-            return False, f"unexpected runtime entries: {unexpected}"
         for entry in entries:
-            metadata = os.stat(entry, dir_fd=task_fd, follow_symlinks=False)
-            if not stat.S_ISREG(metadata.st_mode):
-                return False, f"runtime entry is not a regular file: {entry}"
-            if metadata.st_nlink != 1:
-                return False, f"runtime entry has multiple links: {entry}"
-            relative = f".kent/runtime/{task_short_id}/{entry}"
-            ignored = run(
-                ["git", "check-ignore", "-q", "--", relative],
-                cwd=workspace,
-                check=False,
-            ).returncode == 0
-            tracked = run(
-                ["git", "ls-files", "--error-unmatch", "--", relative],
-                cwd=workspace,
-                check=False,
-            ).returncode == 0
-            if not ignored or tracked:
+            if entry.startswith(CI_REPORT_PREFIX):
                 return (
                     False,
-                    f"runtime entry is tracked or not ignored: {relative}",
+                    f"CI evidence requires sealed v2 admission: {entry}",
                 )
-        for entry in entries:
+            descriptor = _open_evidence_file(task_fd, entry)
+            admitted[entry] = (descriptor, os.fstat(descriptor))
+
+        git_command, git_environment = _evidence_git_workspace(workspace)
+
+        def revalidate() -> None:
+            _revalidate_directory_link(root_fd, ".kent", kent_fd)
+            _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+            _revalidate_directory_link(runtime_fd, task_short_id, task_fd)
+            if set(_bounded_inventory(task_fd)) != admitted.keys():
+                raise ValueError("runtime inventory changed after admission")
+            paths = sorted(
+                f".kent/runtime/{task_short_id}/{name}"
+                for name in admitted
+            )
+            if paths:
+                ignored = run(
+                    [*git_command, "check-ignore", "-z", "--stdin"],
+                    cwd=workspace,
+                    check=False,
+                    environment=git_environment,
+                    input_text="".join(path + "\0" for path in paths),
+                )
+                tracked = run(
+                    [
+                        *git_command,
+                        "--literal-pathspecs",
+                        "ls-files",
+                        "-z",
+                        "--",
+                        *paths,
+                    ],
+                    cwd=workspace,
+                    check=False,
+                    environment=git_environment,
+                )
+                if (
+                    ignored.returncode != 0
+                    or not ignored.stdout.endswith("\0")
+                    or ignored.stdout.split("\0")[:-1] != paths
+                    or tracked.returncode != 0
+                    or tracked.stdout
+                ):
+                    raise ValueError(
+                        "runtime entries are tracked or not ignored in "
+                        "selected workspace"
+                    )
+            for name, (descriptor, saved) in admitted.items():
+                _revalidate_file_link(task_fd, name, descriptor)
+                current = os.fstat(descriptor)
+                if any(
+                    getattr(current, key) != getattr(saved, key)
+                    for key in RUNTIME_FILE_METADATA
+                ):
+                    raise ValueError("runtime file changed during cleanup")
+
+        revalidate()
+        order = [entry for entry in entries if entry != "evidence-ledger.jsonl"]
+        if "evidence-ledger.jsonl" in entries:
+            order.append("evidence-ledger.jsonl")
+        for entry in order:
+            revalidate()
             os.unlink(entry, dir_fd=task_fd)
             os.fsync(task_fd)
+            descriptor, _ = admitted.pop(entry)
+            os.close(descriptor)
             if _phase_hook is not None:
                 if entry == "fix-checkpoint.json":
                     _phase_hook("after_fix_checkpoint_unlink_fsync")
@@ -1581,6 +1630,8 @@ def remove_runtime_state(
                     _phase_hook("after_smoke_checkpoint_unlink_fsync")
                 elif entry == "evidence-ledger.jsonl":
                     _phase_hook("after_ledger_unlink_fsync")
+                elif entry not in {"runtime.lock", "terminal-sentinel"}:
+                    _phase_hook("after_opaque_unlink_fsync")
         os.close(task_fd)
         descriptors.remove(task_fd)
         os.rmdir(task_short_id, dir_fd=runtime_fd)
@@ -1588,6 +1639,8 @@ def remove_runtime_state(
     except (NotADirectoryError, OSError, ValueError) as error:
         return False, str(error)
     finally:
+        for descriptor, _ in admitted.values():
+            os.close(descriptor)
         close_descriptors(*descriptors)
 
 

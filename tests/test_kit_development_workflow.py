@@ -949,8 +949,10 @@ class CleanupPreparationTest(unittest.TestCase):
         self.assertIn("not a sealed", result[1])
         self.assertTrue((root / ".kent/runtime/TASK-1/plan-contract.json").exists())
 
-    def test_real_sealed_plan_snapshot_is_unknown_to_janitor(self) -> None:
+    def test_real_sealed_plan_snapshot_is_admitted_by_janitor(self) -> None:
         root = self.fixture()
+        source = root / ".kent/runtime/TASK-1/plan-contract.json"
+        expected = source.read_bytes()
         sealed = self.command(
             root, "workflow-evidence-ledger", self.seal_request,
             "seal", "--task", "TASK-1", "--workspace", str(root),
@@ -958,9 +960,15 @@ class CleanupPreparationTest(unittest.TestCase):
         self.assertEqual(sealed.returncode, 0, sealed.stderr)
         report = "Fixture retained authority\n" + json.loads(sealed.stdout)["terminal_marker"]
         result = self.admission(root, report)
-        self.assertFalse(result[0], result)
-        self.assertIn("plan-contract.json", result[1])
-        self.assertTrue((root / ".kent/runtime/TASK-1/plan-contract.json").exists())
+        self.assertTrue(result[0], result)
+        self.assertIn("sealed evidence retained", result[1])
+        self.assertFalse((root / ".kent/runtime/TASK-1").exists())
+        tombstones = list((root / ".kent/runtime").glob(".evidence-cleanup-*"))
+        self.assertEqual(len(tombstones), 1)
+        self.assertEqual(
+            (tombstones[0] / "plan-contract.json").read_bytes(),
+            expected,
+        )
 
 
 if __name__ == "__main__":
