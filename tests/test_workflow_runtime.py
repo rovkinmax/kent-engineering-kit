@@ -8563,8 +8563,8 @@ class WorkflowJanitorTest(GitRepositoryTest):
         root = self.create_repository()
         runtime = root / ".kent" / "runtime" / "TASK-1"
         runtime.mkdir(parents=True)
-        (runtime / "fix-checkpoint.json").write_text("{}")
-        (runtime / "evidence-ledger.jsonl").write_text("{}\n")
+        self._write_valid_runtime_file(runtime / "fix-checkpoint.json", "{}")
+        self._write_valid_runtime_file(runtime / "evidence-ledger.jsonl", "{}\n")
         result = subprocess.run(
             [str(JANITOR)],
             cwd=root,
@@ -9175,9 +9175,11 @@ class WorkflowJanitorTest(GitRepositoryTest):
         for name, content in opaque.items():
             self._write_valid_runtime_file(active / name, content)
         active.rename(tombstone)
-        (runtime_dir / (
-            ".evidence-terminal-" + hashlib.sha256(b"TASK-1").hexdigest()
-        )).write_bytes(b"")
+        self._write_valid_runtime_file(
+            runtime_dir / (
+                ".evidence-terminal-" + hashlib.sha256(b"TASK-1").hexdigest()
+            ),
+        )
         result = subprocess.run(
             [str(scripts / "workflow-task-janitor")],
             input=self.janitor_input(root, cleanup_report=marker_line),
