@@ -1,15 +1,13 @@
 # Workflow Contract
 
-The common workflow layer is platform-neutral. Projects supply build, test,
-device, source-control, issue-tracker, and release adapters.
+Platform-neutral; projects supply build,test,device,source-control,
+issue-tracker,release adapters.
 
-This is the maintainer source for the generator. Normal nodes receive their
-role prompt, generated edge prompt, context manifest, and project procedures;
-they do not preload this contract.
+Generator source; nodes receive role/edge prompts,context manifest,project
+procedures; not this contract.
 
-Kit/workflow mutation governance is defined by
-`contracts/kit-change-governance.md`. It does not apply to ordinary product
-implementation.
+Kit/workflow governance: `contracts/kit-change-governance.md`; product work
+exempt.
 
 ## Lifecycle
 
@@ -60,12 +58,11 @@ implementation.
 
 Runtime v2 is atomic.
 
-## User-facing workflow communication
+## User
 
 - Direct questions, transition commentary, `blocker_reason`, `closure_reason`,
   approval summaries, and Needs User Action text use the user's preferred
-  conversation language. The installed global contract defaults these surfaces
-  to Russian for this user.
+  conversation language; installed contract defaults them to Russian.
 - Code, commands, identifiers, structured parameter keys, and repository
   artifacts retain their project-defined language.
 - Approval text is concise and decision-oriented. It states what the user must
@@ -177,7 +174,7 @@ Runtime v2 is atomic.
 - `cleanup_mode`
 - `cleanup_session_id`
 
-## Node context manifests and evidence ledger
+## Context
 
 - Five manifests: `plan`, `implement`, `review`, `smoke`, `delivery` budget
   required/conditional/forbidden sources. Edges carry Task values, not docs.
@@ -223,18 +220,19 @@ Runtime v2 is atomic.
 - PR preparation reports `git branch --show-current`; downstream stages never
   reconstruct branch identity from the task ID.
 
-## Release source and publication contracts
+## Release source/publication
 
-- Schema 3 manual-package-publish-after-main approval-gated Publish Package,procedures.publish/roles.package_release,exact merged source,authorized package/version/destination/tag policy,JIT credentials,remote pre/poststate,no overwrite/delete,Cleanup publication_report
-- Schema 4 no publication node,selected-commit preflight derives profile/job sources,spec/manifest/snapshot/optional builder->regular files,raw digests/read-only preview,runtime attestation/activation false
-- Required/qualification credential-safe,effects explicit,Normalized adapters: permissions/env/defaults,matrices,ordered steps/inputs,conditions/secrets/failure masking
-- github-packages-classic-pat-step-read job-local,arbitrary source secret ref->fixed GITHUB_PACKAGES_TOKEN env,1 unconditional run-only recipient,uses/with empty,cache-read iff full-SHA restore-only,default secretless,operator-owned scope/account/SSO/expiry/rotation,not enforced/proved by Kit,pull_request/push/deployment/workflow_dispatch source-policy rows
+- Profile schema 3 manual-package-publish-after-main approval-gated Publish Package,procedures.publish/roles.package_release,exact merged source,authorized package/version/destination/tag policy,JIT credentials,remote pre/poststate,no overwrite/delete,Cleanup publication_report
+- Profile schema 4 no publication node,selected-commit preflight derives profile/job sources,spec/manifest/snapshot/optional builder->regular files,raw digests/read-only preview,runtime attestation/activation false
+- Required/qualification credential-safe,effects explicit,normalized adapters: permissions/env/defaults,matrices,ordered steps/inputs,conditions/secrets,failure masking
+- github-packages-classic-pat-step-read job-local,any source-secret ref->fixed GITHUB_PACKAGES_TOKEN env,1 unconditional run-only recipient,uses/with empty,cache-read iff full-SHA restore-only,secretless default,operator-owned scope/account/SSO/expiry/rotation,Kit no enforcement/proof,source-policy rows=pull_request,push,deployment,workflow_dispatch
 - Variants concrete/runtime-bound template authority,job-manifest digests,canonical bytes,optional Script-owned Russian approval,runtime proofs bind selected sources,manual migration/apply/publication/default
+- Release-spec S3 native_agent_approvals: effect_jobs_v1.jobs=[] iff variants≠∅,no Script materializations,each variant=1 valid approval-required Kent-template Agent declaration,transitions=authority_transitions,unambiguous snapshot Agent-edge,qual/effect refs=[],qualification_jobs_v1.jobs=[]; required_jobs_v1.jobs≠∅; else S3/S1/2 effect jobs≠∅; standalone JobContractTable strict; zero jobs attest no effects/materialization
 
 ## Execution targets
 
 - Generated workflows always set an explicit Kent 2.6.1 execution-target policy.
-- The profile supplies a default and may override it by workflow kind.
+- Profile supplies default; workflow kind may override.
 - Supported policy values are `ask-on-first-execution`, `none`, `head`,
   `default-branch`, and `ref:<revision>`.
 - Delivery workflows should normally ask on first execution.
@@ -243,11 +241,10 @@ Runtime v2 is atomic.
 - Release and hotfix workflows should use an explicitly selected revision.
 - `none` is reserved for intentional source-workspace execution, including
   non-Git workspaces and small local jobs that do not need isolation.
-- A task-level start, approval, or move override may select a concrete target
-  without mutating the workflow policy.
-- Verification dispatch compares `workspace_path` with the canonical execution
-  root. Artifact subdirectories, nested paths and foreign repositories route
-  to metadata-only Fix before fan-out.
+- Start/approval/move override may select target without mutating
+  policy.
+- Verification dispatch compares `workspace_path` to canonical execution root;
+  artifact/nested/foreign paths route metadata-only Fix before fan-out.
 - Verifier execution: `workflow-verify-report` docstring.
 
 ## Work-kind routing
@@ -290,7 +287,7 @@ Runtime v2 is atomic.
 
 ## Active feedback and recovery
 
-- Task/run watch and wait are deterministic observers, not model-polling loops.
+- Task/run watch/wait are deterministic observers, not model polling.
   `kent question`/`answer` own pending questions and approvals. Start, Move,
   and Resume accept `--branch-name`; the short ID remains lifecycle identity.
   Resume is asynchronous; re-read state and use retained-worktree recovery.
@@ -373,7 +370,7 @@ defined by `contracts/plan-contract.md`.
   directly to final Compliance. Any substantive defect routes to normal Fix and
   the full verification flow.
 
-## Pull-request merge strategy
+## PR
 
 - `policies.pr_merge_strategy` accepts `auto`, `merge`, `squash`, or `rebase`;
   default `auto`.
@@ -512,7 +509,7 @@ Source CI (`prepare_ci=1.0.0`): `workflowkit/ci_contract.py` owns producer, diag
 - Completed and canceled task history may be discarded when the user accepts
   that consequence; it is not by itself a retirement blocker.
 
-### Release-live portfolio operation
+### Release-live
 
 The `release-live-portfolio-plan-v1` is one closed, immutable plan for the fixed
 `<state_dir>/release-live-portfolio.journal.json` receipt and ordered members.
