@@ -14,6 +14,8 @@ from workflowkit.release import (
     AuthoritySpec,
     AuthorityTemplateSpec,
     GitHubRefPolicy,
+    JobContractTable,
+    NativeAgentApproval,
     NormalizedGitHubWorkflowSourceV1,
     ReleaseSourceManifest,
     ReleaseSpec,
@@ -29,6 +31,7 @@ from workflowkit.release import (
     validate_operation_jobs,
     validate_qualification_job_sources,
     validate_required_job_sources,
+    validate_native_agent_approvals,
     WorkflowSourceIntent,
 )
 from workflowkit.runtime import (
@@ -346,6 +349,84 @@ def valid_spec() -> dict:
                 ],
             }
         ],
+    }
+
+
+def schema3_native_spec_data() -> dict:
+    data = valid_spec()
+    data["schema_version"] = 3
+    data["operation_variants"][0]["authority_kind"] = {
+        "kind": "kent_transition_template",
+        "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+        "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+        "approval_authority": "release-manager",
+    }
+    data["operation_variants"][0]["authority_transitions"] = ["approve"]
+    data["operation_variants"][0]["approval_required"] = True
+    data["native_agent_approvals"] = [
+        {
+            "variant_key": "publish",
+            "source_node_key": "approval",
+            "source_node_kind": "agent",
+            "transitions": [
+                {
+                    "transition_key": "approve",
+                    "target_node_key": "publish",
+                }
+            ],
+        }
+    ]
+    return data
+
+
+def schema3_native_only_spec_data() -> dict:
+    data = schema3_native_spec_data()
+    data["operation_variants"][0]["effect_job_contract_keys"] = []
+    data["effect_jobs_v1"] = {
+        "schema": "effect_jobs_v1",
+        "jobs": [],
+    }
+    return data
+
+
+def native_snapshot(
+    *,
+    workflow_id: str = "123e4567-e89b-12d3-a456-426614174000",
+    project_id: str = "project-123e4567-e89b-12d3-a456-426614174000",
+    source_kind: str = "agent",
+    target_key: str = "publish",
+    requires_approval: bool = True,
+    extra_edges: list[dict] | None = None,
+) -> dict:
+    nodes = [
+        {"id": "node-approval", "key": "approval", "kind": source_kind},
+        {"id": "node-publish", "key": target_key, "kind": "terminal"},
+    ]
+    edges = [
+        {
+            "id": "edge-approve",
+            "transition_group_id": "group-approve",
+            "target_node_id": "node-publish",
+            "requires_approval": requires_approval,
+        }
+    ]
+    edges.extend(extra_edges or [])
+    return {
+        "workflow_id": workflow_id,
+        "project_id": project_id,
+        "version": 6,
+        "graph": {
+            "version": 6,
+            "nodes": nodes,
+            "transition_groups": [
+                {
+                    "id": "group-approve",
+                    "source_node_id": "node-approval",
+                    "transition_id": "approve",
+                }
+            ],
+            "edges": edges,
+        },
     }
 
 
@@ -3111,6 +3192,466 @@ class ReleaseSpecTest(unittest.TestCase):
         )
         with self.assertRaises(ReleaseSpecError):
             ReleaseSpec.from_dict(mismatched)
+
+    def test_schema3_native_agent_approval_is_closed_and_snapshot_bound(self) -> None:
+        data = schema3_native_spec_data()
+        spec = ReleaseSpec.from_dict(data)
+        self.assertIsInstance(
+            spec.native_agent_approvals[0],
+            NativeAgentApproval,
+        )
+        self.assertEqual(
+            spec.as_dict()["native_agent_approvals"],
+            data["native_agent_approvals"],
+        )
+        validate_native_agent_approvals(spec, native_snapshot())
+        preview = render_release_preview(
+            spec,
+            {},
+            SelectedReleaseArtifacts(
+                spec_raw_blob_sha256="a" * 64,
+                source_manifest_raw_blob_sha256="b" * 64,
+                snapshot_raw_blob_sha256="c" * 64,
+            ),
+        )
+        self.assertEqual(
+            preview["approval_sections"],
+            [
+                {
+                    "variant_key": "publish",
+                    "mechanism": "native_agent",
+                    "source_node_key": "approval",
+                    "source_node_kind": "agent",
+                    "transitions": [
+                        {
+                            "transition_key": "approve",
+                            "target_node_key": "publish",
+                        }
+                    ],
+                }
+            ],
+        )
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "deterministic approval materialization",
+        ):
+            render_approval_summary(
+                spec.native_agent_approvals[0],
+                {"variant_key": "publish"},
+                "b" * 64,
+            )
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "deterministic approval materialization",
+        ):
+            validate_approval_materialization(
+                spec.native_agent_approvals[0],
+                {"variant_key": "publish"},
+                "b" * 64,
+            )
+
+    def test_schema3_native_agent_approval_rejects_bad_mechanisms_and_bindings(
+        self,
+    ) -> None:
+        for schema_version in (1, 2):
+            legacy = schema3_native_spec_data()
+            legacy["schema_version"] = schema_version
+            with self.assertRaisesRegex(ReleaseSpecError, "unknown keys"):
+                ReleaseSpec.from_dict(legacy)
+
+        both = schema3_native_spec_data()
+        both["approval_materializations"] = [
+            {
+                "variant_key": "publish",
+                "source_path": ".kent/scripts/approve",
+                "source_node_key": "approval",
+                "source_node_kind": "script",
+                "authority_transition_parameter": "authority_transition",
+                "summary_language": "ru",
+                "summary_sections": [
+                    "Нужно от вас",
+                    "Почему",
+                    "После подтверждения",
+                ],
+                "materialized_before_pending_approval": True,
+                "commentary_equals_summary": True,
+                "decision_may_select_approval": False,
+                "required_fields": ["version"],
+                "templates": {
+                    "approve": {
+                        "Нужно от вас": "Version {{version}}",
+                        "Почему": "Digest {{operation_digest}}",
+                        "После подтверждения": "Continue",
+                    }
+                },
+            }
+        ]
+        with self.assertRaisesRegex(ReleaseSpecError, "both"):
+            ReleaseSpec.from_dict(both)
+
+        bad_snapshots = (
+            (
+                native_snapshot(
+                    workflow_id="223e4567-e89b-12d3-a456-426614174000"
+                ),
+                "workflow identity",
+            ),
+            (
+                native_snapshot(source_kind="script"),
+                "source node must be an Agent",
+            ),
+            (
+                native_snapshot(requires_approval=False),
+                "must require approval",
+            ),
+            (
+                native_snapshot(target_key="other"),
+                "target does not match",
+            ),
+        )
+        for snapshot, pattern in bad_snapshots:
+            with self.subTest(pattern=pattern):
+                with self.assertRaisesRegex(ReleaseSpecError, pattern):
+                    validate_native_agent_approvals(
+                        ReleaseSpec.from_dict(schema3_native_spec_data()),
+                        snapshot,
+                    )
+
+        duplicate = schema3_native_spec_data()
+        duplicate["native_agent_approvals"][0]["transitions"].append(
+            duplicate["native_agent_approvals"][0]["transitions"][0]
+        )
+        with self.assertRaisesRegex(ReleaseSpecError, "unique transition keys"):
+            ReleaseSpec.from_dict(duplicate)
+
+        incomplete = schema3_native_spec_data()
+        incomplete["native_agent_approvals"][0]["transitions"] = []
+        with self.assertRaisesRegex(ReleaseSpecError, "exactly"):
+            ReleaseSpec.from_dict(incomplete)
+
+        duplicate_edge = native_snapshot()
+        duplicate_edge["graph"]["edges"].append(
+            {
+                **duplicate_edge["graph"]["edges"][0],
+                "id": duplicate_edge["graph"]["edges"][0]["id"],
+            }
+        )
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "edge IDs must be unique",
+        ):
+            validate_native_agent_approvals(
+                ReleaseSpec.from_dict(schema3_native_spec_data()),
+                duplicate_edge,
+            )
+
+        missing_edge_id = native_snapshot()
+        missing_edge_id["graph"]["edges"][0].pop("id")
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            r"release snapshot\.graph\.edges\[0\]\.id",
+        ):
+            validate_native_agent_approvals(
+                ReleaseSpec.from_dict(schema3_native_spec_data()),
+                missing_edge_id,
+            )
+
+    def test_schema3_native_only_allows_zero_effect_jobs_without_attestation(
+        self,
+    ) -> None:
+        spec = ReleaseSpec.from_dict(schema3_native_only_spec_data())
+        self.assertEqual(spec.effect_jobs_v1.jobs, ())
+        direct_empty_effect = replace(
+            ReleaseSpec.from_dict(valid_spec()),
+            effect_jobs_v1=JobContractTable(
+                schema="effect_jobs_v1",
+                jobs=(),
+            ),
+            operation_variants=(
+                replace(
+                    ReleaseSpec.from_dict(valid_spec()).operation_variants[0],
+                    effect_job_contract_keys=(),
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "effect_jobs_v1.jobs must be non-empty",
+        ):
+            direct_empty_effect.validate()
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "native Agent approvals require release spec schema 3",
+        ):
+            replace(
+                ReleaseSpec.from_dict(valid_spec()),
+                schema_version=1,
+                native_agent_approvals=(
+                    NativeAgentApproval(
+                        variant_key="publish",
+                        source_node_key="approval",
+                        source_node_kind="agent",
+                        transitions=(("approve", "publish"),),
+                    ),
+                ),
+            ).validate()
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "native Agent approvals require release spec schema 3",
+        ):
+            replace(
+                ReleaseSpec.from_dict(valid_spec()),
+                schema_version=2,
+                native_agent_approvals=(
+                    NativeAgentApproval(
+                        variant_key="publish",
+                        source_node_key="approval",
+                        source_node_kind="agent",
+                        transitions=(("approve", "publish"),),
+                    ),
+                ),
+            ).validate()
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "operation_variants must be non-empty",
+        ):
+            replace(
+                spec,
+                operation_variants=(),
+                native_agent_approvals=(),
+            ).validate()
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "incorrect approval mechanism cardinality",
+        ):
+            replace(spec, native_agent_approvals=()).validate()
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "required_jobs_v1.jobs must be non-empty",
+        ):
+            replace(
+                spec,
+                required_jobs_v1=JobContractTable(
+                    schema="required_jobs_v1",
+                    jobs=(),
+                ),
+            ).validate()
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "effect_jobs_v1.schema must be effect_jobs_v1",
+        ):
+            replace(
+                spec,
+                effect_jobs_v1=JobContractTable(
+                    schema="wrong_jobs_v1",
+                    jobs=(),
+                ),
+            ).validate()
+        duplicate_variant = replace(
+            spec,
+            operation_variants=spec.operation_variants
+            + (spec.operation_variants[0],),
+        )
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "operation_variants keys must be unique",
+        ):
+            duplicate_variant.validate()
+        validated = self._validated_jobs(spec)
+        self.assertEqual(validated.effect, ())
+        self.assertNotIn(
+            "effect",
+            {
+                binding["set_kind"]
+                for binding in validated.operation_jobs_manifest["bindings"]
+            },
+        )
+        _inputs, context, binding, authority = self._kent_chain()
+        operation = {
+            "schema_version": 1,
+            "variant_key": "publish",
+            "operation_kind": "publish",
+            "repository": "owner/repository",
+            "runtime_source_envelope_digest": binding.runtime_source_envelope_digest,
+            "operation_jobs_manifest_digest": validated.operation_jobs_manifest_digest,
+            "authority": authority,
+            "project_fields": {"version": "1.2.3"},
+        }
+        canonical = canonicalize_publication_operation(
+            operation,
+            spec.operation_variants[0],
+            validated,
+            spec=spec,
+            runtime_execution_context=context,
+            runtime_authority_binding=binding,
+        )
+        self.assertEqual(
+            canonical.operation_jobs_manifest["bindings"],
+            validated.operation_jobs_manifest["bindings"],
+        )
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "effect_jobs_v1.jobs must be non-empty",
+        ):
+            validate_effect_job_sources(
+                normalized_workflow(
+                    jobs=[job("required_release", validation_required=True)]
+                ),
+                {"schema": "effect_jobs_v1", "jobs": []},
+            )
+        for set_kind in ("required", "effect"):
+            with self.subTest(standalone_set_kind=set_kind):
+                with self.assertRaisesRegex(
+                    ReleaseSpecError,
+                    f"{set_kind}_jobs_v1.jobs must be non-empty",
+                ):
+                    JobContractTable.from_dict(
+                        {
+                            "schema": f"{set_kind}_jobs_v1",
+                            "jobs": [],
+                        },
+                        set_kind,
+                    )
+        with self.assertRaises(TypeError):
+            JobContractTable.from_dict(
+                {"schema": "effect_jobs_v1", "jobs": []},
+                "effect",
+                allow_empty=True,
+            )
+
+        for schema_version in (1, 2):
+            legacy = (
+                valid_spec()
+                if schema_version == 1
+                else schema3_native_spec_data()
+            )
+            legacy["schema_version"] = schema_version
+            legacy.pop("native_agent_approvals", None)
+            legacy["effect_jobs_v1"]["jobs"] = []
+            with self.subTest(schema_version=schema_version):
+                with self.assertRaisesRegex(
+                    ReleaseSpecError,
+                    "effect_jobs_v1.jobs must be non-empty",
+                ):
+                    ReleaseSpec.from_dict(legacy)
+
+        no_native = schema3_native_spec_data()
+        no_native.pop("native_agent_approvals")
+        no_native["effect_jobs_v1"]["jobs"] = []
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "effect_jobs_v1.jobs must be non-empty",
+        ):
+            ReleaseSpec.from_dict(no_native)
+
+        github = schema3_native_spec_data()
+        github.pop("native_agent_approvals")
+        github["operation_variants"][0]["authority_kind"] = {
+            "kind": "github_run_template",
+            "workflow_path": ".github/workflows/release.yml",
+            "workflow_name": "Release",
+            "event": "workflow_dispatch",
+            "ref_policy": {
+                "kind": "exact",
+                "ref": "refs/heads/main",
+            },
+        }
+        github["operation_variants"][0]["authority_transitions"] = []
+        github["operation_variants"][0]["approval_required"] = False
+        github["effect_jobs_v1"]["jobs"] = []
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "effect_jobs_v1.jobs must be non-empty",
+        ):
+            ReleaseSpec.from_dict(github)
+
+        orphan_effect = schema3_native_only_spec_data()
+        orphan_effect["effect_jobs_v1"] = valid_spec()["effect_jobs_v1"]
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "native-only release specs must have an empty",
+        ):
+            ReleaseSpec.from_dict(orphan_effect)
+
+        mixed = schema3_native_spec_data()
+        mixed["approval_materializations"] = [
+            {
+                "variant_key": "publish",
+                "source_path": ".kent/scripts/approve",
+                "source_node_key": "approval",
+                "source_node_kind": "script",
+                "authority_transition_parameter": "authority_transition",
+                "summary_language": "ru",
+                "summary_sections": [
+                    "Нужно от вас",
+                    "Почему",
+                    "После подтверждения",
+                ],
+                "materialized_before_pending_approval": True,
+                "commentary_equals_summary": True,
+                "decision_may_select_approval": False,
+                "required_fields": ["version"],
+                "templates": {
+                    "approve": {
+                        "Нужно от вас": "Version {{version}}",
+                        "Почему": "Digest {{operation_digest}}",
+                        "После подтверждения": "Continue",
+                    }
+                },
+            }
+        ]
+        mixed["effect_jobs_v1"]["jobs"] = []
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "effect_jobs_v1.jobs must be non-empty",
+        ):
+            ReleaseSpec.from_dict(mixed)
+
+    def test_schema3_canonicalization_keeps_schema2_runtime_proof_contract(self) -> None:
+        spec = ReleaseSpec.from_dict(schema3_native_spec_data())
+        validated = self._validated_jobs(spec)
+        _inputs, context, binding, authority = self._kent_chain()
+        operation = {
+            "schema_version": 1,
+            "variant_key": "publish",
+            "operation_kind": "publish",
+            "repository": "owner/repository",
+            "runtime_source_envelope_digest": binding.runtime_source_envelope_digest,
+            "operation_jobs_manifest_digest": validated.operation_jobs_manifest_digest,
+            "authority": authority,
+            "project_fields": {"version": "1.2.3"},
+        }
+        result = canonicalize_publication_operation(
+            operation,
+            spec.operation_variants[0],
+            validated,
+            spec=spec,
+            runtime_execution_context=context,
+            runtime_authority_binding=binding,
+        )
+        self.assertEqual(result.operation["authority"], dict(binding.authority))
+        with self.assertRaisesRegex(
+            ReleaseSpecError,
+            "runtime execution context",
+        ):
+            canonicalize_publication_operation(
+                operation,
+                spec.operation_variants[0],
+                validated,
+                spec=spec,
+                runtime_authority_binding=binding,
+            )
+        broken = deepcopy(operation)
+        broken["authority"]["authority_transition"] = "reject"
+        with self.assertRaises(ReleaseSpecError):
+            canonicalize_publication_operation(
+                broken,
+                spec.operation_variants[0],
+                validated,
+                spec=spec,
+                runtime_execution_context=context,
+                runtime_authority_binding=binding,
+            )
 
     def test_nullable_project_fields_and_authority_formats(self) -> None:
         spec_data = valid_spec()

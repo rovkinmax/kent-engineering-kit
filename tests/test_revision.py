@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -112,7 +113,19 @@ def release_spec_contents(
     repository: str = "owner/repository",
     workflow_path: str = ".github/workflows/release.yml",
     approval_path: str | None = None,
+    native_agent: bool = False,
+    native_only: bool = False,
 ) -> str:
+    if native_only and (
+        schema_version != 3
+        or not native_agent
+        or approval_path is not None
+        or both_templates
+    ):
+        raise ValueError(
+            "native_only fixtures require schema 3, native_agent, and one "
+            "native-only variant"
+        )
     event = {
         "name": "pull_request",
         "branches": [],
@@ -240,7 +253,22 @@ def release_spec_contents(
         ],
     }
     variants = [variant]
-    if schema_version == 2 and both_templates:
+    if native_only:
+        variants = [
+            {
+                **variant,
+                "authority_kind": {
+                    "kind": "kent_transition_template",
+                    "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+                    "project_id": "project-123e4567-e89b-12d3-a456-426614174000",
+                    "approval_authority": "release-manager",
+                },
+                "authority_transitions": ["approve"],
+                "effect_job_contract_keys": [],
+                "approval_required": True,
+            }
+        ]
+    elif schema_version in {2, 3} and both_templates:
         project_fields = [
             {
                 "name": "version",
@@ -267,7 +295,7 @@ def release_spec_contents(
                     "approval_authority": "release-manager",
                 },
                 "authority_transitions": ["approve"],
-                "approval_required": bool(approval_path),
+                "approval_required": bool(approval_path or native_agent),
             },
             {
                 **shared_jobs,
@@ -325,12 +353,12 @@ def release_spec_contents(
         },
         "effect_jobs_v1": {
             "schema": "effect_jobs_v1",
-            "jobs": [effect],
+            "jobs": [] if native_only else [effect],
         },
         "operation_variants": variants,
     }
     if approval_path:
-        approval_variant_key = "approve" if schema_version == 2 else "publish"
+        approval_variant_key = "approve" if schema_version in {2, 3} else "publish"
         roots["approval_materializations"] = [
             {
                 "variant_key": approval_variant_key,
@@ -355,6 +383,20 @@ def release_spec_contents(
                         "После подтверждения": "Продолжить",
                     }
                 },
+            }
+        ]
+    if native_agent:
+        roots["native_agent_approvals"] = [
+            {
+                "variant_key": "publish" if native_only else "approve",
+                "source_node_key": "approval",
+                "source_node_kind": "agent",
+                "transitions": [
+                    {
+                        "transition_key": "approve",
+                        "target_node_key": "publish",
+                    }
+                ],
             }
         ]
     lines = []
@@ -727,6 +769,8 @@ class RevisionPreflightTest(unittest.TestCase):
         approval: bool = False,
         release_schema_version: int = 1,
         both_templates: bool = False,
+        native_agent: bool = False,
+        native_only: bool = False,
     ) -> Path:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -784,6 +828,8 @@ class RevisionPreflightTest(unittest.TestCase):
                         ),
                         schema_version=release_schema_version,
                         both_templates=both_templates,
+                        native_agent=native_agent,
+                        native_only=native_only,
                     ),
                 ),
                 (
@@ -792,7 +838,56 @@ class RevisionPreflightTest(unittest.TestCase):
                         topology_kind=topology_kind,
                     ),
                 ),
-                (".kent/release/snapshot.json", "{}\n"),
+                (
+                    ".kent/release/snapshot.json",
+                    (
+                        json.dumps(
+                            {
+                                "workflow_id": (
+                                    "123e4567-e89b-12d3-a456-426614174000"
+                                ),
+                                "project_id": (
+                                    "project-123e4567-e89b-12d3-a456-426614174000"
+                                ),
+                                "version": 6,
+                                "graph": {
+                                    "version": 6,
+                                    "nodes": [
+                                        {
+                                            "id": "node-approval",
+                                            "key": "approval",
+                                            "kind": "agent",
+                                        },
+                                        {
+                                            "id": "node-publish",
+                                            "key": "publish",
+                                            "kind": "terminal",
+                                        },
+                                    ],
+                                    "transition_groups": [
+                                        {
+                                            "id": "group-approve",
+                                            "source_node_id": "node-approval",
+                                            "transition_id": "approve",
+                                        }
+                                    ],
+                                    "edges": [
+                                        {
+                                            "id": "edge-approve",
+                                            "transition_group_id": "group-approve",
+                                            "target_node_id": "node-publish",
+                                            "requires_approval": True,
+                                        }
+                                    ],
+                                },
+                            },
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                        if native_agent
+                        else "{}\n"
+                    ),
+                ),
                 (".github/workflows/release.yml", "name: Release\n"),
             ):
                 path = root / configured_path
@@ -914,6 +1009,60 @@ class RevisionPreflightTest(unittest.TestCase):
         self.assertIn(".kent/release/spec.toml", checked)
         self.assertIn(".kent/release/build.sh", checked)
         self.assertIn(".kent/release/snapshot.json", checked)
+
+    def test_schema3_native_agent_preflight_binds_snapshot_without_script(
+        self,
+    ) -> None:
+        root = self.create_project(
+            schema4=True,
+            release_schema_version=3,
+            both_templates=True,
+            native_agent=True,
+        )
+        result = preflight_project_revision(root, "HEAD")
+        self.assertTrue(result.release_preview["source_contract_valid"])
+        self.assertEqual(
+            result.release_preview["approval_sections"][0]["mechanism"],
+            "native_agent",
+        )
+        self.assertNotIn(
+            ".kent/scripts/approve-release",
+            {item.path for item in result.checked_paths},
+        )
+
+        snapshot = root / ".kent/release/snapshot.json"
+        broken = json.loads(snapshot.read_text())
+        broken["graph"]["edges"][0]["requires_approval"] = False
+        snapshot.write_text(json.dumps(broken, separators=(",", ":")) + "\n")
+        self.commit_all(root, "Break native Agent approval binding")
+        with self.assertRaisesRegex(
+            RevisionPreflightError,
+            "must require approval",
+        ):
+            preflight_project_revision(root, "HEAD")
+
+    def test_schema3_native_only_preflight_has_zero_effect_jobs(self) -> None:
+        root = self.create_project(
+            schema4=True,
+            release_schema_version=3,
+            native_agent=True,
+            native_only=True,
+        )
+        result = preflight_project_revision(root, "HEAD")
+        spec = tomllib.loads((root / ".kent/release/spec.toml").read_text())
+        self.assertEqual(spec["effect_jobs_v1"]["jobs"], [])
+        self.assertEqual(
+            spec["operation_variants"][0]["effect_job_contract_keys"],
+            [],
+        )
+        self.assertEqual(
+            result.release_preview["approval_sections"][0]["mechanism"],
+            "native_agent",
+        )
+        self.assertNotIn(
+            ".kent/scripts/approve-release",
+            {item.path for item in result.checked_paths},
+        )
 
     def test_preflight_omits_optional_metadata_only_builder(self) -> None:
         root = self.create_project(

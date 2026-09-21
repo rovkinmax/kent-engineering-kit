@@ -46,8 +46,13 @@ SPEC_ROOTS = {
     "effect_jobs_v1",
     "operation_variants",
     "approval_materializations",
+    "native_agent_approvals",
 }
-REQUIRED_SPEC_ROOTS = SPEC_ROOTS - {"approval_materializations"}
+REQUIRED_SPEC_ROOTS = SPEC_ROOTS - {
+    "approval_materializations",
+    "native_agent_approvals",
+}
+LEGACY_SPEC_ROOTS = SPEC_ROOTS - {"native_agent_approvals"}
 SOURCE_INTENT_KEYS = {
     "name",
     "id",
@@ -165,6 +170,16 @@ APPROVAL_KEYS = {
     "decision_may_select_approval",
     "required_fields",
     "templates",
+}
+NATIVE_AGENT_APPROVAL_KEYS = {
+    "variant_key",
+    "source_node_key",
+    "source_node_kind",
+    "transitions",
+}
+NATIVE_AGENT_TRANSITION_KEYS = {
+    "transition_key",
+    "target_node_key",
 }
 WORKFLOW_KEYS = {
     "schema",
@@ -1389,6 +1404,16 @@ class JobContractTable:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any], set_kind: str) -> "JobContractTable":
+        return cls._parse(value, set_kind)
+
+    @classmethod
+    def _parse(
+        cls,
+        value: Mapping[str, Any],
+        set_kind: str,
+        *,
+        allow_empty_effect: bool = False,
+    ) -> "JobContractTable":
         data = _closed(value, JOB_TABLE_KEYS, f"{set_kind}_jobs_v1")
         _require_keys(data, JOB_TABLE_KEYS, f"{set_kind}_jobs_v1")
         schema = _string(
@@ -1411,7 +1436,11 @@ class JobContractTable:
         keys = [row["contract_key"] for row in rows]
         if len(set(keys)) != len(keys):
             _error(f"{set_kind}_jobs_v1 contract_key values must be unique")
-        if set_kind in {"required", "effect"} and not rows:
+        if (
+            set_kind in {"required", "effect"}
+            and not rows
+            and not (set_kind == "effect" and allow_empty_effect)
+        ):
             _error(f"{set_kind}_jobs_v1.jobs must be non-empty")
         return cls(
             schema=schema,
@@ -1920,7 +1949,7 @@ class OperationVariant:
                 AuthorityTemplateSpec.from_dict(
                     _required(data, "authority_kind", label)
                 )
-                if schema_version == 2
+                if schema_version in {2, 3}
                 else AuthoritySpec.from_dict(
                     _required(data, "authority_kind", label)
                 )
@@ -2126,6 +2155,119 @@ class ApprovalMaterialization:
         }
 
 
+@dataclass(frozen=True)
+class NativeAgentApproval:
+    """A source-level binding for an approval edge implemented by an Agent."""
+
+    variant_key: str
+    source_node_key: str
+    source_node_kind: str
+    transitions: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+        index: int = 0,
+    ) -> "NativeAgentApproval":
+        label = f"native_agent_approvals[{index}]"
+        data = _closed(value, NATIVE_AGENT_APPROVAL_KEYS, label)
+        _require_keys(data, NATIVE_AGENT_APPROVAL_KEYS, label)
+        raw_transitions = _list(
+            data["transitions"],
+            f"{label}.transitions",
+        )
+        transitions: list[tuple[str, str]] = []
+        for transition_index, raw_transition in enumerate(raw_transitions):
+            transition_label = f"{label}.transitions[{transition_index}]"
+            transition = _closed(
+                raw_transition,
+                NATIVE_AGENT_TRANSITION_KEYS,
+                transition_label,
+            )
+            _require_keys(
+                transition,
+                NATIVE_AGENT_TRANSITION_KEYS,
+                transition_label,
+            )
+            transitions.append(
+                (
+                    _normalized_key(
+                        _required(transition, "transition_key", transition_label),
+                        f"{transition_label}.transition_key",
+                    ),
+                    _normalized_key(
+                        _required(transition, "target_node_key", transition_label),
+                        f"{transition_label}.target_node_key",
+                    ),
+                )
+            )
+        ordered = tuple(sorted(transitions))
+        if transitions != list(ordered):
+            _error(f"{label}.transitions must be sorted")
+        transition_keys = [item[0] for item in transitions]
+        if len(set(transition_keys)) != len(transition_keys):
+            _error(f"{label}.transitions must contain unique transition keys")
+        result = cls(
+            variant_key=_normalized_key(
+                _required(data, "variant_key", label),
+                f"{label}.variant_key",
+            ),
+            source_node_key=_normalized_key(
+                _required(data, "source_node_key", label),
+                f"{label}.source_node_key",
+            ),
+            source_node_kind=_string(
+                _required(data, "source_node_kind", label),
+                f"{label}.source_node_kind",
+            ),
+            transitions=ordered,
+        )
+        return result
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        index: int = 0,
+    ) -> "NativeAgentApproval":
+        return cls.from_dict(value, index)
+
+    def validate(self, variant: OperationVariant) -> None:
+        if self.variant_key != variant.key:
+            _error("native Agent approval references an unknown variant")
+        if self.source_node_kind != "agent":
+            _error("native Agent approval source_node_kind must be agent")
+        if (
+            not variant.approval_required
+            or variant.authority_kind.kind != "kent_transition_template"
+        ):
+            _error(
+                "only approval-required Kent template variants may use native "
+                "Agent approval"
+            )
+        transition_keys = tuple(item[0] for item in self.transitions)
+        if set(transition_keys) != set(variant.authority_transitions):
+            _error(
+                "native Agent approval transitions must cover exactly "
+                "authority transitions"
+            )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "variant_key": self.variant_key,
+            "source_node_key": self.source_node_key,
+            "source_node_kind": self.source_node_kind,
+            "transitions": [
+                {
+                    "transition_key": transition_key,
+                    "target_node_key": target_node_key,
+                }
+                for transition_key, target_node_key in self.transitions
+            ],
+        }
+
+
 def _template_references(
     text: str,
     allowed_keys: set[str],
@@ -2185,6 +2327,9 @@ class ReleaseSpec:
     approval_materializations: tuple[ApprovalMaterialization, ...] = field(
         default_factory=tuple
     )
+    native_agent_approvals: tuple[NativeAgentApproval, ...] = field(
+        default_factory=tuple
+    )
 
     @classmethod
     def from_dict(
@@ -2193,16 +2338,22 @@ class ReleaseSpec:
         *,
         profile: Any | None = None,
     ) -> "ReleaseSpec":
-        data = _closed(value, SPEC_ROOTS, "release spec")
+        raw = _mapping(value, "release spec")
+        schema_version = _integer(
+            _required(raw, "schema_version", "release spec"),
+            "release spec.schema_version",
+        )
+        allowed_roots = (
+            SPEC_ROOTS
+            if schema_version == 3
+            else LEGACY_SPEC_ROOTS
+        )
+        data = _closed(raw, allowed_roots, "release spec")
         missing = sorted(REQUIRED_SPEC_ROOTS - set(data))
         if missing:
             _error(f"release spec is missing roots: {missing}")
-        schema_version = _integer(
-            _required(data, "schema_version", "release spec"),
-            "release spec.schema_version",
-        )
-        if schema_version not in {1, 2}:
-            _error("release spec schema_version must be 1 or 2")
+        if schema_version not in {1, 2, 3}:
+            _error("release spec schema_version must be 1, 2, or 3")
         variants = tuple(
             OperationVariant.from_dict(
                 item,
@@ -2222,6 +2373,30 @@ class ReleaseSpec:
             ApprovalMaterialization.from_dict(item, index)
             for index, item in enumerate(
                 _list(data.get("approval_materializations", []), "approval_materializations")
+            )
+        )
+        native_agent_approvals = tuple(
+            NativeAgentApproval.from_dict(item, index)
+            for index, item in enumerate(
+                _list(
+                    data.get("native_agent_approvals", []),
+                    "native_agent_approvals",
+                )
+            )
+        )
+        native_keys = [item.variant_key for item in native_agent_approvals]
+        if native_keys != sorted(native_keys):
+            _error("native_agent_approvals must be sorted by variant_key")
+        if len(set(native_keys)) != len(native_keys):
+            _error("native_agent_approvals must have unique variant keys")
+        native_only_effects = (
+            schema_version == 3
+            and not materializations
+            and set(native_keys) == set(variant_keys)
+            and all(
+                not variant.qualification_job_contract_keys
+                and not variant.effect_job_contract_keys
+                for variant in variants
             )
         )
         result = cls(
@@ -2264,12 +2439,14 @@ class ReleaseSpec:
                 _required(data, "qualification_jobs_v1", "release spec"),
                 "qualification",
             ),
-            effect_jobs_v1=JobContractTable.from_dict(
+            effect_jobs_v1=JobContractTable._parse(
                 _required(data, "effect_jobs_v1", "release spec"),
                 "effect",
+                allow_empty_effect=native_only_effects,
             ),
             operation_variants=variants,
             approval_materializations=materializations,
+            native_agent_approvals=native_agent_approvals,
         )
         result.validate(profile=profile)
         return result
@@ -2310,12 +2487,26 @@ class ReleaseSpec:
         return cls.from_toml(contents, profile=profile)
 
     def validate(self, *, profile: Any | None = None) -> None:
+        if self.schema_version not in {1, 2, 3}:
+            _error("release spec schema_version must be 1, 2, or 3")
+        if self.schema_version != 3 and self.native_agent_approvals:
+            _error("native Agent approvals require release spec schema 3")
         if self.spec_kind != "release":
             _error("release spec.spec_kind must be release")
         if self.runtime_attested:
             _error("tracked release spec.runtime_attested must be false")
         if self.adoption_mode not in {"managed-in-place", "metadata-only"}:
             _error("release spec.adoption_mode is unsupported")
+        if not self.operation_variants:
+            _error("operation_variants must be non-empty")
+        if not all(
+            isinstance(variant, OperationVariant)
+            for variant in self.operation_variants
+        ):
+            _error("operation_variants must contain OperationVariant values")
+        variant_keys = [variant.key for variant in self.operation_variants]
+        if len(set(variant_keys)) != len(variant_keys):
+            _error("operation_variants keys must be unique")
         self.workflow_source_intent.validate(adoption_mode=self.adoption_mode)
         self.source_manifest.validate()
         for variant in self.operation_variants:
@@ -2324,7 +2515,10 @@ class ReleaseSpec:
                     _error("schema-1 operation variants require concrete authority")
             else:
                 if not isinstance(variant.authority_kind, AuthorityTemplateSpec):
-                    _error("schema-2 operation variants require authority templates")
+                    _error(
+                        f"schema-{self.schema_version} operation variants "
+                        "require authority templates"
+                    )
                 template = variant.authority_kind
                 if template.kind == "kent_transition_template":
                     if template.values["workflow_id"] != self.workflow_source_intent.id:
@@ -2352,6 +2546,14 @@ class ReleaseSpec:
             "qualification": self.qualification_jobs_v1,
             "effect": self.effect_jobs_v1,
         }
+        for set_kind, table in tables.items():
+            if not isinstance(table, JobContractTable):
+                _error(f"{set_kind}_jobs_v1 must be a JobContractTable")
+            expected_schema = f"{set_kind}_jobs_v1"
+            if table.schema != expected_schema:
+                _error(f"{set_kind}_jobs_v1.schema must be {expected_schema}")
+            if set_kind == "required" and not table.jobs:
+                _error("required_jobs_v1.jobs must be non-empty")
         global_keys: dict[str, str] = {}
         global_identities: dict[str, str] = {}
         for set_kind, table in tables.items():
@@ -2414,6 +2616,11 @@ class ReleaseSpec:
                 _error("release spec.adoption_mode does not match ProjectProfile.release")
         materialization_by_variant = {}
         for item in self.approval_materializations:
+            if not isinstance(item, ApprovalMaterialization):
+                _error(
+                    "approval_materializations must contain "
+                    "ApprovalMaterialization values"
+                )
             if item.variant_key in materialization_by_variant:
                 _error("approval_materializations must have unique variant keys")
             materialization_by_variant[item.variant_key] = item
@@ -2424,12 +2631,68 @@ class ReleaseSpec:
             if variant is None:
                 _error("approval materialization references an unknown variant")
             item.validate(variant)
+        native_by_variant = {}
+        native_identities: set[tuple[str, str]] = set()
+        for item in self.native_agent_approvals:
+            if not isinstance(item, NativeAgentApproval):
+                _error(
+                    "native_agent_approvals must contain NativeAgentApproval "
+                    "values"
+                )
+            if item.variant_key in native_by_variant:
+                _error("native_agent_approvals must have unique variant keys")
+            native_by_variant[item.variant_key] = item
+            variant = next(
+                (
+                    candidate
+                    for candidate in self.operation_variants
+                    if candidate.key == item.variant_key
+                ),
+                None,
+            )
+            if variant is None:
+                _error("native Agent approval references an unknown variant")
+            item.validate(variant)
+            for transition_key, _target_node_key in item.transitions:
+                identity = (item.source_node_key, transition_key)
+                if identity in native_identities:
+                    _error(
+                        "native Agent approval declarations may not overlap "
+                        "source transition identities"
+                    )
+                native_identities.add(identity)
         for variant in self.operation_variants:
             has_materialization = variant.key in materialization_by_variant
-            if variant.approval_required != has_materialization:
+            has_native_approval = variant.key in native_by_variant
+            mechanisms = int(has_materialization) + int(has_native_approval)
+            if variant.approval_required != bool(mechanisms):
                 _error(
-                    f"variant {variant.key!r} has incorrect approval materialization cardinality"
+                    f"variant {variant.key!r} has incorrect approval mechanism "
+                    "cardinality"
                 )
+            if mechanisms > 1:
+                _error(
+                    f"variant {variant.key!r} declares both Script and native "
+                    "Agent approval mechanisms"
+                )
+        native_only_effects = (
+            self.schema_version == 3
+            and not self.approval_materializations
+            and set(native_by_variant)
+            == {variant.key for variant in self.operation_variants}
+            and all(
+                not variant.qualification_job_contract_keys
+                and not variant.effect_job_contract_keys
+                for variant in self.operation_variants
+            )
+        )
+        if not native_only_effects and not self.effect_jobs_v1.jobs:
+            _error("effect_jobs_v1.jobs must be non-empty")
+        if native_only_effects and self.effect_jobs_v1.jobs:
+            _error(
+                "schema-3 native-only release specs must have an empty "
+                "effect_jobs_v1 table"
+            )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -2449,7 +2712,253 @@ class ReleaseSpec:
             "approval_materializations": [
                 item.as_dict() for item in self.approval_materializations
             ],
+            **(
+                {
+                    "native_agent_approvals": [
+                        item.as_dict() for item in self.native_agent_approvals
+                    ]
+                }
+                if self.schema_version == 3
+                else {}
+            ),
         }
+
+
+def validate_native_agent_approvals(
+    spec: ReleaseSpec,
+    snapshot: Mapping[str, Any],
+) -> None:
+    """Validate schema-3 Agent approval declarations against one snapshot.
+
+    The declaration is descriptive source metadata.  It does not attest that
+    an approval was granted and it does not make an Agent transition
+    executable through a deterministic materialization API.
+    """
+
+    if not isinstance(spec, ReleaseSpec):
+        _error("native Agent approval validation requires ReleaseSpec")
+    if spec.schema_version != 3:
+        if spec.native_agent_approvals:
+            _error("native Agent approvals require release spec schema 3")
+        return
+    if not spec.native_agent_approvals:
+        return
+
+    snapshot_data = _mapping(snapshot, "release snapshot")
+    workflow_data = snapshot_data.get("workflow")
+    if workflow_data is not None:
+        workflow_data = _mapping(workflow_data, "release snapshot.workflow")
+    workflow_id_value = snapshot_data.get("workflow_id")
+    if workflow_id_value is None and workflow_data is not None:
+        workflow_id_value = workflow_data.get("id")
+    workflow_id = _string(workflow_id_value, "release snapshot.workflow_id")
+    if not UUID_RE.fullmatch(workflow_id):
+        _error("release snapshot.workflow_id must be a UUID")
+    project_data = snapshot_data.get("project")
+    if project_data is not None:
+        project_data = _mapping(project_data, "release snapshot.project")
+    project_id_value = snapshot_data.get("project_id")
+    if project_id_value is None and workflow_data is not None:
+        project_id_value = workflow_data.get("project_id")
+    if project_id_value is None and project_data is not None:
+        project_id_value = project_data.get("id")
+    project_id = _string(project_id_value, "release snapshot.project_id")
+    if not project_id.startswith("project-") or not UUID_RE.fullmatch(
+        project_id.removeprefix("project-")
+    ):
+        _error("release snapshot.project_id must be project-<UUID>")
+    graph_value = snapshot_data.get("graph")
+    graph = _mapping(
+        snapshot_data if graph_value is None else graph_value,
+        "release snapshot.graph",
+    )
+    version_value = snapshot_data.get("version")
+    if version_value is None:
+        version_value = snapshot_data.get("revision")
+    if version_value is None and workflow_data is not None:
+        version_value = workflow_data.get("revision", workflow_data.get("version"))
+    if version_value is None:
+        version_value = graph.get("version")
+    version = _integer(version_value, "release snapshot.version", positive=True)
+    _require_keys(
+        graph,
+        {"nodes", "transition_groups", "edges"},
+        "release snapshot.graph",
+    )
+    graph_version = graph.get("version")
+    if graph_version is not None and _integer(
+        graph_version,
+        "release snapshot.graph.version",
+        positive=True,
+    ) != version:
+        _error("release snapshot graph.version does not match snapshot.version")
+
+    nodes = _list(graph["nodes"], "release snapshot.graph.nodes")
+    node_by_id: dict[str, Mapping[str, Any]] = {}
+    node_by_key: dict[str, Mapping[str, Any]] = {}
+    for index, raw_node in enumerate(nodes):
+        label = f"release snapshot.graph.nodes[{index}]"
+        node = _mapping(raw_node, label)
+        node_id = _string(
+            node.get("id", node.get("node_id")),
+            f"{label}.id",
+        )
+        node_key = _normalized_key(
+            _required(node, "key", label),
+            f"{label}.key",
+        )
+        node_kind = _string(
+            _required(node, "kind", label),
+            f"{label}.kind",
+        )
+        if node_id in node_by_id:
+            _error("release snapshot graph node IDs must be unique")
+        if node_key in node_by_key:
+            _error("release snapshot graph node keys must be unique")
+        node_by_id[node_id] = node
+        node_by_key[node_key] = node
+        if node_kind not in {"start", "agent", "script", "join", "terminal"}:
+            _error(f"{label}.kind is unsupported")
+
+    groups = _list(
+        graph["transition_groups"],
+        "release snapshot.graph.transition_groups",
+    )
+    group_by_id: dict[str, Mapping[str, Any]] = {}
+    group_by_source_transition: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for index, raw_group in enumerate(groups):
+        label = f"release snapshot.graph.transition_groups[{index}]"
+        group = _mapping(raw_group, label)
+        group_id = _string(
+            group.get("id", group.get("transition_group_id")),
+            f"{label}.id",
+        )
+        source_id = _string(
+            _required(group, "source_node_id", label),
+            f"{label}.source_node_id",
+        )
+        transition = _normalized_key(
+            _required(group, "transition_id", label),
+            f"{label}.transition_id",
+        )
+        if group_id in group_by_id:
+            _error("release snapshot transition group IDs must be unique")
+        source = node_by_id.get(source_id)
+        if source is None:
+            _error(f"{label}.source_node_id is unknown")
+        source_key = _normalized_key(
+            _required(source, "key", f"{label}.source node"),
+            f"{label}.source node.key",
+        )
+        identity = (source_key, transition)
+        if identity in group_by_source_transition:
+            _error(
+                "release snapshot has ambiguous source transition groups"
+            )
+        group_by_id[group_id] = group
+        group_by_source_transition[identity] = group
+
+    edges_by_group: dict[str, list[Mapping[str, Any]]] = {}
+    edge_ids: set[str] = set()
+    for index, raw_edge in enumerate(
+        _list(graph["edges"], "release snapshot.graph.edges")
+    ):
+        label = f"release snapshot.graph.edges[{index}]"
+        edge = _mapping(raw_edge, label)
+        edge_id = _string(
+            edge.get("id", edge.get("edge_id")),
+            f"{label}.id",
+        )
+        if edge_id in edge_ids:
+            _error("release snapshot graph edge IDs must be unique")
+        edge_ids.add(edge_id)
+        group_id = _string(
+            _required(edge, "transition_group_id", label),
+            f"{label}.transition_group_id",
+        )
+        if group_id not in group_by_id:
+            _error(f"{label}.transition_group_id is unknown")
+        target_id = _string(
+            _required(edge, "target_node_id", label),
+            f"{label}.target_node_id",
+        )
+        if target_id not in node_by_id:
+            _error(f"{label}.target_node_id is unknown")
+        requires_approval = _bool(
+            _required(edge, "requires_approval", label),
+            f"{label}.requires_approval",
+        )
+        edges_by_group.setdefault(group_id, []).append(
+            {
+                "target_node_id": target_id,
+                "requires_approval": requires_approval,
+            }
+        )
+
+    variant_by_key = {variant.key: variant for variant in spec.operation_variants}
+    for item in spec.native_agent_approvals:
+        variant = variant_by_key[item.variant_key]
+        template = variant.authority_kind
+        if not isinstance(template, AuthorityTemplateSpec):
+            _error("native Agent approval requires an authority template")
+        if template.values["kind"] != "kent_transition_template":
+            _error("native Agent approval requires a Kent authority template")
+        if template.values["workflow_id"] != workflow_id:
+            _error(
+                f"native Agent approval variant {variant.key!r} workflow identity "
+                "does not match release snapshot"
+            )
+        if template.values["project_id"] != project_id:
+            _error(
+                f"native Agent approval variant {variant.key!r} project identity "
+                "does not match release snapshot"
+            )
+        source = node_by_key.get(item.source_node_key)
+        if source is None:
+            _error(
+                f"native Agent approval variant {variant.key!r} source node "
+                "is unknown"
+            )
+        if source.get("kind") != "agent" or item.source_node_kind != "agent":
+            _error(
+                f"native Agent approval variant {variant.key!r} source node "
+                "must be an Agent"
+            )
+        for transition_key, target_key in item.transitions:
+            group = group_by_source_transition.get(
+                (item.source_node_key, transition_key)
+            )
+            if group is None:
+                _error(
+                    f"native Agent approval variant {variant.key!r} transition "
+                    f"{transition_key!r} is not in the release snapshot"
+                )
+            group_id = _string(
+                group.get("id", group.get("transition_group_id")),
+                "release snapshot transition group.id",
+            )
+            outgoing = edges_by_group.get(group_id, [])
+            if len(outgoing) != 1:
+                _error(
+                    f"native Agent approval transition {transition_key!r} "
+                    "must resolve to exactly one edge"
+                )
+            edge = outgoing[0]
+            if not edge["requires_approval"]:
+                _error(
+                    f"native Agent approval transition {transition_key!r} "
+                    "must require approval"
+                )
+            target = node_by_id[edge["target_node_id"]]
+            actual_target = _normalized_key(
+                _required(target, "key", "release snapshot target node"),
+                "release snapshot target node.key",
+            )
+            if actual_target != target_key:
+                _error(
+                    f"native Agent approval transition {transition_key!r} "
+                    "target does not match the release snapshot"
+                )
 
 
 def _coerce_workflows(
@@ -3159,9 +3668,15 @@ def canonicalize_publication_operation(
             _error("schema-1 canonicalization does not accept runtime proofs")
     else:
         if not isinstance(runtime_execution_context, RuntimeExecutionContext):
-            _error("schema-2 canonicalization requires runtime execution context")
+            _error(
+                f"schema-{spec.schema_version} canonicalization requires "
+                "runtime execution context"
+            )
         if not isinstance(runtime_authority_binding, RuntimeAuthorityBinding):
-            _error("schema-2 canonicalization requires runtime authority binding")
+            _error(
+                f"schema-{spec.schema_version} canonicalization requires "
+                "runtime authority binding"
+            )
     if not isinstance(validated_jobs, ValidatedOperationJobs):
         _error("canonicalization requires ValidatedOperationJobs")
     if validated_jobs._proof is not _VALIDATION_TOKEN:
@@ -3219,7 +3734,7 @@ def canonicalize_publication_operation(
     if not SHA256_RE.fullmatch(runtime_digest):
         _error("operation.runtime_source_envelope_digest must be lowercase 64-hex")
     resolved_runtime: Mapping[str, Any] | None = None
-    if spec.schema_version == 2:
+    if spec.schema_version in {2, 3}:
         resolved_runtime = _resolve_runtime_authority_binding(
             runtime_authority_binding,
             runtime_execution_context,
@@ -3255,7 +3770,7 @@ def canonicalize_publication_operation(
             field_spec,
             f"operation.project_fields.{field_spec.name}",
         )
-    if spec.schema_version == 2:
+    if spec.schema_version in {2, 3}:
         template = selected.authority_kind
         if template.kind == "kent_transition_template":
             if authority.kind != "kent_transition":
@@ -3352,6 +3867,14 @@ def render_approval_summary(
     *,
     authority_transition: str | None = None,
 ) -> str:
+    if isinstance(materialization, NativeAgentApproval) or (
+        isinstance(materialization, Mapping)
+        and materialization.get("source_node_kind") == "agent"
+    ):
+        _error(
+            "native Agent approvals do not support deterministic approval "
+            "materialization"
+        )
     materialized = (
         materialization
         if isinstance(materialization, ApprovalMaterialization)
@@ -3401,6 +3924,14 @@ def validate_approval_materialization(
     expected_summary: str | None = None,
     expected_commentary: str | None = None,
 ) -> str:
+    if isinstance(materialization, NativeAgentApproval) or (
+        isinstance(materialization, Mapping)
+        and materialization.get("source_node_kind") == "agent"
+    ):
+        _error(
+            "native Agent approvals do not support deterministic approval "
+            "materialization"
+        )
     materialized = (
         materialization
         if isinstance(materialization, ApprovalMaterialization)
@@ -3610,9 +4141,26 @@ def render_release_preview(
         "approval_sections": [
             {
                 "variant_key": item.variant_key,
+                "mechanism": "script",
                 "sections": list(item.summary_sections),
             }
             for item in spec.approval_materializations
+        ]
+        + [
+            {
+                "variant_key": item.variant_key,
+                "mechanism": "native_agent",
+                "source_node_key": item.source_node_key,
+                "source_node_kind": item.source_node_kind,
+                "transitions": [
+                    {
+                        "transition_key": transition_key,
+                        "target_node_key": target_node_key,
+                    }
+                    for transition_key, target_node_key in item.transitions
+                ],
+            }
+            for item in spec.native_agent_approvals
         ],
     }
     return preview
@@ -3665,6 +4213,7 @@ __all__ = [
     "NormalizedGitHubJobV1",
     "NormalizedGitHubStepV1",
     "NormalizedGitHubWorkflowSourceV1",
+    "NativeAgentApproval",
     "OperationVariant",
     "ProjectField",
     "ReleaseError",
@@ -3690,6 +4239,7 @@ __all__ = [
     "operation_jobs_manifest_digest",
     "render_approval_summary",
     "render_release_preview",
+    "validate_native_agent_approvals",
     "sha256_digest",
     "sha256_hex",
     "validate_approval_materialization",

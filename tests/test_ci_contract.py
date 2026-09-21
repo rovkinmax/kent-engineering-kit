@@ -21,6 +21,7 @@ from workflowkit.ci_contract import prepare_ci_payload
 
 from tests.test_revision import (
     CONTEXT_MANIFESTS,
+    RevisionPreflightTest,
     WORK_KIND_PROCEDURES,
     release_spec_contents,
     schema4_profile_contents,
@@ -41,6 +42,52 @@ def source_validation_copy_ignore(directory, names):
 
 
 class CiContractTest(unittest.TestCase):
+    def test_required_job_projection_accepts_schema3_native_agent_source(self) -> None:
+        fixture = RevisionPreflightTest("test_schema3_native_agent_preflight_binds_snapshot_without_script")
+        try:
+            root = fixture.create_project(
+                schema4=True,
+                release_schema_version=3,
+                both_templates=True,
+                native_agent=True,
+            )
+            profile = ci_contract._profile_at_revision(root, "HEAD")
+            rows = ci_contract._required_rows(
+                root,
+                profile,
+                fixture.run_git(root, "rev-parse", "HEAD").stdout.strip(),
+                repository="owner/repository",
+            )
+            self.assertEqual(
+                [row["contract_key"] for row in rows],
+                ["required_release_contract"],
+            )
+        finally:
+            fixture.doCleanups()
+
+    def test_required_job_projection_accepts_schema3_native_only_source(self) -> None:
+        fixture = RevisionPreflightTest("test_schema3_native_only_preflight_has_zero_effect_jobs")
+        try:
+            root = fixture.create_project(
+                schema4=True,
+                release_schema_version=3,
+                native_agent=True,
+                native_only=True,
+            )
+            profile = ci_contract._profile_at_revision(root, "HEAD")
+            rows = ci_contract._required_rows(
+                root,
+                profile,
+                fixture.run_git(root, "rev-parse", "HEAD").stdout.strip(),
+                repository="owner/repository",
+            )
+            self.assertEqual(
+                [row["contract_key"] for row in rows],
+                ["required_release_contract"],
+            )
+        finally:
+            fixture.doCleanups()
+
     def test_runner_assertion_matches_supported_puber_bytes_only(self) -> None:
         assertion = 'test "${RUNNER_ENVIRONMENT:-github-hosted}" = github-hosted'
         for step, asserted in (

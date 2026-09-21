@@ -22,6 +22,7 @@ from .release import (
     ReleaseSpecError,
     SelectedReleaseArtifacts,
     render_release_preview,
+    validate_native_agent_approvals,
 )
 from .runtime import (
     MAX_EXTERNAL_ROOT_BYTES,
@@ -306,6 +307,13 @@ def _preflight_project_revision(
     snapshot_path = profile.release.snapshot_path
     snapshot_bytes = blobs[snapshot_path]
     snapshot = parse_snapshot(snapshot_bytes, snapshot_path)
+    try:
+        validate_native_agent_approvals(spec, snapshot)
+    except (ReleaseSpecError, ValueError) as error:
+        raise RevisionPreflightError(
+            f"cannot validate release snapshot at "
+            f"{requested_ref}:{snapshot_path}: {error}"
+        ) from error
     del snapshot
 
     artifacts = SelectedReleaseArtifacts(
