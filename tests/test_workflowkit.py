@@ -390,7 +390,7 @@ class WorkflowKitTest(unittest.TestCase):
                 for name, selector in selectors.items()
                 if "model_context_window" in selector
             },
-            {"root": 872000, **{name: 372000 for name in luna_selectors}},
+            {"root": 400000, **{name: 372000 for name in luna_selectors}},
         )
         self.assertEqual(
             {
@@ -436,8 +436,11 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(
             compaction_settings,
             {
-                ("subagents", name, "context_compaction_threshold_tokens"): 353400
-                for name in luna_roles
+                ("context_compaction_threshold_tokens",): 360000,
+                **{
+                    ("subagents", name, "context_compaction_threshold_tokens"): 353400
+                    for name in luna_roles
+                },
             },
         )
 

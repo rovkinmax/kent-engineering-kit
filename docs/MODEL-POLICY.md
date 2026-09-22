@@ -58,7 +58,8 @@ Evaluate it against task quality, provider failures, retries, latency, context
 growth, and review/Fix-loop counts. Model and reasoning changes are explicitly
 paired above; do not attribute an outcome solely to the model.
 
-The root retains `model_context_window = 872000`. Each of the eight Luna
+The Astra root uses `model_context_window = 400000` and
+`context_compaction_threshold_tokens = 360000`. Each of the eight Luna
 subagent roles explicitly pairs `model_context_window = 372000` with
 `context_compaction_threshold_tokens = 353400`. The supervisor has a separate
 372000 window; its schema does not provide a compaction-threshold setting.
@@ -69,9 +70,11 @@ the Luna pair. These are operator-chosen harness budgets, not claims about
 provider maximum capacity.
 
 Preserve low verbosity, tools, prompts, callability, priority mode, workflow
-concurrency of 4, and maximum subagent depth of 1. No root compaction key is
-added to the managed fragment. Operator-owned root compaction settings,
-including the global threshold 828400 and mode `native`, remain unchanged.
+concurrency of 4, and maximum subagent depth of 1. The root window and
+compaction threshold are managed together and must match the installed
+global configuration. Compaction mode `native` and other operator-owned
+compaction settings remain unchanged. The 400000/360000 pair is a bounded
+working-budget experiment, not a proven quota-saving optimum.
 
 Kent 2.7.2 derives Luna's 372000/353400 pair on a fresh role launch but skips
 that derivation under a model lock. Without explicit pairs, continuation can
