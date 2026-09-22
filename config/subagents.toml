@@ -1,7 +1,7 @@
 model = "gpt-6-astra"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
-thinking_level = "medium"
+thinking_level = "low"
 model_verbosity = "low"
 max_subagent_depth = 1
 

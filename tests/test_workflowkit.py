@@ -373,7 +373,7 @@ class WorkflowKitTest(unittest.TestCase):
         }
         luna_roles = luna_selectors.intersection(roles)
         expected_reasoning = {
-            "root": "medium",
+            "root": "low",
             "reviewer": "xhigh",
             **{name: policy[0] for name, policy in expected_roles.items()},
         }

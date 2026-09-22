@@ -9,7 +9,7 @@ or duplicate coder roles. The historical July policy below is not current.
 
 ### Allocation and Manual Selection
 
-- Main agent and planner: `gpt-6-astra`, medium.
+- Main agent and planner: `gpt-6-astra`, low.
 - Simple coder (`implementation-worker`): `gpt-5.6-luna`, xhigh.
 - Complex standalone coding: explicitly select Astra medium on the same role.
 - Runtime QA (`runtime-smoke-tester`): Luna high.
