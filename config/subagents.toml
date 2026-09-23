@@ -1,7 +1,7 @@
-model = "gpt-6-astra"
+model = "gpt-6-sol"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
-thinking_level = "low"
+thinking_level = "high"
 model_verbosity = "low"
 max_subagent_depth = 1
 
@@ -11,13 +11,19 @@ concurrency = 4
 
 [reviewer]
 frequency = "edits"
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 thinking_level = "xhigh"
 model_verbosity = "low"
 model_context_window = 372000
 
+# Interactive sessions use root settings; headless/default workflow runs retain Astra.
+[subagents.default]
+model = "gpt-6-astra"
+thinking_level = "low"
+model_verbosity = "low"
+
 [subagents.fast]
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 thinking_level = "high"
 model_verbosity = "low"
 priority_request_mode = false
@@ -26,7 +32,7 @@ context_compaction_threshold_tokens = 353400
 
 [subagents.compliance_reviewer]
 description = "Agent for reviewing code, plans, documents, diffs, or other scopes only for compliance with applicable specifications and AGENTS.md rules. Cannot edit files."
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_context_window = 372000
 context_compaction_threshold_tokens = 353400
 system_prompt_file = "agents/compliance_reviewer.md"
@@ -45,9 +51,9 @@ planning = false
 
 [subagents.researcher]
 description = "Read-only primary-source research for technical and product questions."
-model = "gpt-6-astra"
+model = "gpt-6-sol"
 system_prompt_file = "agents/researcher.md"
-thinking_level = "medium"
+thinking_level = "high"
 model_verbosity = "low"
 agent_callable = true
 workflow_subagent = true
@@ -101,7 +107,7 @@ edit = false
 
 [subagents.implementation-worker]
 description = "Single-writer implementation slices governed by the approved project plan."
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_context_window = 372000
 context_compaction_threshold_tokens = 353400
 system_prompt_file = "agents/implementation-worker.md"
@@ -131,9 +137,9 @@ edit = false
 
 [subagents.build-doctor]
 description = "Deterministic build and test failure diagnosis with optional bounded fixes."
-model = "gpt-6-astra"
+model = "gpt-6-sol"
 system_prompt_file = "agents/build-doctor.md"
-thinking_level = "medium"
+thinking_level = "high"
 model_verbosity = "low"
 agent_callable = true
 workflow_subagent = true
@@ -145,7 +151,7 @@ edit = false
 
 [subagents.workflow-gate]
 description = "Low-noise synthesis of structured verification evidence into workflow routing."
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_context_window = 372000
 context_compaction_threshold_tokens = 353400
 system_prompt_file = "agents/workflow-gate.md"
@@ -161,7 +167,7 @@ edit = false
 
 [subagents.runtime-smoke-tester]
 description = "Platform-neutral runtime smoke execution through project procedures and adapters."
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_context_window = 372000
 context_compaction_threshold_tokens = 353400
 system_prompt_file = "agents/runtime-smoke-tester.md"
@@ -191,7 +197,7 @@ edit = false
 
 [subagents.delivery-operator]
 description = "Conservative PR preparation, branch delivery, and recoverability-aware cleanup."
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_context_window = 372000
 context_compaction_threshold_tokens = 353400
 system_prompt_file = "agents/delivery-operator.md"
@@ -207,7 +213,7 @@ edit = false
 
 [subagents.ci-monitor]
 description = "Bounded CI, pull-request, and release-automation monitoring without mutations."
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_context_window = 372000
 context_compaction_threshold_tokens = 353400
 system_prompt_file = "agents/ci-monitor.md"
@@ -224,7 +230,7 @@ edit = false
 
 [subagents.release-decision]
 description = "Tool-less human decision gate for deterministic release state."
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_context_window = 372000
 context_compaction_threshold_tokens = 353400
 system_prompt_file = "agents/release-decision.md"

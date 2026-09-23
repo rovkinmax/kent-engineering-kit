@@ -328,15 +328,16 @@ class WorkflowKitTest(unittest.TestCase):
         )
         # reasoning, agent callability, workflow callability, shell, patch
         expected_roles = {
+            "default": ("low", None, None, None, None),
             "fast": ("high", None, None, None, None),
             "compliance_reviewer": ("high", False, False, True, False),
-            "researcher": ("medium", True, True, True, False),
+            "researcher": ("high", True, True, True, False),
             "standards-reviewer": ("medium", False, False, True, False),
             "spec-reviewer": ("medium", False, False, True, False),
             "architecture-designer": ("high", True, True, True, False),
             "implementation-worker": ("xhigh", True, True, True, True),
             "fix-worker": ("medium", True, True, True, True),
-            "build-doctor": ("medium", True, True, True, True),
+            "build-doctor": ("high", True, True, True, True),
             "workflow-gate": ("high", False, False, True, False),
             "runtime-smoke-tester": ("high", True, False, True, False),
             "release-manager": ("medium", False, False, True, True),
@@ -348,34 +349,35 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(set(roles), set(expected_roles))
         selectors = {"root": config, "reviewer": config["reviewer"], **roles}
         expected_models = {
-            "root": "gpt-6-astra",
-            "reviewer": "gpt-5.6-luna",
-            "fast": "gpt-5.6-luna",
-            "compliance_reviewer": "gpt-5.6-luna",
-            "researcher": "gpt-6-astra",
+            "root": "gpt-6-sol",
+            "reviewer": "gpt-6-luna",
+            "default": "gpt-6-astra",
+            "fast": "gpt-6-luna",
+            "compliance_reviewer": "gpt-6-luna",
+            "researcher": "gpt-6-sol",
             "standards-reviewer": "gpt-6-astra",
             "spec-reviewer": "gpt-6-astra",
             "architecture-designer": "gpt-6-astra",
-            "implementation-worker": "gpt-5.6-luna",
+            "implementation-worker": "gpt-6-luna",
             "fix-worker": "gpt-6-astra",
-            "build-doctor": "gpt-6-astra",
-            "workflow-gate": "gpt-5.6-luna",
-            "runtime-smoke-tester": "gpt-5.6-luna",
+            "build-doctor": "gpt-6-sol",
+            "workflow-gate": "gpt-6-luna",
+            "runtime-smoke-tester": "gpt-6-luna",
             "release-manager": "gpt-6-astra",
-            "delivery-operator": "gpt-5.6-luna",
-            "ci-monitor": "gpt-5.6-luna",
-            "release-decision": "gpt-5.6-luna",
+            "delivery-operator": "gpt-6-luna",
+            "ci-monitor": "gpt-6-luna",
+            "release-decision": "gpt-6-luna",
         }
         self.assertEqual(
             {name: selector["model"] for name, selector in selectors.items()},
             expected_models,
         )
         luna_selectors = {
-            name for name, model in expected_models.items() if model == "gpt-5.6-luna"
+            name for name, model in expected_models.items() if model == "gpt-6-luna"
         }
         luna_roles = luna_selectors.intersection(roles)
         expected_reasoning = {
-            "root": "low",
+            "root": "high",
             "reviewer": "xhigh",
             **{name: policy[0] for name, policy in expected_roles.items()},
         }
@@ -405,7 +407,20 @@ class WorkflowKitTest(unittest.TestCase):
         for name, (_, callable_, workflow_callable, shell, patch) in expected_roles.items():
             role = roles[name]
             with self.subTest(role=name):
-                if name == "fast":
+                if name == "default":
+                    self.assertEqual(
+                        role,
+                        {
+                            "model": "gpt-6-astra",
+                            "thinking_level": "low",
+                            "model_verbosity": "low",
+                        },
+                    )
+                    effective_default = {**config, **role}
+                    self.assertEqual(effective_default["model"], "gpt-6-astra")
+                    self.assertEqual(effective_default["thinking_level"], "low")
+                    self.assertEqual(effective_default["model_context_window"], 400000)
+                elif name == "fast":
                     for key in ("agent_callable", "workflow_subagent", "tools"):
                         self.assertNotIn(key, role)
                 else:
