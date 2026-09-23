@@ -663,6 +663,90 @@ class WorkflowKitTest(unittest.TestCase):
             standards_dispatch.prompt,
         )
 
+    def assert_native_join_parameter_contract(self, spec: WorkflowSpec) -> None:
+        node_kinds = {node.key: node.kind for node in spec.nodes}
+        join_keys = {
+            node.key
+            for node in spec.nodes
+            if node.kind == "join"
+        }
+        for edge in spec.edges:
+            if edge.source in join_keys:
+                self.assertEqual(
+                    tuple(parameter.key for parameter in edge.parameters),
+                    (),
+                    edge.key,
+                )
+
+        for join_key in join_keys:
+            provided: dict[str, str] = {}
+            for edge in spec.edges:
+                if edge.target != join_key:
+                    continue
+                self.assertIn(edge.source, node_kinds)
+                for parameter in edge.parameters:
+                    self.assertNotIn(
+                        parameter.key,
+                        provided,
+                        f"{join_key}: {parameter.key} from "
+                        f"{provided.get(parameter.key)} and {edge.key}",
+                    )
+                    provided[parameter.key] = edge.key
+
+    def test_join_parameter_contract_matches_native_aggregate_rules(self) -> None:
+        source_ci_contents = (
+            self.schema4_runtime_v2_contents()
+            .replace(
+                '"github_observation"]',
+                '"github_observation", "prepare_ci"]',
+            )
+            .replace(
+                'wait_ci = "3.0.0"\n',
+                'wait_ci = "3.0.0"\nprepare_ci = "2.0.0"\n',
+            )
+            .replace(
+                'wait_ci = ".kent/scripts/workflow-wait-github-ci"',
+                'wait_ci = ".kent/scripts/workflow-wait-github-ci"\n'
+                'prepare_ci = ".kent/scripts/workflow-prepare-github-ci"',
+            )
+        )
+        disabled_contents = (
+            self.schema4_runtime_v2_contents()
+            .replace("ci_monitoring = true", "ci_monitoring = false")
+            .replace(
+                ', "wait_ci", "github_observation"]',
+                ', "github_observation"]',
+            )
+            .replace('wait_ci = "3.0.0"\n', "")
+        )
+        profiles = (
+            ("schema3_ci", self.load_profile(), 1),
+            (
+                "schema4_ci",
+                self.load_schema4_profile(lambda _: source_ci_contents),
+                1,
+            ),
+            (
+                "schema4_disabled",
+                self.load_schema4_profile(lambda _: disabled_contents),
+                1,
+            ),
+            (
+                "kit_schema3_lite",
+                ProjectProfile.from_toml(
+                    REPO_ROOT,
+                    (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text(),
+                    check_files=False,
+                ),
+                3,
+            ),
+        )
+        for name, profile, version in profiles:
+            with self.subTest(profile=name):
+                self.assert_native_join_parameter_contract(
+                    build_delivery_workflow(profile, version)
+                )
+
     def test_delivery_is_versioned_and_asks_for_execution_target(self) -> None:
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 3)
@@ -2471,8 +2555,8 @@ class WorkflowKitTest(unittest.TestCase):
             "plan_contract_fix_continue", "plan_contract_checked_fix",
             "dispatch_deterministic_verify", "dispatch_invalid_workspace",
             "dispatch_standards_review", "dispatch_spec_review",
-            "deterministic_report_join", "standards_report_join", "spec_report_join",
-            "verification_join_gate", "gate_fix", "gate_reverify_after_user_action",
+            "deterministic_report_join",
+            "gate_fix", "gate_reverify_after_user_action",
             "gate_smoke_required", "gate_delivery_ready", "smoke_prepare_pr",
             "smoke_fix", "compliance_evidence_repair",
             "compliance_needs_user_action", "evidence_repair_compliance",
@@ -2598,8 +2682,6 @@ class WorkflowKitTest(unittest.TestCase):
             "dispatch_invalid_workspace",
             "dispatch_standards_review",
             "deterministic_report_join",
-            "verification_join_gate",
-            "standards_report_join",
             "gate_fix",
             "gate_reverify_after_user_action",
             "gate_delivery_ready",

@@ -973,7 +973,6 @@ def build_delivery_workflow(
                     transition_description=(
                         "All direct verification branches reported; evaluate them."
                     ),
-                    parameters=fix_continuity_parameters,
                 ),
             ]
         )
@@ -990,7 +989,7 @@ def build_delivery_workflow(
                     parameters=(
                         STANDARDS_STATUS,
                         STANDARDS_REPORT,
-                    ) + fix_continuity_parameters,
+                    ),
                 )
             )
         if "spec_review" in review_branches:
@@ -1006,7 +1005,7 @@ def build_delivery_workflow(
                     parameters=(
                         SPEC_STATUS,
                         REVIEW_REPORT,
-                    ) + fix_continuity_parameters,
+                    ),
                 )
             )
     else:

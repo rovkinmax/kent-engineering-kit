@@ -1281,28 +1281,7 @@
       "context_source": "immediate_source",
       "prompt": "Evaluate the joined verification reports without editing files.\n\nRead `.kent/context/review.md` first and stay inside its required and\nconditionally triggered sources.\n\nBefore transition, pipe one non-empty JSON object to\n`.kent/scripts/workflow-evidence-ledger append --task {{.TaskShortId}} --workspace\n<workspace>`. Set `node_key` to `verification_gate`, `evidence_type` to\n`review`, and `context.manifest_path` to `.kent/context/review.md`.\n`context.files_read` lists other project instruction files in actual read\norder; do not repeat the manifest there. Record repeated questions and\nverification loops, use null for unavailable model/compaction counters, and\nexclude secrets or broad raw evidence. Append is idempotent for the current\nKent run; on recovery, reuse the returned sequence/hash and continue.\n\nWorkspace: {{.Params.verification_dispatch_fanout_verify.workspace_path}}\nReview context: {{.Params.verification_dispatch_fanout_verify.review_context}}\nVerification status: {{.Params.verification_status}}\nVerification report: {{.Params.verification_report}}\nStandards status: {{.Params.standards_status}}\nStandards report: {{.Params.standards_report}}\nSpecification review: not enabled by the project profile.\n\nApply the `workflow-gate` role contract. Choose a delivery transition only when\nevery enabled status is `passed`. Do not poll or classify PR CI here; delivery\nowns CI after PR preparation. Keep full reports in `review_context` and make\nuser-facing commentary name only a real decision or external action.\n\nFor `verification_gate_needs_changes`, emit the deduplicated, dependency-ordered repair bundle\nrequired by the `workflow-gate` role contract.\n\nProvide `workspace_path`, a refreshed `review_context` summarizing all reports,\nand the required Smoke decision fields. The refreshed `review_context` must\nrecord the profile Smoke policy, selected transition, rationale, and required\nscope or concrete evidence for bypassing Smoke.\n\nProject policy disables runtime Smoke for this workflow.\nChoose `verification_gate_delivery_ready` and set `smoke_rationale` to the profile policy. Do not\ninvent a Smoke requirement that the project cannot execute.\n\nChoose `verification_gate_needs_changes` for task-scoped failures and provide `workspace_path`\nplus `fix_context`. Choose `verification_gate_needs_user_action` for external or contradictory\nblockers and provide `workspace_path`, `review_context`, and `blocker_reason`;\nafter approval every verification branch reruns. Choose `verification_gate_wont_do` only for an\nexplicit cancellation decision and provide `closure_reason`.",
       "transition_description": "All direct verification branches reported; evaluate them.",
-      "parameters": [
-        {
-          "key": "pr_url",
-          "description": "Canonical pull request URL.",
-          "purpose": "ordinary"
-        },
-        {
-          "key": "branch_name",
-          "description": "Exact non-empty current Git branch from git branch --show-current; required even when no pull request exists.",
-          "purpose": "ordinary"
-        },
-        {
-          "key": "merge_strategy",
-          "description": "Resolved pull-request merge strategy: merge, squash, or rebase.",
-          "purpose": "ordinary"
-        },
-        {
-          "key": "pr_feedback_cursor",
-          "description": "Opaque validated cursor for incremental GitHub pull-request feedback.",
-          "purpose": "ordinary"
-        }
-      ],
+      "parameters": [],
       "assignee_selection": "configured",
       "thinking_selection": "configured",
       "requires_approval": false
@@ -1325,26 +1304,6 @@
         {
           "key": "standards_report",
           "description": "Read-only repository standards, architecture, and engineering report.",
-          "purpose": "ordinary"
-        },
-        {
-          "key": "pr_url",
-          "description": "Canonical pull request URL.",
-          "purpose": "ordinary"
-        },
-        {
-          "key": "branch_name",
-          "description": "Exact non-empty current Git branch from git branch --show-current; required even when no pull request exists.",
-          "purpose": "ordinary"
-        },
-        {
-          "key": "merge_strategy",
-          "description": "Resolved pull-request merge strategy: merge, squash, or rebase.",
-          "purpose": "ordinary"
-        },
-        {
-          "key": "pr_feedback_cursor",
-          "description": "Opaque validated cursor for incremental GitHub pull-request feedback.",
           "purpose": "ordinary"
         }
       ],
