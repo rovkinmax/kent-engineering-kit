@@ -8178,6 +8178,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
 
     def make_ci_terminal_state(
         self, *, count=2, mutate_records=None, report_size=None, linked=False,
+        report_kind="v2",
     ):
         """Real archive producer -> actual ledger append/seal -> Janitor."""
         from workflowkit import runtime
@@ -8203,15 +8204,52 @@ class WorkflowJanitorTest(GitRepositoryTest):
         artifacts = []
         with mock.patch.dict(os.environ, environment, clear=True):
             for index in range(count):
-                report = ci_report()
-                report["pull_number"] = index + 1
-                report["attempts"][0]["head_oid"] = head
-                if index % 2:
-                    attempt = report["attempts"][0]
-                    attempt["reason"] = "expected_check_failed"
-                    attempt["watcher_exit_code"] = 1
-                    attempt["expected_checks"][0].update(bucket="fail", state="FAILURE")
-                if report_size is not None:
+                if report_kind == "v3":
+                    contract = {
+                        "schema": "github-ci-contract-v1",
+                        "repository": "owner/repository",
+                        "pull_number": index + 1,
+                        "head_oid": head,
+                        "base_oid": head,
+                        "require_ci": True,
+                    }
+                    check = {
+                        "workflow_name": "CI",
+                        "check_name": "unit",
+                        "event": "pull_request",
+                        "bucket": "fail" if index % 2 else "pass",
+                        "state": "FAILURE" if index % 2 else "SUCCESS",
+                        "link": "https://github.com/owner/repository/actions/runs/1",
+                    }
+                    classification = runtime.classify_github_checks(
+                        [check],
+                        require_ci=True,
+                    )
+                    report = runtime.build_dynamic_ci_report(
+                        contract=contract,
+                        attempts=[{
+                            "sequence": 1,
+                            "head_oid": head,
+                            "base_oid": head,
+                            "retry": None,
+                            "checks": classification["checks"],
+                            "check_count": classification["check_count"],
+                            "checks_sha256": classification["checks_sha256"],
+                            "reason": classification["state"],
+                            "watcher_exit_code": 1 if index % 2 else 0,
+                            "error": None,
+                        }],
+                    )
+                else:
+                    report = ci_report()
+                    report["pull_number"] = index + 1
+                    report["attempts"][0]["head_oid"] = head
+                    if index % 2:
+                        attempt = report["attempts"][0]
+                        attempt["reason"] = "expected_check_failed"
+                        attempt["watcher_exit_code"] = 1
+                        attempt["expected_checks"][0].update(bucket="fail", state="FAILURE")
+                if report_size is not None and report_kind == "v2":
                     attempt = report["attempts"][0]
                     report["attempts"] = [
                         {
@@ -8340,6 +8378,76 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     self.assertLess(max(i for i, phase in enumerate(phases)
                                         if phase == "after_ci_report_unlink_fsync"),
                                     phases.index("before_ledger_unlink"))
+
+    def test_ci_v3_archive_dispatch_and_resume(self):
+        from workflowkit import runtime
+
+        for managed in (False, True):
+            with self.subTest(managed=managed):
+                fixture = self.make_ci_terminal_state(
+                    count=1,
+                    report_kind="v3",
+                )
+                result = self.ci_cleanup(fixture, managed=managed)
+                self.assertTrue(result[0], result)
+                if managed:
+                    self.assertTrue(fixture[4].exists())
+                    report = next(fixture[4].glob("ci-report-*.json"))
+                    runtime.validate_ci_archive(
+                        runtime.parse_canonical_json(
+                            report.read_bytes(),
+                            label="v3 janitor fixture",
+                        )
+                    )
+                else:
+                    self.assertFalse(fixture[4].exists())
+
+        fixture = self.make_ci_terminal_state(
+            count=1,
+            report_kind="v3",
+        )
+        root, janitor, marker, active, tombstone, names = fixture
+        active.rename(tombstone)
+        sentinel = tombstone.parent / janitor.runtime_state_names("TASK-1")[1]
+        self._write_valid_runtime_file(sentinel)
+        result = self.ci_cleanup(fixture)
+        self.assertTrue(result[0], result)
+        self.assertFalse(tombstone.exists())
+
+    def test_ci_v3_archive_rejects_malformed_unknown_tampered_and_unreferenced(self):
+        from workflowkit import runtime
+
+        for case in ("malformed", "unknown", "tampered", "unreferenced"):
+            with self.subTest(case=case):
+                fixture = self.make_ci_terminal_state(
+                    count=1,
+                    report_kind="v3",
+                )
+                root, _, _, active, tombstone, names = fixture
+                report = active / names[0]
+                raw = report.read_bytes()
+                if case == "malformed":
+                    report.write_bytes(b"not-json")
+                elif case == "unknown":
+                    report.write_bytes(
+                        runtime.canonical_bytes(
+                            {"schema": "github-ci-report-v4"}
+                        )
+                    )
+                elif case == "tampered":
+                    report.write_bytes(raw + b"\n")
+                else:
+                    value = json.loads(raw)
+                    value["attempts"][0]["watcher_exit_code"] = 7
+                    extra = runtime.canonical_bytes(value)
+                    self._write_valid_runtime_file(
+                        active / f"ci-report-{hashlib.sha256(extra).hexdigest()}.json",
+                        extra,
+                    )
+                result = self.ci_cleanup(fixture)
+                self.assertFalse(result[0], result)
+                self.assertTrue(active.exists())
+                self.assertFalse(tombstone.exists())
 
     def test_ci_invalid_artifacts_block_before_namespace_mutation(self):
         cases = (

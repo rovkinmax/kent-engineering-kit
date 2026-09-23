@@ -4453,6 +4453,18 @@ def validate_dynamic_ci_report_history(
     return report
 
 
+def validate_ci_archive(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate an explicitly tagged v2 or v3 CI archive."""
+    if not isinstance(value, Mapping):
+        raise RuntimeContractError("CI archive must be an object")
+    schema = value.get("schema")
+    if schema == CI_REPORT_SCHEMA:
+        return validate_ci_report(value)
+    if schema == DYNAMIC_CI_REPORT_SCHEMA:
+        return validate_dynamic_ci_report(value)
+    raise RuntimeContractError("unsupported CI archive schema")
+
+
 def classify_dynamic_ci_report(value: Mapping[str, Any]) -> str:
     report = validate_dynamic_ci_report(value)
     return report["attempts"][-1]["reason"]
@@ -4847,6 +4859,7 @@ __all__ = [
     "terminal_marker_line",
     "validate_ci_report",
     "validate_ci_report_history",
+    "validate_ci_archive",
     "validate_dynamic_ci_report",
     "validate_dynamic_ci_report_history",
     "validate_ci_contract",

@@ -37,6 +37,7 @@ from workflowkit.runtime import (
     terminal_marker_line,
     validate_ci_report,
     validate_cleanup_report,
+    validate_ci_archive,
     validate_ci_report_history,
     validate_expected_ci_checks,
     validate_pr_feedback_cursor,
@@ -861,6 +862,63 @@ class RuntimeContractTest(unittest.TestCase):
             runtime_module.validate_dynamic_ci_report(report),
             report,
         )
+
+    def test_ci_archive_dispatcher_requires_explicit_v2_or_v3_schema(self) -> None:
+        legacy = ci_report()
+        self.assertEqual(validate_ci_archive(legacy), legacy)
+
+        contract = runtime_module.validate_ci_contract(dynamic_contract())
+        rows = [dynamic_check()]
+        classification = runtime_module.classify_github_checks(
+            rows,
+            require_ci=True,
+        )
+        attempt = {
+            "sequence": 1,
+            "head_oid": contract["head_oid"],
+            "base_oid": contract["base_oid"],
+            "retry": None,
+            "checks": classification["checks"],
+            "check_count": classification["check_count"],
+            "checks_sha256": classification["checks_sha256"],
+            "reason": "green",
+            "watcher_exit_code": 0,
+            "error": None,
+        }
+        current = runtime_module.build_dynamic_ci_report(
+            contract=contract,
+            attempts=[attempt],
+        )
+        self.assertEqual(validate_ci_archive(current), current)
+
+        for bucket, state, reason in (
+            ("fail", "FAILURE", "failed"),
+            ("pending", "WAITING", "pending"),
+        ):
+            with self.subTest(reason=reason):
+                classified = runtime_module.classify_github_checks(
+                    [dynamic_check(bucket=bucket, state=state)],
+                    require_ci=True,
+                )
+                archive = runtime_module.build_dynamic_ci_report(
+                    contract=contract,
+                    attempts=[{
+                        **attempt,
+                        "checks": classified["checks"],
+                        "check_count": classified["check_count"],
+                        "checks_sha256": classified["checks_sha256"],
+                        "reason": reason,
+                    }],
+                )
+                self.assertEqual(validate_ci_archive(archive), archive)
+
+        for unknown in (
+            {**current, "schema": "github-ci-report-v4"},
+            {"schema": "github-ci-report-unknown"},
+        ):
+            with self.subTest(schema=unknown["schema"]):
+                with self.assertRaises(RuntimeContractError):
+                    validate_ci_archive(unknown)
 
     def test_dynamic_ci_contract_and_report_preserve_retry_history(self) -> None:
         contract = runtime_module.validate_ci_contract(dynamic_contract())
