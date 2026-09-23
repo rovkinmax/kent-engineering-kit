@@ -751,7 +751,7 @@ class _EvidenceAdmission:
                         total += len(report_bytes)
                         if total > MAX_CI_ARTIFACT_BYTES:
                             raise ValueError("total CI report bytes exceed limit")
-                        report = runtime.validate_ci_report(
+                        report = runtime.validate_ci_archive(
                             runtime.parse_canonical_json(
                                 report_bytes, label="CI artifact",
                                 max_bytes=runtime.MAX_CI_REPORT_BYTES,

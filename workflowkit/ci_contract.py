@@ -1,18 +1,20 @@
-"""Source-derived CI preparation wire contract (prepare_ci=1.0.0).
+"""Dynamic CI preparation and release-source admission contracts.
 
-GitHub metadata and immutable Git blobs are the only policy inputs. Existing
-runtime/revision contracts own canonical packets and selected-source provenance.
+Ordinary preparation binds a stable GitHub pull-request identity and creates
+the dynamic CI cycle contract. It does not inspect release source jobs,
+materialize commits, or infer expected checks. The legacy source-derived
+normalizer and admission helpers remain available to release-only callers.
 Input is duplicate-free JSON, <=1 MiB/depth 100, read within two seconds.
 Workspace, canonical GitHub PR URL, branch, strategy and task short ID are real
 nonempty strings. Invalid identity exits nonzero with a safe error, no transition.
 Errors never contain source snippets, authenticated output or subprocess stderr.
 
 ci_prepare_failed is preparation diagnosis, NOT a new CI report schema.
-It preserves all identity/cursor/packet strings; absent report/expected/policy
-packets are empty strings ONLY on diagnosis and its retry back to preparation.
-Supplied invalid reports remain invalid. CI Monitor has no positive-green route.
+It preserves all identity/cursor/packet strings; absent contract/report packets
+are empty strings ONLY on diagnosis and its retry back to preparation. Supplied
+invalid reports remain invalid. CI Monitor has no positive-green route.
 Ready-initial omits the absent report; ready-retry carries a validated same-cycle
-report. Both carry the three expected-check fields, policy, task ID and cursor.
+github-ci-report-v3. Both carry the contract, task ID and cursor.
 
 P need not adopt the producer. H declares the capability and contains matching
 first-party prepare/CI-wait/PR-wait/runtime templates. Metadata matches the exact
@@ -97,6 +99,9 @@ from .runtime import (
     RuntimeContractError,
     capture_runtime_source_envelope,
     canonical_bytes,
+    validate_ci_contract,
+    validate_dynamic_ci_report,
+    validate_dynamic_pr_feedback_cursor,
     make_ci_policy_snapshot,
     validate_ci_policy_snapshot,
     validate_ci_report,
@@ -116,7 +121,7 @@ SHA1_HEX = set("0123456789abcdef")
 
 
 class CiContractError(RuntimeError):
-    """Raised when source-derived CI preparation cannot prove its contract."""
+    """Raised when CI preparation or source admission cannot prove its contract."""
 
 
 class BoundedCommandError(CiContractError):
@@ -208,10 +213,7 @@ def preparation_failure(payload: Mapping[str, Any]) -> dict[str, str]:
     """Diagnosis transport only: empty strings denote absent packets, not reports."""
     identity = validate_preparation_identity(payload)
     values = {}
-    for key in (
-        "ci_report", "ci_policy_snapshot", "expected_ci_checks",
-        "expected_ci_checks_sha256", "runtime_source_envelope_digest",
-    ):
+    for key in ("ci_contract", "ci_report"):
         value = payload.get(key, "")
         if not isinstance(value, str):
             raise CiContractError("input_invalid")
@@ -555,7 +557,8 @@ def archive_ci_report(root: Path, task: str, report: Mapping[str, Any]) -> str:
     """Retain a validated report in the existing locked task evidence area."""
     import fcntl
 
-    raw = canonical_bytes(validate_ci_report(report))
+    normalized = validate_dynamic_ci_report(report)
+    raw = canonical_bytes(normalized)
     if len(raw) > MAX_CI_REPORT_BYTES:
         raise CiContractError("report_archive_limit")
     template = Path(__file__).resolve().parents[1] / "templates/project/workflow-evidence-ledger"
@@ -616,16 +619,24 @@ def archive_ci_report(root: Path, task: str, report: Mapping[str, Any]) -> str:
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
+    manifest_path = next(
+        (
+            relative
+            for relative in (".kent/context/delivery.md", ".kent/project-contract.md")
+            if (root / relative).is_file()
+        ),
+        None,
+    )
+    if manifest_path is None:
+        raise CiContractError("report_archive_context_invalid")
     result = run_bounded_command(
         [sys.executable, "-B", str(template), "append", "--task", task, "--workspace", str(root)],
         stdin=canonical_bytes({
             "node_key": "ci_prepare", "evidence_type": "ci_report",
             "summary": "Validated CI cycle report retained before preparation re-entry.",
-            "artifacts": [artifact], "checks": ["github-ci-report-v2 validated"],
+            "artifacts": [artifact], "checks": ["github-ci-report-v3 validated"],
             "context": {
-                "manifest_path": _profile_at_revision(
-                    root, report["attempts"][-1]["head_oid"],
-                ).context_manifests["delivery"],
+                "manifest_path": manifest_path,
                 "files_read": [], "model_calls": 0, "compaction_count": 0,
             },
         }),
@@ -1141,16 +1152,107 @@ def prepare_ci_payload(
 ) -> dict[str, Any]:
     validate_preparation_identity(payload)
     for key in (
-        "ci_report", "ci_policy_snapshot", "expected_ci_checks",
-        "expected_ci_checks_sha256", "runtime_source_envelope_digest", "pr_feedback_cursor",
+        "ci_contract", "ci_report", "pr_feedback_cursor",
     ):
         if key in payload and not isinstance(payload[key], str):
             raise CiContractError("input_invalid")
+    return _prepare_ci_payload(payload, gh_bin=gh_bin)
+
+
+def _dynamic_pull_number(pr_url: str) -> int:
+    parts = [part for part in urlparse(pr_url).path.split("/") if part]
+    if len(parts) != 4:
+        raise CiContractError("pr_url must identify one GitHub pull request")
     try:
-        with source_read_budget():
-            return _prepare_ci_payload(payload, gh_bin=gh_bin)
-    except RevisionPreflightError as error:
-        raise CiContractError("source_preflight_failed") from error
+        number = int(parts[3])
+    except ValueError as error:
+        raise CiContractError("pr_url must identify one GitHub pull request") from error
+    if number < 1 or number > 2147483647:
+        raise CiContractError("pr_url must identify one GitHub pull request")
+    return number
+
+
+def _dynamic_contract(
+    *,
+    repository: str,
+    pull_number: int,
+    head_oid: str,
+    base_oid: str,
+) -> dict[str, Any]:
+    return validate_ci_contract({
+        "schema": "github-ci-contract-v1",
+        "repository": repository,
+        "pull_number": pull_number,
+        "head_oid": head_oid,
+        "base_oid": base_oid,
+        "require_ci": True,
+    })
+
+
+def _validate_dynamic_prepare_packets(
+    payload: Mapping[str, Any],
+    *,
+    repository: str,
+    pull_number: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+    contract: dict[str, Any] | None = None
+    raw_contract = payload.get("ci_contract", "")
+    if raw_contract:
+        try:
+            contract = validate_ci_contract(parse_preparation_json(raw_contract))
+        except (CiContractError, RuntimeContractError, TypeError, ValueError) as error:
+            raise CiContractError("previous CI contract is invalid") from error
+        if (
+            contract["repository"] != repository
+            or contract["pull_number"] != pull_number
+        ):
+            raise CiContractError("previous CI contract identity is invalid")
+    report: dict[str, Any] | None = None
+    raw_report = payload.get("ci_report", "")
+    if raw_report:
+        try:
+            report = validate_dynamic_ci_report(parse_preparation_json(raw_report))
+        except (CiContractError, RuntimeContractError, TypeError, ValueError) as error:
+            raise CiContractError("previous CI report is invalid") from error
+        report_contract = report["contract"]
+        if (
+            report_contract["repository"] != repository
+            or report_contract["pull_number"] != pull_number
+        ):
+            raise CiContractError("previous CI report identity is invalid")
+    cursor = payload.get("pr_feedback_cursor", "uninitialized")
+    if cursor != "uninitialized":
+        try:
+            validate_dynamic_pr_feedback_cursor(parse_preparation_json(cursor))
+        except (CiContractError, RuntimeContractError, TypeError, ValueError) as error:
+            raise CiContractError("previous PR feedback cursor is invalid") from error
+    return contract, report, cursor
+
+
+def _dynamic_prepare_result(
+    *,
+    transition: str,
+    workspace: Path,
+    payload: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    cursor: str,
+    merge_report: str | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "transition": transition,
+        "workspace_path": str(workspace),
+        "pr_url": str(payload["pr_url"]),
+        "branch_name": str(payload["branch_name"]),
+        "merge_strategy": str(payload["merge_strategy"]),
+        "pr_head_oid": contract["head_oid"],
+        "pr_base_oid": contract["base_oid"],
+        "task_short_id": str(payload["task_short_id"]),
+        "ci_contract": canonical_bytes(contract).decode("utf-8"),
+        "pr_feedback_cursor": cursor,
+    }
+    if merge_report is not None:
+        result["merge_report"] = merge_report
+    return result
 
 
 def _prepare_ci_payload(
@@ -1159,138 +1261,81 @@ def _prepare_ci_payload(
     workspace = Path(payload["workspace_path"]).resolve()
     pr_url = payload["pr_url"]
     repository = _repository_from_url(pr_url)
+    pull_number = _dynamic_pull_number(pr_url)
     first = read_pull_request(workspace, pr_url, gh_bin=gh_bin)
     _validate_pr_metadata(first, payload)
-    state = str(first.get("state") or "").upper()
-    if state == "MERGED":
-        return {
-            "transition": "ci_prepare_pr_merged",
-            "workspace_path": str(workspace),
-            "pr_url": pr_url,
-            "branch_name": str(payload["branch_name"]),
-            "merge_report": json.dumps(first, sort_keys=True),
-        }
     head = first["headRefOid"]
     target = first["baseRefOid"]
-    root = workspace
-    for oid in dict.fromkeys((target, head)):
-        materialize_exact_commit(root, repository, oid, gh_bin=gh_bin)
-    profile = _profile_at_revision(root, target)
-    head_profile = _profile_at_revision(root, head)
-    try:
-        target_rows = _required_rows(root, profile, target, repository)
-        checks = _validate_job_sources(root, target, head, target_rows)
-        source_projection = _source_policy_projection(
-            root,
-            target,
-            profile,
-            target_rows,
+    contract = _dynamic_contract(
+        repository=repository,
+        pull_number=pull_number,
+        head_oid=head,
+        base_oid=target,
+    )
+    prior_contract, previous_report, cursor = _validate_dynamic_prepare_packets(
+        payload,
+        repository=repository,
+        pull_number=pull_number,
+    )
+    if str(first.get("state") or "").upper() == "MERGED":
+        if previous_report is not None:
+            archive_ci_report(workspace, payload["task_short_id"], previous_report)
+        return _dynamic_prepare_result(
+            transition="ci_prepare_pr_merged",
+            workspace=workspace,
+            payload=payload,
+            contract=contract,
+            cursor=cursor,
+            merge_report=json.dumps(first, sort_keys=True),
         )
-        preflight = preflight_project_revision(root, head)
-        inputs = preflight.selected_runtime_source_inputs
-        if inputs is None:
-            raise CiContractError("selected runtime source inputs are unavailable")
-        if inputs.repository != repository:
-            raise CiContractError("source_repository_mismatch")
-        _validate_adoption(root, head, head_profile)
-        captures = collect_runtime_external_captures(root, inputs)
-        envelope = capture_runtime_source_envelope(inputs, captures)
-        expected = {
-            "schema": "github-ci-expected-checks-v1",
-            "repository": repository,
-            "project_commit": head,
-            "runtime_source_envelope_digest": envelope[
-                "runtime_source_envelope_digest"
-            ],
-            "checks": checks,
-        }
-        policy = make_ci_policy_snapshot(
-            target,
-            expected,
-            source_projection,
-        )
-        expected = validate_expected_ci_checks(expected)
-        expected_digest = expected_ci_checks_sha256(expected)
-    except (RevisionPreflightError, RuntimeContractError, ValueError) as error:
-        raise CiContractError("source_preflight_failed") from error
     second = read_pull_request(workspace, pr_url, gh_bin=gh_bin)
     _validate_pr_metadata(second, payload)
     if second["state"] == "MERGED":
-        return {
-            "transition": "ci_prepare_pr_merged", "workspace_path": str(workspace),
-            "pr_url": pr_url, "branch_name": payload["branch_name"],
-            "merge_report": json.dumps(second, sort_keys=True),
-        }
+        if previous_report is not None:
+            archive_ci_report(workspace, payload["task_short_id"], previous_report)
+        contract = _dynamic_contract(
+            repository=repository,
+            pull_number=pull_number,
+            head_oid=second["headRefOid"],
+            base_oid=second["baseRefOid"],
+        )
+        return _dynamic_prepare_result(
+            transition="ci_prepare_pr_merged",
+            workspace=workspace,
+            payload=payload,
+            contract=contract,
+            cursor=cursor,
+            merge_report=json.dumps(second, sort_keys=True),
+        )
     if (
         second["headRefOid"] != head
         or str(second.get("baseRefOid") or "") != target
         or second.get("baseRefName") != first.get("baseRefName")
     ):
         raise CiContractError("pull request identity changed during CI preparation")
-    previous = payload.get("ci_report")
-    same_cycle = False
-    if isinstance(previous, str) and previous:
-        try:
-            previous_report = validate_ci_report(parse_preparation_json(previous))
-            previous_policy_raw = payload.get("ci_policy_snapshot")
-            if not isinstance(previous_policy_raw, str):
-                raise RuntimeContractError("previous CI policy snapshot is missing")
-            previous_policy = validate_ci_policy_snapshot(
-                parse_preparation_json(previous_policy_raw)
-            )
-            previous_expected = validate_expected_ci_checks(
-                parse_preparation_json(payload["expected_ci_checks"])
-            )
-            prior_digest = expected_ci_checks_sha256(previous_expected)
-            if (
-                previous_report["repository"] != repository
-                or previous_report["pull_number"] != int(pr_url.rsplit("/", 1)[1])
-                or previous_expected["repository"] != repository
-                or previous_report["expected_ci_checks_sha256"] != prior_digest
-                or payload["expected_ci_checks_sha256"] != prior_digest
-                or previous_report["runtime_source_envelope_digest"]
-                != previous_expected["runtime_source_envelope_digest"]
-                or payload["runtime_source_envelope_digest"]
-                != previous_expected["runtime_source_envelope_digest"]
-                or previous_policy["policy_sha256"] != ci_policy_projection_sha256(previous_expected)
-            ):
-                raise RuntimeContractError("previous CI packet is contradictory")
-            current_policy = validate_ci_policy_snapshot(policy)
-            same_cycle = (
-                previous_report["expected_ci_checks_sha256"] == expected_digest
-                and previous_report["runtime_source_envelope_digest"]
-                == expected["runtime_source_envelope_digest"]
-                and previous_policy["policy_sha256"]
-                == current_policy["policy_sha256"]
-                and previous_policy["source_policy_sha256"]
-                == current_policy["source_policy_sha256"]
-            )
-        except (RuntimeContractError, CiContractError, ValueError, KeyError, TypeError):
-            raise CiContractError("previous CI report is invalid")
+    if prior_contract is not None and (
+        prior_contract["head_oid"] != head
+        or prior_contract["base_oid"] != target
+    ):
+        same_cycle = False
+    else:
+        same_cycle = (
+            previous_report is not None
+            and previous_report["contract"] == contract
+        )
+    if previous_report is not None:
         archive_ci_report(workspace, payload["task_short_id"], previous_report)
-    result: dict[str, Any] = {
-        "transition": (
+    result = _dynamic_prepare_result(
+        transition=(
             "ci_prepare_ready_retry" if same_cycle else "ci_prepare_ready_initial"
         ),
-        "workspace_path": str(workspace),
-        "pr_url": pr_url,
-        "branch_name": str(payload["branch_name"]),
-        "merge_strategy": str(payload["merge_strategy"]),
-        "expected_ci_checks": canonical_bytes(expected).decode("utf-8"),
-        "expected_ci_checks_sha256": expected_digest,
-        "runtime_source_envelope_digest": expected[
-            "runtime_source_envelope_digest"
-        ],
-        "ci_policy_snapshot": canonical_bytes(policy).decode("utf-8"),
-        "pr_head_oid": head,
-        "pr_base_oid": target,
-        "task_short_id": payload["task_short_id"],
-        "pr_feedback_cursor": payload.get("pr_feedback_cursor", "uninitialized"),
-    }
+        workspace=workspace,
+        payload=payload,
+        contract=contract,
+        cursor=cursor,
+    )
     if same_cycle:
-        result["ci_report"] = previous
-    if "pr_feedback_cursor" in payload:
-        result["pr_feedback_cursor"] = payload["pr_feedback_cursor"]
+        result["ci_report"] = str(payload["ci_report"])
     return result
 
 

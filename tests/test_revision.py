@@ -810,6 +810,7 @@ class RevisionPreflightTest(unittest.TestCase):
             "workflow-verify",
             "workflow-wait-github-ci",
             "workflow-wait-github-pr",
+            "workflow_github_observation.py",
         ):
             path = scripts / name
             path.write_text("#!/usr/bin/env bash\nexit 0\n")
@@ -926,6 +927,7 @@ class RevisionPreflightTest(unittest.TestCase):
                 ".kent/scripts/workflow-verify",
                 ".kent/scripts/workflow-wait-github-ci",
                 ".kent/scripts/workflow-wait-github-pr",
+                ".kent/scripts/workflow_github_observation.py",
                 ".kent/workflow-profile.toml",
                 *WORK_KIND_PROCEDURES,
                 *CONTEXT_MANIFESTS,

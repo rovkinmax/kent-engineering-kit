@@ -42,7 +42,7 @@ class CommandTemplate:
 COMMAND_TEMPLATES = {
     "prepare_ci": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-prepare-github-ci",
-        "1.0.0",
+        "2.0.0",
     ),
     "runtime_contracts": CommandTemplate(
         REPO_ROOT / "workflowkit" / "runtime.py",
@@ -88,7 +88,7 @@ COMMAND_TEMPLATES = {
     ),
     "wait_ci": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-wait-github-ci",
-        "2.0.0",
+        "3.0.0",
     ),
     "dispatch": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch",
@@ -100,7 +100,11 @@ COMMAND_TEMPLATES = {
     ),
     "wait_pr": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-wait-github-pr",
-        "2.0.0",
+        "3.0.0",
+    ),
+    "github_observation": CommandTemplate(
+        REPO_ROOT / "workflowkit" / "github_observation.py",
+        "1.0.0",
     ),
     "verify": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-verify-report",
@@ -114,6 +118,7 @@ V2_COMMANDS = {
     "janitor",
     "wait_ci",
     "wait_pr",
+    "github_observation",
 }
 
 
@@ -285,8 +290,6 @@ def validate_schema4_command_versions(profile: ProjectProfile) -> None:
                 f"no toolkit template exists for managed command {key!r}"
             )
         expected = template.version
-        if key in V2_COMMANDS and not profile.runtime_contracts_v2():
-            expected = "1.0.0"
         actual = profile.command_versions[key]
         if actual != expected:
             raise ValueError(

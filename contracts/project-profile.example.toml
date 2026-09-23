@@ -44,6 +44,7 @@ plan_contract_verify = ".kent/scripts/workflow-plan-contract-verify"
 plan_contract_fix_continue = ".kent/scripts/workflow-plan-contract-fix-continue"
 wait_ci = ".kent/scripts/workflow-wait-github-ci"
 wait_pr = ".kent/scripts/workflow-wait-github-pr"
+github_observation = ".kent/scripts/workflow_github_observation.py"
 janitor = ".kent/scripts/workflow-task-janitor"
 smoke = ""
 

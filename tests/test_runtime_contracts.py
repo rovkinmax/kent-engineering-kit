@@ -37,6 +37,7 @@ from workflowkit.runtime import (
     terminal_marker_line,
     validate_ci_report,
     validate_cleanup_report,
+    validate_ci_archive,
     validate_ci_report_history,
     validate_expected_ci_checks,
     validate_pr_feedback_cursor,
@@ -79,6 +80,36 @@ def observed_check(
         "bucket": bucket,
         "state": state,
         "link": "https://github.com/owner/repository/actions/runs/1",
+    }
+
+
+def dynamic_check(
+    *,
+    workflow_name: str = "Pull Request",
+    check_name: str = "unit",
+    event: str = "pull_request",
+    bucket: str = "pass",
+    state: str = "SUCCESS",
+    link: str | None = "https://github.com/owner/repository/actions/runs/1",
+) -> dict[str, object]:
+    return {
+        "workflow_name": workflow_name,
+        "check_name": check_name,
+        "event": event,
+        "bucket": bucket,
+        "state": state,
+        "link": link,
+    }
+
+
+def dynamic_contract(*, require_ci: bool = True) -> dict[str, object]:
+    return {
+        "schema": "github-ci-contract-v1",
+        "repository": "owner/repository",
+        "pull_number": 1,
+        "head_oid": ZERO_SHA1,
+        "base_oid": "1" * 40,
+        "require_ci": require_ci,
     }
 
 
@@ -729,6 +760,323 @@ class RuntimeContractTest(unittest.TestCase):
                     for index in range(1001)
                 ]
             )
+
+    def test_dynamic_ci_is_open_world_and_fail_closed(self) -> None:
+        external = dynamic_check(
+            workflow_name="",
+            event="",
+            bucket="skipping",
+            state="NEUTRAL",
+            link="https://app.aikido.dev/featurebranch/scan/200235380?groupId=1019",
+        )
+        green = runtime_module.classify_github_checks(
+            [external, dynamic_check(check_name="security")],
+            require_ci=True,
+        )
+        self.assertEqual(green["state"], "green")
+        self.assertEqual(green["transition"], "green")
+        self.assertEqual(green["check_count"], 2)
+        self.assertEqual(
+            green["checks"],
+            [external, dynamic_check(check_name="security")],
+        )
+        same_name_different_event = runtime_module.classify_github_checks(
+            [
+                dynamic_check(event="pull_request"),
+                dynamic_check(event="merge_group"),
+            ],
+            require_ci=True,
+        )
+        self.assertEqual(same_name_different_event["state"], "green")
+        self.assertEqual(same_name_different_event["check_count"], 2)
+
+        failed_extra = runtime_module.classify_github_checks(
+            [
+                dynamic_check(),
+                dynamic_check(
+                    check_name="external-security",
+                    bucket="fail",
+                    state="FAILURE",
+                ),
+            ],
+            require_ci=True,
+        )
+        self.assertEqual(failed_extra["state"], "failed")
+        self.assertEqual(failed_extra["transition"], "failed")
+        self.assertEqual(failed_extra["check_count"], 2)
+
+        pending = runtime_module.classify_github_checks(
+            [dynamic_check(bucket="pending", state="WAITING")],
+            require_ci=True,
+        )
+        self.assertEqual(pending["state"], "pending")
+        self.assertEqual(pending["transition"], "pending")
+
+        self.assertEqual(
+            runtime_module.classify_github_checks([], require_ci=False)["state"],
+            "not_required",
+        )
+        self.assertEqual(
+            runtime_module.classify_github_checks([], require_ci=True)["state"],
+            "no_checks",
+        )
+
+        invalid = runtime_module.classify_github_checks(
+            [dynamic_check(bucket="pass", state="FAILURE")],
+            require_ci=True,
+        )
+        self.assertEqual(invalid["state"], "invalid_observation")
+        self.assertEqual(
+            invalid["diagnostic"]["code"],
+            "state_bucket_conflict",
+        )
+
+    def test_dynamic_invalid_observation_attempt_is_valid_report_evidence(self) -> None:
+        contract = runtime_module.validate_ci_contract(dynamic_contract())
+        classification = runtime_module.classify_github_checks(
+            [dynamic_check(bucket="pass", state="FAILURE")],
+            require_ci=True,
+        )
+        attempt = {
+            "sequence": 1,
+            "head_oid": contract["head_oid"],
+            "base_oid": contract["base_oid"],
+            "retry": None,
+            "checks": classification["checks"],
+            "check_count": classification["check_count"],
+            "checks_sha256": classification["checks_sha256"],
+            "reason": "invalid_observation",
+            "watcher_exit_code": None,
+            "error": {
+                "code": "invalid_observation",
+                "message": "a check row is malformed or contradictory",
+                "stdout_sha256": ZERO_SHA256,
+                "stderr_sha256": ZERO_SHA256,
+            },
+        }
+        report = runtime_module.build_dynamic_ci_report(
+            contract=contract,
+            attempts=[attempt],
+        )
+        self.assertEqual(
+            runtime_module.validate_dynamic_ci_report(report),
+            report,
+        )
+
+    def test_ci_archive_dispatcher_requires_explicit_v2_or_v3_schema(self) -> None:
+        legacy = ci_report()
+        self.assertEqual(validate_ci_archive(legacy), legacy)
+
+        contract = runtime_module.validate_ci_contract(dynamic_contract())
+        rows = [dynamic_check()]
+        classification = runtime_module.classify_github_checks(
+            rows,
+            require_ci=True,
+        )
+        attempt = {
+            "sequence": 1,
+            "head_oid": contract["head_oid"],
+            "base_oid": contract["base_oid"],
+            "retry": None,
+            "checks": classification["checks"],
+            "check_count": classification["check_count"],
+            "checks_sha256": classification["checks_sha256"],
+            "reason": "green",
+            "watcher_exit_code": 0,
+            "error": None,
+        }
+        current = runtime_module.build_dynamic_ci_report(
+            contract=contract,
+            attempts=[attempt],
+        )
+        self.assertEqual(validate_ci_archive(current), current)
+
+        for bucket, state, reason in (
+            ("fail", "FAILURE", "failed"),
+            ("pending", "WAITING", "pending"),
+        ):
+            with self.subTest(reason=reason):
+                classified = runtime_module.classify_github_checks(
+                    [dynamic_check(bucket=bucket, state=state)],
+                    require_ci=True,
+                )
+                archive = runtime_module.build_dynamic_ci_report(
+                    contract=contract,
+                    attempts=[{
+                        **attempt,
+                        "checks": classified["checks"],
+                        "check_count": classified["check_count"],
+                        "checks_sha256": classified["checks_sha256"],
+                        "reason": reason,
+                    }],
+                )
+                self.assertEqual(validate_ci_archive(archive), archive)
+
+        for unknown in (
+            {**current, "schema": "github-ci-report-v4"},
+            {"schema": "github-ci-report-unknown"},
+        ):
+            with self.subTest(schema=unknown["schema"]):
+                with self.assertRaises(RuntimeContractError):
+                    validate_ci_archive(unknown)
+
+    def test_dynamic_ci_contract_and_report_preserve_retry_history(self) -> None:
+        contract = runtime_module.validate_ci_contract(dynamic_contract())
+        self.assertEqual(contract, dynamic_contract())
+        rows = [dynamic_check(workflow_name="", event="")]
+        attempt = {
+            "sequence": 1,
+            "head_oid": ZERO_SHA1,
+            "base_oid": "1" * 40,
+            "retry": None,
+            "checks": rows,
+            "check_count": 1,
+            "checks_sha256": canonical_sha256(rows),
+            "reason": "green",
+            "watcher_exit_code": 0,
+            "error": None,
+        }
+        report = runtime_module.build_dynamic_ci_report(
+            contract=contract,
+            attempts=[attempt],
+        )
+        self.assertEqual(report["schema"], "github-ci-report-v3")
+        self.assertEqual(report["contract"], contract)
+        self.assertEqual(
+            runtime_module.validate_dynamic_ci_report(report),
+            report,
+        )
+        retry = {
+            **attempt,
+            "sequence": 2,
+            "checks": [
+                dynamic_check(workflow_name="", event="", bucket="pending", state="WAITING")
+            ],
+            "checks_sha256": canonical_sha256(
+                [
+                    dynamic_check(
+                        workflow_name="",
+                        event="",
+                        bucket="pending",
+                        state="WAITING",
+                    )
+                ]
+            ),
+            "retry": {
+                "attempt_id": "attempt-1",
+                "failure_fingerprint_sha256": "a" * 64,
+            },
+            "reason": "pending",
+        }
+        appended = runtime_module.append_dynamic_ci_report(report, retry)
+        self.assertEqual(
+            appended["attempts"][-1]["retry"],
+            retry["retry"],
+        )
+        self.assertEqual(appended["attempts"][-1]["sequence"], 2)
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.validate_ci_contract(
+                {**contract, "unknown": True}
+            )
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.validate_dynamic_ci_report(
+                {**report, "runtime_source_envelope_digest": ZERO_SHA256}
+            )
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.validate_dynamic_ci_report(
+                {**report, "discarded_attempts_sha256": "1" * 64}
+            )
+
+    def test_dynamic_feedback_cursor_ignores_timestamp_noise_and_never_auto_acks(self) -> None:
+        item = {
+            "kind": "issue_comment",
+            "id": "1",
+            "author_login": "reviewer",
+            "created_at": "2026-08-20T10:00:00Z",
+            "updated_at": "2026-08-20T10:00:01Z",
+            "body_bytes": 4,
+            "body_sha256": ZERO_SHA256,
+        }
+        cursor = runtime_module.make_dynamic_pr_feedback_cursor(
+            repository="owner/repository",
+            pull_number=1,
+            items=[item],
+            review_decision="CHANGES_REQUESTED",
+            checks=[
+                dynamic_check(
+                    workflow_name="",
+                    event="",
+                    link="https://app.aikido.dev/featurebranch/scan/200235380?groupId=1019",
+                )
+            ],
+        )
+        self.assertEqual(
+            runtime_module.validate_dynamic_pr_feedback_cursor(cursor),
+            cursor,
+        )
+        self.assertEqual(
+            runtime_module.validate_dynamic_pr_feedback_cursor(
+                canonical_bytes(cursor).decode("utf-8")
+            ),
+            cursor,
+        )
+        timestamp_only = runtime_module.make_dynamic_pr_feedback_cursor(
+            repository="owner/repository",
+            pull_number=1,
+            items=[{**item, "updated_at": "2026-08-21T10:00:01Z"}],
+            review_decision="CHANGES_REQUESTED",
+        )
+        self.assertEqual(
+            runtime_module.diff_dynamic_pr_feedback_cursor(
+                cursor,
+                timestamp_only,
+            )["transition"],
+            "still_waiting",
+        )
+        edited = runtime_module.make_dynamic_pr_feedback_cursor(
+            repository="owner/repository",
+            pull_number=1,
+            items=[{**item, "body_bytes": 5, "body_sha256": "1" * 64}],
+            review_decision="CHANGES_REQUESTED",
+        )
+        diff = runtime_module.diff_dynamic_pr_feedback_cursor(cursor, edited)
+        self.assertEqual(diff["transition"], "state_changed")
+        self.assertEqual(diff["observed_cursor"], edited)
+        self.assertNotIn("acknowledged", diff)
+        review_changed = runtime_module.make_dynamic_pr_feedback_cursor(
+            repository="owner/repository",
+            pull_number=1,
+            items=[item],
+            review_decision="APPROVED",
+        )
+        self.assertEqual(
+            runtime_module.diff_dynamic_pr_feedback_cursor(
+                cursor,
+                review_changed,
+            )["transition"],
+            "state_changed",
+        )
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.diff_dynamic_pr_feedback_cursor(
+                cursor,
+                {**edited, "repository": "other/repository"},
+            )
+        draft_review = {
+            "kind": "review",
+            "id": "draft-1",
+            "author_login": None,
+            "state": "COMMENTED",
+            "submitted_at": None,
+            "commit_oid": None,
+            "body_bytes": 0,
+            "body_sha256": ZERO_SHA256,
+        }
+        draft_cursor = runtime_module.make_dynamic_pr_feedback_cursor(
+            repository="owner/repository",
+            pull_number=1,
+            items=[draft_review],
+        )
+        self.assertEqual(draft_cursor["item_count"], 1)
 
     def test_expected_checks_require_identity_digest_and_current_head(self) -> None:
         expected = expected_checks()
