@@ -22,9 +22,9 @@ gap and use available evidence. Ask only for real decisions or external acts.
 
 `.kent/workflow-profile.toml` maps work kinds, procedures and commands.
 `.kent/workflows/kit_development.py` composes the existing lite graph; its
-semantic candidate is Kit Engineering Delivery v2, with spec
-`.kent/workflows/kit-engineering-delivery-v2.spec.json`. Preserve the v1
-snapshot and task-backed Workflow unchanged; future live rollout requires
+semantic candidate is Kit Engineering Delivery v3, with spec
+`.kent/workflows/kit-engineering-delivery-v3.spec.json`. Preserve the v1 and v2
+snapshots and task-backed Workflow unchanged; future live rollout requires
 a separately approved new Workflow UUID and fresh qualification.
 The flow has 21 nodes, 51 transition groups and 52 edges, with continuous
 writer sessions and task branch identity. Plan's callable read-only leaf and
@@ -39,9 +39,11 @@ do not add a hook, role, shared engine or alternate lifecycle.
 
 Generated checkpoint, plan-contract and dispatch commands use the existing
 schema-3 synchronizer. The builder explicitly materializes byte-identical
-evidence-ledger, verify-report, wait-github-pr, task-janitor and sibling
-`workflow_runtime_contracts.py` from checkout-local authoritative sources.
-These five are not schema-3 synchronizer outputs or runtime-v2 adoption.
+evidence-ledger, verify-report, wait-github-pr, task-janitor,
+`workflow_runtime_contracts.py`, and the shared
+`workflow_github_observation.py` sibling from checkout-local authoritative
+sources. These six are not schema-3 synchronizer outputs or runtime-v2
+adoption.
 `prepare_cleanup` is the project-owned `.kent/scripts/workflow-prepare-cleanup`
 command, not a generated template or new node. Cleanup uses it to retain the
 known accepted-plan snapshot and prepare the existing terminal evidence seal.

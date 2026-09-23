@@ -38,11 +38,20 @@ RELEASE_TOPOLOGY_ADOPTIONS = {
 WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 RUNTIME_CONTRACT_VERSION = "2.0.0"
-PREPARE_CI_VERSION = "1.0.0"
+PREPARE_CI_VERSION = "2.0.0"
+WAIT_CI_VERSION = "3.0.0"
+WAIT_PR_VERSION = "3.0.0"
+GITHUB_OBSERVATION_VERSION = "1.0.0"
 RUNTIME_CONTRACT_COMMANDS = {
     "runtime_contracts",
     "verify",
     "evidence",
+}
+OBSERVATION_COMMAND = "github_observation"
+MONITORING_COMMANDS = {
+    "wait_ci",
+    "wait_pr",
+    OBSERVATION_COMMAND,
 }
 ROLE_PROMPT_DIRECTORIES = (
     Path(".kent/subagents"),
@@ -481,14 +490,9 @@ class ProjectProfile:
                     "major.minor.patch format"
                 )
 
-        runtime_keys = set(self.kit_managed_commands) & {
-            "runtime_contracts",
-            "verify",
-            "evidence",
-            "janitor",
-            "wait_pr",
-            "wait_ci",
-        }
+        runtime_keys = set(self.kit_managed_commands) & (
+            RUNTIME_CONTRACT_COMMANDS | MONITORING_COMMANDS | {"janitor"}
+        )
         if "prepare_ci" in runtime_keys:
             raise SpecError(
                 "prepare_ci is not a runtime-contract command; declare it "
@@ -521,6 +525,7 @@ class ProjectProfile:
                 expected.add("janitor")
             if self.capabilities.get("pull_requests", False):
                 expected.add("wait_pr")
+                expected.add(OBSERVATION_COMMAND)
             if self.capabilities.get("ci_monitoring", False):
                 expected.add("wait_ci")
             if runtime_keys != expected:
@@ -529,14 +534,23 @@ class ProjectProfile:
                     "exact conditional runtime subset "
                     f"{sorted(expected)!r}"
                 )
-            if any(
-                self.command_versions.get(key) != RUNTIME_CONTRACT_VERSION
-                for key in expected
-            ):
-                raise SpecError(
-                    "all runtime-contract v2 managed commands must use "
-                    f"{RUNTIME_CONTRACT_VERSION!r}"
-                )
+            expected_versions = {
+                **{
+                    key: RUNTIME_CONTRACT_VERSION
+                    for key in RUNTIME_CONTRACT_COMMANDS
+                },
+                "janitor": RUNTIME_CONTRACT_VERSION,
+                "wait_ci": WAIT_CI_VERSION,
+                "wait_pr": WAIT_PR_VERSION,
+                OBSERVATION_COMMAND: GITHUB_OBSERVATION_VERSION,
+            }
+            for key in sorted(expected):
+                if self.command_versions.get(key) != expected_versions[key]:
+                    raise SpecError(
+                        "runtime-contract v2 managed command "
+                        f"{key!r} requires version "
+                        f"{expected_versions[key]!r}"
+                    )
             support_parent = Path(self.command("runtime_contracts")).parent
             for key in sorted(expected):
                 if Path(self.command(key)).parent != support_parent:
@@ -544,9 +558,7 @@ class ProjectProfile:
                         "runtime-contract v2 managed command paths must share "
                         "the runtime_contracts parent directory"
                     )
-        elif runtime_versions or any(
-            key in runtime_keys for key in ("verify", "evidence", "janitor", "wait_pr", "wait_ci")
-        ):
+        elif runtime_versions or runtime_keys:
             if runtime_versions:
                 raise SpecError(
                     "command version 2.0.0 requires runtime_contracts adoption"
@@ -554,6 +566,11 @@ class ProjectProfile:
             if "runtime_contracts" in self.command_versions:
                 raise SpecError(
                     "runtime_contracts must be managed to adopt runtime contracts"
+                )
+            if OBSERVATION_COMMAND in self.command_versions:
+                raise SpecError(
+                    "github_observation must be managed to adopt the "
+                    "GitHub observation contract"
                 )
 
         if self.release is None:

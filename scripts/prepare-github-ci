@@ -24,12 +24,19 @@ def main() -> int:
         payload = read_preparation_input(sys.stdin.buffer)
         if payload.get("operation") == "archive_ci_report":
             validate_preparation_identity(payload)
-            from workflowkit.runtime import validate_ci_report
+            from workflowkit.runtime import validate_dynamic_ci_report
 
-            report = validate_ci_report(parse_preparation_json(payload["ci_report"]))
+            report = validate_dynamic_ci_report(
+                parse_preparation_json(payload["ci_report"])
+            )
+            repository = payload["pr_url"].split("/pull/")[0].removeprefix(
+                "https://github.com/"
+            )
+            pull_number = int(payload["pr_url"].rsplit("/", 1)[1])
+            contract = report["contract"]
             if (
-                report["repository"] != payload["pr_url"].split("/pull/")[0].removeprefix("https://github.com/")
-                or report["pull_number"] != int(payload["pr_url"].rsplit("/", 1)[1])
+                contract["repository"] != repository
+                or contract["pull_number"] != pull_number
             ):
                 raise CiContractError("report_identity_invalid")
             artifact = archive_ci_report(

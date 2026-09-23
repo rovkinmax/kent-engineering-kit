@@ -140,10 +140,10 @@ class WorkflowKitTest(unittest.TestCase):
     def test_non_opt_in_cleanup_graphs_preserve_frozen_baseline_bytes(self) -> None:
         # Captured from exact pre-amendment M2, before editing delivery.py.
         expected = {
-            (False, False): "a720b3ad56754e3274abd3a7209bf425dc65d08536141fa617581b84cfc9cca3",
-            (False, True): "8b2dd5f2fc00688264001c350d25f1fcb3a1788b04c23ce825666697d13d16c1",
-            (True, False): "f480566f3124b61ece79fee9527e706d0ebb9be5d6b0084c817aa7ba88050906",
-            (True, True): "d0575152812c5b094434c506fd855e11468223c0ca0b4c44c004ec669fecc15a",
+            (False, False): "19025d561a73b50c71ff829c467956fb89925b4101e8f0dfc31981f353899775",
+            (False, True): "afb543d9d34240cadc3a8ed04c84545e77d1db32d9c3daf8273c20d9086af054",
+            (True, False): "0d99a469c1fcf33a978752c9cb26bf1d5d4935659eb513fec89f6f1f7769a54c",
+            (True, True): "1ba8ee078584908e3d5aa9879482b230a73273da01c44e9d8ce06696a9f206b4",
         }
         for (managed, published), baseline in expected.items():
             for helper in (None, ""):
@@ -274,7 +274,8 @@ class WorkflowKitTest(unittest.TestCase):
             'kit_managed_commands = ["dispatch"]',
             (
                 'kit_managed_commands = ["runtime_contracts", "verify", '
-                '"evidence", "janitor", "wait_pr", "wait_ci"]'
+                '"evidence", "janitor", "wait_pr", "wait_ci", '
+                '"github_observation"]'
             ),
         )
         contents = contents.replace(
@@ -293,8 +294,9 @@ class WorkflowKitTest(unittest.TestCase):
                 'verify = "2.0.0"\n'
                 'evidence = "2.0.0"\n'
                 'janitor = "2.0.0"\n'
-                'wait_pr = "2.0.0"\n'
-                'wait_ci = "2.0.0"\n'
+                'wait_pr = "3.0.0"\n'
+                'wait_ci = "3.0.0"\n'
+                'github_observation = "1.0.0"\n'
             ),
         )
         return contents
@@ -1444,10 +1446,17 @@ class WorkflowKitTest(unittest.TestCase):
                 parameter.key
                 for parameter in by_key["prepare_pr_ci_watch"].parameters
             ),
-            ("workspace_path", "pr_url", "branch_name", "merge_strategy"),
+            (
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "ci_contract",
+            ),
         )
         self.assertIsNone(by_key["prepare_pr_ci_watch"].prompt)
         self.assertEqual(by_key["ci_watch_waiting_pr"].target, "waiting_pr")
+        self.assertEqual(by_key["ci_watch_state_changed"].target, "waiting_pr")
         self.assertEqual(by_key["ci_watch_diagnose"].target, "ci_monitor")
         self.assertEqual(by_key["ci_watch_merged"].target, "cleanup")
         self.assertEqual(
@@ -1485,6 +1494,7 @@ class WorkflowKitTest(unittest.TestCase):
                 "pr_url",
                 "branch_name",
                 "merge_strategy",
+                "ci_contract",
                 "ci_report",
             ),
         )
@@ -1498,6 +1508,7 @@ class WorkflowKitTest(unittest.TestCase):
                 "pr_url",
                 "branch_name",
                 "merge_strategy",
+                "ci_contract",
                 "ci_report",
             ),
         )
@@ -1564,11 +1575,19 @@ class WorkflowKitTest(unittest.TestCase):
                 "branch_name",
                 "merge_strategy",
                 "blocker_reason",
+                "ci_contract",
+                "ci_report",
             ),
         )
         self.assertEqual(
             tuple(parameter.key for parameter in by_key["waiting_pr_fix"].parameters),
-            ("workspace_path", "merge_strategy", "pr_report"),
+            (
+                "workspace_path",
+                "merge_strategy",
+                "pr_report",
+                "ci_contract",
+                "ci_report",
+            ),
         )
         self.assertEqual(by_key["waiting_pr_watch_merge"].target, "merge_watch")
         self.assertFalse(by_key["waiting_pr_watch_merge"].requires_approval)
@@ -1584,6 +1603,8 @@ class WorkflowKitTest(unittest.TestCase):
                 "merge_strategy",
                 "pr_head_oid",
                 "pr_base_oid",
+                "ci_contract",
+                "ci_report",
             ),
         )
         self.assertEqual(
@@ -2360,16 +2381,16 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertTrue(profile.runtime_contracts_v2())
         with self.assertRaisesRegex(
             SpecError,
-            "requires prepare_ci 1.0.0",
+            "requires prepare_ci 2.0.0",
         ):
             build_delivery_workflow(profile, 1)
 
         coexist = self.schema4_runtime_v2_contents().replace(
-            '"wait_ci"]',
-            '"wait_ci", "dispatch"]',
+            '"github_observation"]',
+            '"github_observation", "dispatch"]',
         ).replace(
-            'wait_ci = "2.0.0"\n',
-            'wait_ci = "2.0.0"\ndispatch = "1.0.0"\n',
+            'github_observation = "1.0.0"\n',
+            'github_observation = "1.0.0"\ndispatch = "1.0.0"\n',
         )
         coexist_profile = self.load_schema4_profile(lambda _: coexist)
         self.assertTrue(coexist_profile.runtime_contracts_v2())
@@ -2377,14 +2398,20 @@ class WorkflowKitTest(unittest.TestCase):
         with self.assertRaisesRegex(SpecError, "exact conditional"):
             self.load_schema4_profile(
                 lambda _: self.schema4_runtime_v2_contents().replace(
-                    '"wait_pr", "wait_ci"]',
+                    '"wait_pr", "wait_ci", "github_observation"]',
                     '"wait_pr"]',
                 ).replace(
-                    'wait_ci = "2.0.0"\n',
+                    'wait_ci = "3.0.0"\n',
+                    "",
+                ).replace(
+                    'github_observation = "1.0.0"\n',
                     "",
                 )
             )
-        with self.assertRaisesRegex(SpecError, "all runtime-contract v2"):
+        with self.assertRaisesRegex(
+            SpecError,
+            "runtime-contract v2 managed command",
+        ):
             self.load_schema4_profile(
                 lambda _: self.schema4_runtime_v2_contents().replace(
                     'evidence = "2.0.0"',
@@ -2397,10 +2424,13 @@ class WorkflowKitTest(unittest.TestCase):
     ) -> None:
         contents = (
             self.schema4_runtime_v2_contents()
-            .replace('"wait_ci"]', '"wait_ci", "prepare_ci"]')
             .replace(
-                'wait_ci = "2.0.0"\n',
-                'wait_ci = "2.0.0"\nprepare_ci = "1.0.0"\n',
+                '"github_observation"]',
+                '"github_observation", "prepare_ci"]',
+            )
+            .replace(
+                'wait_ci = "3.0.0"\n',
+                'wait_ci = "3.0.0"\nprepare_ci = "2.0.0"\n',
             )
             .replace(
                 'wait_ci = ".kent/scripts/workflow-wait-github-ci"',
@@ -2431,9 +2461,21 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(cursor_edges, {
             "prepare_pr_ci_prepare", "ci_prepare_ready_initial", "ci_prepare_ready_retry",
             "ci_prepare_failed", "ci_watch_waiting_pr", "ci_watch_diagnose",
-            "ci_watch_source_changed", "ci_monitor_watch", "ci_monitor_needs_user_action",
+            "ci_watch_state_changed", "ci_watch_source_changed", "ci_monitor_watch",
+            "ci_monitor_needs_user_action",
             "waiting_pr_watch_merge", "merge_watch_still_waiting", "merge_watch_state_changed",
             "waiting_pr_needs_user_action", "waiting_pr_fix", "waiting_pr_ci_monitor",
+            "ci_monitor_fix", "fix_needs_user_action", "fix_continue", "fix_verify",
+            "compliance_prepare_pr", "compliance_fix", "evidence_repair_fix",
+            "plan_contract_verify", "plan_contract_checked_verify",
+            "plan_contract_fix_continue", "plan_contract_checked_fix",
+            "dispatch_deterministic_verify", "dispatch_invalid_workspace",
+            "dispatch_standards_review", "dispatch_spec_review",
+            "deterministic_report_join", "standards_report_join", "spec_report_join",
+            "verification_join_gate", "gate_fix", "gate_reverify_after_user_action",
+            "gate_smoke_required", "gate_delivery_ready", "smoke_prepare_pr",
+            "smoke_fix", "compliance_evidence_repair",
+            "compliance_needs_user_action", "evidence_repair_compliance",
         })
         prompts = " ".join((edge.prompt or "") for edge in spec.edges)
         self.assertIn("uninitialized", prompts)
@@ -2444,21 +2486,142 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn("never synthesizes materialized cursors", " ".join(prompts.split()))
         for key in ("ci_prepare_failed", "ci_monitor_watch", "ci_monitor_needs_user_action"):
             self.assertTrue({
-                "task_short_id", "ci_report", "ci_policy_snapshot",
-                "expected_ci_checks", "expected_ci_checks_sha256", "runtime_source_envelope_digest",
+                "task_short_id", "ci_report", "ci_contract",
             } <= {parameter.key for parameter in by_key[key].parameters}, key)
+        expected_fix_carriers = (
+            "pr_url",
+            "branch_name",
+            "merge_strategy",
+            "ci_contract",
+            "task_short_id",
+            "ci_report",
+            "pr_feedback_cursor",
+        )
+        self.assertEqual(
+            tuple(parameter.key for parameter in by_key["ci_monitor_fix"].parameters),
+            ("workspace_path", "fix_context") + expected_fix_carriers,
+        )
+        self.assertEqual(
+            tuple(parameter.key for parameter in by_key["fix_verify"].parameters),
+            ("workspace_path", "review_context", "task_short_id")
+            + tuple(
+                parameter
+                for parameter in expected_fix_carriers
+                if parameter != "task_short_id"
+            ),
+        )
+        self.assertEqual(
+            tuple(parameter.key for parameter in by_key["fix_continue"].parameters),
+            ("workspace_path", "fix_context", "task_short_id")
+            + tuple(
+                parameter
+                for parameter in expected_fix_carriers
+                if parameter != "task_short_id"
+            ),
+        )
+        self.assertTrue(
+            set(expected_fix_carriers)
+            <= {parameter.key for parameter in by_key["fix_needs_user_action"].parameters}
+        )
+        self.assertTrue(
+            set(expected_fix_carriers)
+            <= {
+                parameter.key
+                for parameter in by_key["compliance_prepare_pr"].parameters
+            }
+        )
 
     def test_ci_disabled_schema_four_keeps_pr_tail_without_ci_packets(self) -> None:
         profile = self.load_schema4_profile(
             lambda _: self.schema4_runtime_v2_contents().replace(
                 "ci_monitoring = true", "ci_monitoring = false",
-            ).replace(', "wait_ci"]', ']').replace('wait_ci = "2.0.0"\n', '')
+            ).replace(', "wait_ci", "github_observation"]', ', "github_observation"]')
+            .replace('wait_ci = "3.0.0"\n', '')
         )
         spec = build_delivery_workflow(profile, 1)
         self.assertNotIn("ci_prepare", {node.key for node in spec.nodes})
         self.assertNotIn("ci_watch", {node.key for node in spec.nodes})
+        by_key = {edge.key: edge for edge in spec.edges}
         merge_watch = next(edge for edge in spec.edges if edge.target == "merge_watch")
-        self.assertNotIn("expected_ci_checks", {p.key for p in merge_watch.parameters})
+        self.assertNotIn("ci_contract", {p.key for p in merge_watch.parameters})
+        expected = {
+            "pr_url",
+            "branch_name",
+            "merge_strategy",
+            "pr_feedback_cursor",
+        }
+        for key in (
+            "waiting_pr_fix",
+            "fix_needs_user_action",
+            "fix_verify",
+            "fix_continue",
+            "compliance_prepare_pr",
+        ):
+            self.assertTrue(
+                expected <= {parameter.key for parameter in by_key[key].parameters},
+                key,
+            )
+            self.assertNotIn(
+                "ci_contract",
+                {parameter.key for parameter in by_key[key].parameters},
+            )
+            self.assertNotIn(
+                "ci_report",
+                {parameter.key for parameter in by_key[key].parameters},
+            )
+
+    def test_kit_lite_schema_three_preserves_feedback_cursor_through_fix_loop(
+        self,
+    ) -> None:
+        profile = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        self.assertEqual(profile.schema_version, 3)
+        self.assertEqual(profile.delivery_profile, "lite")
+        self.assertFalse(profile.runtime_contracts_v2())
+        spec = build_delivery_workflow(profile, 3)
+        by_key = {edge.key: edge for edge in spec.edges}
+        expected = {
+            "pr_url",
+            "branch_name",
+            "merge_strategy",
+            "pr_feedback_cursor",
+        }
+        for key in (
+            "plan_contract_verify",
+            "plan_contract_checked_verify",
+            "fix_verify",
+            "fix_needs_user_action",
+            "dispatch_deterministic_verify",
+            "dispatch_invalid_workspace",
+            "dispatch_standards_review",
+            "deterministic_report_join",
+            "verification_join_gate",
+            "standards_report_join",
+            "gate_fix",
+            "gate_reverify_after_user_action",
+            "gate_delivery_ready",
+            "prepare_pr_waiting_pr",
+            "waiting_pr_watch_merge",
+            "merge_watch_still_waiting",
+            "merge_watch_state_changed",
+            "waiting_pr_needs_user_action",
+            "waiting_pr_fix",
+        ):
+            self.assertTrue(
+                expected <= {parameter.key for parameter in by_key[key].parameters},
+                key,
+            )
+            self.assertNotIn(
+                "ci_contract",
+                {parameter.key for parameter in by_key[key].parameters},
+            )
+            self.assertNotIn(
+                "ci_report",
+                {parameter.key for parameter in by_key[key].parameters},
+            )
 
     def test_schema_four_variants_remain_valid_without_legacy_publish(
         self,
@@ -3357,7 +3520,7 @@ class WorkflowKitTest(unittest.TestCase):
                 )
                 .replace(
                     'dispatch = "1.0.0"\n',
-                    'dispatch = "1.0.0"\nwait_pr = "1.0.0"\n',
+                    'dispatch = "1.0.0"\nwait_pr = "3.0.0"\n',
                 )
                 .replace(
                     'wait_pr = ".kent/scripts/workflow-wait-github-pr"',

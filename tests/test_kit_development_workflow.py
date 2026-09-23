@@ -78,10 +78,10 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
 
     def test_exact_graph_and_approval_delta(self) -> None:
         profile = kit.profile_at(ROOT)
-        base = build_delivery_workflow(profile, 2)
+        base = build_delivery_workflow(profile, 3)
         spec = kit.build_workflow(profile)
         spec.validate()  # Includes context source and parameter topology.
-        self.assertEqual(spec.name, "Kit Engineering Delivery v2")
+        self.assertEqual(spec.name, "Kit Engineering Delivery v3")
         self.assertEqual(spec.nodes, base.nodes)
         self.assertEqual(len(spec.nodes), 21)
         self.assertEqual(len(spec.edges), 52)
@@ -130,27 +130,26 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
                 self.assertIn("unmodified", edge.prompt)
                 self.assertIn("KENT_RUN_ID", edge.prompt)
 
-    def test_v2_preserves_v1_except_cleanup_prompts_and_candidate_name(self) -> None:
+    def test_v3_preserves_historical_v1_and_v2_snapshots(self) -> None:
         import hashlib
 
-        historical = ROOT / ".kent/workflows/kit-engineering-delivery-v1.spec.json"
-        raw = historical.read_bytes()
+        historical_v1 = ROOT / ".kent/workflows/kit-engineering-delivery-v1.spec.json"
+        raw = historical_v1.read_bytes()
         self.assertEqual(
             hashlib.sha256(raw).hexdigest(),
             "3f586796ee574682251716f28eb38eb5abf475cb8bc0c2f04003bb0d9d41decc",
         )
-        previous = json.loads(raw)
+        historical_v2 = ROOT / ".kent/workflows/kit-engineering-delivery-v2.spec.json"
+        raw_v2 = historical_v2.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw_v2).hexdigest(),
+            "6fbbf4187bd8d705678b080f2f8a1f66d44b907d8de8063f50d4aaacf0a99ea7",
+        )
+        self.assertEqual(json.loads(raw)["name"], "Kit Engineering Delivery v1")
+        self.assertEqual(json.loads(raw_v2)["name"], "Kit Engineering Delivery v2")
         current = json.loads(kit.rendered_spec())
-        self.assertEqual(current["name"], "Kit Engineering Delivery v2")
-        changed = []
-        for old, new in zip(previous["edges"], current["edges"], strict=True):
-            if old["target"] == "cleanup":
-                self.assertNotEqual(new["prompt"], old["prompt"])
-                changed.append(new["key"])
-                new["prompt"] = old["prompt"]
-        self.assertEqual(len(changed), 7)
-        current["name"] = previous["name"]
-        self.assertEqual(current, previous)
+        self.assertEqual(current["name"], "Kit Engineering Delivery v3")
+        self.assertNotEqual(current, json.loads(raw_v2))
 
     def test_snapshot_is_exact_and_check_is_read_only(self) -> None:
         snapshot = ROOT / kit.SPEC_PATH

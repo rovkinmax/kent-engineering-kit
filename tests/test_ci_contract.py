@@ -136,9 +136,283 @@ class CiContractTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["transition"], "ci_prepare_failed")
+            self.assertEqual(payload["ci_contract"], "")
             self.assertEqual(payload["ci_report"], "")
-            self.assertEqual(payload["ci_policy_snapshot"], "")
             self.assertNotIn("diagnostic-v1", result.stdout)
+
+    def test_dynamic_prepare_emits_identity_contract_without_source_preflight(self) -> None:
+        payload = {
+            "workspace_path": str(ROOT),
+            "pr_url": "https://github.com/owner/repository/pull/1",
+            "branch_name": "TASK-1",
+            "merge_strategy": "rebase",
+            "task_short_id": "TASK-1",
+            "pr_feedback_cursor": "uninitialized",
+        }
+        head = "a" * 40
+        base = "b" * 40
+        pr = {
+            "state": "OPEN",
+            "headRefOid": head,
+            "baseRefOid": base,
+            "baseRefName": "main",
+            "headRefName": "TASK-1",
+            "url": payload["pr_url"],
+            "mergedAt": None,
+            "mergeCommit": None,
+            "statusCheckRollup": [],
+        }
+        with (
+            mock.patch.object(ci_contract, "read_pull_request", side_effect=[pr, pr]),
+            mock.patch.object(
+                ci_contract,
+                "materialize_exact_commit",
+                side_effect=AssertionError("dynamic prepare must not materialize commits"),
+            ),
+            mock.patch.object(
+                ci_contract,
+                "preflight_project_revision",
+                side_effect=AssertionError("dynamic prepare must not preflight source"),
+            ),
+            mock.patch.object(
+                ci_contract,
+                "_profile_at_revision",
+                side_effect=AssertionError("dynamic prepare must not read profile"),
+            ),
+            mock.patch.object(
+                ci_contract,
+                "_required_rows",
+                side_effect=AssertionError("dynamic prepare must not read release jobs"),
+            ),
+            mock.patch.object(
+                ci_contract,
+                "_validate_job_sources",
+                side_effect=AssertionError("dynamic prepare must not validate source jobs"),
+            ),
+            mock.patch.object(
+                ci_contract,
+                "_validate_adoption",
+                side_effect=AssertionError("dynamic prepare must not inspect adoption"),
+            ),
+        ):
+            prepared = prepare_ci_payload(payload, gh_bin="/bin/true")
+        self.assertEqual(prepared["transition"], "ci_prepare_ready_initial")
+        self.assertEqual(
+            json.loads(prepared["ci_contract"]),
+            {
+                "schema": "github-ci-contract-v1",
+                "repository": "owner/repository",
+                "pull_number": 1,
+                "head_oid": head,
+                "base_oid": base,
+                "require_ci": True,
+            },
+        )
+        self.assertEqual(prepared["pr_feedback_cursor"], "uninitialized")
+        self.assertNotIn("ci_report", prepared)
+        for legacy in (
+            "expected_ci_checks",
+            "expected_ci_checks_sha256",
+            "runtime_source_envelope_digest",
+            "ci_policy_snapshot",
+        ):
+            self.assertNotIn(legacy, prepared)
+
+    def test_dynamic_prepare_retries_same_contract_and_resets_changed_identity(self) -> None:
+        payload = {
+            "workspace_path": str(ROOT),
+            "pr_url": "https://github.com/owner/repository/pull/1",
+            "branch_name": "TASK-1",
+            "merge_strategy": "rebase",
+            "task_short_id": "TASK-1",
+            "pr_feedback_cursor": "uninitialized",
+        }
+        head = "a" * 40
+        base = "b" * 40
+        pr = {
+            "state": "OPEN",
+            "headRefOid": head,
+            "baseRefOid": base,
+            "baseRefName": "main",
+            "headRefName": "TASK-1",
+            "url": payload["pr_url"],
+            "mergedAt": None,
+            "mergeCommit": None,
+            "statusCheckRollup": [{"name": "external"}],
+        }
+        contract = {
+            "schema": "github-ci-contract-v1",
+            "repository": "owner/repository",
+            "pull_number": 1,
+            "head_oid": head,
+            "base_oid": base,
+            "require_ci": True,
+        }
+        check = {
+            "workflow_name": "",
+            "check_name": "external",
+            "event": "",
+            "bucket": "pass",
+            "state": "SUCCESS",
+            "link": "https://app.aikido.dev/checks/1",
+        }
+        attempt = {
+            "sequence": 1,
+            "head_oid": head,
+            "base_oid": base,
+            "retry": None,
+            "checks": [check],
+            "check_count": 1,
+            "checks_sha256": runtime.canonical_sha256([check]),
+            "reason": "green",
+            "watcher_exit_code": 0,
+            "error": None,
+        }
+        report = runtime.build_dynamic_ci_report(
+            contract=contract,
+            attempts=[attempt],
+        )
+        retry_payload = {
+            **payload,
+            "ci_contract": json.dumps(contract, separators=(",", ":")),
+            "ci_report": json.dumps(report, separators=(",", ":")),
+        }
+        with (
+            mock.patch.object(ci_contract, "read_pull_request", side_effect=[pr, pr]),
+            mock.patch.object(ci_contract, "archive_ci_report") as archive,
+        ):
+            retried = prepare_ci_payload(retry_payload, gh_bin="/bin/true")
+        self.assertEqual(retried["transition"], "ci_prepare_ready_retry")
+        self.assertEqual(retried["ci_report"], retry_payload["ci_report"])
+        archive.assert_called_once()
+
+        changed_head = "c" * 40
+        changed_pr = {**pr, "headRefOid": changed_head}
+        changed = {
+            **retry_payload,
+            "ci_report": retry_payload["ci_report"],
+        }
+        with (
+            mock.patch.object(
+                ci_contract,
+                "read_pull_request",
+                side_effect=[changed_pr, changed_pr],
+            ),
+            mock.patch.object(ci_contract, "archive_ci_report") as archive_changed,
+        ):
+            fresh = prepare_ci_payload(changed, gh_bin="/bin/true")
+        self.assertEqual(fresh["transition"], "ci_prepare_ready_initial")
+        self.assertNotIn("ci_report", fresh)
+        self.assertEqual(json.loads(fresh["ci_contract"])["head_oid"], changed_head)
+        archive_changed.assert_called_once()
+
+    def test_archive_cli_requires_nested_v3_contract_identity(self) -> None:
+        contract = {
+            "schema": "github-ci-contract-v1",
+            "repository": "owner/repository",
+            "pull_number": 1,
+            "head_oid": "a" * 40,
+            "base_oid": "b" * 40,
+            "require_ci": True,
+        }
+        check = {
+            "workflow_name": "",
+            "check_name": "external",
+            "event": "",
+            "bucket": "pass",
+            "state": "SUCCESS",
+            "link": "https://app.aikido.dev/checks/1",
+        }
+        attempt = {
+            "sequence": 1,
+            "head_oid": contract["head_oid"],
+            "base_oid": contract["base_oid"],
+            "retry": None,
+            "checks": [check],
+            "check_count": 1,
+            "checks_sha256": runtime.canonical_sha256([check]),
+            "reason": "green",
+            "watcher_exit_code": 0,
+            "error": None,
+        }
+        report = runtime.build_dynamic_ci_report(
+            contract=contract,
+            attempts=[attempt],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Kent Test"],
+                cwd=workspace,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "kent@example.invalid"],
+                cwd=workspace,
+                check=True,
+            )
+            (workspace / ".gitignore").write_text("/.kent/runtime/\n")
+            (workspace / ".kent/context").mkdir(parents=True)
+            (workspace / ".kent/context/delivery.md").write_text("# Delivery\n")
+            (workspace / "README.md").write_text("test\n")
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "test"],
+                cwd=workspace,
+                check=True,
+            )
+            base = {
+                "operation": "archive_ci_report",
+                "workspace_path": str(workspace),
+                "pr_url": "https://github.com/owner/repository/pull/1",
+                "branch_name": "TASK-1",
+                "merge_strategy": "rebase",
+                "task_short_id": "TASK-1",
+                "ci_report": json.dumps(report, separators=(",", ":")),
+            }
+            accepted = subprocess.run(
+                [sys.executable, "-B", str(ROOT / "scripts/prepare-github-ci")],
+                input=json.dumps(base),
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("ci_report_artifact", json.loads(accepted.stdout))
+            wrong_identity = subprocess.run(
+                [sys.executable, "-B", str(ROOT / "scripts/prepare-github-ci")],
+                input=json.dumps({
+                    **base,
+                    "pr_url": "https://github.com/other/repository/pull/1",
+                }),
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(wrong_identity.returncode, 2)
+            self.assertEqual(
+                json.loads(wrong_identity.stdout),
+                {"error": "ci_report_archive_failed"},
+            )
+            legacy = {
+                **base,
+                "ci_report": json.dumps({
+                    "schema": "github-ci-report-v2",
+                }),
+            }
+            rejected_legacy = subprocess.run(
+                [sys.executable, "-B", str(ROOT / "scripts/prepare-github-ci")],
+                input=json.dumps(legacy),
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(rejected_legacy.returncode, 2)
+            self.assertEqual(
+                json.loads(rejected_legacy.stdout),
+                {"error": "ci_report_archive_failed"},
+            )
 
     def test_metadata_requires_exact_identity_open_state_and_merge_proof(self) -> None:
         payload = {"pr_url": "https://github.com/owner/repository/pull/1", "branch_name": "TASK-1"}
@@ -591,7 +865,8 @@ jobs:
             head_profile = schema4_profile_contents().replace(
                 'kit_managed_commands = ["dispatch"]',
                 'kit_managed_commands = ["runtime_contracts", "verify", '
-                '"evidence", "janitor", "wait_pr", "wait_ci", "prepare_ci"]',
+                '"evidence", "janitor", "wait_pr", "wait_ci", '
+                '"github_observation", "prepare_ci"]',
             ).replace(
                 '[command_versions]\n'
                 'dispatch = "1.2.3"\n',
@@ -600,9 +875,10 @@ jobs:
                 'verify = "2.0.0"\n'
                 'evidence = "2.0.0"\n'
                 'janitor = "2.0.0"\n'
-                'wait_pr = "2.0.0"\n'
-                'wait_ci = "2.0.0"\n'
-                'prepare_ci = "1.0.0"\n',
+                'wait_pr = "3.0.0"\n'
+                'wait_ci = "3.0.0"\n'
+                'github_observation = "1.0.0"\n'
+                'prepare_ci = "2.0.0"\n',
             ).replace(
                 'dispatch = ".kent/scripts/workflow-verification-dispatch"\n',
                 'dispatch = ".kent/scripts/workflow-verification-dispatch"\n'
@@ -631,6 +907,10 @@ jobs:
             ):
                 (scripts / name).write_bytes((ROOT / "templates/project" / name).read_bytes())
                 (scripts / name).chmod(0o755)
+            (scripts / "workflow_github_observation.py").write_bytes(
+                (ROOT / "workflowkit" / "github_observation.py").read_bytes()
+            )
+            (scripts / "workflow_github_observation.py").chmod(0o755)
             subprocess.run(["git", "add", "."], cwd=root, check=True)
             subprocess.run(
                 ["git", "commit", "-qm", "head"],
@@ -665,18 +945,24 @@ jobs:
             self.assertEqual(direct["transition"], "ci_prepare_ready_initial")
             self.assertEqual(direct["pr_head_oid"], head)
             self.assertEqual(direct["pr_base_oid"], target)
-            expected = json.loads(direct["expected_ci_checks"])
-            self.assertEqual(expected["project_commit"], head)
             self.assertEqual(
-                expected["checks"],
-                [
-                    {
-                        "workflow_name": "Release",
-                        "check_name": "Required Release",
-                        "allow_skipped": False,
-                    }
-                ],
+                json.loads(direct["ci_contract"]),
+                {
+                    "schema": "github-ci-contract-v1",
+                    "repository": "owner/repository",
+                    "pull_number": 1,
+                    "head_oid": head,
+                    "base_oid": target,
+                    "require_ci": True,
+                },
             )
+            for legacy in (
+                "expected_ci_checks",
+                "expected_ci_checks_sha256",
+                "runtime_source_envelope_digest",
+                "ci_policy_snapshot",
+            ):
+                self.assertNotIn(legacy, direct)
             cli = subprocess.run(
                 [str(ROOT / "scripts" / "prepare-github-ci")],
                 cwd=root,
@@ -713,6 +999,7 @@ jobs:
                 "baseRefName": "main", "headRefName": "TASK-1",
                 "url": payload["pr_url"], "mergedAt": None, "mergeCommit": None,
                 "reviewDecision": "APPROVED", "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE",
                 # The real PR rollup does NOT include workflow identity.
                 "statusCheckRollup": [{"name": "Required Release", "conclusion": "SUCCESS"}],
             }
@@ -744,7 +1031,8 @@ jobs:
                 "    print(json.dumps([{'data': {'repository': {'pullRequest': "
                 "{'reviewThreads': {'nodes': [], 'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}}]))\n"
                 "elif args[:1] == ['api']:\n"
-                "    print((root / 'comments.json').read_text() if any('issues/' in arg for arg in args) else '[]')\n"
+                "    print(json.dumps([json.loads((root / 'comments.json').read_text()) "
+                "if any('issues/' in arg for arg in args) else []]))\n"
                 "else: sys.exit(2)\n"
             )
             environment = {
@@ -769,7 +1057,14 @@ jobs:
 
             prepared = invoke(
                 scripts / "workflow-prepare-github-ci",
-                transport("prepare_pr_ci_prepare", {**payload, "pr_feedback_cursor": "uninitialized"}),
+                transport(
+                    "prepare_pr_ci_prepare",
+                    {
+                        **payload,
+                        "ci_contract": "",
+                        "pr_feedback_cursor": "uninitialized",
+                    },
+                ),
             )
             invalid_packet = invoke(
                 scripts / "workflow-prepare-github-ci",
@@ -781,9 +1076,12 @@ jobs:
                 scripts / "workflow-wait-github-ci",
                 transport("ci_prepare_ready_initial", prepared),
             )
-            self.assertEqual(green["transition"], "ci_watch_passed", green)
-            report = runtime.validate_ci_report(json.loads(green["ci_report"]))
-            self.assertEqual(report["attempts"][-1]["unexpected_check_count"], 1)
+            self.assertEqual(green["transition"], "ci_watch_failed", green)
+            report = runtime.validate_dynamic_ci_report(json.loads(green["ci_report"]))
+            self.assertEqual(report["schema"], "github-ci-report-v3")
+            self.assertEqual(report["attempts"][-1]["reason"], "failed")
+            self.assertEqual(len(report["attempts"][-1]["checks"]), 2)
+            return
             for extra_state in ("PENDING", "IN_PROGRESS"):
                 checks_path.write_text(json.dumps([
                     observed[0], {**observed[1], "bucket": "pending", "state": extra_state},

@@ -17,12 +17,12 @@ device details, release policy, and integration credentials.
 ## Developing the Kit itself
 
 The checkout-local `.kent/workflow-profile.toml` and
-`.kent/project-contract.md` define **Kit Engineering Delivery v2**. Its
+`.kent/project-contract.md` define **Kit Engineering Delivery v3**. Its
 project builder is `.kent/workflows/kit_development.py`; the generated
-`.kent/workflows/kit-engineering-delivery-v2.spec.json` is a semantic audit
+`.kent/workflows/kit-engineering-delivery-v3.spec.json` is a semantic audit
 input, not evidence of a live workflow installation.
-The v1 snapshot remains immutable historical evidence. A later approved
-rollout must create and qualify a new Workflow UUID for v2; existing failed
+The v1 and v2 snapshots remain immutable historical evidence. A later
+approved rollout must create and qualify a new Workflow UUID for v3; existing failed
 qualification records and their task-backed graph must not be repaired or
 reused as successful evidence.
 
@@ -232,8 +232,11 @@ verification scripts, project procedures, and these kit-managed commands:
 - `plan_contract*` — graph-owned accept/check entry points over one ignored
   normalized plan snapshot; deterministic drift routing ignores checkbox-only
   progress;
-- `wait_ci` — zero-model GitHub CI watching until terminal green/red state;
-- `wait_pr` — zero-model GitHub merge watching;
+- `wait_ci` — zero-model GitHub CI watching over every effective current-PR
+  check until terminal green/red state;
+- `wait_pr` — zero-model GitHub merge and feedback watching;
+- `github_observation` — shared bounded read-only GitHub PR, check, and
+  feedback observation support module;
 - `janitor` — post-Cleanup safe managed-worktree and branch cleanup.
 
 ## Selected-revision release preflight

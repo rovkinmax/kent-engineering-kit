@@ -22,11 +22,12 @@ from workflowkit.model import SpecError, WorkflowSpec
 from workflowkit.profile import ProjectProfile
 
 
-SPEC_PATH = ".kent/workflows/kit-engineering-delivery-v2.spec.json"
+SPEC_PATH = ".kent/workflows/kit-engineering-delivery-v3.spec.json"
 PROJECT_COPIES = {
     "evidence": "templates/project/workflow-evidence-ledger",
     "verify": "templates/project/workflow-verify-report",
     "wait_pr": "templates/project/workflow-wait-github-pr",
+    "github_observation": "workflowkit/github_observation.py",
     "janitor": "templates/project/workflow-task-janitor",
     "runtime_contracts": "workflowkit/runtime.py",
 }
@@ -45,6 +46,7 @@ COMMAND_TARGETS = {
     key: f".kent/scripts/{Path(source).name}"
     for key, source in (SCHEMA3_COPIES | PROJECT_COPIES).items()
 } | {
+    "github_observation": ".kent/scripts/workflow_github_observation.py",
     "runtime_contracts": ".kent/scripts/workflow_runtime_contracts.py",
     "compile_verify": ".kent/scripts/workflow-compile-verify",
     "prepare_cleanup": ".kent/scripts/workflow-prepare-cleanup",
@@ -62,7 +64,7 @@ request a third routine preview review or claim the graph hashes receipts.
 
 
 def build_workflow(profile: ProjectProfile) -> WorkflowSpec:
-    base = build_delivery_workflow(profile, 2)
+    base = build_delivery_workflow(profile, 3)
     accepts = [edge for edge in base.edges if edge.key == "plan_review_accept"]
     if len(accepts) != 1 or accepts[0].requires_approval:
         raise SpecError("expected exactly one unapproved plan_review_accept edge")

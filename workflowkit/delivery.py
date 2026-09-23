@@ -145,21 +145,9 @@ TASK_SHORT_ID = ParameterSpec(
     "task_short_id",
     "Stable human-readable Kent task short ID.",
 )
-EXPECTED_CI_CHECKS = ParameterSpec(
-    "expected_ci_checks",
-    "Canonical source-derived mandatory CI check contract for the current cycle.",
-)
-EXPECTED_CI_CHECKS_SHA256 = ParameterSpec(
-    "expected_ci_checks_sha256",
-    "SHA-256 digest of the canonical expected CI check contract.",
-)
-RUNTIME_SOURCE_ENVELOPE_DIGEST = ParameterSpec(
-    "runtime_source_envelope_digest",
-    "Digest of the real selected-head runtime source envelope.",
-)
-CI_POLICY_SNAPSHOT = ParameterSpec(
-    "ci_policy_snapshot",
-    "Canonical target-branch policy snapshot for the current CI cycle.",
+CI_CONTRACT = ParameterSpec(
+    "ci_contract",
+    "Validated GitHub CI identity and monitoring policy for the current PR cycle.",
 )
 
 
@@ -208,22 +196,43 @@ def build_delivery_workflow(
     ):
         raise SpecError(
             "schema-4 runtime-contract v2 delivery requires "
-            "prepare_ci 1.0.0 source-contract adoption"
+            "prepare_ci 2.0.0 source-contract adoption"
         )
-    pr_cursor_parameters = (PR_FEEDBACK_CURSOR,) if runtime_v2 else ()
+    kit_lite_pr_cursor = (
+        profile.schema_version == 3
+        and profile.delivery_profile == "lite"
+        and profile.capability("pull_requests")
+        and bool(profile.command("github_observation"))
+    )
+    cursor_enabled = runtime_v2 or kit_lite_pr_cursor
+    pr_cursor_parameters = (PR_FEEDBACK_CURSOR,) if cursor_enabled else ()
     ci_contract_parameters = (
-        (
-            EXPECTED_CI_CHECKS,
-            EXPECTED_CI_CHECKS_SHA256,
-            RUNTIME_SOURCE_ENVELOPE_DIGEST,
-            CI_POLICY_SNAPSHOT,
-            TASK_SHORT_ID,
-        )
+        (CI_CONTRACT, TASK_SHORT_ID)
         if source_ci
-        else ()
+        else ((CI_CONTRACT,) if profile.capability("ci_monitoring") else ())
     )
     ci_contract_retry_parameters = ci_contract_parameters + (
-        (CI_REPORT,) if source_ci else ()
+        (CI_REPORT,) if profile.capability("ci_monitoring") else ()
+    )
+    fix_continuity_parameters = (
+        (
+            PR_URL,
+            BRANCH_NAME,
+            MERGE_STRATEGY,
+            *ci_contract_retry_parameters,
+        ) + pr_cursor_parameters
+        if cursor_enabled
+        else ()
+    )
+    fix_identity_parameters = (
+        (PR_URL, BRANCH_NAME)
+        if cursor_enabled
+        else ()
+    )
+    fix_continuity_parameters_without_task = tuple(
+        parameter
+        for parameter in fix_continuity_parameters
+        if parameter.key != TASK_SHORT_ID.key
     )
     writer_recovery_context = (
         "new_session" if fresh_writers else "compact_and_continue_session"
@@ -711,7 +720,10 @@ def build_delivery_workflow(
                     "The accepted plan contract is unchanged and writer work "
                     "is complete; normalize inputs for read-only verification."
                 ),
-                parameters=(WORKSPACE, REVIEW_CONTEXT),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                ) + fix_continuity_parameters,
             ),
             EdgeSpec(
                 key="plan_contract_checked_continue",
@@ -736,7 +748,10 @@ def build_delivery_workflow(
                     "The accepted plan contract is unchanged and writer work "
                     "is complete; normalize inputs for read-only verification."
                 ),
-                parameters=(WORKSPACE, REVIEW_CONTEXT),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                ) + fix_continuity_parameters,
             ),
         ]
     )
@@ -754,7 +769,7 @@ def build_delivery_workflow(
                         "The independently revalidated plan is accepted; "
                         "continue the remaining bounded repair bundle."
                     ),
-                    parameters=(WORKSPACE, FIX_CONTEXT),
+                    parameters=(WORKSPACE, FIX_CONTEXT) + fix_continuity_parameters,
                 ),
                 EdgeSpec(
                     key="plan_contract_checked_fix",
@@ -767,7 +782,7 @@ def build_delivery_workflow(
                         "The accepted plan contract is unchanged; continue only "
                         "the remaining bounded repair bundle."
                     ),
-                    parameters=(WORKSPACE, FIX_CONTEXT),
+                    parameters=(WORKSPACE, FIX_CONTEXT) + fix_continuity_parameters,
                 ),
             ]
         )
@@ -830,13 +845,24 @@ def build_delivery_workflow(
                     "Task-scoped fixes are complete; check the accepted plan "
                     "contract before rerunning every verification branch."
                 ),
-                parameters=(WORKSPACE, REVIEW_CONTEXT, TASK_SHORT_ID),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ) + fix_continuity_parameters_without_task,
             ),
             recovery_edge(
                 "fix",
                 profile=profile,
                 context=writer_recovery_context,
                 fresh_session=fresh_writers,
+                extra_parameters=fix_continuity_parameters,
+                extra_prompt=(
+                    "Preserve the exact PR identity, CI contract/report, and "
+                    "acknowledged feedback cursor through Fix recovery."
+                    if fix_continuity_parameters
+                    else ""
+                ),
             ),
             cancellation_edge("fix"),
         ]
@@ -853,11 +879,15 @@ def build_delivery_workflow(
                     "One bounded fix slice is complete; check the accepted plan "
                     "before continuing the remaining task-scoped findings."
                 ),
-                parameters=(WORKSPACE, FIX_CONTEXT, TASK_SHORT_ID),
+                parameters=(
+                    WORKSPACE,
+                    FIX_CONTEXT,
+                    TASK_SHORT_ID,
+                ) + fix_continuity_parameters_without_task,
             )
         )
 
-    fanout_parameters = (WORKSPACE, REVIEW_CONTEXT)
+    fanout_parameters = (WORKSPACE, REVIEW_CONTEXT) + fix_continuity_parameters
     edges.append(
         EdgeSpec(
             key="dispatch_deterministic_verify",
@@ -882,7 +912,10 @@ def build_delivery_workflow(
             transition_description=(
                 "Reject an artifact or foreign workspace path before verification."
             ),
-            parameters=(REPORTED_WORKSPACE, FIX_CONTEXT),
+            parameters=(
+                REPORTED_WORKSPACE,
+                FIX_CONTEXT,
+            ) + fix_continuity_parameters,
         )
     )
     if "standards_review" in review_branches:
@@ -926,7 +959,10 @@ def build_delivery_workflow(
                     transition_description=(
                         "Deterministic verification completed and reported its status."
                     ),
-                    parameters=(VERIFICATION_STATUS, VERIFICATION_REPORT),
+                    parameters=(
+                        VERIFICATION_STATUS,
+                        VERIFICATION_REPORT,
+                    ) + fix_continuity_parameters,
                 ),
                 EdgeSpec(
                     key="verification_join_gate",
@@ -937,6 +973,7 @@ def build_delivery_workflow(
                     transition_description=(
                         "All direct verification branches reported; evaluate them."
                     ),
+                    parameters=fix_continuity_parameters,
                 ),
             ]
         )
@@ -953,7 +990,7 @@ def build_delivery_workflow(
                     parameters=(
                         STANDARDS_STATUS,
                         STANDARDS_REPORT,
-                    ),
+                    ) + fix_continuity_parameters,
                 )
             )
         if "spec_review" in review_branches:
@@ -966,7 +1003,10 @@ def build_delivery_workflow(
                     transition_description=(
                         "Specification review completed and reported its status."
                     ),
-                    parameters=(SPEC_STATUS, REVIEW_REPORT),
+                    parameters=(
+                        SPEC_STATUS,
+                        REVIEW_REPORT,
+                    ) + fix_continuity_parameters,
                 )
             )
     else:
@@ -980,7 +1020,10 @@ def build_delivery_workflow(
                 transition_description=(
                     "Deterministic verification completed; evaluate its report."
                 ),
-                parameters=(VERIFICATION_STATUS, VERIFICATION_REPORT),
+                parameters=(
+                    VERIFICATION_STATUS,
+                    VERIFICATION_REPORT,
+                ) + fix_continuity_parameters,
             )
         )
 
@@ -997,7 +1040,7 @@ def build_delivery_workflow(
                 transition_description=(
                     "Verification found task-scoped issues for the single writer to fix."
                 ),
-                parameters=(WORKSPACE, FIX_CONTEXT),
+                parameters=(WORKSPACE, FIX_CONTEXT) + fix_continuity_parameters,
             ),
             EdgeSpec(
                 key="gate_reverify_after_user_action",
@@ -1008,7 +1051,11 @@ def build_delivery_workflow(
                 transition_description=(
                     "Verification is externally blocked; rerun all branches after approval."
                 ),
-                parameters=(WORKSPACE, REVIEW_CONTEXT, BLOCKER),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                    BLOCKER,
+                ) + fix_continuity_parameters,
             ),
             cancellation_edge("verification_gate"),
         ]
@@ -1032,7 +1079,7 @@ def build_delivery_workflow(
                     REVIEW_CONTEXT,
                     SMOKE_RATIONALE,
                     SMOKE_SCOPE,
-                ),
+                ) + fix_continuity_parameters,
             )
         )
     if smoke_policy in {"conditional", "disabled"}:
@@ -1051,7 +1098,7 @@ def build_delivery_workflow(
                     WORKSPACE,
                     REVIEW_CONTEXT,
                     SMOKE_RATIONALE,
-                ),
+                ) + fix_continuity_parameters,
             )
         )
 
@@ -1074,7 +1121,10 @@ def build_delivery_workflow(
                     transition_description=(
                         "Focused smoke testing passed and delivery may continue."
                     ),
-                    parameters=(WORKSPACE, REVIEW_CONTEXT),
+                    parameters=(
+                        WORKSPACE,
+                        REVIEW_CONTEXT,
+                    ) + fix_continuity_parameters,
                 ),
                 EdgeSpec(
                     key="smoke_fix",
@@ -1087,7 +1137,7 @@ def build_delivery_workflow(
                     transition_description=(
                         "Smoke testing found task-scoped implementation issues."
                     ),
-                    parameters=(WORKSPACE, FIX_CONTEXT),
+                    parameters=(WORKSPACE, FIX_CONTEXT) + fix_continuity_parameters,
                 ),
                 recovery_edge(
                     "smoke",
@@ -1112,7 +1162,7 @@ def build_delivery_workflow(
                         WORKSPACE,
                         REVIEW_CONTEXT,
                         COMPLIANCE_REPORT,
-                    ),
+                    ) + fix_continuity_parameters,
                 ),
                 EdgeSpec(
                     key="compliance_fix",
@@ -1125,7 +1175,7 @@ def build_delivery_workflow(
                     transition_description=(
                         "Final compliance found task-scoped issues that require fixes."
                     ),
-                    parameters=(WORKSPACE, FIX_CONTEXT),
+                    parameters=(WORKSPACE, FIX_CONTEXT) + fix_continuity_parameters,
                 ),
                 EdgeSpec(
                     key="compliance_evidence_repair",
@@ -1138,7 +1188,11 @@ def build_delivery_workflow(
                         "Only packaging evidence is incomplete; repair those "
                         "artifacts without repeating source or runtime work."
                     ),
-                    parameters=(WORKSPACE, REVIEW_CONTEXT, EVIDENCE_CONTEXT),
+                    parameters=(
+                        WORKSPACE,
+                        REVIEW_CONTEXT,
+                        EVIDENCE_CONTEXT,
+                    ) + fix_continuity_parameters,
                 ),
                 EdgeSpec(
                     key="compliance_needs_user_action",
@@ -1151,7 +1205,11 @@ def build_delivery_workflow(
                     transition_description=(
                         "Final compliance is externally blocked; recheck after approval."
                     ),
-                    parameters=(WORKSPACE, REVIEW_CONTEXT, BLOCKER),
+                    parameters=(
+                        WORKSPACE,
+                        REVIEW_CONTEXT,
+                        BLOCKER,
+                    ) + fix_continuity_parameters,
                 ),
                 cancellation_edge("compliance"),
                 EdgeSpec(
@@ -1166,7 +1224,10 @@ def build_delivery_workflow(
                         "Packaging evidence was repaired; rerun only final "
                         "Compliance Review."
                     ),
-                    parameters=(WORKSPACE, REVIEW_CONTEXT),
+                    parameters=(
+                        WORKSPACE,
+                        REVIEW_CONTEXT,
+                    ) + fix_continuity_parameters,
                 ),
                 EdgeSpec(
                     key="evidence_repair_fix",
@@ -1180,7 +1241,7 @@ def build_delivery_workflow(
                         "Evidence repair proved that substantive source work "
                         "is still required."
                     ),
-                    parameters=(WORKSPACE, FIX_CONTEXT),
+                    parameters=(WORKSPACE, FIX_CONTEXT) + fix_continuity_parameters,
                 ),
                 recovery_edge(
                     "evidence_repair",
@@ -1226,7 +1287,7 @@ def build_delivery_workflow(
                         PR_URL,
                         BRANCH_NAME,
                         MERGE_STRATEGY,
-                    ) + pr_cursor_parameters + ((TASK_SHORT_ID,) if source_ci else ()),
+                    ) + pr_cursor_parameters + ci_contract_parameters,
                 ),
                 EdgeSpec(
                     key="prepare_pr_no_pr",
@@ -1274,8 +1335,8 @@ def build_delivery_workflow(
                             transition="ready_initial",
                             target="ci_watch",
                             transition_description=(
-                                "The source-derived initial CI contract is complete; "
-                                "watch this exact head and policy cycle."
+                                "The initial CI contract is complete; watch this "
+                                "exact PR identity cycle."
                             ),
                             parameters=(
                                 WORKSPACE,
@@ -1291,8 +1352,8 @@ def build_delivery_workflow(
                             transition="ready_retry",
                             target="ci_watch",
                             transition_description=(
-                                "The unchanged source-derived CI cycle is ready "
-                                "for another deterministic observation."
+                                "The unchanged CI contract is ready for another "
+                                "deterministic observation."
                             ),
                             parameters=(
                                 WORKSPACE,
@@ -1309,16 +1370,16 @@ def build_delivery_workflow(
                             target="ci_monitor",
                             prompt=ci_prompt(profile),
                             transition_description=(
-                                "CI preparation could not prove the target policy, "
-                                "head sources, or runtime envelope."
+                                "CI preparation could not establish or validate "
+                                "the current PR identity and CI cycle contract."
                             ),
                             parameters=(
                                 WORKSPACE,
                                 PR_URL,
                                 BRANCH_NAME,
                                 MERGE_STRATEGY,
-                                CI_REPORT,
                                 *ci_contract_parameters,
+                                CI_REPORT,
                             ) + pr_cursor_parameters,
                         ),
                         EdgeSpec(
@@ -1357,8 +1418,31 @@ def build_delivery_workflow(
                             PR_URL,
                             BRANCH_NAME,
                             MERGE_STRATEGY,
-                            CI_REPORT,
                             *ci_contract_parameters,
+                            CI_REPORT,
+                        ) + pr_cursor_parameters,
+                    ),
+                    EdgeSpec(
+                        key="ci_watch_state_changed",
+                        source="ci_watch",
+                        transition="state_changed",
+                        target="waiting_pr",
+                        prompt=waiting_pr_changed_prompt(profile),
+                        transition_description=(
+                            "The PR feedback, mergeability, or identity changed "
+                            "while CI was still being observed; classify the "
+                            "material change before passive waiting resumes."
+                        ),
+                        parameters=(
+                            WORKSPACE,
+                            PR_URL,
+                            BRANCH_NAME,
+                            MERGE_STRATEGY,
+                            PR_REPORT,
+                            PR_HEAD_OID,
+                            PR_BASE_OID,
+                            *ci_contract_parameters,
+                            CI_REPORT,
                         ) + pr_cursor_parameters,
                     ),
                     EdgeSpec(
@@ -1376,8 +1460,8 @@ def build_delivery_workflow(
                             PR_URL,
                             BRANCH_NAME,
                             MERGE_STRATEGY,
-                            CI_REPORT,
                             *ci_contract_parameters,
+                            CI_REPORT,
                         ) + pr_cursor_parameters,
                     ),
                     *(
@@ -1388,8 +1472,8 @@ def build_delivery_workflow(
                                 transition="source_changed",
                                 target="ci_prepare",
                                 transition_description=(
-                                    "The target policy changed during observation; "
-                                    "recompute a fresh CI cycle from immutable sources."
+                                    "The PR identity changed during observation; "
+                                    "start a fresh CI cycle for its current head and base."
                                 ),
                                 parameters=(
                                     WORKSPACE,
@@ -1436,8 +1520,8 @@ def build_delivery_workflow(
                             PR_URL,
                             BRANCH_NAME,
                             MERGE_STRATEGY,
-                            CI_REPORT,
                             *ci_contract_parameters,
+                            CI_REPORT,
                         ) + pr_cursor_parameters,
                     ),
                     EdgeSpec(
@@ -1469,7 +1553,7 @@ def build_delivery_workflow(
                         transition_description=(
                             "CI found task-scoped failures that require fixes."
                         ),
-                        parameters=(WORKSPACE, FIX_CONTEXT),
+                        parameters=(WORKSPACE, FIX_CONTEXT) + fix_continuity_parameters,
                     ),
                     recovery_edge(
                         "ci_monitor",
@@ -1479,8 +1563,8 @@ def build_delivery_workflow(
                             PR_URL,
                             BRANCH_NAME,
                             MERGE_STRATEGY,
-                            CI_REPORT,
                             *ci_contract_parameters,
+                            CI_REPORT,
                         ) + pr_cursor_parameters,
                         extra_prompt=(
                             "Preserve the exact PR, branch, merge strategy, "
@@ -1505,6 +1589,7 @@ def build_delivery_workflow(
                             PR_URL,
                             BRANCH_NAME,
                             MERGE_STRATEGY,
+                            *ci_contract_parameters,
                             CI_REPORT,
                         ) + pr_cursor_parameters,
                     )
@@ -1646,6 +1731,7 @@ def build_delivery_workflow(
                     ),
                     parameters=(
                         WORKSPACE,
+                        *fix_identity_parameters,
                         MERGE_STRATEGY,
                         PR_REPORT,
                         *ci_contract_retry_parameters,
@@ -2840,9 +2926,8 @@ def prepare_pr_prompt(profile: ProjectProfile) -> str:
     )
     merge_policy = profile.pr_merge_strategy()
     cursor = (
-        "\nFor runtime-contract v2, initialize the outgoing PR feedback "
-        "cursor to the literal `uninitialized` on the first PR watcher edge; "
-        "do not read an incoming cursor here.\n"
+        "\nPreserve a same-PR feedback cursor; initialize `uninitialized` only "
+        "for a new PR. Never reset it after Fix or verification.\n"
         if profile.runtime_contracts_v2()
         else ""
     )
@@ -2902,10 +2987,10 @@ approval. Use `needs_changes` with `workspace_path` and `blocker_reason` for
 recoverable PR/branch issues; this path also requires approval. Use
 `needs_user_action` with `blocker_reason` for external blockers.
 
-Prepare PR emits `pr_feedback_cursor=uninitialized`; delivery preserves
-supplied cursors and never synthesizes materialized cursors. Only the
-deterministic PR watcher resets invalid cursors to `uninitialized` with
-`pull_request_feedback_invalid`."""
+Prepare PR preserves supplied same-PR cursor; initialize only for a new PR.
+delivery preserves supplied cursors and never synthesizes materialized cursors.
+Only the deterministic PR watcher resets invalid cursors to `uninitialized`
+with `pull_request_feedback_invalid`."""
 
 
 def ci_prompt(profile: ProjectProfile) -> str:
@@ -2915,31 +3000,34 @@ def ci_prompt(profile: ProjectProfile) -> str:
         else ""
     )
     source_cycle = (
-        """In the source-contract mode, mandatory identities come only from the
-target-branch source-derived expected contract. Unexpected failed checks are
-diagnostics and do not independently block delivery. When a retry is allowed,
-choose `watch_ci` with the complete expected-check fields, policy snapshot,
-unchanged `ci_report`, and cursor; do not choose `waiting_pr` directly."""
+        """In source-contract mode, the CI contract contains only the current
+PR identity and whether CI is required. It contains no expected job names or
+release fields. The deterministic watcher classifies every effective check
+reported for that PR; failed extras are not ignored and pending observations
+are not human actions. When a retry is allowed, choose `watch_ci` with the
+unchanged validated contract, accumulated `ci_report`, and cursor; do not
+choose `waiting_pr` directly."""
         if profile.source_ci_contract()
         else ""
     )
     source_values = (
-        """Expected checks: {{.Params.expected_ci_checks}}
-Expected checks digest: {{.Params.expected_ci_checks_sha256}}
-Runtime source envelope digest: {{.Params.runtime_source_envelope_digest}}
-Policy snapshot: {{.Params.ci_policy_snapshot}}
-Task: {{.Params.task_short_id}}"""
-        if profile.source_ci_contract()
+        """GitHub CI contract: {{.Params.ci_contract}}"""
+        + (
+            "\nTask: {{.Params.task_short_id}}"
+            if profile.source_ci_contract()
+            else ""
+        )
+        if profile.capability("ci_monitoring")
         else ""
     )
     preparation_diagnosis = (
-        """A `ci_prepare_failed` entry is preparation diagnosis, not a terminal CI
-observation. Missing packets are represented by empty strings only on this
-diagnostic route. Never parse an empty `ci_report` as a report, invent a report
-or expected contract, or infer green CI. Preserve all supplied packet strings,
-including empty values, cursor and `task_short_id` when choosing `watch_ci`;
-this always re-enters deterministic preparation, never the watcher directly.
-Only a bounded retry or a proven task-scoped fix/external blocker is allowed."""
+        """A `ci_prepare_failed` entry is preparation diagnosis, not a terminal
+CI observation. Missing packets are represented by empty strings only on this
+diagnostic route. Never parse an empty `ci_report` as a report, invent a
+contract, or infer green CI. Preserve the supplied contract, report, cursor
+and `task_short_id` when choosing `watch_ci`; this always re-enters
+deterministic preparation, never the watcher directly. Only a bounded retry
+or a proven task-scoped fix/external blocker is allowed."""
         if profile.source_ci_contract()
         else ""
     )
@@ -2980,9 +3068,11 @@ post-merge regression belongs in a separate follow-up task.
   "While the PR remains open, complete with `waiting_pr` only when all required "
   "checks are green and the resolved method remains feasible. Provide")}
 `workspace_path`, `pr_url`, `branch_name`, `merge_strategy`, and `ci_report`.
-Use `needs_changes` with `workspace_path` and `fix_context` only for a proven
-task-differential code or history failure. After retry exhaustion, use
-`needs_user_action` only for a real external blocker or decision.
+Use `needs_changes` with `workspace_path` and `fix_context` for a proven
+task-differential failure or normal target conflict; no task-differential proof
+is needed for that integration conflict. Fix re-verifies the exact PR
+head/base. After retry exhaustion, `needs_user_action` is only for an
+external blocker.
 Never use `needs_user_action` merely because CI is still running."""
 
 
@@ -3001,17 +3091,20 @@ def waiting_pr_prompt(profile: ProjectProfile) -> str:
 method in this node before starting another deterministic merge watch."""
     )
     source_contract = (
-        """Source-derived CI contract:
-Expected mandatory checks: {{.Params.expected_ci_checks}}
-Expected-check digest: {{.Params.expected_ci_checks_sha256}}
-Runtime source envelope digest: {{.Params.runtime_source_envelope_digest}}
-Target policy snapshot: {{.Params.ci_policy_snapshot}}
+        """GitHub CI contract:
+{{.Params.ci_contract}}
 CI report: {{.Params.ci_report}}
-Task: {{.Params.task_short_id}}
-Use the exact source-declared mandatory identities for blocking. An extra
-failed check is diagnostic feedback and does not independently block or wake
-this wait. Preserve the contract and CI report through every watcher re-entry."""
-        if profile.source_ci_contract()
+The contract binds only the current PR identity and whether CI is required.
+The deterministic watcher considers every effective check it observes; no
+expected job list, digest, or extra-check allowlist can make a failure
+irrelevant. Preserve the contract and CI report through every watcher
+re-entry."""
+        + (
+            "\nTask: {{.Params.task_short_id}}"
+            if profile.source_ci_contract()
+            else ""
+        )
+        if profile.capability("ci_monitoring")
         else ""
     )
     return f"""Check delivery state for {{{{.TaskShortId}}}}.
@@ -3035,10 +3128,14 @@ source-control or user-reported feasibility without mutating the task branch.
 
 Choose `pr_merged` only when the source-control system conclusively reports the
 PR as merged; provide `workspace_path`, `pr_url`, `branch_name`, and
-`merge_report`. If it remains open, required checks are green, no changes are
-requested, and the selected method is feasible, choose `watch_merge` and
-provide `workspace_path`, `pr_url`, `branch_name`, `merge_strategy`, and the
-exact current head and base commits as `pr_head_oid` and `pr_base_oid`. The
+`merge_report`. If it remains open and the target reports a normal integration
+conflict, choose `needs_changes` with the current `pr_report`; do not demand
+proof that the task introduced the target change. The existing Fix path owns
+conflict resolution and refreshed verification, without granting new push or
+force-push rights. Otherwise, when CI is green, no changes are requested, and
+the selected method is feasible, choose `watch_merge` and provide
+`workspace_path`, `pr_url`, `branch_name`, `merge_strategy`, and the exact
+current head and base commits as `pr_head_oid` and `pr_base_oid`. The
 deterministic watcher waits without an approval or model turn and wakes this
 node only after meaningful state changes. A base OID change wakes this node so
 method-specific feasibility can be revalidated through the normal merge-policy
@@ -3068,7 +3165,12 @@ The deterministic watcher stopped because PR state changed:
         )
         + """
 
-Classify only that fresh state. Do not repeat passive polling in the agent."""
+Classify only that fresh state. The report may include
+`observed_feedback_cursor` for newly reported or edited feedback. Keep the
+incoming acknowledged cursor unchanged while considering all simultaneous CI,
+feedback, head, base, and mergeability changes. Advance the cursor only after
+every reported feedback item has been considered. Do not repeat passive
+polling in the agent."""
     )
 
 
@@ -3389,7 +3491,8 @@ containing only the remaining task-scoped issues. Choose `verify` only when no
 PR-feedback slice remains, and provide `workspace_path`, the same
 `task_short_id`, plus refreshed `review_context`."""
 
-    return f"""Fix task-scoped PR feedback.
+    return f"""Fix task-scoped PR feedback or a normal target-branch integration
+conflict.
 
 {context_instruction(profile, "implement", "fix", "implementation")}
 
@@ -3408,7 +3511,14 @@ pin the expected remote head, prove the repaired final tree is byte-for-byte
 identical unless the authorization explicitly permits code changes, and update
 only the task branch with force-with-lease. Stop with `needs_user_action` on a
 lease, tree, target-tip, or authorization mismatch; never fall back to an
-unconditional force push.
+unconditional force push. For an ordinary conflict with the current target
+branch, preserve the immutable task baseline and exact PR identity, resolve
+the integration conflict through the existing approved merge strategy, and do
+not require task-differential proof that the target introduced the conflict.
+No new push or force-push authority is granted by this route.
+If the PR report includes `observed_feedback_cursor`, consider every reported
+feedback item before acknowledging it; retain the acknowledged cursor through
+the full Fix and verification loop.
 {completion_contract}
 Use `needs_user_action` with `blocker_reason` for external or policy blockers.
 Choose `wont_do` only for an explicit cancellation decision and provide
