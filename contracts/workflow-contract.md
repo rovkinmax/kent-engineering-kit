@@ -46,6 +46,10 @@ exempt.
   restore. Preserve terminal IDs/statuses/anchors; forbid replacement,
   link/default/create/promotion effects and concurrent allocation. Disclose
   the absent canary at live approval.
+- Canonical reconciliation plans retain native `project-<lowercase UUID>`
+  identities in both workflow ownership and project links. Workflow identities
+  remain bare UUIDs. Legacy plans with bare project UUIDs must be rebuilt from
+  native readback and approved under a fresh plan hash; do not coerce them.
 - `wont_do` is terminal, requires an explicit cancellation decision, and emits
   `closure_reason`.
 - Parallel verification branches are read-only.

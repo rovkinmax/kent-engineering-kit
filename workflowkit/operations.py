@@ -135,6 +135,15 @@ def _sha256(value: Any, label: str) -> str:
 def _uuid(value: Any, label: str) -> str:
     return _digest(value, label, UUID_RE).lower()
 
+def _native_project_id(value: Any, label: str) -> str:
+    value = _string(value, label)
+    if not value.startswith('project-'):
+        raise PlanValidationError(f'{label} must be a native project ID')
+    suffix = value[len('project-'):]
+    if _uuid(suffix, label) != suffix:
+        raise PlanValidationError(f'{label} must use a canonical lowercase UUID')
+    return value
+
 def _repository(value: Any, label: str) -> str:
     value = _string(value, label)
     import re
@@ -2242,7 +2251,7 @@ def _validate_canonical_plan(plan: LoadedPlan) -> dict[str, Any]:
         item = dict(_closed(raw, {'workflow_id', 'project_id', 'intent', 'expected_version', 'graph', 'metadata',
                 'terminal_tasks', 'terminal_anchors', 'links', 'default'}, label))
         item['workflow_id'] = _uuid(_required(item, 'workflow_id', label), f'{label}.workflow_id')
-        item['project_id'] = _uuid(_required(item, 'project_id', label), f'{label}.project_id')
+        item['project_id'] = _native_project_id(_required(item, 'project_id', label), f'{label}.project_id')
         intent = _string(_required(item, 'intent', label), f'{label}.intent')
         if intent not in {'graph-only', 'metadata-only', 'graph-and-metadata'}:
             raise PlanValidationError('canonical intent is unsupported')
@@ -2269,7 +2278,7 @@ def _validate_canonical_plan(plan: LoadedPlan) -> dict[str, Any]:
         links: list[dict[str, Any]] = []
         for raw_link in _bounded_list(_required(item, 'links', label), f'{label}.links'):
             link = _closed(raw_link, {'project_id', 'workflow_id', 'is_default'}, 'link')
-            parsed_link = {'project_id': _uuid(_required(link, 'project_id', 'link'), 'link.project_id'), 'workflow_id':
+            parsed_link = {'project_id': _native_project_id(_required(link, 'project_id', 'link'), 'link.project_id'), 'workflow_id':
                     _uuid(_required(link, 'workflow_id', 'link'), 'link.workflow_id'), 'is_default': _required(link,
                     'is_default', 'link')}
             if parsed_link['project_id'] != item['project_id']:
