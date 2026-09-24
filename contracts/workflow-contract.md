@@ -164,6 +164,7 @@ Runtime v2 is atomic.
 - `pr_report`
 - `ci_report`
 - `ci_contract`
+- `delivery_context`
 - `merge_report`
 - `publication_report`
 - `closure_reason`
@@ -173,6 +174,41 @@ Runtime v2 is atomic.
 - `pr_base_oid`
 - `cleanup_mode`
 - `cleanup_session_id`
+
+## Delivery continuity
+
+The generator carries delivery state only for runtime-contract-v2 profiles and
+the schema-3 Kit-lite cursor profile when pull requests and
+`github_observation` are enabled. Other profiles preserve their existing
+parameters and prompt bytes.
+
+`delivery_context` is a compact JSON string using the closed
+`workflow-delivery-context-v1` shape. Before a PR exists it contains exactly
+`schema` and `phase=pre_pr`. After a PR is observed it contains `schema`,
+`phase=post_pr`, the observed `pr_url`, `branch_name`, `merge_strategy`, and
+`pr_feedback_cursor`, plus `ci_contract` and/or `ci_report` only when those
+exact packets have been produced. The packet never contains a task ID.
+Preserve nested CI packet strings byte-for-byte; do not normalize, reconstruct,
+or invent absent delivery state.
+
+Plan initializes the pre-PR packet. The deterministic accepted-plan snapshot
+and digest exclude it because it is transport state, not plan content. Plan
+Contract, branch identity, Implement/Fix, verification dispatch, Gate, Smoke,
+and applicable Compliance continuations preserve the packet. Gate reads the
+current cycle's scoped
+`verification_dispatch_fanout_verify.delivery_context`; deterministic
+verification result edges carry only status and report and do not become
+delivery-state carriers.
+
+PR and CI observation agents retain their existing flat identity, report, and
+cursor inputs on watcher-to-agent edges and self-recovery loops. They pack the
+latest observed values when a Fix transition must carry delivery continuity.
+Source-contract CI producer entries and retries carry only `workspace_path`,
+`task_short_id`, and `delivery_context`; the producer unwraps that packet to
+the existing flat deterministic watcher contract. Without source-contract CI,
+PR preparation and Waiting PR retain their existing flat observation
+parameters. Merge, publication, and terminal Cleanup remain on their existing
+flat result contracts.
 
 ## Context
 

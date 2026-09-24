@@ -25,6 +25,7 @@ from workflowkit.runtime import (
     classify_pr_feedback,
     classify_terminal_state,
     classify_verification_report,
+    delivery_context_fields,
     discarded_attempt_digest,
     expected_ci_checks_sha256,
     make_pr_feedback_cursor,
@@ -39,6 +40,7 @@ from workflowkit.runtime import (
     validate_cleanup_report,
     validate_ci_archive,
     validate_ci_report_history,
+    validate_delivery_context,
     validate_expected_ci_checks,
     validate_pr_feedback_cursor,
     validate_pr_feedback_item,
@@ -149,6 +151,104 @@ def ci_report() -> dict[str, object]:
 
 
 class RuntimeContractTest(unittest.TestCase):
+    def test_delivery_context_is_closed_and_preserves_nested_packet_strings(self) -> None:
+        pre_pr = {
+            "schema": "workflow-delivery-context-v1",
+            "phase": "pre_pr",
+        }
+        self.assertEqual(validate_delivery_context(pre_pr), pre_pr)
+
+        packet = ' { "schema" : "not-yet-valid CI", "raw": true } '
+        report_packet = " malformed but retained \n"
+        post_pr = {
+            "schema": "workflow-delivery-context-v1",
+            "phase": "post_pr",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "feature/TASK-17",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": "uninitialized",
+            "ci_contract": packet,
+            "ci_report": report_packet,
+        }
+        self.assertEqual(validate_delivery_context(post_pr), post_pr)
+        self.assertEqual(
+            delivery_context_fields(
+                {"delivery_context": json.dumps(post_pr, ensure_ascii=False)}
+            ),
+            {"delivery_context": json.dumps(post_pr, ensure_ascii=False)},
+        )
+        self.assertEqual(delivery_context_fields({}), {})
+
+    def test_delivery_context_binds_feedback_cursor_to_pr_identity(self) -> None:
+        context = {
+            "schema": "workflow-delivery-context-v1",
+            "phase": "post_pr",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "feature/TASK-17",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": canonical_bytes(
+                runtime_module.make_dynamic_pr_feedback_cursor(
+                    repository="owner/repository",
+                    pull_number=17,
+                    items=[],
+                )
+            ).decode("utf-8"),
+        }
+        self.assertEqual(validate_delivery_context(context), context)
+
+        mismatched = {
+            **context,
+            "pr_feedback_cursor": canonical_bytes(
+                runtime_module.make_dynamic_pr_feedback_cursor(
+                    repository="another/repository",
+                    pull_number=17,
+                    items=[],
+                )
+            ).decode("utf-8"),
+        }
+        with self.assertRaises(RuntimeContractError):
+            validate_delivery_context(mismatched)
+
+    def test_delivery_context_rejects_invalid_shapes_and_duplicate_json_keys(self) -> None:
+        post_pr = {
+            "schema": "workflow-delivery-context-v1",
+            "phase": "post_pr",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "feature/TASK-17",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": "uninitialized",
+        }
+        invalid = (
+            {**post_pr, "unexpected": "field"},
+            {**post_pr, "phase": "pre_pr", "pr_url": ""},
+            {**post_pr, "pr_url": "https://github.com/owner/repository/issues/17"},
+            {**post_pr, "branch_name": "-unsafe"},
+            {**post_pr, "merge_strategy": "unknown"},
+            {**post_pr, "pr_feedback_cursor": "not-json"},
+            {**post_pr, "ci_contract": ""},
+            {key: value for key, value in post_pr.items() if key != "branch_name"},
+            {
+                **post_pr,
+                "ci_report": "x" * runtime_module.MAX_DYNAMIC_CI_REPORT_BYTES + "x",
+            },
+            {"schema": "workflow-delivery-context-v1", "phase": "pre_pr", "branch_name": "invented"},
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(RuntimeContractError):
+                validate_delivery_context(value)
+
+        for raw in (
+            '{"schema":"workflow-delivery-context-v1","phase":"pre_pr",'
+            '"phase":"post_pr"}',
+            " " * 1_000_001,
+            json.dumps({"schema": "workflow-delivery-context-v1", "phase": "pre_pr"})
+            + " trailing",
+        ):
+            with self.subTest(raw_length=len(raw)), self.assertRaises(RuntimeContractError):
+                delivery_context_fields({"delivery_context": raw})
+        with self.assertRaises(RuntimeContractError):
+            delivery_context_fields({"delivery_context": 17})
+
     def test_canonical_json_is_compact_sorted_and_digestable(self) -> None:
         ordinary = {"z": 1, "a": "é"}
         self.assertEqual(

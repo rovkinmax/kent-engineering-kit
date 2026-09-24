@@ -26,3 +26,7 @@ The repository digest detects artifact drift. It does not provide task-comment
 ordering, a monotonic authority revision, or atomic transition compare-and-swap.
 Those require Kent runtime support and must not be inferred from private
 database rows or fragile CLI text.
+
+The workflow `delivery_context` is transport state, not plan content. Exclude it
+from the accepted-plan snapshot and digest so observed PR or CI state cannot
+trigger plan revalidation.

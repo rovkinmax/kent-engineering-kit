@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -32,6 +33,79 @@ BRANCH_IDENTITY = load_script_module()
 
 
 class BranchIdentityTest(unittest.TestCase):
+    def test_handoff_preserves_exact_delivery_context(self) -> None:
+        from workflowkit import runtime
+
+        raw = '{ "schema": "workflow-delivery-context-v1", "phase": "pre_pr" }'
+        incoming = {
+            "workspace_path": str(self.root),
+            "plan_path": ".todo/plan.md",
+            "work_kind": "test",
+            "delivery_context": raw,
+        }
+        with mock.patch.dict(sys.modules, {"workflow_runtime_contracts": runtime}):
+            self.assertEqual(BRANCH_IDENTITY.handoff_values(incoming), incoming)
+            with self.assertRaises(ValueError):
+                BRANCH_IDENTITY.handoff_values({**incoming, "delivery_context": "{}"})
+            with self.assertRaises(ValueError):
+                BRANCH_IDENTITY.handoff_values({"delivery_context": raw})
+
+    def test_jira_continuation_remote_collision_is_not_reused(self) -> None:
+        self.configure("jira")
+        branch = "feature/MBL-826-continue"
+        self.run_git(self.root, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+        self.task(
+            source_url="https://example.atlassian.net/browse/MBL-826",
+            body=f"branch_name: {branch}",
+        )
+        result, payload = self.run_script(handoff=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_blocked")
+        self.assertEqual(self.branch(), "TASK-1")
+
+    def test_explicit_jira_continuation_branch(self) -> None:
+        self.configure("jira")
+        self.task(
+            source_url="https://example.atlassian.net/browse/MBL-826",
+            body="Approved continuation.\nbranch_name: feature/MBL-826-continue\n",
+        )
+        result, payload = self.run_script(handoff=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_ready")
+        self.assertEqual(self.branch(), "feature/MBL-826-continue")
+
+    def test_jira_branch_directive_rejects_ambiguous_wrong_key_and_unsafe(self) -> None:
+        self.configure("jira")
+        for body in (
+            "branch_name: feature/MBL-827-continue",
+            "branch_name: feature/MBL-826-continue\nbranch_name: feature/MBL-826-next",
+            "branch_name: feature/MBL-826-../unsafe",
+            "branch_name: feature/MBL-826-",
+            "branch_name: unrelated",
+        ):
+            with self.subTest(body=body):
+                self.task(
+                    source_url="https://example.atlassian.net/browse/MBL-826",
+                    body=body,
+                )
+                result, payload = self.run_script(handoff=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(payload["transition"], "branch_identity_blocked")
+                self.assertEqual(self.branch(), "TASK-1")
+
+    def test_jira_continuation_branch_collision_is_not_reused(self) -> None:
+        self.configure("jira")
+        branch = "feature/MBL-826-continue"
+        self.run_git(self.root, "branch", branch)
+        self.task(
+            source_url="https://example.atlassian.net/browse/MBL-826",
+            body=f"branch_name: {branch}",
+        )
+        result, payload = self.run_script(handoff=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_blocked")
+        self.assertEqual(self.branch(), "TASK-1")
+
     def test_kent_binary_falls_back_when_service_path_is_minimal(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

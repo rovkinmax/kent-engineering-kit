@@ -633,7 +633,7 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertLessEqual(
             (REPO_ROOT / "contracts" / "workflow-contract.md").stat().st_size,
-            36500,
+            39000,
         )
         self.assertNotIn(
             "The runner has received a shutdown signal",
@@ -2558,23 +2558,12 @@ class WorkflowKitTest(unittest.TestCase):
             if any(parameter.key == "pr_feedback_cursor" for parameter in edge.parameters)
         }
         self.assertEqual(cursor_edges, {
-            "prepare_pr_ci_prepare", "ci_prepare_ready_initial", "ci_prepare_ready_retry",
+            "ci_prepare_ready_initial", "ci_prepare_ready_retry",
             "ci_prepare_failed", "ci_watch_waiting_pr", "ci_watch_diagnose",
-            "ci_watch_state_changed", "ci_watch_source_changed", "ci_monitor_watch",
-            "ci_monitor_needs_user_action",
-            "waiting_pr_watch_merge", "merge_watch_still_waiting", "merge_watch_state_changed",
-            "waiting_pr_needs_user_action", "waiting_pr_fix", "waiting_pr_ci_monitor",
-            "ci_monitor_fix", "fix_needs_user_action", "fix_continue", "fix_verify",
-            "compliance_prepare_pr", "compliance_fix", "evidence_repair_fix",
-            "plan_contract_verify", "plan_contract_checked_verify",
-            "plan_contract_fix_continue", "plan_contract_checked_fix",
-            "dispatch_deterministic_verify", "dispatch_invalid_workspace",
-            "dispatch_standards_review", "dispatch_spec_review",
-            "deterministic_report_join",
-            "gate_fix", "gate_reverify_after_user_action",
-            "gate_smoke_required", "gate_delivery_ready", "smoke_prepare_pr",
-            "smoke_fix", "compliance_evidence_repair",
-            "compliance_needs_user_action", "evidence_repair_compliance",
+            "ci_watch_state_changed", "ci_watch_source_changed",
+            "ci_monitor_needs_user_action", "waiting_pr_watch_merge",
+            "merge_watch_still_waiting", "merge_watch_state_changed",
+            "waiting_pr_needs_user_action",
         })
         prompts = " ".join((edge.prompt or "") for edge in spec.edges)
         self.assertIn("uninitialized", prompts)
@@ -2583,47 +2572,32 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn("pull_request_feedback_invalid", prompts)
         self.assertIn("delivery preserves supplied cursors", " ".join(prompts.split()))
         self.assertIn("never synthesizes materialized cursors", " ".join(prompts.split()))
-        for key in ("ci_prepare_failed", "ci_monitor_watch", "ci_monitor_needs_user_action"):
+        for key in ("ci_prepare_failed", "ci_monitor_needs_user_action"):
             self.assertTrue({
                 "task_short_id", "ci_report", "ci_contract",
             } <= {parameter.key for parameter in by_key[key].parameters}, key)
-        expected_fix_carriers = (
-            "pr_url",
-            "branch_name",
-            "merge_strategy",
-            "ci_contract",
-            "task_short_id",
-            "ci_report",
-            "pr_feedback_cursor",
-        )
         self.assertEqual(
             tuple(parameter.key for parameter in by_key["ci_monitor_fix"].parameters),
-            ("workspace_path", "fix_context") + expected_fix_carriers,
+            ("workspace_path", "fix_context", "delivery_context"),
+        )
+        self.assertEqual(
+            tuple(parameter.key for parameter in by_key["ci_monitor_watch"].parameters),
+            ("workspace_path", "task_short_id", "delivery_context"),
         )
         self.assertEqual(
             tuple(parameter.key for parameter in by_key["fix_verify"].parameters),
-            ("workspace_path", "review_context", "task_short_id")
-            + tuple(
-                parameter
-                for parameter in expected_fix_carriers
-                if parameter != "task_short_id"
-            ),
+            ("workspace_path", "review_context", "task_short_id", "delivery_context"),
         )
         self.assertEqual(
             tuple(parameter.key for parameter in by_key["fix_continue"].parameters),
-            ("workspace_path", "fix_context", "task_short_id")
-            + tuple(
-                parameter
-                for parameter in expected_fix_carriers
-                if parameter != "task_short_id"
-            ),
+            ("workspace_path", "fix_context", "task_short_id", "delivery_context"),
         )
         self.assertTrue(
-            set(expected_fix_carriers)
+            {"delivery_context"}
             <= {parameter.key for parameter in by_key["fix_needs_user_action"].parameters}
         )
         self.assertTrue(
-            set(expected_fix_carriers)
+            {"delivery_context"}
             <= {
                 parameter.key
                 for parameter in by_key["compliance_prepare_pr"].parameters
@@ -2656,8 +2630,9 @@ class WorkflowKitTest(unittest.TestCase):
             "fix_continue",
             "compliance_prepare_pr",
         ):
-            self.assertTrue(
-                expected <= {parameter.key for parameter in by_key[key].parameters},
+            self.assertIn(
+                "delivery_context",
+                {parameter.key for parameter in by_key[key].parameters},
                 key,
             )
             self.assertNotIn(
@@ -2682,13 +2657,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertFalse(profile.runtime_contracts_v2())
         spec = build_delivery_workflow(profile, 3)
         by_key = {edge.key: edge for edge in spec.edges}
-        expected = {
-            "pr_url",
-            "branch_name",
-            "merge_strategy",
-            "pr_feedback_cursor",
-        }
-        for key in (
+        context_edges = (
             "plan_contract_verify",
             "plan_contract_checked_verify",
             "fix_verify",
@@ -2696,21 +2665,51 @@ class WorkflowKitTest(unittest.TestCase):
             "dispatch_deterministic_verify",
             "dispatch_invalid_workspace",
             "dispatch_standards_review",
-            "deterministic_report_join",
             "gate_fix",
             "gate_reverify_after_user_action",
             "gate_delivery_ready",
+            "waiting_pr_fix",
+        )
+        for key in context_edges:
+            self.assertIn(
+                "delivery_context",
+                {parameter.key for parameter in by_key[key].parameters},
+                key,
+            )
+            self.assertNotIn(
+                "pr_feedback_cursor",
+                {parameter.key for parameter in by_key[key].parameters},
+                key,
+            )
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["deterministic_report_join"].parameters
+            ),
+            ("verification_status", "verification_report"),
+        )
+        flat_observation_edges = (
             "prepare_pr_waiting_pr",
             "waiting_pr_watch_merge",
             "merge_watch_still_waiting",
             "merge_watch_state_changed",
             "waiting_pr_needs_user_action",
-            "waiting_pr_fix",
-        ):
-            self.assertTrue(
-                expected <= {parameter.key for parameter in by_key[key].parameters},
+        )
+        for key in flat_observation_edges:
+            self.assertIn(
+                "pr_feedback_cursor",
+                {parameter.key for parameter in by_key[key].parameters},
                 key,
             )
+            self.assertNotIn(
+                "delivery_context",
+                {parameter.key for parameter in by_key[key].parameters},
+                key,
+            )
+        for key in (
+            *context_edges,
+            *flat_observation_edges,
+        ):
             self.assertNotIn(
                 "ci_contract",
                 {parameter.key for parameter in by_key[key].parameters},

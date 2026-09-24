@@ -48,6 +48,12 @@ PLAN_CONTRACT_CHECK = {
         / "workflow-plan-contract-fix-continue"
     ),
 }
+VERIFICATION_DISPATCH = (
+    REPO_ROOT
+    / "templates"
+    / "project"
+    / "workflow-verification-dispatch"
+)
 APK_INSTALL = (
     REPO_ROOT / "templates" / "project" / "android-apk-install-preserve"
 )
@@ -399,12 +405,28 @@ class WorkflowPlanContractTest(GitRepositoryTest):
         route: str = "continue",
         spoof_mode: str | None = None,
         spoof_route: str | None = None,
+        delivery_context: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         executable = (
             PLAN_CONTRACT_ACCEPT
             if mode == "accept"
             else PLAN_CONTRACT_CHECK[route]
         )
+        if delivery_context is not None:
+            scripts = root / ".kent" / "scripts"
+            scripts.mkdir(parents=True, exist_ok=True)
+            for source in (
+                PLAN_CONTRACT,
+                PLAN_CONTRACT_ACCEPT,
+                *PLAN_CONTRACT_CHECK.values(),
+            ):
+                target = scripts / source.name
+                target.write_bytes(source.read_bytes())
+                target.chmod(0o755)
+            (scripts / "workflow_runtime_contracts.py").write_bytes(
+                (REPO_ROOT / "workflowkit" / "runtime.py").read_bytes()
+            )
+            executable = scripts / executable.name
         payload = {
             "workspace_path": str(root),
             "plan_path": ".todo/task/plan.md",
@@ -422,6 +444,8 @@ class WorkflowPlanContractTest(GitRepositoryTest):
             payload["fix_context"] = "remaining fix bundle"
         if spoof_mode is not None:
             payload["plan_contract_mode"] = spoof_mode
+        if delivery_context is not None:
+            payload["delivery_context"] = delivery_context
         return subprocess.run(
             [str(executable)],
             cwd=root,
@@ -430,6 +454,124 @@ class WorkflowPlanContractTest(GitRepositoryTest):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+        )
+
+    def test_delivery_context_survives_plan_contract_routes(self) -> None:
+        context = json.dumps({
+            "schema": "workflow-delivery-context-v1",
+            "phase": "pre_pr",
+        })
+        root = self.create_repository()
+        plan = root / ".todo" / "task" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\n\n- [ ] Implement feature\n")
+
+        for route in ("start", "continue", "verify", "fix_continue"):
+            with self.subTest(accepted_route=route):
+                accepted = self.run_contract(
+                    root,
+                    mode="accept",
+                    route=route,
+                    delivery_context=context,
+                )
+                self.assertEqual(accepted.returncode, 0, accepted.stderr)
+                self.assertEqual(
+                    json.loads(accepted.stdout)["delivery_context"],
+                    context,
+                )
+        snapshot = json.loads(
+            (root / ".kent" / "runtime" / "TASK-PLAN" / "plan-contract.json")
+            .read_text()
+        )
+        self.assertNotIn("delivery_context", snapshot)
+
+        for route in ("continue", "verify", "fix_continue"):
+            with self.subTest(route=route):
+                checked = self.run_contract(
+                    root,
+                    mode="check",
+                    route=route,
+                    delivery_context=context,
+                )
+                self.assertEqual(checked.returncode, 0, checked.stderr)
+                self.assertEqual(
+                    json.loads(checked.stdout)["delivery_context"],
+                    context,
+                )
+
+        plan.write_text("# Plan\n\n- [ ] Changed acceptance\n")
+        for route in ("continue", "verify", "fix_continue"):
+            with self.subTest(changed_route=route):
+                changed = self.run_contract(
+                    root,
+                    mode="check",
+                    route=route,
+                    delivery_context=context,
+                )
+                self.assertEqual(changed.returncode, 0, changed.stderr)
+                self.assertEqual(
+                    json.loads(changed.stdout)["transition"],
+                    f"plan_contract_{route}_changed",
+                )
+                self.assertEqual(
+                    json.loads(changed.stdout)["delivery_context"],
+                    context,
+                )
+        self.assertFalse((root / ".kent/scripts/__pycache__").exists())
+
+    def test_invalid_supplied_delivery_context_fails_before_acceptance(self) -> None:
+        root = self.create_repository()
+        plan = root / ".todo" / "task" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\n\n- [ ] Implement feature\n")
+        result = self.run_contract(
+            root,
+            mode="accept",
+            delivery_context='{"schema":"wrong","phase":"pre_pr"}',
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse((root / ".kent/runtime/TASK-PLAN/plan-contract.json").exists())
+
+    def test_plan_contract_uses_materialized_runtime_sibling(self) -> None:
+        root = self.create_repository()
+        plan = root / ".todo" / "task" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\n\n- [ ] Implement feature\n")
+        scripts = root / ".kent" / "scripts"
+        scripts.mkdir(parents=True)
+        command = scripts / "workflow-plan-contract"
+        command.write_bytes(PLAN_CONTRACT.read_bytes())
+        command.chmod(0o755)
+        (scripts / "workflow_runtime_contracts.py").write_bytes(
+            (REPO_ROOT / "workflowkit" / "runtime.py").read_bytes()
+        )
+        context = json.dumps({
+            "schema": "workflow-delivery-context-v1",
+            "phase": "pre_pr",
+        })
+        result = subprocess.run(
+            [str(command)],
+            cwd=root,
+            input=json.dumps({
+                "workspace_path": str(root),
+                "plan_path": ".todo/task/plan.md",
+                "work_kind": "feature",
+                "plan_route": "continue",
+                "plan_route_context": "not-applicable",
+                "review_context": "accepted preview",
+                "task_short_id": "TASK-PLAN",
+                "delivery_context": context,
+            }),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env={**os.environ, "KENT_PLAN_CONTRACT_MODE": "accept"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["delivery_context"],
+            context,
         )
 
     def test_checkbox_progress_does_not_change_accepted_contract(self) -> None:
@@ -538,6 +680,106 @@ class WorkflowPlanContractTest(GitRepositoryTest):
             "plan_contract_fix_continue_stable",
         )
         self.assertEqual(payload["fix_context"], "remaining fix bundle")
+
+
+class WorkflowVerificationDispatchTest(GitRepositoryTest):
+    def invoke(
+        self,
+        root: Path,
+        *,
+        workspace_path: str,
+        delivery_context: str | None,
+        runtime_sibling: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        scripts = root / ".kent" / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        executable = scripts / "workflow-verification-dispatch"
+        executable.write_bytes(VERIFICATION_DISPATCH.read_bytes())
+        executable.chmod(0o755)
+        support = scripts / "workflow_runtime_contracts.py"
+        if runtime_sibling:
+            support.write_bytes(
+                (REPO_ROOT / "workflowkit" / "runtime.py").read_bytes()
+            )
+        else:
+            support.unlink(missing_ok=True)
+        payload = {
+            "workspace_path": workspace_path,
+            "review_context": "verification evidence",
+        }
+        if delivery_context is not None:
+            payload["delivery_context"] = delivery_context
+        return subprocess.run(
+            [str(executable)],
+            cwd=root,
+            input=json.dumps(payload),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def test_dispatch_preserves_context_on_success_and_invalid_workspace(self) -> None:
+        root = self.create_repository()
+        context = ' { "schema" : "workflow-delivery-context-v1", "phase" : "pre_pr" } '
+        success = self.invoke(
+            root,
+            workspace_path=str(root),
+            delivery_context=context,
+        )
+        self.assertEqual(success.returncode, 0, success.stderr)
+        result = json.loads(success.stdout)
+        self.assertEqual(result["transition"], "verification_dispatch_fanout_verify")
+        self.assertEqual(result["delivery_context"], context)
+
+        invalid = self.invoke(
+            root,
+            workspace_path=str(root / "tracked.txt"),
+            delivery_context=context,
+        )
+        self.assertEqual(invalid.returncode, 0, invalid.stderr)
+        result = json.loads(invalid.stdout)
+        self.assertEqual(result["transition"], "verification_dispatch_invalid_workspace")
+        self.assertEqual(result["delivery_context"], context)
+        self.assertFalse((root / ".kent/scripts/__pycache__").exists())
+
+    def test_dispatch_rejects_malformed_supplied_context_without_fallback(self) -> None:
+        root = self.create_repository()
+        result = self.invoke(
+            root,
+            workspace_path=str(root),
+            delivery_context='{"schema":"wrong","phase":"pre_pr"}',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_legacy_dispatch_without_context_needs_no_runtime_sibling(self) -> None:
+        root = self.create_repository()
+        result = self.invoke(
+            root,
+            workspace_path=str(root),
+            delivery_context=None,
+            runtime_sibling=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["transition"],
+            "verification_dispatch_fanout_verify",
+        )
+
+    def test_dispatch_rejects_oversized_input(self) -> None:
+        root = self.create_repository()
+        result = subprocess.run(
+            [str(VERIFICATION_DISPATCH)],
+            cwd=root,
+            input=" " * (1024 * 1024 + 1),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
 
 
 class AndroidApkInstallPreserveTest(GitRepositoryTest):

@@ -78,10 +78,10 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
 
     def test_exact_graph_and_approval_delta(self) -> None:
         profile = kit.profile_at(ROOT)
-        base = build_delivery_workflow(profile, 3)
+        base = build_delivery_workflow(profile, 4)
         spec = kit.build_workflow(profile)
         spec.validate()  # Includes context source and parameter topology.
-        self.assertEqual(spec.name, "Kit Engineering Delivery v3")
+        self.assertEqual(spec.name, "Kit Engineering Delivery v4")
         self.assertEqual(spec.nodes, base.nodes)
         self.assertEqual(len(spec.nodes), 21)
         self.assertEqual(len(spec.edges), 52)
@@ -130,7 +130,7 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
                 self.assertIn("unmodified", edge.prompt)
                 self.assertIn("KENT_RUN_ID", edge.prompt)
 
-    def test_v3_preserves_historical_v1_and_v2_snapshots(self) -> None:
+    def test_v4_preserves_historical_v1_v2_and_v3_snapshots(self) -> None:
         import hashlib
 
         historical_v1 = ROOT / ".kent/workflows/kit-engineering-delivery-v1.spec.json"
@@ -147,8 +147,13 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
         )
         self.assertEqual(json.loads(raw)["name"], "Kit Engineering Delivery v1")
         self.assertEqual(json.loads(raw_v2)["name"], "Kit Engineering Delivery v2")
+        raw_v3 = (ROOT / ".kent/workflows/kit-engineering-delivery-v3.spec.json").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw_v3).hexdigest(),
+            "9650b3a597a8999cd1504fb4c67f9fc676b26dd567351603bf49c07887bebba7",
+        )
         current = json.loads(kit.rendered_spec())
-        self.assertEqual(current["name"], "Kit Engineering Delivery v3")
+        self.assertEqual(current["name"], "Kit Engineering Delivery v4")
         self.assertNotEqual(current, json.loads(raw_v2))
 
     def test_snapshot_is_exact_and_check_is_read_only(self) -> None:

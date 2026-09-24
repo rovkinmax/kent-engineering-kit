@@ -15,6 +15,7 @@ if str(repo_root) not in sys.path:
 from workflowkit.ci_contract import (
     CiContractError, prepare_ci_payload, preparation_failure, read_preparation_input,
     archive_ci_report, parse_preparation_json, validate_preparation_identity,
+    unwrap_delivery_context_payload,
 )
 
 
@@ -22,6 +23,7 @@ def main() -> int:
     payload: dict[str, object] = {}
     try:
         payload = read_preparation_input(sys.stdin.buffer)
+        payload = unwrap_delivery_context_payload(payload)
         if payload.get("operation") == "archive_ci_report":
             validate_preparation_identity(payload)
             from workflowkit.runtime import validate_dynamic_ci_report
