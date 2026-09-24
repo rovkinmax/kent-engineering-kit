@@ -19,13 +19,23 @@ from workflowkit.operations import (
     reconcile_canonical_workflows,
 )
 from tests.test_workflow_retirement import (
-    PROJECT_ID,
-    make_d9_fixture,
+    PROJECT_ID as RETIREMENT_PROJECT_ID,
+    make_d9_fixture as make_retirement_fixture,
     read_log,
     read_state,
     workflow_id,
     write_state,
 )
+
+PROJECT_ID = "project-" + RETIREMENT_PROJECT_ID
+
+
+def make_d9_fixture(root: Path) -> dict:
+    fixture = make_retirement_fixture(root)
+    state = read_state(fixture)
+    state["project_id"] = PROJECT_ID
+    write_state(fixture, state)
+    return fixture
 
 
 def canonical_plan(
@@ -150,6 +160,47 @@ def install_effect(
 
 
 class CanonicalWorkflowLifecycleTest(unittest.TestCase):
+    def test_native_project_identity_is_preserved_in_cli_readbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, _ = canonical_plan(fixture)
+            reconcile_canonical_workflows(plan, mode="prepare")
+            calls = read_log(fixture)
+            project_calls = [call for call in calls if "--project" in call]
+            self.assertTrue(project_calls)
+            for call in project_calls:
+                self.assertEqual(call[call.index("--project") + 1], PROJECT_ID)
+
+    def test_canonical_project_fields_reject_non_native_or_mismatched_ids(self) -> None:
+        invalid = (
+            RETIREMENT_PROJECT_ID,
+            "workspace-" + RETIREMENT_PROJECT_ID,
+            "project-" + RETIREMENT_PROJECT_ID.upper(),
+            "project-not-a-uuid",
+            "project-" + RETIREMENT_PROJECT_ID + " ",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            _, baseline = canonical_plan(fixture)
+            for field in ("project", "link"):
+                for value in (*invalid, "project-123e4567-e89b-12d3-a456-426614174099"):
+                    with self.subTest(field=field, value=value):
+                        document = json.loads(json.dumps(baseline))
+                        member = document["workflows"][0]
+                        target = member if field == "project" else member["links"][0]
+                        target["project_id"] = value
+                        raw = canonical_bytes(document)
+                        path = Path(temporary) / "invalid-project.json"
+                        path.write_bytes(raw)
+                        plan = load_plan(
+                            path,
+                            schema="canonical-workflow-reconcile-plan-v1",
+                            expected_sha256=hashlib.sha256(raw).hexdigest(),
+                        )
+                        with self.assertRaises(PlanValidationError):
+                            operations._validate_canonical_plan(plan)
+            self.assertEqual(read_log(fixture), [])
+
     def test_workflow_summary_requires_closed_metadata_and_normalizes_live_targets(self) -> None:
         wid = workflow_id(0)
         policies = {
