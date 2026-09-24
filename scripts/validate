@@ -28,7 +28,6 @@ bash -n "$repo_root/templates/project/emulator-resource-lock.sh"
 bash -n "$repo_root/templates/project/jira-api.sh"
 bash -n "$repo_root/templates/project/mobile-evidence-audit.sh"
 bash -n "$repo_root/templates/project/sentry-issues.sh"
-bash -n "$repo_root/templates/project/workflow-verification-dispatch"
 bash -n "$repo_root/templates/project/workflow-plan-contract-accept"
 bash -n "$repo_root/templates/project/workflow-plan-contract-continue"
 bash -n "$repo_root/templates/project/workflow-plan-contract-fix-continue"
@@ -52,6 +51,7 @@ python3 -m py_compile \
   "$repo_root/templates/project/workflow-evidence-ledger" \
   "$repo_root/templates/project/workflow-verify-report" \
   "$repo_root/templates/project/workflow-plan-contract" \
+  "$repo_root/templates/project/workflow-verification-dispatch" \
   "$repo_root/templates/project/workflow-wait-github-ci" \
   "$repo_root/templates/project/workflow-wait-github-pr" \
   "$repo_root/templates/project/workflow-task-janitor"

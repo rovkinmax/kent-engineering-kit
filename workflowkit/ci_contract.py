@@ -109,6 +109,8 @@ from .runtime import (
     expected_ci_checks_sha256,
     ci_policy_projection_sha256,
     MAX_CI_REPORT_BYTES,
+    delivery_context_fields,
+    validate_delivery_context,
 )
 
 
@@ -209,8 +211,53 @@ def validate_preparation_identity(payload: Mapping[str, Any]) -> dict[str, str]:
     return identity
 
 
+def unwrap_delivery_context_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Unwrap an explicitly supplied lifecycle context at the CI boundary."""
+
+    try:
+        fields = delivery_context_fields(payload)
+    except RuntimeContractError as error:
+        raise CiContractError("delivery_context_invalid") from error
+    result = dict(payload)
+    if not fields:
+        return result
+    try:
+        context = validate_delivery_context(
+            parse_preparation_json(fields["delivery_context"])
+        )
+    except (CiContractError, RuntimeContractError, TypeError, ValueError) as error:
+        raise CiContractError("delivery_context_invalid") from error
+
+    flat_fields = (
+        "pr_url",
+        "branch_name",
+        "merge_strategy",
+        "pr_feedback_cursor",
+        "ci_contract",
+        "ci_report",
+    )
+    for key in flat_fields:
+        if key not in payload:
+            continue
+        if key in context:
+            if payload[key] != context[key]:
+                raise CiContractError("delivery_context_conflict")
+        elif payload[key] != "":
+            raise CiContractError("delivery_context_conflict")
+
+    result.pop("delivery_context", None)
+    for key in flat_fields:
+        result.pop(key, None)
+        if key in context:
+            result[key] = context[key]
+    return result
+
+
 def preparation_failure(payload: Mapping[str, Any]) -> dict[str, str]:
     """Diagnosis transport only: empty strings denote absent packets, not reports."""
+    payload = unwrap_delivery_context_payload(payload)
     identity = validate_preparation_identity(payload)
     values = {}
     for key in ("ci_contract", "ci_report"):
@@ -1150,6 +1197,7 @@ def prepare_ci_payload(
     *,
     gh_bin: str | None = None,
 ) -> dict[str, Any]:
+    payload = unwrap_delivery_context_payload(payload)
     validate_preparation_identity(payload)
     for key in (
         "ci_contract", "ci_report", "pr_feedback_cursor",

@@ -149,6 +149,84 @@ CI_CONTRACT = ParameterSpec(
     "ci_contract",
     "Validated GitHub CI identity and monitoring policy for the current PR cycle.",
 )
+DELIVERY_CONTEXT = ParameterSpec(
+    "delivery_context",
+    "Closed workflow-delivery-context-v1 JSON string: pre_pr, or post_pr with "
+    "observed PR identity and only produced CI packets.",
+)
+
+
+def _delivery_context_enabled(profile: ProjectProfile) -> bool:
+    return profile.runtime_contracts_v2() or (
+        profile.schema_version == 3
+        and profile.delivery_profile == "lite"
+        and profile.capability("pull_requests")
+        and bool(profile.command("github_observation"))
+    )
+
+
+def delivery_context_input(profile: ProjectProfile) -> str:
+    if not _delivery_context_enabled(profile):
+        return ""
+    return (
+        "Delivery context (preserve the exact JSON string): "
+        "{{.Params.delivery_context}}\n"
+    )
+
+
+def delivery_context_input_section(profile: ProjectProfile) -> str:
+    if not _delivery_context_enabled(profile):
+        return "\n\n"
+    return "\n\n" + delivery_context_input(profile) + "\n"
+
+
+def delivery_context_line_section(profile: ProjectProfile) -> str:
+    if not _delivery_context_enabled(profile):
+        return "\n"
+    return "\n" + delivery_context_input(profile)
+
+
+def delivery_context_passthrough(profile: ProjectProfile) -> str:
+    if not _delivery_context_enabled(profile):
+        return ""
+    return (
+        "Preserve the exact incoming `delivery_context` JSON string on every "
+        "outgoing transition; do not normalize or rewrite nested packet strings."
+    )
+
+
+def delivery_context_passthrough_section(profile: ProjectProfile) -> str:
+    if not _delivery_context_enabled(profile):
+        return "\n\n"
+    return "\n\n" + delivery_context_passthrough(profile) + "\n\n"
+
+
+def delivery_context_tail(profile: ProjectProfile) -> str:
+    if not _delivery_context_enabled(profile):
+        return ""
+    return "\n\n" + delivery_context_passthrough(profile)
+
+
+def delivery_context_pack_instruction(profile: ProjectProfile) -> str:
+    if not _delivery_context_enabled(profile):
+        return ""
+    return """When a transition requires `delivery_context`, emit its compact
+closed `workflow-delivery-context-v1` JSON string. Use exactly `schema` and
+`phase=pre_pr` before any PR is observed. For `phase=post_pr`, include the
+observed `pr_url`, `branch_name`, `merge_strategy`, and
+`pr_feedback_cursor`. Include `ci_contract` and `ci_report` only when those
+exact packets were produced; preserve their string values byte-for-byte.
+Never invent absent PR or CI fields or rewrite a nested packet."""
+
+
+def delivery_context_pack_section(profile: ProjectProfile) -> str:
+    if not _delivery_context_enabled(profile):
+        return "\n\n"
+    return (
+        "\n\n"
+        + delivery_context_pack_instruction(profile)
+        + "\n\n"
+    )
 
 
 def build_delivery_workflow(
@@ -198,13 +276,11 @@ def build_delivery_workflow(
             "schema-4 runtime-contract v2 delivery requires "
             "prepare_ci 2.0.0 source-contract adoption"
         )
-    kit_lite_pr_cursor = (
-        profile.schema_version == 3
-        and profile.delivery_profile == "lite"
-        and profile.capability("pull_requests")
-        and bool(profile.command("github_observation"))
+    cursor_enabled = _delivery_context_enabled(profile)
+    delivery_context_enabled = cursor_enabled
+    delivery_context_parameters = (
+        (DELIVERY_CONTEXT,) if delivery_context_enabled else ()
     )
-    cursor_enabled = runtime_v2 or kit_lite_pr_cursor
     pr_cursor_parameters = (PR_FEEDBACK_CURSOR,) if cursor_enabled else ()
     ci_contract_parameters = (
         (CI_CONTRACT, TASK_SHORT_ID)
@@ -214,21 +290,7 @@ def build_delivery_workflow(
     ci_contract_retry_parameters = ci_contract_parameters + (
         (CI_REPORT,) if profile.capability("ci_monitoring") else ()
     )
-    fix_continuity_parameters = (
-        (
-            PR_URL,
-            BRANCH_NAME,
-            MERGE_STRATEGY,
-            *ci_contract_retry_parameters,
-        ) + pr_cursor_parameters
-        if cursor_enabled
-        else ()
-    )
-    fix_identity_parameters = (
-        (PR_URL, BRANCH_NAME)
-        if cursor_enabled
-        else ()
-    )
+    fix_continuity_parameters = delivery_context_parameters
     fix_continuity_parameters_without_task = tuple(
         parameter
         for parameter in fix_continuity_parameters
@@ -249,7 +311,9 @@ def build_delivery_workflow(
         if package_publish
         else cleanup_prompt(profile, merged=True)
     )
-    implementation_parameters = (WORKSPACE, PLAN, WORK_KIND)
+    implementation_parameters = (
+        (WORKSPACE, PLAN, WORK_KIND) + delivery_context_parameters
+    )
     branch_identity_enabled = profile.branch_identity_policy() != "task"
     nodes: list[NodeSpec] = [
         NodeSpec("backlog", "start", "Backlog"),
@@ -442,6 +506,7 @@ def build_delivery_workflow(
                     PLAN_ROUTE_CONTEXT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
+                    *delivery_context_parameters,
                 ),
             ),
             EdgeSpec(
@@ -462,6 +527,7 @@ def build_delivery_workflow(
                     PLAN_REVIEW_REPORT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
+                    *delivery_context_parameters,
                 ),
             ),
             EdgeSpec(
@@ -485,11 +551,13 @@ def build_delivery_workflow(
                     PLAN_REVIEW_REPORT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
+                    *delivery_context_parameters,
                 ),
             ),
             recovery_edge(
                 "plan_review",
                 context=non_writer_recovery_context,
+                carry_delivery_context=delivery_context_enabled,
                 extra_parameters=(
                     WORKSPACE,
                     PLAN,
@@ -498,6 +566,7 @@ def build_delivery_workflow(
                     PLAN_ROUTE_CONTEXT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
+                    *delivery_context_parameters,
                 ),
             ),
             cancellation_edge("plan_review"),
@@ -521,11 +590,13 @@ def build_delivery_workflow(
                     PLAN_ROUTE_CONTEXT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
+                    *delivery_context_parameters,
                 ),
             ),
             recovery_edge(
                 "plan_revalidation",
                 context=non_writer_recovery_context,
+                carry_delivery_context=delivery_context_enabled,
                 extra_parameters=(
                     WORKSPACE,
                     PLAN,
@@ -558,6 +629,7 @@ def build_delivery_workflow(
                     PLAN_CHANGE_REPORT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
+                    *delivery_context_parameters,
                 ),
             ),
             EdgeSpec(
@@ -581,6 +653,7 @@ def build_delivery_workflow(
                     PLAN_CHANGE_REPORT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
+                    *delivery_context_parameters,
                 ),
             ),
         ]
@@ -608,6 +681,7 @@ def build_delivery_workflow(
                     PLAN_CHANGE_REPORT,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
+                    *delivery_context_parameters,
                 ),
             )
         )
@@ -668,6 +742,7 @@ def build_delivery_workflow(
                 recovery_edge(
                     "branch_identity_resolution",
                     context=non_writer_recovery_context,
+                    carry_delivery_context=delivery_context_enabled,
                     extra_parameters=implementation_parameters,
                     extra_prompt=(
                         "When the exact branch blocker is resolved, choose "
@@ -791,6 +866,7 @@ def build_delivery_workflow(
             recovery_edge(
                 "plan",
                 context=non_writer_recovery_context,
+                carry_delivery_context=delivery_context_enabled,
             ),
             cancellation_edge("plan"),
         ]
@@ -810,7 +886,7 @@ def build_delivery_workflow(
                     WORKSPACE,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
-                ),
+                ) + delivery_context_parameters,
             ),
             EdgeSpec(
                 key="implement_verify",
@@ -825,13 +901,14 @@ def build_delivery_workflow(
                     WORKSPACE,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
-                ),
+                ) + delivery_context_parameters,
             ),
             recovery_edge(
                 "implement",
                 profile=profile,
                 context=writer_recovery_context,
                 fresh_session=fresh_writers,
+                carry_delivery_context=delivery_context_enabled,
                 extra_parameters=(WORK_KIND,),
                 extra_prompt=work_kind_recovery_instruction(profile),
             ),
@@ -856,6 +933,7 @@ def build_delivery_workflow(
                 profile=profile,
                 context=writer_recovery_context,
                 fresh_session=fresh_writers,
+                carry_delivery_context=delivery_context_enabled,
                 extra_parameters=fix_continuity_parameters,
                 extra_prompt=(
                     "Preserve the exact PR identity, CI contract/report, and "
@@ -908,7 +986,7 @@ def build_delivery_workflow(
             target="fix",
             context="new_session",
             context_source="immediate_source",
-            prompt=workspace_path_fix_prompt(),
+            prompt=workspace_path_fix_prompt(profile),
             transition_description=(
                 "Reject an artifact or foreign workspace path before verification."
             ),
@@ -962,7 +1040,7 @@ def build_delivery_workflow(
                     parameters=(
                         VERIFICATION_STATUS,
                         VERIFICATION_REPORT,
-                    ) + fix_continuity_parameters,
+                    ),
                 ),
                 EdgeSpec(
                     key="verification_join_gate",
@@ -1022,7 +1100,7 @@ def build_delivery_workflow(
                 parameters=(
                     VERIFICATION_STATUS,
                     VERIFICATION_REPORT,
-                ) + fix_continuity_parameters,
+                ),
             )
         )
 
@@ -1141,6 +1219,7 @@ def build_delivery_workflow(
                 recovery_edge(
                     "smoke",
                     context=non_writer_recovery_context,
+                    carry_delivery_context=delivery_context_enabled,
                 ),
             ]
         )
@@ -1247,6 +1326,7 @@ def build_delivery_workflow(
                     profile=profile,
                     context=writer_recovery_context,
                     fresh_session=fresh_writers,
+                    carry_delivery_context=delivery_context_enabled,
                     extra_parameters=(
                         WORKSPACE,
                         REVIEW_CONTEXT,
@@ -1266,6 +1346,55 @@ def build_delivery_workflow(
             "ci_watch" if profile.capability("ci_monitoring") else "waiting_pr"
         )
         ci_entry_target = "ci_prepare" if source_ci else created_target
+        if source_ci:
+            prepare_pr_parameters = (
+                WORKSPACE,
+                TASK_SHORT_ID,
+            ) + delivery_context_parameters
+        else:
+            prepare_pr_parameters = (
+                WORKSPACE,
+                PR_URL,
+                BRANCH_NAME,
+                MERGE_STRATEGY,
+            ) + pr_cursor_parameters + ci_contract_parameters
+        if source_ci:
+            ci_prepare_retry_parameters = (
+                WORKSPACE,
+                TASK_SHORT_ID,
+            ) + delivery_context_parameters
+        else:
+            ci_prepare_retry_parameters = (
+                WORKSPACE,
+                PR_URL,
+                BRANCH_NAME,
+                MERGE_STRATEGY,
+                *ci_contract_retry_parameters,
+            ) + pr_cursor_parameters
+        if source_ci:
+            ci_monitor_watch_parameters = (
+                WORKSPACE,
+                TASK_SHORT_ID,
+            ) + delivery_context_parameters
+        else:
+            ci_monitor_watch_parameters = (
+                WORKSPACE,
+                PR_URL,
+                BRANCH_NAME,
+                MERGE_STRATEGY,
+                *ci_contract_parameters,
+                CI_REPORT,
+            ) + pr_cursor_parameters
+        waiting_pr_fix_parameters = (
+            (WORKSPACE, PR_REPORT) + delivery_context_parameters
+            if delivery_context_enabled
+            else (
+                (WORKSPACE,)
+                + (MERGE_STRATEGY, PR_REPORT)
+                + ci_contract_retry_parameters
+                + pr_cursor_parameters
+            )
+        )
         edges.extend(
             [
                 EdgeSpec(
@@ -1281,12 +1410,7 @@ def build_delivery_workflow(
                     transition_description=(
                         "The pull request exists and its delivery state must be checked."
                     ),
-                    parameters=(
-                        WORKSPACE,
-                        PR_URL,
-                        BRANCH_NAME,
-                        MERGE_STRATEGY,
-                    ) + pr_cursor_parameters + ci_contract_parameters,
+                    parameters=prepare_pr_parameters,
                 ),
                 EdgeSpec(
                     key="prepare_pr_no_pr",
@@ -1315,11 +1439,12 @@ def build_delivery_workflow(
                     transition_description=(
                         "PR preparation found task-scoped changes that must be fixed."
                     ),
-                    parameters=(WORKSPACE, BLOCKER),
+                    parameters=(WORKSPACE, BLOCKER) + delivery_context_parameters,
                 ),
                 recovery_edge(
                     "prepare_pr",
                     context=non_writer_recovery_context,
+                    carry_delivery_context=delivery_context_enabled,
                 ),
             ]
         )
@@ -1514,14 +1639,7 @@ def build_delivery_workflow(
                             "A bounded infrastructure retry or refreshed CI "
                             "run is ready for deterministic preparation."
                         ),
-                        parameters=(
-                            WORKSPACE,
-                            PR_URL,
-                            BRANCH_NAME,
-                            MERGE_STRATEGY,
-                            *ci_contract_parameters,
-                            CI_REPORT,
-                        ) + pr_cursor_parameters,
+                        parameters=ci_monitor_watch_parameters,
                     ),
                     EdgeSpec(
                         key="ci_monitor_merged",
@@ -1728,13 +1846,7 @@ def build_delivery_workflow(
                     transition_description=(
                         "The PR state requires task-scoped changes before merge."
                     ),
-                    parameters=(
-                        WORKSPACE,
-                        *fix_identity_parameters,
-                        MERGE_STRATEGY,
-                        PR_REPORT,
-                        *ci_contract_retry_parameters,
-                    ) + pr_cursor_parameters,
+                    parameters=waiting_pr_fix_parameters,
                 ),
                 EdgeSpec(
                     key="waiting_pr_close_without_merge",
@@ -1761,13 +1873,7 @@ def build_delivery_workflow(
                         "The PR head changed or checks restarted; wait "
                         "deterministically for terminal CI state."
                     ),
-                    parameters=(
-                        WORKSPACE,
-                        PR_URL,
-                        BRANCH_NAME,
-                        MERGE_STRATEGY,
-                        *ci_contract_retry_parameters,
-                    ) + pr_cursor_parameters,
+                    parameters=ci_prepare_retry_parameters,
                 )
             )
 
@@ -2045,10 +2151,17 @@ def recovery_edge(
     profile: ProjectProfile | None = None,
     context: str = "compact_and_continue_session",
     fresh_session: bool = False,
+    carry_delivery_context: bool = False,
     extra_parameters: tuple[ParameterSpec, ...] = (),
     extra_prompt: str = "",
 ) -> EdgeSpec:
     extra_contract = f"\n{extra_prompt}" if extra_prompt else ""
+    delivery_context_contract = (
+        "\nIncoming delivery_context: {{.Params.delivery_context}}\nPreserve "
+        "the exact JSON string and every nested packet byte."
+        if carry_delivery_context
+        else ""
+    )
     cancellation_contract = ""
     if node_key in {
         "plan",
@@ -2118,7 +2231,7 @@ Approval means only that the exact reported blocker action is now complete; it
 is not acknowledgement that waiting may begin. Verify resolution before
 editing. If the blocker remains, preserve task scope and return
 `needs_user_action` again. Do not infer approval for any broader or destructive
-action.{extra_contract}"""
+action.{delivery_context_contract}{extra_contract}"""
             + cancellation_contract
         )
     else:
@@ -2132,7 +2245,7 @@ project instructions. Approval means only that the exact reported blocker
 action is now complete; it is not acknowledgement that waiting may begin.
 Verify resolution before continuing. If the blocker remains, preserve task
 scope and return `needs_user_action` again. Do not infer approval for any
-broader or destructive action.{extra_contract}"""
+broader or destructive action.{delivery_context_contract}{extra_contract}"""
             + cancellation_contract
         )
     return EdgeSpec(
@@ -2147,7 +2260,16 @@ broader or destructive action.{extra_contract}"""
             "Work is externally blocked. Do not approve until the reported "
             "external action is complete; approval resumes this stage."
         ),
-        parameters=(BLOCKER,) + extra_parameters,
+        parameters=tuple(
+            {
+                parameter.key: parameter
+                for parameter in (
+                    (BLOCKER,)
+                    + extra_parameters
+                    + ((DELIVERY_CONTEXT,) if carry_delivery_context else ())
+                )
+            }.values()
+        ),
     )
 
 
@@ -2230,9 +2352,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
 def branch_identity_resolution_prompt(profile: ProjectProfile) -> str:
     return f"""Resolve the deterministic branch-identity blocker before Implement.
 
-{context_instruction(profile, "delivery", "branch_identity_resolution", "delivery")}
-
-Project branch policy: `{profile.branch_identity_policy()}`.
+{context_instruction(profile, "delivery", "branch_identity_resolution", "delivery")}{delivery_context_input_section(profile)}Project branch policy: `{profile.branch_identity_policy()}`.
 Reported blocker: {{{{.Params.blocker_reason}}}}
 
 Write all user-facing explanation in Russian. Inspect repository and task state
@@ -2243,7 +2363,7 @@ smallest safe external action that resolves it.
 Choose `needs_user_action` with an updated `blocker_reason` while the blocker
 remains. After the user or external system resolves that exact blocker, verify
 it and choose `retry`. Choose `wont_do` only for an explicit cancellation and
-provide `closure_reason`."""
+provide `closure_reason`.{delivery_context_tail(profile)}"""
 
 
 def checkpoint_instruction(profile: ProjectProfile, stage: str) -> str:
@@ -2410,6 +2530,31 @@ Do not reset, revert, or reimplement preserved code during Plan."""
 If the task body says the recovery Plan must stop for confirmation, complete
 through `needs_user_action` with a concise artifact/remaining-work summary and
 an explicit confirmation request. Do not choose `implement` in that Plan run."""
+    context_contract = ""
+    if _delivery_context_enabled(profile):
+        if recovery_aware:
+            context_contract = """If no lifecycle packet was supplied, initialize
+`delivery_context` before the first Plan transition, including a recovery
+transition. Use the compact JSON string
+`{"schema":"workflow-delivery-context-v1","phase":"pre_pr"}`. On the first
+`review_plan` handoff, provide it unchanged. Never add placeholder PR or CI
+fields. On every later transition, preserve the exact incoming `delivery_context`
+string."""
+        else:
+            context_contract = """If no lifecycle packet was supplied, initialize
+`delivery_context` as the compact JSON string
+`{"schema":"workflow-delivery-context-v1","phase":"pre_pr"}`. On the first
+`review_plan` handoff, provide it unchanged. Never add placeholder PR or CI
+fields. On recovery or any later transition, preserve the exact incoming
+`delivery_context` string."""
+    delivery_context_field = (
+        ", `delivery_context`" if _delivery_context_enabled(profile) else ""
+    )
+    context_contract_section = (
+        "\n\n" + context_contract + "\n\n"
+        if context_contract
+        else "\n\n"
+    )
 
     return f"""Plan {{{{.TaskShortId}}}}: {{{{.TaskTitle}}}}
 
@@ -2449,14 +2594,12 @@ another explicit authoritative source. Agent-authored comments, implementation
 inference, and unsupported claims that "the user clarified" are not product
 authority. Use `needs_user_action` before implementation when that provenance
 is absent.
-{recovery_contract}
-
-Complete with `review_plan` only when the plan has no unresolved product, API,
+{recovery_contract}{context_contract_section}Complete with `review_plan` only when the plan has no unresolved product, API,
 UX, or safety ambiguity. `workspace_path` is the repository or
 managed-worktree root; it is never `.todo/<feature>` or another artifact
 directory. Provide that root plus `plan_path`, selected `work_kind`,
 `plan_route=start`, `plan_route_context=not-applicable`,
-`task_short_id={{{{.TaskShortId}}}}`, and a concise `review_context` naming the
+`task_short_id={{{{.TaskShortId}}}}`{delivery_context_field}, and a concise `review_context` naming the
 governing authority, source IDs, acceptance criteria, planned evidence, and
 risks. Use the literal `not-applicable` as `plan_path` only when the project
 contract explicitly allows planless work. Kent transition parameters must be
@@ -2481,12 +2624,16 @@ evidence before editing; do not repeat checked work. If a comment changes a
 product decision, update the authoritative design/specification/plan with the
 exact comment ID before implementation. Keep the step independently
 verifiable; the next step runs in another fresh writer session."""
+    delivery_context_contract = (
+        " Preserve the exact incoming `delivery_context` value on every "
+        "transition.\n\n"
+        if _delivery_context_enabled(profile)
+        else " "
+    )
 
     return f"""Implement {{{{.TaskShortId}}}}: {{{{.TaskTitle}}}}
 
-{context_instruction(profile, "implement", "implement", "implementation")}
-
-Plan: {{{{.Params.plan_path}}}}. Workspace: {{{{.Params.workspace_path}}}}.
+{context_instruction(profile, "implement", "implement", "implementation")}{delivery_context_input_section(profile)}Plan: {{{{.Params.plan_path}}}}. Workspace: {{{{.Params.workspace_path}}}}.
 
 {work_kind_implement_instruction(profile)}
 
@@ -2502,7 +2649,7 @@ production edit.
 After marking that step complete, choose `continue_implementation` with
 `workspace_path`, `task_short_id={{{{.TaskShortId}}}}`, and a concise
 `review_context` with the completed step, changed files, checks, and next ready
-step when unchecked writer-owned ready steps remain. Choose `verify` when every
+step when unchecked writer-owned ready steps remain.{delivery_context_contract}Choose `verify` when every
 writer-owned plan step is complete; provide the same workspace/task identity
 plus `review_context` summarizing plan/spec paths, the fixed comparison point,
 changed files, checks, risks, and any downstream runtime acceptance scope.
@@ -2519,9 +2666,7 @@ def plan_review_prompt(profile: ProjectProfile) -> str:
     return f"""Independently review the proposed plan for
 {{{{.TaskShortId}}}} without editing files.
 
-{context_instruction(profile, "review", "plan_review", "review")}
-
-Workspace: {{{{.Params.workspace_path}}}}
+{context_instruction(profile, "review", "plan_review", "review")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}
 Plan: {{{{.Params.plan_path}}}}
 Work kind: {{{{.Params.work_kind}}}}
 Requested post-review route: {{{{.Params.plan_route}}}}
@@ -2571,9 +2716,7 @@ def plan_revalidation_prompt(
     )
     return f"""Revalidate the authoritative plan for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "plan", "plan_revalidation", "plan")}
-
-Workspace: {{{{.Params.workspace_path}}}}
+{context_instruction(profile, "plan", "plan_revalidation", "plan")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}
 Plan: {{{{.Params.plan_path}}}}
 Work kind: {{{{.Params.work_kind}}}}
 Intended route after acceptance: {{{{.Params.plan_route}}}}
@@ -2601,7 +2744,7 @@ refreshed `review_context`. Preserve the remaining bounded Fix bundle only in
 normalized snapshot is accepted. Use `needs_user_action` with preserved
 context and `blocker_reason` only for a real unresolved decision or external
 authority. Choose `wont_do` only for explicit cancellation and provide
-`closure_reason`."""
+`closure_reason`.{delivery_context_tail(profile)}"""
 
 
 def fix_prompt(
@@ -2644,17 +2787,13 @@ and focused checks."""
 
     return f"""Apply task-scoped fixes for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "implement", "fix", "implementation")}
-
-Workspace: {{{{.Params.workspace_path}}}}. Findings:
+{context_instruction(profile, "implement", "fix", "implementation")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}. Findings:
 {{{{.Params.fix_context}}}}
 
 {procedure_instruction(profile, "fix")}
 {bounded_contract}
 
-{checkpoint}
-
-Apply the `fix-worker` role contract only to concrete task-introduced or
+{checkpoint}{delivery_context_passthrough_section(profile)}Apply the `fix-worker` role contract only to concrete task-introduced or
 task-worsened findings in `fix_context`. Baseline-wide debt, an unproven
 differential, or contradictory policy is not writer scope.
 {completion_contract}
@@ -2665,23 +2804,21 @@ explicitly. Choose `wont_do` only for explicit cancellation and provide
 `closure_reason`."""
 
 
-def workspace_path_fix_prompt() -> str:
-    return """Correct invalid workflow metadata without editing production files.
+def workspace_path_fix_prompt(profile: ProjectProfile) -> str:
+    return f"""Correct invalid workflow metadata without editing production files.
 
 Verification dispatch rejected the reported workspace:
-{{.Params.reported_workspace_path}}
-Reason: {{.Params.fix_context}}
-
-Treat Kent's current task execution root as authoritative. Resolve its canonical
+{{{{.Params.reported_workspace_path}}}}
+Reason: {{{{.Params.fix_context}}}}{delivery_context_input_section(profile)}Treat Kent's current task execution root as authoritative. Resolve its canonical
 repository root with `git rev-parse --show-toplevel`, or canonical current
 directory for an intentional non-Git workspace. Do not move the worktree,
 change task artifacts, or edit code.
 
 Complete with `verify` and provide the canonical root as `workspace_path`,
-`task_short_id={{.TaskShortId}}`, plus the preserved `review_context`. Use
+`task_short_id={{{{.TaskShortId}}}}`, plus the preserved `review_context`. Use
 `needs_user_action` only if Kent's execution root itself is unavailable or
 ambiguous. Choose `wont_do` only for explicit cancellation and provide
-`closure_reason`."""
+`closure_reason`.{delivery_context_tail(profile)}"""
 
 
 def standards_review_prompt(profile: ProjectProfile) -> str:
@@ -2733,13 +2870,25 @@ def verification_gate_prompt(profile: ProjectProfile) -> str:
         else "Specification review: not enabled by the project profile."
     )
     smoke_decision = smoke_decision_instruction(profile)
+    delivery_context = (
+        "Delivery context: "
+        "{{.Params.verification_dispatch_fanout_verify.delivery_context}}\n"
+        if _delivery_context_enabled(profile)
+        else ""
+    )
+    delivery_context_handoff = (
+        "Return the exact incoming `delivery_context` value on the selected "
+        "transition. Do not use context copied from a previous dispatch cycle."
+        if _delivery_context_enabled(profile)
+        else ""
+    )
     return f"""Evaluate the joined verification reports without editing files.
 
 {context_instruction(profile, "review", "verification_gate", "review")}
 
 Workspace: {{{{.Params.verification_dispatch_fanout_verify.workspace_path}}}}
 Review context: {{{{.Params.verification_dispatch_fanout_verify.review_context}}}}
-Verification status: {{{{.Params.verification_status}}}}
+{delivery_context}Verification status: {{{{.Params.verification_status}}}}
 Verification report: {{{{.Params.verification_report}}}}
 {standards}
 {spec}
@@ -2753,7 +2902,7 @@ For `needs_changes`, emit the deduplicated, dependency-ordered repair bundle
 required by the `workflow-gate` role contract.
 
 Provide `workspace_path`, a refreshed `review_context` summarizing all reports,
-and the required Smoke decision fields. The refreshed `review_context` must
+{delivery_context_handoff}and the required Smoke decision fields. The refreshed `review_context` must
 record the profile Smoke policy, selected transition, rationale, and required
 scope or concrete evidence for bypassing Smoke.
 
@@ -2770,25 +2919,21 @@ def smoke_prompt(profile: ProjectProfile) -> str:
     checkpoint = checkpoint_instruction(profile, "smoke")
     return f"""Run focused smoke testing for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "smoke", "smoke", "smoke")}
-
-Workspace: {{{{.Params.workspace_path}}}}. Review context:
+{context_instruction(profile, "smoke", "smoke", "smoke")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}. Review context:
 {{{{.Params.review_context}}}}
 Smoke rationale: {{{{.Params.smoke_rationale}}}}
 Required scope: {{{{.Params.smoke_scope}}}}
 
 {procedure_instruction(profile, "smoke")}
 
-{checkpoint}
-
-Follow the project-specific browser, device, simulator, hardware, resource-lock,
+{checkpoint}{delivery_context_passthrough_section(profile)}Follow the project-specific browser, device, simulator, hardware, resource-lock,
 build, deploy, install, launch, account, and isolation rules that apply. Do not
 edit production files; route implementation findings to the single writer.
 Complete with `passed` and provide `workspace_path` plus an updated
 `review_context` containing the decision, rationale, tested scope, evidence,
 artifacts, and untested areas. Use `needs_changes` with `workspace_path` and
 `fix_context` for task code issues. Use `needs_user_action` with
-`blocker_reason` for external blockers."""
+`blocker_reason` for external blockers.{delivery_context_tail(profile)}"""
 
 
 def compliance_prompt(profile: ProjectProfile) -> str:
@@ -2800,9 +2945,7 @@ def compliance_prompt(profile: ProjectProfile) -> str:
     evidence_chain = ", ".join(completed_reviews)
     return f"""Run the final read-only delivery compliance review for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "review", "compliance", "review")}
-
-Workspace: {{{{.Params.workspace_path}}}}. Final review context:
+{context_instruction(profile, "review", "compliance", "review")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}. Final review context:
 {{{{.Params.review_context}}}}
 
 {procedure_instruction(profile, "compliance")}
@@ -2825,15 +2968,13 @@ verification flow. Choose
 `needs_user_action` for missing or contradictory authority, evidence, or
 external decisions and provide `workspace_path`, `review_context`, and
 `blocker_reason`. Choose `wont_do` only for explicit cancellation and provide
-`closure_reason`."""
+`closure_reason`.{delivery_context_tail(profile)}"""
 
 
 def compliance_recovery_prompt(profile: ProjectProfile) -> str:
     return f"""Resume the final read-only delivery compliance review.
 
-{context_instruction(profile, "review", "compliance", "review")}
-
-Workspace: {{{{.Params.workspace_path}}}}
+{context_instruction(profile, "review", "compliance", "review")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}
 Final review context: {{{{.Params.review_context}}}}
 Previous blocker: {{{{.Params.blocker_reason}}}}
 
@@ -2850,15 +2991,13 @@ Choose `ship_pr` only when the final work product is compliant. Provide
 `needs_changes` with `workspace_path` and `fix_context` for substantive
 task-scoped violations. Choose `needs_user_action` with `workspace_path`,
 `review_context`, and `blocker_reason` if the blocker remains. Choose `wont_do`
-only for explicit cancellation and provide `closure_reason`."""
+only for explicit cancellation and provide `closure_reason`.{delivery_context_tail(profile)}"""
 
 
 def evidence_repair_prompt(profile: ProjectProfile) -> str:
     return f"""Repair packaging-only workflow evidence for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "implement", "evidence_repair", "implementation")}
-
-Workspace: {{{{.Params.workspace_path}}}}. Final review context:
+{context_instruction(profile, "implement", "evidence_repair", "implementation")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}. Final review context:
 {{{{.Params.review_context}}}}
 Allowed evidence repair:
 {{{{.Params.evidence_context}}}}
@@ -2887,15 +3026,13 @@ substantive and cannot be repaired inside the named evidence artifacts. Use
 `needs_user_action` only for an external blocker and provide `blocker_reason`.
 Also preserve `workspace_path`, `review_context`, and `evidence_context` for
 recovery. Choose `wont_do` only for explicit cancellation and provide
-`closure_reason`."""
+`closure_reason`.{delivery_context_tail(profile)}"""
 
 
 def compliance_recheck_prompt(profile: ProjectProfile) -> str:
     return f"""Recheck final Compliance after packaging-only evidence repair.
 
-{context_instruction(profile, "review", "compliance", "review")}
-
-Workspace: {{{{.Params.workspace_path}}}}
+{context_instruction(profile, "review", "compliance", "review")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}
 Updated review context: {{{{.Params.review_context}}}}
 
 {procedure_instruction(profile, "compliance")}
@@ -2911,10 +3048,14 @@ Choose `needs_changes` with `workspace_path` and `fix_context` only when the
 repair exposed a substantive task defect. Use `needs_user_action` with
 `workspace_path`, `review_context`, and `blocker_reason` for an external or
 authority blocker. Choose `wont_do` only for explicit cancellation and provide
-`closure_reason`."""
+`closure_reason`.{delivery_context_tail(profile)}"""
 
 
 def prepare_pr_prompt(profile: ProjectProfile) -> str:
+    source_ci = (
+        profile.source_ci_contract()
+        and profile.capability("ci_monitoring")
+    )
     compliance_context = (
         "Final Compliance Review: {{.Params.compliance_report}}"
         if (
@@ -2927,14 +3068,45 @@ def prepare_pr_prompt(profile: ProjectProfile) -> str:
     cursor = (
         "\nPreserve a same-PR feedback cursor; initialize `uninitialized` only "
         "for a new PR. Never reset it after Fix or verification.\n"
-        if profile.runtime_contracts_v2()
+        if _delivery_context_enabled(profile)
         else ""
+    )
+    delivery_context_contract = ""
+    if _delivery_context_enabled(profile):
+        delivery_context_contract = """Incoming lifecycle packet:
+{{.Params.delivery_context}}
+
+Before any transition that carries `delivery_context`, construct its compact
+closed `workflow-delivery-context-v1` JSON value from observed delivery state.
+If no PR exists, keep `phase=pre_pr` with no PR or CI fields. After observing a
+PR, use `phase=post_pr` with its actual URL, current branch, resolved merge
+strategy, and feedback cursor. Include `ci_contract` or `ci_report` only when
+that exact packet has actually been produced; preserve each nested packet
+string byte-for-byte. Never invent earlier CI state. For the `monitor_ci`
+handoff to source-contract CI, provide only `workspace_path`,
+`task_short_id={{.TaskShortId}}`, and this post-PR `delivery_context`."""
+    if source_ci:
+        monitor_handoff_contract = """Complete `monitor_ci` with only
+`workspace_path`, `task_short_id={{.TaskShortId}}`, and the updated
+`delivery_context`; PR identity and CI packets belong only in that packet."""
+    elif (
+        not profile.capability("ci_monitoring")
+        and _delivery_context_enabled(profile)
+    ):
+        monitor_handoff_contract = """Complete `monitor_ci` with
+`workspace_path`, the actual `pr_url`, `branch_name`, and `merge_strategy`,
+plus the updated `delivery_context`."""
+    else:
+        monitor_handoff_contract = """Complete through `monitor_ci` and provide `workspace_path`, `pr_url`, and
+`branch_name`, plus the resolved `merge_strategy`."""
+    delivery_context_block = (
+        "\n\n" + delivery_context_contract + "\n\n"
+        if _delivery_context_enabled(profile)
+        else "\n\n"
     )
     return f"""Prepare delivery for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "delivery", "prepare_pr", "delivery")}
-
-Workspace: {{{{.Params.workspace_path}}}}. Review context:
+{context_instruction(profile, "delivery", "prepare_pr", "delivery")}{delivery_context_block}Workspace: {{{{.Params.workspace_path}}}}. Review context:
 {{{{.Params.review_context}}}}
 {cursor}
 {compliance_context}
@@ -2976,10 +3148,8 @@ by the project contract. A source workspace, detached checkout, protected
 branch, or ambiguous branch owner must route to `needs_user_action`; never push
 through that ambiguity.
 
-Complete through `monitor_ci` and provide `workspace_path`, `pr_url`, and
-`branch_name`, plus the resolved `merge_strategy`.
-{("Source-contract CI also requires `task_short_id={{.TaskShortId}}`."
-  if profile.source_ci_contract() and profile.capability("ci_monitoring") else "")}
+{monitor_handoff_contract}
+
 If no PR is genuinely
 applicable, choose `no_pr` and provide `pr_report`; this path requires
 approval. Use `needs_changes` with `workspace_path` and `blocker_reason` for
@@ -2993,6 +3163,22 @@ with `pull_request_feedback_invalid`."""
 
 
 def ci_prompt(profile: ProjectProfile) -> str:
+    source_ci = profile.source_ci_contract() and profile.capability("ci_monitoring")
+    delivery_fix_handoff = (
+        """\n\nFor `needs_changes`, pack the latest observed PR identity, cursor,
+and any produced CI packets in `delivery_context`; preserve packet bytes and
+omit unproduced fields. Keep `needs_user_action` on its existing flat
+self-recovery contract."""
+        if _delivery_context_enabled(profile)
+        else ""
+    )
+    retry_output = (
+        "`workspace_path`, `task_short_id={{.TaskShortId}}`, and "
+        "`delivery_context`"
+        if source_ci
+        else "`workspace_path`, `pr_url`, `branch_name`, and\n"
+        "`merge_strategy` plus the unchanged accumulated `ci_report`"
+    )
     cursor = (
         "\nIncremental PR feedback cursor: {{.Params.pr_feedback_cursor}}\n"
         if profile.runtime_contracts_v2()
@@ -3003,17 +3189,17 @@ def ci_prompt(profile: ProjectProfile) -> str:
 PR identity and whether CI is required. It contains no expected job names or
 release fields. The deterministic watcher classifies every effective check
 reported for that PR; failed extras are not ignored and pending observations
-are not human actions. When a retry is allowed, choose `watch_ci` with the
-unchanged validated contract, accumulated `ci_report`, and cursor; do not
-choose `waiting_pr` directly."""
-        if profile.source_ci_contract()
+are not human actions. When a retry is allowed, choose `watch_ci`; preserve
+the current identity, any produced contract/report, and cursor in the packet.
+Do not choose `waiting_pr` directly."""
+        if source_ci
         else ""
     )
     source_values = (
         """GitHub CI contract: {{.Params.ci_contract}}"""
         + (
             "\nTask: {{.Params.task_short_id}}"
-            if profile.source_ci_contract()
+            if source_ci
             else ""
         )
         if profile.capability("ci_monitoring")
@@ -3023,18 +3209,17 @@ choose `waiting_pr` directly."""
         """A `ci_prepare_failed` entry is preparation diagnosis, not a terminal
 CI observation. Missing packets are represented by empty strings only on this
 diagnostic route. Never parse an empty `ci_report` as a report, invent a
-contract, or infer green CI. Preserve the supplied contract, report, cursor
-and `task_short_id` when choosing `watch_ci`; this always re-enters
+contract, or infer green CI. Preserve the supplied contract, report, cursor,
+and the exact PR identity in `delivery_context` when choosing `watch_ci`.
+Supply `task_short_id` as its own transition parameter. This always re-enters
 deterministic preparation, never the watcher directly. Only a bounded retry
 or a proven task-scoped fix/external blocker is allowed."""
-        if profile.source_ci_contract()
+        if source_ci
         else ""
     )
     return f"""Monitor CI for {{{{.TaskShortId}}}} without editing files.
 
-{context_instruction(profile, "delivery", "ci_monitor", "delivery")}
-
-PR: {{{{.Params.pr_url}}}}
+{context_instruction(profile, "delivery", "ci_monitor", "delivery")}{delivery_context_pack_section(profile)}PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
@@ -3050,8 +3235,7 @@ Apply the `ci-monitor` role contract to the exact terminal watcher report when p
 Do not start another polling loop or ask for approval merely to wait. Re-read
 only the exact PR/run/job metadata and bounded failed-job logs. If the role's
 bounded exact-job retry policy applies, perform one permitted retry and choose
-`watch_ci` with `workspace_path`, `pr_url`, `branch_name`, and
-`merge_strategy` plus the unchanged accumulated `ci_report`; the deterministic
+`watch_ci` with {retry_output}; the deterministic
 watcher owns the wait and appends the new terminal observation. Preserve every
 attempt and failure fingerprint in `ci_report`.
 
@@ -3071,11 +3255,28 @@ Use `needs_changes` with `workspace_path` and `fix_context` for a proven
 task-differential failure or normal target conflict; no task-differential proof
 is needed for that integration conflict. Fix re-verifies the exact PR
 head/base. After retry exhaustion, `needs_user_action` is only for an
-external blocker.
+external blocker.{delivery_fix_handoff}
 Never use `needs_user_action` merely because CI is still running."""
 
 
 def waiting_pr_prompt(profile: ProjectProfile) -> str:
+    source_ci = profile.source_ci_contract() and profile.capability("ci_monitoring")
+    delivery_fix_handoff = (
+        """\n\nFor `needs_changes`, pack the latest observed identity, cursor, and
+any produced CI packets in `delivery_context`; preserve packet strings exactly
+and omit unproduced fields."""
+        + (
+            "\nFor source-contract `ci_required`, provide only "
+            "`workspace_path`, `task_short_id={{.TaskShortId}}`, and the updated "
+            "`delivery_context`; the producer unwraps those observed values. "
+            "Keep `needs_user_action` on its existing flat self-recovery contract."
+            if source_ci
+            else "\nKeep non-source-contract `ci_required` and "
+            "`needs_user_action` on their existing flat contracts."
+        )
+        if _delivery_context_enabled(profile)
+        else ""
+    )
     cursor = (
         "\nIncremental PR feedback cursor: {{.Params.pr_feedback_cursor}}\n"
         if profile.runtime_contracts_v2()
@@ -3083,6 +3284,10 @@ def waiting_pr_prompt(profile: ProjectProfile) -> str:
     )
     ci_recheck = (
         """If the PR head changed or required checks restarted, choose
+`ci_required` and provide `workspace_path`, `task_short_id={{.TaskShortId}}`,
+and `delivery_context`; the producer will unwrap the exact current PR state."""
+        if source_ci
+        else """If the PR head changed or required checks restarted, choose
 `ci_required` and provide `workspace_path`, `pr_url`, `branch_name`, and
 `merge_strategy`; the CI node will watch the new exact run."""
         if profile.capability("ci_monitoring")
@@ -3108,9 +3313,7 @@ re-entry."""
     )
     return f"""Check delivery state for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "delivery", "waiting_pr", "delivery")}
-
-PR: {{{{.Params.pr_url}}}}
+{context_instruction(profile, "delivery", "waiting_pr", "delivery")}{delivery_context_pack_section(profile)}PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
@@ -3146,7 +3349,7 @@ Merely waiting for review or merge is not a blocker. Use
 `needs_changes` with `workspace_path`, `merge_strategy`, and `pr_report` when
 task code or history must change. Choose `close_without_merge` only when the
 latest user comment explicitly approves closing or canceling this PR; provide
-`workspace_path`, `pr_report`, and `closure_reason`."""
+`workspace_path`, `pr_report`, and `closure_reason`.{delivery_fix_handoff}"""
 
 
 def waiting_pr_changed_prompt(profile: ProjectProfile) -> str:
@@ -3431,6 +3634,8 @@ def pr_recovery_fix_prompt(
     *,
     bounded: bool = False,
 ) -> str:
+    delivery_input = delivery_context_line_section(profile)
+    delivery_continuity = delivery_context_tail(profile)
     fresh_contract = ""
     completion_contract = """After resolving task-scoped code, complete with
 `verify` and provide `workspace_path`, `task_short_id={{.TaskShortId}}`, plus
@@ -3451,8 +3656,7 @@ recovery slice remains, and provide `workspace_path`, the same
 
 {context_instruction(profile, "implement", "fix", "implementation")}
 
-Workspace: {{{{.Params.workspace_path}}}}.
-Recovery issue: {{{{.Params.blocker_reason}}}}
+Workspace: {{{{.Params.workspace_path}}}}.{delivery_input}Recovery issue: {{{{.Params.blocker_reason}}}}
 
 {procedure_instruction(profile, "fix")}
 {fresh_contract}
@@ -3461,7 +3665,7 @@ The approval applies only to the exact reported PR/branch recovery. Never infer
 permission for a broader rebase or force-push. {completion_contract}
 Use `needs_user_action` with `blocker_reason` if the approved recovery is still
 unsafe. Choose `wont_do` only for an explicit cancellation decision and
-provide `closure_reason`."""
+provide `closure_reason`.{delivery_continuity}"""
 
 
 def pr_feedback_fix_prompt(
@@ -3469,10 +3673,21 @@ def pr_feedback_fix_prompt(
     *,
     bounded: bool = False,
 ) -> str:
+    context_enabled = _delivery_context_enabled(profile)
+    delivery_input = delivery_context_line_section(profile)
+    delivery_continuity = delivery_context_tail(profile)
     cursor = (
         "\nValidated PR feedback cursor: {{.Params.pr_feedback_cursor}}\n"
-        if profile.runtime_contracts_v2()
+        if profile.runtime_contracts_v2() and not context_enabled
         else ""
+    )
+    pr_identity = (
+        """The PR URL, branch, merge strategy, and feedback cursor are in the
+lifecycle packet above; preserve and use those exact values.
+PR report: {{.Params.pr_report}}"""
+        if context_enabled
+        else """Resolved merge strategy: {{.Params.merge_strategy}}.
+PR report: {{.Params.pr_report}}"""
     )
     fresh_contract = ""
     completion_contract = """Complete with `verify` and provide
@@ -3495,9 +3710,7 @@ conflict.
 
 {context_instruction(profile, "implement", "fix", "implementation")}
 
-Workspace: {{{{.Params.workspace_path}}}}.
-Resolved merge strategy: {{{{.Params.merge_strategy}}}}.
-PR report: {{{{.Params.pr_report}}}}
+Workspace: {{{{.Params.workspace_path}}}}.{delivery_input}{pr_identity}
 {cursor}
 
 {procedure_instruction(profile, "fix")}
@@ -3521,7 +3734,7 @@ the full Fix and verification loop.
 {completion_contract}
 Use `needs_user_action` with `blocker_reason` for external or policy blockers.
 Choose `wont_do` only for an explicit cancellation decision and provide
-`closure_reason`."""
+`closure_reason`.{delivery_continuity}"""
 
 
 def post_smoke_target(profile: ProjectProfile) -> str:

@@ -16,8 +16,12 @@ from unittest import mock
 from workflowkit import runtime
 from workflowkit import ci_contract
 from workflowkit.release import NormalizedGitHubWorkflowSourceV1
-from workflowkit.ci_contract import CiContractError, normalize_github_workflow
-from workflowkit.ci_contract import prepare_ci_payload
+from workflowkit.ci_contract import (
+    CiContractError,
+    normalize_github_workflow,
+    preparation_failure,
+    prepare_ci_payload,
+)
 
 from tests.test_revision import (
     CONTEXT_MANIFESTS,
@@ -42,6 +46,156 @@ def source_validation_copy_ignore(directory, names):
 
 
 class CiContractTest(unittest.TestCase):
+    def test_delivery_context_unwraps_before_identity_and_failure_routing(self) -> None:
+        context = {
+            "schema": "workflow-delivery-context-v1",
+            "phase": "post_pr",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "feature/TASK-17",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": "uninitialized",
+            "ci_contract": "malformed-but-preserved",
+            "ci_report": ' { "schema" : "invalid" } ',
+        }
+        payload = {
+            "workspace_path": str(ROOT),
+            "task_short_id": "TASK-17",
+            "delivery_context": json.dumps(context),
+        }
+        with mock.patch.object(
+            ci_contract,
+            "_prepare_ci_payload",
+            return_value={"transition": "prepared"},
+        ) as prepare:
+            result = prepare_ci_payload(payload)
+        self.assertEqual(result, {"transition": "prepared"})
+        passed = prepare.call_args.args[0]
+        for key in (
+            "pr_url",
+            "branch_name",
+            "merge_strategy",
+            "pr_feedback_cursor",
+            "ci_contract",
+            "ci_report",
+        ):
+            self.assertEqual(passed[key], context[key])
+        self.assertNotIn("delivery_context", passed)
+        self.assertEqual(passed["workspace_path"], str(ROOT))
+        self.assertEqual(passed["task_short_id"], "TASK-17")
+
+        failure = preparation_failure(payload)
+        self.assertEqual(failure["transition"], "ci_prepare_failed")
+        self.assertEqual(failure["pr_url"], context["pr_url"])
+        self.assertEqual(failure["ci_contract"], context["ci_contract"])
+        self.assertEqual(failure["ci_report"], context["ci_report"])
+
+    def test_delivery_context_rejects_contradictory_mixed_flat_values(self) -> None:
+        context = {
+            "schema": "workflow-delivery-context-v1",
+            "phase": "post_pr",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "feature/TASK-17",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": "uninitialized",
+        }
+        payload = {
+            "workspace_path": str(ROOT),
+            "task_short_id": "TASK-17",
+            "delivery_context": json.dumps(context),
+            "branch_name": "feature/TASK-18",
+        }
+        with self.assertRaises(CiContractError):
+            prepare_ci_payload(payload)
+        with self.assertRaises(CiContractError):
+            preparation_failure(payload)
+
+    def test_context_packet_strings_reach_existing_ci_diagnostic_validator(self) -> None:
+        context = {
+            "schema": "workflow-delivery-context-v1",
+            "phase": "post_pr",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "feature/TASK-17",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": "uninitialized",
+            "ci_contract": "malformed-but-still-a-string",
+        }
+        payload = {
+            "workspace_path": str(ROOT),
+            "task_short_id": "TASK-17",
+            "delivery_context": json.dumps(context),
+        }
+        pull_request = {
+            "url": context["pr_url"],
+            "headRefName": context["branch_name"],
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefOid": "a" * 40,
+            "baseRefOid": "b" * 40,
+        }
+        with mock.patch.object(
+            ci_contract,
+            "read_pull_request",
+            return_value=pull_request,
+        ):
+            with self.assertRaisesRegex(
+                CiContractError,
+                "previous CI contract is invalid",
+            ):
+                prepare_ci_payload(payload)
+
+    def test_prepare_ci_cli_routes_context_identity_after_unwrap(self) -> None:
+        context = {
+            "schema": "workflow-delivery-context-v1",
+            "phase": "post_pr",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "feature/TASK-17",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": "uninitialized",
+        }
+        result = subprocess.run(
+            [sys.executable, "-B", str(ROOT / "scripts/prepare-github-ci")],
+            input=json.dumps({
+                "workspace_path": str(ROOT),
+                "task_short_id": "TASK-17",
+                "delivery_context": json.dumps(context),
+            }),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env={**os.environ, "KENT_GH_BIN": "/nonexistent-gh"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["transition"], "ci_prepare_failed")
+        self.assertEqual(output["pr_url"], context["pr_url"])
+        self.assertEqual(output["branch_name"], context["branch_name"])
+        self.assertEqual(output["pr_feedback_cursor"], "uninitialized")
+        self.assertEqual(output["ci_contract"], "")
+        self.assertEqual(output["ci_report"], "")
+
+    def test_prepare_ci_cli_does_not_fallback_from_invalid_context_to_flat_values(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-B", str(ROOT / "scripts/prepare-github-ci")],
+            input=json.dumps({
+                "workspace_path": str(ROOT),
+                "task_short_id": "TASK-17",
+                "pr_url": "https://github.com/owner/repository/pull/17",
+                "branch_name": "feature/TASK-17",
+                "merge_strategy": "rebase",
+                "pr_feedback_cursor": "uninitialized",
+                "delivery_context": '{"schema":"wrong","phase":"pre_pr"}',
+            }),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env={**os.environ, "KENT_GH_BIN": "/nonexistent-gh"},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"error": "ci_prepare_input_invalid"},
+        )
+
     def test_required_job_projection_accepts_schema3_native_agent_source(self) -> None:
         fixture = RevisionPreflightTest("test_schema3_native_agent_preflight_binds_snapshot_without_script")
         try:
@@ -1055,14 +1209,22 @@ jobs:
                 self.assertEqual(result.returncode, 0, result.stderr)
                 return json.loads(result.stdout)
 
+            delivery_context = json.dumps({
+                "schema": "workflow-delivery-context-v1",
+                "phase": "post_pr",
+                "pr_url": payload["pr_url"],
+                "branch_name": payload["branch_name"],
+                "merge_strategy": payload["merge_strategy"],
+                "pr_feedback_cursor": "uninitialized",
+            })
             prepared = invoke(
                 scripts / "workflow-prepare-github-ci",
                 transport(
                     "prepare_pr_ci_prepare",
                     {
-                        **payload,
-                        "ci_contract": "",
-                        "pr_feedback_cursor": "uninitialized",
+                        "workspace_path": str(root),
+                        "task_short_id": payload["task_short_id"],
+                        "delivery_context": delivery_context,
                     },
                 ),
             )

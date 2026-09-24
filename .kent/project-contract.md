@@ -22,8 +22,8 @@ gap and use available evidence. Ask only for real decisions or external acts.
 
 `.kent/workflow-profile.toml` maps work kinds, procedures and commands.
 `.kent/workflows/kit_development.py` composes the existing lite graph; its
-semantic candidate is Kit Engineering Delivery v3, with spec
-`.kent/workflows/kit-engineering-delivery-v3.spec.json`. Preserve the v1 and v2
+semantic candidate is Kit Engineering Delivery v4, with spec
+`.kent/workflows/kit-engineering-delivery-v4.spec.json`. Preserve the v1, v2 and v3
 snapshots and task-backed Workflow unchanged; future live rollout requires
 a separately approved new Workflow UUID and fresh qualification.
 The flow has 21 nodes, 51 transition groups and 52 edges, with continuous
