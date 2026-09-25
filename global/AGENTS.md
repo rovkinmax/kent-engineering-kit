@@ -75,8 +75,13 @@
 - `compact_and_continue_session` may keep the same session ID. Verify the
   compaction event and refreshed lock rather than expecting a new ID.
 - Workflow transition keys, Script stdout, prompts, and parameters are one
-  revisioned contract. Do not mutate a task-backed graph edge by edge; create a
-  new workflow revision and let active tasks finish on their frozen graph.
+  revisioned contract. Apply complete graph changes, never edge-by-edge edits.
+  Task presence or status alone does not prohibit an update. Before changing a
+  shared Workflow, read the installed Kent Engineering Kit contract
+  `contracts/workflow-update-compatibility.md` and establish impact-scoped
+  compatibility with affected tasks, retained execution and pending decisions.
+  If relevant compatibility is unproven, defer the effect. Source publication
+  does not authorize live changes or refresh locked Session instructions.
 
 ## Worktrees And Shared Resources
 
