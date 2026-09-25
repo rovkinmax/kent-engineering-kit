@@ -38,6 +38,7 @@
   structured keys, and repository artifacts in their project-defined language.
 - This includes questions, transition commentary, `blocker_reason`,
   `closure_reason`, and approval summaries.
+- Ask questions in plain, conversational language: briefly explain what is happening, what the user needs to decide, and what the choice changes, without bureaucratic phrasing or unexplained technical jargon.
 - Make approval and blocker text decision-oriented. Use the compact Russian
   structure `Нужно от вас`, `Почему`, and `После подтверждения` when useful.
 - Questions and approvals are for real user decisions or external actions. In approval text, do not paste raw review reports; do not present task-scoped code fixes as actions the user must perform.
