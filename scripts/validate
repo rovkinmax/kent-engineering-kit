@@ -260,6 +260,11 @@ if grep -n -F 'Do not call `kent run`' "$repo_root"/agents/*.md; then
   exit 1
 fi
 
+if grep -n -F 'contracts/role-contract.md' "$repo_root"/agents/*.md; then
+  echo "global role prompts must not depend on an uninstalled Kit contract" >&2
+  exit 1
+fi
+
 for communication_role in \
   "$repo_root/agents/architecture-designer.md" \
   "$repo_root/agents/researcher.md" \
@@ -269,7 +274,9 @@ for communication_role in \
   "$repo_root/agents/release-manager.md"; do
   for communication_guard in \
     'kent run steer <session-id>' \
+    'kent run watch <session-id>' \
     'kent run --agent grill' \
+    'Do not use `kent run wait`' \
     'In Workflow, do not' \
     'child agents'; do
     grep -F "$communication_guard" "$communication_role" >/dev/null || {
@@ -279,10 +286,15 @@ for communication_role in \
   done
 done
 
-grep -F 'prompts/grill.md' "$repo_root/agents/grill.md" >/dev/null || {
-    echo "grill role must load the canonical decision method" >&2
+for grill_guard in \
+  'prompts/grill.md' \
+  'kent run watch <session-id>' \
+  'Do not use `kent run wait`'; do
+  grep -F "$grill_guard" "$repo_root/agents/grill.md" >/dev/null || {
+    echo "grill role must retain the canonical method and bounded watch" >&2
     exit 1
-}
+  }
+done
 
 names_file="$(mktemp)"
 trap 'rm -f "$names_file"' EXIT

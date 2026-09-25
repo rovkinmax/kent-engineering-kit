@@ -230,11 +230,19 @@ kent run --agent grill 'Critique this design and list unresolved decisions'
 
 Give grill the ID of an existing Session to request independent criticism.
 It uses `kent run steer <session-id> '<message>'` for an active run; only grill
+and the six bounded roles may observe one next outcome of that same active run
+with a time-bounded read-only `kent run watch <session-id>` after steer.
+An unrelated result or unresolved Question does not prove a response;
+`kent run wait`, stop, and Task/Workflow actions remain unavailable. Only grill
 may attempt one continuation of a verified idle, ordinary non-Workflow
-Session. If the target cannot be verified, it returns a prepared request
-instead. `prompts/grill.md` owns the method; the role cannot edit files or
-change Task/Workflow state. Source validation alone does not prove runtime
-communication works.
+Session after a normally completed run. A manual stop or interruption requires
+a new human decision for that Session after the stop; unknown outcomes block
+automatic continuation. If the target cannot be verified, grill returns a
+prepared request. `prompts/grill.md` owns the method; the role cannot edit
+files or change Task/Workflow state. Source validation does not prove runtime
+communication: after separately approved installation and restart, exercise
+active messaging and an intentionally interrupted disposable Session without
+touching real Tasks.
 
 After changing global subagent configuration, restart Kent and reopen Kent
 Desktop. Skills, prompts, and `AGENTS.md` are consumed by new sessions.
