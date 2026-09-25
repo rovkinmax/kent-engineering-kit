@@ -74,8 +74,10 @@ Do not create or link live workflows until the project profile validates.
 For Kent 2.6 graph work, inspect the complete graph and compute the kit-owned
 local semantic preview before graph apply. Do not treat graph apply as a
 dry-run: it saves non-destructive changes and pauses only for destructive
-confirmation. Apply a versioned workflow non-default first, then validate and require a
-managed-worktree canary before changing the project default. Any workflow with
-Tasks is a frozen revision; create a new version rather than editing it in
-place. Task Start/Move/Resume may receive an explicit `--branch-name` when the
+confirmation. Workflow update eligibility follows
+[Execution-history and compatibility policy](../contracts/workflow-contract.md#execution-history-and-compatibility-policy).
+For a separately approved new revision, apply non-default first, then validate
+and require a managed-worktree canary before changing the project default.
+Source edits do not mutate live workflows.
+Task Start/Move/Resume may receive an explicit `--branch-name` when the
 initial managed-worktree branch must differ from the task short ID.

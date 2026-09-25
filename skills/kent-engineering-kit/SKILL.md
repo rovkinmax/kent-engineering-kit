@@ -14,8 +14,9 @@ The Kit is platform-neutral. Shared workflow owns lifecycle, approvals,
 fan-out/Join, waiting, cleanup, and portable parameters. Projects own build,
 architecture, devices, integrations, credentials, and release procedures.
 Maintainer contracts are normative generator sources. Do not edit Kent's
-database directly. Existing task-backed graphs are frozen: semantic changes
-use a new non-default version and a managed-worktree canary. Do not install,
+database directly. Workflow updates follow
+[Execution-history and compatibility policy](../../contracts/workflow-contract.md#execution-history-and-compatibility-policy);
+source edits do not mutate live workflows. Do not install,
 activate, publish, push, restart, or mutate live Workflow/Task/default state
 without a separately approved effect gate.
 

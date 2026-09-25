@@ -26,6 +26,10 @@ semantic candidate is Kit Engineering Delivery v4, with spec
 `.kent/workflows/kit-engineering-delivery-v4.spec.json`. Preserve the v1, v2 and v3
 snapshots and task-backed Workflow unchanged; future live rollout requires
 a separately approved new Workflow UUID and fresh qualification.
+That specific rollout restriction remains unchanged. General workflow update
+eligibility follows
+[Execution-history and compatibility policy](../contracts/workflow-contract.md#execution-history-and-compatibility-policy);
+source edits do not mutate live workflows or authorize broader driver admission.
 The flow has 21 nodes, 51 transition groups and 52 edges, with continuous
 writer sessions and task branch identity. Plan's callable read-only leaf and
 the separate Plan Review node provide the two preview reviews. Only
