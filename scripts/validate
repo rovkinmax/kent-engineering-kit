@@ -255,16 +255,34 @@ if configured != available:
     )
 PY
 
-leaf_guard="Do not call \`kent run\`"
-for leaf_role in \
+if grep -n -F 'Do not call `kent run`' "$repo_root"/agents/*.md; then
+  echo "role prompt blanket prohibition conflicts with bounded Session communication" >&2
+  exit 1
+fi
+
+for communication_role in \
+  "$repo_root/agents/architecture-designer.md" \
+  "$repo_root/agents/researcher.md" \
   "$repo_root/agents/standards-reviewer.md" \
   "$repo_root/agents/spec-reviewer.md" \
-  "$repo_root/agents/compliance_reviewer.md"; do
-  grep -F "$leaf_guard" "$leaf_role" >/dev/null || {
-    echo "workflow leaf role must prohibit child-agent creation: $leaf_role" >&2
-    exit 1
-  }
+  "$repo_root/agents/compliance_reviewer.md" \
+  "$repo_root/agents/release-manager.md"; do
+  for communication_guard in \
+    'kent run steer <session-id>' \
+    'kent run --agent grill' \
+    'In Workflow, do not' \
+    'child agents'; do
+    grep -F "$communication_guard" "$communication_role" >/dev/null || {
+      echo "role must preserve bounded Session and Workflow child policy: $communication_role" >&2
+      exit 1
+    }
+  done
 done
+
+grep -F 'prompts/grill.md' "$repo_root/agents/grill.md" >/dev/null || {
+    echo "grill role must load the canonical decision method" >&2
+    exit 1
+}
 
 names_file="$(mktemp)"
 trap 'rm -f "$names_file"' EXIT

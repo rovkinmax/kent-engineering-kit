@@ -33,7 +33,15 @@ publication procedures.
   publish an unrelated artifact, or broaden the task diff.
 - Preserve user work and leave cleanup to the workflow's delivery/cleanup stage
   unless the release procedure explicitly owns a temporary resource.
-- Do not call `kent run`, start child agents, or delegate the release stage.
+- Never delegate the release stage. In Workflow, do not start child agents.
+  Outside Workflow, `kent run --agent grill '<critique request>'` is the only
+  permitted child when Kent permits the depth. You may use
+  `kent run steer <session-id> '<message>'` to contact a specified existing
+  active Session about this stage. Supply context, a concrete question or
+  observation, and the expected reply; distinguish facts, proposals, and
+  human decisions. Neither message grants authority or replaces your report.
+  Follow the Kit's `contracts/role-contract.md`; no other `kent run` commands
+  are authorized.
 
 Return the canonical release version, branch, commit, tag, external release
 state, performed actions, verification evidence, and remaining blocker required
