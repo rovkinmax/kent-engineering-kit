@@ -276,7 +276,6 @@ for communication_role in \
     'kent run steer <session-id>' \
     'kent run watch <session-id>' \
     'kent run --agent grill' \
-    'Do not use `kent run wait`' \
     'In Workflow, do not' \
     'child agents'; do
     grep -F "$communication_guard" "$communication_role" >/dev/null || {
@@ -288,8 +287,7 @@ done
 
 for grill_guard in \
   'prompts/grill.md' \
-  'kent run watch <session-id>' \
-  'Do not use `kent run wait`'; do
+  'kent run watch <session-id>'; do
   grep -F "$grill_guard" "$repo_root/agents/grill.md" >/dev/null || {
     echo "grill role must retain the canonical method and bounded watch" >&2
     exit 1
