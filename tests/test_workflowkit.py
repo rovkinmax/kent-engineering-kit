@@ -504,6 +504,7 @@ class WorkflowKitTest(unittest.TestCase):
             "standards-reviewer": ("medium", False, False, True, False),
             "spec-reviewer": ("medium", False, False, True, False),
             "architecture-designer": ("high", True, True, True, False),
+            "grill": ("high", True, False, True, False),
             "implementation-worker": ("xhigh", True, True, True, True),
             "fix-worker": ("medium", True, True, True, True),
             "build-doctor": ("high", True, True, True, True),
@@ -527,6 +528,7 @@ class WorkflowKitTest(unittest.TestCase):
             "standards-reviewer": "gpt-6-astra",
             "spec-reviewer": "gpt-6-astra",
             "architecture-designer": "gpt-6-astra",
+            "grill": "gpt-6-astra",
             "implementation-worker": "gpt-6-luna",
             "fix-worker": "gpt-6-astra",
             "build-doctor": "gpt-6-sol",
@@ -629,6 +631,68 @@ class WorkflowKitTest(unittest.TestCase):
                 },
             },
         )
+
+    def test_grill_method_and_session_communication_contract(self) -> None:
+        prompt = (REPO_ROOT / "agents" / "grill.md").read_text()
+        method = (REPO_ROOT / "prompts" / "grill.md").read_text()
+        contract = (REPO_ROOT / "contracts" / "role-contract.md").read_text()
+        normalized_prompt = " ".join(prompt.split())
+        self.assertIn("Ask exactly one decision question at a time.", method)
+        self.assertIn("prompts/grill.md", prompt)
+        self.assertNotIn("Ask exactly one decision question at a time.", prompt)
+        for requirement in (
+            "one material decision question at a time",
+            "In a headless run, do not ask",
+            "excessive",
+            "complexity",
+            "cost",
+            "foregone usefulness",
+            "kent run steer <session-id>",
+            "kent run --session <session-id>",
+            "demonstrably idle, ordinary",
+            "not owned by a Workflow Task",
+            "Do not retry an ambiguous outcome",
+            "never edit files yourself",
+            "start children",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, normalized_prompt)
+        for requirement in (
+            "verified facts, agent proposals, and human decisions",
+            "recipient retains its own contract",
+            "formal reports, Workflow transitions, or independent review",
+            "Steer permission does not permit `kent run stop`",
+            "only outside Workflow",
+            "max_subagent_depth",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, contract)
+
+    def test_communication_exception_does_not_restore_blanket_run_ban(self) -> None:
+        role_names = (
+            "architecture-designer",
+            "researcher",
+            "standards-reviewer",
+            "spec-reviewer",
+            "compliance_reviewer",
+            "release-manager",
+        )
+        for name in role_names:
+            with self.subTest(role=name):
+                prompt = (REPO_ROOT / "agents" / f"{name}.md").read_text()
+                self.assertIn("kent run steer <session-id>", prompt)
+                self.assertIn("kent run --agent grill", prompt)
+                self.assertIn(
+                    "In Workflow, do not start child agents",
+                    " ".join(prompt.split()),
+                )
+                self.assertIn("contracts/role-contract.md", prompt)
+                self.assertNotIn("Do not call `kent run`", prompt)
+                self.assertNotIn("kent run --session", prompt)
+                self.assertNotIn("kent run stop", prompt)
+        for path in (REPO_ROOT / "agents").glob("*.md"):
+            with self.subTest(role=path.name):
+                self.assertNotIn("Do not call `kent run`", path.read_text())
 
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
         config = tomllib.loads(

@@ -219,8 +219,26 @@ monitoring, research, architecture, and independent review roles. Canonical
 roles are contract-complete without project overrides. Workspace
 specialization remains optional and must preserve the same role contract.
 
+After separately approved installation of the grill role, the managed config
+merge, and a Kent restart, start a new decision discussion interactively or
+headlessly:
+
+```sh
+kent --agent grill
+kent run --agent grill 'Critique this design and list unresolved decisions'
+```
+
+Give grill the ID of an existing Session to request independent criticism.
+It uses `kent run steer <session-id> '<message>'` for an active run; only grill
+may attempt one continuation of a verified idle, ordinary non-Workflow
+Session. If the target cannot be verified, it returns a prepared request
+instead. `prompts/grill.md` owns the method; the role cannot edit files or
+change Task/Workflow state. Source validation alone does not prove runtime
+communication works.
+
 After changing global subagent configuration, restart Kent and reopen Kent
 Desktop. Skills, prompts, and `AGENTS.md` are consumed by new sessions.
+Existing Sessions keep their locked prompts and execution settings.
 
 ## Workflow generation
 

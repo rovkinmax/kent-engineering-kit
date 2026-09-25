@@ -105,6 +105,20 @@ shell = true
 patch = false
 edit = false
 
+[subagents.grill]
+description = "Read-only decision stress-testing and bounded cross-Session criticism."
+model = "gpt-6-astra"
+system_prompt_file = "agents/grill.md"
+thinking_level = "high"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = false
+
+[subagents.grill.tools]
+shell = true
+patch = false
+edit = false
+
 [subagents.implementation-worker]
 description = "Single-writer implementation slices governed by the approved project plan."
 model = "gpt-6-luna"

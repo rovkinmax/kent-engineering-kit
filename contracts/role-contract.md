@@ -38,6 +38,37 @@ require explicit mutation confirmation, and report preimage/postimage
 settlement without granting shell, patch, edit, delegation, or workflow
 subagent access.
 
+## Session Communication
+
+Shell-capable roles may use `kent run steer <session-id> '<message>'` only to
+contact a specified, existing, active Session about the current assignment.
+Include relevant context, a specific question or observation, and the
+expected response. Mark verified facts, agent proposals, and human decisions
+separately; cite the source of a claimed user decision. Do not select unrelated
+Sessions, impersonate the user, or imply that a steer grants new authority to
+the recipient. The recipient retains its own contract. Messages do not replace
+formal reports, Workflow transitions, or independent review.
+
+Steer permission does not permit `kent run stop`, continuation of other
+Sessions, Task or Workflow management, approvals, or creating children.
+Only grill has the narrower additional permission to attempt
+`kent run --session <session-id> '<bounded critique request>'` once for an
+explicitly specified, demonstrably idle ordinary Session that is not owned by
+a Workflow Task. An unknown target type or state, or an ambiguous result,
+blocks continuation rather than triggering a retry. This exception is not
+permission for other roles to resume Sessions.
+
+The six roles with previously blanket `kent run` prohibitions may also start
+`kent run --agent grill '<bounded critique request>'` only outside Workflow
+and only when Kent permits their child depth. This is independent criticism,
+not delegation of the caller's responsibility. In Workflow, these roles remain
+leaf Sessions: they may steer an existing active Session or return the request
+to their caller, but cannot launch grill. Grill has
+`agent_callable = true` and `workflow_subagent = false`; do not raise the root
+`max_subagent_depth` or grant tools to a tool-less role to circumvent these
+limits. These narrow Kent Session-state effects do not authorize other
+mutations prohibited by a role.
+
 ## Review Ownership
 
 Generated Delivery workflows assign operational ownership directly from the
@@ -66,9 +97,11 @@ of those final review responsibilities before the graph fan-out.
 Standards, Specification, and Compliance are direct workflow leaf roles. Their
 config sets `agent_callable = false` and `workflow_subagent = false` so other
 agents cannot target those review roles, while their prompts prohibit the
-review sessions themselves from creating any child role. Delegation depth is a
-root setting rather than a per-role child policy, so the no-child guarantee is
-behavioral rather than tool-enforced.
+review sessions themselves from creating any child role in Workflow. Outside
+Workflow, they may request grill criticism only within the Session
+Communication boundary. Delegation depth is a root setting rather than a
+per-role child policy, so the Workflow no-child guarantee is behavioral
+rather than tool-enforced.
 
 Standalone review commands may use project-specialized reviewers when no
 generated Delivery graph owns the same review pass.
