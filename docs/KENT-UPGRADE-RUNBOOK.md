@@ -29,9 +29,9 @@ proof.
 3. Export every live Workflow and create a verified Kent database backup.
    For each workflow, also capture `kent workflow graph inspect <uuid>` as the
    complete graph document.
-4. Do not edit a task-backed Workflow in place. Treat its graph and persisted
-   provenance as a frozen revision. Prepare a new workflow revision for any
-   semantic change and retain the old revision for rollback.
+4. Assess the exact proposed update under
+   [Execution-history and compatibility policy](../contracts/workflow-contract.md#execution-history-and-compatibility-policy).
+   Source edits and an upgrade do not authorize live graph effects.
 5. Verify Kent's `worktrees.base_dir`. All automatic and explicit managed
    worktree paths must remain below that directory and must not overlap the
    source Workspace. Persisted worktrees outside the namespace cannot be
@@ -51,14 +51,16 @@ Kent 2.6's graph workflow separates review from atomic persistence:
    review that fresh impact and repeat with `--confirm`. Kent applies the graph
    atomically as one operation; it does not expose a partially edited sequence
    of node/edge mutations.
-4. Validate the resulting revision in execution mode, link it non-default,
+4. Verify the resulting graph under the approved operation's exact postconditions.
+   For a new revision, validate it in execution mode, link it non-default,
    and run the managed-worktree canary before any default promotion.
 
 A successful local preview is not a promotion. A successful atomic apply is
-not permission to rewrite Tasks: task-backed revisions remain frozen, and a
-semantic change must be linked as a new revision. If the new revision fails,
-rollback by restoring the previous project default/link; do not move existing
-Tasks across incompatible graphs.
+not permission to rewrite Tasks. Update and forward-restore eligibility follow
+[Execution-history and compatibility policy](../contracts/workflow-contract.md#execution-history-and-compatibility-policy).
+For a failed new-revision rollout, restore the previous project default/link
+only under the approved recovery boundary; do not move existing Tasks across
+incompatible graphs.
 
 ## After upgrading
 

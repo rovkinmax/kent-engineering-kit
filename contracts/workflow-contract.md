@@ -37,10 +37,10 @@ exempt.
   re-enter the fan-out source so every sibling and Join invariant is recreated.
 - Transition keys, Script stdout, prompts, and prior-value keys form one
   versioned contract. Runtime baseline: Kent 2.6.1 (August 13, 2026).
-- Graph apply is complete, previewed, confirmed, and atomic. Generic
-  task-backed changes use a new non-default version and managed-worktree
-  canary.
-- Canonical exception: an approved release may advance the same linked/default
+- Graph apply is complete, previewed, confirmed, and atomic. Eligibility follows
+  [policy](#execution-history-and-compatibility-policy).
+- The terminal-only canonical reconciliation driver supports an approved
+  release advancing the same linked/default
   UUID once only with terminal tasks/anchors, settled approvals, quiescence,
   exact source/target and link/default invariants, a live gate, and forward
   restore. Preserve terminal IDs/statuses/anchors; forbid replacement,
@@ -61,6 +61,10 @@ exempt.
   authorized revision/task; the immutable candidate is never patched in place.
 
 Runtime v2 is atomic.
+
+### Execution-history and compatibility policy
+
+For workflow updates, read [the authoritative policy](workflow-update-compatibility.md).
 
 ## User
 
@@ -129,8 +133,9 @@ Runtime v2 is atomic.
   work without resetting preserved implementation.
 - When a recovery task explicitly requests a Plan-only confirmation gate, Plan
   completes through `needs_user_action` instead of selecting Implement.
-- Existing task-backed workflows retain their recorded writer policy. Changing
-  this policy requires a new non-default workflow and managed-worktree canary.
+- Writer-policy changes follow
+  [policy](#execution-history-and-compatibility-policy),
+  including compatibility with retained writer instructions.
 - Verification Gate deduplicates overlapping reports into one
   dependency-ordered Fix bundle. In continuous mode, the retained Fix session
   resolves every compatible root-cause group before re-verification. It does
@@ -471,8 +476,9 @@ defined by `contracts/plan-contract.md`.
   already delivered before stale or late workflow routing reached the writer.
   The edge requires authoritative PR URL, branch, and merge proof; it never
   resumes implementation or repeats verification on the merged task branch.
-- Task-backed workflows keep their recorded PR prompts. Apply this contract in
-  a new non-default workflow and canary it before promotion.
+- Adopting PR prompt changes follows
+  [policy](#execution-history-and-compatibility-policy),
+  including compatibility with retained PR instructions and pending decisions.
 - When the task resolves an issue in the same repository, Prepare PR adds the
   source-control provider's closing reference (`Fixes #N` on GitHub). A
   cross-repository, partial, or follow-up relationship is linked without a

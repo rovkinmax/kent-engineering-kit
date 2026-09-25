@@ -644,6 +644,19 @@ class WorkflowKitTest(unittest.TestCase):
             role_prompt("ci-monitor.md"),
         )
 
+    def test_workflow_update_policy_placement_is_bounded(self) -> None:
+        contract = (REPO_ROOT / "contracts" / "workflow-contract.md").read_text()
+        self.assertIn(
+            "### Execution-history and compatibility policy\n\n"
+            "For workflow updates, read [the authoritative policy]"
+            "(workflow-update-compatibility.md).",
+            contract,
+        )
+        policy = REPO_ROOT / "contracts" / "workflow-update-compatibility.md"
+        self.assertTrue(policy.is_file())
+        self.assertTrue(policy.read_text().strip())
+        self.assertLessEqual(policy.stat().st_size, 4000)
+
     def test_team_delivery_has_direct_fanout_join(self) -> None:
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)
@@ -3913,7 +3926,11 @@ class WorkflowKitTest(unittest.TestCase):
         }
         client.run_json = lambda args: commands.append(args) or {}
 
-        with self.assertRaisesRegex(SpecError, "frozen"):
+        with self.assertRaisesRegex(
+            SpecError,
+            "this client does not support task-referenced semantic updates"
+            r"\. Use a separately approved lifecycle operation",
+        ):
             client.workflow_has_tasks = lambda current: True
             client.apply(spec)
         self.assertEqual(commands, [])
@@ -3970,7 +3987,11 @@ class WorkflowKitTest(unittest.TestCase):
         client.workflow_has_tasks = lambda current: False
         client.workflow_is_linked = lambda current: True
 
-        with self.assertRaisesRegex(SpecError, "linked to a project"):
+        with self.assertRaisesRegex(
+            SpecError,
+            "linked to a project; this client does not support linked semantic updates"
+            r"\. Use a separately approved lifecycle operation",
+        ):
             client.apply(spec)
 
     def test_apply_rejects_non_atomic_graph_mutation_when_tasks_exist(self) -> None:
@@ -4030,7 +4051,8 @@ class WorkflowKitTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             SpecError,
-            "graph is frozen",
+            "this client does not support task-referenced semantic updates"
+            r"\. Use a separately approved lifecycle operation",
         ):
             client.apply(spec)
         self.assertEqual(commands, [])

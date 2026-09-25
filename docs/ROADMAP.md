@@ -12,9 +12,10 @@
 
 Current baseline: **Kent 2.6.1, released August 13, 2026** (Kent 2.6.0 was
 released August 12, 2026). The upgrade establishes the generator,
-documentation, and operational baseline. Project adoption uses new non-default
-workflow revisions; it never rewrites task-backed graphs or moves existing
-task records between revisions.
+documentation, and operational baseline. Current project adoption follows
+[Execution-history and compatibility policy](../contracts/workflow-contract.md#execution-history-and-compatibility-policy).
+Historical rollout records and the specific experiment restrictions below
+retain their original scope; source changes do not authorize live effects.
 
 The kit is intentionally iterative. Stabilize real delivery first; normalize
 names, remove experiments, and introduce a strict compatibility version only
@@ -248,11 +249,12 @@ Kent, and leaves frozen workflow revisions and Task records unchanged.
 ### C3. Configuration and restart boundary
 
 Graph documents, prompts, contracts, skills, and roadmap changes do not
-require a Kent restart. A new workflow revision is still required for semantic
-changes, and graph apply itself is atomic after confirmation.
+require a Kent restart. General semantic update eligibility follows
+[Execution-history and compatibility policy](../contracts/workflow-contract.md#execution-history-and-compatibility-policy);
+graph apply itself is atomic after confirmation.
 
-Dynamic selection values are workflow graph fields and therefore use a new
-non-default workflow revision but require no restart. Agent-role allowlists,
+For this experiment, dynamic selection values are workflow graph fields and
+use a new non-default workflow revision but require no restart. Agent-role allowlists,
 model/reasoning policy, `workflow.pre_compaction_tokens`, concurrency, and
 delegation settings are Kent service configuration. Merge an approved config
 fragment into the effective `~/.kent/config.toml`, restart the Kent service,

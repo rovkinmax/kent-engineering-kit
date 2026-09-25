@@ -93,11 +93,12 @@ assess target drift separately through three-way merge or method-specific replay
 evidence. Missing target-only commits in an older checkout never authorize Fix
 by themselves.
 
-Changing this contract or generator prompt does not mutate a task-backed live
-workflow. Existing graph definitions remain frozen. A project revision may
-enforce the rule through its project contract for new tasks that select that
-revision, but cross-project graph-level enforcement requires a separately
-validated replacement workflow.
+Changing this contract or generator prompt does not mutate live workflows.
+Graph-level adoption requires a separately approved lifecycle operation under
+[Execution-history and compatibility policy](workflow-contract.md#execution-history-and-compatibility-policy).
+A project revision may enforce the rule through its project contract for new
+tasks that select that revision; retained Session instructions do not refresh
+automatically.
 
 ## Project Adoption
 

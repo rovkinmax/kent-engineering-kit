@@ -75,15 +75,15 @@ class KentClient:
         )
         if plan.graph_changed and not created and self.workflow_has_tasks(definition):
             raise SpecError(
-                f"workflow {workflow_before['name']!r} has tasks; its graph is "
-                "frozen. Generate a new workflow version or migrate/retire its "
-                "tasks first"
+                f"workflow {workflow_before['name']!r} has tasks; this client "
+                "does not support task-referenced semantic updates. Use a "
+                "separately approved lifecycle operation"
             )
         if plan.graph_changed and not created and self.workflow_is_linked(definition):
             raise SpecError(
                 f"workflow {workflow_before['name']!r} is linked to a project; "
-                "generate a new workflow revision instead of reconciling it "
-                "in place"
+                "this client does not support linked semantic updates. Use a "
+                "separately approved lifecycle operation"
             )
 
         graph_saved = False

@@ -127,11 +127,10 @@ documented in `docs/MODEL-POLICY.md`.
   `kent workflow graph apply <path|->` validates and atomically saves the
   document. Graph apply is not a general dry-run: without `--confirm` it saves
   non-destructive changes and pauses only for destructive impact.
-- A workflow referenced by any Task is a frozen task-backed revision for this
-  kit. Semantic graph changes are applied to a new non-default workflow
-  revision; existing Tasks are never rewritten or moved between incompatible
-  graphs. Keep the previous revision linked for rollback until its Tasks are
-  terminal.
+- Workflow update eligibility follows
+  [Execution-history and compatibility policy](contracts/workflow-contract.md#execution-history-and-compatibility-policy).
+  The generic client does not support task-referenced or linked semantic
+  updates; those require a separately approved lifecycle operation.
 - Kent 2.5's workflow-wide transition-key and offset-pagination contracts
   remain compatibility facts for existing data; the generator uses canonical
   workflow UUIDs and source-qualified transition keys.
@@ -332,8 +331,8 @@ Create or update the unversioned conditional-Smoke lab without a PR/CI tail:
   --apply
 ```
 
-If the current Smoke Lab already has tasks and a structural experiment needs a
-new graph, add a free-form suffix such as `--label "iteration beta"`. Labels are
+For a separately approved isolated Smoke Lab experiment needing a new graph,
+add a free-form suffix such as `--label "iteration beta"`. Labels are
 temporary experiment names, not semantic versions. Labeled snapshots include a
 deterministic hash suffix so distinct labels cannot overwrite each other.
 
@@ -351,8 +350,9 @@ verifiable slice and is best reserved for low-coupling mechanical work with
 small handoffs. Verification Gate always deduplicates review findings into one
 dependency-ordered bundle; continuous Fix resolves every compatible group
 before re-verification. Non-writer approval-recovery loops retain
-compact-and-continue continuity. Use a new non-default workflow instance to
-canary this policy; task-backed live graphs are never rewritten to adopt it.
+compact-and-continue continuity. Adoption follows
+[Execution-history and compatibility policy](contracts/workflow-contract.md#execution-history-and-compatibility-policy).
+Canary a separately approved new workflow instance before default promotion.
 
 The optional `policies.pr_merge_strategy` accepts `auto`, `merge`, `squash`,
 or `rebase` and defaults to `auto`. `auto` resolves from source-control
@@ -446,12 +446,13 @@ roadmap. Generated workflows use a shared fan-out/Join/Gate
 lifecycle with project-owned profiles, procedures, verification, Smoke, and
 delivery adapters. Taskless generated workflows may be reconciled in place only
 when the Kent CLI can express the change without deleting nodes or edges,
-changing an edge source, or removing an approval. A workflow becomes
-mutation-protected after tasks reference it.
+changing an edge source, or removing an approval. The generic client's
+task-reference and project-link guards remain unchanged; general eligibility
+follows [Execution-history and compatibility policy](contracts/workflow-contract.md#execution-history-and-compatibility-policy).
 
-Changes to generator prompts or shared contracts do not mutate task-backed live
-workflows. They require a new non-default experiment and canary before any
-default promotion.
+Changes to generator prompts or shared contracts do not mutate live workflows.
+Adoption requires a separately approved lifecycle operation under that policy;
+new non-default experiments require a canary before default promotion.
 
 Kent Desktop may display
 `workflow.validation.script_path_relative_check_skipped` for a relative script

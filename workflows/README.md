@@ -82,16 +82,23 @@ side effects.
 
 ## Rollout
 
+Workflow update eligibility follows
+[Execution-history and compatibility policy](../contracts/workflow-contract.md#execution-history-and-compatibility-policy).
+Source generation does not mutate live workflows. For a separately approved
+new-revision rollout:
+
 1. Validate the project profile and selected Git revision.
 2. Preview generation without `--apply`.
 3. Apply a new non-default workflow revision.
 4. Run a managed-worktree canary.
 5. Set the validated revision as project default for new tasks.
-6. Let existing tasks finish on their frozen graph.
+6. Let existing tasks finish on the retained revision under that rollout scope.
 
-Do not reconcile semantic graph changes in place after a workflow has task
-records. Recreate Backlog tasks in the replacement workflow before retirement;
-completed or canceled history may be discarded only with user approval.
+The generic client does not support task-referenced or linked semantic updates;
+use a separately approved lifecycle operation under the canonical policy.
+Retirement has separate stricter gates: recreate Backlog tasks in the
+replacement workflow before retirement; completed or canceled history may be
+discarded only with user approval.
 
 ## Retirement
 
