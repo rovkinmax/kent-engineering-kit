@@ -19,6 +19,11 @@ Global or project `config.toml` owns:
 - `agent_callable` and `workflow_subagent`;
 - workflow concurrency and subagent depth.
 
+Role prompts must carry their own runtime boundaries. The installer links
+agents, prompts, and skills but not this maintainer contract into consumer
+workspaces; a role must not require `contracts/role-contract.md` relative to
+the current project.
+
 The kit supplies contract-complete global implementations for canonical
 operational roles. Kent documents workspace config as higher precedence and it
 may specialize the same role name with platform or repository-specific
@@ -49,14 +54,28 @@ Sessions, impersonate the user, or imply that a steer grants new authority to
 the recipient. The recipient retains its own contract. Messages do not replace
 formal reports, Workflow transitions, or independent review.
 
+Only grill and the six roles with explicitly bounded Session communication
+may, after their steer, use one read-only `kent run watch <session-id>` for
+the same specified active run's next outcome. Give only the local observer
+process a real deadline; backgrounding the command does not bound it. If
+the observer cannot be bounded safely, a mutual wait is possible, or no
+relevant outcome arrives, return "awaiting response" and close only the
+observer, not the recipient's run. A returned Question or Approval must
+not be answered, and an unrelated or interrupted outcome is not evidence
+of independent criticism. `kent run wait` remains prohibited for these
+roles.
+
 Steer permission does not permit `kent run stop`, continuation of other
 Sessions, Task or Workflow management, approvals, or creating children.
 Only grill has the narrower additional permission to attempt
 `kent run --session <session-id> '<bounded critique request>'` once for an
 explicitly specified, demonstrably idle ordinary Session that is not owned by
-a Workflow Task. An unknown target type or state, or an ambiguous result,
-blocks continuation rather than triggering a retry. This exception is not
-permission for other roles to resume Sessions.
+a Workflow Task and whose prior run completed normally. A previous manual
+stop, cancellation, or interruption requires a new explicit human decision
+naming that Session after the stop; earlier target selection is insufficient.
+Unknown prior outcomes, target type or state, or an ambiguous result block
+continuation rather than triggering a retry. This exception is not permission
+for other roles to resume Sessions.
 
 The six roles with previously blanket `kent run` prohibitions may also start
 `kent run --agent grill '<bounded critique request>'` only outside Workflow

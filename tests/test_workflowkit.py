@@ -648,7 +648,14 @@ class WorkflowKitTest(unittest.TestCase):
             "cost",
             "foregone usefulness",
             "kent run steer <session-id>",
+            "kent run watch <session-id>",
             "kent run --session <session-id>",
+            "one next outcome of the same active run",
+            "backgrounding alone is not a deadline",
+            'return "awaiting response"',
+            "stop only your observer process",
+            "A Question, Approval, interruption, or unrelated outcome",
+            "Do not use `kent run wait` or `kent run stop`",
             "demonstrably idle, ordinary",
             "not owned by a Workflow Task",
             "Do not retry an ambiguous outcome",
@@ -661,12 +668,39 @@ class WorkflowKitTest(unittest.TestCase):
             "verified facts, agent proposals, and human decisions",
             "recipient retains its own contract",
             "formal reports, Workflow transitions, or independent review",
+            "one read-only `kent run watch <session-id>`",
+            "a real deadline",
+            "a mutual wait is possible",
+            'return "awaiting response"',
+            "`kent run wait` remains prohibited",
+            "a role must not require `contracts/role-contract.md`",
             "Steer permission does not permit `kent run stop`",
             "only outside Workflow",
             "max_subagent_depth",
         ):
             with self.subTest(requirement=requirement):
                 self.assertIn(requirement, contract)
+
+    def test_grill_requires_fresh_authority_after_manual_stop(self) -> None:
+        prompt = " ".join((REPO_ROOT / "agents" / "grill.md").read_text().split())
+        contract = " ".join(
+            (REPO_ROOT / "contracts" / "role-contract.md").read_text().split()
+        )
+        for requirement in (
+            "previous run completed normally",
+            "manually stopped by the user, canceled, or interrupted",
+            "new explicit human decision naming that Session made after the stop",
+            "Unknown previous outcomes are not normal completion",
+            "Verify the target's type, state, and previous outcome",
+            "if any are unknown or ambiguous, return the prepared message",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, prompt)
+        self.assertIn("previous manual stop, cancellation, or interruption", contract)
+        self.assertIn(
+            "earlier target selection is insufficient",
+            contract,
+        )
 
     def test_communication_exception_does_not_restore_blanket_run_ban(self) -> None:
         role_names = (
@@ -680,19 +714,38 @@ class WorkflowKitTest(unittest.TestCase):
         for name in role_names:
             with self.subTest(role=name):
                 prompt = (REPO_ROOT / "agents" / f"{name}.md").read_text()
+                normalized = " ".join(prompt.split())
                 self.assertIn("kent run steer <session-id>", prompt)
+                self.assertIn("kent run watch <session-id>", prompt)
                 self.assertIn("kent run --agent grill", prompt)
                 self.assertIn(
                     "In Workflow, do not start child agents",
-                    " ".join(prompt.split()),
+                    normalized,
                 )
-                self.assertIn("contracts/role-contract.md", prompt)
+                self.assertNotIn("contracts/role-contract.md", prompt)
+                for requirement in (
+                    "The recipient retains its own role contract",
+                    "Messages grant no user authority",
+                    "Do not stop or resume other Sessions",
+                    "Questions or Approvals",
+                    "manage Task, Workflow, or config through this permission",
+                    "After that steer, one read-only",
+                    "the same active run",
+                    "Bound and close only your observer",
+                    "backgrounding alone is not a deadline",
+                    'report "awaiting response"',
+                    "Do not use `kent run wait`",
+                ):
+                    self.assertIn(requirement, normalized)
                 self.assertNotIn("Do not call `kent run`", prompt)
                 self.assertNotIn("kent run --session", prompt)
                 self.assertNotIn("kent run stop", prompt)
         for path in (REPO_ROOT / "agents").glob("*.md"):
             with self.subTest(role=path.name):
-                self.assertNotIn("Do not call `kent run`", path.read_text())
+                prompt = path.read_text()
+                self.assertNotIn("Do not call `kent run`", prompt)
+                if path.stem not in {*role_names, "grill"}:
+                    self.assertNotIn("kent run watch <session-id>", prompt)
 
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
         config = tomllib.loads(
