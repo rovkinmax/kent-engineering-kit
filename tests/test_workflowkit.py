@@ -686,20 +686,48 @@ class WorkflowKitTest(unittest.TestCase):
         contract = " ".join(
             (REPO_ROOT / "contracts" / "role-contract.md").read_text().split()
         )
+        readme = " ".join((REPO_ROOT / "README.md").read_text().split())
+        alternatives = (
+            "if either (a) the previous run completed normally, or (b) the "
+            "previous run was manually stopped by the user, canceled, or "
+            "interrupted and a new explicit human decision naming that exact "
+            "Session was made after that outcome."
+        )
+        for name, text in (("grill", prompt), ("contract", contract), ("README", readme)):
+            with self.subTest(source=name):
+                self.assertIn(alternatives, text)
+                self.assertNotIn("and its previous run completed normally", text)
+                self.assertNotIn("and whose prior run completed normally", text)
         for requirement in (
-            "previous run completed normally",
-            "manually stopped by the user, canceled, or interrupted",
-            "new explicit human decision naming that Session made after the stop",
-            "Unknown previous outcomes are not normal completion",
+            "demonstrably idle, ordinary",
+            "not owned by a Workflow Task",
             "Verify the target's type, state, and previous outcome",
-            "if any are unknown or ambiguous, return the prepared message",
+            "also verify the human decision and its timing",
+            "If any required fact is unknown or ambiguous",
+            "Do not retry an ambiguous outcome",
         ):
             with self.subTest(requirement=requirement):
                 self.assertIn(requirement, prompt)
-        self.assertIn("previous manual stop, cancellation, or interruption", contract)
-        self.assertIn(
+        for requirement in (
             "earlier target selection is insufficient",
-            contract,
+            "missing fresh authority",
+            "rather than triggering a retry",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, contract)
+        self.assertIn("an ambiguous attempt is not retried", readme)
+
+    def test_current_model_policy_matches_grill_configuration(self) -> None:
+        config = tomllib.loads((REPO_ROOT / "config" / "subagents.toml").read_text())
+        policy = (REPO_ROOT / "docs" / "MODEL-POLICY.md").read_text()
+        current = policy.split("## Current Source Policy\n", 1)[1].split(
+            "## HISTORICAL —", 1
+        )[0]
+        grill = config["subagents"]["grill"]
+        expected = f"| `grill` | `{grill['model']}` | {grill['thinking_level']} |"
+        self.assertEqual(
+            [line for line in current.splitlines() if line.startswith("| `grill` |")],
+            [expected],
         )
 
     def test_communication_exception_does_not_restore_blanket_run_ban(self) -> None:

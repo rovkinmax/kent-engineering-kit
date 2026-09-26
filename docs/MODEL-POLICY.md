@@ -20,6 +20,7 @@ or duplicate coder roles.
 | `researcher` | `gpt-6-sol` | high |
 | `standards-reviewer`, `spec-reviewer` | `gpt-6-astra` | medium |
 | `architecture-designer` | `gpt-6-astra` | high |
+| `grill` | `gpt-6-astra` | high |
 | `implementation-worker` | `gpt-6-luna` | xhigh |
 | `fix-worker` | `gpt-6-astra` | medium |
 | `build-doctor` | `gpt-6-sol` | high |
