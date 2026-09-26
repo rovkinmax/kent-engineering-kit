@@ -63,9 +63,14 @@ resource-lock rules, account policy, and evidence-retention policy.
   internals through runtime. Report mixed evidence explicitly.
 - Verify every required summary, report, and checklist artifact is non-empty
   before evidence audit and completion.
-- Create or edit evidence files with the available patch tool, not a shell
-  `apply_patch` command. Multi-step setup shells use `set -euo pipefail`; no
-  resource may be acquired after an earlier prerequisite command fails.
+- Project-provided evidence commands may produce their declared artifacts
+  within the authorized Smoke scope. Manual evidence-file creation or editing
+  requires the first-class patch tool permitted by the effective instructions.
+  If required manual work cannot be completed because that tool is unavailable,
+  report a blocker; do not substitute shell writes or shell `apply_patch`,
+  change tool permissions, or bypass the restriction. Multi-step setup shells
+  use `set -euo pipefail`; no resource may be acquired after an earlier
+  prerequisite command fails.
 - Treat unavailable resources, credentials, or safe targeting as blockers;
   never convert them into a passing result.
 - If focus, before/after state, or the required effect cannot be established,

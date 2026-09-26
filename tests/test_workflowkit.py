@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
+from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 from workflowkit.delivery import (
     build_canary_workflow,
@@ -17,6 +21,8 @@ from workflowkit.delivery import (
     build_smoke_lab_workflow,
     context_instruction,
     cleanup_prompt,
+    janitor_recovery_prompt,
+    plan_prompt,
     published_cleanup_prompt,
 )
 from workflowkit.kent import (
@@ -65,9 +71,103 @@ CONTEXT_MANIFESTS = (
     ".kent/context/delivery.md",
 )
 
+PLAN_RECOVERY_NEW = """If recovery inputs identify prior work, inspect each supplied item
+independently:
+
+- If a checkpoint ref is supplied, verify HEAD exactly matches it; inspect its
+  diff, tests, and evidence.
+- If a source task is identified, read its body without modifying or canceling
+  it.
+- If exact task-comment IDs are supplied, read the exact referenced comments
+  without modifying or canceling the source task.
+- Update one authoritative design/spec/plan; cite human comment IDs for
+  decisions and explicitly supersede conflicts.
+
+A source-task reference or comment IDs alone do not establish preserved
+implementation. Treat it as preserved only when HEAD matches a supplied
+checkpoint or concrete source diff/evidence confirms it. Plan only remaining
+verifiable work; never reset, revert, or reimplement preserved code during
+Plan."""
+PLAN_RECOVERY_OLD = """If the task body declares a checkpoint ref, source task, or exact task-comment
+IDs, treat the current checkout as preserved implementation rather than a blank
+feature:
+
+- verify that HEAD matches the declared checkpoint;
+- read the source task body and exact referenced comments without modifying or
+  canceling the source task;
+- update one authoritative design/specification/plan set and reference comment
+  IDs instead of duplicating decisions;
+- explicitly supersede conflicting earlier decisions;
+- inspect the checkpoint diff and existing tests/evidence;
+- plan only remaining independently verifiable work.
+
+Do not reset, revert, or reimplement preserved code during Plan."""
+PLAN_CONFIRMATION_NEW = """If the task body says the recovery Plan must stop for confirmation, complete
+through `plan_needs_user_action` with a concise artifact/remaining-work summary and
+an explicit confirmation request. Do not choose `plan_review_plan` in that Plan
+run."""
+PLAN_CONFIRMATION_OLD = """If the task body says the recovery Plan must stop for confirmation, complete
+through `plan_needs_user_action` with a concise artifact/remaining-work summary and
+an explicit confirmation request. Do not choose `implement` in that Plan run."""
+CLEANUP_CAPTURE = """Before leaving, preserve the canonical task worktree root as `workspace_path`
+and capture `branch_name` with
+`git -C <workspace_path> branch --show-current`. Keep both exact values after
+leaving; never look up the branch from the post-leave working directory."""
+CLEANUP_BRANCH_NEW = """  `git -C <workspace_path> branch --show-current`, including `no_pr` and
+  `report_only`; never use `null`, `none`, `not-applicable`, an empty value, or
+  the Kent task ID by inference;"""
+CLEANUP_BRANCH_OLD = """  `git branch --show-current`, including `no_pr` and `report_only`; never use
+  `null`, `none`, `not-applicable`, an empty value, or the Kent task ID by
+  inference;"""
+CLEANUP_WORKSPACE_NEW = "- canonical `workspace_path` for the preserved task worktree root;"
+CLEANUP_WORKSPACE_OLD = "- canonical `workspace_path`;"
+CLEANUP_REPORT_NEW = """- a non-empty `cleanup_report` describing preflight and preserved resources,
+  including the exact `workspace_path` and `branch_name`."""
+CLEANUP_REPORT_OLD = "- a non-empty `cleanup_report` describing preflight and preserved resources."
+PUBLISHED_CAPTURE = """Before leaving, retain the exact supplied `workspace_path` and `branch_name`.
+If a branch lookup is needed, use
+`git -C <workspace_path> branch --show-current`; do not resolve it from the
+post-leave working directory. Include both exact values in `cleanup_report`
+and preserve them for Janitor recovery."""
+PUBLISHED_REPORT_NEW = """`cleanup_session_id` from `KENT_SESSION_ID`; and a non-empty `cleanup_report`
+including the exact `workspace_path` and `branch_name`."""
+PUBLISHED_REPORT_OLD = (
+    "`cleanup_session_id` from `KENT_SESSION_ID`; and a non-empty `cleanup_report`."
+)
+JANITOR_RECOVERY_NEW = """Use the retained Cleanup context and the exact `workspace_path` and
+`branch_name` recorded in its `cleanup_report`; do not infer either from this
+recovery session's current directory. If a branch lookup is needed, use
+`git -C <workspace_path> branch --show-current` and require the same exact
+branch. Do not directly remove a Kent-managed worktree from this agent session.
+Close every task-owned background shell or kept-open tool session. If this
+session still targets the task worktree, run `kent worktree leave` before
+retrying. If the infrastructure failure is transient and the same safety
+proofs still hold, choose `cleanup_run_janitor` again with the complete canonical
+parameter contract. Otherwise choose `cleanup_needs_user_action` with the exact
+blocker. Preserve every ambiguous or unique resource."""
+JANITOR_RECOVERY_OLD = """Use the retained Cleanup context. Do not directly remove a Kent-managed
+worktree from this agent session. Close every task-owned background shell or
+kept-open tool session. If this session still targets the task worktree, run
+`kent worktree leave` before retrying. If the infrastructure failure is
+transient and the same safety proofs still hold, choose `cleanup_run_janitor` again
+with the complete canonical parameter contract. Otherwise choose
+`cleanup_needs_user_action` with the exact blocker. Preserve every ambiguous or unique
+resource."""
+
 
 def role_prompt(filename: str) -> str:
     return (REPO_ROOT / "agents" / filename).read_text()
+
+
+def load_transition_key_migrator():
+    path = REPO_ROOT / "scripts" / "migrate-transition-keys"
+    loader = SourceFileLoader("transition_key_migrator_test", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise AssertionError("could not load transition-key migrator")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 def create_work_kind_procedures(root: Path) -> None:
@@ -151,8 +251,77 @@ class WorkflowKitTest(unittest.TestCase):
                     profile = self.cleanup_profile(managed=managed, published=published)
                     if helper is not None:
                         profile = replace(profile, commands={**profile.commands, "prepare_cleanup": helper})
+                    document = spec_as_json(build_delivery_workflow(profile, 1))
+                    edges = {edge["key"]: edge for edge in document["edges"]}
+
+                    def reverse_prompt(
+                        edge_key: str,
+                        replacements: tuple[tuple[str, str], ...],
+                    ) -> None:
+                        edge = edges[edge_key]
+                        prompt = edge["prompt"]
+                        self.assertIsInstance(prompt, str, edge_key)
+                        for current, historical in replacements:
+                            self.assertEqual(
+                                prompt.count(current),
+                                1,
+                                f"{edge_key} must contain exactly one approved delta",
+                            )
+                            prompt = prompt.replace(current, historical, 1)
+                        edge["prompt"] = prompt
+
+                    reverse_prompt(
+                        "start_plan",
+                        (
+                            (PLAN_RECOVERY_NEW, PLAN_RECOVERY_OLD),
+                            (PLAN_CONFIRMATION_NEW, PLAN_CONFIRMATION_OLD),
+                        ),
+                    )
+                    if managed:
+                        cleanup_keys = [
+                            "prepare_pr_no_pr",
+                            "waiting_pr_close_without_merge",
+                        ]
+                        if not published:
+                            cleanup_keys.extend(
+                                (
+                                    "fix_pr_merged_cleanup",
+                                    "waiting_pr_cleanup",
+                                    "merge_watch_cleanup",
+                                    "ci_watch_merged",
+                                    "ci_monitor_merged",
+                                )
+                            )
+                        for key in cleanup_keys:
+                            reverse_prompt(
+                                key,
+                                (
+                                    (
+                                        f"\n\n{CLEANUP_CAPTURE}\n\n",
+                                        "\n\n",
+                                    ),
+                                    (CLEANUP_BRANCH_NEW, CLEANUP_BRANCH_OLD),
+                                    (CLEANUP_WORKSPACE_NEW, CLEANUP_WORKSPACE_OLD),
+                                    (CLEANUP_REPORT_NEW, CLEANUP_REPORT_OLD),
+                                ),
+                            )
+                        if published:
+                            reverse_prompt(
+                                "publish_cleanup",
+                                (
+                                    (
+                                        f"\n\n{PUBLISHED_CAPTURE}\n\n",
+                                        "\n\n",
+                                    ),
+                                    (PUBLISHED_REPORT_NEW, PUBLISHED_REPORT_OLD),
+                                ),
+                            )
+                        reverse_prompt(
+                            "task_janitor_blocked",
+                            ((JANITOR_RECOVERY_NEW, JANITOR_RECOVERY_OLD),),
+                        )
                     raw = json.dumps(
-                        spec_as_json(build_delivery_workflow(profile, 1)),
+                        document,
                         sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                     ).encode()
                     self.assertEqual(hashlib.sha256(raw).hexdigest(), baseline)
@@ -2063,6 +2232,156 @@ class WorkflowKitTest(unittest.TestCase):
             by_key["evidence_repair_needs_user_action"].prompt,
         )
 
+    def test_recovery_plan_conditions_inspection_on_supplied_inputs(self) -> None:
+        prompt = " ".join(
+            plan_prompt(self.load_profile(), recovery_aware=True).split()
+        )
+
+        self.assertIn("inspect each supplied item independently", prompt)
+        self.assertIn("If a checkpoint ref is supplied", prompt)
+        self.assertIn("If a source task is identified", prompt)
+        self.assertIn("If exact task-comment IDs are supplied", prompt)
+        self.assertIn(
+            "source-task reference or comment IDs alone do not establish",
+            prompt,
+        )
+        self.assertIn(
+            "Do not choose `review_plan` in that Plan run.",
+            prompt,
+        )
+        self.assertNotIn("Do not choose `implement`", prompt)
+
+    def test_cleanup_and_janitor_prompts_preserve_workspace_and_branch(self) -> None:
+        profile = self.cleanup_profile(managed=True, published=False)
+        spec = build_delivery_workflow(profile, 1)
+        by_key = {edge.key: edge for edge in spec.edges}
+        cleanup_keys = (
+            "prepare_pr_no_pr",
+            "fix_pr_merged_cleanup",
+            "waiting_pr_cleanup",
+            "merge_watch_cleanup",
+            "waiting_pr_close_without_merge",
+        )
+        for key in cleanup_keys:
+            prompt = by_key[key].prompt
+            with self.subTest(edge=key):
+                self.assertIn(CLEANUP_CAPTURE, prompt)
+                self.assertIn(
+                    "`git -C <workspace_path> branch --show-current`",
+                    prompt,
+                )
+                self.assertIn(
+                    "including the exact `workspace_path` and `branch_name`",
+                    prompt,
+                )
+                self.assertLess(
+                    prompt.index(CLEANUP_CAPTURE),
+                    prompt.index("`kent worktree leave`"),
+                )
+                self.assertNotIn("`git branch --show-current`", prompt)
+
+        published_profile = self.cleanup_profile(managed=True, published=True)
+        published = published_cleanup_prompt(published_profile)
+        self.assertIn(PUBLISHED_CAPTURE, published)
+        self.assertLess(
+            published.index(PUBLISHED_CAPTURE),
+            published.index("`kent worktree leave`"),
+        )
+        self.assertIn(
+            "including the exact `workspace_path` and `branch_name`",
+            published,
+        )
+
+        recovery = janitor_recovery_prompt(profile)
+        self.assertIn(
+            "exact `workspace_path` and\n`branch_name` recorded in its `cleanup_report`",
+            recovery,
+        )
+        self.assertIn(
+            "`git -C <workspace_path> branch --show-current`",
+            recovery,
+        )
+        self.assertIn(
+            "do not infer either from this recovery session's current directory",
+            " ".join(recovery.split()),
+        )
+
+    def test_transition_key_migrator_explains_task_backed_limitation(self) -> None:
+        script = REPO_ROOT / "scripts" / "migrate-transition-keys"
+        help_result = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("legacy per-edge", help_result.stdout)
+        self.assertIn("not atomic", help_result.stdout)
+        self.assertIn("separately approved complete-graph operation", help_result.stdout)
+        self.assertIn(
+            "default is a read-only plan",
+            " ".join(help_result.stdout.split()),
+        )
+
+        workflow_id = "00112233-4455-6677-8899-aabbccddeeff"
+        definition = {
+            "workflow": {"id": workflow_id, "name": "Legacy"},
+            "nodes": [
+                {"id": "node-plan", "key": "plan"},
+                {"id": "node-implement", "key": "implement"},
+            ],
+            "transition_groups": [
+                {
+                    "id": "group-plan",
+                    "source_node_id": "node-plan",
+                    "transition_id": "review_plan",
+                },
+            ],
+            "edges": [
+                {
+                    "id": "edge-plan",
+                    "transition_group_id": "group-plan",
+                    "target_node_id": "node-implement",
+                    "prompt_template": None,
+                },
+            ],
+        }
+        migrator = load_transition_key_migrator()
+        with (
+            mock.patch.object(
+                migrator,
+                "run_json",
+                return_value=definition,
+            ) as run_json,
+            mock.patch.object(migrator, "KentClient") as kent_client,
+            mock.patch.object(
+                sys,
+                "argv",
+                [str(script), workflow_id, "--apply"],
+            ),
+        ):
+            kent_client.return_value.workflow_has_tasks.return_value = True
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "legacy per-edge migrator cannot update task-backed workflows atomically",
+            ) as raised:
+                migrator.main()
+
+        self.assertIn(
+            "separately approved complete-graph operation",
+            str(raised.exception),
+        )
+        self.assertIn(
+            "do not retire or migrate tasks as a workaround",
+            str(raised.exception),
+        )
+        run_json.assert_called_once_with(
+            ["workflow", "inspect", workflow_id, "--json"],
+        )
+        kent_client.return_value.workflow_has_tasks.assert_called_once_with(
+            definition,
+        )
+
     def test_managed_worktree_cleanup_uses_task_janitor(self) -> None:
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)
@@ -2106,11 +2425,11 @@ class WorkflowKitTest(unittest.TestCase):
             "waiting_pr_close_without_merge",
         ):
             self.assertIn(
-                "`git branch --show-current`",
+                "`git -C <workspace_path> branch --show-current`",
                 by_key[key].prompt,
             )
             self.assertIn(
-                "never use\n  `null`, `none`, `not-applicable`",
+                "never use `null`, `none`, `not-applicable`",
                 by_key[key].prompt,
             )
 

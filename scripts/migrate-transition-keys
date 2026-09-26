@@ -17,13 +17,21 @@ from workflowkit import KentClient
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Migrate a Kent workflow to workflow-wide transition keys."
+        description=(
+            "Plan a legacy per-edge transition-key migration. Task-backed "
+            "workflows require a separately approved complete-graph operation. "
+            "The default is a read-only plan."
+        )
     )
     parser.add_argument("workflow", help="Canonical Kent workflow UUID.")
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Apply the migration. The default is a read-only plan.",
+        help=(
+            "Apply legacy per-edge updates. They are not atomic for "
+            "task-backed workflows, which require a separately approved "
+            "complete-graph operation."
+        ),
     )
     return parser.parse_args()
 
@@ -162,8 +170,10 @@ def main() -> int:
         return 0
     if transition_changes and KentClient(Path.cwd()).workflow_has_tasks(definition):
         raise RuntimeError(
-            "workflow has tasks; task-backed transition migration is not "
-            "atomic. Create a replacement workflow or retire/migrate its tasks"
+            "workflow has tasks; this legacy per-edge migrator cannot update "
+            "task-backed workflows atomically. Use only a separately approved "
+            "complete-graph operation; do not retire or migrate tasks as a "
+            "workaround"
         )
 
     for change in transition_changes:

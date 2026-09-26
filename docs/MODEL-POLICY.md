@@ -1,11 +1,48 @@
 # Model Policy
 
-## Current Source Policy — September 16, 2026
+## Current Source Policy
 
-[`config/subagents.toml`](../config/subagents.toml) is the authoritative managed
-configuration fragment and the single source of truth for role allocation.
+[`config/subagents.toml`](../config/subagents.toml) is the authoritative
+managed configuration fragment. The allocation below describes only the
+committed source; it does not attest installed configuration, a launched
+session's selected model, or runtime activation. Preserve the historical
+September 16 and July records below as records, not as current allocations.
 Use existing roles and explicit configuration; do not add a complexity router
-or duplicate coder roles. The historical July policy below is not current.
+or duplicate coder roles.
+
+| Scope or role | Model | Reasoning |
+| --- | --- | --- |
+| Interactive root | `gpt-6-sol` | high |
+| Headless/default role | `gpt-6-astra` | low |
+| Built-in reviewer/supervisor | `gpt-6-luna` | xhigh |
+| `fast` | `gpt-6-luna` | high |
+| `compliance_reviewer` | `gpt-6-luna` | high |
+| `researcher` | `gpt-6-sol` | high |
+| `standards-reviewer`, `spec-reviewer` | `gpt-6-astra` | medium |
+| `architecture-designer` | `gpt-6-astra` | high |
+| `implementation-worker` | `gpt-6-luna` | xhigh |
+| `fix-worker` | `gpt-6-astra` | medium |
+| `build-doctor` | `gpt-6-sol` | high |
+| `workflow-gate` | `gpt-6-luna` | high |
+| `runtime-smoke-tester` | `gpt-6-luna` | high |
+| `release-manager` | `gpt-6-astra` | medium |
+| `delivery-operator` | `gpt-6-luna` | high |
+| `ci-monitor` | `gpt-6-luna` | low |
+| `release-decision` | `gpt-6-luna` | low |
+
+The interactive root's source settings include
+`model_context_window = 400000` and
+`context_compaction_threshold_tokens = 360000`. Per-role budget settings are
+declared individually in the TOML; do not infer them from model allocation or
+count selectors as a substitute for reading that source.
+
+## HISTORICAL — September 16, 2026 Policy and Adoption Record
+
+The following section preserves the September 16 policy and adoption record.
+Its allocations, budget statements, rollout details, and operator instructions
+are historical; consult the current source table and current project
+procedures instead. This record does not prove installed configuration or
+runtime state.
 
 ### Allocation and Manual Selection
 
@@ -59,15 +96,13 @@ growth, and review/Fix-loop counts. Model and reasoning changes are explicitly
 paired above; do not attribute an outcome solely to the model.
 
 The Astra root uses `model_context_window = 400000` and
-`context_compaction_threshold_tokens = 360000`. Each of the eight Luna
-subagent roles explicitly pairs `model_context_window = 372000` with
+`context_compaction_threshold_tokens = 360000`. Luna subagent roles explicitly
+pair `model_context_window = 372000` with
 `context_compaction_threshold_tokens = 353400`. The supervisor has a separate
 372000 window; its schema does not provide a compaction-threshold setting.
-There are nine Luna selectors including the supervisor, and eight Astra
-selectors including the root. No Astra subagent receives an explicit role
-budget. Standards review now inherits the root budget; runtime QA receives
-the Luna pair. These are operator-chosen harness budgets, not claims about
-provider maximum capacity.
+No Astra subagent receives an explicit role budget. Standards review now
+inherits the root budget; runtime QA receives the Luna pair. These are
+operator-chosen harness budgets, not claims about provider maximum capacity.
 
 Preserve low verbosity, tools, prompts, callability, priority mode, workflow
 concurrency of 4, and maximum subagent depth of 1. The root window and
