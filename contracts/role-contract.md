@@ -70,10 +70,14 @@ Sessions, Task or Workflow management, approvals, or creating children.
 Only grill has the narrower additional permission to attempt
 `kent run --session <session-id> '<bounded critique request>'` once for an
 explicitly specified, demonstrably idle ordinary Session that is not owned by
-a Workflow Task and whose prior run completed normally. A previous manual
-stop, cancellation, or interruption requires a new explicit human decision
-naming that Session after the stop; earlier target selection is insufficient.
-Unknown prior outcomes, target type or state, or an ambiguous result block
+a Workflow Task if either (a) the previous run completed normally, or (b) the
+previous run was manually stopped by the user, canceled, or interrupted and a
+new explicit human decision naming that exact Session was made after that
+outcome. A previous manual stop, cancellation, or interruption does not inherit
+earlier target selection; earlier target selection is insufficient. Verify the
+target's type, state, and previous outcome from reliable Kent evidence, and
+for (b) verify the human decision and its timing. Unknown prior outcomes,
+target type or state, missing fresh authority, or an ambiguous result block
 continuation rather than triggering a retry. This exception is not permission
 for other roles to resume Sessions.
 

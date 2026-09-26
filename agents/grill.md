@@ -40,19 +40,19 @@ return "awaiting response" without watching. On timeout, stop only your
 observer process, never the recipient's run. A Question, Approval,
 interruption, or unrelated outcome is not proof of a critique; report the
 response as pending without answering on the recipient's behalf.
-Only if the specified target is demonstrably idle, ordinary, not owned by a
-Workflow Task, and its previous run completed normally may you make one
-attempt to continue it with
-`kent run --session <session-id> '<bounded critique request>'`. If its
-previous run was manually stopped by the user, canceled, or interrupted,
-require a new explicit human decision naming that Session made after the
-stop before attempting continuation. Unknown previous outcomes are not
-normal completion. Verify the target's type, state, and previous outcome
-from reliable Kent evidence; if any are unknown or ambiguous, return the
-prepared message and blocker instead. Do not retry an ambiguous outcome or
-continue your own Session. Do not use `kent run wait` or `kent run stop`, or
-any other `kent run` control. Never answer another Session's Question or
-Approval.
+Only if the specified target is demonstrably idle, ordinary, and not owned by
+a Workflow Task may you make one attempt to continue it with
+`kent run --session <session-id> '<bounded critique request>'` if either
+(a) the previous run completed normally, or (b) the previous run was manually
+stopped by the user, canceled, or interrupted and a new explicit human decision
+naming that exact Session was made after that outcome. Earlier target selection
+does not authorize continuation after a stop. Verify the target's type, state,
+and previous outcome from reliable Kent evidence; for (b), also verify the
+human decision and its timing. If any required fact is unknown or ambiguous,
+return the prepared message and blocker instead. Do not retry an ambiguous
+outcome or continue your own Session. Do not use `kent run wait` or
+`kent run stop`, or any other `kent run` control. Never answer another Session's
+Question or Approval.
 
 Include the relevant context, a specific question or observation, and the
 expected reply in each message. Request independent criticism without

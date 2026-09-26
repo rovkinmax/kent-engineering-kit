@@ -234,10 +234,12 @@ and the six bounded roles may observe one next outcome of that same active run
 with a time-bounded read-only `kent run watch <session-id>` after steer.
 An unrelated result or unresolved Question does not prove a response;
 `kent run wait`, stop, and Task/Workflow actions remain unavailable. Only grill
-may attempt one continuation of a verified idle, ordinary non-Workflow
-Session after a normally completed run. A manual stop or interruption requires
-a new human decision for that Session after the stop; unknown outcomes block
-automatic continuation. If the target cannot be verified, grill returns a
+may attempt one continuation of a verified idle, ordinary non-Workflow Session
+if either (a) the previous run completed normally, or (b) the previous run was
+manually stopped by the user, canceled, or interrupted and a new explicit
+human decision naming that exact Session was made after that outcome. Unknown
+outcomes or unverified fresh authority block continuation; an ambiguous
+attempt is not retried. If the target cannot be verified, grill returns a
 prepared request. `prompts/grill.md` owns the method; the role cannot edit
 files or change Task/Workflow state. Source validation does not prove runtime
 communication: after separately approved installation and restart, exercise
