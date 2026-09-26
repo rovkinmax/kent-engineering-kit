@@ -2511,25 +2511,29 @@ def plan_prompt(
     if recovery_aware:
         recovery_contract = """
 
-If the task body declares a checkpoint ref, source task, or exact task-comment
-IDs, treat the current checkout as preserved implementation rather than a blank
-feature:
+If recovery inputs identify prior work, inspect each supplied item
+independently:
 
-- verify that HEAD matches the declared checkpoint;
-- read the source task body and exact referenced comments without modifying or
-  canceling the source task;
-- update one authoritative design/specification/plan set and reference comment
-  IDs instead of duplicating decisions;
-- explicitly supersede conflicting earlier decisions;
-- inspect the checkpoint diff and existing tests/evidence;
-- plan only remaining independently verifiable work.
+- If a checkpoint ref is supplied, verify HEAD exactly matches it; inspect its
+  diff, tests, and evidence.
+- If a source task is identified, read its body without modifying or canceling
+  it.
+- If exact task-comment IDs are supplied, read the exact referenced comments
+  without modifying or canceling the source task.
+- Update one authoritative design/spec/plan; cite human comment IDs for
+  decisions and explicitly supersede conflicts.
 
-Do not reset, revert, or reimplement preserved code during Plan."""
+A source-task reference or comment IDs alone do not establish preserved
+implementation. Treat it as preserved only when HEAD matches a supplied
+checkpoint or concrete source diff/evidence confirms it. Plan only remaining
+verifiable work; never reset, revert, or reimplement preserved code during
+Plan."""
         recovery_contract += """
 
 If the task body says the recovery Plan must stop for confirmation, complete
 through `needs_user_action` with a concise artifact/remaining-work summary and
-an explicit confirmation request. Do not choose `implement` in that Plan run."""
+an explicit confirmation request. Do not choose `review_plan` in that Plan
+run."""
     context_contract = ""
     if _delivery_context_enabled(profile):
         if recovery_aware:
@@ -3409,6 +3413,11 @@ proven. For `merged`, it may also delete the same-repository remote task branch
 only when GitHub reports the exact branch head in the merged PR and the remote
 head has not changed.
 
+Before leaving, preserve the canonical task worktree root as `workspace_path`
+and capture `branch_name` with
+`git -C <workspace_path> branch --show-current`. Keep both exact values after
+leaving; never look up the branch from the post-leave working directory.
+
 Before `run_janitor`, close or terminate every task-owned background shell or
 kept-open tool session, then run `kent worktree leave` from this Cleanup
 session. Treat a failed leave request as an infrastructure blocker. The
@@ -3417,16 +3426,17 @@ worktree.
 
 Complete with `run_janitor` and provide:
 
-- canonical `workspace_path`;
+- canonical `workspace_path` for the preserved task worktree root;
 - `task_short_id` as `{{{{.TaskShortId}}}}`;
 - `branch_name` as the exact non-empty output of
-  `git branch --show-current`, including `no_pr` and `report_only`; never use
-  `null`, `none`, `not-applicable`, an empty value, or the Kent task ID by
-  inference;
+  `git -C <workspace_path> branch --show-current`, including `no_pr` and
+  `report_only`; never use `null`, `none`, `not-applicable`, an empty value, or
+  the Kent task ID by inference;
 - `pr_url` and `merge_report`, using the literal `not-applicable` when absent;
 - `cleanup_mode` as `{cleanup_mode}`;
 - `cleanup_session_id` from the current `KENT_SESSION_ID`;
-- a non-empty `cleanup_report` describing preflight and preserved resources.
+- a non-empty `cleanup_report` describing preflight and preserved resources,
+  including the exact `workspace_path` and `branch_name`.
 
 Use `needs_user_action` only when even conservative preservation requires a
 human decision."""
@@ -3595,6 +3605,12 @@ ambiguous state, or content not proven recoverable. Do not remove the managed
 worktree or local branch inside this agent session. The deterministic Task
 Janitor runs only after this resource-owning Cleanup session exits.
 
+Before leaving, retain the exact supplied `workspace_path` and `branch_name`.
+If a branch lookup is needed, use
+`git -C <workspace_path> branch --show-current`; do not resolve it from the
+post-leave working directory. Include both exact values in `cleanup_report`
+and preserve them for Janitor recovery.
+
 Close every task-owned background shell or kept-open tool session and run
 `kent worktree leave` from this Cleanup session before `run_janitor`. The
 Janitor must observe this session outside the task worktree before deletion.
@@ -3602,7 +3618,8 @@ Janitor must observe this session outside the task worktree before deletion.
 Complete with `run_janitor` and provide canonical `workspace_path`;
 `task_short_id` as `{{{{.TaskShortId}}}}`; `pr_url`; `branch_name`;
 `merge_report` including the publication proof; `cleanup_mode` as `merged`;
-`cleanup_session_id` from `KENT_SESSION_ID`; and a non-empty `cleanup_report`.
+`cleanup_session_id` from `KENT_SESSION_ID`; and a non-empty `cleanup_report`
+including the exact `workspace_path` and `branch_name`.
 Use `needs_user_action` only when conservative preservation requires a human
 decision."""
 
@@ -3619,14 +3636,17 @@ Blocker:
 
 {procedure_instruction(profile, "cleanup")}
 
-Use the retained Cleanup context. Do not directly remove a Kent-managed
-worktree from this agent session. Close every task-owned background shell or
-kept-open tool session. If this session still targets the task worktree, run
-`kent worktree leave` before retrying. If the infrastructure failure is
-transient and the same safety proofs still hold, choose `run_janitor` again
-with the complete canonical parameter contract. Otherwise choose
-`needs_user_action` with the exact blocker. Preserve every ambiguous or unique
-resource."""
+Use the retained Cleanup context and the exact `workspace_path` and
+`branch_name` recorded in its `cleanup_report`; do not infer either from this
+recovery session's current directory. If a branch lookup is needed, use
+`git -C <workspace_path> branch --show-current` and require the same exact
+branch. Do not directly remove a Kent-managed worktree from this agent session.
+Close every task-owned background shell or kept-open tool session. If this
+session still targets the task worktree, run `kent worktree leave` before
+retrying. If the infrastructure failure is transient and the same safety
+proofs still hold, choose `run_janitor` again with the complete canonical
+parameter contract. Otherwise choose `needs_user_action` with the exact
+blocker. Preserve every ambiguous or unique resource."""
 
 
 def pr_recovery_fix_prompt(

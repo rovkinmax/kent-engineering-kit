@@ -111,6 +111,25 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
                 self.assertIn("exact preview SHA-256", actual.prompt)
             self.assertEqual(actual, expected)
         self.assertEqual(changed_approvals, ["plan_review_accept"])
+        instruction_prompt_targets = {
+            "prepare_pr_no_pr",
+            "fix_pr_merged_cleanup",
+            "waiting_pr_cleanup",
+            "merge_watch_cleanup",
+            "waiting_pr_close_without_merge",
+            "task_janitor_blocked",
+        }
+        observed_instruction_targets = {
+            edge.key
+            for edge in spec.edges
+            if edge.prompt
+            and "`git -C <workspace_path> branch --show-current`" in edge.prompt
+        }
+        self.assertEqual(observed_instruction_targets, instruction_prompt_targets)
+        for edge in spec.edges:
+            if edge.key in instruction_prompt_targets:
+                self.assertIn("workspace_path", edge.prompt)
+                self.assertIn("branch_name", edge.prompt)
         for node in spec.nodes:
             if node.kind == "agent":
                 self.assertEqual(node.completion_mode, "shell_command")

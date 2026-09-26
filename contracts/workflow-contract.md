@@ -524,7 +524,7 @@ separate.
 
 - Plan uses `orchestrator`; Gate uses optional `gate` and otherwise
   `orchestrator`.
-- Implement and Fix use `implementation`.
+- Implement uses `implementation`; Fix uses `fix`.
 - Smoke uses `qa`.
 - PR preparation and Cleanup use `release`.
 - CI monitoring and Waiting PR use `ci`.

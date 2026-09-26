@@ -13,7 +13,12 @@ Conditional:
 - cleanup: current ownership, process, path and Git/Kent registration proofs.
 
 Do not preload implementation recipes, disabled CI/Smoke, consumer rollout or
-installation instructions. Append evidence before each Agent transition.
+installation instructions. Before each Agent transition, append the required
+non-empty evidence event through the profile command, except for terminal
+Cleanup and its recovery. For those paths, follow the single-owner
+`prepare_cleanup` contract in `.kent/project-contract.md`: the helper owns the
+final event and seal. Do not append standalone evidence before or after the
+helper, or merely to report a blocker; retain blocker details in Task records.
 
 For Kit source delivery, read the source-verification ownership and identity
 contract in `.kent/project-contract.md`. Prepare delivery only with the

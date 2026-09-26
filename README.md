@@ -16,15 +16,16 @@ device details, release policy, and integration credentials.
 
 ## Developing the Kit itself
 
-The checkout-local `.kent/workflow-profile.toml` and
-`.kent/project-contract.md` define **Kit Engineering Delivery v3**. Its
+The checkout-local `.kent/workflow-profile.toml` and `.kent/project-contract.md`
+define the current **Kit Engineering Delivery v4** source candidate. The
 project builder is `.kent/workflows/kit_development.py`; the generated
-`.kent/workflows/kit-engineering-delivery-v3.spec.json` is a semantic audit
-input, not evidence of a live workflow installation.
-The v1 and v2 snapshots remain immutable historical evidence. A later
-approved rollout must create and qualify a new Workflow UUID for v3; existing failed
-qualification records and their task-backed graph must not be repaired or
-reused as successful evidence.
+`.kent/workflows/kit-engineering-delivery-v4.spec.json` is a semantic audit
+input, not evidence of a live workflow installation. The v1, v2, and v3
+snapshots remain immutable historical evidence. This source-only change does
+not modify the existing task-backed Workflow. Any future rollout of v4 needs
+separate approval, a new Workflow UUID, and fresh qualification; existing
+failed qualification records and their task-backed graph must not be repaired
+or reused as successful evidence.
 
 This schema-3 development-only flow reuses the lite delivery graph with a
 continuous writer: Plan, two independent preview reviews, human approval,
@@ -110,8 +111,9 @@ mcporter configuration checks require the explicit
 Role behavior and execution policy are separate contracts. Role prompts must
 not declare `model` or `tools`; global or project Kent configuration owns
 model, reasoning, verbosity, tool availability, and delegation eligibility. See
-`contracts/role-contract.md`. The current cross-project Balanced experiment is
-documented in `docs/MODEL-POLICY.md`.
+`contracts/role-contract.md`. The current source role allocation and retained
+historical policy/adoption records are documented in `docs/MODEL-POLICY.md`;
+they do not attest installed configuration or runtime state.
 
 ## Compatibility
 
@@ -205,9 +207,11 @@ policy, then returns either one resolved method or a structured
 methods.
 
 `config/subagents.toml` is the authoritative managed config fragment. Merge it
-into `~/.kent/config.toml` before restarting Kent. `scripts/validate` compares
-every managed field against the effective global config. The installer
-intentionally does not rewrite user configuration.
+into `~/.kent/config.toml` before restarting Kent. Only
+`./scripts/validate --installed-state` compares managed fields against the
+effective global configuration; the default invocation is source-only.
+Installed-state verification requires separate explicit authorization. The
+installer intentionally does not rewrite user configuration.
 
 The global baseline includes bounded implementation, build diagnosis, evidence
 gating, runtime Smoke, release lifecycle operations, PR/cleanup delivery, CI

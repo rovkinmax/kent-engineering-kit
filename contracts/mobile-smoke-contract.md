@@ -95,9 +95,15 @@ requires the normal authorization for that external action.
   `acquire-any`. Resolve eligible serials deterministically, acquire one exact
   serial, and verify its identity after acquisition. If no eligible target is
   available, release any temporary resource and return a blocker.
-- Evidence setup is fail-fast. Use the agent patch tool for evidence files and
-  `set -euo pipefail` for multi-step shell setup. A failed prerequisite must
-  prevent later lock acquisition, installation, or input.
+- Evidence setup is fail-fast. Project-provided evidence commands may produce
+  their declared artifacts within the authorized Smoke scope. Manual
+  evidence-file creation or editing requires the first-class patch tool
+  permitted by the effective instructions. If required manual work cannot be
+  completed because that tool is unavailable, report a blocker; do not
+  substitute shell writes or shell `apply_patch`, change tool permissions, or
+  bypass the restriction. Use `set -euo pipefail` for multi-step shell setup.
+  A failed prerequisite must prevent later lock acquisition, installation, or
+  input.
 
 - Prefer semantic targeting for control behavior. Prove directional navigation
   separately when D-pad, keyboard, or remote focus behavior is itself in scope.
