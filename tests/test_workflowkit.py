@@ -505,6 +505,7 @@ class WorkflowKitTest(unittest.TestCase):
             "spec-reviewer": ("medium", False, False, True, False),
             "architecture-designer": ("high", True, True, True, False),
             "grill": ("high", True, False, True, False),
+            "task-supervisor": ("high", True, False, True, False),
             "implementation-worker": ("xhigh", True, True, True, True),
             "fix-worker": ("medium", True, True, True, True),
             "build-doctor": ("high", True, True, True, True),
@@ -529,6 +530,7 @@ class WorkflowKitTest(unittest.TestCase):
             "spec-reviewer": "gpt-6-astra",
             "architecture-designer": "gpt-6-astra",
             "grill": "gpt-6-astra",
+            "task-supervisor": "gpt-6-sol",
             "implementation-worker": "gpt-6-luna",
             "fix-worker": "gpt-6-astra",
             "build-doctor": "gpt-6-sol",
@@ -774,6 +776,91 @@ class WorkflowKitTest(unittest.TestCase):
                 self.assertNotIn("Do not call `kent run`", prompt)
                 if path.stem not in {*role_names, "grill"}:
                     self.assertNotIn("kent run watch <session-id>", prompt)
+
+    def test_task_supervisor_packaged_operational_contract(self) -> None:
+        # Static contract guards, not a simulation of model/runtime behavior.
+        prompt = (REPO_ROOT / "agents" / "task-supervisor.md").read_text()
+        normalized = " ".join(prompt.split())
+        scenarios = {
+            "selected_scope": (
+                "stable IDs and project identities",
+                "not unrelated Sessions or every Task",
+            ),
+            "long_work_and_escalation": (
+                "no overall supervision time limit",
+                "Bound each inspection and observer wait individually",
+                "Long planning, build or CI duration alone",
+                "Wait for the user's answer without repeatedly polling",
+                "A native Question may pause observation of all selected Tasks",
+                "return the blocker and options to the caller and end the run",
+            ),
+            "catch_up": (
+                "Re-read all selected Tasks before executing any old queued action",
+                "Discard stale, answered or resolved incidents",
+                "must not reset incident retry budgets",
+                "Fairly process the discovered independently actionable work",
+                "Defer blocked actions while helping other Tasks",
+                "before the next human Question",
+                "does not mean finishing the Tasks",
+            ),
+            "factual_question_not_approval": (
+                "Cite the source",
+                "agent-provided",
+                "may unblock already-authorized effects",
+                "Never answer Approvals or impersonate the user",
+                "re-reading is not an atomic compare-and-set",
+                "unresolved concurrent answering",
+                "reconciliation, not a blind retry",
+            ),
+            "safe_resume": (
+                "kent task resume",
+                "retained executable work",
+                "no active executor or competing recovery",
+                "Never automatically resume a deliberate human stop",
+                "fresh explicit human instruction",
+                "one automatic resume attempt per incident",
+                "without evidenced progress blocks further automatic retries",
+                "proves enqueueing, not a running Session",
+                "Repeated Resume is not a reconstruction procedure",
+            ),
+            "resource_ownership": (
+                "lost token with confirmed same-task ownership",
+                "an absent lease and foreign/corrupt ownership",
+                "genuine identity, serialized ownership",
+                "Never spoof or replace `KENT_TASK_ID`",
+                "Never write a checkpoint concurrently with its owner",
+                "TTL expiry alone does not prove",
+                "A command named \"resume\" is not proof",
+            ),
+            "effect_evidence_and_limits": (
+                "record intent",
+                "record the observed result afterward",
+                "cooperative duplicate prevention, not an atomic distributed lock",
+                "Do not edit product source",
+                "Do not create child agents",
+                "no new permissions",
+                "Do not promise uninterrupted uptime",
+            ),
+        }
+        for scenario, requirements in scenarios.items():
+            with self.subTest(scenario=scenario):
+                for requirement in requirements:
+                    self.assertIn(requirement, normalized)
+        self.assertNotIn("contracts/role-contract.md", prompt)
+        self.assertNotRegex(prompt, r"(?m)^\s*(model|tools)\s*:")
+        self.assertNotIn("kent run watch <session-id>", prompt)
+
+        readme = " ".join((REPO_ROOT / "README.md").read_text().split())
+        contract = " ".join(
+            (REPO_ROOT / "contracts" / "role-contract.md").read_text().split()
+        )
+        policy = (REPO_ROOT / "docs" / "MODEL-POLICY.md").read_text()
+        self.assertIn("kent --agent task-supervisor", readme)
+        self.assertIn("caller-mediated headless alternative", readme)
+        self.assertIn("checks **all selected Tasks**", readme)
+        self.assertIn("permissions of other roles", contract)
+        self.assertIn("first re-read **all selected Tasks**", contract)
+        self.assertIn("| `task-supervisor` | `gpt-6-sol` | high |", policy)
 
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
         config = tomllib.loads(

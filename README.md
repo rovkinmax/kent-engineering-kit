@@ -248,6 +248,54 @@ touching real Tasks.
 
 After changing global subagent configuration, restart Kent and reopen Kent
 Desktop. Skills, prompts, and `AGENTS.md` are consumed by new sessions.
+
+### Task supervisor
+
+After separately approved installation of `agents/task-supervisor.md`, its
+source config stanza, and a Kent restart, start a new interactive Session:
+
+```sh
+kent --agent task-supervisor
+```
+
+Tell it the exact Tasks and projects to accompany, for example: "Supervise
+KENT-123 and KENT-124 in this project until they finish. Resolve factual
+questions and safe technical interruptions; ask me when a decision is needed."
+The source policy is `gpt-6-sol` with `high` reasoning. This role is distinct
+from the built-in edit reviewer and from grill.
+
+There is no overall supervision time limit. Individual reads, waits and
+recovery attempts are bounded; observation backs off on unchanged normal work.
+Long planning or a build is not itself a hang. The role may answer factual
+Questions using authoritative project sources, attempt safe Resume, and help
+restore resources through project procedures. It cannot grant Approvals, make
+new product decisions, impersonate resource owners, edit source/config, or
+change Workflow graphs. Recovery capabilities depend on the project's
+procedures; a lost token, absent lease and foreign ownership are different
+cases, not interchangeable reasons to acquire a resource.
+
+If independent recovery cannot resolve an interruption, the supervisor first
+helps the other selected Tasks where possible, then asks you for one decision
+with options and a recommendation. It waits without repeatedly checking the
+same stopped incident. While that Question is pending, observation of all
+selected Tasks may pause; the Tasks themselves continue their own execution.
+After your answer, it checks **all selected Tasks**, discards stale incidents
+and processes accumulated authorized work before asking the next Question.
+It does not wait for long builds to finish just to complete that catch-up pass.
+
+`kent run --agent task-supervisor '<selected Tasks and project>'` is the
+caller-mediated headless alternative: it cannot ask native interactive
+Questions. When human input is needed, it returns the blocker/options and
+ends; the caller must obtain your decision and arrange continuation. Neither
+mode installs a scheduler or guarantees observation after the Session exits
+or crashes. A restarted supervisor reconciles current state and retained
+action evidence before acting; it does not reset retry budgets.
+
+Inspecting the same pending Question twice is not atomic targeting. Ambiguous
+or concurrent answers and recovery outcomes require reconciliation, not blind
+retries. Prompt-contract tests verify the packaged rules, not live recovery,
+uninterrupted uptime, or model compliance. Installation/config changes do not
+refresh existing Sessions; use a new Session after restart.
 Existing Sessions keep their locked prompts and execution settings.
 
 ## Workflow generation
