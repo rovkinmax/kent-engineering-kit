@@ -112,11 +112,34 @@ The role may inspect relevant evidence, steer the verified active executor,
 answer a demonstrably factual Question with authoritative provenance and agent
 authorship, and perform a guarded `kent task resume` after classified recoverable
 interruption. A factual answer may unblock already-authorized effects but
-cannot create authority. Approvals and new human decisions remain human.
+cannot create authority. New human decisions and required independent human
+judgments remain human; a supervisor may enact an already-made decision.
 Re-read the pending Question and execution immediately before answering;
 first-pending-question targeting is not an atomic question-ID operation.
 Changed, concurrent or unreliable targeting blocks the answer. Reconcile an
 ambiguous effect before any retry.
+
+For a selected other Task, the supervisor may use public `kent task approve`
+when verified human authority or an unambiguous standing authorization covers
+the exact current approval's consequences and its prerequisites are met.
+Recheck the approval ID, recipient and effects, not just its title. Changed
+scope, a later stop, unresolved prerequisites, competing execution or new
+human judgment blocks enactment. Respect actual CLI/project restrictions and
+human-only endpoints; no identity substitution or direct database mutation.
+Read back approval and execution state; do not confuse enqueueing with resumed
+work or blindly retry an ambiguous result.
+
+An original human Session message or native Question answer may supply
+authority when its authorship, content, context and applicability are
+verifiable. Reference its real locator through agent-authored audit context;
+never fabricate `--author user` provenance or downgrade a verified decision to
+mere intent because an agent conveyed it. Receivers verify the original, not
+the summary. Permission for a bounded action includes necessary in-scope
+preparation, not unknown later results or unlimited effects. Already-permitted
+reads/diagnostic preparation need no duplicate consent solely because a source
+is access-controlled or the work is called planning. Required governance and
+independent judgments remain binding. Global guidance grants other roles no
+new enactment permission.
 
 Automatic Resume requires retained execution, consistent node/locked target,
 reconciled effects and no competing executor/recovery. Allow one automatic
@@ -129,11 +152,24 @@ execution does not authorize repeated Resume or manual task movement.
 
 Resource recovery remains project-owned. Distinguish existing/lost tokens,
 missing leases and foreign/corrupt ownership. Prefer recovery by the active
-executor. Direct supervisor recovery needs a supported procedure with genuine
-identity, serialized ownership and checkpoint transfer. No identity spoofing,
+executor. Prefer project adapters and runbooks; if no suitable wrapper exists,
+already-authorized operations may use documented standard tools with verified
+project policy, bounded procedure, genuine identity, effective serialization,
+postconditions and handoff. A missing wrapper alone is not a blocker, while
+an unprovable safety precondition is. No identity spoofing,
 concurrent checkpoint writes, TTL-only foreign-resource reclamation, destructive
 resets or invented adapter capabilities. A missing lease is recoverable only
 through a procedure that establishes availability and safely acquires it.
+
+Explicitly authorized startup of an existing suitable virtual device does not
+require developing a custom launcher, but does require conflict checks and
+project lease compliance. It does not authorize creating devices, wipe,
+configuration edits or physical-device use. Host preparation cannot bypass a
+pre-action lease requirement. A private unshared lock is not exclusive-startup
+proof; verify the intended process/target and handle partial startup.
+Release/reacquire is not atomic handoff; the executor must acquire its own
+runtime lease before app/device work. No PID-only kills, foreign reclamation
+or promises that boot leaves userdata byte-identical.
 
 Record compact intent/result evidence through existing authorized mechanisms
 or Task comments, never per-poll chatter, secrets or a parallel lifecycle.

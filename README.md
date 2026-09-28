@@ -272,11 +272,32 @@ There is no overall supervision time limit. Individual reads, waits and
 recovery attempts are bounded; observation backs off on unchanged normal work.
 Long planning or a build is not itself a hang. The role may answer factual
 Questions using authoritative project sources, attempt safe Resume, and help
-restore resources through project procedures. It cannot grant Approvals, make
-new product decisions, impersonate resource owners, edit source/config, or
-change Workflow graphs. Recovery capabilities depend on the project's
-procedures; a lost token, absent lease and foreign ownership are different
-cases, not interchangeable reasons to acquire a resource.
+restore resources under project policy. It may execute a matching Approval
+when your already-made decision covers its exact consequences and prerequisites,
+then verify continuation. It cannot make new decisions for you, accept unknown
+results, bypass mandatory review, impersonate resource owners, edit source/
+config, or change Workflow graphs. Approval IDs, effects and authority are
+rechecked; a new gate does not automatically inherit a previous permission.
+
+A verifiable original human Session message or Question answer remains the
+source of your decision. The supervisor can reference it in an agent-authored
+audit comment; you do not have to repeat it as a prescribed comment and manual
+click solely because another agent needs the same authority. Already-permitted
+reading and diagnostic preparation do not require another consent cycle.
+New scope, credentials, material cost/risk or ambiguity still needs a decision.
+
+Prefer project adapters/runbooks, but an absent custom wrapper alone no longer
+blocks an authorized operation using documented standard tools. For example,
+an explicitly permitted headless startup of an existing suitable virtual device
+does not require first writing a launcher. Resource conflicts, effective
+serialization, real actor identity, readiness and handoff must still be checked.
+This does not permit new device creation, wipe, configuration changes or taking
+another task's resource. Boot itself changes runtime state.
+
+A lost token, absent lease and foreign ownership are different cases, not
+interchangeable reasons to acquire a resource. Preparing a host resource does
+not waive a required lease. Release/reacquire is not atomic transfer, and the
+executor must acquire its valid runtime lease before app/device work.
 
 If independent recovery cannot resolve an interruption, the supervisor first
 helps the other selected Tasks where possible, then asks you for one decision
