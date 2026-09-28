@@ -41,11 +41,13 @@ identity or source drift requires fresh verification. Do not use
 identity limits are in `.kent/project-contract.md`; Python 3.11+ must already
 exist.
 
-Source development is separate from installed Kit adoption. The installed
-primary checkout remains clean on
-`9363fa48f9f21d2742a41841ab97b18cc4c4e521`; preserve its index, local `main`,
-symlinks, global configuration, consumer pins and workflows. Do not run the
-installation instructions below as part of self-development.
+Source development is separate from installed Kit adoption. Preserve the
+installed primary, its index, local `main`, symlinks, global configuration,
+consumer pins and workflows. The project contract's
+[Source versus installed state](.kent/project-contract.md#source-versus-installed-state)
+section owns the boundary between this flow and separately authorized
+adoption. Do not run the installation instructions below as part of ordinary
+self-development.
 
 Before starting a future Task, explicitly acquire the approved source with
 `git fetch origin`, inspect `git symbolic-ref refs/remotes/origin/HEAD` and
@@ -56,19 +58,21 @@ commit before execution and does not implicitly fetch. A first Task Script
 cannot repair stale source selection. Use normal Kent-managed worktrees;
 do not create a second source workspace or change setup hooks.
 
-After an approved merged delivery, explicitly refresh remote tracking and
-repeat that preflight before another Task starts. Do not check out or
-fast-forward installed local `main`. Bootstrap qualification instead selects
-the exact published candidate SHA under separate effect approval. Keep its
-published branch intact through qualification; report-only cleanup requires
+Within ordinary self-development, after an approved merged delivery,
+explicitly refresh remote tracking and repeat that preflight before another
+Task starts; do not check out or fast-forward installed local `main`.
+Separately authorized adoption follows the project contract section linked
+above. Bootstrap qualification instead selects the exact published candidate
+SHA under separate effect approval. Keep its published branch intact through
+qualification; report-only cleanup requires
 exact HEAD equality with a current published branch tip, not mere ancestry.
 
 Source approval permits only its named source changes and local checks.
 Commit/push/PR, live create/apply/link/default, qualification Task execution,
 consumer rollout and installed adoption each need their applicable explicit
-authority. Future authorized delivery commits and pushes the task branch
-only; never push directly to `main` or merge the PR. Cleanup runs through the
-existing post-session Janitor, and acceptance checks actual worktree-path and
+authority. Within this workflow, authorized delivery commits and pushes the
+task branch only; never push directly to `main` or merge the PR. Cleanup runs
+through the existing post-session Janitor, and acceptance checks actual worktree-path and
 Git absence plus an absent Kent record or the exact original ID/root read back
 as missing retained restorative metadata, not just Task Done.
 

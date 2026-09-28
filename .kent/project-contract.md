@@ -138,11 +138,24 @@ Run/Session/Step records before admitting it as evidence.
 ## Source versus installed state
 
 Development uses one standard Kent-managed task worktree. Preserve the
-installed primary at `9363fa48f9f21d2742a41841ab97b18cc4c4e521`, its index,
-local main, symlinks, global configuration and every consumer pin/workflow.
+installed primary, its index, local main, symlinks, global configuration and
+every consumer pin/workflow during source development.
 README's explicit fetch/preflight precedes Task start: `default-branch`
-resolves local `origin/HEAD` and does not fetch. After merged delivery refresh
-tracking only; never checkout/fast-forward installed main.
+resolves local `origin/HEAD` and does not fetch. Within this self-development
+flow, after merged delivery refresh tracking only; never checkout/fast-forward
+installed main.
+
+A separately authorized adoption operation outside this flow may merge an
+explicitly approved PR and fast-forward the installed primary. Before effects,
+verify the exact repository/branch, clean checkout, actual installed revision,
+merge-linked target and complete activation range. Record observed and target
+revisions in that operation's evidence, not as a current-state pin in this
+standing contract. Stop on dirty or divergent state or unapproved activation
+drift; do not reset, force checkout or push directly to main. Configuration,
+symlink, consumer rollout and restart effects each require explicit inclusion
+in the approved scope; merge or fast-forward permission alone grants none.
+This separate operation does not relax Workflow gates or automatically
+authorize installed adoption.
 
 No live device/login actions, consumer-app implementation or rollout,
 installed-state adoption or restart is automatically authorized by this
@@ -150,7 +163,7 @@ flow. Source-only investigation and deterministic tests of Kit adapters and
 prompts remain valid within explicit task scope, including device-resource
 and login-guidance tooling. Live workflow changes and Git delivery require
 their own explicit effect authority; source approval alone grants neither.
-Never merge a PR or push directly to main.
+This flow never merges a PR or pushes directly to main.
 
 ## Report-only qualification
 
