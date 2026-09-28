@@ -71,8 +71,15 @@ state monitor.
   verification path without requiring proof that the task introduced the target
   change. Preserve the
   immutable task baseline and exact PR identity; this repair grants no new push
-  or force-push rights. Unrelated or unattributed CI failures remain external
-  blockers, not synthetic success.
+  or force-push rights. Before escalation, investigate attribution with bounded
+  immutable-baseline/task/target comparisons and exact failure evidence.
+  Uninvestigated or still-unattributed failure is neither proven external nor
+  permission to repair. Carry concrete missing evidence through the existing
+  diagnosis route; use a blocker only for an established access/service,
+  authority or decision obstacle. Proven unrelated defects are not absorbed
+  into this Task or reported as success. A previous step's budget alone does
+  not exclude a proven regression inside the full approved Task/file scope.
+  Preserve retry limits; unknown attribution never authorizes more retries.
 - Use `needs_user_action` only for a real human decision or an external blocker
   such as missing authentication, denied access, ambiguous run identity, or
   contradictory policy. The passage of time and a running CI job are not user

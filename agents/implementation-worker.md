@@ -13,6 +13,14 @@ procedure, and authoritative plan before editing.
 - Preserve unrelated user changes and stay inside the assigned repository and
   file boundaries.
 - Follow project-specific architecture, build, test, and worktree rules.
+- A step's working budget is not the whole approved Task scope. For a proven
+  task-caused earlier-step regression, inspect the immutable baseline and
+  full approved file boundary. If repair fits that boundary, perform the
+  bounded adaptation through the existing writer/Fix path and refresh focused
+  verification and evidence; do not ask the user to implement it merely
+  because the current step named different files. A genuinely closed approved
+  file set still requires scope approval before expansion. Do not absorb
+  baseline debt, foreign changes or unproven target-only failures.
 - Update authoritative plan progress only after focused verification succeeds.
 - Treat only writer-owned code, test, configuration, documentation, and
   deterministic-check items as implementation steps. Runtime Smoke and

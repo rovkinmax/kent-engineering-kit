@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from abc import ABC, abstractmethod
 import hashlib
 import importlib.util
 import json
@@ -225,6 +226,51 @@ def schema4_with_managed_adapter(contents: str) -> str:
 
 
 class WorkflowKitTest(unittest.TestCase):
+    def test_prior_slice_interface_mismatch_red_then_bounded_repair(self) -> None:
+        class BaselineScreens(ABC):
+            @abstractmethod
+            def search(self): ...
+
+        class BaselineProbe(BaselineScreens):
+            def search(self): return "search"
+
+        self.assertEqual(BaselineProbe().search(), "search")
+
+        class TaskScreens(BaselineScreens):
+            @abstractmethod
+            def actor_items(self, actor_name): ...
+
+        class OmittedProbe(TaskScreens):
+            def search(self): return "search"
+
+        with self.assertRaisesRegex(TypeError, "actor_items"):
+            OmittedProbe()
+
+        class AdaptedProbe(OmittedProbe):
+            def actor_items(self, actor_name): return "unsupported"
+
+        self.assertEqual(AdaptedProbe().search(), "search")
+        self.assertEqual(AdaptedProbe().actor_items("fixture"), "unsupported")
+
+    def test_execution_continuation_contract_and_cases(self) -> None:
+        role = (REPO_ROOT / "agents/delivery-operator.md").read_text()
+        self.assertIn("Consume completed tool output", role)
+        self.assertIn("required fresh safety check", role)
+        monitor = (REPO_ROOT / "agents/ci-monitor.md").read_text()
+        self.assertIn("neither proven external nor", monitor)
+        self.assertIn("unknown attribution never authorizes more retries", monitor)
+        for name in ("implementation-worker", "fix-worker"):
+            text = (REPO_ROOT / f"agents/{name}.md").read_text()
+            self.assertIn("approved", text)
+            self.assertIn("earlier", text)
+            self.assertIn("closed", text)
+        cases = json.loads(
+            (REPO_ROOT / "tests/fixtures/execution-continuation-cases.json").read_text()
+        )["cases"]
+        self.assertEqual(len(cases), 13)
+        self.assertEqual(len({case["id"] for case in cases}), 13)
+        self.assertIn("completed reads do", cleanup_prompt(self.load_profile()))
+
     def test_planning_grill_and_decision_carrier_prompts(self) -> None:
         profile = self.load_profile()
         initial = plan_prompt(profile)
@@ -263,13 +309,13 @@ class WorkflowKitTest(unittest.TestCase):
         )
 
     def test_non_opt_in_cleanup_graphs_preserve_frozen_baseline_bytes(self) -> None:
-        # Pre-amendment cleanup behavior, rebaselined only for the approved
-        # planning-grill/decision-carrier prompt changes (no cleanup delta).
+        # Pre-amendment cleanup ownership behavior, rebaselined for approved
+        # planning and execution-continuation prompt changes only.
         expected = {
-            (False, False): "c5d08769d57714a42978c2f9ca1da6289ab1a79ef3e22480a9399467eb6e5680",
-            (False, True): "a1cca1f6f21331894489514fba53de52f658c3fcc0767df6c18bb1b88c47072d",
-            (True, False): "ff2f0bbbdb30a40e5975987f80c7ca02ee02f40d8db795f8cce0aee9a99ce27e",
-            (True, True): "4149c8f63cf8e486b75e4e3d6de9330366cf0c5828f9ff0af9f1978d1faee5e4",
+            (False, False): "104ee56940e58cc5d7892b8ca79462f851f5776162aa9e4d0a6aaeabc9f504fc",
+            (False, True): "d5d605122ab39befa78d780766cea432ec685d2f191995b1fda0bac43130d2d3",
+            (True, False): "7e67847327451216e0eb46e3b8e4928e76cf9646974d6c9f6641f9c7feefa5c2",
+            (True, True): "05f85c9cd804b28d0b330f0b635062d0f4cd6282493e1800426cf38f081a2288",
         }
         for (managed, published), baseline in expected.items():
             for helper in (None, ""):
@@ -1094,7 +1140,7 @@ class WorkflowKitTest(unittest.TestCase):
             "verification_join_gate": 3200,
             "gate_delivery_ready": 2600,
             "compliance_prepare_pr": 3600,
-            "ci_watch_diagnose": 2800,
+            "ci_watch_diagnose": 3200,
         }
         for key, maximum in budgets.items():
             self.assertLessEqual(

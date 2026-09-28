@@ -31,6 +31,13 @@ module_spec.loader.exec_module(kit)
 
 
 class KitDevelopmentWorkflowTest(unittest.TestCase):
+    def test_execution_repairs_do_not_enable_ci_monitoring(self) -> None:
+        profile = kit.profile_at(ROOT)
+        self.assertFalse(profile.capability("ci_monitoring"))
+        role = (ROOT / "agents/implementation-worker.md").read_text()
+        self.assertIn("full approved file boundary", role)
+        self.assertIn("baseline debt, foreign changes", role)
+
     def test_planning_procedure_orders_grill_before_formal_reviews(self) -> None:
         procedure = (ROOT / ".kent/commands/plan.md").read_text()
         self.assertLess(procedure.index("grill critique"),
