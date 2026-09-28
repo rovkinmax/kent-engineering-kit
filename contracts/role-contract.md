@@ -92,6 +92,70 @@ to their caller, but cannot launch grill. Grill has
 limits. These narrow Kent Session-state effects do not authorize other
 mutations prohibited by a role.
 
+## Task Supervision
+
+`task-supervisor` is a separate operational role, not the built-in edit
+reviewer, a workflow node, or an extension of grill. Its explicit permissions
+below do not expand the Session Communication permissions of other roles.
+The installed role prompt carries these boundaries without depending on this
+maintainer document in a consumer workspace.
+
+The caller selects Tasks and their project identities. Selection permits
+resolving their current owning Sessions, not unrelated recipients or
+project-wide authority. Prefer a dedicated interactive Session: observe until
+all selected Tasks are terminal or the user stops supervision, without an
+overall time limit. Bound individual inspections/waits and recovery attempts,
+back off on unchanged normal work, and do not classify long planning as a hang.
+The role provides no scheduler, restart mechanism or uptime guarantee.
+
+The role may inspect relevant evidence, steer the verified active executor,
+answer a demonstrably factual Question with authoritative provenance and agent
+authorship, and perform a guarded `kent task resume` after classified recoverable
+interruption. A factual answer may unblock already-authorized effects but
+cannot create authority. Approvals and new human decisions remain human.
+Re-read the pending Question and execution immediately before answering;
+first-pending-question targeting is not an atomic question-ID operation.
+Changed, concurrent or unreliable targeting blocks the answer. Reconcile an
+ambiguous effect before any retry.
+
+Automatic Resume requires retained execution, consistent node/locked target,
+reconciled effects and no competing executor/recovery. Allow one automatic
+attempt per incident, with actual execution readback; enqueueing is not proof
+of continuation. Repeated failure without progress needs diagnosis and
+escalation. Never automatically resume a deliberate user stop; a fresh exact
+human instruction may authorize continuation after the same checks, without
+reviving terminal/canceled Tasks or bypassing an approval gate. Missing
+execution does not authorize repeated Resume or manual task movement.
+
+Resource recovery remains project-owned. Distinguish existing/lost tokens,
+missing leases and foreign/corrupt ownership. Prefer recovery by the active
+executor. Direct supervisor recovery needs a supported procedure with genuine
+identity, serialized ownership and checkpoint transfer. No identity spoofing,
+concurrent checkpoint writes, TTL-only foreign-resource reclamation, destructive
+resets or invented adapter capabilities. A missing lease is recoverable only
+through a procedure that establishes availability and safely acquires it.
+
+Record compact intent/result evidence through existing authorized mechanisms
+or Task comments, never per-poll chatter, secrets or a parallel lifecycle.
+Comments are audit, not live control; cooperative deduplication is not a lock.
+Retained evidence preserves incident budgets across supervisor invocations.
+Do not add source/config edits, child agents, Git delivery, Workflow mutation,
+manual start/move/complete, stopping runs or direct continuation of Workflow
+Sessions to the recovery permission.
+
+When independent help is exhausted, ask the user one concrete decision with
+options and a recommendation, then wait without polling that stopped incident.
+The native Question may pause observation of all selected Tasks, not the Tasks
+themselves. After an answer or restart, first re-read **all selected Tasks**,
+discard stale/resolved work, reconcile unknown effects and fairly complete
+the discovered authorized actions before the next human Question. One blocked
+action must not prevent independent help elsewhere. Catch-up handles incidents,
+not the completion of long-running Tasks or an infinite stream of new events.
+
+Headless invocation is caller-mediated: when input is required, return the
+blocker/options and end the run. The caller obtains the decision and explicitly
+arranges continuation; no background waiting is implied by a final response.
+
 ## Review Ownership
 
 Generated Delivery workflows assign operational ownership directly from the

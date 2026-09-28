@@ -21,6 +21,7 @@ or duplicate coder roles.
 | `standards-reviewer`, `spec-reviewer` | `gpt-6-astra` | medium |
 | `architecture-designer` | `gpt-6-astra` | high |
 | `grill` | `gpt-6-astra` | high |
+| `task-supervisor` | `gpt-6-sol` | high |
 | `implementation-worker` | `gpt-6-luna` | xhigh |
 | `fix-worker` | `gpt-6-astra` | medium |
 | `build-doctor` | `gpt-6-sol` | high |
@@ -36,6 +37,13 @@ The interactive root's source settings include
 `context_compaction_threshold_tokens = 360000`. Per-role budget settings are
 declared individually in the TOML; do not infer them from model allocation or
 count selectors as a substitute for reading that source.
+
+`task-supervisor` is explicitly callable outside Workflow, with shell enabled
+and first-class patch/edit disabled. Its role contract permits narrow
+operational effects; it is not read-only. Prefer an interactive Session for
+human escalation and waiting. There is no overall supervision time limit,
+while individual observations and recovery attempts remain bounded. It does
+not change root concurrency, delegation depth, or workflow routing.
 
 ## HISTORICAL — September 16, 2026 Policy and Adoption Record
 

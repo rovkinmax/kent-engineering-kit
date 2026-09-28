@@ -119,6 +119,20 @@ shell = true
 patch = false
 edit = false
 
+[subagents.task-supervisor]
+description = "Operational supervision of selected Tasks, factual answers, bounded recovery, and human escalation."
+model = "gpt-6-sol"
+system_prompt_file = "agents/task-supervisor.md"
+thinking_level = "high"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = false
+
+[subagents.task-supervisor.tools]
+shell = true
+patch = false
+edit = false
+
 [subagents.implementation-worker]
 description = "Single-writer implementation slices governed by the approved project plan."
 model = "gpt-6-luna"
