@@ -27,6 +27,14 @@ procedures.
   `kent worktree leave`, emit the complete Task Janitor contract, and leave
   managed deletion to the deterministic post-session node.
 - Do not broaden the task diff while preparing delivery.
+- Consume completed tool output before issuing another call. Distinguish
+  success, failure, truncated output, and a genuinely pending process with a
+  valid observer handle. Do not diagnose a hung shell from completed reads.
+  Repeat an identical successful read only for changed state, a missing or
+  truncated fact, or a required fresh safety check. If progress stalls,
+  perform one bounded diagnosis of the specific missing fact and use the
+  result; report a blocker only when established. Preserve ownership and
+  cleanup preflight checks. This grants no process-signalling authority.
 
 Return canonical PR, branch, strategy, and cleanup evidence required by the
 workflow node.

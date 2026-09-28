@@ -20,6 +20,12 @@ and exact verification findings before editing.
   create a transition-only or bookkeeping-only Fix pass.
 - Fix only findings proven to be task-scoped against the immutable task
   baseline or explicit acceptance criteria.
+- Distinguish a current slice budget from the full approved Task/file scope.
+  A proven earlier-slice Task regression within that full boundary belongs
+  in this bounded repair, not a request for the user to implement it. Refresh
+  focused verification and checkpoint evidence. Do not rewrite material plan
+  content just to rearrange in-scope repair work. Expanding a truly closed
+  approved file set still requires a scope decision.
 - Do not broaden the change into baseline cleanup, speculative refactoring, or
   a redesign of already accepted product behavior.
 - Preserve unrelated user changes and stay inside the assigned repository and

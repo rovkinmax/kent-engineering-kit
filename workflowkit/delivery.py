@@ -2659,6 +2659,11 @@ legacy procedure transition names such as `audit`.
 Apply the `implementation-worker` role contract to exactly one ready
 writer-owned plan step. Capture any planned pre-edit evidence before the first
 production edit.
+The step budget is not full Task authority: repair proven earlier-step Task
+regressions within the full approved file scope through the existing writer/
+Fix path, refreshing focused evidence. Truly closed file boundaries still
+require a scope decision; baseline, foreign and unproven target-only defects
+are not absorbed.
 
 After marking that step complete, choose `continue_implementation` with
 `workspace_path`, `task_short_id={{{{.TaskShortId}}}}`, and a concise
@@ -2836,6 +2841,10 @@ and focused checks."""
 {checkpoint}{delivery_context_passthrough_section(profile)}Apply the `fix-worker` role contract only to concrete task-introduced or
 task-worsened findings in `fix_context`. Baseline-wide debt, an unproven
 differential, or contradictory policy is not writer scope.
+An earlier step's budget does not exclude a proven regression inside the full
+approved Task/file scope. Perform bounded repair and refresh focused evidence;
+do not turn progress rearrangement into material plan revalidation. A truly
+closed approved file boundary still requires a decision before expansion.
 {completion_contract}
 Use `needs_user_action` only for an external blocker and provide
 `blocker_reason`. Its approval is a resume signal after the named external
@@ -3280,6 +3289,11 @@ watcher owns the wait and appends the new terminal observation. Preserve every
 attempt and failure fingerprint in `ci_report`.
 
 Query authoritative PR merge state before classifying any failed or late check.
+First perform bounded baseline/task/target attribution using exact failure
+evidence. Unknown attribution is neither an external blocker nor permission
+to edit: retain the concrete gap in the existing diagnosis route. Escalate
+only an established access/service/authority or decision obstacle; preserve
+retry limits. Prior-step budgets do not exclude proven in-scope regressions.
 If the PR is already merged, never route the merged task branch to Fix. Complete
 with `pr_merged` and provide `workspace_path`, `pr_url`, `branch_name`, and a
 `merge_report` that includes merge proof plus the late CI state. Any actionable
@@ -3416,6 +3430,15 @@ polling in the agent."""
     )
 
 
+def cleanup_result_instruction() -> str:
+    return """Consume completed output; distinguish success, failure, truncation,
+and a pending process with an observer handle. Repeat a successful identical
+read only for changed state, missing facts or required fresh safety evidence.
+On no progress, diagnose the specific missing fact once; completed reads do
+not prove a hung shell. Preserve ownership/preflight checks; no new signalling
+or monitoring authority is granted."""
+
+
 def cleanup_prompt(
     profile: ProjectProfile,
     *,
@@ -3488,6 +3511,8 @@ describing performed and skipped actions. Use `needs_user_action` with
 {context}
 
 {procedure_instruction(profile, "cleanup")}
+
+{cleanup_result_instruction()}
 
 Treat cleanup as report-first. Never delete the primary checkout, dirty or
 ambiguous state, or content not proven recoverable.
@@ -3610,6 +3635,8 @@ Publication proof: {{{{.Params.publication_report}}}}
 
 {procedure_instruction(profile, "cleanup")}
 
+{cleanup_result_instruction()}
+
 Require a non-empty publication report proving the exact task-authorized
 package version exists in the remote registry. Do not publish, tag, push, or
 edit project files from Cleanup. Treat cleanup as report-first and preserve
@@ -3631,6 +3658,8 @@ Merge proof: {{{{.Params.merge_report}}}}
 Publication proof: {{{{.Params.publication_report}}}}
 
 {procedure_instruction(profile, "cleanup")}
+
+{cleanup_result_instruction()}
 
 Require a non-empty publication report proving the exact task-authorized
 package version exists in the remote registry. Do not publish, tag, push, or

@@ -97,6 +97,27 @@ review leaves cannot launch it. Do not raise the root
 limits. These narrow Kent Session-state effects do not authorize other
 mutations prohibited by a role.
 
+## Execution Continuation
+
+Delivery roles consume completed results and distinguish success, failure,
+truncation and a genuine pending observer handle. An identical successful
+read needs changed state, a missing fact or required fresh safety evidence.
+One bounded no-progress diagnosis targets the missing fact; completed reads
+do not prove a hung shell. Required ownership/preflight checks remain.
+
+Writer/Fix roles distinguish step budgets from full approved Task/file scope.
+Proven earlier-step regressions inside that scope receive bounded repair and
+fresh focused evidence; closed approved file boundaries still constrain them.
+Do not turn ordinary repair progress into a new product decision or absorb
+baseline debt, foreign changes or unproven target-only failures.
+
+CI attribution requires bounded differential investigation before escalation.
+Unknown attribution proves neither externality nor permission to edit.
+Retain the concrete evidence gap and existing diagnosis route; real access,
+service, authority or decision obstacles remain blockers. Retry limits and
+merged-PR rules remain unchanged. Role prompts carry these rules independently
+of this maintainer-only contract.
+
 ## Task Supervision
 
 `task-supervisor` is a separate operational role, not the built-in edit
