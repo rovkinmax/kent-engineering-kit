@@ -7,7 +7,12 @@
    preview naming files, graph delta, rollout, rollback and restart impact;
    link exact human source IDs for any supersession. Keep writer-owned plan
    steps separate from workflow-owned review/verification/delivery stages.
-3. Freeze the preview and compute its SHA-256. Inside Plan, delegate exactly
+3. Before freeze, obtain one bounded read-only grill critique of the concrete
+   draft. Plan owns questions, dispositions and source verification; grill is
+   childless and its critique is not either independent PASS receipt. On
+   revalidation repeat critique only for substantive changes under
+   `contracts/plan-contract.md`, not bookkeeping, typos or waiting.
+   Then freeze the preview and compute its SHA-256. Inside Plan, delegate exactly
    one independent read-only preview review to an existing callable
    `architecture-designer` or `researcher` leaf. Supply the exact artifact,
    hash, task authority and bounded affected surfaces; forbid edits/effects
@@ -29,6 +34,12 @@ obtain approval. Material scope changes need a new preview; ordinary fixes
 within approved scope and missing agent bookkeeping do not create a new
 product decision. Reconstruct missing evidence only when safely bounded and
 disclose gaps; never invent old reviews or approvals.
+
+Preserve exact human sources and artifact pointers through Plan, Review and
+Revalidation using `contracts/plan-contract.md`. Keep sources in the plan or
+discoverable existing report-only evidence, not only transient review_context.
+Recover accessible original evidence before asking for a known decision again;
+an approved agent proposal requires both proposal and human acceptance.
 
 For explicitly authorized report-only qualification, `plan_path=not-applicable`
 is valid. Keep preview/review/approval in task evidence without tracked writes.

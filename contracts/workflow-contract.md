@@ -342,17 +342,16 @@ flat result contracts.
 - User feedback for an active run is delivered through `kent run steer` or the
   equivalent interactive session message. The node then exits through its
   declared transition with refreshed structured context.
-- When feedback changes a product decision or acceptance criterion, the next
-  writer updates the authoritative task design/specification/plan first and
-  references the exact task-comment ID. Code, review context, and checkpoints
-  refer to that artifact instead of creating independent copies of the
-  decision.
-- A design, specification, or plan may narrow or supersede the task body only
-  with an exact human-authored task-comment ID or another explicit
-  authoritative source. Agent-authored comments, implementation inference, and
-  unsupported prose such as "the user clarified" are not authority. Plan or
-  Specification Review returns `needs_user_action` before implementation when
-  that provenance is missing.
+- Changed product decisions or acceptance require the next writer to update
+  the authoritative plan first, citing the exact human source (Task comment,
+  verifiable original Session message or native Question answer). Code,
+  review context and checkpoints reference that artifact, not duplicate it.
+- Narrowing or superseding the task body requires exact human authority.
+  Agent comments, implementation inference and unsupported "user clarified"
+  claims are insufficient. Plan and Specification Review recover accessible
+  original evidence before escalating missing bookkeeping, following
+  `contracts/plan-contract.md`. Use `needs_user_action` only for necessary
+  authority still unavailable or a real unresolved decision.
 - Resource-owning nodes such as Smoke must release locks, preserve required
   authentication and app data, record whether any destructive action began,
   and finish evidence hygiene before returning `needs_changes`.

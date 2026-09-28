@@ -2596,8 +2596,18 @@ Any design, specification, or plan that narrows, replaces, or claims to
 supersede the task body must cite the exact human-authored task-comment ID or
 another explicit authoritative source. Agent-authored comments, implementation
 inference, and unsupported claims that "the user clarified" are not product
-authority. Use `needs_user_action` before implementation when that provenance
-is absent.
+authority. First recover accessible original sources before treating missing
+agent bookkeeping as absent authority; use `needs_user_action` only for a
+remaining real decision or unavailable necessary authority.
+
+Obtain bounded read-only grill critique of the concrete draft before freezing
+the plan and before formal reviews. Plan owns questions/dispositions; grill
+cannot edit, ask the user, spawn children or supply PASS. Missing eligibility
+blocks; simple work needs short critique. Preserve project review gates.
+Keep exact human sources in the plan or discoverable Task evidence;
+`review_context` is not the sole durable authority carrier. Link human
+acceptance to its exact agent proposal. Recover native evidence before asking
+again; agent summaries or truncated sources cannot supply missing consent.
 {recovery_contract}{context_contract_section}Complete with `review_plan` only when the plan has no unresolved product, API,
 UX, or safety ambiguity. `workspace_path` is the repository or
 managed-worktree root; it is never `.todo/<feature>` or another artifact
@@ -2682,6 +2692,15 @@ by the plan, and the plan itself. Use the read-only `spec-reviewer` contract,
 adapted to the proposed plan rather than an implementation diff. Do not edit
 the plan, code, task, or external systems.
 
+Verify original human sources or retained native evidence through the
+authoritative plan/evidence pointers. Recover accessible missing references
+before escalating a bookkeeping gap. Preserve applicable source references,
+scope, and artifact location when adding the review result to `review_context`;
+do not replace them with a PASS summary. Human acceptance of an agent proposal
+requires the linked proposal and acceptance. Agent paraphrases and incomplete
+historical source bodies do not establish missing authority. Grill co-design
+is not an independent review receipt; do not launch grill from this leaf.
+
 Check:
 
 - every narrowed or superseded decision has exact human authority;
@@ -2734,6 +2753,23 @@ contract from material changes to requirements, architecture, acceptance,
 safety, or evidence. Reconcile only material changes in the authoritative
 design/specification/plan and cite exact human-authored task-comment IDs or
 other explicit sources. Do not edit production code or execute verification.
+Preserve still-applicable human source references and artifact pointers through
+revalidation; explicitly identify genuine supersession. Recover accessible
+original messages, native answers/comments or retained native read results
+before asking for a decision already made. Keep the exact proposal plus human
+acceptance when that pair grants authority. An agent summary or truncated
+historical source cannot fill missing consent. Store durable references in
+the authoritative plan or discoverable project-permitted report-only evidence,
+not only `review_context`; do not repurpose `plan_route_context`.
+
+Consult a bounded read-only grill leaf before freeze and formal review only
+when materially revising requirements, API/UX, architecture, authority,
+safety/effects, cost, or evidence strategy, or when execution disproves the
+chosen approach. Hash drift, checkbox progress, typos, operational waiting,
+and repeated identical failures alone do not require another grill call.
+Plan owns questions and dispositions; grill cannot edit, ask the user, spawn
+children, or replace independent review. Report unavailable effective leaf
+eligibility as a concrete blocker rather than claiming critique occurred.
 When revalidation was triggered by deterministic drift, compare the current
 plan with the prior normalized snapshot at
 `.kent/runtime/{{{{.TaskShortId}}}}/plan-contract.json`; checkbox state alone
