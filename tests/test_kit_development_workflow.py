@@ -31,6 +31,15 @@ module_spec.loader.exec_module(kit)
 
 
 class KitDevelopmentWorkflowTest(unittest.TestCase):
+    def test_planning_procedure_orders_grill_before_formal_reviews(self) -> None:
+        procedure = (ROOT / ".kent/commands/plan.md").read_text()
+        self.assertLess(procedure.index("grill critique"),
+                        procedure.index("Then freeze"))
+        self.assertLess(procedure.index("Then freeze"),
+                        procedure.index("one independent read-only preview review"))
+        self.assertIn("both independent reviews PASS", procedure)
+        self.assertIn("not either independent PASS receipt", procedure)
+
     def fixture(self) -> Path:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

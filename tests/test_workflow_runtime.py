@@ -406,6 +406,7 @@ class WorkflowPlanContractTest(GitRepositoryTest):
         spoof_mode: str | None = None,
         spoof_route: str | None = None,
         delivery_context: str | None = None,
+        review_context: str = "bounded review context",
     ) -> subprocess.CompletedProcess[str]:
         executable = (
             PLAN_CONTRACT_ACCEPT
@@ -437,7 +438,7 @@ class WorkflowPlanContractTest(GitRepositoryTest):
                 if route == "fix_continue"
                 else "not-applicable"
             ),
-            "review_context": "bounded review context",
+            "review_context": review_context,
             "task_short_id": "TASK-PLAN",
         }
         if route == "fix_continue":
@@ -518,6 +519,39 @@ class WorkflowPlanContractTest(GitRepositoryTest):
                     context,
                 )
         self.assertFalse((root / ".kent/scripts/__pycache__").exists())
+
+    def test_decision_references_use_durable_plan_and_route_carriers(self) -> None:
+        root = self.create_repository()
+        plan = root / ".todo/task/plan.md"
+        plan.parent.mkdir(parents=True)
+        source = "fixture-session/question-1: human approved bounded feature"
+        original = f"# Plan\n\nAuthority: {source}\n\n- [ ] Implement\n"
+        plan.write_text(original)
+        context = f"Read .todo/task/plan.md; source={source}"
+        for route in ("start", "continue", "verify", "fix_continue"):
+            with self.subTest(route=route):
+                result = self.run_contract(
+                    root, mode="accept", route=route, review_context=context,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = json.loads(result.stdout)
+                if route in {"start", "continue"}:
+                    self.assertEqual(payload["plan_path"], ".todo/task/plan.md")
+                    self.assertNotIn("review_context", payload)
+                elif route == "verify":
+                    self.assertEqual(payload["review_context"], context)
+                else:
+                    self.assertEqual(payload["fix_context"], "remaining fix bundle")
+                self.assertIn(source, plan.read_text())
+        plan.write_text(original.replace("[ ]", "[x]"))
+        stable = self.run_contract(root, mode="check", review_context=context)
+        self.assertEqual(stable.returncode, 0, stable.stderr)
+        self.assertEqual(json.loads(stable.stdout)["transition"],
+                         "plan_contract_continue_stable")
+        plan.write_text(original + "\nNew acceptance criterion\n")
+        changed = self.run_contract(root, mode="check", review_context=context)
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertEqual(json.loads(changed.stdout)["review_context"], context)
 
     def test_invalid_supplied_delivery_context_fails_before_acceptance(self) -> None:
         root = self.create_repository()

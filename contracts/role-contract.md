@@ -87,7 +87,12 @@ and only when Kent permits their child depth. This is independent criticism,
 not delegation of the caller's responsibility. In Workflow, these roles remain
 leaf Sessions: they may steer an existing active Session or return the request
 to their caller, but cannot launch grill. Grill has
-`agent_callable = true` and `workflow_subagent = false`; do not raise the root
+`agent_callable = true` and `workflow_subagent = true`. Plan may invoke one
+bounded read-only grill leaf after discovery and a concrete draft, before
+freeze and formal reviews. Revalidation repeats critique only for substantive
+design or authority changes as defined in `contracts/plan-contract.md`.
+Grill remains childless and supplies no independent review receipt. Workflow
+review leaves cannot launch it. Do not raise the root
 `max_subagent_depth` or grant tools to a tool-less role to circumvent these
 limits. These narrow Kent Session-state effects do not authorize other
 mutations prohibited by a role.

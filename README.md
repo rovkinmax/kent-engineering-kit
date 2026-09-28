@@ -223,6 +223,16 @@ monitoring, research, architecture, and independent review roles. Canonical
 roles are contract-complete without project overrides. Workspace
 specialization remains optional and must preserve the same role contract.
 
+Generated Plan invokes a bounded grill leaf after discovery and a concrete
+draft, before freeze and independent reviews. Revalidation repeats critique
+only for substantive changes; grill is not a review receipt and is not added
+to every node. Plan preserves human decision references in its authoritative
+artifact through Review and Revalidation; see `contracts/plan-contract.md`.
+Source workflow eligibility does not activate installed configuration or live
+graphs. Adopt those together only through separately approved compatibility
+and installation gates; existing locked Sessions retain their instructions
+and settings. Do not restart Kent or update live defaults implicitly.
+
 After separately approved installation of the grill role, the managed config
 merge, and a Kent restart, start a new decision discussion interactively or
 headlessly:

@@ -14,5 +14,6 @@ Conditional:
 
 Do not preload implementation, delivery, disabled Smoke, consumer adapters,
 global configuration or the full maintainer documentation tree.
-Record authority, work kind, preview hash, first-review evidence and decisions
+Record authority source pointers, grill critique/dispositions, work kind,
+preview hash, first-review evidence and decisions
 in the profile evidence ledger before transition.

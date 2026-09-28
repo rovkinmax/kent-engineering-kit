@@ -112,7 +112,7 @@ system_prompt_file = "agents/grill.md"
 thinking_level = "high"
 model_verbosity = "low"
 agent_callable = true
-workflow_subagent = false
+workflow_subagent = true
 
 [subagents.grill.tools]
 shell = true

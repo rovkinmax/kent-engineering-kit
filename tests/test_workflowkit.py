@@ -23,6 +23,8 @@ from workflowkit.delivery import (
     cleanup_prompt,
     janitor_recovery_prompt,
     plan_prompt,
+    plan_review_prompt,
+    plan_revalidation_prompt,
     published_cleanup_prompt,
 )
 from workflowkit.kent import (
@@ -223,6 +225,29 @@ def schema4_with_managed_adapter(contents: str) -> str:
 
 
 class WorkflowKitTest(unittest.TestCase):
+    def test_planning_grill_and_decision_carrier_prompts(self) -> None:
+        profile = self.load_profile()
+        initial = plan_prompt(profile)
+        review = plan_review_prompt(profile)
+        variants = [
+            plan_revalidation_prompt(profile, from_review=value)
+            for value in (False, True)
+        ]
+        self.assertIn("before freezing the plan and before formal reviews",
+                      " ".join(initial.split()))
+        self.assertIn("not the sole durable authority carrier", initial)
+        self.assertIn("do not launch grill from this leaf", review)
+        self.assertIn("do not replace them with a PASS summary", review)
+        for prompt in variants:
+            self.assertIn("execution disproves", prompt)
+            self.assertIn("do not repurpose `plan_route_context`", prompt)
+            self.assertIn("do not require another grill call", prompt)
+        cases = json.loads(
+            (REPO_ROOT / "tests/fixtures/planning-decision-carriers.json").read_text()
+        )
+        self.assertEqual(len(cases["cases"]), 8)
+        self.assertEqual(len({case["id"] for case in cases["cases"]}), 8)
+
     def cleanup_profile(self, *, managed: bool, published: bool) -> ProjectProfile:
         profile = self.load_profile()
         return replace(
@@ -238,12 +263,13 @@ class WorkflowKitTest(unittest.TestCase):
         )
 
     def test_non_opt_in_cleanup_graphs_preserve_frozen_baseline_bytes(self) -> None:
-        # Captured from exact pre-amendment M2, before editing delivery.py.
+        # Pre-amendment cleanup behavior, rebaselined only for the approved
+        # planning-grill/decision-carrier prompt changes (no cleanup delta).
         expected = {
-            (False, False): "19025d561a73b50c71ff829c467956fb89925b4101e8f0dfc31981f353899775",
-            (False, True): "afb543d9d34240cadc3a8ed04c84545e77d1db32d9c3daf8273c20d9086af054",
-            (True, False): "0d99a469c1fcf33a978752c9cb26bf1d5d4935659eb513fec89f6f1f7769a54c",
-            (True, True): "1ba8ee078584908e3d5aa9879482b230a73273da01c44e9d8ce06696a9f206b4",
+            (False, False): "c5d08769d57714a42978c2f9ca1da6289ab1a79ef3e22480a9399467eb6e5680",
+            (False, True): "a1cca1f6f21331894489514fba53de52f658c3fcc0767df6c18bb1b88c47072d",
+            (True, False): "ff2f0bbbdb30a40e5975987f80c7ca02ee02f40d8db795f8cce0aee9a99ce27e",
+            (True, True): "4149c8f63cf8e486b75e4e3d6de9330366cf0c5828f9ff0af9f1978d1faee5e4",
         }
         for (managed, published), baseline in expected.items():
             for helper in (None, ""):
@@ -504,7 +530,7 @@ class WorkflowKitTest(unittest.TestCase):
             "standards-reviewer": ("medium", False, False, True, False),
             "spec-reviewer": ("medium", False, False, True, False),
             "architecture-designer": ("high", True, True, True, False),
-            "grill": ("high", True, False, True, False),
+            "grill": ("high", True, True, True, False),
             "task-supervisor": ("high", True, False, True, False),
             "implementation-worker": ("xhigh", True, True, True, True),
             "fix-worker": ("medium", True, True, True, True),
@@ -1059,7 +1085,8 @@ class WorkflowKitTest(unittest.TestCase):
             for edge in build_delivery_workflow(profile, 1).edges
         }
         budgets = {
-            "start_plan": 6500,
+            # Bounded addition for approved co-design and decision carriers.
+            "start_plan": 7200,
             "plan_contract_implement": 5000,
             "gate_fix": 4000,
             "dispatch_standards_review": 1500,
