@@ -24,6 +24,15 @@
   cites an exact human-authored task-comment ID or another explicit
   authoritative source. Agent summaries and unsupported claims that "the user
   clarified" do not create product authority.
+- An original human Session message or native Question answer can be that
+  explicit source when its authorship, exact content, context and current
+  applicability can be verified. Cite its real Session and event/message/
+  Question identifier or equivalent verifiable locator. An agent-authored
+  audit comment may reference it and identify the scope it supersedes, but
+  does not replace the source or become human-authored. Never manufacture
+  provenance with `--author user`. Receivers verify the original decision;
+  do not require the user to retype it merely because an agent conveyed it.
+  Missing or ambiguous consent remains a concrete blocker.
 - Missing agent-produced bookkeeping is not a user decision. Reconstruct it
   only when bounded and safe; otherwise record the gap and continue with the
   available evidence.
@@ -42,6 +51,12 @@
 - Make approval and blocker text decision-oriented. Use the compact Russian
   structure `Нужно от вас`, `Почему`, and `После подтверждения` when useful.
 - Questions and approvals are for real user decisions or external actions. In approval text, do not paste raw review reports; do not present task-scoped code fixes as actions the user must perform.
+- Do not request the same permission again for already-authorized reading or
+  necessary bounded diagnostic preparation. An access-controlled source or a
+  stage named Plan alone is not a new authority boundary. Ask for a genuinely
+  new decision, credential/access scope, material cost/risk or ambiguity.
+  Applicable role restrictions, governance reviews and effect gates remain
+  binding; this guidance grants no role new operational permissions.
 
 ## Engineering Safety
 

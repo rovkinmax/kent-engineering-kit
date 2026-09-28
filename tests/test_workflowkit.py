@@ -807,7 +807,7 @@ class WorkflowKitTest(unittest.TestCase):
                 "Cite the source",
                 "agent-provided",
                 "may unblock already-authorized effects",
-                "Never answer Approvals or impersonate the user",
+                "Never impersonate the user",
                 "re-reading is not an atomic compare-and-set",
                 "unresolved concurrent answering",
                 "reconciliation, not a blind retry",
@@ -846,6 +846,48 @@ class WorkflowKitTest(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 for requirement in requirements:
                     self.assertIn(requirement, normalized)
+        expanded_scenarios = {
+            "decision_enactment_not_new_judgment": (
+                "kent task approve",
+                "selected other Task",
+                "exact current pending approval ID",
+                "transition consequences and actual prerequisites",
+                "required independent human judgment block enactment",
+                "Do not evade a rejected actor or a human-only endpoint",
+                "An accepted command is not proof of continuation",
+                "do not use a replacement approval ID",
+            ),
+            "human_source_carry": (
+                "original human Session message or native Question answer",
+                "not merely an intention because it reached you first",
+                "equivalent verifiable locator",
+                "audit is not itself human authority",
+                "Never use `--author user`",
+                "necessary bounded diagnostic preparation",
+                "not unlimited retries/spend",
+                "Do not demand the same decision",
+            ),
+            "tool_fallback_with_real_resource_safety": (
+                "Absence of a wrapper alone is not a blocker",
+                "an unproven mandatory safety condition is",
+                "documented standard tools",
+                "an already-authorized operation",
+                "explicitly authorized startup",
+                "without first developing a launcher",
+                "not an exemption from a project's pre-action lease requirement",
+                "private lock unknown to other participants",
+                "not a competitor",
+                "Release/reacquire is not atomic transfer",
+                "executor must obtain its own valid runtime lease",
+                "Never kill based only on a reusable PID",
+            ),
+        }
+        for scenario, requirements in expanded_scenarios.items():
+            with self.subTest(scenario=scenario):
+                for requirement in requirements:
+                    self.assertIn(requirement, normalized)
+        self.assertNotIn("Never answer Approvals", normalized)
+        self.assertNotIn("start another emulator", normalized)
         self.assertNotIn("contracts/role-contract.md", prompt)
         self.assertNotRegex(prompt, r"(?m)^\s*(model|tools)\s*:")
         self.assertNotIn("kent run watch <session-id>", prompt)
@@ -861,6 +903,14 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn("permissions of other roles", contract)
         self.assertIn("first re-read **all selected Tasks**", contract)
         self.assertIn("| `task-supervisor` | `gpt-6-sol` | high |", policy)
+        guidance = " ".join(
+            (REPO_ROOT / "global" / "AGENTS.md").read_text().split()
+        )
+        self.assertIn("original human Session message or native Question answer", guidance)
+        self.assertIn("Never manufacture provenance with `--author user`", guidance)
+        self.assertIn("guidance grants no role new operational permissions", guidance)
+        self.assertIn("no duplicate consent", contract)
+        self.assertIn("already-made decision covers its exact consequences", readme)
 
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
         config = tomllib.loads(
