@@ -126,10 +126,19 @@ def primary_root(workspace: Path) -> Path:
     raise RuntimeError("cannot determine the primary Git worktree")
 
 
+def _unique_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def json_object(output: str, label: str) -> dict[str, object]:
     try:
-        payload = json.loads(output)
-    except json.JSONDecodeError as error:
+        payload = json.loads(output, object_pairs_hook=_unique_json_pairs)
+    except ValueError as error:
         raise RuntimeError(f"{label} returned invalid JSON: {error}") from error
     if not isinstance(payload, dict):
         raise RuntimeError(f"{label} returned a non-object JSON payload")
@@ -159,23 +168,37 @@ def cleanup_session_uses_workspace(
     payload = json_object(result.stdout, "Kent worktree status")
     target = payload.get("target")
     worktree = payload.get("worktree")
-    candidates: list[object] = []
-    if isinstance(target, dict):
-        candidates.append(target.get("EffectiveWorkdir"))
-    if isinstance(worktree, dict):
-        candidates.extend(
-            (
-                worktree.get("recorded_root"),
-                worktree.get("observed_root"),
-            )
-        )
-    for candidate in candidates:
-        if not isinstance(candidate, str) or not candidate.strip():
-            continue
-        candidate_path = Path(candidate).expanduser().resolve()
-        if candidate_path == workspace or candidate_path.is_relative_to(workspace):
-            return True
-    return False
+    if not isinstance(target, dict) or (
+        worktree is not None and not isinstance(worktree, dict)
+    ):
+        raise RuntimeError("Kent worktree status has no trustworthy target identity")
+    worktree = worktree or {}
+    legacy = "EffectiveWorkdir" in target or any(
+        key in worktree for key in ("recorded_root", "observed_root")
+    )
+    native = "effectiveWorkdir" in target or any(
+        key in worktree for key in ("recordedRoot", "observedRoot")
+    )
+    if legacy == native:
+        raise RuntimeError("Kent worktree status has missing or mixed identity dialects")
+    effective_key = "effectiveWorkdir" if native else "EffectiveWorkdir"
+    root_keys = ("recordedRoot", "observedRoot") if native else (
+        "recorded_root", "observed_root",
+    )
+    effective = Path(_kent_root(target.get(effective_key), "Session effective root"))
+    roots = [
+        Path(_kent_root(worktree[key], "Session worktree root"))
+        for key in root_keys if key in worktree
+    ]
+    if len(set(roots)) > 1 or any(
+        effective != root and not effective.is_relative_to(root) for root in roots
+    ):
+        raise RuntimeError("Kent worktree status roots contradict each other")
+    workspace = workspace.resolve()
+    return any(
+        root == workspace or root.is_relative_to(workspace)
+        for root in [effective, *roots]
+    )
 
 
 def git_registers_worktree(primary: Path, workspace: Path) -> bool:
@@ -190,7 +213,10 @@ def git_registers_worktree(primary: Path, workspace: Path) -> bool:
 
 
 def _kent_root(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if (
+        not isinstance(value, str) or not value.strip()
+        or not Path(value).expanduser().is_absolute()
+    ):
         raise RuntimeError(f"Kent worktree list has no {label}")
     return str(Path(value).expanduser().resolve())
 
@@ -199,15 +225,55 @@ def _kent_record(
     item: object,
     *,
     workspace: Path,
+    primary: Path,
 ) -> dict[str, str]:
     if not isinstance(item, dict):
         raise RuntimeError("Kent worktree list contains a malformed entry")
     topology = item.get("topology")
     if not isinstance(topology, dict):
         raise RuntimeError("Kent worktree list entry has no topology")
-    variant = topology.get("variant")
-    if not isinstance(variant, str):
-        raise RuntimeError("Kent worktree list entry has no topology variant")
+    variants = {"external", "missing", "registered", "mainWorkspace"}
+    native = "variant" not in topology
+    if native:
+        if len(topology) != 1 or not (set(topology) <= variants):
+            raise RuntimeError("Kent worktree list has unknown or ambiguous topology")
+        variant = next(iter(topology))
+    else:
+        variant = topology.get("variant")
+        if not isinstance(variant, str) or variant not in variants:
+            raise RuntimeError("Kent worktree list has unknown topology variant")
+        if set(topology) != {"variant", variant}:
+            raise RuntimeError("Kent worktree list has ambiguous topology payloads")
+    body = topology.get(variant)
+    if not isinstance(body, dict):
+        raise RuntimeError("Kent worktree topology payload is malformed")
+    # Only identity fields are translated; projection/display metadata is not identity.
+    aliases = {"canonical_root": "canonicalRoot", "worktree_id": "worktreeId",
+               "is_main_worktree": "isMainWorktree"}
+    normalized = dict(body)
+    for name in ("git", "kent"):
+        identity = body.get(name)
+        if identity is None:
+            continue
+        if not isinstance(identity, dict):
+            raise RuntimeError("Kent worktree topology identity is malformed")
+        forbidden = aliases.keys() if native else aliases.values()
+        if any(key in identity for key in forbidden):
+            raise RuntimeError("Kent worktree topology mixes identity dialects")
+        normalized[name] = {
+            **identity,
+            **{old: identity[new] for old, new in aliases.items()
+               if native and new in identity},
+        }
+    topology = {variant: normalized}
+    if variant == "mainWorkspace":
+        git = normalized.get("git")
+        if not isinstance(git, dict) or git.get("is_main_worktree") is not True:
+            raise RuntimeError("Kent primary topology is not a main worktree")
+        root = _kent_root(git.get("canonical_root"), "primary root")
+        if root != str(primary.resolve()):
+            raise RuntimeError("Kent primary topology root differs from known primary")
+        return {"variant": variant, "root": root}
     if variant == "external":
         external = topology.get("external")
         git = external.get("git") if isinstance(external, dict) else None
@@ -241,6 +307,8 @@ def _kent_record(
         kent = registered.get("kent")
         if not isinstance(git, dict) or not isinstance(kent, dict):
             raise RuntimeError("Kent registered topology is incomplete")
+        if git.get("is_main_worktree", False) is not False:
+            raise RuntimeError("Kent registered topology claims the primary worktree")
         git_root = _kent_root(git.get("canonical_root"), "registered Git root")
         kent_root = _kent_root(kent.get("canonical_root"), "registered Kent root")
         if git_root != kent_root:
@@ -284,9 +352,14 @@ def kent_worktree_entries(
     if not isinstance(worktrees, list):
         raise RuntimeError("Kent worktree list has no worktrees array")
     entries = [
-        _kent_record(item, workspace=workspace)
+        _kent_record(item, workspace=workspace, primary=primary)
         for item in worktrees
     ]
+    if len({entry["root"] for entry in entries}) != len(entries):
+        raise RuntimeError("Kent worktree list contains duplicate roots")
+    identities = [entry["worktree_id"] for entry in entries if "worktree_id" in entry]
+    if len(set(identities)) != len(identities):
+        raise RuntimeError("Kent worktree list contains duplicate managed identities")
     return entries
 
 
