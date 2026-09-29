@@ -8370,6 +8370,70 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
 
 
 class WorkflowJanitorTest(GitRepositoryTest):
+    def test_delete_result_native_and_legacy_contracts(self) -> None:
+        module = load_template_module(JANITOR, "janitor_delete_contract")
+        for outcome in ("DELETED", "RETAINED", "NOT_REQUESTED", "NOT_APPLICABLE"):
+            with self.subTest(outcome=outcome):
+                cleanup = {"kind": "WORKTREE_BRANCH_CLEANUP_OUTCOME_" + outcome}
+                if outcome in ("DELETED", "RETAINED"):
+                    cleanup["branchName"] = "TASK-1"
+                self.assertEqual(module.deletion_result_kind({"cleanup": cleanup}), "completed")
+        self.assertEqual(module.deletion_result_kind({"kind": "completed"}), "completed")
+        self.assertEqual(module.deletion_result_kind({
+            "kind": "scheduled", "scheduled": {"operation_id": "operation"},
+        }), "scheduled")
+        native = {"cleanup": {
+            "kind": "WORKTREE_BRANCH_CLEANUP_OUTCOME_DELETED", "branchName": "TASK-1",
+        }}
+        invalid = [
+            {}, {"success": native}, {"cleanup": None}, {"cleanup": {}},
+            {"cleanup": {"kind": "WORKTREE_BRANCH_CLEANUP_OUTCOME_UNSPECIFIED"}},
+            {"cleanup": {"kind": "WORKTREE_BRANCH_CLEANUP_OUTCOME_DELETED"}},
+            {"cleanup": {**native["cleanup"], "branchName": 1}},
+            {"cleanup": {**native["cleanup"], "diagnostic": []}},
+            {"cleanup": {**native["cleanup"], "unknown": True}},
+            {**native, "leftoverRoot": "/retained"},
+            {**native, "leftoverRoot": None},
+            {**native, "kind": "completed"},
+            {"kind": "completed", "scheduled": {}},
+            {"kind": "scheduled", "completed": {}},
+            {"kind": "completed", "completed": None},
+            {"kind": "completed", "completed": {"leftover_root": "/retained"}},
+            {"kind": "scheduled", "scheduled": []},
+            {"kind": "unknown"},
+        ]
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                with self.assertRaises((TypeError, ValueError)):
+                    module.deletion_result_kind(payload)
+
+    def test_native_delete_success_reaches_done_after_actual_deletion(self) -> None:
+        original = self.retained_kent_record_wrapper
+        counters = []
+
+        def native_wrapper(root: Path) -> Path:
+            wrapper = original(root)
+            counter = root / "delete-count"
+            counters.append(counter)
+            text = wrapper.read_text()
+            text = text.replace(
+                'git -C "$KENT_TEST_PRIMARY" worktree remove --force "$target"\n',
+                'git -C "$KENT_TEST_PRIMARY" worktree remove --force "$target"\n'
+                'git -C "$KENT_TEST_PRIMARY" branch -D TASK-1 >/dev/null\n'
+                f"echo deleted >> '{counter}'\n",
+            )
+            text = text.replace(
+                '{"kind":"completed","completed":{"cleanup":{"kind":"retained"}}}',
+                '{"cleanup":{"kind":"WORKTREE_BRANCH_CLEANUP_OUTCOME_DELETED",'
+                '"branchName":"TASK-1"}}',
+            )
+            wrapper.write_text(text)
+            return wrapper
+
+        with mock.patch.object(self, "retained_kent_record_wrapper", native_wrapper):
+            self.test_no_pr_cleanup_settles_local_branch_and_reports_retained_kent_record()
+        self.assertEqual(counters[0].read_text().splitlines(), ["deleted"])
+
     def test_native_kent_topology_and_primary_identity(self) -> None:
         module = load_template_module(JANITOR, "janitor_native_topology")
         primary = self.create_repository()
