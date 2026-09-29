@@ -8370,6 +8370,115 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
 
 
 class WorkflowJanitorTest(GitRepositoryTest):
+    def test_native_kent_topology_and_primary_identity(self) -> None:
+        module = load_template_module(JANITOR, "janitor_native_topology")
+        primary = self.create_repository()
+        workspace = (primary / ".kent/worktrees/TASK-1").resolve()
+        entries = [
+            {"topology": {"mainWorkspace": {"git": {
+                "canonicalRoot": str(primary), "isMainWorktree": True,
+            }}}},
+            {"topology": {"registered": {
+                "git": {"canonicalRoot": str(workspace)},
+                "kent": {"canonicalRoot": str(workspace),
+                         "worktreeId": "kent-record-task-1", "managed": True},
+            }}},
+        ]
+        result = subprocess.CompletedProcess([], 0, json.dumps({"worktrees": entries}), "")
+        with mock.patch.object(module, "run", return_value=result):
+            record = module.capture_kent_worktree_record(
+                "wrapper", primary, workspace, "cleanup-session",
+            )
+        self.assertEqual(record, {
+            "variant": "registered", "root": str(workspace.resolve()),
+            "worktree_id": "kent-record-task-1",
+        })
+
+    def test_native_kent_session_status_membership(self) -> None:
+        module = load_template_module(JANITOR, "janitor_native_status")
+        primary = self.create_repository()
+        workspace = primary / ".kent/worktrees/TASK-1"
+        for root, effective, expected in (
+            (primary, primary, False),
+            (workspace, workspace, True),
+            (workspace, workspace / "subdirectory", True),
+        ):
+            with self.subTest(root=root, effective=effective):
+                payload = {
+                    "target": {"effectiveWorkdir": str(effective)},
+                    "worktree": {"recordedRoot": str(root), "observedRoot": str(root)},
+                }
+                result = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+                with mock.patch.object(module, "run", return_value=result):
+                    self.assertEqual(module.cleanup_session_uses_workspace(
+                        "wrapper", primary, "cleanup-session", workspace,
+                    ), expected)
+        for payload in (
+            {},
+            {"target": {"effectiveWorkdir": str(primary),
+                        "EffectiveWorkdir": str(workspace)}},
+            {"target": {"effectiveWorkdir": str(primary)},
+             "worktree": {"recordedRoot": str(workspace),
+                          "observedRoot": str(primary)}},
+        ):
+            with self.subTest(invalid=payload):
+                result = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+                with mock.patch.object(module, "run", return_value=result):
+                    with self.assertRaises(RuntimeError):
+                        module.cleanup_session_uses_workspace(
+                            "wrapper", primary, "cleanup-session", workspace,
+                        )
+
+    def test_kent_duplicate_json_identity_is_rejected(self) -> None:
+        module = load_template_module(JANITOR, "janitor_duplicate_json")
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            module.json_object('{"worktrees":[],"worktrees":[]}', "Kent list")
+
+    def test_native_kent_rejects_ambiguous_and_unsafe_records(self) -> None:
+        module = load_template_module(JANITOR, "janitor_native_rejections")
+        primary = self.create_repository()
+        workspace = primary / ".kent/worktrees/TASK-1"
+        git = {"canonicalRoot": str(workspace)}
+        kent = {"canonicalRoot": str(workspace),
+                "worktreeId": "kent-record-task-1", "managed": True}
+        registered = {"git": git, "kent": kent}
+        invalid = [
+            {},
+            {"futureVariant": registered},
+            {"registered": registered, "missing": {"kent": kent}},
+            {"variant": "registered", "registered": registered},
+            {"registered": {"git": {**git, "canonical_root": str(workspace)},
+                            "kent": kent}},
+            {"registered": {"git": {"canonicalRoot": str(primary)}, "kent": kent}},
+            {"registered": {"git": {**git, "isMainWorktree": True}, "kent": kent}},
+            {"registered": {"git": git, "kent": {**kent, "managed": False}}},
+            {"registered": {"git": git, "kent": {**kent, "worktreeId": ""}}},
+            {"mainWorkspace": {"git": {**git, "isMainWorktree": True}}},
+            {"mainWorkspace": {"git": {"canonicalRoot": str(primary),
+                                      "isMainWorktree": False}}},
+            {"external": {"git": {"canonicalRoot": "relative/path"}}},
+        ]
+        for topology in invalid:
+            with self.subTest(topology=topology):
+                with self.assertRaises(RuntimeError):
+                    module._kent_record(
+                        {"topology": topology}, workspace=workspace, primary=primary,
+                    )
+        other = primary / ".kent/worktrees/OTHER"
+        payload = {"worktrees": [
+            {"topology": {"registered": registered}},
+            {"topology": {"registered": {
+                "git": {"canonicalRoot": str(other)},
+                "kent": {**kent, "canonicalRoot": str(other)},
+            }}},
+        ]}
+        result = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        with mock.patch.object(module, "run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "duplicate managed identities"):
+                module.capture_kent_worktree_record(
+                    "wrapper", primary, workspace.resolve(), "cleanup-session",
+                )
+
     def _write_valid_runtime_file(
         self,
         path: Path,
@@ -9739,12 +9848,14 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertIn("Remote branch retained: true", report)
 
     def test_kent_topology_preflight_and_post_delete_matrix(self) -> None:
-        for phase in ("before", "after"):
+        for selected_phase in ("before", "after", "native_before", "native_after"):
+            native = selected_phase.startswith("native_")
+            phase = selected_phase.removeprefix("native_")
             for state in (
                 "absent", "missing", "registered", "changed_id", "changed_root",
                 "duplicate", "unreadable", "malformed", "external",
             ):
-                with self.subTest(phase=phase, state=state):
+                with self.subTest(phase=phase, state=state, native=native):
                     root, worktree, _, _ = self.make_managed_worktree(with_v2=False)
                     kent = {
                         "worktree_id": "kent-record-task-1",
@@ -9792,6 +9903,27 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     )
                     if state == "unreadable":
                         selected.unlink()
+                    if native and state != "malformed":
+                        for fixture in (before, after):
+                            if not fixture.exists():
+                                continue
+                            payload = json.loads(fixture.read_text())
+                            for item in payload["worktrees"]:
+                                topology = item["topology"]
+                                variant = topology.pop("variant")
+                                for name in ("git", "kent"):
+                                    identity = topology[variant].get(name)
+                                    if identity is None:
+                                        continue
+                                    identity["canonicalRoot"] = identity.pop("canonical_root")
+                                    if "worktree_id" in identity:
+                                        identity["worktreeId"] = identity.pop("worktree_id")
+                            payload["worktrees"].insert(0, {"topology": {
+                                "mainWorkspace": {"git": {
+                                    "canonicalRoot": str(root), "isMainWorktree": True,
+                                }},
+                            }})
+                            fixture.write_text(json.dumps(payload))
                     deleted = root / "delete-done"
                     wrapper = self.retained_kent_record_wrapper(root)
                     result = subprocess.run(
