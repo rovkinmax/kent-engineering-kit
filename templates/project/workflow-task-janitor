@@ -1724,6 +1724,44 @@ def complete(transition: str, report: str, blocker: str = "") -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
 
+def deletion_result_kind(payload: dict) -> str:
+    """Decode legacy completion or Kent 2.8 CLI direct DeleteSuccess."""
+    if "kind" in payload:
+        if set(payload) - {"kind", "completed", "scheduled"}:
+            raise ValueError("mixed or unknown legacy deletion fields")
+        kind = payload["kind"]
+        if kind not in {"completed", "scheduled"}:
+            raise ValueError("unknown legacy deletion result")
+        if (kind == "completed" and "scheduled" in payload) or (
+            kind == "scheduled" and "completed" in payload
+        ):
+            raise ValueError("conflicting legacy deletion outcomes")
+        if kind in payload:
+            details = payload[kind]
+            if not isinstance(details, dict):
+                raise ValueError("malformed legacy deletion details")
+            if "leftover_root" in details or "leftoverRoot" in details:
+                raise ValueError("legacy deletion left a root")
+        return kind
+    if set(payload) - {"cleanup", "leftoverRoot"} or "leftoverRoot" in payload:
+        raise ValueError("unknown deletion fields or leftover root")
+    cleanup = payload.get("cleanup")
+    if not isinstance(cleanup, dict) or set(cleanup) - {"kind", "branchName", "diagnostic"}:
+        raise ValueError("malformed native branch cleanup")
+    kind = cleanup.get("kind")
+    prefix = "WORKTREE_BRANCH_CLEANUP_OUTCOME_"
+    if kind not in {prefix + value for value in (
+        "DELETED", "RETAINED", "NOT_REQUESTED", "NOT_APPLICABLE"
+    )}:
+        raise ValueError("unknown native branch cleanup outcome")
+    for key in ("branchName", "diagnostic"):
+        if key in cleanup and not isinstance(cleanup[key], str):
+            raise ValueError("invalid native branch cleanup text")
+    if kind in {prefix + "DELETED", prefix + "RETAINED"} and not cleanup.get("branchName"):
+        raise ValueError("native branch cleanup lacks branch identity")
+    return "completed"
+
+
 def delete_managed_worktree(
     wrapper: str,
     primary: Path,
@@ -1789,7 +1827,15 @@ def delete_managed_worktree(
                 f"Janitor could not confirm removal of {workspace}: {error}",
                 "Kent worktree deletion returned no trustworthy completion result.",
             )
-        deletion_kind = str(deletion_payload.get("kind") or "")
+        try:
+            deletion_kind = deletion_result_kind(deletion_payload)
+        except (TypeError, ValueError) as error:
+            return (
+                False,
+                f"Janitor could not confirm deletion of {workspace}: {error}. "
+                "The destructive operation may already have completed.",
+                "Kent did not return a trustworthy completed worktree deletion result.",
+            )
         if deletion_kind == "scheduled":
             scheduled = deletion_payload.get("scheduled")
             operation_id = (
@@ -1799,7 +1845,7 @@ def delete_managed_worktree(
             )
             return (
                 False,
-                f"Janitor preserved {workspace}: Kent scheduled worktree "
+                f"Janitor could not confirm deletion of {workspace}: Kent scheduled worktree "
                 f"deletion operation {operation_id or '<unknown>'} but did "
                 "not confirm completion.",
                 "Resume Cleanup so the session can leave the task worktree, "
