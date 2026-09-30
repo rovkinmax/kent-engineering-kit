@@ -592,20 +592,20 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(set(roles), set(expected_roles))
         selectors = {"root": config, "reviewer": config["reviewer"], **roles}
         expected_models = {
-            "root": "gpt-6-sol",
+            "root": "gpt-6.1-sol",
             "reviewer": "gpt-6-luna",
-            "default": "gpt-6-astra",
+            "default": "gpt-6.1-sol",
             "fast": "gpt-6-luna",
             "compliance_reviewer": "gpt-6-luna",
-            "researcher": "gpt-6-sol",
+            "researcher": "gpt-6.1-sol",
             "standards-reviewer": "gpt-6-astra",
             "spec-reviewer": "gpt-6-astra",
             "architecture-designer": "gpt-6-astra",
             "grill": "gpt-6-astra",
-            "task-supervisor": "gpt-6-sol",
+            "task-supervisor": "gpt-6.1-sol",
             "implementation-worker": "gpt-6-luna",
-            "fix-worker": "gpt-6-astra",
-            "build-doctor": "gpt-6-sol",
+            "fix-worker": "gpt-6.1-sol",
+            "build-doctor": "gpt-6.1-sol",
             "workflow-gate": "gpt-6-luna",
             "runtime-smoke-tester": "gpt-6-luna",
             "release-manager": "gpt-6-astra",
@@ -656,13 +656,13 @@ class WorkflowKitTest(unittest.TestCase):
                     self.assertEqual(
                         role,
                         {
-                            "model": "gpt-6-astra",
+                            "model": "gpt-6.1-sol",
                             "thinking_level": "low",
                             "model_verbosity": "low",
                         },
                     )
                     effective_default = {**config, **role}
-                    self.assertEqual(effective_default["model"], "gpt-6-astra")
+                    self.assertEqual(effective_default["model"], "gpt-6.1-sol")
                     self.assertEqual(effective_default["thinking_level"], "low")
                     self.assertEqual(effective_default["model_context_window"], 400000)
                 elif name == "fast":
@@ -974,7 +974,7 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn("checks **all selected Tasks**", readme)
         self.assertIn("permissions of other roles", contract)
         self.assertIn("first re-read **all selected Tasks**", contract)
-        self.assertIn("| `task-supervisor` | `gpt-6-sol` | high |", policy)
+        self.assertIn("| `task-supervisor` | `gpt-6.1-sol` | high |", policy)
         guidance = " ".join(
             (REPO_ROOT / "global" / "AGENTS.md").read_text().split()
         )

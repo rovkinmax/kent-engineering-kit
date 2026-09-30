@@ -12,19 +12,19 @@ or duplicate coder roles.
 
 | Scope or role | Model | Reasoning |
 | --- | --- | --- |
-| Interactive root | `gpt-6-sol` | high |
-| Headless/default role | `gpt-6-astra` | low |
+| Interactive root | `gpt-6.1-sol` | high |
+| Headless/default role | `gpt-6.1-sol` | low |
 | Built-in reviewer/supervisor | `gpt-6-luna` | xhigh |
 | `fast` | `gpt-6-luna` | high |
 | `compliance_reviewer` | `gpt-6-luna` | high |
-| `researcher` | `gpt-6-sol` | high |
+| `researcher` | `gpt-6.1-sol` | high |
 | `standards-reviewer`, `spec-reviewer` | `gpt-6-astra` | medium |
 | `architecture-designer` | `gpt-6-astra` | high |
 | `grill` | `gpt-6-astra` | high |
-| `task-supervisor` | `gpt-6-sol` | high |
+| `task-supervisor` | `gpt-6.1-sol` | high |
 | `implementation-worker` | `gpt-6-luna` | xhigh |
-| `fix-worker` | `gpt-6-astra` | medium |
-| `build-doctor` | `gpt-6-sol` | high |
+| `fix-worker` | `gpt-6.1-sol` | medium |
+| `build-doctor` | `gpt-6.1-sol` | high |
 | `workflow-gate` | `gpt-6-luna` | high |
 | `runtime-smoke-tester` | `gpt-6-luna` | high |
 | `release-manager` | `gpt-6-astra` | medium |

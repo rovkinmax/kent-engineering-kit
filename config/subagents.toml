@@ -1,4 +1,4 @@
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
 thinking_level = "high"
@@ -16,9 +16,9 @@ thinking_level = "xhigh"
 model_verbosity = "low"
 model_context_window = 372000
 
-# Interactive sessions use root settings; headless/default workflow runs retain Astra.
+# Interactive and headless/default sessions use Sol; their reasoning settings differ.
 [subagents.default]
-model = "gpt-6-astra"
+model = "gpt-6.1-sol"
 thinking_level = "low"
 model_verbosity = "low"
 
@@ -51,7 +51,7 @@ planning = false
 
 [subagents.researcher]
 description = "Read-only primary-source research for technical and product questions."
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 system_prompt_file = "agents/researcher.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -121,7 +121,7 @@ edit = false
 
 [subagents.task-supervisor]
 description = "Operational supervision of selected Tasks, factual answers, bounded recovery, and human escalation."
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 system_prompt_file = "agents/task-supervisor.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -151,7 +151,7 @@ edit = false
 
 [subagents.fix-worker]
 description = "Single-writer repair of verified task-scoped findings and failed implementation slices."
-model = "gpt-6-astra"
+model = "gpt-6.1-sol"
 system_prompt_file = "agents/fix-worker.md"
 thinking_level = "medium"
 model_verbosity = "low"
@@ -165,7 +165,7 @@ edit = false
 
 [subagents.build-doctor]
 description = "Deterministic build and test failure diagnosis with optional bounded fixes."
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 system_prompt_file = "agents/build-doctor.md"
 thinking_level = "high"
 model_verbosity = "low"

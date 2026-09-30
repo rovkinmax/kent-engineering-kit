@@ -275,7 +275,7 @@ kent --agent task-supervisor
 Tell it the exact Tasks and projects to accompany, for example: "Supervise
 KENT-123 and KENT-124 in this project until they finish. Resolve factual
 questions and safe technical interruptions; ask me when a decision is needed."
-The source policy is `gpt-6-sol` with `high` reasoning. This role is distinct
+The source policy is `gpt-6.1-sol` with `high` reasoning. This role is distinct
 from the built-in edit reviewer and from grill.
 
 There is no overall supervision time limit. Individual reads, waits and
