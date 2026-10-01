@@ -1,0 +1,6 @@
+{
+  "incident": "OSM-79",
+  "acquire_stdout_shape": "bare_token",
+  "consumer_expected_shape": "resource_token_records",
+  "consumer_fix_owner": "OSM-111"
+}

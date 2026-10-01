@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "task_short_id": "KEN-6",
+  "stage_data": {
+    "lock_resource": "emulator-fixture"
+  }
+}

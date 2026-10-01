@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "task_short_id": "KEN-6",
+  "stage_data": {
+    "task_native_id": "task-00000000-0000-4000-8000-000000000006",
+    "task_short_id": "KEN-6",
+    "lease_owner_id": "KEN-6",
+    "lock_resource": "emulator-conflicting"
+  }
+}

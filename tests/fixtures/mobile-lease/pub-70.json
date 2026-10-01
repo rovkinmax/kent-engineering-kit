@@ -1,0 +1,7 @@
+{
+  "incident": "PUB-70",
+  "acquisition_returned_token": true,
+  "historical_owner_task_id": "unknown",
+  "resume_owned_result": "blocked",
+  "operator_intervention": "outside_release_then_identity_correct_acquire_release"
+}

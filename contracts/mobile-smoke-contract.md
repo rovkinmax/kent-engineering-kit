@@ -178,14 +178,52 @@ requires the normal authorization for that external action.
   not ask again. Reuse that authorization for the same account, environment,
   action, and task scope until it is revoked or the scope materially changes.
   Store only the authorization boundary, never credential values.
-- A recovery session reads the checkpoint before acquisition. If its recorded
-  token still owns the exact resource, use the lock adapter's `resume`
-  operation to refresh the lease with the same token and current owner
-  metadata.
-- If acquisition succeeded but stdout was lost before the token reached the
-  checkpoint, first require `status` to show the same non-empty Kent task ID,
-  then use `resume-owned`. That operation verifies ownership under the resource
-  guard, returns the existing token, and refreshes metadata; it never creates a
-  missing lock or adopts another task's lock.
-- A different task ID or live token remains busy and is never reclaimed as the
-  current task's lease.
+- Resolve the current Task using the short ID rendered for the Smoke run:
+  inspect `summary.id` and `summary.short_id` from
+  `kent task show <task-short-id> --json`, and verify the returned short ID.
+  Resolve the current Session with `kent session-id`. `KENT_TASK_ID` and
+  `KENT_SESSION_ID` are adapter inputs, not assumed Kent exports: set them
+  explicitly from this readback. A label, sole lock occupancy, or Session ID
+  alone does not establish Task ownership.
+- Keep top-level checkpoint `task_short_id` authoritative. Store
+  `task_native_id`, `task_short_id`, `lease_owner_id`, `lock_resource`, and
+  `lock_token` together in its extensible stage data. A legacy checkpoint
+  missing native identity fields may be enriched only after native readback
+  matches its existing short ID. Conflicting Task fields block recovery.
+  New leases use the verified short ID as `lease_owner_id`. A legacy lease
+  written with the native Task ID may be recovered only when readback proves
+  that exact native-ID/short-ID pair; retain that owner ID consistently through
+  release. Do not silently rewrite foreign ownership.
+- Parse lock output according to the command used: `acquire` returns one bare
+  token; `acquire-any` returns exactly one `resource=...` record followed by
+  one `token=...` record. Reject missing, empty, duplicate, malformed, or
+  unexpected records; verify that a selected resource is eligible. Persist
+  the exact resource and token in the checkpoint immediately, before any
+  device action. Keep the token only in the scoped ignored checkpoint; never
+  echo it in reports, comments, or evidence.
+- A recovery session reads and validates its checkpoint before acquisition.
+  With a recorded resource and token, call `resume` for that exact pair after
+  validating the checkpoint Task binding. A failed or mismatched resume blocks;
+  do not fall back to resource discovery. With a known resource but missing
+  token or lost acquisition output, inspect redacted `status`, prove that the
+  exact resource has one valid owner record for the verified Task, then use
+  guarded `resume-owned`. It returns the existing token and refreshes metadata;
+  it requires the existing lease and valid owner metadata.
+- If no resource is persisted, inventory only the project-eligible resource
+  list. Recover with `resume-owned` only when exactly one candidate has valid
+  metadata for the same verified Task. Zero proven matches proceeds through
+  normal fresh acquisition; multiple same-Task matches are ambiguous and block.
+  Foreign, malformed, duplicate, or resource-mismatched metadata is never
+  ownership proof. A sole occupied resource is not ownership proof.
+- Preserve the adapter's caller-TTL policy: a competing lease stays busy until
+  its age is greater than the acquiring caller's explicit TTL (`age <= TTL`
+  stays busy; replacement requires `age > TTL`). TTL is not stored in the
+  owner record. Exact-owner `resume` or `resume-owned` may refresh a still-
+  present lease even after its age is greater than an acquiring caller's TTL.
+  The first guarded operation wins: resume-first refreshes the lease, while
+  replacement-first invalidates recovery with the old owner/token.
+  `resume-owned` never creates a missing lock or reclaims a foreign or unknown
+  owner.
+  After explicit release or trap cleanup, read back `status` for the exact
+  resource and require `unlocked`. Failed or locked readback is unresolved
+  cleanup, never proof of release. `status` must continue to redact tokens.

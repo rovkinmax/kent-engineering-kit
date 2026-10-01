@@ -1,0 +1,4 @@
+{
+  "acquire": "synthetic-bare-token\n",
+  "acquire_any": "resource=emulator-fixture\ntoken=synthetic-selection-token\n"
+}

@@ -1,0 +1,7 @@
+{
+  "incident": "OSM-78",
+  "historical_owner_task_id": "unknown",
+  "checkpoint_token_present": false,
+  "follow_up": "caller_ttl_replacement_then_release",
+  "original_token_loss_cause": "not_established"
+}

@@ -9,10 +9,91 @@ script_path="$(
 )"
 runtime_root="${KENT_RESOURCE_LOCK_DIR:-$HOME/.kent/runtime/resource-locks}"
 guard_root="$runtime_root/.guards"
-mkdir -p "$runtime_root" "$guard_root"
 if [[ -z "${KENT_RESOURCE_LOCK_OWNER_PID:-}" ]]; then
   export KENT_RESOURCE_LOCK_OWNER_PID="$PPID"
 fi
+
+ensure_runtime_roots() {
+  mkdir -p "$runtime_root" "$guard_root"
+}
+
+task_id_is_valid() {
+  local task_id="$1"
+  [[ "$task_id" =~ ^[A-Z][A-Z0-9]*-[0-9]+$ ||
+    "$task_id" =~ ^task-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]
+}
+
+session_id_is_valid() {
+  local session_id="$1"
+  [[ "$session_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]
+}
+
+require_lock_identity() {
+  local task_id="${KENT_TASK_ID:-}"
+  local session_id="${KENT_SESSION_ID:-}"
+
+  if ! task_id_is_valid "$task_id"; then
+    printf 'resource_lock_task_identity_invalid\n' >&2
+    return 64
+  fi
+  if ! session_id_is_valid "$session_id"; then
+    printf 'resource_lock_session_identity_invalid\n' >&2
+    return 64
+  fi
+}
+
+owner_field_count() {
+  local owner_file="$1"
+  local field="$2"
+  awk -v expected="$field" '
+    index($0, "=") {
+      separator = index($0, "=")
+      if (substr($0, 1, separator - 1) == expected) {
+        count++
+      }
+    }
+    END { print count + 0 }
+  ' "$owner_file"
+}
+
+owner_field_value() {
+  local owner_file="$1"
+  local field="$2"
+  awk -v expected="$field" '
+    index($0, "=") {
+      separator = index($0, "=")
+      if (substr($0, 1, separator - 1) == expected) {
+        print substr($0, separator + 1)
+      }
+    }
+  ' "$owner_file"
+}
+
+LOCK_OWNER_TOKEN=""
+LOCK_OWNER_TASK_ID=""
+LOCK_OWNER_RESOURCE=""
+
+read_lock_owner() {
+  local owner_file="$1"
+  local expected_resource="$2"
+  local token_count task_count resource_count
+
+  [[ -f "$owner_file" ]] || return 1
+  token_count="$(owner_field_count "$owner_file" token)"
+  task_count="$(owner_field_count "$owner_file" task_id)"
+  resource_count="$(owner_field_count "$owner_file" resource)"
+  if [[ "$token_count" -ne 1 || "$task_count" -ne 1 ||
+    "$resource_count" -ne 1 ]]; then
+    return 1
+  fi
+
+  LOCK_OWNER_TOKEN="$(owner_field_value "$owner_file" token)"
+  LOCK_OWNER_TASK_ID="$(owner_field_value "$owner_file" task_id)"
+  LOCK_OWNER_RESOURCE="$(owner_field_value "$owner_file" resource)"
+  [[ -n "$LOCK_OWNER_TOKEN" ]] || return 1
+  task_id_is_valid "$LOCK_OWNER_TASK_ID" || return 1
+  [[ "$LOCK_OWNER_RESOURCE" == "$expected_resource" ]]
+}
 
 usage() {
   cat >&2 <<'USAGE'
@@ -96,6 +177,7 @@ locked_try_acquire() {
   local ttl_seconds="$2"
   local dir age token owner_pid
 
+  require_lock_identity || return $?
   owner_pid="$KENT_RESOURCE_LOCK_OWNER_PID"
   require_nonnegative_integer owner_pid "$owner_pid"
 
@@ -150,17 +232,32 @@ locked_release() {
 locked_resume() {
   local resource="$1"
   local token="$2"
-  local dir current owner_pid
+  local dir owner_pid
+
+  require_lock_identity || return $?
+  if [[ -z "$token" || "$token" == *$'\n'* || "$token" == *$'\r'* ]]; then
+    printf 'resource_lock_token_invalid resource=%s\n' "$resource" >&2
+    return 64
+  fi
 
   owner_pid="$KENT_RESOURCE_LOCK_OWNER_PID"
   require_nonnegative_integer owner_pid "$owner_pid"
 
   dir="$(lock_dir_for "$resource")"
   if [[ -d "$dir" ]]; then
-    current="$(sed -n 's/^token=//p' "$dir/owner" 2>/dev/null || true)"
-    if [[ "$current" != "$token" ]]; then
+    if ! read_lock_owner "$dir/owner" "$resource"; then
+      printf 'resource_lock_owner_metadata_invalid resource=%s\n' \
+        "$resource" >&2
+      return 75
+    fi
+    if [[ "$LOCK_OWNER_TOKEN" != "$token" ]]; then
       printf 'resource_lock_token_mismatch resource=%s lock_dir=%s\n' \
         "$resource" "$dir" >&2
+      return 75
+    fi
+    if [[ "$LOCK_OWNER_TASK_ID" != "$KENT_TASK_ID" ]]; then
+      printf 'resource_lock_owned_by_other_task resource=%s\n' \
+        "$resource" >&2
       return 75
     fi
   else
@@ -184,12 +281,8 @@ locked_resume_owned() {
   local resource="$1"
   local dir token owner_task_id task_id owner_pid
 
+  require_lock_identity || return $?
   task_id="${KENT_TASK_ID:-}"
-  if [[ -z "$task_id" || "$task_id" == "unknown" ]]; then
-    printf 'resource_lock_task_identity_required resource=%s\n' \
-      "$resource" >&2
-    return 64
-  fi
 
   owner_pid="$KENT_RESOURCE_LOCK_OWNER_PID"
   require_nonnegative_integer owner_pid "$owner_pid"
@@ -201,19 +294,16 @@ locked_resume_owned() {
     return 75
   fi
 
-  token="$(sed -n 's/^token=//p' "$dir/owner" 2>/dev/null || true)"
-  owner_task_id="$(
-    sed -n 's/^task_id=//p' "$dir/owner" 2>/dev/null || true
-  )"
-  if [[ -z "$token" || -z "$owner_task_id" ||
-    "$owner_task_id" == "unknown" ]]; then
-    printf 'resource_lock_owner_metadata_missing resource=%s\n' \
+  if ! read_lock_owner "$dir/owner" "$resource"; then
+    printf 'resource_lock_owner_metadata_invalid resource=%s\n' \
       "$resource" >&2
     return 75
   fi
+  token="$LOCK_OWNER_TOKEN"
+  owner_task_id="$LOCK_OWNER_TASK_ID"
   if [[ "$owner_task_id" != "$task_id" ]]; then
-    printf 'resource_lock_owned_by_other_task resource=%s owner_task_id=%s task_id=%s\n' \
-      "$resource" "$owner_task_id" "$task_id" >&2
+    printf 'resource_lock_owned_by_other_task resource=%s\n' \
+      "$resource" >&2
     return 75
   fi
 
@@ -269,6 +359,12 @@ with_resource_guard() {
   shift 2
   local guard_file backend
 
+  case "$operation" in
+    try-acquire|resume|resume-owned)
+      require_lock_identity || return $?
+      ;;
+  esac
+  ensure_runtime_roots
   guard_file="$(guard_file_for "$resource")"
   backend="${KENT_RESOURCE_LOCK_BACKEND:-auto}"
 
@@ -322,6 +418,7 @@ acquire() {
   local ttl_seconds="${3:-7200}"
   local started now token attempt_status
 
+  require_lock_identity || return $?
   require_nonnegative_integer wait_seconds "$wait_seconds"
   require_nonnegative_integer ttl_seconds "$ttl_seconds"
   started="$(now_epoch)"
@@ -372,6 +469,7 @@ acquire_any() {
     return 64
   fi
 
+  require_lock_identity || return $?
   resources=("${args[@]:0:separator}")
   if [[ ${#args[@]} -gt $(( separator + 1 )) ]]; then
     wait_seconds="${args[$(( separator + 1 ))]}"
@@ -520,12 +618,14 @@ case "$cmd" in
     if [[ $# -ge 2 ]]; then
       with_resource_guard "$2" status
     else
-      find "$runtime_root" \
-        -maxdepth 1 \
-        -type d \
-        -name 'mobile-*.lock' \
-        -print |
-        sort
+      if [[ -d "$runtime_root" ]]; then
+        find "$runtime_root" \
+          -maxdepth 1 \
+          -type d \
+          -name 'mobile-*.lock' \
+          -print |
+          sort
+      fi
     fi
     ;;
   adb-emulators)
