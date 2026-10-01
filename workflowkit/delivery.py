@@ -32,7 +32,8 @@ PLAN_REVIEW_REPORT = ParameterSpec(
 )
 PLAN_CHANGE_REPORT = ParameterSpec(
     "plan_change_report",
-    "Deterministic summary of material plan-contract changes.",
+    "Material replanning reason: deterministic contract drift or explicitly "
+    "agent-reported findings and original authority.",
 )
 WORK_KIND = ParameterSpec(
     "work_kind",
@@ -1997,6 +1998,36 @@ def build_delivery_workflow(
             ]
         )
 
+    for source in ("fix", "compliance"):
+        if any(node.key == source for node in nodes):
+            edges.append(
+                EdgeSpec(
+                    key=f"{source}_replan",
+                    source=source,
+                    transition="replan",
+                    target="plan_revalidation",
+                    context="continue_session",
+                    context_source="node:plan",
+                    prompt=owner_replan_prompt(profile),
+                    transition_description=(
+                        "The accepted execution plan needs substantive reconciliation; "
+                        "return to Plan before production edits, preserving review gates."
+                    ),
+                    parameters=(
+                        WORKSPACE, PLAN, WORK_KIND, REVIEW_CONTEXT, PLAN_CHANGE_REPORT,
+                    ) + delivery_context_parameters,
+                )
+            )
+    # Recovery/PR/evidence-return prompts must expose the same owner route.
+    # Invalid-workspace recovery remains metadata-only until the root is valid.
+    edges = [
+        replace(edge, prompt=f"{edge.prompt}\n\n{owner_replan_instruction(profile)}")
+        if edge.target in {"fix", "compliance"}
+        and edge.prompt
+        and edge.key != "dispatch_invalid_workspace"
+        else edge
+        for edge in edges
+    ]
     edges = qualify_transition_keys(edges)
     spec = WorkflowSpec(
         name=profile.workflow_name("delivery", version),
@@ -2502,6 +2533,70 @@ Those outcomes require a later exact approval after a merged fix or an explicit
 no-action decision."""
 
 
+def lifecycle_feasibility_instruction() -> str:
+    return """Before accepting an execution plan, check the whole required lifecycle
+against the Task's actual authority and project profile: deterministic checks,
+runtime evidence, publication/PR/CI order and cleanup/resource preservation.
+Use accessible graph/procedure facts; do not execute those effects in Plan.
+Resolve technical ordering within authorized scope yourself. Ask only for the
+exact new scope, risk, cost or authority decision, not permission to inspect or
+repeat a decision already established. Explain known consequences of one
+decision together; keep independent product decisions separate. If the graph
+has no executable route, report that capability gap instead of asking the user
+to choose an ordering that the graph cannot execute."""
+
+
+def owner_replan_instruction(profile: ProjectProfile | None = None) -> str:
+    continuity = (
+        "\nPreserve incoming delivery_context exactly."
+        if profile is not None and _delivery_context_enabled(profile) else ""
+    )
+    return """Choose `replan` before production edits when a concrete finding or verified
+new authority requires substantive reconciliation of the accepted execution
+plan. This route returns work to its planner; it grants no expanded source,
+publication or resource authority. Ordinary within-contract repairs stay in
+Fix; packaging-only defects stay in Evidence Repair. Unknown human authority
+still requires its exact missing decision, not a fabricated approval.
+
+Read the accepted `.kent/runtime/{{.TaskShortId}}/plan-contract.json` in the
+native Task's repository root, without writing it. Verify schema_version=1,
+task_short_id={{.TaskShortId}}, and SHA-256 of normalized_plan UTF-8 against
+normalized_sha256. Resolve plan_path within that root as a regular non-escaping
+file (or the existing explicitly authorized not-applicable sentinel); verify
+work_kind is declared by the project profile. Do not guess from Session memory.
+If snapshot, identity, path or authority is missing or contradictory, report
+the precise evidence gap through needs_user_action without changing files.
+For replan provide workspace_path, snapshot plan_path and work_kind,
+review_context with remaining actionable findings/evidence/authority locators,
+and plan_change_report explaining the material discrepancy. Label semantic
+findings agent-reported, not deterministic hash drift. Repeated approval IDs do not resolve
+an unchanged blocker; an already-made decision needs an executable owner route,
+not another question about whether to respect it.""" + continuity
+
+
+def owner_replan_prompt(profile: ProjectProfile) -> str:
+    prompt = plan_revalidation_prompt(profile, from_review=False)
+    prompt = prompt.replace("{{.Params.plan_route_context}}", "not-applicable")
+    prompt = prompt.replace("{{.Params.plan_route}}", "continue")
+    prompt = prompt.replace(
+        "Detected plan-contract change:",
+        "Agent-reported substantive replanning finding (not a drift attestation):",
+    )
+    return prompt + """
+
+This entry precedes source repair. Reconcile the reported execution-plan
+problem; do not infer permission to expand production scope. The route after
+normal project review and acceptance is continue, with route context
+not-applicable. Before review_plan, persist remaining actionable findings,
+evidence pointers and permission boundaries in the authoritative plan or
+existing discoverable report-only artifact: review_context is NOT carried
+into Implement by the continue route. Preserve completed work and immutable
+baseline. If only downstream ordering changed and no writer-owned step
+remains, state that explicitly so Implement proceeds to normal verification
+without fictitious edits or repeating completed steps. Do not fabricate
+completed CI/Smoke or skip any project acceptance gate."""
+
+
 def plan_prompt(
     profile: ProjectProfile,
     *,
@@ -2574,6 +2669,7 @@ Task body:
 Keep discovery, design/spec ingestion, decisions, and implementation planning in
 this one Plan session. Ask questions when a product decision is required. Do not
 invoke nested prompt flows and do not implement production changes.
+{lifecycle_feasibility_instruction()}
 Before planning implementation, write an explicit scope boundary containing the
 included root source IDs, related evidence, dependencies, and deferred or
 out-of-scope issues. A relationship, shared parent, common design file, or
@@ -2766,6 +2862,7 @@ acceptance when that pair grants authority. An agent summary or truncated
 historical source cannot fill missing consent. Store durable references in
 the authoritative plan or discoverable project-permitted report-only evidence,
 not only `review_context`; do not repurpose `plan_route_context`.
+{lifecycle_feasibility_instruction()}
 
 Consult a bounded read-only grill leaf before freeze and formal review only
 when materially revising requirements, API/UX, architecture, authority,
@@ -2811,9 +2908,10 @@ the findings, fixes, changed files, artifact paths, and focused checks."""
 
 This is a fresh bounded writer session. Read exact task-comment IDs referenced
 by the findings and inspect the preserved diff, authoritative artifacts, and
-existing evidence before editing. If feedback changes a product decision or
-acceptance criterion, update the authoritative design/specification/plan first
-and reference the comment ID. Do not redo completed work.
+existing evidence before editing. Material changes to product decisions,
+acceptance or authority require the available replan route before source
+repair; they are not permission to update the plan and immediately implement.
+Do not redo completed work.
 
 Apply exactly one independently verifiable fix slice and update the
 authoritative fix checklist. A non-empty incoming `fix_context` is a work

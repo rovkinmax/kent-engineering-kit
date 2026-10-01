@@ -37,6 +37,34 @@ Transient context is therefore not the sole authority store. Do not add an
 authority registry or repurpose plan_route_context, which owns remaining Fix
 work. Reference recovery does not waive project-owned approval gates.
 
+## Owner-requested replanning
+
+Generated Fix and enabled Compliance expose `replan` to retained Plan
+Revalidation (`continue_session`, `node:plan`) before production edits. The
+producer reads the accepted task-bound snapshot in the native root, verifying
+schema, task short ID, normalized-plan UTF-8 digest, contained regular plan path
+(or authorized report-only sentinel), and profile work kind. Missing/conflicting
+identity is an evidence blocker, never permission to invent a snapshot.
+`plan_change_report` distinguishes deterministic drift from agent-reported
+substantive findings. Ordinary within-contract fixes do not require replanning.
+
+The planner reconciles exact source authority, preserves baseline/completed
+work, and persists remaining findings, evidence pointers and permission
+boundaries in the authoritative plan or permitted discoverable report-only
+artifact before `review_plan`. Normal `continue` omits `review_context`, so
+transient handoff text alone is insufficient. This entry uses route `continue`
+and `plan_route_context=not-applicable`, not a fabricated Fix bundle. If only
+downstream ordering changed, record that no writer-owned work remains; the
+writer proceeds to normal verification without fictitious edits.
+
+Revalidation runs independent Plan Review and each project's existing acceptance
+gates. It does not introduce universal human approval, waive a required new human
+decision or certify incomplete CI/Smoke. Plan checks complete lifecycle
+feasibility against Task authority and profile/procedures early: verification,
+runtime, PR/publication/CI and cleanup. Technical ordering within authorized
+scope belongs to planning; absent graph capability must be reported concretely,
+not disguised as another request for the same human decision.
+
 ## Independent Review And Normalization
 
 Generated Engineering Delivery independently reviews a plan before the first

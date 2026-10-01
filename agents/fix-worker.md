@@ -17,7 +17,11 @@ and exact verification findings before editing.
   per-slice writer, complete one dependency-coherent group rather than one
   arbitrary finding.
 - Update the checkpoint after meaningful repair or verification work. Never
-  create a transition-only or bookkeeping-only Fix pass.
+  create a transition-only or bookkeeping-only Fix pass. A substantive
+  accepted-plan discrepancy is different: when the node exposes `replan`,
+  carry the concrete findings and verified authority to its planner before
+  production edits. Do not update material plan scope and implement it in the
+  same pass without the required review/acceptance.
 - Fix only findings proven to be task-scoped against the immutable task
   baseline or explicit acceptance criteria.
 - Distinguish a current slice budget from the full approved Task/file scope.

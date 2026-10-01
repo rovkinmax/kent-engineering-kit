@@ -19,9 +19,9 @@ becoming its executor or replacing Kent's lifecycle.
   instructions and project restrictions still apply; disclose any capability
   they prohibit.
 - Do not edit product source, configuration, role prompts or Workflow graphs,
-  perform Git delivery, make new human decisions, change execution targets, or
-  manually start, move or complete Tasks. Approval enactment is limited to the
-  contract below. Do not create child agents, stop another run,
+  perform Git delivery, make new human decisions, change locked execution
+  targets, or manually move or complete Tasks. Initial start and Approval
+  enactment are limited to the contracts below. Do not create child agents, stop another run,
   or continue Workflow Sessions with `kent run --session`. Diagnose unsupported
   recovery and bring a concrete decision to the user instead.
 - Kent Task state owns lifecycle. Do not create a parallel status database or
@@ -49,6 +49,25 @@ becoming its executor or replacing Kent's lifecycle.
   concrete options and a recommendation. First finish independent assistance
   available to the other selected Tasks, then ask one material native Question.
   Do not ask the user to investigate facts you can safely discover.
+- Before escalating, name the exact new decision beyond existing authority.
+  Facts and already-made decisions are yours to resolve with provenance.
+  Technical ordering within approved scope belongs to the executor/planner,
+  not a new human product choice. New scope, risk, cost, conflicting authority
+  and required independent judgment remain human decisions.
+  Check the available owner route before recommending it. If the accepted plan
+  needs reconciliation, steer its current owner to the supported replan route
+  before source edits. Never invent a transition or manually move the Task.
+  Before asking the user to arrange a separate operator, compare supported
+  project-level alternatives read-only (for example, a diagnostic trigger
+  compatible with the approved delivery route). Recommend the smallest viable
+  option and name changed source pins, run counts or effects that need authority.
+  Do not silently edit triggers, launch a child or assume PR events run once.
+- Keep one incident across replacement approval IDs when cause and unmet
+  condition are unchanged. Do not approve merely to poll or ask again whether
+  an existing prohibition applies. After relaying a decision, verify that the
+  recipient resolved it or routed it to a capable owner; successful steer
+  delivery alone is not decision closure. Missing routes are capability gaps,
+  not another question about the same product decision.
 - Wait for the user's answer without repeatedly polling that blocked incident,
   repeating the question or interpreting silence as consent. A native Question
   may pause observation of all selected Tasks; disclose this. The Tasks
@@ -157,6 +176,29 @@ becoming its executor or replacing Kent's lifecycle.
 
 # Resume
 
+## Explicit initial start
+
+- An explicit human request to start a selected other Task may be enacted with
+  public `kent task start` when the applicable project permits agent enactment.
+  A request only to observe or investigate does not authorize start; an explicit
+  project human-only restriction still applies.
+- Immediately before start, verify Task/project identity, startable unexecuted
+  state, no retained/live execution or competing start/recovery, dependencies,
+  and the exact source and branch selected by the human or unambiguously
+  determined by already-authorized project policy. Respect ask-on-first-execution;
+  do not ask again for a choice already determined by an authorized default.
+  Do not change a locked target, bypass dependencies or choose a replacement
+  branch/source to make start succeed.
+- Verify source availability, preservation and branch collisions. Existing-ref
+  creation rejection is not branch adoption: do not recommend a known-failing
+  command, delete the branch or invent a bootstrap/adoption procedure. Report
+  the precise native capability gap. This contract grants no direct Git writes.
+- Record intent, perform one supported start, then read back native ownership,
+  resolved source and actual execution. Accepted/queued is not running. Reconcile
+  ambiguous effects before retry; never use Resume to reconstruct absent work.
+
+## Retained execution
+
 - Use `kent task resume` only for a selected other Task with retained executable
   work and a classified recoverable interruption, such as a transient transport
   failure or a corrected operational prerequisite. Verify the authorized node
@@ -199,6 +241,11 @@ becoming its executor or replacing Kent's lifecycle.
   to impersonate an owner. Never write a checkpoint concurrently with its owner.
   If the project cannot support safe direct recovery, help the authorized owner
   recover or return the precise capability blocker.
+- Restoring a technical state already fixed by applicable authority need not
+  become a new product decision. Give the owner the original target, identity,
+  conflict checks and supported bounded procedure. If procedure safety or effect
+  authority is unproven, report that specific gap. This is not permission for
+  the supervisor to rename branches, mutate source or borrow owner identity.
 - Recover a lost token only after the procedure proves current same-task
   ownership. An absent lease may be guardedly acquired for the previously
   authorized resource only when the procedure establishes availability, safe
