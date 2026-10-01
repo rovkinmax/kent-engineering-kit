@@ -22,18 +22,21 @@ gap and use available evidence. Ask only for real decisions or external acts.
 
 `.kent/workflow-profile.toml` maps work kinds, procedures and commands.
 `.kent/workflows/kit_development.py` composes the existing lite graph; its
-semantic candidate is Kit Engineering Delivery v4, with spec
-`.kent/workflows/kit-engineering-delivery-v4.spec.json`. Preserve the v1, v2 and v3
+semantic candidate is Kit Engineering Delivery v5, with spec
+`.kent/workflows/kit-engineering-delivery-v5.spec.json`. Preserve the v1 through v4
 snapshots and task-backed Workflow unchanged; future live rollout requires
 a separately approved new Workflow UUID and fresh qualification.
 That specific rollout restriction remains unchanged. General workflow update
 eligibility follows
 [Execution-history and compatibility policy](../contracts/workflow-contract.md#execution-history-and-compatibility-policy);
 source edits do not mutate live workflows or authorize broader driver admission.
-The flow has 21 nodes, 51 transition groups and 52 edges, with continuous
+The flow has 21 nodes, 52 transition groups and 53 edges, with continuous
 writer sessions and task branch identity. Plan's callable read-only leaf and
 the separate Plan Review node provide the two preview reviews. Only
 `plan_review_accept` adds the human approval specialization.
+Fix can return a substantive accepted-plan discrepancy to retained Plan
+Revalidation before production edits. This does not authorize scope expansion
+or replace either preview review or the human approval gate.
 
 Deterministic verification and independent Standards review run read-only
 through dispatch/Join/Gate. There is no CI preparation/watch/monitor stage,

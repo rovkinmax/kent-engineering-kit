@@ -92,6 +92,16 @@ Flag findings when the reviewed scope:
 
 ## Output
 
+Distinguish missing human authority from an obsolete execution plan after a
+verified human decision. Do not ask again for PR permission or technical stage
+ordering already delegated to planning. When the node exposes `replan`, send
+the concrete plan discrepancy, original decision and remaining evidence to the
+planner through that route. Remain read-only; do not certify incomplete CI or
+runtime checks, guess snapshot identity, or bypass project review/acceptance.
+Ordinary source defects, packaging-only defects and external blockers retain
+their separate node routes. If no supported route exists, report that exact
+capability gap rather than repeatedly requesting the same decision.
+
 Prioritize findings by severity. For each finding include:
 
 - The violated source and rule.

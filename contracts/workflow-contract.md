@@ -401,6 +401,17 @@ defined by `contracts/plan-contract.md`.
 - `ship_pr` advances to PR preparation with `compliance_report`.
 - `needs_changes` returns to the single-writer Fix stage and then reruns the
   full verification fan-out.
+- `replan` returns a substantive accepted-plan discrepancy to retained Plan
+  Revalidation before source edits. Fix exposes the same route. Producers
+  verify accepted snapshot identity and recover canonical plan/work-kind fields;
+  `plan_change_report` labels deterministic drift or agent-reported findings.
+  Normal Plan Review and project acceptance remain mandatory; there is no
+  universal new approval gate. Remaining findings must survive in durable plan
+  artifacts because normal writer continuation omits `review_context`.
+  Ordinary repairs and packaging-only defects retain their existing routes.
+  All Fix/Compliance ingress prompts expose this choice, except the narrowly
+  metadata-only invalid-workspace correction, which must first establish a
+  valid native root. See `contracts/plan-contract.md`.
 - `needs_user_action` is an approval-gated Compliance self-loop. `wont_do`
   remains approval-gated terminal cancellation.
 - Profiles declare `standards_review` and `compliance_review` explicitly.

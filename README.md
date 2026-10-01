@@ -17,12 +17,12 @@ device details, release policy, and integration credentials.
 ## Developing the Kit itself
 
 The checkout-local `.kent/workflow-profile.toml` and `.kent/project-contract.md`
-define the current **Kit Engineering Delivery v4** source candidate. The
+define the current **Kit Engineering Delivery v5** source candidate. The
 project builder is `.kent/workflows/kit_development.py`; the generated
-`.kent/workflows/kit-engineering-delivery-v4.spec.json` is a semantic audit
-input, not evidence of a live workflow installation. The v1, v2, and v3
+`.kent/workflows/kit-engineering-delivery-v5.spec.json` is a semantic audit
+input, not evidence of a live workflow installation. The v1 through v4
 snapshots remain immutable historical evidence. This source-only change does
-not modify the existing task-backed Workflow. Any future rollout of v4 needs
+not modify the existing task-backed Workflow. Any future rollout of v5 needs
 separate approval, a new Workflow UUID, and fresh qualification; existing
 failed qualification records and their task-backed graph must not be repaired
 or reused as successful evidence.
@@ -288,6 +288,20 @@ then verify continuation. It cannot make new decisions for you, accept unknown
 results, bypass mandatory review, impersonate resource owners, edit source/
 config, or change Workflow graphs. Approval IDs, effects and authority are
 rechecked; a new gate does not automatically inherit a previous permission.
+
+An explicit request to start a selected Task may be enacted through native
+`kent task start` after identity, source/branch, dependency and no-competing-run
+checks, when project policy permits it. This is not permission to move Tasks,
+adopt existing branches, override human-only restrictions or invent a target.
+Facts and existing decisions are resolved with provenance; technical ordering
+within scope goes to the capable owner/planner, not another user choice.
+Repeated approval IDs for one unchanged blocker remain one incident.
+
+Generated Fix and Compliance can return a substantive execution-plan discrepancy
+to existing Plan Revalidation before source edits. The normal review/acceptance
+chain remains; Kit's own candidate retains its human approval specialization.
+Read [decision closure and project coverage](docs/SUPERVISOR-DECISION-CLOSURE.md)
+for tests, limitations and the separately approved activation boundary.
 
 A verifiable original human Session message or Question answer remains the
 source of your decision. The supervisor can reference it in an agent-authored

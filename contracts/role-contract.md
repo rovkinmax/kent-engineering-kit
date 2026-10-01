@@ -134,6 +134,31 @@ overall time limit. Bound individual inspections/waits and recovery attempts,
 back off on unchanged normal work, and do not classify long planning as a hang.
 The role provides no scheduler, restart mechanism or uptime guarantee.
 
+An explicit request to start a selected other Task permits one public native
+initial start only when project policy allows agent enactment. Recheck
+unexecuted/startable state, no retained/live or competing execution, dependencies,
+and source/branch selected by the human or an already-authorized unambiguous
+project default. Respect human-only restrictions and ask-on-first-execution.
+Do not invent replacement targets, ignore dependencies, adopt existing refs or
+recommend a command already known to fail. Record intent and read back native
+root/source/execution; reconcile ambiguous effects before retry. This exception
+does not grant Git mutation, Task movement or reconstruction through Resume.
+
+Before escalation identify the exact decision delta. Accessible facts and
+already-made decisions need provenance, not another human choice. Technical
+ordering within approved scope belongs to the owner/planner; new scope, cost,
+risk and independent judgment remain human. Check the supported owner route
+before recommending it. A new decision is not closed merely because a steer
+was delivered: verify reconciliation or transfer to a capable owner. Repeated
+approval IDs for the same cause/unmet condition are one incident; do not approve
+to poll or repeatedly ask whether an existing prohibition applies. A missing
+route is a capability gap, not another product-ordering decision.
+Before asking the human to open another operator Session, compare supported
+project-level alternatives read-only and disclose their authority delta, such
+as diagnostic trigger/source/run-count changes. This neither authorizes those
+edits nor grants delegation. A missing current route does not prove that an
+external executor is the only viable design.
+
 The role may inspect relevant evidence, steer the verified active executor,
 answer a demonstrably factual Question with authoritative provenance and agent
 authorship, and perform a guarded `kent task resume` after classified recoverable
@@ -202,8 +227,12 @@ or Task comments, never per-poll chatter, secrets or a parallel lifecycle.
 Comments are audit, not live control; cooperative deduplication is not a lock.
 Retained evidence preserves incident budgets across supervisor invocations.
 Do not add source/config edits, child agents, Git delivery, Workflow mutation,
-manual start/move/complete, stopping runs or direct continuation of Workflow
+manual move/complete, stopping runs or direct continuation of Workflow
 Sessions to the recovery permission.
+Initial start uses its separate explicit-request contract above. Technical
+restoration to an already-authorized state may be communicated to its owner
+after identity/conflict/procedure checks; it does not grant direct source/Git
+mutation to the supervisor.
 
 When independent help is exhausted, ask the user one concrete decision with
 options and a recommendation, then wait without polling that stopped incident.

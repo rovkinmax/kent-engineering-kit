@@ -324,6 +324,43 @@ class WorkflowKitTest(unittest.TestCase):
                     if helper is not None:
                         profile = replace(profile, commands={**profile.commands, "prepare_cleanup": helper})
                     document = spec_as_json(build_delivery_workflow(profile, 1))
+                    # Project only this approved semantic delta away; preserve
+                    # the historical cleanup bytes/hashes, do not rebaseline them.
+                    from workflowkit.delivery import (
+                        lifecycle_feasibility_instruction, owner_replan_instruction,
+                    )
+                    document["edges"] = [
+                        edge for edge in document["edges"]
+                        if edge["key"] not in {"fix_replan", "compliance_replan"}
+                    ]
+                    for edge in document["edges"]:
+                        prompt = edge.get("prompt")
+                        if prompt:
+                            if edge["target"] in {"fix", "compliance"} and (
+                                edge["key"] != "dispatch_invalid_workspace"
+                            ):
+                                suffix = "\n\n" + owner_replan_instruction().replace(
+                                    "`replan`", f"`{edge['target']}_replan`",
+                                )
+                                self.assertTrue(prompt.endswith(suffix), edge["key"])
+                                prompt = prompt[:-len(suffix)]
+                            prompt = prompt.replace(
+                                lifecycle_feasibility_instruction() + "\n", "",
+                            ).replace(
+                                "existing evidence before editing. Material changes to product decisions,\n"
+                                "acceptance or authority require the available replan route before source\n"
+                                "repair; they are not permission to update the plan and immediately implement.\n"
+                                "Do not redo completed work.",
+                                "existing evidence before editing. If feedback changes a product decision or\n"
+                                "acceptance criterion, update the authoritative design/specification/plan first\n"
+                                "and reference the comment ID. Do not redo completed work.",
+                            )
+                            edge["prompt"] = prompt
+                        for parameter in edge.get("parameters", []):
+                            if parameter["key"] == "plan_change_report":
+                                parameter["description"] = (
+                                    "Deterministic summary of material plan-contract changes."
+                                )
                     edges = {edge["key"]: edge for edge in document["edges"]}
 
                     def reverse_prompt(
@@ -849,6 +886,134 @@ class WorkflowKitTest(unittest.TestCase):
                 if path.stem not in {*role_names, "grill"}:
                     self.assertNotIn("kent run watch <session-id>", prompt)
 
+    def test_replan_routes_preserve_review_and_owner_context(self) -> None:
+        profile = self.load_profile()
+        spec = build_delivery_workflow(profile, 99)
+        edges = {edge.key: edge for edge in spec.edges}
+        for source in ("fix", "compliance"):
+            with self.subTest(source=source):
+                edge = edges[f"{source}_replan"]
+                self.assertEqual(edge.transition, f"{source}_replan")
+                self.assertEqual(edge.target, "plan_revalidation")
+                self.assertEqual(edge.context, "continue_session")
+                self.assertEqual(edge.context_source, "node:plan")
+                keys = {parameter.key for parameter in edge.parameters}
+                self.assertTrue({
+                    "workspace_path", "plan_path", "work_kind",
+                    "review_context", "plan_change_report",
+                }.issubset(keys))
+                self.assertNotIn("plan_route_context", keys)
+                self.assertIn("continue", edge.prompt)
+                self.assertIn("remaining actionable findings", edge.prompt)
+        self.assertEqual(edges["plan_revalidation_review"].target, "plan_review")
+        self.assertEqual(edges["plan_review_accept"].target, "plan_contract")
+        spec.validate()
+
+    def test_replan_instruction_covers_fix_and_compliance_ingress(self) -> None:
+        spec = build_delivery_workflow(self.load_profile(), 99)
+        for edge in spec.edges:
+            if edge.target not in {"fix", "compliance"} or not edge.prompt:
+                continue
+            with self.subTest(edge=edge.key):
+                if edge.key == "dispatch_invalid_workspace":
+                    self.assertIn("without editing production files", edge.prompt)
+                    continue
+                self.assertIn(f"Choose `{edge.target}_replan`", edge.prompt)
+                self.assertIn("plan-contract.json", edge.prompt)
+                self.assertIn("before production edits", edge.prompt)
+
+    def test_replan_profile_matrix_and_parameter_closure(self) -> None:
+        source_ci = self.schema4_runtime_v2_contents().replace(
+            '"github_observation"]', '"github_observation", "prepare_ci"]',
+        ).replace(
+            'wait_ci = "3.0.0"\n', 'wait_ci = "3.0.0"\nprepare_ci = "2.0.0"\n',
+        ).replace(
+            'wait_ci = ".kent/scripts/workflow-wait-github-ci"',
+            'wait_ci = ".kent/scripts/workflow-wait-github-ci"\n'
+            'prepare_ci = ".kent/scripts/workflow-prepare-github-ci"',
+        )
+        profiles = [
+            self.load_profile(),
+            self.load_schema4_profile(lambda _: source_ci),
+            ProjectProfile.load(REPO_ROOT),
+        ]
+        for original in profiles:
+            for writer in ("continuous", "fresh_per_slice"):
+                profile = replace(
+                    original,
+                    policies={**original.policies, "writer_sessions": writer},
+                )
+                spec = build_delivery_workflow(profile, 99)
+                edges = {edge.key: edge for edge in spec.edges}
+                with self.subTest(profile=profile.project_name, writer=writer):
+                    spec.validate()
+                    self.assertIn("fix_replan", edges)
+                    self.assertEqual(
+                        "compliance_replan" in edges,
+                        any(node.key == "compliance" for node in spec.nodes),
+                    )
+                    for source in ("fix", "compliance"):
+                        if f"{source}_replan" not in edges:
+                            continue
+                        edge = edges[f"{source}_replan"]
+                        expected = {
+                            "workspace_path", "plan_path", "work_kind",
+                            "review_context", "plan_change_report",
+                        }
+                        if "{{.Params.delivery_context}}" in edge.prompt:
+                            expected.add("delivery_context")
+                        self.assertEqual(
+                            {parameter.key for parameter in edge.parameters}, expected,
+                        )
+                        self.assertNotIn("{{.Params.plan_route", edge.prompt)
+                        self.assertEqual(edge.context_source, "node:plan")
+                    for edge in spec.edges:
+                        if edge.target not in {"fix", "compliance"} or not edge.prompt:
+                            continue
+                        if edge.key == "dispatch_invalid_workspace":
+                            self.assertNotIn("Choose `fix_replan`", edge.prompt)
+                            continue
+                        self.assertIn(f"Choose `{edge.target}_replan`", edge.prompt)
+                        for guard in (
+                            "schema_version=1", "normalized_plan UTF-8",
+                            "task_short_id={{.TaskShortId}}",
+                            "regular non-escaping", "work_kind is declared",
+                        ):
+                            self.assertIn(guard, edge.prompt)
+                    self.assertEqual(
+                        edges["plan_revalidation_review"].target, "plan_review",
+                    )
+                    self.assertEqual(edges["plan_review_accept"].target, "plan_contract")
+                    # Global generator does not impose Kit's project-only approval.
+                    self.assertFalse(edges["plan_review_accept"].requires_approval)
+
+    def test_supervisor_decision_closure_static_scenarios(self) -> None:
+        # These guards bind policy fixtures to shipped prompts, not LLM behavior.
+        from workflowkit.delivery import owner_replan_instruction, owner_replan_prompt
+
+        cases = json.loads(
+            (REPO_ROOT / "tests/fixtures/supervisor-decision-closure.json").read_text()
+        )["cases"]
+        self.assertEqual(len(cases), 17)
+        self.assertEqual(len({case["id"] for case in cases}), len(cases))
+        role = (REPO_ROOT / "agents/task-supervisor.md").read_text()
+        text = " ".join((
+            role + owner_replan_instruction() + owner_replan_prompt(self.load_profile())
+        ).split())
+        for case in cases:
+            with self.subTest(case=case["id"]):
+                self.assertTrue(case["input"] and case["expected"])
+                self.assertIn(case["guard"], text)
+        self.assertNotIn("manually start, move or complete Tasks", role)
+        self.assertIn("manually move or complete Tasks", role)
+        self.assertIn("no retained/live execution or competing start/recovery", role)
+        for prompt in (
+            plan_prompt(self.load_profile()),
+            plan_revalidation_prompt(self.load_profile(), from_review=True),
+        ):
+            self.assertIn("whole required lifecycle", prompt)
+            self.assertIn("do not execute those effects in Plan", prompt)
+
     def test_task_supervisor_packaged_operational_contract(self) -> None:
         # Static contract guards, not a simulation of model/runtime behavior.
         prompt = (REPO_ROOT / "agents" / "task-supervisor.md").read_text()
@@ -1131,14 +1296,14 @@ class WorkflowKitTest(unittest.TestCase):
             for edge in build_delivery_workflow(profile, 1).edges
         }
         budgets = {
-            # Bounded addition for approved co-design and decision carriers.
-            "start_plan": 7200,
+            # Approved lifecycle feasibility and task-bound replan instructions.
+            "start_plan": 8000,
             "plan_contract_implement": 5000,
-            "gate_fix": 4000,
+            "gate_fix": 5600,
             "dispatch_standards_review": 1500,
             "dispatch_spec_review": 1300,
             "verification_join_gate": 3200,
-            "gate_delivery_ready": 2600,
+            "gate_delivery_ready": 3900,
             "compliance_prepare_pr": 3600,
             "ci_watch_diagnose": 3200,
         }
@@ -1157,7 +1322,7 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertLessEqual(
             (REPO_ROOT / "contracts" / "workflow-contract.md").stat().st_size,
-            39000,
+            40500,
         )
         self.assertNotIn(
             "The runner has received a shutdown signal",
