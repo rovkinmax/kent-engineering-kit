@@ -1,0 +1,6 @@
+{
+  "eligible_resources": [
+    "emulator-fixture",
+    "emulator-secondary"
+  ]
+}

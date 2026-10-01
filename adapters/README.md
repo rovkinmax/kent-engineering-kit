@@ -205,6 +205,25 @@ from physical devices, and requires token-matched release. A managed worktree
 therefore carries the executable while still coordinating with every other
 Kent session on the machine.
 
+### Mobile resource-lock interface
+
+Before calling the adapter, a project procedure resolves the current Task's
+native ID and short ID from native Task JSON and obtains the current Session
+with `kent session-id`. Kent does not promise to export `KENT_TASK_ID`; the
+procedure sets `KENT_TASK_ID` to the verified Task short ID and
+`KENT_SESSION_ID` to the current Session. New leases use the Task short ID as
+owner identity. A legacy native-ID owner may be retained only when native
+readback proves its short-ID mapping.
+
+The stdout API is command-specific: `acquire` emits a bare token, while
+`acquire-any` emits exactly `resource=<id>` and then `token=<value>`. Parse the
+selected command's complete output, validate it, and checkpoint the resource
+and token before device operations. `status` redacts tokens. After token-matched
+release or trap cleanup, read back the exact resource and require `unlocked`;
+otherwise cleanup remains unresolved. The detailed checkpoint and recovery
+rules live in
+[`contracts/mobile-smoke-contract.md`](../contracts/mobile-smoke-contract.md).
+
 `required_adapters` is platform-neutral: profiles list the executable adapters
 their workflow contract cannot operate without. These adapters do not choose a
 device policy for the project. Project procedures still define whether an

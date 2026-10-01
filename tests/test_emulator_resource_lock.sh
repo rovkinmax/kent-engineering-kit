@@ -40,6 +40,8 @@ DEVICES
 ADB
 chmod +x "$temporary/bin/adb"
 export PATH="$temporary/bin:$PATH"
+export KENT_TASK_ID="KEN-6"
+export KENT_SESSION_ID="11111111-1111-4111-8111-111111111111"
 
 token="$(
   KENT_RESOURCE_LOCK_OWNER_PID=424242 \
@@ -84,29 +86,29 @@ set -e
 "$adapter" release emulator-5559 "$resume_token"
 
 owned_token="$(
-  KENT_TASK_ID=task-1 \
-    KENT_SESSION_ID=session-1 \
+  KENT_TASK_ID=KEN-6 \
+    KENT_SESSION_ID=11111111-1111-4111-8111-111111111111 \
     "$adapter" acquire emulator-5562 0 7200
 )"
 resumed_owned_token="$(
-  KENT_TASK_ID=task-1 \
-    KENT_SESSION_ID=session-2 \
+  KENT_TASK_ID=KEN-6 \
+    KENT_SESSION_ID=22222222-2222-4222-8222-222222222222 \
     KENT_RESOURCE_LOCK_OWNER_PID=515151 \
     "$adapter" resume-owned emulator-5562
 )"
 [[ "$resumed_owned_token" == "$owned_token" ]]
 owned_owner_file="$KENT_RESOURCE_LOCK_DIR/mobile-emulator-5562.lock/owner"
 [[ "$(sed -n 's/^pid=//p' "$owned_owner_file")" == "515151" ]]
-[[ "$(sed -n 's/^task_id=//p' "$owned_owner_file")" == "task-1" ]]
-[[ "$(sed -n 's/^session_id=//p' "$owned_owner_file")" == "session-2" ]]
+[[ "$(sed -n 's/^task_id=//p' "$owned_owner_file")" == "KEN-6" ]]
+[[ "$(sed -n 's/^session_id=//p' "$owned_owner_file")" == "22222222-2222-4222-8222-222222222222" ]]
 set +e
-KENT_TASK_ID=task-2 \
+KENT_TASK_ID=KEN-7 \
   "$adapter" resume-owned emulator-5562 >/dev/null 2>&1
 other_task_resume_status=$?
 KENT_TASK_ID=unknown \
   "$adapter" resume-owned emulator-5562 >/dev/null 2>&1
 unknown_task_resume_status=$?
-KENT_TASK_ID=task-1 \
+KENT_TASK_ID=KEN-6 \
   "$adapter" resume-owned emulator-5563 >/dev/null 2>&1
 absent_lock_resume_status=$?
 set -e
@@ -174,6 +176,23 @@ replacement_token="$(cat "$replacement_file")"
 [[ "$("$adapter" status emulator-5554 | head -1)" == "locked" ]]
 "$adapter" release emulator-5554 "$replacement_token"
 
+if command -v flock >/dev/null 2>&1; then
+  flock_token="$(
+    KENT_RESOURCE_LOCK_BACKEND=flock \
+      "$adapter" acquire emulator-5557 0 7200
+  )"
+  [[ -n "$flock_token" ]]
+  [[ "$(
+    KENT_RESOURCE_LOCK_BACKEND=flock \
+      "$adapter" status emulator-5557 | head -1
+  )" == "locked" ]]
+  KENT_RESOURCE_LOCK_BACKEND=flock \
+    "$adapter" release emulator-5557 "$flock_token"
+  echo "flock backend tests passed"
+else
+  echo "flock backend unavailable"
+fi
+
 if command -v lockf >/dev/null 2>&1; then
   lockf_token="$(
     KENT_RESOURCE_LOCK_BACKEND=lockf \
@@ -186,6 +205,9 @@ if command -v lockf >/dev/null 2>&1; then
   )" == "locked" ]]
   KENT_RESOURCE_LOCK_BACKEND=lockf \
     "$adapter" release emulator-5558 "$lockf_token"
+  echo "lockf backend tests passed"
+else
+  echo "lockf backend unavailable"
 fi
 
 echo "emulator resource lock tests passed"

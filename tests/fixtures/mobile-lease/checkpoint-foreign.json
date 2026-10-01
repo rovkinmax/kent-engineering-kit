@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "task_short_id": "KEN-6",
+  "stage_data": {
+    "task_native_id": "task-b6672872-8aaf-4dc9-ba9c-dfab7393a5b4",
+    "task_short_id": "KEN-6",
+    "lease_owner_id": "PUB-70",
+    "lock_resource": "emulator-foreign",
+    "lock_token": "synthetic-foreign-checkpoint-token"
+  }
+}

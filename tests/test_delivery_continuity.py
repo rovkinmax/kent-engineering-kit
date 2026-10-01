@@ -483,6 +483,58 @@ class DeliveryContinuityTest(unittest.TestCase):
             )
         )
 
+    def test_generated_smoke_prompt_preserves_mobile_lease_contract(self) -> None:
+        profile = runtime_v2_profile(ci=False)
+        prompt = edge_map(profile)["gate_smoke_required"].prompt or ""
+        for required in (
+            "kent task show {{.TaskShortId}} --json",
+            "`summary.id`",
+            "`summary.short_id`",
+            "`kent session-id`",
+            "`KENT_TASK_ID`",
+            "`KENT_SESSION_ID`",
+            "`task_native_id`",
+            "`task_short_id`",
+            "`lease_owner_id`",
+            "`lock_resource`",
+            "`lock_token`",
+            "`acquire` emits one bare token",
+            "`acquire-any` emits exactly `resource=...` then `token=...`",
+            "Reject missing, empty, duplicate, malformed, extra, or ineligible",
+            "`resume` on that exact pair",
+            "`resume-owned`",
+            "only project-eligible resources",
+            "multiple matches",
+            "sole occupancy",
+            "`age <= TTL` stays busy",
+            "`age > TTL`",
+            "resume-first refreshes",
+            "replacement-first invalidates",
+            "require `unlocked`",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, prompt)
+
+        contract = (REPO_ROOT / "contracts" / "mobile-smoke-contract.md").read_text()
+        for required in (
+            "`summary.id`",
+            "`summary.short_id`",
+            "`lease_owner_id`",
+            "`lock_resource`",
+            "`lock_token`",
+            "multiple same-Task matches are ambiguous and block",
+            "`age <= TTL`",
+            "`age > TTL`",
+            "require `unlocked`",
+        ):
+            with self.subTest(contract=required):
+                self.assertIn(required, contract)
+
+        adapter_readme = (REPO_ROOT / "adapters" / "README.md").read_text()
+        self.assertIn("### Mobile resource-lock interface", adapter_readme)
+        self.assertIn("`acquire-any` emits exactly", adapter_readme)
+        self.assertIn("`contracts/mobile-smoke-contract.md`", adapter_readme)
+
     def test_real_wrapper_stdout_projects_to_selected_edge_specs(self) -> None:
         profile = runtime_v2_profile(ci=True, source_ci=True)
         spec = build_delivery_workflow(profile, 1)
