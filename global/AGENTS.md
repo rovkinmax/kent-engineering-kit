@@ -47,6 +47,11 @@
   structured keys, and repository artifacts in their project-defined language.
 - This includes questions, transition commentary, `blocker_reason`,
   `closure_reason`, and approval summaries.
+- Write human-visible Session goals in the user's preferred language (Russian
+  for this user), using short Markdown headings and bullet lists. Separate the
+  objective, current work, boundaries and completion criteria. Keep normal
+  spacing and concise prose; reference durable plans/evidence instead of
+  embedding dense identifier inventories or raw logs in the goal.
 - Ask questions in plain, conversational language: briefly explain what is happening, what the user needs to decide, and what the choice changes, without bureaucratic phrasing or unexplained technical jargon.
 - Make approval and blocker text decision-oriented. Use the compact Russian
   structure `Нужно от вас`, `Почему`, and `После подтверждения` when useful.
