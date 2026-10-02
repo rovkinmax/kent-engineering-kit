@@ -27,6 +27,15 @@ procedures.
   `kent worktree leave`, emit the complete Task Janitor contract, and leave
   managed deletion to the deterministic post-session node.
 - Do not broaden the task diff while preparing delivery.
+- Missing agent bookkeeping is not missing human authority. Before escalating
+  absent delivery/cleanup evidence, perform bounded recovery from accessible
+  original sources and assemble/read back the records required by the project
+  procedure. Reuse verified records rather than duplicating authority. Never
+  invent consent or treat an older pending decision as the current outcome.
+  Inaccessible original authority, conflicting evidence or unsafe ownership
+  remains a blocker: state the exact unavailable fact or required external
+  action, not a request for the user to produce agent-owned paperwork.
+  This grants no new tool, process, lifecycle or cleanup permissions.
 - Consume completed tool output before issuing another call. Distinguish
   success, failure, truncated output, and a genuinely pending process with a
   valid observer handle. Do not diagnose a hung shell from completed reads.

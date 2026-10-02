@@ -47,6 +47,72 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
         self.assertIn("both independent reviews PASS", procedure)
         self.assertIn("not either independent PASS receipt", procedure)
 
+    def test_evidence_custody_preserves_post_approval_sources(self) -> None:
+        # Instruction-contract regression, not a simulation of agent behavior.
+        plan = " ".join((ROOT / ".kent/commands/plan.md").read_text().split())
+        implement = " ".join((ROOT / ".kent/commands/implement.md").read_text().split())
+        for text in (
+            "first post-approval Implement entry",
+            "original preview ScopeHash",
+            "Never record an expected or pending approval as accepted",
+        ):
+            with self.subTest(owner="plan", requirement=text):
+                self.assertIn(text, plan)
+        for text in (
+            "first accepted entry and after material plan revalidation",
+            "original human decision",
+            "both same-hash PASS receipts",
+            "read back",
+            "not only transient `review_context`",
+            "Do not repeat this capture on every writer slice",
+        ):
+            with self.subTest(owner="implement", requirement=text):
+                self.assertIn(text, implement)
+
+    def test_evidence_custody_cleanup_assembles_available_records(self) -> None:
+        cleanup = " ".join((ROOT / ".kent/commands/cleanup-task.md").read_text().split())
+        for text in (
+            "Cleanup owns assembling and reading back `retention_receipt`",
+            "missing preassembled receipt alone is not an external blocker",
+            "historical Plan comment",
+            "original decision and review sources",
+            "outside the future-deleted root",
+            "original ScopeHash",
+        ):
+            with self.subTest(requirement=text):
+                self.assertIn(text, cleanup)
+        self.assertLess(cleanup.index("Cleanup owns assembling"),
+                        cleanup.index("Invoke the profile's `prepare_cleanup`"))
+
+    def test_evidence_custody_does_not_invent_authority_or_seal(self) -> None:
+        cleanup = " ".join((ROOT / ".kent/commands/cleanup-task.md").read_text().split())
+        for text in (
+            "pending approval, current node or downstream progression",
+            "does not prove original human consent",
+            "inaccessible original decision",
+            "conflicting scope/hash",
+            "ambiguous ownership",
+            "name the exact missing fact",
+            "Cleanup also owns the redaction and operation-report proofs",
+            "real current unmodified `KENT_SESSION_ID`",
+            "Do not issue any standalone ledger append",
+            "never accept its seal as valid",
+        ):
+            with self.subTest(requirement=text):
+                self.assertIn(text, cleanup)
+
+    def test_evidence_custody_role_recovers_bookkeeping_not_consent(self) -> None:
+        role = " ".join((ROOT / "agents/delivery-operator.md").read_text().split())
+        for text in (
+            "Missing agent bookkeeping is not missing human authority",
+            "bounded recovery from accessible original sources",
+            "Never invent consent",
+            "an older pending decision as the current outcome",
+            "exact unavailable fact or required external action",
+        ):
+            with self.subTest(requirement=text):
+                self.assertIn(text, role)
+
     def fixture(self) -> Path:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

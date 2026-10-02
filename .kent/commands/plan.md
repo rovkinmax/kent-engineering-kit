@@ -28,6 +28,14 @@
    No approval before both PASS; no third routine preview review. Preserve
    approval and both receipts with the one authoritative preview.
 
+Plan owns durable pointers to the frozen preview, original preview ScopeHash
+and first review; Plan Review owns its second same-hash receipt. Keep these
+discoverable in existing Task evidence, not solely a transient handoff. The
+first post-approval Implement entry owns preserving the actual acceptance
+source with those references, as described in `.kent/commands/implement.md`.
+Never record an expected or pending approval as accepted. A pre-approval Plan
+receipt remains historical; it cannot describe the outcome of a later gate.
+
 Revalidation reruns this sequence: refresh the first independent review and
 the separate Plan Review, bind both to the revalidated preview hash, then
 obtain approval. Material scope changes need a new preview; ordinary fixes

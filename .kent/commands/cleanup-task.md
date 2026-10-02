@@ -30,6 +30,32 @@ back the retention data in the Task record outside this future-deleted root.
 The local archive is not durable after Janitor and cannot replace that record.
 Do not return to Implement or Plan Contract after retiring the accepted cache.
 
+Cleanup owns assembling and reading back `retention_receipt` from verified
+original sources before invoking the helper. A missing preassembled receipt
+alone is not an external blocker. Inspect the retained preview/review
+references and original decision and review sources with bounded reads; do
+not treat a historical Plan comment saying approval is still pending as the
+outcome of a later gate. Reuse a verified adequate Task record, or retain the
+exact snapshot bytes, original ScopeHash and source references in an existing
+Task record outside the future-deleted root, then actually read it back and
+compute the required digest. Do not rewrite original authority or append
+ordinary ledger evidence just to assemble this record.
+
+A pending approval, current node or downstream progression does not prove
+original human consent. An inaccessible original decision, conflicting
+scope/hash, missing original review proof or ambiguous ownership still blocks
+cleanup: preserve resources and name the exact missing fact, inspected
+sources and necessary recovery action. Do not fabricate approval, request
+reapproval solely for bookkeeping, or invent a native audit capability.
+Escalate only an established external dependency, not receipt assembly that
+this owner can safely complete.
+
+Cleanup also owns the redaction and operation-report proofs required by
+`seal_request`, using actual evidence and genuine current identities. These
+are agent preparation work, not documents the user must write. The existing
+helper remains the sole owner of the final ordinary append and seal; none
+of this recovery relaxes its admission, recovery or Janitor checks.
+
 Invoke the profile's `prepare_cleanup` command with one JSON object on stdin:
 
 - `workspace_path`, `task_short_id`: the original canonical owned root/task;
