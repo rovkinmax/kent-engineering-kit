@@ -3575,6 +3575,41 @@ not prove a hung shell. Preserve ownership/preflight checks; no new signalling
 or monitoring authority is granted."""
 
 
+def managed_cleanup_coordination_instruction(
+    profile: ProjectProfile,
+) -> str:
+    if not profile.capability("managed_worktrees"):
+        return ""
+    return """For managed worktree Cleanup and Janitor recovery, follow the
+bounded cross-Session cleanup coordination protocol in
+`contracts/worktree-contract.md` before terminal preparation, retry, or leave.
+Before contact, freeze `task_short_id`, project, exact `workspace_path`, branch,
+owner, and attempt in the cleanup Task record. Close only safe children proven
+to belong to this Task; a parent move or old PID exit does not prove release.
+For a verified active owner, use `kent run steer <owner-session-id>` once and
+require a fresh acknowledgement for the exact current request in a new
+owner-attributed Task comment naming the root, released child identities, and
+runtime disposition. Read bounded comments with
+`kent task comment list <task> --project <project> --limit <n> --offset <n>`;
+`run watch/wait`, Questions, and approvals are not acknowledgements.
+An incomplete page or readback is an evidence gap, not proof that the owner is
+unavailable. If a materially new blocker appears, raise it to the owner once
+within this same attempt and only if the deadline permits; never reset the
+deadline.
+
+Use one single monotonic 60-second deadline for the entire attempt, at most two
+bounded Task-comment observations, and no more than 30 seconds between them.
+Bound each observer to the remaining time; stop only the task-owned observer,
+never stop or signal another Session. After acknowledgement, freshly recheck
+before terminal preparation and immediately before leave/handoff. New owner
+re-entry, a retained child, or changed runtime/evidence invalidates the prior
+all-clear. Reuse the recorded attempt and Question on an identical retry; never
+ask the user to finish safe task-owned cleanup. On refusal, timeout, an
+unavailable owner, unknown ownership, incomplete evidence, or unsupported
+action, preserve the root and use the existing blocker route. Acknowledgement
+and last-read evidence are not an atomic reservation or a race-free guarantee."""
+
+
 def cleanup_prompt(
     profile: ProjectProfile,
     *,
@@ -3639,6 +3674,8 @@ human decision."""
         completion = """Complete with `done` and provide `cleanup_report`
 describing performed and skipped actions. Use `needs_user_action` with
 `blocker_reason` when safe cleanup requires a human decision."""
+    coordination = managed_cleanup_coordination_instruction(profile)
+    coordination_section = f"\n\n{coordination}" if coordination else ""
     return f"""Perform conservative cleanup for {{{{.TaskShortId}}}}.
 
 {context_instruction(profile, "delivery", "cleanup", "delivery")}
@@ -3648,7 +3685,7 @@ describing performed and skipped actions. Use `needs_user_action` with
 
 {procedure_instruction(profile, "cleanup")}
 
-{cleanup_result_instruction()}
+{cleanup_result_instruction()}{coordination_section}
 
 Treat cleanup as report-first. Never delete the primary checkout, dirty or
 ambiguous state, or content not proven recoverable.
@@ -3782,6 +3819,7 @@ Complete with `done` and provide a non-empty `cleanup_report`. Use
 `needs_user_action` with `blocker_reason` only when safe cleanup requires a
 human decision."""
 
+    coordination = managed_cleanup_coordination_instruction(profile)
     return f"""Perform conservative cleanup for {{{{.TaskShortId}}}} only after
 successful package publication.
 
@@ -3796,6 +3834,8 @@ Publication proof: {{{{.Params.publication_report}}}}
 {procedure_instruction(profile, "cleanup")}
 
 {cleanup_result_instruction()}
+
+{coordination}
 
 Require a non-empty publication report proving the exact task-authorized
 package version exists in the remote registry. Do not publish, tag, push, or
@@ -3826,6 +3866,8 @@ decision."""
 
 
 def janitor_recovery_prompt(profile: ProjectProfile) -> str:
+    coordination = managed_cleanup_coordination_instruction(profile)
+    coordination_section = f"\n\n{coordination}" if coordination else ""
     return f"""Recover the task cleanup after deterministic Janitor failure.
 
 {context_instruction(profile, "delivery", "cleanup", "delivery")}
@@ -3835,7 +3877,7 @@ Previous cleanup report:
 Blocker:
 {{{{.Params.blocker_reason}}}}
 
-{procedure_instruction(profile, "cleanup")}
+{procedure_instruction(profile, "cleanup")}{coordination_section}
 
 Use the retained Cleanup context and the exact `workspace_path` and
 `branch_name` recorded in its `cleanup_report`; do not infer either from this
