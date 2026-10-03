@@ -92,6 +92,14 @@ Kent resolves relative postprocessor paths from the service process working
 directory. Use the stable home-relative installed path rather than a
 project-relative path.
 
+## Gradle UI story-change evidence
+
+Projects that opt into checking changes to supported UI can use the
+[story-change policy](gradle/story-change-policy.md) and its
+[bounded evidence validator](gradle/story_change_evidence.py). The adapter
+validates evidence structure and status; each project owns adoption and review
+of actual registry membership, source changes, and check results.
+
 ## Jira source adapter
 
 Projects that use Jira as an authoritative planning source may declare the
