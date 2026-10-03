@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 from abc import ABC, abstractmethod
 import hashlib
@@ -73,6 +74,145 @@ CONTEXT_MANIFESTS = (
     ".kent/context/smoke.md",
     ".kent/context/delivery.md",
 )
+REVALIDATION_EDGE_CONTRACTS = {
+    "plan_review_revalidate": {
+        "source": "plan_review",
+        "transition": "plan_review_needs_changes",
+    },
+    "plan_contract_continue_revalidate": {
+        "source": "plan_contract_continue",
+        "transition": "plan_contract_continue_changed",
+    },
+    "plan_contract_verify_revalidate": {
+        "source": "plan_contract_verify",
+        "transition": "plan_contract_verify_changed",
+    },
+}
+REVALIDATION_MATERIAL_GRILL_CLAUSE = (
+    "Consult a bounded read-only grill leaf before freeze and formal review "
+    "only when materially revising requirements, API/UX, architecture, "
+    "authority, safety/effects, cost, or evidence strategy, or when "
+    "execution disproves the chosen approach."
+)
+REVALIDATION_ELIGIBILITY_CLAUSE = (
+    "Report unavailable effective leaf eligibility as a concrete blocker "
+    "rather than claiming critique occurred."
+)
+REVALIDATION_PROMPT_REQUIREMENTS = (
+    (
+        "grill timing",
+        "Consult a bounded read-only grill leaf before freeze and formal review",
+    ),
+    (
+        "material-change triggers",
+        "only when materially revising requirements, API/UX, architecture, "
+        "authority, safety/effects, cost, or evidence strategy",
+    ),
+    (
+        "execution-disproof trigger",
+        "or when execution disproves the chosen approach",
+    ),
+    (
+        "grill non-triggers",
+        "Hash drift, checkbox progress, typos, operational waiting, and "
+        "repeated identical failures alone do not require another grill call.",
+    ),
+    ("unavailable eligibility blocker", REVALIDATION_ELIGIBILITY_CLAUSE),
+    (
+        "linked proposal and human acceptance",
+        "Keep the exact proposal plus human acceptance when that pair grants authority.",
+    ),
+    (
+        "discoverable durable authority",
+        "Store durable references in the authoritative plan or discoverable "
+        "project-permitted report-only evidence, not only `review_context`;",
+    ),
+    (
+        "no agent-summary consent substitution",
+        "An agent summary or truncated historical source cannot fill missing consent.",
+    ),
+)
+
+
+def compact_prompt(value: str) -> str:
+    return " ".join(value.split())
+
+
+def assert_revalidation_edge_contract(
+    document: dict[str, object],
+    key: str,
+) -> None:
+    edges = {
+        edge["key"]: edge
+        for edge in document["edges"]
+        if isinstance(edge, dict) and isinstance(edge.get("key"), str)
+    }
+    edge = edges.get(key)
+    if edge is None:
+        raise AssertionError(f"{key}: missing required revalidation edge")
+    expected = REVALIDATION_EDGE_CONTRACTS[key]
+    for field, value in (
+        ("source", expected["source"]),
+        ("transition", expected["transition"]),
+        ("target", "plan_revalidation"),
+    ):
+        if edge.get(field) != value:
+            raise AssertionError(
+                f"{key}: {field} expected {value!r}, got {edge.get(field)!r}"
+            )
+    if edge.get("context") != "continue_session":
+        raise AssertionError(
+            f"{key}: retained-session context expected "
+            f"'continue_session', got {edge.get('context')!r}"
+        )
+    if edge.get("context_source") != "node:plan":
+        raise AssertionError(
+            f"{key}: retained planning context expected 'node:plan', "
+            f"got {edge.get('context_source')!r}"
+        )
+    prompt = edge.get("prompt")
+    if not isinstance(prompt, str):
+        raise AssertionError(f"{key}: missing revalidation prompt")
+    normalized = compact_prompt(prompt)
+    for label, required_text in REVALIDATION_PROMPT_REQUIREMENTS:
+        if compact_prompt(required_text) not in normalized:
+            raise AssertionError(f"{key}: missing {label} clause")
+
+
+def mutate_revalidation_edge(
+    document: dict[str, object],
+    key: str,
+    transform,
+) -> dict[str, object]:
+    mutant = deepcopy(document)
+    edges = list(mutant["edges"])
+    for index, edge in enumerate(edges):
+        if edge.get("key") == key:
+            edges[index] = transform(edge)
+            mutant["edges"] = edges
+            return mutant
+    raise AssertionError(f"{key}: cannot mutate missing edge")
+
+
+def remove_revalidation_prompt_clause(clause: str):
+    wanted = compact_prompt(clause)
+
+    def transform(edge: dict[str, object]) -> dict[str, object]:
+        prompt = edge.get("prompt")
+        if not isinstance(prompt, str):
+            raise AssertionError(f"{edge.get('key')}: missing source prompt")
+        normalized = compact_prompt(prompt)
+        if wanted not in normalized:
+            raise AssertionError(
+                f"{edge.get('key')}: source clause missing before mutation"
+            )
+        return {**edge, "prompt": normalized.replace(wanted, "", 1)}
+
+    return transform
+
+
+def replace_revalidation_edge_field(field: str, value: object):
+    return lambda edge: {**edge, field: value}
 
 # Frozen KEN-6 prompt delta: project only these exact bytes away when checking
 # historical whole-workflow hashes. Future prompt changes must still fail.
@@ -346,6 +486,73 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertEqual(len(cases["cases"]), 8)
         self.assertEqual(len({case["id"] for case in cases["cases"]}), 8)
+
+    def test_revalidation_graph_contract_and_mutation_sensitivity(self) -> None:
+        profile = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        document = spec_as_json(build_delivery_workflow(profile, 1))
+        for key in REVALIDATION_EDGE_CONTRACTS:
+            with self.subTest(edge=key):
+                assert_revalidation_edge_contract(document, key)
+
+        clause_mutants = (
+            (
+                REVALIDATION_MATERIAL_GRILL_CLAUSE,
+                "grill timing",
+            ),
+            (
+                REVALIDATION_ELIGIBILITY_CLAUSE,
+                "unavailable eligibility blocker",
+            ),
+        )
+        for key in REVALIDATION_EDGE_CONTRACTS:
+            for clause, diagnostic in clause_mutants:
+                mutant = mutate_revalidation_edge(
+                    document,
+                    key,
+                    remove_revalidation_prompt_clause(clause),
+                )
+                self.assertNotEqual(document, mutant)
+                with self.subTest(edge=key, removed_clause=diagnostic):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        rf"{key}: missing {diagnostic} clause",
+                    ):
+                        assert_revalidation_edge_contract(mutant, key)
+
+        wrong_context = mutate_revalidation_edge(
+            document,
+            "plan_review_revalidate",
+            replace_revalidation_edge_field("context", "new_session"),
+        )
+        self.assertNotEqual(document, wrong_context)
+        with self.assertRaisesRegex(
+            AssertionError,
+            "plan_review_revalidate: retained-session context",
+        ):
+            assert_revalidation_edge_contract(
+                wrong_context,
+                "plan_review_revalidate",
+            )
+
+        omitted_edge = deepcopy(document)
+        omitted_edge["edges"] = [
+            edge
+            for edge in omitted_edge["edges"]
+            if edge.get("key") != "plan_contract_verify_revalidate"
+        ]
+        self.assertNotEqual(document, omitted_edge)
+        with self.assertRaisesRegex(
+            AssertionError,
+            "plan_contract_verify_revalidate: missing required revalidation edge",
+        ):
+            assert_revalidation_edge_contract(
+                omitted_edge,
+                "plan_contract_verify_revalidate",
+            )
 
     def cleanup_profile(self, *, managed: bool, published: bool) -> ProjectProfile:
         profile = self.load_profile()
