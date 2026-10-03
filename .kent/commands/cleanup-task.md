@@ -6,6 +6,15 @@ delivery or explicit report-only/cancellation authority before terminal
 cleanup. Preserve unknown ownership, dirty state and ambiguous resources;
 report concrete blockers rather than guessing or deleting them.
 
+For managed worktree cleanup and retained Janitor recovery, follow the bounded
+cross-Session cleanup coordination protocol in
+`contracts/worktree-contract.md` before terminal preparation, retry, or leave.
+Attempt identity and contact outcomes belong in the exact cleanup Task's
+existing comments outside the retiring root, not in an extra ledger event.
+Complete safe task-owned child cleanup yourself; ask the user only for a real
+cross-owner decision or unavailable external action. This protocol does not
+change the existing terminal-preparation helper's ownership.
+
 Close only processes proven owned by this task and safe to stop, retaining
 evidence first. Never kill an unknown process, delete primary/user resources,
 credentials or consumer state, or bypass node-owned cleanup with a task move.

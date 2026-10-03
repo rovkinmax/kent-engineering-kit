@@ -201,6 +201,34 @@ retrying. If the infrastructure failure is transient and the same safety
 proofs still hold, choose `cleanup_run_janitor` again with the complete canonical
 parameter contract. Otherwise choose `cleanup_needs_user_action` with the exact
 blocker. Preserve every ambiguous or unique resource."""
+CROSS_SESSION_CLEANUP_NEW = """For managed worktree Cleanup and Janitor recovery, follow the
+bounded cross-Session cleanup coordination protocol in
+`contracts/worktree-contract.md` before terminal preparation, retry, or leave.
+Before contact, freeze `task_short_id`, project, exact `workspace_path`, branch,
+owner, and attempt in the cleanup Task record. Close only safe children proven
+to belong to this Task; a parent move or old PID exit does not prove release.
+For a verified active owner, use `kent run steer <owner-session-id>` once and
+require a fresh acknowledgement for the exact current request in a new
+owner-attributed Task comment naming the root, released child identities, and
+runtime disposition. Read bounded comments with
+`kent task comment list <task> --project <project> --limit <n> --offset <n>`;
+`run watch/wait`, Questions, and approvals are not acknowledgements.
+An incomplete page or readback is an evidence gap, not proof that the owner is
+unavailable. If a materially new blocker appears, raise it to the owner once
+within this same attempt and only if the deadline permits; never reset the
+deadline.
+
+Use one single monotonic 60-second deadline for the entire attempt, at most two
+bounded Task-comment observations, and no more than 30 seconds between them.
+Bound each observer to the remaining time; stop only the task-owned observer,
+never stop or signal another Session. After acknowledgement, freshly recheck
+before terminal preparation and immediately before leave/handoff. New owner
+re-entry, a retained child, or changed runtime/evidence invalidates the prior
+all-clear. Reuse the recorded attempt and Question on an identical retry; never
+ask the user to finish safe task-owned cleanup. On refusal, timeout, an
+unavailable owner, unknown ownership, incomplete evidence, or unsupported
+action, preserve the root and use the existing blocker route. Acknowledgement
+and last-read evidence are not an atomic reservation or a race-free guarantee."""
 JANITOR_RECOVERY_OLD = """Use the retained Cleanup context. Do not directly remove a Kent-managed
 worktree from this agent session. Close every task-owned background shell or
 kept-open tool session. If this session still targets the task worktree, run
@@ -469,6 +497,7 @@ class WorkflowKitTest(unittest.TestCase):
                                     (CLEANUP_BRANCH_NEW, CLEANUP_BRANCH_OLD),
                                     (CLEANUP_WORKSPACE_NEW, CLEANUP_WORKSPACE_OLD),
                                     (CLEANUP_REPORT_NEW, CLEANUP_REPORT_OLD),
+                                    (CROSS_SESSION_CLEANUP_NEW + "\n\n", ""),
                                 ),
                             )
                         if published:
@@ -480,11 +509,15 @@ class WorkflowKitTest(unittest.TestCase):
                                         "\n\n",
                                     ),
                                     (PUBLISHED_REPORT_NEW, PUBLISHED_REPORT_OLD),
+                                    (CROSS_SESSION_CLEANUP_NEW + "\n\n", ""),
                                 ),
                             )
                         reverse_prompt(
                             "task_janitor_blocked",
-                            ((JANITOR_RECOVERY_NEW, JANITOR_RECOVERY_OLD),),
+                            (
+                                (CROSS_SESSION_CLEANUP_NEW + "\n\n", ""),
+                                (JANITOR_RECOVERY_NEW, JANITOR_RECOVERY_OLD),
+                            ),
                         )
                     raw = json.dumps(
                         document,
@@ -2881,6 +2914,84 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn(
             "do not infer either from this recovery session's current directory",
             " ".join(recovery.split()),
+        )
+
+    def test_managed_cleanup_prompts_share_bounded_cross_session_protocol(self) -> None:
+        profile = self.cleanup_profile(managed=True, published=False)
+        prompts = {
+            "ordinary": cleanup_prompt(profile),
+            "merged": cleanup_prompt(profile, merged=True),
+            "no_pr": cleanup_prompt(profile, no_pr=True),
+            "closed": cleanup_prompt(profile, closed=True),
+            "published": published_cleanup_prompt(
+                self.cleanup_profile(managed=True, published=True)
+            ),
+            "janitor_recovery": janitor_recovery_prompt(profile),
+        }
+        requirements = (
+            "`kent run steer <owner-session-id>`",
+            "parent move or old PID exit does not prove release",
+            "single monotonic 60-second deadline",
+            "at most two bounded Task-comment observations",
+            "no more than 30 seconds between them",
+            "fresh acknowledgement for the exact current request",
+            "incomplete page or readback is an evidence gap",
+            "materially new blocker",
+            "same attempt",
+            "never reset the deadline",
+            "owner re-entry",
+            "retained child",
+            "immediately before leave/handoff",
+            "unavailable owner",
+            "preserve the root and use the existing blocker route",
+            "unsupported action",
+            "never ask the user to finish safe task-owned cleanup",
+            "never stop or signal another Session",
+        )
+        for name, prompt in prompts.items():
+            normalized = " ".join(prompt.split())
+            with self.subTest(prompt=name):
+                for requirement in requirements:
+                    self.assertIn(requirement, normalized)
+                self.assertNotIn("KEN-8", prompt)
+                self.assertNotIn("OSM-87", prompt)
+                self.assertNotIn("7a04b98e-e9b0-4a70-b36d-b343912673c5", prompt)
+
+        unmanaged = self.cleanup_profile(managed=False, published=False)
+        unmanaged_prompts = (
+            cleanup_prompt(unmanaged),
+            cleanup_prompt(unmanaged, no_pr=True),
+            published_cleanup_prompt(
+                self.cleanup_profile(managed=False, published=True)
+            ),
+            janitor_recovery_prompt(unmanaged),
+        )
+        for prompt in unmanaged_prompts:
+            self.assertNotIn("kent run steer", prompt)
+
+    def test_project_cleanup_surfaces_reference_protocol_and_preserve_pr35(self) -> None:
+        portable = (REPO_ROOT / "contracts/worktree-contract.md").read_text()
+        role = (REPO_ROOT / "agents/delivery-operator.md").read_text()
+        procedure = (REPO_ROOT / ".kent/commands/cleanup-task.md").read_text()
+
+        self.assertIn(
+            "bounded cross-Session cleanup coordination",
+            " ".join(portable.split()),
+        )
+        for source in (role, procedure):
+            normalized = " ".join(source.split())
+            self.assertIn("contracts/worktree-contract.md", normalized)
+            self.assertIn(
+                "bounded cross-Session cleanup coordination",
+                normalized,
+            )
+        self.assertIn(
+            "Missing agent bookkeeping is not missing human authority.",
+            role,
+        )
+        self.assertIn(
+            "The helper owns the final ordinary append and seal.",
+            procedure,
         )
 
     def test_transition_key_migrator_explains_task_backed_limitation(self) -> None:

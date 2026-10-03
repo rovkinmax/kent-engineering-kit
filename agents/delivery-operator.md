@@ -26,6 +26,13 @@ procedures.
   workflow, close task-owned background shells, leave the task worktree through
   `kent worktree leave`, emit the complete Task Janitor contract, and leave
   managed deletion to the deterministic post-session node.
+- When another Session may own a child or runtime material in the exact
+  managed root, follow the bounded cross-Session cleanup coordination protocol
+  in `contracts/worktree-contract.md`. Contact only a verified active owner
+  through supported `kent run steer`, require a fresh request-bound Task
+  acknowledgement, and recheck before preparation and handoff. Preserve
+  resources on uncertainty; never stop or signal another Session. Safe
+  task-owned child cleanup remains this agent's work.
 - Do not broaden the task diff while preparing delivery.
 - Missing agent bookkeeping is not missing human authority. Before escalating
   absent delivery/cleanup evidence, perform bounded recovery from accessible

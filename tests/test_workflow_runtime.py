@@ -5,6 +5,7 @@ import errno
 import fcntl
 import hashlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import shlex
@@ -8434,6 +8435,350 @@ class WorkflowJanitorTest(GitRepositoryTest):
             self.test_no_pr_cleanup_settles_local_branch_and_reports_retained_kent_record()
         self.assertEqual(counters[0].read_text().splitlines(), ["deleted"])
 
+    def test_managed_retirement_blocks_foreign_runtime_sibling_before_native_delete(
+        self,
+    ) -> None:
+        for with_v2 in (True, False):
+            with self.subTest(with_v2=with_v2):
+                root, worktree, scripts, marker = self.make_managed_worktree(
+                    with_v2=with_v2,
+                )
+                runtime = worktree / ".kent" / "runtime"
+                foreign = runtime / "foreign-owner"
+                foreign.mkdir(parents=True)
+                foreign_file = foreign / "opaque-state"
+                foreign_bytes = b"foreign runtime evidence\n"
+                foreign_file.write_bytes(foreign_bytes)
+                worktree_stat = worktree.stat()
+                worktree_identity = (worktree_stat.st_dev, worktree_stat.st_ino)
+                branch_oid = self.run_git(
+                    root, "rev-parse", "refs/heads/TASK-1",
+                ).stdout.strip()
+                native_delete_called = root / "native-delete-called"
+                wrapper = self.completed_wrapper(root)
+                environment = {
+                    **os.environ,
+                    "KENT_WORKTREE_WRAPPER": str(wrapper),
+                    "KENT_TEST_PRIMARY": str(root),
+                    "KENT_TEST_WRAPPER_MARKER": str(native_delete_called),
+                }
+                cleanup_report = marker if with_v2 else "Cleanup preflight passed."
+
+                result = subprocess.run(
+                    [str(scripts / "workflow-task-janitor")],
+                    cwd=worktree,
+                    input=self.janitor_input(
+                        worktree,
+                        branch_name="TASK-1",
+                        cleanup_mode="no_pr",
+                        cleanup_report=cleanup_report,
+                    ),
+                    text=True,
+                    capture_output=True,
+                    env=environment,
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertFalse(
+                    native_delete_called.exists(),
+                    "foreign runtime sibling reached native worktree deletion",
+                )
+                self.assertEqual(
+                    payload["transition"],
+                    "task_janitor_blocked",
+                    payload,
+                )
+                self.assertIn("runtime-parent", payload["cleanup_report"])
+                self.assertIn("owner", payload["blocker_reason"].lower())
+                self.assertTrue(worktree.is_dir())
+                current = worktree.stat()
+                self.assertEqual(
+                    (current.st_dev, current.st_ino),
+                    worktree_identity,
+                )
+                self.assertEqual(foreign_file.read_bytes(), foreign_bytes)
+                self.assertIn(
+                    str(worktree),
+                    self.run_git(root, "worktree", "list", "--porcelain").stdout,
+                )
+                self.assertEqual(
+                    self.run_git(
+                        root, "rev-parse", "refs/heads/TASK-1",
+                    ).stdout.strip(),
+                    branch_oid,
+                )
+
+    def test_managed_retirement_rechecks_parent_after_terminal_preparation(self) -> None:
+        root, worktree, scripts, marker = self.make_managed_worktree(with_v2=True)
+        wrapper = self.completed_wrapper(root)
+        environment = {
+            **os.environ,
+            "KENT_WORKTREE_WRAPPER": str(wrapper),
+            "KENT_TEST_PRIMARY": str(root),
+        }
+        branch_oid = self.run_git(
+            root, "rev-parse", "refs/heads/TASK-1",
+        ).stdout.strip()
+        janitor = load_template_module(
+            scripts / "workflow-task-janitor",
+            "janitor_parent_recheck_after_prepare",
+        )
+        original_prepare = janitor._prepare_v2_managed_runtime_state
+        delete_calls = []
+        foreign_bytes = b"arrived after evidence preparation\n"
+        foreign_file = (
+            worktree / ".kent" / "runtime" / "late-foreign-owner" / "opaque-state"
+        )
+
+        def prepare_then_inject(workspace, task_short_id, *, cleanup_report):
+            result = original_prepare(
+                workspace,
+                task_short_id,
+                cleanup_report=cleanup_report,
+            )
+            foreign_file.parent.mkdir()
+            foreign_file.write_bytes(foreign_bytes)
+            return result
+
+        def refuse_native_delete(*args, **kwargs):
+            delete_calls.append((args, kwargs))
+            return False, "injected native refusal", "native refused"
+
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environment),
+            mock.patch.object(
+                janitor,
+                "_prepare_v2_managed_runtime_state",
+                side_effect=prepare_then_inject,
+            ),
+            mock.patch.object(
+                janitor,
+                "delete_managed_worktree",
+                side_effect=refuse_native_delete,
+            ),
+            mock.patch.object(
+                sys,
+                "stdin",
+                io.StringIO(
+                    self.janitor_input(
+                        worktree,
+                        branch_name="TASK-1",
+                        cleanup_mode="no_pr",
+                        cleanup_report=marker,
+                    )
+                ),
+            ),
+            mock.patch.object(sys, "stdout", output),
+        ):
+            exit_code = janitor.main()
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(
+            delete_calls,
+            [],
+            "runtime-parent drift reached native worktree deletion",
+        )
+        self.assertEqual(payload["transition"], "task_janitor_blocked", payload)
+        self.assertTrue(worktree.is_dir())
+        self.assertEqual(foreign_file.read_bytes(), foreign_bytes)
+        self.assertIn(
+            str(worktree),
+            self.run_git(root, "worktree", "list", "--porcelain").stdout,
+        )
+        self.assertEqual(
+            self.run_git(root, "rev-parse", "refs/heads/TASK-1").stdout.strip(),
+            branch_oid,
+        )
+
+    def test_managed_runtime_parent_admission_fails_closed_for_unsafe_state(self) -> None:
+        for case in ("foreign_symlink", "wrong_type", "over_limit",
+                     "read_failure", "directory_identity_drift"):
+            with self.subTest(case=case):
+                root, worktree, scripts, marker = self.make_managed_worktree(with_v2=True)
+                runtime = worktree / ".kent" / "runtime"
+                janitor = load_template_module(
+                    scripts / "workflow-task-janitor",
+                    f"janitor_runtime_parent_{case}",
+                )
+                outside = root / "foreign-runtime-state"
+                outside_bytes = b"preserve external runtime bytes\n"
+                outside.write_bytes(outside_bytes)
+                preserved_runtime = runtime.with_name("runtime-preserved")
+                preserved_active = root / "preserved-task-runtime"
+                preserved_active_snapshot: dict[str, bytes] = {}
+
+                def snapshot_runtime_parent(directory: Path) -> dict[str, object]:
+                    snapshot = {}
+                    for item in directory.iterdir():
+                        if item.is_symlink():
+                            value = ("symlink", os.readlink(item))
+                        elif item.is_dir():
+                            value = (
+                                "directory",
+                                {
+                                    nested.name: nested.read_bytes()
+                                    for nested in item.iterdir()
+                                },
+                            )
+                        elif item.is_file():
+                            value = ("file", item.read_bytes())
+                        else:
+                            value = ("other", item.lstat().st_mode)
+                        snapshot[item.name] = value
+                    return snapshot
+
+                if case == "foreign_symlink":
+                    (runtime / "foreign-link").symlink_to(outside)
+                elif case == "wrong_type":
+                    active = runtime / "TASK-1"
+                    preserved_active_snapshot = {
+                        item.name: item.read_bytes() for item in active.iterdir()
+                    }
+                    active.rename(preserved_active)
+                    active.write_bytes(b"wrong type at task name\n")
+                elif case == "over_limit":
+                    for index in range(janitor.MAX_RUNTIME_ENTRIES + 1):
+                        (runtime / f"foreign-{index}").write_bytes(
+                            f"state-{index}\n".encode()
+                        )
+
+                entry_snapshot = snapshot_runtime_parent(runtime)
+
+                initial_runtime_identity = (
+                    runtime.stat().st_dev,
+                    runtime.stat().st_ino,
+                )
+                initial_worktree_stat = worktree.stat()
+                initial_worktree_identity = (
+                    initial_worktree_stat.st_dev,
+                    initial_worktree_stat.st_ino,
+                )
+                branch_oid = self.run_git(
+                    root, "rev-parse", "refs/heads/TASK-1",
+                ).stdout.strip()
+                native_delete_called = root / "native-delete-called"
+
+                if case == "read_failure":
+                    original_scandir = janitor.os.scandir
+                    runtime_stat = runtime.stat()
+
+                    def fail_runtime_inventory(path):
+                        if isinstance(path, int):
+                            descriptor_stat = os.fstat(path)
+                            if (
+                                descriptor_stat.st_dev == runtime_stat.st_dev
+                                and descriptor_stat.st_ino == runtime_stat.st_ino
+                            ):
+                                raise PermissionError(
+                                    "injected runtime inventory read failure"
+                                )
+                        return original_scandir(path)
+
+                    with mock.patch.object(
+                        janitor.os,
+                        "scandir",
+                        side_effect=fail_runtime_inventory,
+                    ):
+                        result_code, payload = self.run_managed_janitor_module(
+                            janitor,
+                            root,
+                            worktree,
+                            cleanup_report=marker,
+                            native_delete_called=native_delete_called,
+                        )
+                elif case == "directory_identity_drift":
+                    original_open = janitor.open_child_directory
+                    replaced = False
+
+                    def replace_runtime_after_open(parent_fd, name):
+                        nonlocal replaced
+                        descriptor = original_open(parent_fd, name)
+                        if name == "runtime" and not replaced:
+                            replaced = True
+                            runtime.rename(preserved_runtime)
+                            runtime.mkdir(mode=0o700)
+                        return descriptor
+
+                    with mock.patch.object(
+                        janitor,
+                        "open_child_directory",
+                        side_effect=replace_runtime_after_open,
+                    ):
+                        result_code, payload = self.run_managed_janitor_module(
+                            janitor,
+                            root,
+                            worktree,
+                            cleanup_report=marker,
+                            native_delete_called=native_delete_called,
+                        )
+                else:
+                    result_code, payload = self.run_managed_janitor_module(
+                        janitor,
+                        root,
+                        worktree,
+                        cleanup_report=marker,
+                        native_delete_called=native_delete_called,
+                    )
+
+                self.assertEqual(result_code, 0, payload)
+                self.assertEqual(payload["transition"], "task_janitor_blocked", payload)
+                self.assertIn("runtime-parent", payload["cleanup_report"])
+                self.assertIn("owner", payload["blocker_reason"].lower())
+                self.assertFalse(
+                    native_delete_called.exists(),
+                    "unsafe runtime-parent state reached native deletion",
+                )
+                self.assertTrue(worktree.is_dir())
+                current_worktree_stat = worktree.stat()
+                self.assertEqual(
+                    (current_worktree_stat.st_dev, current_worktree_stat.st_ino),
+                    initial_worktree_identity,
+                )
+                self.assertIn(
+                    str(worktree),
+                    self.run_git(root, "worktree", "list", "--porcelain").stdout,
+                )
+                self.assertEqual(
+                    self.run_git(
+                        root, "rev-parse", "refs/heads/TASK-1",
+                    ).stdout.strip(),
+                    branch_oid,
+                )
+                self.assertEqual(outside.read_bytes(), outside_bytes)
+                if case == "foreign_symlink":
+                    self.assertTrue((runtime / "foreign-link").is_symlink())
+                    self.assertTrue(os.path.samefile(runtime / "foreign-link", outside))
+                elif case == "directory_identity_drift":
+                    self.assertTrue(replaced)
+                    self.assertTrue(preserved_runtime.is_dir())
+                    self.assertEqual(
+                        snapshot_runtime_parent(preserved_runtime),
+                        entry_snapshot,
+                    )
+                    replacement_stat = runtime.stat()
+                    self.assertNotEqual(
+                        (replacement_stat.st_dev, replacement_stat.st_ino),
+                        initial_runtime_identity,
+                    )
+                else:
+                    self.assertEqual(
+                        snapshot_runtime_parent(runtime),
+                        entry_snapshot,
+                    )
+                if case == "wrong_type":
+                    self.assertTrue(preserved_active.is_dir())
+                    self.assertEqual(
+                        {
+                            item.name: item.read_bytes()
+                            for item in preserved_active.iterdir()
+                        },
+                        preserved_active_snapshot,
+                    )
+
     def test_native_kent_topology_and_primary_identity(self) -> None:
         module = load_template_module(JANITOR, "janitor_native_topology")
         primary = self.create_repository()
@@ -9670,6 +10015,46 @@ class WorkflowJanitorTest(GitRepositoryTest):
         payload.update(overrides)
         return json.dumps(payload)
 
+    def run_managed_janitor_module(
+        self,
+        janitor,
+        root: Path,
+        worktree: Path,
+        *,
+        cleanup_report: str,
+        native_delete_called: Path,
+    ) -> tuple[int, dict[str, object]]:
+        output = io.StringIO()
+        wrapper = self.completed_wrapper(root)
+        environment = {
+            **os.environ,
+            "KENT_WORKTREE_WRAPPER": str(wrapper),
+            "KENT_TEST_PRIMARY": str(root),
+            "KENT_TEST_WRAPPER_MARKER": str(native_delete_called),
+        }
+        with (
+            mock.patch.dict(os.environ, environment),
+            mock.patch.object(
+                sys,
+                "stdin",
+                io.StringIO(
+                    self.janitor_input(
+                        worktree,
+                        branch_name="TASK-1",
+                        cleanup_mode="no_pr",
+                        cleanup_report=cleanup_report,
+                    )
+                ),
+            ),
+            mock.patch.object(sys, "stdout", output),
+        ):
+            original_cwd = Path.cwd()
+            try:
+                exit_code = janitor.main()
+            finally:
+                os.chdir(original_cwd)
+        return exit_code, json.loads(output.getvalue())
+
     def add_origin_branch(self, root: Path, worktree: Path) -> Path:
         remote_temporary = tempfile.TemporaryDirectory()
         self.addCleanup(remote_temporary.cleanup)
@@ -10227,6 +10612,107 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         self.assertTrue(worktree.exists())
 
+    def test_managed_runtime_parent_retry_admits_exact_tombstone_after_native_refusal(
+        self,
+    ) -> None:
+        root, worktree, scripts, marker = self.make_managed_worktree(with_v2=True)
+        janitor = load_template_module(
+            scripts / "workflow-task-janitor",
+            "janitor_runtime_parent_native_retry",
+        )
+        native_delete_called = root / "native-delete-called"
+        delete_calls = []
+        branch_oid_before = self.run_git(
+            root, "rev-parse", "refs/heads/TASK-1",
+        ).stdout.strip()
+
+        def native_refusal(*args, **kwargs):
+            delete_calls.append((args, kwargs))
+            return False, "injected native refusal", "native refused"
+
+        with mock.patch.object(
+            janitor,
+            "delete_managed_worktree",
+            side_effect=native_refusal,
+        ):
+            first_code, first = self.run_managed_janitor_module(
+                janitor,
+                root,
+                worktree,
+                cleanup_report=marker,
+                native_delete_called=native_delete_called,
+            )
+
+        self.assertEqual(first_code, 0, first)
+        self.assertEqual(first["transition"], "task_janitor_blocked", first)
+        self.assertEqual(len(delete_calls), 1)
+        self.assertFalse(native_delete_called.exists())
+        self.assertTrue(worktree.is_dir())
+        self.assertIn(
+            str(worktree),
+            self.run_git(root, "worktree", "list", "--porcelain").stdout,
+        )
+        self.assertEqual(
+            self.run_git(root, "rev-parse", "refs/heads/TASK-1").stdout.strip(),
+            branch_oid_before,
+        )
+
+        runtime_contracts = load_template_module(
+            REPO_ROOT / "workflowkit" / "runtime.py",
+            "runtime_parent_retry_contracts",
+        )
+        marker_value = runtime_contracts.validate_cleanup_report(marker)
+        runtime_parent = worktree / ".kent" / "runtime"
+        tombstone = (
+            ".evidence-cleanup-" + runtime_contracts.canonical_sha256(marker_value)
+        )
+        lock_name, sentinel_name = janitor.runtime_state_names("TASK-1")
+        self.assertEqual(
+            {item.name for item in runtime_parent.iterdir()},
+            {lock_name, sentinel_name, tombstone},
+        )
+        self.assertTrue((runtime_parent / tombstone).is_dir())
+        self.assertTrue((runtime_parent / sentinel_name).is_file())
+
+        second_code, second = self.run_managed_janitor_module(
+            janitor,
+            root,
+            worktree,
+            cleanup_report=marker,
+            native_delete_called=native_delete_called,
+        )
+        self.assertEqual(second_code, 0, second)
+        self.assertEqual(second["transition"], "task_janitor_done", second)
+        self.assertFalse(worktree.exists())
+        self.assertTrue(root.exists(), f"primary checkout disappeared: {root}")
+        worktrees_after = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            worktrees_after.returncode,
+            0,
+            f"primary checkout is not usable: {worktrees_after.stderr}",
+        )
+        self.assertNotIn(
+            str(worktree),
+            worktrees_after.stdout,
+        )
+        local_branch = subprocess.run(
+            [
+                "git", "-C", str(root), "show-ref", "--verify", "--quiet",
+                "refs/heads/TASK-1",
+            ],
+            check=False,
+        )
+        self.assertEqual(local_branch.returncode, 1)
+        self.assertIn(
+            "refs/heads/TASK-1",
+            self.run_git(root, "ls-remote", "--heads", "origin", "refs/heads/TASK-1").stdout,
+        )
+
     def test_managed_completed_wrapper_without_tombstone_reports_ambiguous_evidence(
         self,
     ) -> None:
@@ -10310,6 +10796,11 @@ class WorkflowJanitorTest(GitRepositoryTest):
         runtime.mkdir(parents=True)
         self._write_valid_runtime_file(runtime / "fix-checkpoint.json", "{}")
         self._write_valid_runtime_file(runtime / "evidence-ledger.jsonl", "{}\n")
+        neighbor = root / ".kent" / "runtime" / "TASK-2"
+        neighbor.mkdir()
+        neighbor_state = neighbor / "fix-checkpoint.json"
+        neighbor_bytes = b"neighbor task state\n"
+        self._write_valid_runtime_file(neighbor_state, neighbor_bytes)
         result = subprocess.run(
             [str(JANITOR)],
             cwd=root,
@@ -10324,6 +10815,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertEqual(payload["transition"], "task_janitor_done")
         self.assertIn("kept the primary checkout", payload["cleanup_report"])
         self.assertFalse(runtime.exists())
+        self.assertEqual(neighbor_state.read_bytes(), neighbor_bytes)
 
     def test_primary_runtime_symlink_is_preserved(self) -> None:
         root = self.create_repository()
