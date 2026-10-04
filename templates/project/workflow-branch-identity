@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -18,6 +20,37 @@ JIRA_KEY = re.compile(r"(?<![A-Z0-9])([A-Z][A-Z0-9]+-\d+)(?![A-Z0-9])", re.I)
 URL = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
 POLICIES = {"task", "jira", "github_issue"}
 HANDOFF_KEYS = ("workspace_path", "plan_path", "work_kind")
+CODER_HANDOFF_KEYS = (
+    "task_short_id",
+    "accepted_plan_sha256",
+    "plan_route",
+    "plan_route_context",
+    "review_context",
+)
+CODER_SELECTION_SCHEMA = "coder-selection-v1"
+CODER_SELECTION_FIELDS = {
+    "schema",
+    "task_short_id",
+    "complexity",
+    "rationale",
+}
+CODER_SELECTION_TARGETS = {
+    "simple": ("implementation-simple", "xhigh"),
+    "complex": ("implementation-complex", "medium"),
+}
+CODER_SELECTION_FENCE = re.compile(
+    r"(?ms)^```json[ \t]*\r?\n(.*?)^```[ \t]*$"
+)
+IMPLEMENTATION_ROLES = {
+    "implementation-worker",
+    "implementation-simple",
+    "implementation-complex",
+}
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+CHECKBOX = re.compile(
+    r"^(\s*(?:(?:[-*+]|\d+[.)])\s+|#{1,6}\s+)\[)[ xX](\])"
+)
+CODER_SELECTION_POLICY = {"disabled", "complexity"}
 DEFAULT_KENT_PATHS = (
     str(Path.home() / ".kent" / "bin" / "kent"),
     "/opt/homebrew/bin/kent",
@@ -103,7 +136,8 @@ def task_id(payload: dict[str, object]) -> str:
 
 def handoff_values(payload: dict[str, object]) -> dict[str, str]:
     present = [key for key in HANDOFF_KEYS if key in payload]
-    if not present and "delivery_context" not in payload:
+    coder_present = [key for key in CODER_HANDOFF_KEYS if key in payload]
+    if not present and "delivery_context" not in payload and not coder_present:
         return {}
     if len(present) != len(HANDOFF_KEYS):
         missing = sorted(set(HANDOFF_KEYS) - set(present))
@@ -125,7 +159,263 @@ def handoff_values(payload: dict[str, object]) -> dict[str, str]:
         from workflow_runtime_contracts import delivery_context_fields
 
         values.update(delivery_context_fields(payload))
+    if coder_present:
+        if len(coder_present) != len(CODER_HANDOFF_KEYS):
+            missing = sorted(set(CODER_HANDOFF_KEYS) - set(coder_present))
+            raise ValueError(
+                "complexity-selection handoff is incomplete; missing "
+                + ", ".join(missing)
+            )
+        for key in CODER_HANDOFF_KEYS:
+            value = payload[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{key} must be a non-empty string")
+            values[key] = value.strip()
+        if SHA256.fullmatch(values["accepted_plan_sha256"]) is None:
+            raise ValueError("accepted_plan_sha256 must be a lowercase SHA-256 digest")
     return values
+
+
+def coder_selection_policy(root: Path) -> str:
+    path = root / ".kent" / "workflow-profile.toml"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("project workflow profile is missing or unsafe")
+    profile = tomllib.loads(path.read_text(encoding="utf-8"))
+    policies = profile.get("policies")
+    if not isinstance(policies, dict):
+        raise ValueError("project workflow profile has no policies table")
+    policy = policies.get("coder_selection", "disabled")
+    if not isinstance(policy, str) or policy not in CODER_SELECTION_POLICY:
+        raise ValueError("policies.coder_selection is unsupported")
+    if (
+        policy == "complexity"
+        and policies.get("writer_sessions", "continuous") != "continuous"
+    ):
+        raise ValueError(
+            "complexity coder selection requires continuous writer Sessions"
+        )
+    return policy
+
+
+def duplicate_free_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
+
+
+def normalized_plan_bytes(path: Path) -> bytes:
+    text = path.read_text(encoding="utf-8")
+    lines = [
+        CHECKBOX.sub(r"\1 \2", line).rstrip()
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+    while lines and not lines[-1]:
+        lines.pop()
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def plan_coder_selection(path: Path, *, short_id: str) -> dict[str, str]:
+    contents = path.read_text(encoding="utf-8")
+    selections: list[dict[str, str]] = []
+    for match in CODER_SELECTION_FENCE.finditer(contents):
+        source = match.group(1)
+        if CODER_SELECTION_SCHEMA not in source:
+            continue
+        decoded = json.loads(source, object_pairs_hook=duplicate_free_object)
+        if not isinstance(decoded, dict) or decoded.get("schema") != CODER_SELECTION_SCHEMA:
+            continue
+        if set(decoded) != CODER_SELECTION_FIELDS:
+            raise ValueError("plan coder selection has missing or unknown fields")
+        if (
+            decoded.get("task_short_id") != short_id
+            or not isinstance(decoded.get("complexity"), str)
+            or decoded.get("complexity") not in CODER_SELECTION_TARGETS
+            or not isinstance(decoded.get("rationale"), str)
+            or not decoded["rationale"].strip()
+        ):
+            raise ValueError("plan coder selection is malformed or wrong-task")
+        selections.append(
+            {
+                "schema": CODER_SELECTION_SCHEMA,
+                "task_short_id": short_id,
+                "complexity": decoded["complexity"],
+                "rationale": decoded["rationale"].strip(),
+            }
+        )
+    if len(selections) != 1:
+        raise ValueError(
+            "accepted plan must contain exactly one fenced "
+            f"{CODER_SELECTION_SCHEMA} object; found {len(selections)}"
+        )
+    return selections[0]
+
+
+def coder_selection_snapshot(
+    root: Path,
+    handoff: dict[str, str],
+    *,
+    short_id: str,
+) -> tuple[str, str]:
+    runtime = root / ".kent" / "runtime"
+    task_directory = runtime / short_id
+    for directory in (root / ".kent", runtime, task_directory):
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("accepted plan snapshot directory is missing or unsafe")
+    snapshot_path = task_directory / "plan-contract.json"
+    if snapshot_path.is_symlink() or not snapshot_path.is_file():
+        raise ValueError("accepted task-bound plan snapshot is missing or unsafe")
+    snapshot = json.loads(
+        snapshot_path.read_text(encoding="utf-8"),
+        object_pairs_hook=duplicate_free_object,
+    )
+    if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 1:
+        raise ValueError("accepted plan snapshot has an unsupported schema")
+    if snapshot.get("task_short_id") != short_id:
+        raise ValueError("accepted plan snapshot belongs to a different Task")
+    accepted_digest = snapshot.get("normalized_sha256")
+    normalized = snapshot.get("normalized_plan")
+    if (
+        not isinstance(accepted_digest, str)
+        or SHA256.fullmatch(accepted_digest) is None
+        or not isinstance(normalized, str)
+        or hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        != accepted_digest
+    ):
+        raise ValueError("accepted plan snapshot digest is invalid")
+    if handoff["accepted_plan_sha256"] != accepted_digest:
+        raise ValueError("accepted_plan_sha256 does not match the snapshot")
+    selection = snapshot.get("coder_selection")
+    if not isinstance(selection, dict):
+        raise ValueError("accepted plan snapshot has no coder selection")
+    if set(selection) != CODER_SELECTION_FIELDS:
+        raise ValueError("accepted coder selection has missing or unknown fields")
+    if (
+        selection.get("schema") != CODER_SELECTION_SCHEMA
+        or selection.get("task_short_id") != short_id
+        or not isinstance(selection.get("complexity"), str)
+        or selection.get("complexity") not in CODER_SELECTION_TARGETS
+        or not isinstance(selection.get("rationale"), str)
+        or not selection["rationale"].strip()
+    ):
+        raise ValueError("accepted coder selection is malformed or wrong-task")
+    if snapshot.get("coder_selection_sha256") != accepted_digest:
+        raise ValueError("accepted coder selection is not digest-bound")
+    plan_path_value = snapshot.get("plan_path")
+    if not isinstance(plan_path_value, str) or not plan_path_value:
+        raise ValueError("accepted plan snapshot has no plan_path")
+    if plan_path_value != handoff["plan_path"]:
+        raise ValueError("accepted plan path differs from the handoff")
+    candidate = Path(plan_path_value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError("accepted plan path is missing or unsafe")
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError("accepted plan path escapes the task workspace")
+    if hashlib.sha256(normalized_plan_bytes(resolved)).hexdigest() != accepted_digest:
+        raise ValueError("accepted normalized plan changed before branch retry")
+    if plan_coder_selection(resolved, short_id=short_id) != selection:
+        raise ValueError(
+            "snapshot coder selection differs from the digest-bound plan choice"
+        )
+    role, effort = CODER_SELECTION_TARGETS[selection["complexity"]]
+    return role, effort
+
+
+def no_retained_writer(
+    root: Path,
+    *,
+    task: str,
+    native_task_id: str,
+) -> str | None:
+    result = run(
+        [
+            resolve_kent_bin(),
+            "task",
+            "sessions",
+            task,
+            "--project",
+            str(root),
+            "--json",
+        ],
+        cwd=root,
+    )
+    response = json.loads(result.stdout)
+    if not isinstance(response, dict) or response.get("task_id") != native_task_id:
+        raise ValueError("retained Session readback belongs to a different Task")
+    items = response.get("items")
+    if not isinstance(items, list):
+        raise ValueError("retained Session readback has no items list")
+    writers: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("retained Session readback contains a malformed item")
+        session_id = item.get("session_id")
+        role = item.get("agent_role")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("retained Session has no identity")
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError("retained Session has no assigned role")
+        if role.startswith("implementation-"):
+            writers.append({"session_id": session_id, "agent_role": role})
+    if writers:
+        return (
+            "a retained implementation Session already exists; branch retry "
+            "cannot start a second writer"
+        )
+    return None
+
+
+def revalidate_before_writer(
+    handoff: dict[str, str],
+    reason: str,
+) -> int:
+    if not all(key in handoff for key in CODER_HANDOFF_KEYS):
+        return blocked(
+            "Невозможно передать задачу на повторную сверку: отсутствуют "
+            "задача, digest или контекст принятого плана. Требуется "
+            "восстановить корректный workflow handoff.",
+            handoff,
+        )
+    complete(
+        "branch_identity_revalidate",
+        "Принятый выбор исполнителя или его связь с планом не подтверждены; "
+        "возвращаюсь к проверке плана до запуска писателя.",
+        workspace_path=handoff["workspace_path"],
+        plan_path=handoff["plan_path"],
+        work_kind=handoff["work_kind"],
+        plan_route=handoff["plan_route"],
+        plan_route_context=handoff["plan_route_context"],
+        plan_change_report=(
+            "Accepted coder selection could not be validated before the first "
+            f"writer: {reason}"
+        ),
+        review_context=handoff["review_context"],
+        task_short_id=handoff["task_short_id"],
+        accepted_plan_sha256=handoff["accepted_plan_sha256"],
+        **(
+            {"delivery_context": handoff["delivery_context"]}
+            if "delivery_context" in handoff
+            else {}
+        ),
+    )
+    return 0
+
+
+def ready_for_writer(
+    message: str,
+    handoff: dict[str, str],
+    selection: tuple[str, str] | None,
+) -> int:
+    values = dict(handoff)
+    if selection is not None:
+        values["target_assignee"], values["target_thinking"] = selection
+    complete("branch_identity_ready", message, **values)
+    return 0
 
 
 def resolve_kent_bin() -> str:
@@ -428,9 +718,61 @@ def apply_branch_identity(
                 f"запущен в {root}. Нужно восстановить канонический task root.",
                 handoff,
             )
-    task = task_payload(root, task_id(incoming))
+    native_task_id = task_id(incoming)
+    task = task_payload(root, native_task_id)
     short_id = task_short_id(task)
     policy = profile_policy(root)
+    selection: tuple[str, str] | None = None
+    if coder_selection_policy(root) == "complexity":
+        if not all(key in handoff for key in CODER_HANDOFF_KEYS):
+            return blocked(
+                "В complexity route отсутствует обязательный task-bound "
+                "snapshot handoff; первый writer не запущен.",
+                handoff,
+            )
+        if handoff["task_short_id"] != short_id:
+            return revalidate_before_writer(
+                handoff,
+                "workflow task_short_id differs from Kent's current Task",
+            )
+        if handoff["plan_route"] != "start":
+            return revalidate_before_writer(
+                handoff,
+                "branch identity is only valid for the initial start route",
+            )
+        summary = task.get("summary")
+        returned_task_id = (
+            summary.get("id")
+            if isinstance(summary, dict)
+            else task.get("id")
+        )
+        if returned_task_id != native_task_id:
+            return blocked(
+                "Kent task readback native identity does not match _kent.task_id.",
+                handoff,
+            )
+        try:
+            selection = coder_selection_snapshot(
+                root,
+                handoff,
+                short_id=short_id,
+            )
+        except ValueError as error:
+            return revalidate_before_writer(handoff, str(error))
+        try:
+            writer_issue = no_retained_writer(
+                root,
+                task=short_id,
+                native_task_id=native_task_id,
+            )
+        except (RuntimeError, json.JSONDecodeError, ValueError) as error:
+            return blocked(
+                "Не удалось безопасно проверить retained writer перед первым "
+                f"запуском: {error}",
+                handoff,
+            )
+        if writer_issue is not None:
+            return revalidate_before_writer(handoff, writer_issue)
     source_url = task_string(task, "source_url")
     body = task_body(task)
     try:
@@ -440,12 +782,11 @@ def apply_branch_identity(
     current = current_branch(root)
 
     if current == desired:
-        complete(
-            "branch_identity_ready",
+        return ready_for_writer(
             f"Ветка уже соответствует политике проекта: {current}.",
-            **handoff,
+            handoff,
+            selection,
         )
-        return 0
     if current != short_id:
         return blocked(
             f"Текущая ветка {current!r} не совпадает ни с Kent ID "
@@ -454,12 +795,11 @@ def apply_branch_identity(
             handoff,
         )
     if desired == short_id:
-        complete(
-            "branch_identity_ready",
+        return ready_for_writer(
             f"Внешний идентификатор не найден; сохранена Kent-ветка {short_id}.",
-            **handoff,
+            handoff,
+            selection,
         )
-        return 0
 
     validate_branch(root, desired)
     if local_branch_exists(root, desired):
@@ -491,12 +831,11 @@ def apply_branch_identity(
             f"{desired!r}: {error}",
             handoff,
         )
-    complete(
-        "branch_identity_ready",
+    return ready_for_writer(
         f"Ветка переименована: {short_id} → {desired}.",
-        **handoff,
+        handoff,
+        selection,
     )
-    return 0
 
 
 def main() -> int:

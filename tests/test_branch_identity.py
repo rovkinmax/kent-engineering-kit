@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -162,10 +163,21 @@ class BranchIdentityTest(unittest.TestCase):
         self.run_git(self.root, "remote", "add", "origin", str(self.remote))
 
         kent = Path(temporary.name) / "kent"
-        kent.write_text("#!/bin/sh\ncat \"$KENT_TASK_PAYLOAD\"\n")
+        kent.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "task" ] && [ "$2" = "sessions" ]; then\n'
+            '  exec /bin/cat "$KENT_SESSION_PAYLOAD"\n'
+            "fi\n"
+            'exec /bin/cat "$KENT_TASK_PAYLOAD"\n'
+        )
         kent.chmod(0o755)
         self.kent = kent
         self.payload_path = Path(temporary.name) / "task.json"
+        self.sessions_path = Path(temporary.name) / "sessions.json"
+        self.sessions_path.write_text(
+            json.dumps({"task_id": "task-uuid", "items": []})
+        )
+        self.coder_handoff: dict[str, str] = {}
 
     def run_git(
         self,
@@ -181,13 +193,24 @@ class BranchIdentityTest(unittest.TestCase):
             check=check,
         )
 
-    def configure(self, policy: str) -> None:
+    def configure(
+        self,
+        policy: str,
+        *,
+        coder_selection: bool = False,
+    ) -> None:
         profile = self.root / ".kent" / "workflow-profile.toml"
         profile.parent.mkdir()
-        profile.write_text(
+        profile_contents = (
             "[policies]\n"
             f'branch_identity = "{policy}"\n'
         )
+        if coder_selection:
+            profile_contents += (
+                'writer_sessions = "continuous"\n'
+                'coder_selection = "complexity"\n'
+            )
+        profile.write_text(profile_contents)
 
     def task(
         self,
@@ -199,7 +222,7 @@ class BranchIdentityTest(unittest.TestCase):
         self.payload_path.write_text(
             json.dumps(
                 {
-                    "summary": {"short_id": short_id},
+                    "summary": {"id": "task-uuid", "short_id": short_id},
                     "source_url": source_url,
                     "body": body,
                 }
@@ -210,10 +233,12 @@ class BranchIdentityTest(unittest.TestCase):
         self,
         *,
         handoff: bool = False,
+        coder_selection: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
         environment = os.environ.copy()
         environment["KENT_BIN"] = str(self.kent)
         environment["KENT_TASK_PAYLOAD"] = str(self.payload_path)
+        environment["KENT_SESSION_PAYLOAD"] = str(self.sessions_path)
         workflow_input = {"_kent": {"task_id": "task-uuid"}}
         if handoff:
             workflow_input.update(
@@ -223,6 +248,8 @@ class BranchIdentityTest(unittest.TestCase):
                     "work_kind": "test",
                 }
             )
+        if coder_selection:
+            workflow_input.update(self.coder_handoff)
         result = subprocess.run(
             [str(SCRIPT)],
             cwd=self.root,
@@ -236,12 +263,227 @@ class BranchIdentityTest(unittest.TestCase):
         payload = json.loads(result.stdout) if result.stdout.strip() else {}
         return result, payload
 
+    def prepare_coder_selection(self, complexity: str) -> Path:
+        plan = self.root / ".todo" / "canary" / "plan.md"
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        selection = {
+            "schema": "coder-selection-v1",
+            "task_short_id": "TASK-1",
+            "complexity": complexity,
+            "rationale": "The accepted implementation scope supports this choice.",
+        }
+        contents = (
+            "# Accepted plan\n\n"
+            "- [ ] Implement the reviewed behavior.\n\n"
+            "```json\n"
+            + json.dumps(selection, indent=2)
+            + "\n```\n"
+        )
+        plan.write_text(contents)
+        normalized = BRANCH_IDENTITY.normalized_plan_bytes(plan)
+        digest = hashlib.sha256(normalized).hexdigest()
+        runtime = self.root / ".kent" / "runtime" / "TASK-1"
+        runtime.mkdir(parents=True)
+        (runtime / "plan-contract.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_short_id": "TASK-1",
+                    "plan_path": ".todo/canary/plan.md",
+                    "work_kind": "test",
+                    "normalized_sha256": digest,
+                    "normalized_plan": normalized.decode("utf-8"),
+                    "coder_selection": selection,
+                    "coder_selection_sha256": digest,
+                }
+            )
+        )
+        self.coder_handoff = {
+            "task_short_id": "TASK-1",
+            "accepted_plan_sha256": digest,
+            "plan_route": "start",
+            "plan_route_context": "not-applicable",
+            "review_context": "Reviewed selection with human approval.",
+        }
+        return plan
+
     def branch(self) -> str:
         return self.run_git(
             self.root,
             "branch",
             "--show-current",
         ).stdout.strip()
+
+    def test_complexity_selection_is_revalidated_and_emitted_on_branch_entry(
+        self,
+    ) -> None:
+        self.configure("task", coder_selection=True)
+        self.task(short_id="TASK-1")
+        plan = self.prepare_coder_selection("simple")
+        snapshot_path = (
+            self.root
+            / ".kent"
+            / "runtime"
+            / "TASK-1"
+            / "plan-contract.json"
+        )
+        accepted_snapshot = snapshot_path.read_text()
+
+        result, payload = self.run_script(handoff=True, coder_selection=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_ready")
+        self.assertEqual(payload["target_assignee"], "implementation-simple")
+        self.assertEqual(payload["target_thinking"], "xhigh")
+        self.assertEqual(payload["accepted_plan_sha256"], self.coder_handoff["accepted_plan_sha256"])
+
+        retry, retry_payload = self.run_script(
+            handoff=True,
+            coder_selection=True,
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(retry_payload["transition"], "branch_identity_ready")
+        self.assertEqual(retry_payload["target_assignee"], "implementation-simple")
+        self.assertEqual(retry_payload["target_thinking"], "xhigh")
+        self.assertEqual(
+            retry_payload["accepted_plan_sha256"],
+            self.coder_handoff["accepted_plan_sha256"],
+        )
+
+        accepted_plan = plan.read_text()
+        plan.write_text(plan.read_text() + "\nPlan changed after acceptance.\n")
+        stale, stale_payload = self.run_script(
+            handoff=True,
+            coder_selection=True,
+        )
+        self.assertEqual(stale.returncode, 0, stale.stderr)
+        self.assertEqual(stale_payload["transition"], "branch_identity_revalidate")
+        self.assertNotIn("target_assignee", stale_payload)
+        self.assertIn("changed", stale_payload["plan_change_report"])
+
+        plan.write_text(accepted_plan)
+        substituted_snapshot = json.loads(accepted_snapshot)
+        substituted_snapshot["coder_selection"]["complexity"] = "complex"
+        snapshot_path.write_text(json.dumps(substituted_snapshot))
+        substituted, substituted_payload = self.run_script(
+            handoff=True,
+            coder_selection=True,
+        )
+        self.assertEqual(substituted.returncode, 0, substituted.stderr)
+        self.assertEqual(
+            substituted_payload["transition"],
+            "branch_identity_revalidate",
+        )
+        self.assertIn(
+            "differs from the digest-bound plan choice",
+            substituted_payload["plan_change_report"],
+        )
+        snapshot_path.write_text(accepted_snapshot)
+
+        self.sessions_path.write_text(
+            json.dumps(
+                {
+                    "task_id": "task-uuid",
+                    "items": [
+                        {
+                            "session_id": "existing-writer",
+                            "agent_role": "implementation-simple",
+                            "status": "idle",
+                        }
+                    ],
+                }
+            )
+        )
+        existing, existing_payload = self.run_script(
+            handoff=True,
+            coder_selection=True,
+        )
+        self.assertEqual(existing.returncode, 0, existing.stderr)
+        self.assertEqual(
+            existing_payload["transition"],
+            "branch_identity_revalidate",
+        )
+        self.assertIn(
+            "already exists",
+            existing_payload["plan_change_report"],
+        )
+
+    def test_malformed_complexity_types_revalidate_before_writer_dispatch(self) -> None:
+        self.configure("task", coder_selection=True)
+        self.task(short_id="TASK-1")
+        plan = self.prepare_coder_selection("simple")
+        snapshot_path = self.root / ".kent/runtime/TASK-1/plan-contract.json"
+        original_snapshot = json.loads(snapshot_path.read_text())
+        original_plan = plan.read_text()
+        for location in ("snapshot", "plan"):
+            for malformed in ([], {}):
+                with self.subTest(location=location, complexity=malformed):
+                    snapshot = json.loads(json.dumps(original_snapshot))
+                    plan.write_text(original_plan)
+                    if location == "snapshot":
+                        snapshot["coder_selection"]["complexity"] = malformed
+                    else:
+                        # Keep the digest valid so entry reaches the plan parser,
+                        # rather than being rejected by an earlier drift check.
+                        plan.write_text(original_plan.replace(
+                            '"complexity": "simple"',
+                            f'"complexity": {json.dumps(malformed)}',
+                        ))
+                        normalized = BRANCH_IDENTITY.normalized_plan_bytes(plan)
+                        digest = hashlib.sha256(normalized).hexdigest()
+                        snapshot.update(
+                            normalized_plan=normalized.decode("utf-8"),
+                            normalized_sha256=digest,
+                            coder_selection_sha256=digest,
+                        )
+                    snapshot_path.write_text(json.dumps(snapshot))
+                    self.coder_handoff["accepted_plan_sha256"] = snapshot["normalized_sha256"]
+                    branch_before = self.branch()
+                    result, payload = self.run_script(handoff=True, coder_selection=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(payload["transition"], "branch_identity_revalidate")
+                    self.assertIn("malformed", payload["plan_change_report"])
+                    self.assertEqual(payload["accepted_plan_sha256"], snapshot["normalized_sha256"])
+                    self.assertNotIn("target_assignee", payload)
+                    self.assertNotIn("target_thinking", payload)
+                    self.assertEqual(self.branch(), branch_before)
+
+    def test_complexity_selection_survives_branch_collision_retry(self) -> None:
+        self.configure("jira", coder_selection=True)
+        self.task(
+            source_url="https://example.atlassian.net/browse/MBL-780",
+            short_id="TASK-1",
+        )
+        self.prepare_coder_selection("complex")
+        accepted_digest = self.coder_handoff["accepted_plan_sha256"]
+        desired_branch = "feature/MBL-780"
+        self.run_git(self.root, "branch", desired_branch)
+
+        blocked, blocked_payload = self.run_script(
+            handoff=True,
+            coder_selection=True,
+        )
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        self.assertEqual(blocked_payload["transition"], "branch_identity_blocked")
+        self.assertTrue(blocked_payload["blocker_reason"])
+        self.assertNotIn("target_assignee", blocked_payload)
+
+        # The collision belongs only to this disposable Git fixture. After its
+        # explicit resolution, the same accepted snapshot is revalidated.
+        self.run_git(self.root, "branch", "-D", desired_branch)
+        retried, retried_payload = self.run_script(
+            handoff=True,
+            coder_selection=True,
+        )
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(retried_payload["transition"], "branch_identity_ready")
+        self.assertEqual(
+            (
+                retried_payload["target_assignee"],
+                retried_payload["target_thinking"],
+                retried_payload["accepted_plan_sha256"],
+            ),
+            ("implementation-complex", "medium", accepted_digest),
+        )
 
     def test_jira_source_url_wins_and_renames_branch(self) -> None:
         self.configure("jira")

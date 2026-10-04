@@ -146,6 +146,25 @@ TASK_SHORT_ID = ParameterSpec(
     "task_short_id",
     "Stable human-readable Kent task short ID.",
 )
+ACCEPTED_PLAN_SHA256 = ParameterSpec(
+    "accepted_plan_sha256",
+    "Digest of the task-bound accepted normalized plan, or not-applicable "
+    "before the first accepted snapshot.",
+)
+REVIEWED_NORMALIZED_SHA256 = ParameterSpec(
+    "reviewed_normalized_sha256",
+    "Normalized-plan SHA-256 independently reviewed before human acceptance.",
+)
+TARGET_ASSIGNEE = ParameterSpec(
+    "target_assignee",
+    "Closed coder role selected from the accepted task-bound complexity choice.",
+    purpose="target_assignee",
+)
+TARGET_THINKING = ParameterSpec(
+    "target_thinking",
+    "Reasoning effort paired with the accepted task-bound coder role.",
+    purpose="target_thinking",
+)
 CI_CONTRACT = ParameterSpec(
     "ci_contract",
     "Validated GitHub CI identity and monitoring policy for the current PR cycle.",
@@ -249,11 +268,22 @@ def build_delivery_workflow(
         or profile.role("researcher")
     )
     fresh_writers = profile.writer_session_policy() == "fresh_per_slice"
+    coder_selection_enabled = profile.coder_selection_policy() == "complexity"
+    if coder_selection_enabled and version != 6:
+        raise SpecError(
+            "policies.coder_selection = 'complexity' is supported only by "
+            "the source candidate workflow v6"
+        )
+    planner = "complexity-planner" if coder_selection_enabled else orchestrator
     writer_handoff_context = (
-        "new_session" if fresh_writers else "compact_and_continue_session"
+        "new_session"
+        if fresh_writers or coder_selection_enabled
+        else "compact_and_continue_session"
     )
     branch_identity_handoff_source = (
-        "immediate_source" if fresh_writers else "node:plan"
+        "immediate_source"
+        if fresh_writers or coder_selection_enabled
+        else "node:plan"
     )
     implementation_continuation_context = (
         "new_session" if fresh_writers else "continue_session"
@@ -300,6 +330,15 @@ def build_delivery_workflow(
     writer_recovery_context = (
         "new_session" if fresh_writers else "compact_and_continue_session"
     )
+    implementation_recovery_context = (
+        "new_session"
+        if fresh_writers
+        else (
+            "continue_session"
+            if coder_selection_enabled
+            else "compact_and_continue_session"
+        )
+    )
     non_writer_recovery_context = "compact_and_continue_session"
     final_compliance = (
         pull_requests
@@ -312,13 +351,29 @@ def build_delivery_workflow(
         if package_publish
         else cleanup_prompt(profile, merged=True)
     )
+    selection_carriers = (
+        (TASK_SHORT_ID, ACCEPTED_PLAN_SHA256)
+        if coder_selection_enabled
+        else ()
+    )
     implementation_parameters = (
-        (WORKSPACE, PLAN, WORK_KIND) + delivery_context_parameters
+        (WORKSPACE, PLAN, WORK_KIND)
+        + selection_carriers
+        + ((REVIEW_CONTEXT,) if coder_selection_enabled else ())
+        + delivery_context_parameters
+    )
+    branch_identity_parameters = (
+        implementation_parameters
+        + (
+            (PLAN_ROUTE, PLAN_ROUTE_CONTEXT)
+            if coder_selection_enabled
+            else ()
+        )
     )
     branch_identity_enabled = profile.branch_identity_policy() != "task"
     nodes: list[NodeSpec] = [
         NodeSpec("backlog", "start", "Backlog"),
-        agent_node("plan", "Plan", orchestrator),
+        agent_node("plan", "Plan", planner),
         agent_node("plan_review", "Independent Plan Review", plan_review_role),
         NodeSpec(
             "plan_contract",
@@ -341,7 +396,7 @@ def build_delivery_workflow(
         agent_node(
             "plan_revalidation",
             "Plan Revalidation",
-            orchestrator,
+            planner,
         ),
         agent_node("implement", "Implement", implementation),
         NodeSpec(
@@ -483,7 +538,11 @@ def build_delivery_workflow(
             source="backlog",
             transition="start",
             target="plan",
-            prompt=plan_prompt(profile, recovery_aware=fresh_writers),
+            prompt=plan_prompt(
+                profile,
+                recovery_aware=fresh_writers,
+                coder_selection=coder_selection_enabled,
+            ),
             transition_description="Start one planning session for this task.",
         ),
     ]
@@ -494,7 +553,10 @@ def build_delivery_workflow(
                 source="plan",
                 transition="review_plan",
                 target="plan_review",
-                prompt=plan_review_prompt(profile),
+                prompt=plan_review_prompt(
+                    profile,
+                    coder_selection=coder_selection_enabled,
+                ),
                 transition_description=(
                     "Planning is complete; independently review its authority, "
                     "scope, evidence, and executable ordering."
@@ -538,7 +600,11 @@ def build_delivery_workflow(
                 target="plan_revalidation",
                 context="continue_session",
                 context_source="node:plan",
-                prompt=plan_revalidation_prompt(profile, from_review=True),
+                prompt=plan_revalidation_prompt(
+                    profile,
+                    from_review=True,
+                    coder_selection=coder_selection_enabled,
+                ),
                 transition_description=(
                     "The read-only review found plan-contract defects; revise "
                     "the plan before any writer or verification stage proceeds."
@@ -578,7 +644,10 @@ def build_delivery_workflow(
                 target="plan_review",
                 context="continue_session",
                 context_source="previous_target",
-                prompt=plan_review_prompt(profile),
+                prompt=plan_review_prompt(
+                    profile,
+                    coder_selection=coder_selection_enabled,
+                ),
                 transition_description=(
                     "The plan contract was reconciled; independently re-review "
                     "it before accepting the new snapshot."
@@ -616,7 +685,11 @@ def build_delivery_workflow(
                 target="plan_revalidation",
                 context="continue_session",
                 context_source="node:plan",
-                prompt=plan_revalidation_prompt(profile, from_review=False),
+                prompt=plan_revalidation_prompt(
+                    profile,
+                    from_review=False,
+                    coder_selection=coder_selection_enabled,
+                ),
                 transition_description=(
                     "The normalized accepted plan changed materially; reconcile "
                     "authority and acceptance before continuing."
@@ -640,7 +713,11 @@ def build_delivery_workflow(
                 target="plan_revalidation",
                 context="continue_session",
                 context_source="node:plan",
-                prompt=plan_revalidation_prompt(profile, from_review=False),
+                prompt=plan_revalidation_prompt(
+                    profile,
+                    from_review=False,
+                    coder_selection=coder_selection_enabled,
+                ),
                 transition_description=(
                     "The normalized accepted plan changed materially; reconcile "
                     "authority and acceptance before verification."
@@ -668,7 +745,11 @@ def build_delivery_workflow(
                 target="plan_revalidation",
                 context="continue_session",
                 context_source="node:plan",
-                prompt=plan_revalidation_prompt(profile, from_review=False),
+                prompt=plan_revalidation_prompt(
+                    profile,
+                    from_review=False,
+                    coder_selection=coder_selection_enabled,
+                ),
                 transition_description=(
                     "A bounded Fix slice changed the accepted plan; reconcile "
                     "authority before continuing repair."
@@ -722,7 +803,10 @@ def build_delivery_workflow(
                     source="branch_identity",
                     transition="blocked",
                     target="branch_identity_resolution",
-                    prompt=branch_identity_resolution_prompt(profile),
+                    prompt=branch_identity_resolution_prompt(
+                        profile,
+                        coder_selection=coder_selection_enabled,
+                    ),
                     transition_description=(
                         "Branch identity is ambiguous or collides with existing "
                         "repository state and requires a user decision."
@@ -907,7 +991,7 @@ def build_delivery_workflow(
             recovery_edge(
                 "implement",
                 profile=profile,
-                context=writer_recovery_context,
+                context=implementation_recovery_context,
                 fresh_session=fresh_writers,
                 carry_delivery_context=delivery_context_enabled,
                 extra_parameters=(WORK_KIND,),
@@ -2028,6 +2112,263 @@ def build_delivery_workflow(
         else edge
         for edge in edges
     ]
+    if coder_selection_enabled:
+        def add_parameters(
+            edge: EdgeSpec,
+            additions: tuple[ParameterSpec, ...],
+        ) -> EdgeSpec:
+            existing = {parameter.key for parameter in edge.parameters}
+            return replace(
+                edge,
+                parameters=edge.parameters
+                + tuple(
+                    parameter
+                    for parameter in additions
+                    if parameter.key not in existing
+                ),
+            )
+
+        carried_digest_edges = {
+            "plan_review",
+            "plan_review_accept",
+            "plan_review_revalidate",
+            "plan_revalidation_review",
+            "plan_review_needs_user_action",
+            "plan_revalidation_needs_user_action",
+            "plan_needs_user_action",
+            "plan_contract_continue_revalidate",
+            "plan_contract_verify_revalidate",
+            "plan_contract_fix_revalidate",
+            "fix_replan",
+            "compliance_replan",
+        }
+        branch_edges = {
+            "plan_contract_branch_identity",
+            "branch_identity_implement",
+            "branch_identity_resolution",
+            "branch_identity_retry",
+            "branch_identity_resolution_needs_user_action",
+        }
+        selected_entry_edges = {
+            "plan_contract_implement",
+            "branch_identity_implement",
+        }
+        updated_edges: list[EdgeSpec] = []
+        for edge in edges:
+            current = edge
+            if edge.key in carried_digest_edges:
+                digest_fields = (ACCEPTED_PLAN_SHA256,)
+                if edge.key == "plan_review_accept":
+                    digest_fields += (REVIEWED_NORMALIZED_SHA256,)
+                current = add_parameters(current, digest_fields)
+            if edge.key in branch_edges:
+                branch_parameters = (
+                    (BLOCKER,) + branch_identity_parameters
+                    if edge.key in {
+                        "branch_identity_resolution",
+                        "branch_identity_resolution_needs_user_action",
+                    }
+                    else branch_identity_parameters
+                )
+                current = replace(
+                    current,
+                    parameters=branch_parameters,
+                )
+            if edge.key in selected_entry_edges:
+                current = replace(
+                    current,
+                    context="new_session",
+                    context_source="immediate_source",
+                    prompt=implement_prompt(
+                        profile,
+                        fresh_session=False,
+                        coder_selection=True,
+                        first_selected_session=True,
+                    ),
+                    assignee_selection="previous_node",
+                    thinking_selection="previous_node",
+                )
+                current = add_parameters(
+                    current,
+                    (TARGET_ASSIGNEE, TARGET_THINKING),
+                )
+            elif edge.key in {
+                "plan_contract_continue_implement",
+                "plan_contract_checked_continue",
+            }:
+                current = replace(
+                    current,
+                    prompt=implement_prompt(
+                        profile,
+                        coder_selection=True,
+                    ),
+                )
+            if edge.key == "implement_continue":
+                current = add_parameters(current, (ACCEPTED_PLAN_SHA256,))
+            elif edge.key == "implement_verify":
+                current = add_parameters(current, (ACCEPTED_PLAN_SHA256,))
+            elif edge.key == "implement_needs_user_action":
+                recovery_prompt = (current.prompt or "").replace(
+                    "Use the retained compacted context",
+                    "Continue in this same retained Implement Session",
+                )
+                current = replace(current, context="continue_session")
+                current = add_parameters(
+                    current,
+                    selection_carriers,
+                )
+                current = replace(
+                    current,
+                    prompt=recovery_prompt
+                    + """
+
+Preserve the exact `task_short_id` and `accepted_plan_sha256`. On resume,
+revalidate the accepted selection and this same Session's effective model,
+reasoning level, context window, and identity before editing. Do not start or
+re-lock another writer."""
+                )
+            elif edge.key in {
+                "plan_needs_user_action",
+                "plan_review_needs_user_action",
+                "plan_revalidation_needs_user_action",
+            }:
+                current = add_parameters(current, selection_carriers)
+            updated_edges.append(current)
+        edges = updated_edges
+
+        for key in (
+            "plan_contract_continue_revalidate",
+            "plan_contract_verify_revalidate",
+            "plan_contract_fix_revalidate",
+        ):
+            for index, edge in enumerate(edges):
+                if edge.key == key:
+                    edges[index] = add_parameters(edge, (ACCEPTED_PLAN_SHA256,))
+                    break
+
+        edges.extend(
+            [
+                EdgeSpec(
+                    key="plan_contract_revalidate",
+                    source="plan_contract",
+                    transition="revalidate",
+                    target="plan_revalidation",
+                    context="continue_session",
+                    context_source="node:plan",
+                    prompt=plan_revalidation_prompt(
+                        profile,
+                        from_review=False,
+                        coder_selection=True,
+                    ),
+                    transition_description=(
+                        "The accepted selection or its reviewed plan digest "
+                        "is invalid; reconcile it with the retained planner "
+                        "before any writer starts."
+                    ),
+                    parameters=(
+                        WORKSPACE,
+                        PLAN,
+                        WORK_KIND,
+                        PLAN_ROUTE,
+                        PLAN_ROUTE_CONTEXT,
+                        PLAN_CHANGE_REPORT,
+                        REVIEW_CONTEXT,
+                        TASK_SHORT_ID,
+                        ACCEPTED_PLAN_SHA256,
+                    ) + delivery_context_parameters,
+                ),
+                *(
+                    [
+                        EdgeSpec(
+                            key="branch_identity_revalidate",
+                            source="branch_identity",
+                            transition="revalidate",
+                            target="plan_revalidation",
+                            context="continue_session",
+                            context_source="node:plan",
+                            prompt=plan_revalidation_prompt(
+                                profile,
+                                from_review=False,
+                                coder_selection=True,
+                            ),
+                            transition_description=(
+                                "The accepted plan or selection changed before "
+                                "the first writer; return to reviewed planning."
+                            ),
+                            parameters=(
+                                WORKSPACE,
+                                PLAN,
+                                WORK_KIND,
+                                PLAN_ROUTE,
+                                PLAN_ROUTE_CONTEXT,
+                                PLAN_CHANGE_REPORT,
+                                REVIEW_CONTEXT,
+                                TASK_SHORT_ID,
+                                ACCEPTED_PLAN_SHA256,
+                            ) + delivery_context_parameters,
+                        ),
+                        EdgeSpec(
+                            key="branch_identity_resolution_revalidate",
+                            source="branch_identity_resolution",
+                            transition="revalidate",
+                            target="plan_revalidation",
+                            context="continue_session",
+                            context_source="node:plan",
+                            prompt=plan_revalidation_prompt(
+                                profile,
+                                from_review=False,
+                                coder_selection=True,
+                            ),
+                            transition_description=(
+                                "Branch retry exposed accepted-plan or choice "
+                                "drift; re-review before proceeding."
+                            ),
+                            parameters=(
+                                WORKSPACE,
+                                PLAN,
+                                WORK_KIND,
+                                PLAN_ROUTE,
+                                PLAN_ROUTE_CONTEXT,
+                                PLAN_CHANGE_REPORT,
+                                REVIEW_CONTEXT,
+                                TASK_SHORT_ID,
+                                ACCEPTED_PLAN_SHA256,
+                            ) + delivery_context_parameters,
+                        ),
+                    ]
+                    if branch_identity_enabled
+                    else []
+                ),
+                EdgeSpec(
+                    key="implement_revalidate",
+                    source="implement",
+                    transition="revalidate",
+                    target="plan_revalidation",
+                    context="continue_session",
+                    context_source="node:plan",
+                    prompt=plan_revalidation_prompt(
+                        profile,
+                        from_review=False,
+                        coder_selection=True,
+                    ),
+                    transition_description=(
+                        "The retained writer cannot prove its accepted choice "
+                        "and requests reviewed Plan revalidation."
+                    ),
+                    parameters=(
+                        WORKSPACE,
+                        PLAN,
+                        WORK_KIND,
+                        PLAN_ROUTE,
+                        PLAN_ROUTE_CONTEXT,
+                        PLAN_CHANGE_REPORT,
+                        REVIEW_CONTEXT,
+                        TASK_SHORT_ID,
+                        ACCEPTED_PLAN_SHA256,
+                    ) + delivery_context_parameters,
+                ),
+            ]
+        )
     edges = qualify_transition_keys(edges)
     spec = WorkflowSpec(
         name=profile.workflow_name("delivery", version),
@@ -2380,7 +2721,26 @@ exclude secrets or broad raw evidence. Append is idempotent for the current
 Kent run; on recovery, reuse the returned sequence/hash and continue."""
 
 
-def branch_identity_resolution_prompt(profile: ProjectProfile) -> str:
+def branch_identity_resolution_prompt(
+    profile: ProjectProfile,
+    *,
+    coder_selection: bool = False,
+) -> str:
+    selection_contract = (
+        """
+
+Preserve `task_short_id`, `accepted_plan_sha256`, `plan_route`,
+`plan_route_context`, and `review_context` byte-for-byte. Branch retry is not
+authority to select or replace a coder. If the accepted normalized plan,
+selection, or its task binding changed, choose `revalidate` with the exact
+change report; the retained Plan session will review and obtain fresh human
+approval before any writer starts. Otherwise choose `retry` only after the
+reported branch blocker is resolved. The script revalidates the snapshot and
+rejects any retained implementation writer before dispatch.
+"""
+        if coder_selection
+        else ""
+    )
     return f"""Resolve the deterministic branch-identity blocker before Implement.
 
 {context_instruction(profile, "delivery", "branch_identity_resolution", "delivery")}{delivery_context_input_section(profile)}Project branch policy: `{profile.branch_identity_policy()}`.
@@ -2394,7 +2754,7 @@ smallest safe external action that resolves it.
 Choose `needs_user_action` with an updated `blocker_reason` while the blocker
 remains. After the user or external system resolves that exact blocker, verify
 it and choose `retry`. Choose `wont_do` only for an explicit cancellation and
-provide `closure_reason`.{delivery_context_tail(profile)}"""
+provide `closure_reason`.{delivery_context_tail(profile)}""" + selection_contract
 
 
 def checkpoint_instruction(profile: ProjectProfile, stage: str) -> str:
@@ -2589,6 +2949,14 @@ def owner_replan_instruction(profile: ProjectProfile | None = None) -> str:
         "\nPreserve incoming delivery_context exactly."
         if profile is not None and _delivery_context_enabled(profile) else ""
     )
+    selection_contract = (
+        "\nFor complexity-selected coding, provide `accepted_plan_sha256` from "
+        "the verified task-bound snapshot's `normalized_sha256`; never use "
+        "`not-applicable` when an accepted snapshot exists. Preserve this "
+        "authoritative digest through revalidation, review and approval."
+        if profile is not None and profile.coder_selection_policy() == "complexity"
+        else ""
+    )
     return """Choose `replan` before production edits when a concrete finding or verified
 new authority requires substantive reconciliation of the accepted execution
 plan. This route returns work to its planner; it grants no expanded source,
@@ -2609,11 +2977,15 @@ review_context with remaining actionable findings/evidence/authority locators,
 and plan_change_report explaining the material discrepancy. Label semantic
 findings agent-reported, not deterministic hash drift. Repeated approval IDs do not resolve
 an unchanged blocker; an already-made decision needs an executable owner route,
-not another question about whether to respect it.""" + continuity
+not another question about whether to respect it.""" + selection_contract + continuity
 
 
 def owner_replan_prompt(profile: ProjectProfile) -> str:
-    prompt = plan_revalidation_prompt(profile, from_review=False)
+    prompt = plan_revalidation_prompt(
+        profile,
+        from_review=False,
+        coder_selection=profile.coder_selection_policy() == "complexity",
+    )
     prompt = prompt.replace("{{.Params.plan_route_context}}", "not-applicable")
     prompt = prompt.replace("{{.Params.plan_route}}", "continue")
     prompt = prompt.replace(
@@ -2639,6 +3011,7 @@ def plan_prompt(
     profile: ProjectProfile,
     *,
     recovery_aware: bool = False,
+    coder_selection: bool = False,
 ) -> str:
     recovery_contract = ""
     if recovery_aware:
@@ -2692,6 +3065,20 @@ fields. On recovery or any later transition, preserve the exact incoming
         if context_contract
         else "\n\n"
     )
+    coder_selection_contract = ""
+    if coder_selection:
+        coder_selection_contract = """
+
+For this opt-in v6 workflow, make the conservative complexity decision in the
+authoritative plan using exactly one fenced `coder-selection-v1` JSON object.
+Bind `task_short_id` to this Task, use only `simple` or `complex`, and give a
+concise evidence-based rationale. Simple is local work with an understood
+solution and deterministic checks, without public-contract, workflow-graph,
+migration, concurrency, or security changes; every other case or uncertainty
+is complex. Never put a model or role string in the decision. Before the first
+accepted snapshot, set `accepted_plan_sha256` to the literal
+`not-applicable`; during revalidation preserve the incoming accepted digest
+unchanged until the replacement plan is accepted."""
 
     return f"""Plan {{{{.TaskShortId}}}}: {{{{.TaskTitle}}}}
 
@@ -2754,13 +3141,15 @@ contract explicitly allows planless work. Kent transition parameters must be
 non-empty.
 Complete with `needs_user_action` and `blocker_reason` for an external blocker.
 Choose `wont_do` only for an explicit cancellation decision and provide
-`closure_reason`."""
+`closure_reason`.""" + coder_selection_contract
 
 
 def implement_prompt(
     profile: ProjectProfile,
     *,
     fresh_session: bool = False,
+    coder_selection: bool = False,
+    first_selected_session: bool = False,
 ) -> str:
     fresh_contract = ""
     if fresh_session:
@@ -2778,7 +3167,54 @@ verifiable; the next step runs in another fresh writer session."""
         if _delivery_context_enabled(profile)
         else " "
     )
+    selection_contract = ""
+    if coder_selection:
+        selection_contract = """
 
+The accepted task-bound plan snapshot is the authority for the coder choice;
+do not rely on Plan conversation history or infer a replacement role. Read
+`.kent/runtime/{{.TaskShortId}}/plan-contract.json` and the authoritative plan.
+Accepted plan digest: `{{.Params.accepted_plan_sha256}}`.
+Require exact task identity and `accepted_plan_sha256` equality, validate the
+closed selection and its digest binding, then read the plan's original review,
+human-approval, and evidence pointers. A missing, unsafe, mismatched, stale, or
+changed selection blocks edits and returns through Plan revalidation.
+
+Determine the only permitted coder from the snapshot: `simple` means
+`implementation-simple` / `gpt-5.6-luna` / `xhigh` / 372000 context tokens;
+`complex` means `implementation-complex` / `gpt-6.1-sol` / `medium` / 400000
+context tokens. Before any production edit, verify this Session's actual
+effective model, reasoning level, context window, and retained Session identity
+using the supported native `GetSessionExecutionEnvironment` and
+`GetSessionMainView` readbacks. The retained task Session list alone does not
+prove its historical effort or context window. If native settings are
+unavailable, stale, or drifted, stop and report the exact blocker; never
+substitute a model, start a replacement Session, or silently re-lock."""
+    if first_selected_session:
+        selection_contract += """
+
+This is the separately allocated first Implement Session, not a continuation
+of Plan. The graph supplies the protected `target_assignee` and
+`target_thinking` fields from the validated snapshot:
+`{{.Params.target_assignee}}` / `{{.Params.target_thinking}}`. Verify they
+match its closed mapping and that this Session identity differs from the
+retained Astra Plan Session before editing."""
+
+    selection_transition_contract = (
+        """
+
+On every `continue_implementation`, `verify`, `needs_user_action`, or
+`revalidate` transition, preserve `task_short_id` and the exact incoming
+`accepted_plan_sha256`. If the plan, snapshot, or choice is missing, stale, or
+inconsistent, make no edit and choose `revalidate` with `plan_route=continue`,
+the digest, and an exact `plan_change_report`; do not use continuation or
+recovery to create another writer. For blocker recovery, emit
+`needs_user_action` only for an external action and resume this same Session
+after that action is verified.
+"""
+        if coder_selection
+        else ""
+    )
     return f"""Implement {{{{.TaskShortId}}}}: {{{{.TaskTitle}}}}
 
 {context_instruction(profile, "implement", "implement", "implementation")}{delivery_context_input_section(profile)}Plan: {{{{.Params.plan_path}}}}. Workspace: {{{{.Params.workspace_path}}}}.
@@ -2812,10 +3248,31 @@ Use `needs_user_action` only for an external blocker and provide
 `blocker_reason` plus the unchanged `work_kind`. Its approval is a resume signal
 after the named external action is complete, not acknowledgement of waiting;
 state that condition explicitly. Choose `wont_do` only for explicit
-cancellation and provide `closure_reason`."""
+cancellation and provide `closure_reason`.""" + selection_contract + selection_transition_contract
 
 
-def plan_review_prompt(profile: ProjectProfile) -> str:
+def plan_review_prompt(
+    profile: ProjectProfile,
+    *,
+    coder_selection: bool = False,
+) -> str:
+    selection_context = (
+        "Previous accepted plan digest: {{.Params.accepted_plan_sha256}}\n"
+        if coder_selection
+        else ""
+    )
+    selection_contract = (
+        """
+
+Independently compute the normalized plan SHA-256 using the Plan Contract
+checkbox normalization. Return it as `reviewed_normalized_sha256` and preserve
+the incoming `accepted_plan_sha256` exactly. Verify the single closed,
+task-bound `coder-selection-v1` object and its rationale; do not choose or
+rewrite the coder role/model.
+"""
+        if coder_selection
+        else ""
+    )
     return f"""Independently review the proposed plan for
 {{{{.TaskShortId}}}} without editing files.
 
@@ -2824,7 +3281,7 @@ Plan: {{{{.Params.plan_path}}}}
 Work kind: {{{{.Params.work_kind}}}}
 Requested post-review route: {{{{.Params.plan_route}}}}
 Route context: {{{{.Params.plan_route_context}}}}
-Planning context: {{{{.Params.review_context}}}}
+{selection_context}Planning context: {{{{.Params.review_context}}}}
 
 Read the task body, current human-authored comments, exact source records named
 by the plan, and the plan itself. Use the read-only `spec-reviewer` contract,
@@ -2863,18 +3320,25 @@ unchanged route and route context, `plan_review_report`, and `review_context`;
 the retained Plan session will revise the artifact. Choose `needs_user_action`
 only for a real missing product decision or external authority and provide the
 preserved identity/context plus `blocker_reason`. Choose `wont_do` only for
-explicit cancellation and provide `closure_reason`."""
+explicit cancellation and provide `closure_reason`.""" + selection_contract
 
 
 def plan_revalidation_prompt(
     profile: ProjectProfile,
     *,
     from_review: bool,
+    coder_selection: bool = False,
 ) -> str:
     finding_label = (
         "Independent Plan Review findings: {{.Params.plan_review_report}}"
         if from_review
         else "Detected plan-contract change: {{.Params.plan_change_report}}"
+    )
+    selection_context = (
+        "Previous accepted plan digest: "
+        "{{.Params.accepted_plan_sha256}}\n"
+        if coder_selection
+        else ""
     )
     return f"""Revalidate the authoritative plan for {{{{.TaskShortId}}}}.
 
@@ -2883,7 +3347,7 @@ Plan: {{{{.Params.plan_path}}}}
 Work kind: {{{{.Params.work_kind}}}}
 Intended route after acceptance: {{{{.Params.plan_route}}}}
 Route context: {{{{.Params.plan_route_context}}}}
-Current context: {{{{.Params.review_context}}}}
+{selection_context}Current context: {{{{.Params.review_context}}}}
 {finding_label}
 
 Continue the retained planning context. Re-read current task comments and exact
@@ -2924,7 +3388,20 @@ refreshed `review_context`. Preserve the remaining bounded Fix bundle only in
 normalized snapshot is accepted. Use `needs_user_action` with preserved
 context and `blocker_reason` only for a real unresolved decision or external
 authority. Choose `wont_do` only for explicit cancellation and provide
-`closure_reason`.{delivery_context_tail(profile)}"""
+`closure_reason`.{delivery_context_tail(profile)}""" + (
+        """
+
+Preserve `accepted_plan_sha256` byte-for-byte through review and approval; use
+`not-applicable` only before any snapshot exists. A same-choice plan
+revalidation must resume the original Implement Session. A changed choice or
+missing retained writer is not authority to create or lock another writer;
+stop for an explicit recovery decision. The independent reviewer emits a
+fresh `reviewed_normalized_sha256`, and acceptance compares it with current
+normalized plan bytes.
+"""
+        if coder_selection
+        else ""
+    )
 
 
 def fix_prompt(

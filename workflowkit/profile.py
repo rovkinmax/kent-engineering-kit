@@ -13,6 +13,7 @@ from .model import SpecError, validate_execution_target
 DELIVERY_PROFILES = {"lite", "standard", "team", "release"}
 SMOKE_POLICIES = {"disabled", "conditional", "required"}
 WRITER_SESSION_POLICIES = {"continuous", "fresh_per_slice"}
+CODER_SELECTION_POLICIES = {"disabled", "complexity"}
 PR_MERGE_STRATEGIES = {"auto", "merge", "squash", "rebase"}
 BRANCH_IDENTITY_POLICIES = {"task", "jira", "github_issue"}
 CONTEXT_MANIFEST_KEYS = {"plan", "implement", "review", "smoke", "delivery"}
@@ -247,6 +248,21 @@ class ProjectProfile:
                 "unsupported policies.writer_sessions "
                 f"{writer_session_policy!r}; expected one of "
                 f"{sorted(WRITER_SESSION_POLICIES)}"
+            )
+        coder_selection_policy = self.coder_selection_policy()
+        if coder_selection_policy not in CODER_SELECTION_POLICIES:
+            raise SpecError(
+                "unsupported policies.coder_selection "
+                f"{coder_selection_policy!r}; expected one of "
+                f"{sorted(CODER_SELECTION_POLICIES)}"
+            )
+        if (
+            coder_selection_policy == "complexity"
+            and writer_session_policy != "continuous"
+        ):
+            raise SpecError(
+                "policies.coder_selection = 'complexity' requires "
+                "policies.writer_sessions = 'continuous'"
             )
         pr_merge_strategy = self.pr_merge_strategy()
         if pr_merge_strategy not in PR_MERGE_STRATEGIES:
@@ -684,6 +700,9 @@ class ProjectProfile:
 
     def writer_session_policy(self) -> str:
         return self.policies.get("writer_sessions", "continuous").strip()
+
+    def coder_selection_policy(self) -> str:
+        return self.policies.get("coder_selection", "disabled").strip()
 
     def pr_merge_strategy(self) -> str:
         return self.policies.get("pr_merge_strategy", "auto").strip()

@@ -23,6 +23,7 @@ from workflowkit.profile import ProjectProfile
 
 
 SPEC_PATH = ".kent/workflows/kit-engineering-delivery-v5.spec.json"
+CANDIDATE_SPEC_PATH = ".kent/workflows/kit-engineering-delivery-v6.spec.json"
 PROJECT_COPIES = {
     "evidence": "templates/project/workflow-evidence-ledger",
     "verify": "templates/project/workflow-verify-report",
@@ -63,8 +64,11 @@ request a third routine preview review or claim the graph hashes receipts.
 """
 
 
-def build_workflow(profile: ProjectProfile) -> WorkflowSpec:
-    base = build_delivery_workflow(profile, 5)
+def _add_plan_approval(
+    base: WorkflowSpec,
+    *,
+    expected_shape: tuple[int, int, int],
+) -> WorkflowSpec:
     accepts = [edge for edge in base.edges if edge.key == "plan_review_accept"]
     if len(accepts) != 1 or accepts[0].requires_approval:
         raise SpecError("expected exactly one unapproved plan_review_accept edge")
@@ -86,9 +90,38 @@ def build_workflow(profile: ProjectProfile) -> WorkflowSpec:
         len({(edge.source, edge.transition) for edge in spec.edges}),
         len(spec.edges),
     )
-    if shape != (21, 52, 53):
+    if shape != expected_shape:
         raise SpecError(f"unexpected Kit lite graph shape: {shape}")
     return spec
+
+
+def build_workflow(profile: ProjectProfile) -> WorkflowSpec:
+    """Build the unchanged v5 default Kit graph."""
+    return _add_plan_approval(
+        build_delivery_workflow(profile, 5),
+        expected_shape=(21, 52, 53),
+    )
+
+
+def build_complexity_candidate_workflow(
+    profile: ProjectProfile,
+) -> WorkflowSpec:
+    """Build the source-only v6 candidate without changing the default profile."""
+    if profile.writer_session_policy() != "continuous":
+        raise SpecError(
+            "the Kit complexity candidate requires continuous writer Sessions"
+        )
+    candidate_profile = replace(
+        profile,
+        policies={
+            **profile.policies,
+            "coder_selection": "complexity",
+        },
+    )
+    return _add_plan_approval(
+        build_delivery_workflow(candidate_profile, 6),
+        expected_shape=(21, 54, 55),
+    )
 
 
 def load_synchronizer():
@@ -166,29 +199,55 @@ def rendered_spec(root: Path = ROOT) -> str:
     ) + "\n"
 
 
+def rendered_candidate_spec(root: Path = ROOT) -> str:
+    return json.dumps(
+        spec_as_json(
+            build_complexity_candidate_workflow(profile_at(root)),
+        ),
+        indent=2, ensure_ascii=False,
+    ) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bootstrap", action="store_true",
                         help="Explicitly materialize approved generated copies.")
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--write-spec", action="store_true")
+    output.add_argument(
+        "--write-candidate-spec",
+        action="store_true",
+        help="Write the source-only complexity-selected v6 candidate.",
+    )
     output.add_argument("--check", action="store_true")
     args = parser.parse_args()
     if args.bootstrap:
         bootstrap()
-    rendered = rendered_spec()
     sync = load_synchronizer()
-    target = sync.project_target(ROOT, SPEC_PATH)
-    if args.write_spec:
-        if target.exists() and not target.is_file():
+    if args.write_candidate_spec:
+        rendered = rendered_candidate_spec()
+        target = sync.project_target(ROOT, CANDIDATE_SPEC_PATH)
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise SpecError(
+                f"candidate spec target is not a regular file: {target}"
+            )
+        target.write_text(rendered)
+    elif args.write_spec:
+        rendered = rendered_spec()
+        target = sync.project_target(ROOT, SPEC_PATH)
+        if target.is_symlink() or (target.exists() and not target.is_file()):
             raise SpecError(f"spec target is not a regular file: {target}")
         target.write_text(rendered)
     elif args.check:
         verify_command_closure()
-        if target.read_text() != rendered:
+        target = sync.project_target(ROOT, SPEC_PATH)
+        if target.read_text() != rendered_spec():
             raise SpecError("semantic workflow spec is stale")
+        candidate_target = sync.project_target(ROOT, CANDIDATE_SPEC_PATH)
+        if candidate_target.read_text() != rendered_candidate_spec():
+            raise SpecError("source-only complexity candidate spec is stale")
     else:
-        sys.stdout.write(rendered)
+        sys.stdout.write(rendered_spec())
     return 0
 
 

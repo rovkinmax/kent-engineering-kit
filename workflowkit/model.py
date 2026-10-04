@@ -22,6 +22,92 @@ class SpecError(ValueError):
     """Raised when a generated workflow violates the toolkit contract."""
 
 
+CODER_SELECTION_SCHEMA = "coder-selection-v1"
+CODER_SELECTION_COMPLEXITIES = {"simple", "complex"}
+CODER_SELECTION_TARGETS = {
+    "simple": ("implementation-simple", "xhigh"),
+    "complex": ("implementation-complex", "medium"),
+}
+CODER_SELECTION_FIELDS = {
+    "schema",
+    "task_short_id",
+    "complexity",
+    "rationale",
+}
+
+
+@dataclass(frozen=True)
+class CoderSelection:
+    """Closed, task-bound complexity decision made by the planner."""
+
+    task_short_id: str
+    complexity: str
+    rationale: str
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: object,
+        *,
+        expected_task_short_id: str,
+    ) -> "CoderSelection":
+        if not isinstance(value, dict):
+            raise SpecError("coder selection must be a JSON object")
+        missing = CODER_SELECTION_FIELDS - set(value)
+        unknown = set(value) - CODER_SELECTION_FIELDS
+        if missing or unknown:
+            raise SpecError(
+                "coder selection must declare exactly "
+                f"{sorted(CODER_SELECTION_FIELDS)}; "
+                f"missing={sorted(missing)}, unknown={sorted(unknown)}"
+            )
+        if value["schema"] != CODER_SELECTION_SCHEMA:
+            raise SpecError(
+                f"coder selection schema must be {CODER_SELECTION_SCHEMA!r}"
+            )
+        task_short_id = value["task_short_id"]
+        if (
+            not isinstance(task_short_id, str)
+            or not task_short_id.strip()
+            or task_short_id != expected_task_short_id
+        ):
+            raise SpecError(
+                "coder selection task_short_id does not match the current task"
+            )
+        complexity = value["complexity"]
+        if (
+            not isinstance(complexity, str)
+            or complexity not in CODER_SELECTION_COMPLEXITIES
+        ):
+            raise SpecError(
+                "coder selection complexity must be 'simple' or 'complex'"
+            )
+        rationale = value["rationale"]
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise SpecError("coder selection rationale must be non-empty")
+        return cls(
+            task_short_id=task_short_id,
+            complexity=complexity,
+            rationale=rationale.strip(),
+        )
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "schema": CODER_SELECTION_SCHEMA,
+            "task_short_id": self.task_short_id,
+            "complexity": self.complexity,
+            "rationale": self.rationale,
+        }
+
+    @property
+    def target_assignee(self) -> str:
+        return CODER_SELECTION_TARGETS[self.complexity][0]
+
+    @property
+    def target_thinking(self) -> str:
+        return CODER_SELECTION_TARGETS[self.complexity][1]
+
+
 @dataclass(frozen=True, order=True)
 class ParameterSpec:
     key: str

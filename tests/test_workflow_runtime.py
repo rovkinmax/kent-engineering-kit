@@ -397,6 +397,15 @@ class WorkflowCheckpointTest(GitRepositoryTest):
 
 
 class WorkflowPlanContractTest(GitRepositoryTest):
+    def ensure_disabled_complexity_profile(self, root: Path) -> None:
+        profile = root / ".kent" / "workflow-profile.toml"
+        if not profile.exists():
+            profile.write_text(
+                "[policies]\n"
+                'writer_sessions = "continuous"\n'
+                'coder_selection = "disabled"\n'
+            )
+
     def run_contract(
         self,
         root: Path,
@@ -408,6 +417,7 @@ class WorkflowPlanContractTest(GitRepositoryTest):
         delivery_context: str | None = None,
         review_context: str = "bounded review context",
     ) -> subprocess.CompletedProcess[str]:
+        self.ensure_disabled_complexity_profile(root)
         executable = (
             PLAN_CONTRACT_ACCEPT
             if mode == "accept"
@@ -568,6 +578,7 @@ class WorkflowPlanContractTest(GitRepositoryTest):
 
     def test_plan_contract_uses_materialized_runtime_sibling(self) -> None:
         root = self.create_repository()
+        self.ensure_disabled_complexity_profile(root)
         plan = root / ".todo" / "task" / "plan.md"
         plan.parent.mkdir(parents=True)
         plan.write_text("# Plan\n\n- [ ] Implement feature\n")
