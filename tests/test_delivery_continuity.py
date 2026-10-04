@@ -161,6 +161,11 @@ def create_repository(testcase: unittest.TestCase) -> Path:
             text=True,
         )
     (root / ".kent").mkdir()
+    (root / ".kent" / "workflow-profile.toml").write_text(
+        "[policies]\n"
+        'writer_sessions = "continuous"\n'
+        'coder_selection = "disabled"\n'
+    )
     (root / ".gitignore").write_text("/.kent/runtime/\n")
     (root / "tracked.txt").write_text("ready\n")
     subprocess.run(

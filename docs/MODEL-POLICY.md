@@ -7,8 +7,13 @@ managed configuration fragment. The allocation below describes only the
 committed source; it does not attest installed configuration, a launched
 session's selected model, or runtime activation. Preserve the historical
 September 16 and July records below as records, not as current allocations.
-Use existing roles and explicit configuration; do not add a complexity router
-or duplicate coder roles.
+The source-only KEN-18 candidate adds the three explicit roles below. The
+checked-in Kit profile keeps `coder_selection = "disabled"` and the current
+source builder default remains v5; the v6 candidate is generated separately by
+`.kent/workflows/kit_development.py --write-candidate-spec`. The existing
+`implementation-worker` remains unchanged for the v5 graph and existing
+consumers. These role definitions do not activate a workflow or change any
+running Session; live adoption remains separately authorized.
 
 | Scope or role | Model | Reasoning |
 | --- | --- | --- |
@@ -23,6 +28,9 @@ or duplicate coder roles.
 | `grill` | `gpt-6-astra` | high |
 | `task-supervisor` | `gpt-6.1-sol` | high |
 | `implementation-worker` | `gpt-6-luna` | xhigh |
+| `implementation-simple` | `gpt-5.6-luna` | xhigh |
+| `implementation-complex` | `gpt-6.1-sol` | medium |
+| `complexity-planner` | `gpt-6-astra` | medium |
 | `fix-worker` | `gpt-6.1-sol` | medium |
 | `build-doctor` | `gpt-6.1-sol` | high |
 | `workflow-gate` | `gpt-6-luna` | high |
@@ -37,6 +45,10 @@ The interactive root's source settings include
 `context_compaction_threshold_tokens = 360000`. Per-role budget settings are
 declared individually in the TOML; do not infer them from model allocation or
 count selectors as a substitute for reading that source.
+The KEN-18 candidate roles use explicit working budgets: simple Luna
+372000/353400, complex Sol 400000/360000, and Astra planner 400000/360000.
+These are bounded harness budgets, not provider maximums or evidence of live
+availability.
 
 `task-supervisor` is explicitly callable outside Workflow, with shell enabled
 and first-class patch/edit disabled. Its role contract permits narrow
@@ -44,6 +56,46 @@ operational effects; it is not read-only. Prefer an interactive Session for
 human escalation and waiting. There is no overall supervision time limit,
 while individual observations and recovery attempts remain bounded. It does
 not change root concurrency, delegation depth, or workflow routing.
+
+## KEN-18 Portfolio Readiness Snapshot — October 4, 2026
+
+This dated, read-only assessment compares the Kit source candidate with the
+primary project profiles and current default Engineering Delivery graphs. It
+does not attest installed role configuration, provider availability, or
+effective Session settings. The SDK row uses its `HEAD` profile because its
+primary checkout already contains unrelated local changes; KEN-18 did not edit
+that checkout.
+
+| Project | Source eligibility | Existing workflow and qualification gap |
+| --- | --- | --- |
+| **Kit** | Continuous writers; `coder_selection = "disabled"`. The source builder still defaults to v5; the separate source-only v6 candidate has 21 nodes, 54 transition groups, and 55 edges. | Read-only inspection of the existing task-linked graph found 21 nodes/52 edges, `implementation-worker`, and no selected-coder edges. The candidate is eligible for separate qualification, not activation; existing tasks remain on their selected graph. |
+| **AppsomeAndroid** | Schema 4, declared minimum Kent 2.6.1, continuous writers, no `coder_selection` (disabled by default), Jira branch identity. Its profile meets the continuous-session prerequisite but has no KEN-18 candidate. | Its default Engineering Delivery graph has 30 nodes/86 edges, uses `implementation-worker`, and has no selected-coder edges. A separate candidate must qualify the Team workflow and Jira branch/retry carriers plus effective role settings. |
+| **Puber** | Schema 4, declared minimum Kent 2.6.1, `fresh_per_slice`, no `coder_selection`. It is ineligible under the continuous-writer prerequisite. | Its default Engineering Delivery graph has 31 nodes/90 edges, uses `implementation-worker`, and has no selected-coder edges. Keep the current profile and workflow unchanged; any writer-continuity redesign needs a separate approved scope. |
+| **OsomeAPI-SDK-generator** | Its `HEAD` profile is schema 4, declares Kent 2.6.1, uses `fresh_per_slice`, and has no `coder_selection`; it is ineligible under the current profile. | Its default Engineering Delivery graph has 28 nodes/75 edges, uses `implementation-worker`, and has no selected-coder edges. The primary checkout contains unrelated local changes; it was left untouched and must not be used as an unreviewed qualification base. |
+
+The declared minimums—2.7.2 for Kit and 2.6.1 for AppsomeAndroid, Puber, and
+the SDK—are below the Kent 2.8.0 source pinned for KEN-18's native-selector
+and Session-settings research. These declarations do not prove installed
+capability. A future project qualification must confirm its intended runtime
+supports `new_session`, protected previous-node role/effort selection, branch
+retry validation, and the native effective-settings readbacks. It must also
+verify that the effective `implementation-simple`, `implementation-complex`,
+and `complexity-planner` roles are callable and have the exact approved model,
+reasoning level, context window, and compaction thresholds. The Kit source
+fragment is not evidence that another project or installed configuration
+resolves those roles identically.
+
+This assessment changed no AppsomeAndroid, Puber, or SDK profile, default link,
+live graph, Task, or Session. KEN-18's earlier Kit source-profile opt-out is
+unchanged. Existing Tasks and Sessions remain pinned to their selected
+workflows; no in-place graph rewrite or model replacement is part of KEN-18.
+Any later opt-in requires a separately reviewed project scope and a fresh
+qualified Workflow UUID. Global role-configuration changes, project assignment,
+runtime canaries, and any restart require their own effect approval. A rollback
+must stop new candidate admission and restore the previous approved project
+assignment/configuration; Tasks already admitted to a candidate remain pinned
+and require explicitly supported recovery rather than graph rewriting or a
+silent model swap.
 
 ## HISTORICAL — September 16, 2026 Policy and Adoption Record
 

@@ -78,6 +78,26 @@ ignored normalized snapshot and digest. Writer nodes cannot select this
 operation. Checkbox state is implementation progress and is excluded from
 normalization; all other plan content remains contract data.
 
+For an explicitly enabled complexity-selected writer candidate, the plan
+contains exactly one fenced `coder-selection-v1` JSON object with only
+`schema`, `task_short_id`, `complexity`, and non-empty `rationale`.
+`complexity` is `simple` or `complex`; the typed choice, not a model or role
+string, determines the protected target mapping. Plan Review emits
+`reviewed_normalized_sha256`; acceptance compares it with the current
+normalized plan before writing the existing task-bound snapshot. The accepted
+snapshot records the typed selection bound to that same digest. Before the
+first accepted snapshot, `accepted_plan_sha256` is `not-applicable`; after
+acceptance, review, branch, retry, and revalidation routes preserve the
+authoritative accepted digest.
+
+Missing, duplicate, malformed, wrong-task, or stale choices and reviewed
+digest drift return to retained Plan Revalidation before any writer starts.
+Branch retry rechecks the accepted snapshot against the current normalized
+plan and selection. A snapshot choice that differs from the digest-bound plan
+cannot supply protected target values. These checks detect cooperative
+artifact drift; they do not authenticate task-comment order or make approval
+and snapshot writes atomic.
+
 Every Implement and Fix continuation and transition to verification passes
 through a route-specific graph-owned check node. An unchanged normalized plan
 resumes that fixed route. A material change enters Plan Revalidation in the

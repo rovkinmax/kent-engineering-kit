@@ -23,6 +23,7 @@ from workflowkit.delivery import (
     build_smoke_lab_workflow,
     context_instruction,
     cleanup_prompt,
+    implement_prompt,
     janitor_recovery_prompt,
     plan_prompt,
     plan_review_prompt,
@@ -40,6 +41,7 @@ from workflowkit.kent import (
 )
 from workflowkit.graph import graph_matches_spec, plan_workflow_graph
 from workflowkit.model import (
+    CoderSelection,
     EdgeSpec,
     NodeSpec,
     ParameterSpec,
@@ -56,6 +58,13 @@ EXAMPLE_PROFILE = REPO_ROOT / "contracts" / "project-profile.example.toml"
 VERIFY_REPORT = REPO_ROOT / "templates" / "project" / "workflow-verify-report"
 VERIFY_DISPATCH = (
     REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch"
+)
+PLAN_CONTRACT = REPO_ROOT / "templates" / "project" / "workflow-plan-contract"
+PLAN_CONTRACT_ACCEPT = (
+    REPO_ROOT / "templates" / "project" / "workflow-plan-contract-accept"
+)
+PLAN_CONTRACT_CONTINUE = (
+    REPO_ROOT / "templates" / "project" / "workflow-plan-contract-continue"
 )
 WORK_KIND_PROCEDURES = (
     ".kent/commands/feature-start.md",
@@ -771,7 +780,12 @@ class WorkflowKitTest(unittest.TestCase):
                         context_instruction(baseline_profile, "implement", "implement", "implementation"),
                     )
 
-    def load_profile(self, transform=lambda value: value) -> ProjectProfile:
+    def load_profile(
+        self,
+        transform=lambda value: value,
+        *,
+        branch_identity_script: bool = False,
+    ) -> ProjectProfile:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -779,8 +793,745 @@ class WorkflowKitTest(unittest.TestCase):
         profile_directory.mkdir()
         contents = transform(EXAMPLE_PROFILE.read_text())
         (profile_directory / "workflow-profile.toml").write_text(contents)
+        if branch_identity_script:
+            scripts = profile_directory / "scripts"
+            scripts.mkdir()
+            target = scripts / "workflow-branch-identity"
+            shutil.copyfile(
+                REPO_ROOT / "templates/project/workflow-branch-identity",
+                target,
+            )
+            target.chmod(0o755)
         create_work_kind_procedures(root)
         return ProjectProfile.load(root)
+
+    def create_plan_contract_fixture(
+        self,
+        *,
+        coder_selection: str | None = "complexity",
+    ) -> tuple[Path, Path, object]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        subprocess.run(
+            ["git", "init", "-q", str(root)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        (root / ".gitignore").write_text("/.kent/runtime/\n")
+        kent = root / ".kent"
+        kent.mkdir()
+        scripts = kent / "scripts"
+        scripts.mkdir()
+        for source in (
+            PLAN_CONTRACT,
+            PLAN_CONTRACT_ACCEPT,
+            PLAN_CONTRACT_CONTINUE,
+        ):
+            target = scripts / source.name
+            shutil.copyfile(source, target)
+            target.chmod(0o755)
+        session_response = kent / "task-sessions.json"
+        fake_kent = kent / "test-kent"
+        fake_kent.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "task" ] && [ "$2" = "sessions" ]; then\n'
+            '  exec /bin/cat "$KENT_SESSION_RESPONSE"\n'
+            "fi\n"
+            "exit 2\n"
+        )
+        fake_kent.chmod(0o755)
+        profile = (
+            "[policies]\n"
+            'writer_sessions = "continuous"\n'
+        )
+        if coder_selection is not None:
+            profile += f'coder_selection = "{coder_selection}"\n'
+        (kent / "workflow-profile.toml").write_text(profile)
+        plan = root / "plan.md"
+        plan.write_text(
+            "# Accepted plan\n\n"
+            "- [ ] Implement the reviewed behavior.\n\n"
+            "Complexity decision:\n\n"
+            "```json\n"
+            "{\n"
+            '  "schema": "coder-selection-v1",\n'
+            '  "task_short_id": "KEN-18",\n'
+            '  "complexity": "complex",\n'
+            '  "rationale": "The change affects workflow contracts."\n'
+            "}\n"
+            "```\n"
+        )
+        loader = SourceFileLoader(
+            "ken18_workflow_plan_contract_test",
+            str(PLAN_CONTRACT),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.assertIsNotNone(spec)
+        if spec is None:
+            raise AssertionError("could not load the plan contract template")
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return root, plan, module
+
+    def run_plan_contract(
+        self,
+        root: Path,
+        *,
+        mode: str,
+        payload: dict[str, object],
+        route: str = "continue",
+        session_rows: list[dict[str, str]] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if mode not in {"accept", "check"}:
+            raise ValueError(f"unsupported test mode: {mode}")
+        if route != "continue":
+            raise ValueError(f"unsupported test route: {route}")
+        wrapper = root / ".kent" / "scripts" / (
+            "workflow-plan-contract-accept"
+            if mode == "accept"
+            else "workflow-plan-contract-continue"
+        )
+        snapshot_path = root / ".kent" / "runtime" / "KEN-18" / "plan-contract.json"
+        sessions = session_rows
+        if sessions is None:
+            sessions = []
+            if snapshot_path.is_file():
+                snapshot = json.loads(snapshot_path.read_text())
+                selected = snapshot.get("coder_selection")
+                if isinstance(selected, dict):
+                    role = {
+                        "simple": "implementation-simple",
+                        "complex": "implementation-complex",
+                    }.get(selected.get("complexity"))
+                    if role:
+                        sessions = [
+                            {
+                                "session_id": "retained-implementation-session",
+                                "agent_role": role,
+                                "status": "idle",
+                                "node_name": "Implement",
+                            }
+                        ]
+        session_response = root / ".kent" / "task-sessions.json"
+        session_response.write_text(
+            json.dumps({"task_id": "task-uuid", "items": sessions})
+        )
+        execution_payload = dict(payload)
+        execution_payload.setdefault("_kent", {"task_id": "task-uuid"})
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "KENT_BIN": str(root / ".kent" / "test-kent"),
+                "KENT_SESSION_RESPONSE": str(session_response),
+            }
+        )
+        return subprocess.run(
+            [str(wrapper)],
+            cwd=root,
+            input=json.dumps(execution_payload),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            check=False,
+        )
+
+    def test_coder_selection_is_closed_and_task_bound(self) -> None:
+        for complexity in ("simple", "complex"):
+            with self.subTest(complexity=complexity):
+                selection = CoderSelection.from_mapping(
+                    {
+                        "schema": "coder-selection-v1",
+                        "task_short_id": "KEN-18",
+                        "complexity": complexity,
+                        "rationale": "  Deterministic scoped work.  ",
+                    },
+                    expected_task_short_id="KEN-18",
+                )
+                self.assertEqual(selection.complexity, complexity)
+                self.assertEqual(selection.rationale, "Deterministic scoped work.")
+                if complexity == "simple":
+                    self.assertEqual(selection.target_assignee, "implementation-simple")
+                    self.assertEqual(selection.target_thinking, "xhigh")
+                else:
+                    self.assertEqual(selection.target_assignee, "implementation-complex")
+                    self.assertEqual(selection.target_thinking, "medium")
+                self.assertEqual(
+                    set(selection.as_dict()),
+                    {"schema", "task_short_id", "complexity", "rationale"},
+                )
+
+        valid = {
+            "schema": "coder-selection-v1",
+            "task_short_id": "KEN-18",
+            "complexity": "simple",
+            "rationale": "Small local change.",
+        }
+        invalid_values = (
+            ({**valid, "extra": "not allowed"}, "exactly"),
+            (
+                {key: value for key, value in valid.items() if key != "rationale"},
+                "exactly",
+            ),
+            ({**valid, "schema": "coder-selection-v2"}, "schema"),
+            ({**valid, "task_short_id": "KEN-19"}, "does not match"),
+            ({**valid, "complexity": "unknown"}, "complexity"),
+            ({**valid, "rationale": "  "}, "rationale"),
+        )
+        for value, expected_error in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(SpecError, expected_error):
+                    CoderSelection.from_mapping(
+                        value,
+                        expected_task_short_id="KEN-18",
+                    )
+
+    def test_coder_selection_policy_is_opt_in_and_continuous_only(self) -> None:
+        profile = self.load_profile()
+        self.assertEqual(profile.coder_selection_policy(), "disabled")
+
+        enabled = self.load_profile(
+            lambda contents: contents.replace(
+                'writer_sessions = "fresh_per_slice"',
+                'writer_sessions = "continuous"\ncoder_selection = "complexity"',
+            )
+        )
+        self.assertEqual(enabled.coder_selection_policy(), "complexity")
+
+        with self.assertRaisesRegex(SpecError, "unsupported policies.coder_selection"):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    'writer_sessions = "fresh_per_slice"',
+                    'writer_sessions = "continuous"\ncoder_selection = "automatic"',
+                )
+            )
+        with self.assertRaisesRegex(
+            SpecError,
+            "requires policies.writer_sessions = 'continuous'",
+        ):
+            self.load_profile(
+                lambda contents: contents.replace(
+                    'writer_sessions = "fresh_per_slice"',
+                    'writer_sessions = "fresh_per_slice"\ncoder_selection = "complexity"',
+                )
+            )
+
+    def test_plan_contract_accepts_only_reviewed_task_bound_selection(self) -> None:
+        root, plan, contract = self.create_plan_contract_fixture()
+        normalized = contract.normalized_plan(plan)
+        reviewed_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        acceptance = {
+            "workspace_path": str(root),
+            "task_short_id": "KEN-18",
+            "plan_path": "plan.md",
+            "work_kind": "feature",
+            "plan_route": "start",
+            "plan_route_context": "not-applicable",
+            "review_context": "Independent review and human approval completed.",
+            "accepted_plan_sha256": "not-applicable",
+            "reviewed_normalized_sha256": reviewed_digest,
+        }
+
+        accepted = self.run_plan_contract(
+            root,
+            mode="accept",
+            payload=acceptance,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(
+            json.loads(accepted.stdout)["transition"],
+            "plan_contract_start",
+        )
+        accepted_route = json.loads(accepted.stdout)
+        self.assertEqual(accepted_route["accepted_plan_sha256"], reviewed_digest)
+        self.assertEqual(accepted_route["task_short_id"], "KEN-18")
+        self.assertEqual(accepted_route["target_assignee"], "implementation-complex")
+        self.assertEqual(accepted_route["target_thinking"], "medium")
+        snapshot_path = root / ".kent/runtime/KEN-18/plan-contract.json"
+        snapshot = json.loads(snapshot_path.read_text())
+        self.assertEqual(snapshot["task_short_id"], "KEN-18")
+        self.assertEqual(snapshot["normalized_sha256"], reviewed_digest)
+        self.assertEqual(snapshot["coder_selection_sha256"], reviewed_digest)
+        self.assertEqual(
+            snapshot["coder_selection"],
+            {
+                "schema": "coder-selection-v1",
+                "task_short_id": "KEN-18",
+                "complexity": "complex",
+                "rationale": "The change affects workflow contracts.",
+            },
+        )
+
+        # Checkbox-only implementation progress remains outside the digest.
+        plan.write_text(plan.read_text().replace("- [ ]", "- [x]"))
+        stable = self.run_plan_contract(
+            root,
+            mode="check",
+            payload={
+                "workspace_path": str(root),
+                "task_short_id": "KEN-18",
+                "review_context": "Continue the accepted writer session.",
+                "accepted_plan_sha256": reviewed_digest,
+            },
+        )
+        self.assertEqual(stable.returncode, 0, stable.stderr)
+        self.assertEqual(
+            json.loads(stable.stdout)["transition"],
+            "plan_contract_continue_stable",
+        )
+
+        # A changed choice or stale reviewer digest goes back to Plan and
+        # cannot overwrite the prior accepted snapshot.
+        changed = plan.read_text().replace('"complexity": "complex"', '"complexity": "simple"')
+        plan.write_text(changed)
+        changed_digest = hashlib.sha256(
+            contract.normalized_plan(plan).encode("utf-8")
+        ).hexdigest()
+        stale = self.run_plan_contract(
+            root,
+            mode="accept",
+            payload={
+                **acceptance,
+                "accepted_plan_sha256": reviewed_digest,
+                "reviewed_normalized_sha256": reviewed_digest,
+            },
+        )
+        self.assertEqual(stale.returncode, 0, stale.stderr)
+        stale_result = json.loads(stale.stdout)
+        self.assertEqual(stale_result["transition"], "plan_contract_revalidate")
+        self.assertIn("does not match current plan", stale_result["plan_change_report"])
+        self.assertEqual(
+            json.loads(snapshot_path.read_text())["normalized_sha256"],
+            reviewed_digest,
+        )
+
+        current = self.run_plan_contract(
+            root,
+            mode="check",
+            payload={
+                "workspace_path": str(root),
+                "task_short_id": "KEN-18",
+                "review_context": "The accepted selection changed.",
+                "accepted_plan_sha256": reviewed_digest,
+            },
+        )
+        self.assertEqual(current.returncode, 0, current.stderr)
+        self.assertEqual(
+            json.loads(current.stdout)["transition"],
+            "plan_contract_continue_changed",
+        )
+        self.assertEqual(
+            hashlib.sha256(
+                json.loads(snapshot_path.read_text())["normalized_plan"].encode()
+            ).hexdigest(),
+            reviewed_digest,
+        )
+        self.assertNotEqual(changed_digest, reviewed_digest)
+
+    def test_plan_contract_rejects_preaccept_drift_and_tampered_selection_digest(
+        self,
+    ) -> None:
+        root, plan, contract = self.create_plan_contract_fixture()
+        original = plan.read_text()
+        reviewed_digest = hashlib.sha256(
+            contract.normalized_plan(plan).encode("utf-8")
+        ).hexdigest()
+        plan.write_text(
+            original.replace(
+                "The change affects workflow contracts.",
+                "The plan changed after its independent review.",
+            )
+        )
+        current_digest = hashlib.sha256(
+            contract.normalized_plan(plan).encode("utf-8")
+        ).hexdigest()
+        stale_accept = self.run_plan_contract(
+            root,
+            mode="accept",
+            payload={
+                "workspace_path": str(root),
+                "task_short_id": "KEN-18",
+                "plan_path": "plan.md",
+                "work_kind": "feature",
+                "plan_route": "start",
+                "plan_route_context": "not-applicable",
+                "review_context": "The digest belongs to the earlier review.",
+                "accepted_plan_sha256": "not-applicable",
+                "reviewed_normalized_sha256": reviewed_digest,
+            },
+        )
+        self.assertEqual(stale_accept.returncode, 0, stale_accept.stderr)
+        stale_payload = json.loads(stale_accept.stdout)
+        self.assertEqual(stale_payload["transition"], "plan_contract_revalidate")
+        self.assertIn(
+            "does not match current plan",
+            stale_payload["plan_change_report"],
+        )
+        self.assertEqual(stale_payload["accepted_plan_sha256"], "not-applicable")
+        self.assertNotEqual(current_digest, reviewed_digest)
+        snapshot_path = root / ".kent/runtime/KEN-18/plan-contract.json"
+        self.assertFalse(snapshot_path.exists())
+
+        plan.write_text(original)
+        accepted = self.run_plan_contract(
+            root,
+            mode="accept",
+            payload={
+                "workspace_path": str(root),
+                "task_short_id": "KEN-18",
+                "plan_path": "plan.md",
+                "work_kind": "feature",
+                "plan_route": "start",
+                "plan_route_context": "not-applicable",
+                "review_context": "Reviewed and approved.",
+                "accepted_plan_sha256": "not-applicable",
+                "reviewed_normalized_sha256": reviewed_digest,
+            },
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        original_snapshot = json.loads(snapshot_path.read_text())
+
+        rationale_tamper = dict(original_snapshot)
+        rationale_tamper["coder_selection"] = {
+            **original_snapshot["coder_selection"],
+            "rationale": "Tampered after acceptance.",
+        }
+        snapshot_path.write_text(json.dumps(rationale_tamper))
+        stale_selection = self.run_plan_contract(
+            root,
+            mode="check",
+            payload={
+                "workspace_path": str(root),
+                "task_short_id": "KEN-18",
+                "review_context": "Check the accepted choice.",
+                "accepted_plan_sha256": reviewed_digest,
+            },
+        )
+        self.assertEqual(stale_selection.returncode, 0, stale_selection.stderr)
+        stale_selection_payload = json.loads(stale_selection.stdout)
+        self.assertEqual(
+            stale_selection_payload["transition"],
+            "plan_contract_continue_changed",
+        )
+        self.assertIn(
+            "Coder selection requires revalidation",
+            stale_selection_payload["plan_change_report"],
+        )
+        self.assertNotIn("target_assignee", stale_selection_payload)
+
+        digest_tamper = dict(original_snapshot)
+        digest_tamper["coder_selection_sha256"] = "0" * 64
+        snapshot_path.write_text(json.dumps(digest_tamper))
+        rejected_digest = self.run_plan_contract(
+            root,
+            mode="check",
+            payload={
+                "workspace_path": str(root),
+                "task_short_id": "KEN-18",
+                "review_context": "Check the accepted choice.",
+                "accepted_plan_sha256": reviewed_digest,
+            },
+        )
+        self.assertNotEqual(rejected_digest.returncode, 0)
+        self.assertIn(
+            "not bound to the normalized plan digest",
+            rejected_digest.stderr,
+        )
+
+    def test_plan_contract_maps_simple_selection_to_protected_target_values(self) -> None:
+        root, plan, contract = self.create_plan_contract_fixture()
+        plan.write_text(
+            plan.read_text().replace(
+                '"complexity": "complex"',
+                '"complexity": "simple"',
+            )
+        )
+        digest = hashlib.sha256(
+            contract.normalized_plan(plan).encode("utf-8")
+        ).hexdigest()
+        accepted = self.run_plan_contract(
+            root,
+            mode="accept",
+            payload={
+                "workspace_path": str(root),
+                "task_short_id": "KEN-18",
+                "plan_path": "plan.md",
+                "work_kind": "feature",
+                "plan_route": "start",
+                "plan_route_context": "not-applicable",
+                "review_context": "Reviewed simple selection.",
+                "accepted_plan_sha256": "not-applicable",
+                "reviewed_normalized_sha256": digest,
+            },
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        output = json.loads(accepted.stdout)
+        self.assertEqual(output["transition"], "plan_contract_start")
+        self.assertEqual(output["target_assignee"], "implementation-simple")
+        self.assertEqual(output["target_thinking"], "xhigh")
+
+    def test_plan_contract_rejects_existing_or_missing_retained_writer(self) -> None:
+        root, plan, contract = self.create_plan_contract_fixture()
+        digest = hashlib.sha256(
+            contract.normalized_plan(plan).encode("utf-8")
+        ).hexdigest()
+        acceptance = {
+            "workspace_path": str(root),
+            "task_short_id": "KEN-18",
+            "plan_path": "plan.md",
+            "work_kind": "feature",
+            "plan_route": "start",
+            "plan_route_context": "not-applicable",
+            "review_context": "Reviewed plan.",
+            "accepted_plan_sha256": "not-applicable",
+            "reviewed_normalized_sha256": digest,
+        }
+        existing_writer = self.run_plan_contract(
+            root,
+            mode="accept",
+            payload=acceptance,
+            session_rows=[
+                {
+                    "session_id": "unexpected-writer",
+                    "agent_role": "implementation-complex",
+                }
+            ],
+        )
+        self.assertEqual(existing_writer.returncode, 0, existing_writer.stderr)
+        self.assertEqual(
+            json.loads(existing_writer.stdout)["transition"],
+            "plan_contract_revalidate",
+        )
+        self.assertFalse(
+            (root / ".kent/runtime/KEN-18/plan-contract.json").exists()
+        )
+
+        accepted = self.run_plan_contract(
+            root,
+            mode="accept",
+            payload=acceptance,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        snapshot = root / ".kent/runtime/KEN-18/plan-contract.json"
+        self.assertTrue(snapshot.is_file())
+        continue_payload = {
+            "workspace_path": str(root),
+            "task_short_id": "KEN-18",
+            "review_context": "Continue retained writer.",
+            "accepted_plan_sha256": digest,
+        }
+        missing_writer = self.run_plan_contract(
+            root,
+            mode="check",
+            payload=continue_payload,
+            session_rows=[],
+        )
+        self.assertEqual(missing_writer.returncode, 0, missing_writer.stderr)
+        missing_result = json.loads(missing_writer.stdout)
+        self.assertEqual(
+            missing_result["transition"],
+            "plan_contract_continue_changed",
+        )
+        self.assertIn("exactly one retained", missing_result["plan_change_report"])
+
+        wrong_writer = self.run_plan_contract(
+            root,
+            mode="check",
+            payload=continue_payload,
+            session_rows=[
+                {
+                    "session_id": "wrong-writer",
+                    "agent_role": "implementation-simple",
+                }
+            ],
+        )
+        self.assertEqual(wrong_writer.returncode, 0, wrong_writer.stderr)
+        wrong_result = json.loads(wrong_writer.stdout)
+        self.assertEqual(
+            wrong_result["transition"],
+            "plan_contract_continue_changed",
+        )
+        self.assertIn("differs from the accepted", wrong_result["plan_change_report"])
+
+    def test_plan_contract_preserves_disabled_selection_and_checks_task_identity(
+        self,
+    ) -> None:
+        root, plan, _ = self.create_plan_contract_fixture(
+            coder_selection=None,
+        )
+        acceptance = {
+            "workspace_path": str(root),
+            "task_short_id": "KEN-18",
+            "plan_path": "plan.md",
+            "work_kind": "feature",
+            "plan_route": "start",
+            "plan_route_context": "not-applicable",
+            "review_context": "Legacy disabled selection path.",
+        }
+        accepted = self.run_plan_contract(
+            root,
+            mode="accept",
+            payload=acceptance,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        snapshot_path = root / ".kent/runtime/KEN-18/plan-contract.json"
+        snapshot = json.loads(snapshot_path.read_text())
+        self.assertNotIn("coder_selection", snapshot)
+        snapshot["task_short_id"] = "KEN-19"
+        snapshot_path.write_text(json.dumps(snapshot))
+        checked = self.run_plan_contract(
+            root,
+            mode="check",
+            payload={
+                "workspace_path": str(root),
+                "task_short_id": "KEN-18",
+                "review_context": "Continue.",
+            },
+        )
+        self.assertNotEqual(checked.returncode, 0)
+        self.assertIn(
+            "task_short_id does not match the current task",
+            checked.stderr,
+        )
+        self.assertTrue(plan.is_file())
+
+    def test_plan_contract_routes_invalid_selection_to_revalidation(self) -> None:
+        root, plan, contract = self.create_plan_contract_fixture()
+        original = plan.read_text()
+        snapshot_path = root / ".kent/runtime/KEN-18/plan-contract.json"
+        initial_digest = hashlib.sha256(
+            contract.normalized_plan(plan).encode("utf-8")
+        ).hexdigest()
+        plan.write_text(
+            original.replace('"complexity": "complex"', '"complexity": "unknown"')
+        )
+        invalid_digest = hashlib.sha256(
+            contract.normalized_plan(plan).encode("utf-8")
+        ).hexdigest()
+        rejected_first_accept = self.run_plan_contract(
+            root,
+            mode="accept",
+            payload={
+                "workspace_path": str(root),
+                "task_short_id": "KEN-18",
+                "plan_path": "plan.md",
+                "work_kind": "feature",
+                "plan_route": "start",
+                "plan_route_context": "not-applicable",
+                "review_context": "Invalid first accepted selection fixture.",
+                "accepted_plan_sha256": "not-applicable",
+                "reviewed_normalized_sha256": invalid_digest,
+            },
+        )
+        self.assertEqual(
+            rejected_first_accept.returncode,
+            0,
+            rejected_first_accept.stderr,
+        )
+        rejected_result = json.loads(rejected_first_accept.stdout)
+        self.assertEqual(
+            rejected_result["transition"],
+            "plan_contract_revalidate",
+        )
+        self.assertEqual(
+            rejected_result["accepted_plan_sha256"],
+            "not-applicable",
+        )
+        self.assertFalse(snapshot_path.exists())
+        plan.write_text(original)
+
+        accepted = self.run_plan_contract(
+            root,
+            mode="accept",
+            payload={
+                "workspace_path": str(root),
+                "task_short_id": "KEN-18",
+                "plan_path": "plan.md",
+                "work_kind": "feature",
+                "plan_route": "start",
+                "plan_route_context": "not-applicable",
+                "review_context": "Reviewed and approved.",
+                "accepted_plan_sha256": "not-applicable",
+                "reviewed_normalized_sha256": initial_digest,
+            },
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        invalid_plans = {
+            "wrong_task": original.replace(
+                '"task_short_id": "KEN-18"',
+                '"task_short_id": "KEN-19"',
+            ),
+            "unknown_field": original.replace(
+                '"complexity": "complex",',
+                '"complexity": "complex",\n  "model": "gpt-6.1-sol",',
+            ),
+            "missing_selection": original.replace(
+                "Complexity decision:\n\n"
+                "```json\n"
+                "{\n"
+                '  "schema": "coder-selection-v1",\n'
+                '  "task_short_id": "KEN-18",\n'
+                '  "complexity": "complex",\n'
+                '  "rationale": "The change affects workflow contracts."\n'
+                "}\n"
+                "```\n",
+                "No typed complexity decision.\n",
+            ),
+            "duplicate_field": original.replace(
+                '"complexity": "complex",',
+                '"complexity": "complex",\n  "complexity": "simple",',
+            ),
+            "malformed_json": original.replace(
+                '"complexity": "complex",',
+                '"complexity": complex,',
+            ),
+            "duplicate_selection": original
+            + "\n```json\n"
+            + original.split("```json\n", 1)[1].split("```", 1)[0]
+            + "```\n",
+        }
+        expected_errors = {
+            "wrong_task": "does not match the current task",
+            "unknown_field": "unknown",
+            "missing_selection": "found 0",
+            "duplicate_field": "duplicate JSON object key",
+            "malformed_json": "coder selection JSON is malformed",
+            "duplicate_selection": "found 2",
+        }
+        for case, contents in invalid_plans.items():
+            with self.subTest(case=case):
+                plan.write_text(contents)
+                digest = hashlib.sha256(
+                    contract.normalized_plan(plan).encode("utf-8")
+                ).hexdigest()
+                result = self.run_plan_contract(
+                    root,
+                    mode="accept",
+                    payload={
+                        "workspace_path": str(root),
+                        "task_short_id": "KEN-18",
+                        "plan_path": "plan.md",
+                        "work_kind": "feature",
+                        "plan_route": "start",
+                        "plan_route_context": "not-applicable",
+                        "review_context": "Invalid accepted selection fixture.",
+                        "accepted_plan_sha256": initial_digest,
+                        "reviewed_normalized_sha256": digest,
+                    },
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = json.loads(result.stdout)
+                self.assertEqual(output["transition"], "plan_contract_revalidate")
+                self.assertIn(expected_errors[case], output["plan_change_report"])
+                self.assertEqual(
+                    json.loads(snapshot_path.read_text())["normalized_sha256"],
+                    initial_digest,
+                )
+        plan.write_text(original)
 
     def load_schema4_profile(
         self,
@@ -913,6 +1664,9 @@ class WorkflowKitTest(unittest.TestCase):
             "grill": ("high", True, True, True, False),
             "task-supervisor": ("high", True, False, True, False),
             "implementation-worker": ("xhigh", True, True, True, True),
+            "implementation-simple": ("xhigh", True, True, True, True),
+            "implementation-complex": ("medium", True, True, True, True),
+            "complexity-planner": ("medium", True, True, None, None),
             "fix-worker": ("medium", True, True, True, True),
             "build-doctor": ("high", True, True, True, True),
             "workflow-gate": ("high", False, False, True, False),
@@ -938,6 +1692,9 @@ class WorkflowKitTest(unittest.TestCase):
             "grill": "gpt-6-astra",
             "task-supervisor": "gpt-6.1-sol",
             "implementation-worker": "gpt-6-luna",
+            "implementation-simple": "gpt-5.6-luna",
+            "implementation-complex": "gpt-6.1-sol",
+            "complexity-planner": "gpt-6-astra",
             "fix-worker": "gpt-6.1-sol",
             "build-doctor": "gpt-6.1-sol",
             "workflow-gate": "gpt-6-luna",
@@ -973,7 +1730,13 @@ class WorkflowKitTest(unittest.TestCase):
                 for name, selector in selectors.items()
                 if "model_context_window" in selector
             },
-            {"root": 400000, **{name: 372000 for name in luna_selectors}},
+            {
+                "root": 400000,
+                **{name: 372000 for name in luna_selectors},
+                "implementation-simple": 372000,
+                "implementation-complex": 400000,
+                "complexity-planner": 400000,
+            },
         )
         self.assertEqual(
             {
@@ -1002,6 +1765,25 @@ class WorkflowKitTest(unittest.TestCase):
                 elif name == "fast":
                     for key in ("agent_callable", "workflow_subagent", "tools"):
                         self.assertNotIn(key, role)
+                elif name in {
+                    "implementation-simple",
+                    "implementation-complex",
+                }:
+                    self.assertIs(role["agent_callable"], callable_)
+                    self.assertIs(role["workflow_subagent"], workflow_callable)
+                    self.assertEqual(
+                        role["tools"],
+                        roles["implementation-worker"]["tools"],
+                    )
+                    self.assertEqual(
+                        role["system_prompt_file"],
+                        roles["implementation-worker"]["system_prompt_file"],
+                    )
+                elif name == "complexity-planner":
+                    self.assertIs(role["agent_callable"], callable_)
+                    self.assertIs(role["workflow_subagent"], workflow_callable)
+                    self.assertNotIn("system_prompt_file", role)
+                    self.assertNotIn("tools", role)
                 else:
                     self.assertIs(role["agent_callable"], callable_)
                     self.assertIs(role["workflow_subagent"], workflow_callable)
@@ -1037,8 +1819,610 @@ class WorkflowKitTest(unittest.TestCase):
                     ("subagents", name, "context_compaction_threshold_tokens"): 353400
                     for name in luna_roles
                 },
+                (
+                    "subagents",
+                    "implementation-simple",
+                    "context_compaction_threshold_tokens",
+                ): 353400,
+                **{
+                    ("subagents", name, "context_compaction_threshold_tokens"): 360000
+                    for name in (
+                        "implementation-complex",
+                        "complexity-planner",
+                    )
+                },
             },
         )
+
+    @unittest.skip("pre-edit failure retained in build/kent-workflow/KEN-18/pre-edit")
+    def test_ken18_complexity_lifecycle_pre_edit_red_fixture(self) -> None:
+        profile = ProjectProfile.load(REPO_ROOT)
+        builder_loader = SourceFileLoader(
+            "ken18_kit_development_baseline",
+            str(REPO_ROOT / ".kent/workflows/kit_development.py"),
+        )
+        builder_spec = importlib.util.spec_from_loader(
+            builder_loader.name,
+            builder_loader,
+        )
+        self.assertIsNotNone(builder_spec)
+        if builder_spec is None:
+            return
+        builder = importlib.util.module_from_spec(builder_spec)
+        sys.modules[builder_spec.name] = builder
+        builder_loader.exec_module(builder)
+        workflow = builder.build_workflow(profile)
+        nodes = {node.key: node for node in workflow.nodes}
+        edges = {edge.key: edge for edge in workflow.edges}
+        config = tomllib.loads(
+            (REPO_ROOT / "config" / "subagents.toml").read_text()
+        )
+        roles = config["subagents"]
+
+        expected_coders = {
+            "simple": (
+                "implementation-simple",
+                "gpt-5.6-luna",
+                "xhigh",
+                372000,
+                353400,
+            ),
+            "complex": (
+                "implementation-complex",
+                "gpt-6.1-sol",
+                "medium",
+                400000,
+                360000,
+            ),
+        }
+        configured_implementer = roles[nodes["implement"].agent]
+        self.assertEqual(nodes["implement"].agent, "implementation-worker")
+        with self.subTest(requirement="legacy implementer remains unchanged"):
+            self.assertEqual(
+                (
+                    configured_implementer["model"],
+                    configured_implementer["thinking_level"],
+                    configured_implementer["model_context_window"],
+                    configured_implementer[
+                        "context_compaction_threshold_tokens"
+                    ],
+                ),
+                ("gpt-6-luna", "xhigh", 372000, 353400),
+            )
+        for complexity, (
+            expected_role,
+            expected_model,
+            expected_effort,
+            expected_window,
+            expected_compaction,
+        ) in expected_coders.items():
+            with self.subTest(
+                complexity=complexity,
+                requirement="v5 static model and budget",
+            ):
+                self.assertEqual(
+                    (
+                        configured_implementer["model"],
+                        configured_implementer["thinking_level"],
+                        configured_implementer["model_context_window"],
+                        configured_implementer[
+                            "context_compaction_threshold_tokens"
+                        ],
+                    ),
+                    (
+                        expected_model,
+                        expected_effort,
+                        expected_window,
+                        expected_compaction,
+                    ),
+                )
+            selected = roles.get(expected_role)
+            with self.subTest(complexity=complexity, requirement="role exists"):
+                self.assertIsNotNone(selected, expected_role)
+            if selected is not None:
+                with self.subTest(complexity=complexity, requirement="role allocation"):
+                    self.assertEqual(
+                        (
+                            selected["system_prompt_file"],
+                            selected["agent_callable"],
+                            selected["workflow_subagent"],
+                            selected["tools"],
+                            selected["model"],
+                            selected["thinking_level"],
+                            selected["model_context_window"],
+                            selected["context_compaction_threshold_tokens"],
+                        ),
+                        (
+                            roles["implementation-worker"]["system_prompt_file"],
+                            True,
+                            True,
+                            roles["implementation-worker"]["tools"],
+                            expected_model,
+                            expected_effort,
+                            expected_window,
+                            expected_compaction,
+                        ),
+                    )
+
+        planner = roles.get("complexity-planner")
+        for node_key in ("plan", "plan_revalidation"):
+            with self.subTest(planner_node=node_key):
+                self.assertEqual(nodes[node_key].agent, "complexity-planner")
+        with self.subTest(requirement="planner role exists"):
+            self.assertIsNotNone(planner, "complexity-planner")
+        if planner is not None:
+            with self.subTest(requirement="planner allocation"):
+                self.assertEqual(
+                    (
+                        planner["model"],
+                        planner["thinking_level"],
+                        planner["model_context_window"],
+                        planner["context_compaction_threshold_tokens"],
+                    ),
+                    ("gpt-6-astra", "medium", 400000, 360000),
+                )
+
+        first_entry = edges["plan_contract_implement"]
+        revalidation = edges["plan_contract_continue_revalidate"]
+        same_choice_resume = edges["plan_contract_checked_continue"]
+        recovery = edges["implement_needs_user_action"]
+        with self.subTest(route="first writer identity"):
+            self.assertEqual(
+                (first_entry.context, first_entry.context_source),
+                ("new_session", "immediate_source"),
+            )
+        with self.subTest(route="first writer model selectors"):
+            self.assertEqual(first_entry.assignee_selection, "previous_node")
+            self.assertEqual(first_entry.thinking_selection, "previous_node")
+            self.assertEqual(
+                {parameter.purpose for parameter in first_entry.parameters},
+                {"ordinary", "target_assignee", "target_thinking"},
+            )
+        with self.subTest(route="planner revalidation identity"):
+            self.assertEqual(
+                (revalidation.context, revalidation.context_source),
+                ("continue_session", "node:plan"),
+            )
+        with self.subTest(route="same-choice writer continuation"):
+            self.assertEqual(
+                (same_choice_resume.context, same_choice_resume.context_source),
+                ("continue_session", "previous_target_or_new"),
+            )
+            self.assertEqual(same_choice_resume.assignee_selection, "configured")
+            self.assertEqual(same_choice_resume.thinking_selection, "configured")
+        with self.subTest(route="Implement blocker recovery identity"):
+            self.assertEqual(
+                (recovery.context, recovery.context_source),
+                ("continue_session", "immediate_source"),
+            )
+        with self.subTest(route="human approval remains mandatory"):
+            self.assertTrue(edges["plan_review_accept"].requires_approval)
+
+        for complexity, (
+            expected_role,
+            expected_model,
+            expected_effort,
+            expected_window,
+            expected_compaction,
+        ) in expected_coders.items():
+            plan_session = "plan-session"
+            writer_session = (
+                f"writer-session-{complexity}"
+                if first_entry.context == "new_session"
+                else plan_session
+            )
+            revalidated_plan_session = (
+                plan_session
+                if revalidation.context_source == "node:plan"
+                else "unexpected-session"
+            )
+            resumed_writer_session = (
+                writer_session
+                if (
+                    same_choice_resume.context == "continue_session"
+                    and same_choice_resume.context_source == "previous_target_or_new"
+                )
+                else "unexpected-session"
+            )
+            with self.subTest(complexity=complexity, route="separate writer identity"):
+                self.assertNotEqual(writer_session, plan_session)
+                self.assertEqual(revalidated_plan_session, plan_session)
+            with self.subTest(complexity=complexity, route="same-choice retained writer"):
+                self.assertEqual(resumed_writer_session, writer_session)
+                self.assertIsNotNone(roles.get(expected_role))
+            with self.subTest(
+                complexity=complexity,
+                route="same-choice model and effort",
+            ):
+                self.assertEqual(
+                    (
+                        configured_implementer["model"],
+                        configured_implementer["thinking_level"],
+                        configured_implementer["model_context_window"],
+                        configured_implementer[
+                            "context_compaction_threshold_tokens"
+                        ],
+                    ),
+                    (
+                        expected_model,
+                        expected_effort,
+                        expected_window,
+                        expected_compaction,
+                    ),
+                )
+            selected = roles.get(expected_role)
+            if selected is not None:
+                with self.subTest(
+                    complexity=complexity,
+                    route="same-choice model and effort",
+                ):
+                    self.assertEqual(
+                        (
+                            selected["model"],
+                            selected["thinking_level"],
+                            selected["model_context_window"],
+                            selected["context_compaction_threshold_tokens"],
+                        ),
+                        (
+                            expected_model,
+                            expected_effort,
+                            expected_window,
+                            expected_compaction,
+                        ),
+                    )
+
+    def test_ken18_complexity_lifecycle_for_both_selected_coders(self) -> None:
+        profile = ProjectProfile.load(REPO_ROOT)
+        selected_profile = replace(
+            profile,
+            policies={
+                **profile.policies,
+                "writer_sessions": "continuous",
+                "coder_selection": "complexity",
+            },
+        )
+        builder_loader = SourceFileLoader(
+            "ken18_kit_development_complete_cycle",
+            str(REPO_ROOT / ".kent/workflows/kit_development.py"),
+        )
+        builder_spec = importlib.util.spec_from_loader(
+            builder_loader.name,
+            builder_loader,
+        )
+        self.assertIsNotNone(builder_spec)
+        if builder_spec is None:
+            return
+        builder = importlib.util.module_from_spec(builder_spec)
+        sys.modules[builder_spec.name] = builder
+        builder_loader.exec_module(builder)
+        workflow = builder.build_complexity_candidate_workflow(selected_profile)
+        nodes = {node.key: node for node in workflow.nodes}
+        edges = {edge.key: edge for edge in workflow.edges}
+        roles = tomllib.loads(
+            (REPO_ROOT / "config" / "subagents.toml").read_text()
+        )["subagents"]
+        expected = {
+            "simple": ("implementation-simple", "gpt-5.6-luna", "xhigh", 372000, 353400),
+            "complex": ("implementation-complex", "gpt-6.1-sol", "medium", 400000, 360000),
+        }
+
+        self.assertEqual(
+            (nodes["plan"].agent, nodes["plan_revalidation"].agent),
+            ("complexity-planner", "complexity-planner"),
+        )
+        planner = roles["complexity-planner"]
+        self.assertEqual(
+            (
+                planner["model"],
+                planner["thinking_level"],
+                planner["model_context_window"],
+                planner["context_compaction_threshold_tokens"],
+            ),
+            ("gpt-6-astra", "medium", 400000, 360000),
+        )
+        first_entry = edges["plan_contract_implement"]
+        revalidation = edges["implement_revalidate"]
+        resume = edges["plan_contract_checked_continue"]
+        recovery = edges["implement_needs_user_action"]
+        self.assertEqual(
+            (
+                first_entry.context,
+                first_entry.context_source,
+                first_entry.assignee_selection,
+                first_entry.thinking_selection,
+            ),
+            ("new_session", "immediate_source", "previous_node", "previous_node"),
+        )
+        self.assertEqual(
+            (revalidation.context, revalidation.context_source),
+            ("continue_session", "node:plan"),
+        )
+        self.assertEqual(
+            (resume.context, resume.context_source),
+            ("continue_session", "previous_target_or_new"),
+        )
+        self.assertEqual(
+            (recovery.context, recovery.context_source, recovery.requires_approval),
+            ("continue_session", "immediate_source", True),
+        )
+        recovery_prompt = " ".join((recovery.prompt or "").split())
+        self.assertIn(
+            "Continue in this same retained Implement Session",
+            recovery_prompt,
+        )
+        self.assertNotIn("Use the retained compacted context", recovery_prompt)
+        self.assertIn(
+            "effective model, reasoning level, context window, and identity",
+            recovery_prompt,
+        )
+        self.assertTrue(
+            {"task_short_id", "accepted_plan_sha256"}
+            <= {parameter.key for parameter in recovery.parameters}
+        )
+        self.assertTrue(edges["plan_review_accept"].requires_approval)
+
+        selected_edges = {
+            edge.key
+            for edge in workflow.edges
+            if any(
+                parameter.purpose in {"target_assignee", "target_thinking"}
+                for parameter in edge.parameters
+            )
+        }
+        self.assertEqual(selected_edges, {"plan_contract_implement"})
+        self.assertEqual(nodes["fix"].agent, "fix-worker")
+        self.assertEqual(
+            (
+                edges["fix_needs_user_action"].context,
+                edges["fix_needs_user_action"].context_source,
+            ),
+            ("compact_and_continue_session", "immediate_source"),
+        )
+        self.assertFalse(
+            {
+                parameter.purpose
+                for parameter in edges["implement_verify"].parameters
+            }
+            & {"target_assignee", "target_thinking"}
+        )
+        for edge in workflow.edges:
+            if edge.source in {"verification_dispatch", "deterministic_verify"}:
+                with self.subTest(fanout_edge=edge.key):
+                    self.assertFalse(
+                        {
+                            parameter.purpose for parameter in edge.parameters
+                        }
+                        & {"target_assignee", "target_thinking"}
+                    )
+
+        plan_prompt_text = " ".join(
+            plan_prompt(selected_profile, coder_selection=True).split()
+        )
+        self.assertIn("every other case or uncertainty is complex", plan_prompt_text)
+        writer_prompt = " ".join(
+            implement_prompt(
+                selected_profile,
+                coder_selection=True,
+                first_selected_session=True,
+            ).split()
+        )
+        for requirement in (
+            "GetSessionExecutionEnvironment",
+            "GetSessionMainView",
+            "372000 context tokens",
+            "400000",
+            "identity differs from the retained Astra Plan Session",
+            "do not use continuation or recovery to create another writer",
+        ):
+            with self.subTest(prompt=requirement):
+                self.assertIn(requirement, writer_prompt)
+
+        for complexity, (
+            expected_role,
+            expected_model,
+            expected_effort,
+            expected_window,
+            expected_compaction,
+        ) in expected.items():
+            with self.subTest(complexity=complexity, phase="initial entry"):
+                root, plan, contract = self.create_plan_contract_fixture()
+                if complexity == "simple":
+                    plan.write_text(
+                        plan.read_text().replace(
+                            '"complexity": "complex"',
+                            '"complexity": "simple"',
+                        )
+                    )
+                initial_digest = hashlib.sha256(
+                    contract.normalized_plan(plan).encode("utf-8")
+                ).hexdigest()
+                plan_session_id = f"plan-session-{complexity}"
+                writer_session_id = f"writer-session-{complexity}"
+                plan_sessions = [
+                    {
+                        "session_id": plan_session_id,
+                        "agent_role": "complexity-planner",
+                    }
+                ]
+                start = self.run_plan_contract(
+                    root,
+                    mode="accept",
+                    payload={
+                        "workspace_path": str(root),
+                        "task_short_id": "KEN-18",
+                        "plan_path": "plan.md",
+                        "work_kind": "feature",
+                        "plan_route": "start",
+                        "plan_route_context": "not-applicable",
+                        "review_context": "Reviewed selection and human approval.",
+                        "accepted_plan_sha256": "not-applicable",
+                        "reviewed_normalized_sha256": initial_digest,
+                    },
+                    session_rows=plan_sessions,
+                )
+                self.assertEqual(start.returncode, 0, start.stderr)
+                started = json.loads(start.stdout)
+                self.assertEqual(
+                    (
+                        started["transition"],
+                        started["target_assignee"],
+                        started["target_thinking"],
+                        started["accepted_plan_sha256"],
+                    ),
+                    (
+                        "plan_contract_start",
+                        expected_role,
+                        expected_effort,
+                        initial_digest,
+                    ),
+                )
+                coder = roles[expected_role]
+                self.assertEqual(
+                    (
+                        coder["model"],
+                        coder["thinking_level"],
+                        coder["model_context_window"],
+                        coder["context_compaction_threshold_tokens"],
+                        coder["agent_callable"],
+                        coder["workflow_subagent"],
+                    ),
+                    (
+                        expected_model,
+                        expected_effort,
+                        expected_window,
+                        expected_compaction,
+                        True,
+                        True,
+                    ),
+                )
+                self.assertNotEqual(plan_session_id, writer_session_id)
+
+                writer_sessions = plan_sessions + [
+                    {
+                        "session_id": writer_session_id,
+                        "agent_role": expected_role,
+                    }
+                ]
+                # A material, same-choice plan edit requires Astra revalidation
+                # and re-review, then resumes the same retained writer.
+                plan.write_text(
+                    plan.read_text().replace(
+                        "The change affects workflow contracts.",
+                        "The reviewed implementation rationale remains valid.",
+                    )
+                )
+                revised_digest = hashlib.sha256(
+                    contract.normalized_plan(plan).encode("utf-8")
+                ).hexdigest()
+                changed = self.run_plan_contract(
+                    root,
+                    mode="check",
+                    payload={
+                        "workspace_path": str(root),
+                        "task_short_id": "KEN-18",
+                        "review_context": "Plan drift requires revalidation.",
+                        "accepted_plan_sha256": initial_digest,
+                    },
+                    session_rows=writer_sessions,
+                )
+                self.assertEqual(changed.returncode, 0, changed.stderr)
+                changed_payload = json.loads(changed.stdout)
+                self.assertEqual(
+                    changed_payload["transition"],
+                    "plan_contract_continue_changed",
+                )
+                self.assertEqual(
+                    changed_payload["accepted_plan_sha256"],
+                    initial_digest,
+                )
+                self.assertNotIn("target_assignee", changed_payload)
+                self.assertEqual(writer_sessions[1]["session_id"], writer_session_id)
+
+                reaccepted = self.run_plan_contract(
+                    root,
+                    mode="accept",
+                    payload={
+                        "workspace_path": str(root),
+                        "task_short_id": "KEN-18",
+                        "plan_path": "plan.md",
+                        "work_kind": "feature",
+                        "plan_route": "continue",
+                        "plan_route_context": "not-applicable",
+                        "review_context": "Same choice re-reviewed and approved.",
+                        "accepted_plan_sha256": initial_digest,
+                        "reviewed_normalized_sha256": revised_digest,
+                    },
+                    session_rows=writer_sessions,
+                )
+                self.assertEqual(reaccepted.returncode, 0, reaccepted.stderr)
+                resumed = json.loads(reaccepted.stdout)
+                self.assertEqual(resumed["transition"], "plan_contract_continue")
+                self.assertEqual(resumed["accepted_plan_sha256"], revised_digest)
+                self.assertNotIn("target_assignee", resumed)
+                self.assertNotIn("target_thinking", resumed)
+                stable = self.run_plan_contract(
+                    root,
+                    mode="check",
+                    payload={
+                        "workspace_path": str(root),
+                        "task_short_id": "KEN-18",
+                        "review_context": "Resume the accepted writer.",
+                        "accepted_plan_sha256": revised_digest,
+                    },
+                    session_rows=writer_sessions,
+                )
+                self.assertEqual(stable.returncode, 0, stable.stderr)
+                self.assertEqual(
+                    json.loads(stable.stdout)["transition"],
+                    "plan_contract_continue_stable",
+                )
+
+                # Reclassification is reviewed, but cannot replace this writer.
+                replacement_complexity = (
+                    "complex" if complexity == "simple" else "simple"
+                )
+                plan.write_text(
+                    plan.read_text().replace(
+                        f'"complexity": "{complexity}"',
+                        f'"complexity": "{replacement_complexity}"',
+                    )
+                )
+                replacement_digest = hashlib.sha256(
+                    contract.normalized_plan(plan).encode("utf-8")
+                ).hexdigest()
+                replacement = self.run_plan_contract(
+                    root,
+                    mode="accept",
+                    payload={
+                        "workspace_path": str(root),
+                        "task_short_id": "KEN-18",
+                        "plan_path": "plan.md",
+                        "work_kind": "feature",
+                        "plan_route": "continue",
+                        "plan_route_context": "not-applicable",
+                        "review_context": "Changed choice was re-reviewed.",
+                        "accepted_plan_sha256": revised_digest,
+                        "reviewed_normalized_sha256": replacement_digest,
+                    },
+                    session_rows=writer_sessions,
+                )
+                self.assertEqual(replacement.returncode, 0, replacement.stderr)
+                replacement_payload = json.loads(replacement.stdout)
+                self.assertEqual(
+                    replacement_payload["transition"],
+                    "plan_contract_revalidate",
+                )
+                self.assertIn(
+                    "role differs from the accepted coder selection",
+                    replacement_payload["plan_change_report"],
+                )
+                self.assertNotIn("target_assignee", replacement_payload)
+                self.assertEqual(
+                    json.loads(
+                        (root / ".kent/runtime/KEN-18/plan-contract.json").read_text()
+                    )["normalized_sha256"],
+                    revised_digest,
+                )
 
     def test_grill_method_and_session_communication_contract(self) -> None:
         prompt = (REPO_ROOT / "agents" / "grill.md").read_text()
@@ -1137,6 +2521,26 @@ class WorkflowKitTest(unittest.TestCase):
             [line for line in current.splitlines() if line.startswith("| `grill` |")],
             [expected],
         )
+        for name in (
+            "implementation-worker",
+            "implementation-simple",
+            "implementation-complex",
+            "complexity-planner",
+        ):
+            role = config["subagents"][name]
+            expected = (
+                f"| `{name}` | `{role['model']}` | "
+                f"{role['thinking_level']} |"
+            )
+            with self.subTest(role=name):
+                self.assertEqual(
+                    [
+                        line
+                        for line in current.splitlines()
+                        if line.startswith(f"| `{name}` |")
+                    ],
+                    [expected],
+                )
 
     def test_communication_exception_does_not_restore_blanket_run_ban(self) -> None:
         role_names = (
@@ -1182,6 +2586,107 @@ class WorkflowKitTest(unittest.TestCase):
                 self.assertNotIn("Do not call `kent run`", prompt)
                 if path.stem not in {*role_names, "grill"}:
                     self.assertNotIn("kent run watch <session-id>", prompt)
+
+    def test_selected_owner_replan_preserves_digest_through_repeated_acceptance(self) -> None:
+        from workflowkit.delivery import owner_replan_instruction
+
+        delivery = '{"schema":"workflow-delivery-context-v1","phase":"pre_pr"}'
+        for compliance in (False, True):
+            for complexity in ("simple", "complex"):
+                with self.subTest(compliance=compliance, complexity=complexity):
+                    profile = self.load_profile()
+                    profile = replace(
+                        profile,
+                        delivery_profile="lite",
+                        policies={**profile.policies, "writer_sessions": "continuous",
+                                  "coder_selection": "complexity"},
+                        capabilities={**profile.capabilities, "compliance_review": compliance},
+                    )
+                    spec = build_delivery_workflow(profile, 6)
+                    spec.validate()
+                    edges = {edge.key: edge for edge in spec.edges}
+                    self.assertEqual("compliance_replan" in edges, compliance)
+                    instruction = owner_replan_instruction(profile)
+                    for source in (("fix", "compliance") if compliance else ("fix",)):
+                        self.assertIn(
+                            "accepted_plan_sha256",
+                            {p.key for p in edges[f"{source}_replan"].parameters},
+                        )
+                    self.assertIn("accepted_plan_sha256", instruction)
+                    self.assertIn("normalized_sha256", instruction)
+                    root, plan, contract = self.create_plan_contract_fixture()
+                    shutil.copyfile(
+                        REPO_ROOT / "workflowkit/runtime.py",
+                        root / ".kent/scripts/workflow_runtime_contracts.py",
+                    )
+                    plan.write_text(plan.read_text().replace(
+                        '"complexity": "complex"', f'"complexity": "{complexity}"',
+                    ))
+                    digest = hashlib.sha256(contract.normalized_plan(plan).encode()).hexdigest()
+                    accepted = self.run_plan_contract(root, mode="accept", session_rows=[], payload={
+                        "workspace_path": str(root), "task_short_id": "KEN-18",
+                        "plan_path": "plan.md", "work_kind": "feature",
+                        "plan_route": "start", "plan_route_context": "not-applicable",
+                        "review_context": "Reviewed and approved.",
+                        "accepted_plan_sha256": "not-applicable",
+                        "reviewed_normalized_sha256": digest, "delivery_context": delivery,
+                    })
+                    self.assertEqual(accepted.returncode, 0, accepted.stderr)
+                    selected = json.loads(accepted.stdout)
+                    sessions = [
+                        {"session_id": "retained-plan", "agent_role": "complexity-planner"},
+                        {"session_id": "retained-writer", "agent_role": selected["target_assignee"]},
+                        {"session_id": "retained-fix", "agent_role": "fix-worker"},
+                    ]
+                    for source in (("fix", "compliance") if compliance else ("fix",)):
+                        edge = edges[f"{source}_replan"]
+                        self.assertEqual((edge.context, edge.context_source),
+                                         ("continue_session", "node:plan"))
+                        self.assertIn("Previous accepted plan digest:", edge.prompt)
+                        self.assertIn("same-choice", edge.prompt)
+                        # Traverse actual generated edge carriers; missing required
+                        # fields fail here before the real Accept wrapper is invoked.
+                        for repetition in range(2):
+                            packet = {
+                                "workspace_path": str(root), "plan_path": "plan.md",
+                                "work_kind": "feature", "review_context": "Owner finding reconciled.",
+                                "plan_change_report": "Within accepted selection.",
+                                "delivery_context": delivery, "accepted_plan_sha256": digest,
+                            }
+                            for key in (f"{source}_replan", "plan_revalidation_review",
+                                        "plan_review_accept"):
+                                packet = {p.key: packet[p.key] for p in edges[key].parameters}
+                                self.assertEqual(packet["accepted_plan_sha256"], digest)
+                                self.assertEqual(packet["delivery_context"], delivery)
+                                if key == f"{source}_replan":
+                                    # Owner prompt fixes the reviewed route, not a
+                                    # new writer start or Fix-specific continuation.
+                                    packet.update(plan_route="continue",
+                                                  plan_route_context="not-applicable",
+                                                  task_short_id="KEN-18")
+                                elif key == "plan_revalidation_review":
+                                    packet["reviewed_normalized_sha256"] = digest
+                                    packet["plan_review_report"] = "Independent review PASS."
+                            result = self.run_plan_contract(
+                                root, mode="accept", payload=packet, session_rows=sessions,
+                            )
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            resumed = json.loads(result.stdout)
+                            self.assertEqual(resumed["transition"], "plan_contract_continue")
+                            self.assertEqual(resumed["accepted_plan_sha256"], digest)
+                            self.assertEqual(resumed["delivery_context"], delivery)
+                            self.assertNotIn("target_assignee", resumed)
+                            self.assertNotIn("target_thinking", resumed)
+                            target = edges["plan_contract_continue_implement"]
+                            self.assertEqual(target.target, "implement")
+                            self.assertEqual((target.context, target.context_source),
+                                             ("continue_session", "previous_target_or_new"))
+                            snapshot = json.loads(
+                                (root / ".kent/runtime/KEN-18/plan-contract.json").read_text()
+                            )
+                            self.assertEqual(snapshot["coder_selection"]["complexity"], complexity)
+                            self.assertEqual(snapshot["coder_selection_sha256"], digest)
+                            self.assertEqual(sessions[1]["session_id"], "retained-writer")
 
     def test_replan_routes_preserve_review_and_owner_context(self) -> None:
         profile = self.load_profile()
@@ -1911,6 +3416,187 @@ class WorkflowKitTest(unittest.TestCase):
             "branch_identity",
         )
         self.assertNotIn("plan_implement", edges)
+
+    def test_ken18_complexity_candidate_uses_task_bound_selectors_and_guards(
+        self,
+    ) -> None:
+        def complexity_policy(contents: str) -> str:
+            return contents.replace(
+                'writer_sessions = "fresh_per_slice"\n',
+                'writer_sessions = "continuous"\n'
+                'coder_selection = "complexity"\n',
+            )
+
+        profile = self.load_profile(complexity_policy)
+        with self.assertRaisesRegex(SpecError, "only by the source candidate workflow v6"):
+            build_delivery_workflow(profile, 5)
+        spec = build_delivery_workflow(profile, 6)
+        nodes = {node.key: node for node in spec.nodes}
+        edges = {edge.key: edge for edge in spec.edges}
+
+        self.assertEqual(nodes["plan"].agent, "complexity-planner")
+        self.assertEqual(nodes["plan_revalidation"].agent, "complexity-planner")
+        self.assertEqual(nodes["implement"].agent, "implementation-worker")
+
+        first = edges["plan_contract_implement"]
+        self.assertEqual(
+            (first.context, first.context_source),
+            ("new_session", "immediate_source"),
+        )
+        self.assertEqual(first.assignee_selection, "previous_node")
+        self.assertEqual(first.thinking_selection, "previous_node")
+        self.assertEqual(
+            {parameter.purpose for parameter in first.parameters},
+            {"ordinary", "target_assignee", "target_thinking"},
+        )
+        first_keys = {parameter.key for parameter in first.parameters}
+        self.assertTrue(
+            {"task_short_id", "accepted_plan_sha256", "target_assignee",
+             "target_thinking"} <= first_keys
+        )
+
+        acceptance_keys = {
+            parameter.key for parameter in edges["plan_review_accept"].parameters
+        }
+        self.assertTrue(
+            {
+                "accepted_plan_sha256",
+                "reviewed_normalized_sha256",
+            } <= acceptance_keys
+        )
+        self.assertEqual(
+            edges["plan_contract_revalidate"].target,
+            "plan_revalidation",
+        )
+        self.assertEqual(
+            edges["implement_revalidate"].context_source,
+            "node:plan",
+        )
+        self.assertEqual(
+            (
+                edges["plan_contract_checked_continue"].context,
+                edges["plan_contract_checked_continue"].context_source,
+            ),
+            ("continue_session", "previous_target_or_new"),
+        )
+        recovery = edges["implement_needs_user_action"]
+        self.assertEqual(
+            (recovery.context, recovery.context_source),
+            ("continue_session", "immediate_source"),
+        )
+        self.assertTrue(recovery.requires_approval)
+        self.assertEqual(
+            edges["fix_needs_user_action"].context,
+            "compact_and_continue_session",
+        )
+
+        branch_profile = self.load_profile(
+            lambda contents: complexity_policy(contents)
+            .replace('issue_tracker = "none"', 'issue_tracker = "jira"')
+            .replace('branch_identity = "task"', 'branch_identity = "jira"')
+            .replace(
+                "[commands]\n",
+                "[commands]\n"
+                'branch_identity = ".kent/scripts/workflow-branch-identity"\n',
+            ),
+            branch_identity_script=True,
+        )
+        branch_edges = {
+            edge.key: edge
+            for edge in build_delivery_workflow(branch_profile, 6).edges
+        }
+        branch_entry = branch_edges["branch_identity_implement"]
+        self.assertEqual(
+            (branch_entry.context, branch_entry.context_source),
+            ("new_session", "immediate_source"),
+        )
+        self.assertEqual(branch_entry.assignee_selection, "previous_node")
+        self.assertEqual(branch_entry.thinking_selection, "previous_node")
+        for key in ("plan_contract_branch_identity", "branch_identity_retry"):
+            purposes = {
+                parameter.purpose
+                for parameter in branch_edges[key].parameters
+            }
+            self.assertEqual(purposes, {"ordinary"})
+            self.assertNotIn(
+                "target_assignee",
+                {parameter.key for parameter in branch_edges[key].parameters},
+            )
+        self.assertEqual(
+            branch_edges["branch_identity_revalidate"].context_source,
+            "node:plan",
+        )
+        self.assertEqual(
+            branch_edges["branch_identity_resolution_revalidate"].target,
+            "plan_revalidation",
+        )
+
+    def test_ken18_source_v6_candidate_preserves_opt_out_and_v5_snapshot(
+        self,
+    ) -> None:
+        path = REPO_ROOT / ".kent" / "workflows" / "kit_development.py"
+        loader = SourceFileLoader("ken18_kit_development_candidate_test", str(path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.assertIsNotNone(spec)
+        if spec is None:
+            raise AssertionError("could not load the Kit development builder")
+        builder = importlib.util.module_from_spec(spec)
+        loader.exec_module(builder)
+
+        profile_path = REPO_ROOT / ".kent" / "workflow-profile.toml"
+        profile_before = profile_path.read_bytes()
+        profile = builder.profile_at(REPO_ROOT)
+        self.assertEqual(profile.coder_selection_policy(), "disabled")
+
+        default = builder.build_workflow(profile)
+        candidate = builder.build_complexity_candidate_workflow(profile)
+        self.assertEqual(default.name, "Kit Engineering Delivery v5")
+        self.assertEqual(candidate.name, "Kit Engineering Delivery v6")
+        self.assertEqual(
+            (
+                len(candidate.nodes),
+                len({(edge.source, edge.transition) for edge in candidate.edges}),
+                len(candidate.edges),
+            ),
+            (21, 54, 55),
+        )
+        nodes = {node.key: node for node in candidate.nodes}
+        edges = {edge.key: edge for edge in candidate.edges}
+        self.assertEqual(nodes["plan"].agent, "complexity-planner")
+        self.assertEqual(nodes["plan_revalidation"].agent, "complexity-planner")
+        self.assertEqual(nodes["implement"].agent, "implementation-worker")
+        self.assertEqual(
+            (
+                edges["plan_contract_implement"].context,
+                edges["plan_contract_implement"].context_source,
+                edges["plan_contract_implement"].assignee_selection,
+                edges["plan_contract_implement"].thinking_selection,
+            ),
+            ("new_session", "immediate_source", "previous_node", "previous_node"),
+        )
+
+        v5_path = REPO_ROOT / builder.SPEC_PATH
+        self.assertEqual(
+            hashlib.sha256(v5_path.read_bytes()).hexdigest(),
+            "f5d65a34576b18ee813466c42b31afd79943ad1849f4a9d53d0437332f371ed4",
+        )
+        self.assertEqual(builder.rendered_spec(), v5_path.read_text())
+        candidate_path = REPO_ROOT / builder.CANDIDATE_SPEC_PATH
+        self.assertEqual(builder.rendered_candidate_spec(), candidate_path.read_text())
+        self.assertEqual(profile_path.read_bytes(), profile_before)
+
+        fresh_profile = replace(
+            profile,
+            policies={
+                **profile.policies,
+                "writer_sessions": "fresh_per_slice",
+            },
+        )
+        with self.assertRaisesRegex(
+            SpecError,
+            "requires continuous writer Sessions",
+        ):
+            builder.build_complexity_candidate_workflow(fresh_profile)
 
     def test_delivery_keeps_direct_plan_start_for_task_branch_policy(self) -> None:
         profile = self.load_profile()
