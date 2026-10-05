@@ -397,6 +397,45 @@ a workflow graph, call Kent, or activate publication. Runtime envelopes,
 external-root bytes, project release semantics, and live effects remain owned
 by later project and runtime slices.
 
+### Explicit release source-binding check
+
+The standalone `scripts/check-release-source-bindings` helper checks only
+whether the external source digests declared by a release manifest match blobs
+in one explicitly selected Git commit or tree. For example:
+
+```bash
+python3 scripts/check-release-source-bindings \
+  --project /path/to/project \
+  --ref <full-commit-or-tree-object-id>
+```
+
+The selected profile, release spec, manifest, optional kind map and bound
+source files are all read from that same Git tree. The helper does not use
+`HEAD` by default, inspect working-tree bytes or the index, execute a release
+builder, or update pins. Its `source_bindings_valid` result is not release
+readiness, source-closure validation, graph qualification, runtime attestation,
+or publication authorization. Existing release builders and runtime checks
+remain required. See the [source-binding contract](contracts/release-source-bindings.md)
+for schemas, limits and failure semantics.
+
+A native project can adopt the helper only through its own reviewed source
+change: vendor byte-identical bytes at
+`.kent/scripts/workflow-check-release-source-bindings` from a published Kit
+commit, record that commit and the file SHA-256, then invoke it in an existing
+required CI job immediately after checkout:
+
+```bash
+python3 .kent/scripts/workflow-check-release-source-bindings \
+  --project . \
+  --ref "$GITHUB_SHA"
+```
+
+For a project with a custom source kind, pass its project-owned declarative
+mapping with `--kind-map <repository-relative-path>`. Keep the existing pull
+request checkout and pass its selected commit, including the synthetic merge
+commit where applicable. Do not add a new job, alter event selectors, or
+automatically synchronize the vendored helper or repin changed sources.
+
 Profile synchronization has a strict dual-schema boundary. Schema 3 preserves
 legacy `release_topology` and implicit ownership of known command templates;
 schema 4 requires explicit `kit_managed_commands`, matching

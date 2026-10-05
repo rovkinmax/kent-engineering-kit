@@ -1,0 +1,790 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import unicodedata
+from typing import Any
+
+
+REPORT_SCHEMA = "release-source-bindings-report-v1"
+KIND_MAP_SCHEMA = "release-source-binding-kind-map-v1"
+BUILTIN_KINDS = {"builder-sha256", "source-sha256"}
+OBJECT_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+GROUPED_DIGEST = re.compile(r"^sha256:(?:[0-9a-f]{8}:){7}[0-9a-f]{8}$")
+CUSTOM_KIND = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+
+MAX_DESCRIPTORS = 4096
+MAX_KIND_MAP_ENTRIES = 4096
+MAX_PATH_BYTES = 1024
+MAX_PATHSPEC_ARGUMENT_BYTES = 48 * 1024
+MAX_TOTAL_BLOB_BYTES = 32 * 1024 * 1024
+MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
+COMMAND_TIMEOUT_SECONDS = 30.0
+TOTAL_TIMEOUT_SECONDS = 60.0
+CAT_FILE_HEADER_RESERVE = 128
+
+
+class BindingError(Exception):
+    """A bounded, user-facing source-binding validation failure."""
+
+
+@dataclass(frozen=True)
+class TreeEntry:
+    mode: str
+    object_type: str
+    object_id: str
+
+
+@dataclass(frozen=True)
+class SourceBinding:
+    kind: str
+    path: str
+    expected_digest: str
+
+
+def require_text(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise BindingError(f"{label} must be a non-empty trimmed string")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise BindingError(f"{label} contains a control character")
+    return value
+
+
+def normalize_path(value: Any, label: str) -> str:
+    path = require_text(value, label)
+    if (
+        path.startswith("/")
+        or "\\" in path
+        or unicodedata.normalize("NFC", path) != path
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise BindingError(f"{label} is not a normalized repository-relative path")
+    if PurePosixPath(path).as_posix() != path:
+        raise BindingError(f"{label} is not a canonical POSIX path")
+    if len(path.encode("utf-8")) > MAX_PATH_BYTES:
+        raise BindingError(f"{label} exceeds {MAX_PATH_BYTES} UTF-8 bytes")
+    return path
+
+
+def require_mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise BindingError(f"{label} must be an object")
+    return value
+
+
+def required_mapping_field(
+    mapping: dict[str, Any],
+    key: str,
+    label: str,
+) -> dict[str, Any]:
+    if key not in mapping:
+        raise BindingError(f"{label} is missing required field {key!r}")
+    return require_mapping(mapping[key], f"{label}.{key}")
+
+
+def required_text_field(
+    mapping: dict[str, Any],
+    key: str,
+    label: str,
+) -> str:
+    if key not in mapping:
+        raise BindingError(f"{label} is missing required field {key!r}")
+    return require_text(mapping[key], f"{label}.{key}")
+
+
+def parse_json_object(raw: bytes, label: str) -> dict[str, Any]:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise BindingError(f"{label} contains duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_nonstandard_constant(value: str) -> None:
+        raise BindingError(f"{label} contains unsupported JSON value {value}")
+
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonstandard_constant,
+        )
+    except BindingError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BindingError(f"{label} is not valid UTF-8 JSON: {error}") from error
+    return require_mapping(value, label)
+
+
+def parse_toml_object(raw: bytes, label: str) -> dict[str, Any]:
+    try:
+        value = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise BindingError(f"{label} is not valid UTF-8 TOML: {error}") from error
+    return require_mapping(value, label)
+
+
+def decode_digest(value: Any, label: str) -> str:
+    digest = require_text(value, label)
+    if HEX_DIGEST.fullmatch(digest):
+        return digest
+    if GROUPED_DIGEST.fullmatch(digest):
+        return digest.removeprefix("sha256:").replace(":", "")
+    raise BindingError(
+        f"{label} must be lowercase hex64 or sha256:<eight colon-separated hex8 groups>"
+    )
+
+
+class GitTreeReader:
+    def __init__(self, project: Path) -> None:
+        git = shutil.which("git")
+        if git is None:
+            raise BindingError("git executable was not found")
+        self.git = str(Path(git).resolve())
+        self.project = project
+        self.environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        self.environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_NO_LAZY_FETCH": "1",
+                "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "LC_ALL": "C",
+                "LANG": "C",
+            }
+        )
+        self.deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
+        self.total_blob_bytes = 0
+        self.blob_cache: dict[str, bytes] = {}
+        self.tree_oid = ""
+
+    def ensure_time_remaining(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise BindingError("Git source read exceeded the 60-second total limit")
+
+    def run_git(
+        self,
+        arguments: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        check: bool = True,
+    ) -> bytes:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise BindingError("Git source read exceeded the 60-second total limit")
+        command = [
+            self.git,
+            "--no-replace-objects",
+            "--no-lazy-fetch",
+            "--no-optional-locks",
+            "-C",
+            str(self.project),
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "protocol.allow=never",
+            *arguments,
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=(
+                    subprocess.PIPE
+                    if input_bytes is not None
+                    else subprocess.DEVNULL
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                env=self.environment,
+                bufsize=0,
+            )
+        except OSError as error:
+            raise BindingError(f"could not execute fixed Git plumbing: {error}") from error
+
+        output_lock = threading.Lock()
+        output_size = 0
+        output_limit_exceeded = threading.Event()
+        reader_errors: list[OSError] = []
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+
+        def drain(stream: Any, chunks: list[bytes]) -> None:
+            nonlocal output_size
+            try:
+                while True:
+                    chunk = stream.read(64 * 1024)
+                    if not chunk:
+                        return
+                    with output_lock:
+                        if output_size + len(chunk) > MAX_COMMAND_OUTPUT_BYTES:
+                            output_limit_exceeded.set()
+                            try:
+                                process.kill()
+                            except OSError:
+                                pass
+                            return
+                        output_size += len(chunk)
+                        chunks.append(chunk)
+            except OSError as error:
+                reader_errors.append(error)
+
+        assert process.stdout is not None
+        assert process.stderr is not None
+        readers = [
+            threading.Thread(
+                target=drain,
+                args=(process.stdout, stdout_chunks),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=drain,
+                args=(process.stderr, stderr_chunks),
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+        writer: threading.Thread | None = None
+        writer_errors: list[OSError] = []
+        if input_bytes is not None:
+            def feed() -> None:
+                try:
+                    assert process.stdin is not None
+                    process.stdin.write(input_bytes)
+                    process.stdin.close()
+                except OSError as error:
+                    writer_errors.append(error)
+
+            writer = threading.Thread(target=feed, daemon=True)
+            writer.start()
+
+        timed_out = False
+        try:
+            process.wait(timeout=min(COMMAND_TIMEOUT_SECONDS, remaining))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            process.wait()
+        if writer is not None:
+            writer.join(timeout=1.0)
+            if writer.is_alive():
+                process.kill()
+                raise BindingError("Git input writer did not stop after process exit")
+        for reader in readers:
+            reader.join(timeout=1.0)
+        if any(reader.is_alive() for reader in readers):
+            process.kill()
+            raise BindingError("Git output reader did not stop after process exit")
+        if timed_out:
+            raise BindingError("Git source read exceeded its command time limit")
+        if output_limit_exceeded.is_set():
+            raise BindingError("Git command output exceeded the 8 MiB limit")
+        if reader_errors:
+            raise BindingError("could not read bounded Git command output")
+        if writer_errors and process.returncode == 0:
+            raise BindingError("could not send fixed Git object IDs to Git plumbing")
+
+        stdout = b"".join(stdout_chunks)
+        stderr = b"".join(stderr_chunks)
+        if check and process.returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+            if not detail:
+                detail = "no diagnostic output"
+            raise BindingError(
+                f"git {arguments[0]} failed: {detail[:512]}"
+            )
+        return stdout
+
+    def resolve_project_root(self) -> None:
+        output = self.run_git(["rev-parse", "--show-toplevel"])
+        try:
+            git_root = Path(output.decode("utf-8").rstrip("\n")).resolve(strict=True)
+        except (UnicodeDecodeError, OSError) as error:
+            raise BindingError("Git did not return a valid repository root") from error
+        if git_root != self.project:
+            raise BindingError(
+                f"--project must be the exact repository root; Git found {git_root}"
+            )
+
+    def resolve_ref(self, selector: str) -> tuple[str, str | None]:
+        if not OBJECT_ID.fullmatch(selector):
+            raise BindingError("--ref must be a full lowercase Git commit or tree object ID")
+        resolved = self.run_git(
+            ["rev-parse", "--verify", "--end-of-options", selector]
+        ).decode("ascii", errors="strict").strip()
+        if not OBJECT_ID.fullmatch(resolved):
+            raise BindingError("--ref did not resolve to one full Git object ID")
+        object_type = self.run_git(["cat-file", "-t", resolved]).decode(
+            "ascii",
+            errors="strict",
+        ).strip()
+        if object_type == "tree":
+            return resolved, None
+        if object_type != "commit":
+            raise BindingError("--ref must identify a Git commit or tree object")
+        tree_oid = self.run_git(
+            [
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                f"{resolved}^{{tree}}",
+            ]
+        ).decode("ascii", errors="strict").strip()
+        if not OBJECT_ID.fullmatch(tree_oid):
+            raise BindingError("selected commit did not resolve to one Git tree")
+        return tree_oid, resolved
+
+    def lookup_tree_entries(self, paths: list[str]) -> dict[str, TreeEntry]:
+        unique_paths = list(dict.fromkeys(paths))
+        if len(unique_paths) > MAX_DESCRIPTORS + 4:
+            raise BindingError("selected tree path count exceeds the bounded limit")
+        entries: dict[str, TreeEntry] = {}
+        batch: list[str] = []
+        batch_bytes = 0
+
+        def read_batch(items: list[str]) -> None:
+            if not items:
+                return
+            pathspecs = [f":(literal){path}" for path in items]
+            raw = self.run_git(
+                [
+                    "ls-tree",
+                    "-z",
+                    "--full-tree",
+                    self.tree_oid,
+                    "--",
+                    *pathspecs,
+                ]
+            )
+            requested = set(items)
+            for record in raw.split(b"\0"):
+                if not record:
+                    continue
+                metadata, separator, raw_path = record.partition(b"\t")
+                if not separator:
+                    raise BindingError("git ls-tree returned a malformed record")
+                try:
+                    path = raw_path.decode("utf-8")
+                    fields = metadata.decode("ascii").split(" ")
+                except UnicodeDecodeError as error:
+                    raise BindingError("git ls-tree returned invalid path metadata") from error
+                if len(fields) != 3 or not fields[0] or not fields[1]:
+                    raise BindingError("git ls-tree returned a malformed object record")
+                normalize_path(path, "selected Git path")
+                if path not in requested:
+                    raise BindingError("git ls-tree returned an unrequested path")
+                if path in entries:
+                    raise BindingError(f"selected tree returned duplicate path {path}")
+                if not OBJECT_ID.fullmatch(fields[2]):
+                    raise BindingError(f"selected tree returned invalid object ID for {path}")
+                entries[path] = TreeEntry(fields[0], fields[1], fields[2])
+
+        for path in unique_paths:
+            normalized = normalize_path(path, "repository path")
+            argument_bytes = len(f":(literal){normalized}".encode("utf-8")) + 1
+            if batch and batch_bytes + argument_bytes > MAX_PATHSPEC_ARGUMENT_BYTES:
+                read_batch(batch)
+                batch = []
+                batch_bytes = 0
+            batch.append(normalized)
+            batch_bytes += argument_bytes
+        read_batch(batch)
+
+        missing = [path for path in unique_paths if path not in entries]
+        if missing:
+            raise BindingError(f"selected Git tree is missing path: {missing[0]}")
+        return entries
+
+    @staticmethod
+    def require_regular_blob(path: str, entry: TreeEntry) -> None:
+        if entry.mode not in {"100644", "100755"} or entry.object_type != "blob":
+            raise BindingError(
+                f"selected Git path is not a regular blob with supported mode: "
+                f"path={path} mode={entry.mode} type={entry.object_type}"
+            )
+
+    def blob_bytes(self, object_ids: list[str]) -> dict[str, bytes]:
+        unique_ids = list(dict.fromkeys(object_ids))
+        missing_ids = [object_id for object_id in unique_ids if object_id not in self.blob_cache]
+        if not missing_ids:
+            return {object_id: self.blob_cache[object_id] for object_id in unique_ids}
+
+        request = b"".join(object_id.encode("ascii") + b"\n" for object_id in missing_ids)
+        metadata_output = self.run_git(
+            [
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+            ],
+            input_bytes=request,
+        )
+        metadata_lines = metadata_output.splitlines()
+        if len(metadata_lines) != len(missing_ids):
+            raise BindingError("git cat-file returned an incomplete object-size response")
+
+        sizes: dict[str, int] = {}
+        for expected_id, line in zip(missing_ids, metadata_lines, strict=True):
+            try:
+                object_id, object_type, raw_size = line.decode("ascii").split(" ")
+                size = int(raw_size, 10)
+            except (UnicodeDecodeError, ValueError) as error:
+                raise BindingError("git cat-file returned malformed object metadata") from error
+            if object_id != expected_id or object_type != "blob" or size < 0:
+                raise BindingError(
+                    f"selected Git object is not a readable blob: {expected_id}"
+                )
+            if size + CAT_FILE_HEADER_RESERVE > MAX_COMMAND_OUTPUT_BYTES:
+                raise BindingError(
+                    f"selected Git blob exceeds the 8 MiB command-output limit: {expected_id}"
+                )
+            sizes[object_id] = size
+
+        added_bytes = sum(sizes.values())
+        if self.total_blob_bytes + added_bytes > MAX_TOTAL_BLOB_BYTES:
+            raise BindingError("selected Git blob reads exceed the 32 MiB total limit")
+        self.total_blob_bytes += added_bytes
+
+        batches: list[list[str]] = []
+        current: list[str] = []
+        current_output_size = 0
+        output_budget = MAX_COMMAND_OUTPUT_BYTES
+        for object_id in missing_ids:
+            expected_output_size = sizes[object_id] + CAT_FILE_HEADER_RESERVE
+            if current and current_output_size + expected_output_size > output_budget:
+                batches.append(current)
+                current = []
+                current_output_size = 0
+            if expected_output_size > output_budget:
+                raise BindingError("selected Git blob cannot fit the bounded cat-file response")
+            current.append(object_id)
+            current_output_size += expected_output_size
+        if current:
+            batches.append(current)
+
+        for batch in batches:
+            batch_input = b"".join(object_id.encode("ascii") + b"\n" for object_id in batch)
+            output = self.run_git(["cat-file", "--batch"], input_bytes=batch_input)
+            cursor = 0
+            for expected_id in batch:
+                header_end = output.find(b"\n", cursor)
+                if header_end < 0:
+                    raise BindingError("git cat-file returned a truncated object header")
+                try:
+                    object_id, object_type, raw_size = output[cursor:header_end].decode(
+                        "ascii"
+                    ).split(" ")
+                    size = int(raw_size, 10)
+                except (UnicodeDecodeError, ValueError) as error:
+                    raise BindingError("git cat-file returned a malformed object header") from error
+                cursor = header_end + 1
+                if (
+                    object_id != expected_id
+                    or object_type != "blob"
+                    or size != sizes[expected_id]
+                ):
+                    raise BindingError("git cat-file object header changed during read")
+                end = cursor + size
+                if end >= len(output) or output[end : end + 1] != b"\n":
+                    raise BindingError("git cat-file returned a truncated blob")
+                self.blob_cache[expected_id] = output[cursor:end]
+                cursor = end + 1
+            if cursor != len(output):
+                raise BindingError("git cat-file returned unexpected trailing output")
+        return {object_id: self.blob_cache[object_id] for object_id in unique_ids}
+
+    def read_tree_files(self, paths: list[str]) -> dict[str, bytes]:
+        normalized_paths = [normalize_path(path, "repository path") for path in paths]
+        entries = self.lookup_tree_entries(normalized_paths)
+        for path, entry in entries.items():
+            self.require_regular_blob(path, entry)
+        objects = self.blob_bytes([entry.object_id for entry in entries.values()])
+        return {
+            path: objects[entry.object_id]
+            for path, entry in entries.items()
+        }
+
+
+def load_kind_map(reader: GitTreeReader, configured_path: str) -> dict[str, str]:
+    path = normalize_path(configured_path, "--kind-map")
+    payload = parse_json_object(reader.read_tree_files([path])[path], path)
+    if set(payload) != {"schema", "paths"}:
+        raise BindingError(f"{path} must contain exactly schema and paths")
+    if payload.get("schema") != KIND_MAP_SCHEMA:
+        raise BindingError(f"{path} has an unsupported kind-map schema")
+    paths = require_mapping(payload.get("paths"), f"{path}.paths")
+    if len(paths) > MAX_KIND_MAP_ENTRIES:
+        raise BindingError("kind map exceeds the 4096-entry limit")
+    result: dict[str, str] = {}
+    for kind, mapped_path in paths.items():
+        if not isinstance(kind, str) or not CUSTOM_KIND.fullmatch(kind):
+            raise BindingError(f"{path} contains an invalid custom kind")
+        if kind in BUILTIN_KINDS:
+            raise BindingError(f"{path} cannot override built-in kind {kind}")
+        result[kind] = normalize_path(mapped_path, f"{path}.paths[{kind!r}]")
+    return result
+
+
+def load_project_documents(
+    reader: GitTreeReader,
+    kind_map_path: str | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, str]]:
+    profile_path = ".kent/workflow-profile.toml"
+    profile = parse_toml_object(
+        reader.read_tree_files([profile_path])[profile_path],
+        profile_path,
+    )
+    schema_version = profile.get("schema_version")
+    if type(schema_version) is not int or schema_version != 4:
+        raise BindingError("project profile must use schema_version 4")
+    project_name = required_text_field(profile, "project_name", "project profile")
+    release = required_mapping_field(profile, "release", "project profile")
+    topology_kind = required_text_field(release, "topology_kind", "profile.release")
+    adoption_mode = required_text_field(release, "adoption_mode", "profile.release")
+    spec_path = normalize_path(
+        required_text_field(release, "spec_path", "profile.release"),
+        "profile.release.spec_path",
+    )
+    builder_value = release.get("builder_path", "")
+    if not isinstance(builder_value, str):
+        raise BindingError("profile.release.builder_path must be a string")
+    builder_path = (
+        normalize_path(builder_value, "profile.release.builder_path")
+        if builder_value
+        else ""
+    )
+
+    spec = parse_toml_object(
+        reader.read_tree_files([spec_path])[spec_path],
+        spec_path,
+    )
+    spec_version = spec.get("schema_version")
+    if type(spec_version) is not int or spec_version not in {2, 3}:
+        raise BindingError("release spec must use schema_version 2 or 3")
+    if spec.get("spec_kind") != "release":
+        raise BindingError("selected spec is not a release spec")
+    if required_text_field(spec, "project_name", spec_path) != project_name:
+        raise BindingError("project profile and release spec project_name differ")
+    if required_text_field(spec, "topology_kind", spec_path) != topology_kind:
+        raise BindingError("project profile and release spec topology_kind differ")
+    if required_text_field(spec, "adoption_mode", spec_path) != adoption_mode:
+        raise BindingError("project profile and release spec adoption_mode differ")
+    repository = required_text_field(spec, "repository", spec_path)
+    source_manifest = required_mapping_field(spec, "source_manifest", spec_path)
+    if source_manifest.get("schema") != "release_source_manifest_v1":
+        raise BindingError(f"{spec_path}.source_manifest has an unsupported schema")
+    manifest_path = normalize_path(
+        required_text_field(source_manifest, "path", f"{spec_path}.source_manifest"),
+        f"{spec_path}.source_manifest.path",
+    )
+
+    manifest = parse_json_object(
+        reader.read_tree_files([manifest_path])[manifest_path],
+        manifest_path,
+    )
+    if manifest.get("schema") != "release_source_manifest_v1":
+        raise BindingError(f"{manifest_path} has an unsupported source-manifest schema")
+    if required_text_field(manifest, "project_name", manifest_path) != project_name:
+        raise BindingError("project profile and source manifest project_name differ")
+    if required_text_field(manifest, "repository", manifest_path) != repository:
+        raise BindingError("release spec and source manifest repository differ")
+    if required_text_field(manifest, "topology_kind", manifest_path) != topology_kind:
+        raise BindingError("release spec and source manifest topology_kind differ")
+    external_roots = manifest.get("external_roots")
+    if not isinstance(external_roots, list):
+        raise BindingError(f"{manifest_path}.external_roots must be an array")
+    if len(external_roots) > MAX_DESCRIPTORS:
+        raise BindingError("source manifest exceeds the 4096-descriptor limit")
+
+    kind_map = (
+        load_kind_map(reader, kind_map_path)
+        if kind_map_path is not None
+        else {}
+    )
+    profile["_source_binding_builder_path"] = builder_path
+    profile["_source_binding_manifest_path"] = manifest_path
+    return profile, spec, manifest, kind_map
+
+
+def parse_bindings(
+    profile: dict[str, Any],
+    manifest: dict[str, Any],
+    kind_map: dict[str, str],
+) -> list[SourceBinding]:
+    descriptors = manifest["external_roots"]
+    builder_path = profile["_source_binding_builder_path"]
+    bindings: list[SourceBinding] = []
+    seen_descriptors: set[tuple[str, str]] = set()
+    used_custom_kinds: set[str] = set()
+
+    for index, raw_descriptor in enumerate(descriptors):
+        label = f"source manifest external_roots[{index}]"
+        descriptor = require_mapping(raw_descriptor, label)
+        if set(descriptor) != {"kind", "key", "runtime_digest_required"}:
+            raise BindingError(f"{label} has unsupported or missing fields")
+        kind = required_text_field(descriptor, "kind", label)
+        key = required_text_field(descriptor, "key", label)
+        if descriptor["runtime_digest_required"] is not True:
+            raise BindingError(f"{label}.runtime_digest_required must be true")
+        descriptor_identity = (kind, key)
+        if descriptor_identity in seen_descriptors:
+            raise BindingError(f"{label} duplicates kind/key {kind!r}/{key!r}")
+        seen_descriptors.add(descriptor_identity)
+
+        if kind == "builder-sha256":
+            if not builder_path:
+                raise BindingError(
+                    f"{label} requires profile.release.builder_path"
+                )
+            path = builder_path
+            digest = decode_digest(key, f"{label}.key")
+        elif kind == "source-sha256":
+            path_key, separator, digest_key = key.rpartition("=")
+            if not separator:
+                raise BindingError(f"{label}.key must be normalized path=digest")
+            path = normalize_path(path_key, f"{label}.key path")
+            digest = decode_digest(digest_key, f"{label}.key digest")
+        else:
+            if not CUSTOM_KIND.fullmatch(kind):
+                raise BindingError(f"{label}.kind is unsupported")
+            if kind not in kind_map:
+                raise BindingError(f"{label} uses unmapped kind {kind!r}")
+            path = kind_map[kind]
+            digest = decode_digest(key, f"{label}.key")
+            used_custom_kinds.add(kind)
+        bindings.append(SourceBinding(kind, path, digest))
+
+    unused = sorted(set(kind_map) - used_custom_kinds)
+    if unused:
+        raise BindingError(f"kind map contains unused custom kind {unused[0]!r}")
+
+    expected_by_path: dict[str, str] = {}
+    for binding in bindings:
+        previous = expected_by_path.get(binding.path)
+        if previous is not None and previous != binding.expected_digest:
+            raise BindingError(
+                f"conflicting expected digests for path={binding.path}: "
+                f"{previous} and {binding.expected_digest}"
+            )
+        expected_by_path[binding.path] = binding.expected_digest
+    return bindings
+
+
+def validate_bindings(
+    reader: GitTreeReader,
+    bindings: list[SourceBinding],
+) -> None:
+    paths = list(dict.fromkeys(binding.path for binding in bindings))
+    entries = reader.lookup_tree_entries(paths)
+    for path, entry in entries.items():
+        reader.require_regular_blob(path, entry)
+
+    objects = reader.blob_bytes([entries[path].object_id for path in paths])
+    actual_by_path = {
+        path: hashlib.sha256(objects[entries[path].object_id]).hexdigest()
+        for path in paths
+    }
+    for binding in bindings:
+        actual = actual_by_path[binding.path]
+        if actual != binding.expected_digest:
+            raise BindingError(
+                f"source binding mismatch: kind={binding.kind} path={binding.path} "
+                f"expected={binding.expected_digest} actual={actual}"
+            )
+
+
+def validate_project(
+    project: str,
+    selector: str,
+    kind_map_path: str | None,
+) -> dict[str, Any]:
+    requested_project = Path(project).expanduser()
+    if requested_project.is_symlink():
+        raise BindingError("--project must not be a symlink")
+    try:
+        root = requested_project.resolve(strict=True)
+    except OSError as error:
+        raise BindingError(f"--project is not an accessible directory: {error}") from error
+    if not root.is_dir():
+        raise BindingError("--project must be a repository directory")
+
+    reader = GitTreeReader(root)
+    reader.resolve_project_root()
+    tree_oid, commit_oid = reader.resolve_ref(selector)
+    reader.tree_oid = tree_oid
+
+    profile, _, manifest, kind_map = load_project_documents(reader, kind_map_path)
+    bindings = parse_bindings(profile, manifest, kind_map)
+    validate_bindings(reader, bindings)
+    reader.ensure_time_remaining()
+    return {
+        "schema": REPORT_SCHEMA,
+        "requested_ref": selector,
+        "tree_oid": tree_oid,
+        "commit_oid": commit_oid,
+        "checked_count": len(bindings),
+        "source_bindings_valid": True,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Check release source digests from one explicit Git commit or tree."
+    )
+    parser.add_argument("--project", required=True, help="exact repository root")
+    parser.add_argument(
+        "--ref",
+        required=True,
+        help="full lowercase Git commit or tree object ID",
+    )
+    parser.add_argument(
+        "--kind-map",
+        help="optional repository-relative JSON map read from the selected tree",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    if sys.version_info < (3, 11):
+        print("release-source-bindings requires Python 3.11 or newer", file=sys.stderr)
+        return 1
+    args = parse_args()
+    try:
+        report = validate_project(args.project, args.ref, args.kind_map)
+    except BindingError as error:
+        print(f"release-source-bindings: {error}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"release-source-bindings: invalid selected source: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
