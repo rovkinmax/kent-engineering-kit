@@ -1,0 +1,80 @@
+{
+  "schema": "release-source-binding-consumer-ci-v1",
+  "existing_jobs_only": true,
+  "checker_step": {
+    "name": "Validate release source bindings",
+    "position": "immediately-after-checkout",
+    "run": "python3 .kent/scripts/workflow-check-release-source-bindings --project . --ref \"$GITHUB_SHA\""
+  },
+  "consumers": [
+    {
+      "project": "AppsomeAndroid",
+      "repository": "OsomePteLtd/AppsomeAndroid",
+      "target_branch": "release/4.31.0",
+      "target_commit": "532797e49a6b37f0da295d06150f3217297bee16",
+      "workflow_path": ".github/workflows/build_stage_apk.yml",
+      "job": "detekt",
+      "checkout_action": "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+      "pull_request": {
+        "branches": ["master", "release/*"],
+        "types": ["opened", "synchronize"]
+      },
+      "other_events": [
+        {"event": "deployment"},
+        {"event": "push", "branches": ["master", "release/*"]},
+        {"event": "workflow_dispatch"}
+      ],
+      "path_filters": false,
+      "kind_map": null
+    },
+    {
+      "project": "Puber",
+      "repository": "rovkinmax/Puber",
+      "target_branch": "master",
+      "target_commit": "d51d489222e63c9ff215864b48b5022be99692ee",
+      "workflow_path": ".github/workflows/pr-checks.yml",
+      "job": "detekt",
+      "checkout_action": "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+      "pull_request": {
+        "branches": ["master"],
+        "types": null
+      },
+      "other_events": [],
+      "path_filters": false,
+      "kind_map": null
+    },
+    {
+      "project": "OsomeAPI-SDK-generator",
+      "repository": "OsomePteLtd/kmp-mobile-shared",
+      "target_branch": "main",
+      "target_commit": "3d9206a4c2d297f194fb99785eab65c821a3a0d6",
+      "workflow_path": ".github/workflows/check-pr.yml",
+      "job": "check",
+      "checkout_action": "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+      "pull_request": {
+        "branches": ["main"],
+        "types": ["opened", "synchronize", "reopened"]
+      },
+      "other_events": [],
+      "path_filters": false,
+      "kind_map": ".kent/workflows/source-binding-kinds.json",
+      "run": "python3 .kent/scripts/workflow-check-release-source-bindings --project . --ref \"$GITHUB_SHA\" --kind-map .kent/workflows/source-binding-kinds.json"
+    },
+    {
+      "project": "osome-slack-reader",
+      "repository": "OsomePteLtd/osome-slack-reader",
+      "target_branch": "main",
+      "target_commit": "1a0bfd7c0d7bbfd54885515b27b8d286570b705a",
+      "workflow_path": ".github/workflows/ci.yml",
+      "job": "quality",
+      "checkout_action": "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+      "pull_request": {
+        "branches": null,
+        "types": null
+      },
+      "other_events": [],
+      "path_filters": false,
+      "kind_map": null
+    }
+  ]
+}
