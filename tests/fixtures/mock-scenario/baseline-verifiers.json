@@ -1,0 +1,35 @@
+{
+  "schema": "mock-scenario-baseline-verifiers-v1",
+  "task_short_id": "KEN-11",
+  "fixed_point": "22c7e1821a194d7e867dde81ddfd10187c8486c3",
+  "scenario_id": "behavior-change-without-mock-backed-scenario-update",
+  "expected_transition": "blocked",
+  "projects": {
+    "AppsomeAndroid": {
+      "repository": "OsomePteLtd/AppsomeAndroid",
+      "revision": "2b52c2c69d8e553f02ed810f3441d6d6c2c5e14d",
+      "verifier_path": ".kent/scripts/workflow-compile-verify",
+      "fixture_path": "baseline/appsome/workflow-compile-verify",
+      "git_blob": "778ad0d9464227a92e23cf275743690c43582c15",
+      "sha256": "6a5e5349f0f1a457a3afa9fc9205bf0320730aff15bea71b8248660182097fc2",
+      "mode": "100755",
+      "fake_compile_command": [
+        "./gradlew",
+        ":app:compileDevDebugKotlin"
+      ]
+    },
+    "Puber": {
+      "repository": "rovkinmax/Puber",
+      "revision": "18d3e34dae2df2e2ab78f4208ec6cc0a15711ab9",
+      "verifier_path": ".kent/scripts/workflow-compile-verify",
+      "fixture_path": "baseline/puber/workflow-compile-verify",
+      "git_blob": "d3ac1170a7d293ef24a269d8231f2172b6cfb6ae",
+      "sha256": "bc342644325925eae39bfbbe489d1be1681f46b4e434cceceac5bb399b5b005c",
+      "mode": "100755",
+      "fake_compile_command": [
+        "./gradlew",
+        ":app:compileDevDebugKotlin"
+      ]
+    }
+  }
+}

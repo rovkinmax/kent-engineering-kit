@@ -1,0 +1,1191 @@
+#!/usr/bin/env python3
+"""Exercise bounded scenario evidence, verifier recovery and release closure."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BASELINE = "bf4a29c288410be93321bd53406c424d13024e71"
+CHILD_RELATIVE = ".kent/scripts/workflow-compile-verify"
+TASK = ":app:compileDevDebugKotlin"
+EVIDENCE_DIR = ROOT / "build/kent-workflow/OSM-112"
+MAX_LOG_BYTES = 16_384
+WORK_KINDS = ("feature", "bugfix", "refactor", "migration", "dependency", "test")
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def git(*args: str, cwd: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def capture_baseline_red() -> dict[str, object]:
+    head = git("rev-parse", "HEAD", cwd=ROOT)
+    if head != BASELINE:
+        raise RuntimeError(f"Expected immutable task baseline {BASELINE}, found {head}")
+
+    baseline_child = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"{BASELINE}:{CHILD_RELATIVE}"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    current_child = (ROOT / CHILD_RELATIVE).read_bytes()
+    if current_child != baseline_child:
+        raise RuntimeError("Compile verifier differs from the immutable baseline")
+
+    with tempfile.TemporaryDirectory(prefix="osome-baseline-red-") as temporary:
+        synthetic_root = Path(temporary) / ".kent/worktrees/mock-scenario-baseline"
+        child_path = synthetic_root / CHILD_RELATIVE
+        child_path.parent.mkdir(parents=True)
+        child_path.write_bytes(baseline_child)
+        child_path.chmod(0o755)
+
+        fake_compile = synthetic_root / "tools/agentw"
+        fake_compile.parent.mkdir(parents=True)
+        fake_compile.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" > invocation-args.txt\n"
+            "printf 'mock compile success\\n'\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_compile.chmod(0o755)
+
+        git("init", "-q", cwd=synthetic_root)
+        git("config", "user.name", "Appsome baseline fixture", cwd=synthetic_root)
+        git("config", "user.email", "baseline@example.invalid", cwd=synthetic_root)
+        git("add", CHILD_RELATIVE, "tools/agentw", cwd=synthetic_root)
+        git("commit", "-q", "-m", "baseline compile fixture", cwd=synthetic_root)
+        synthetic_commit = git("rev-parse", "HEAD", cwd=synthetic_root)
+
+        result = subprocess.run(
+            [str(child_path)],
+            cwd=synthetic_root,
+            input="{}\n",
+            text=True,
+            capture_output=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            check=True,
+        )
+        try:
+            output = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("Baseline compile child emitted invalid JSON") from error
+        invocation = (synthetic_root / "invocation-args.txt").read_text(
+            encoding="utf-8"
+        ).strip()
+        compiler_log = (
+            synthetic_root / "build/kent-workflow/compile-dev-debug.log"
+        ).read_bytes()
+        if output != {"transition": "passed"}:
+            raise RuntimeError(f"Expected baseline red result 'passed', got {output!r}")
+        if invocation != TASK or b"mock compile success\n" not in compiler_log:
+            raise RuntimeError("The fixed fake compiler did not complete the expected task")
+
+        bounded_log = (
+            "Compile child stdout:\n"
+            f"{result.stdout}"
+            "Compile child stderr:\n"
+            f"{result.stderr}"
+            "Fake compiler log:\n"
+            f"{compiler_log.decode('utf-8', errors='replace')}"
+        ).encode("utf-8")
+        if len(bounded_log) > MAX_LOG_BYTES:
+            raise RuntimeError("Baseline reproduction log exceeded its size limit")
+
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = EVIDENCE_DIR / "pre-edit-red.log"
+        log_path.write_bytes(bounded_log)
+        evidence: dict[str, object] = {
+            "schema": "appsome-mock-scenario-pre-edit-red-v1",
+            "task": "OSM-112",
+            "immutable_baseline": BASELINE,
+            "compile_child_path": CHILD_RELATIVE,
+            "compile_child_sha256": sha256(baseline_child),
+            "synthetic_git_head": synthetic_commit,
+            "scenario_evidence_present": False,
+            "expected_transition": "blocked",
+            "observed_transition": output["transition"],
+            "fixed_fake_compile": {
+                "task": invocation,
+                "result": "success",
+            },
+            "reproduced": True,
+            "bounded_log_path": str(log_path.relative_to(ROOT)),
+            "bounded_log_sha256": sha256(bounded_log),
+        }
+        evidence_path = EVIDENCE_DIR / "pre-edit-red.json"
+        evidence_path.write_text(
+            json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return evidence
+
+
+class ScenarioFixture:
+    def __init__(self, work_kind: str = "feature") -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="appsome-scenario-suite-")
+        self.root = Path(self.temporary.name).resolve() / "repo"
+        self.root.mkdir()
+        self.work_kind = work_kind
+        self.helper = self.root / ".kent/scripts/workflow-mock-scenario-evidence"
+        self.helper.parent.mkdir(parents=True)
+        shutil.copyfile(ROOT / ".kent/scripts/workflow-mock-scenario-evidence", self.helper)
+        self.helper.chmod(0o755)
+        (self.root / ".gitignore").write_text("**/build/\n", encoding="utf-8")
+        self.source = self.root / "src/main/Label.kt"
+        self.source.parent.mkdir(parents=True)
+        self.source.write_text('fun label() = "old"\n', encoding="utf-8")
+        self.fixture_path = self.root / "src/test/resources/label.json"
+        self.fixture_path.parent.mkdir(parents=True)
+        self.fixture_path.write_text('{"label":"old","expected":"OLD"}\n', encoding="utf-8")
+        self.scenario_path = "src/test/label_scenario.py"
+        self.case_id = "com.example.LabelScenario#showsUpdatedLabel"
+        scenario = self.root / self.scenario_path
+        scenario.write_text(
+            "import json\nfrom pathlib import Path\n"
+            "def showsUpdatedLabel():\n"
+            "    fixture = json.loads(Path('src/test/resources/label.json').read_text())\n"
+            "    rendered = fixture['label'].upper()  # synthetic mock-backed view\n"
+            "    assert rendered == fixture['expected'], (rendered, fixture['expected'])\n"
+            "    print(json.dumps({'consumed_label': fixture['label'], 'rendered': rendered}))\n"
+            "if __name__ == '__main__':\n    showsUpdatedLabel()\n",
+            encoding="utf-8",
+        )
+        self.git("init", "--quiet")
+        self.git("config", "user.name", "Appsome evidence fixture")
+        self.git("config", "user.email", "evidence@example.invalid")
+        self.git("add", ".")
+        self.git("commit", "--quiet", "-m", "synthetic baseline")
+        self.baseline = self.git("rev-parse", "HEAD")
+        self.results_dir = "app/build/test-results/mock-scenario"
+        (self.root / self.results_dir).mkdir(parents=True)
+        self.artifact_dir = self.root / "build/kent-workflow/OSM-112"
+        self.artifact_dir.mkdir(parents=True)
+
+    def git(self, *arguments: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(self.root), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.stdout.strip()
+
+    def close(self) -> None:
+        self.temporary.cleanup()
+
+    def change_app_behavior(self) -> None:
+        self.source.write_text('fun label() = "new"\n', encoding="utf-8")
+        self.change_fixture_only()
+        scenario = self.root / self.scenario_path
+        scenario.write_text(
+            scenario.read_text(encoding="utf-8").replace(
+                "    print(json.dumps",
+                "    source = Path('src/main/Label.kt').read_text()\n"
+                "    assert source == 'fun label() = \"new\"\\n'\n"
+                "    assert fixture['label'] == 'new' and rendered == 'NEW'\n"
+                "    print(json.dumps",
+            ),
+            encoding="utf-8",
+        )
+
+    def change_fixture_only(self) -> None:
+        self.fixture_path.write_text('{"label":"new","expected":"NEW"}\n', encoding="utf-8")
+
+    def run_selected_scenario(
+        self, testcase: unittest.TestCase, *, expected_outcome: str = "passed"
+    ) -> None:
+        result = subprocess.run(
+            [sys.executable, self.scenario_path], cwd=self.root, capture_output=True,
+            text=True, timeout=2, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        if expected_outcome == "passed":
+            testcase.assertEqual(0, result.returncode, result.stderr)
+            testcase.assertEqual(
+                {"consumed_label": "new", "rendered": "NEW"}, json.loads(result.stdout)
+            )
+        else:
+            testcase.assertEqual(1, result.returncode, result.stderr)
+            testcase.assertIn("AssertionError", result.stderr)
+        self.write_junit([self.case_id], outcome=expected_outcome)
+        (self.artifact_dir / "verification.log").write_text(
+            result.stdout + result.stderr, encoding="utf-8"
+        )
+
+    def change_non_applicable(self) -> None:
+        documentation = self.root / "docs/workflow-note.md"
+        documentation.parent.mkdir(parents=True)
+        documentation.write_text("Document a tooling contract.\n", encoding="utf-8")
+
+    def write_junit(
+        self,
+        case_ids: list[str],
+        *,
+        outcome: str = "passed",
+    ) -> Path:
+        cases = []
+        for case_id in case_ids:
+            class_name, method_name = case_id.split("#", 1)
+            child = ""
+            if outcome == "failed":
+                child = '<failure message="assertion failed">failed</failure>'
+            elif outcome == "skipped":
+                child = '<skipped message="not run"/>'
+            cases.append(
+                f'<testcase classname="{class_name}" name="{method_name}">'
+                f"{child}</testcase>"
+            )
+        result = self.root / self.results_dir / "TEST-selected.xml"
+        result.write_text(
+            f'<testsuite tests="{len(cases)}">{"".join(cases)}</testsuite>\n',
+            encoding="utf-8",
+        )
+        return result
+
+    def write_log(self) -> str:
+        log = self.artifact_dir / "verification.log"
+        log.write_text("synthetic selected verification completed\n", encoding="utf-8")
+        return log.relative_to(self.root).as_posix()
+
+    def run_helper(
+        self,
+        testcase: unittest.TestCase,
+        command: str,
+        request: dict[str, object],
+    ) -> dict[str, object]:
+        result = subprocess.run(
+            [sys.executable, str(self.helper), command],
+            cwd=self.root,
+            input=json.dumps(request, separators=(",", ":")) + "\n",
+            text=True,
+            capture_output=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            check=False,
+            timeout=2,
+        )
+        testcase.assertLessEqual(len(result.stdout), 32 * 1024, result.stderr)
+        testcase.assertLessEqual(len(result.stderr), 8192)
+        testcase.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def capture_before(
+        self,
+        testcase: unittest.TestCase,
+        selected_case_ids: list[str],
+        *,
+        output_path: str = "build/kent-workflow/OSM-112/start.json",
+    ) -> dict[str, object]:
+        return self.run_helper(
+            testcase,
+            "capture-before",
+            {
+                "workspace_path": str(self.root),
+                "task_short_id": "OSM-112",
+                "work_kind": self.work_kind,
+                "baseline": self.baseline,
+                "results_dir": self.results_dir,
+                "selected_case_ids": selected_case_ids,
+                "output_path": output_path,
+            },
+        )
+
+    def capture_after(
+        self,
+        testcase: unittest.TestCase,
+        *,
+        runner_exit_code: int = 0,
+        log_path: str | None = None,
+        start_path: str = "build/kent-workflow/OSM-112/start.json",
+        output_path: str = "build/kent-workflow/OSM-112/execution.json",
+    ) -> dict[str, object]:
+        return self.run_helper(
+            testcase,
+            "capture-after",
+            {
+                "workspace_path": str(self.root),
+                "start_path": start_path,
+                "output_path": output_path,
+                "runner_exit_code": runner_exit_code,
+                "log_path": log_path or self.write_log(),
+            },
+        )
+
+    def packet(
+        self,
+        start: dict[str, object],
+        after: dict[str, object],
+        *,
+        applicable: bool = True,
+        command: str = "python3 tools/run-selected-scenario",
+        behavior_delta_paths: list[str] | None = None,
+        scenario_paths: list[str] | None = None,
+        rationale: str = "This delivery changes workflow tooling, not app UI behavior.",
+    ) -> tuple[dict[str, object], dict[str, object], Path]:
+        start_record = json.loads(
+            (self.root / str(start["start_path"])).read_text(encoding="utf-8")
+        )
+        receipt = json.loads(
+            (self.root / str(after["receipt_path"])).read_text(encoding="utf-8")
+        )
+        delta = start_record["source_delta"]
+        all_paths = [str(item["path"]) for item in delta["files"]]
+        if behavior_delta_paths is None:
+            behavior_delta_paths = all_paths
+        if applicable:
+            if scenario_paths is None:
+                scenario_paths = [self.scenario_path]
+            behavior: dict[str, object] = {
+                "behavior_id": "label.changed",
+                "applicability": "applicable",
+                "delta_paths": behavior_delta_paths,
+                "source_paths": (
+                    ["src/main/Label.kt"]
+                    if "src/main/Label.kt" in behavior_delta_paths
+                    else []
+                ),
+                "scenario_paths": scenario_paths,
+                "mock_seam": "The scenario loads the changed label fixture.",
+                "assertions": ["The rendered label equals the fixture value."],
+                "test_case_ids": start_record["selected_case_ids"],
+            }
+        else:
+            behavior = {
+                "behavior_id": "workflow.documentation",
+                "applicability": "not_applicable",
+                "delta_paths": behavior_delta_paths,
+                "source_paths": [],
+                "rationale": rationale,
+                "alternative_verification": [
+                    "The bounded policy and local validator suite pass."
+                ],
+            }
+        log = receipt["verification_log"]
+        packet: dict[str, object] = {
+            "schema": "mock-scenario-evidence-v1",
+            "execution_id": start_record["execution_id"],
+            "task_short_id": "OSM-112",
+            "work_kind": self.work_kind,
+            "baseline": self.baseline,
+            "source_delta": delta,
+            "source_sha256": delta["sha256"],
+            "behaviors": [behavior],
+            "verification": {
+                "result": receipt["result"],
+                "command": command,
+                "log_path": log["path"],
+                "log_sha256": log["sha256"],
+            },
+            "execution_receipt": {
+                "path": after["receipt_path"],
+                "sha256": after["receipt_sha256"],
+            },
+        }
+        evidence_path = self.artifact_dir / "evidence.json"
+        evidence_path.write_text(
+            json.dumps(packet, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        envelope = {
+            "schema": "mock-scenario-review-context-v1",
+            "evidence_path": evidence_path.relative_to(self.root).as_posix(),
+            "evidence_sha256": sha256(evidence_path.read_bytes()),
+            "narrative": "Retain the existing review context and behavior rationale.",
+        }
+        return packet, envelope, evidence_path
+
+    def validate(
+        self,
+        testcase: unittest.TestCase,
+        envelope: object,
+    ) -> dict[str, object]:
+        if isinstance(envelope, str):
+            serialized = envelope
+        else:
+            serialized = json.dumps(envelope, separators=(",", ":"))
+        return self.run_helper(
+            testcase,
+            "validate",
+            {"workspace_path": str(self.root), "review_context": serialized},
+        )
+
+
+class MockScenarioEvidenceTest(unittest.TestCase):
+    def test_all_kinds_execution_failure_skip_and_missing_case(self) -> None:
+        for work_kind in WORK_KINDS:
+            for outcome, status in (("failed", "failed"), ("skipped", "blocked"), ("missing", "blocked")):
+                with self.subTest(work_kind=work_kind, outcome=outcome):
+                    fixture = self.make_fixture(work_kind)
+                    try:
+                        fixture.change_app_behavior()
+                        start = fixture.capture_before(self, [fixture.case_id])
+                        fixture.write_junit(
+                            [fixture.case_id] if outcome != "missing" else ["com.example.LabelScenario#other"],
+                            outcome=outcome,
+                        )
+                        after = fixture.capture_after(self, runner_exit_code=1 if outcome == "failed" else 0)
+                        _, envelope, _ = fixture.packet(start, after)
+                        result = fixture.validate(self, envelope)
+                        self.assertEqual(status, result["status"], result)
+                    finally:
+                        fixture.close()
+
+    def test_regular_artifact_reads_remain_bounded(self) -> None:
+        for artifact in ("evidence.json", "start.json", "execution.json", "verification.log"):
+            with self.subTest(artifact=artifact):
+                fixture = self.make_fixture()
+                try:
+                    _, envelope, _ = self.valid_applicable_packet(fixture)
+                    limit = 4 * 1024 * 1024 if artifact.endswith(".log") else 256 * 1024
+                    (fixture.artifact_dir / artifact).write_bytes(b"x" * (limit + 1))
+                    result = fixture.validate(self, envelope)
+                    self.assertEqual("blocked", result["status"])
+                    self.assertEqual(
+                        "log_too_large" if artifact.endswith(".log") else "json_too_large",
+                        result["reason_code"],
+                    )
+                finally:
+                    fixture.close()
+
+    def test_all_kinds_applicable_and_missing_scenario_delta(self) -> None:
+        for work_kind in WORK_KINDS:
+            with self.subTest(work_kind=work_kind, case="changed-scenario"):
+                fixture = self.make_fixture(work_kind)
+                try:
+                    packet, envelope, _ = self.valid_applicable_packet(fixture)
+                    self.assertEqual(work_kind, packet["work_kind"])
+                    self.assertEqual("passed", fixture.validate(self, envelope)["status"])
+                finally:
+                    fixture.close()
+            for scenario_paths in ([fixture.scenario_path], []):
+                with self.subTest(work_kind=work_kind, scenario_paths=scenario_paths):
+                    fixture = self.make_fixture(work_kind)
+                    try:
+                        # Executing a pre-existing case is insufficient: only
+                        # implementation changed, not the scenario or fixture.
+                        fixture.source.write_text('fun label() = "new"\n', encoding="utf-8")
+                        start = fixture.capture_before(self, [fixture.case_id])
+                        result = subprocess.run(
+                            [sys.executable, fixture.scenario_path], cwd=fixture.root,
+                            capture_output=True, text=True, timeout=2,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                        )
+                        self.assertEqual(0, result.returncode, result.stderr)
+                        fixture.write_junit([fixture.case_id])
+                        after = fixture.capture_after(self)
+                        self.assertEqual("passed", after["status"])
+                        _, envelope, _ = fixture.packet(start, after, scenario_paths=scenario_paths)
+                        blocked = fixture.validate(self, envelope)
+                        self.assertEqual("blocked", blocked["status"])
+                        self.assertEqual(
+                            "scenario_path_unmapped" if scenario_paths else "list_invalid",
+                            blocked["reason_code"],
+                        )
+                    finally:
+                        fixture.close()
+
+    def test_mixed_applicability_requires_every_behavior(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_non_applicable()
+            packet, envelope, path = self.valid_applicable_packet(fixture)
+            documentation = "docs/workflow-note.md"
+            packet["behaviors"][0]["delta_paths"].remove(documentation)
+            packet["behaviors"].append({
+                "behavior_id": "workflow.documentation", "applicability": "not_applicable",
+                "delta_paths": [documentation], "source_paths": [],
+                "rationale": "The workflow note is documentation, not rendered application behavior.",
+                "alternative_verification": ["Synthetic source inventory maps the tooling note."],
+            })
+            path.write_text(json.dumps(packet), encoding="utf-8")
+            envelope["evidence_sha256"] = sha256(path.read_bytes())
+            result = fixture.validate(self, envelope)
+            self.assertEqual("passed", result["status"])
+            self.assertEqual(2, result["behavior_count"])
+            packet["behaviors"].pop()
+            path.write_text(json.dumps(packet), encoding="utf-8")
+            envelope["evidence_sha256"] = sha256(path.read_bytes())
+            self.assertEqual(
+                "behavior_inventory_incomplete", fixture.validate(self, envelope)["reason_code"]
+            )
+        finally:
+            fixture.close()
+
+    def test_fix_reentry_recovers_pointer_and_refreshes_changed_evidence(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            old_packet, envelope, _ = self.valid_applicable_packet(fixture)
+            pointer = fixture.artifact_dir / "review-envelope.json"
+            pointer.write_text(json.dumps(envelope), encoding="utf-8")
+            self.assertEqual("blocked", fixture.validate(self, None)["status"])
+            recovered = json.loads(pointer.read_text(encoding="utf-8"))
+            self.assertEqual("passed", fixture.validate(self, recovered)["status"])
+            # Fix the mapped behavior, then prove the recovered old evidence
+            # cannot admit the new source. A fresh execution must be captured.
+            fixture.source.write_text('fun label() = "fixed"\n', encoding="utf-8")
+            scenario = fixture.root / fixture.scenario_path
+            scenario.write_text(
+                scenario.read_text().replace('fun label() = "new"', 'fun label() = "fixed"'),
+                encoding="utf-8",
+            )
+            stale = fixture.validate(self, recovered)
+            self.assertEqual("source_drift", stale["reason_code"])
+            start = fixture.capture_before(
+                self, [fixture.case_id], output_path="build/kent-workflow/OSM-112/fix-start.json"
+            )
+            fixture.run_selected_scenario(self)
+            # Same case/result content is stale; an actual fresh run has a
+            # distinct XML identity, here explicitly marked with the run ID.
+            xml = fixture.root / fixture.results_dir / "TEST-selected.xml"
+            xml.write_text(xml.read_text().replace("<testsuite ", f'<testsuite run="{start["execution_id"]}" '))
+            after = fixture.capture_after(
+                self, log_path="build/kent-workflow/OSM-112/verification.log",
+                start_path=str(start["start_path"]),
+                output_path="build/kent-workflow/OSM-112/fix-execution.json",
+            )
+            packet, refreshed, _ = fixture.packet(start, after)
+            self.assertNotEqual(old_packet["execution_id"], packet["execution_id"])
+            self.assertNotEqual(old_packet["source_sha256"], packet["source_sha256"])
+            self.assertEqual("passed", fixture.validate(self, refreshed)["status"])
+        finally:
+            fixture.close()
+
+    def test_fifo_artifacts_fail_closed_without_waiting_for_a_writer(self) -> None:
+        for artifact in ("evidence.json", "start.json", "execution.json", "verification.log"):
+            with self.subTest(artifact=artifact):
+                fixture = self.make_fixture()
+                try:
+                    _, envelope, _ = self.valid_applicable_packet(fixture)
+                    path = fixture.artifact_dir / artifact
+                    path.unlink()
+                    os.mkfifo(path)
+                    started = time.monotonic()
+                    try:
+                        result = fixture.validate(self, envelope)
+                    except subprocess.TimeoutExpired:
+                        self.fail(f"FIFO {artifact} blocked instead of returning JSON")
+                    self.assertLess(time.monotonic() - started, 2)
+                    self.assertEqual("blocked", result["status"])
+                    self.assertEqual("field_invalid", result["reason_code"])
+                    if artifact in ("start.json", "verification.log"):
+                        (fixture.artifact_dir / "execution.json").unlink()
+                        result = fixture.capture_after(
+                            self, log_path="build/kent-workflow/OSM-112/verification.log"
+                        )
+                        self.assertEqual("field_invalid", result["reason_code"])
+                finally:
+                    fixture.close()
+
+    def test_multiline_narrative_is_retained_and_bounded(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            _, envelope, _ = self.valid_applicable_packet(fixture)
+            narrative = "Prior review:\r\n- first finding\n\tSecond line.\n"
+            envelope["narrative"] = narrative
+            self.assertEqual("passed", fixture.validate(self, envelope)["status"])
+            self.assertEqual(narrative, envelope["narrative"])
+            for invalid in (" \r\n\t", "x" * (16 * 1024 + 1), "bad\x00text"):
+                envelope["narrative"] = invalid
+                result = fixture.validate(self, envelope)
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("field_invalid", result["reason_code"])
+        finally:
+            fixture.close()
+
+    def make_fixture(self, work_kind: str = "feature") -> ScenarioFixture:
+        return ScenarioFixture(work_kind)
+
+    def valid_applicable_packet(
+        self,
+        fixture: ScenarioFixture,
+        *,
+        outcome: str = "passed",
+        runner_exit_code: int = 0,
+        preexisting: bool = False,
+    ) -> tuple[dict[str, object], dict[str, object], Path]:
+        fixture.change_app_behavior()
+        if outcome == "failed":
+            scenario = fixture.root / fixture.scenario_path
+            scenario.write_text(scenario.read_text().replace("rendered == 'NEW'", "rendered == 'WRONG'"))
+        if preexisting:
+            fixture.write_junit([fixture.case_id], outcome="passed")
+        start = fixture.capture_before(self, [fixture.case_id])
+        if start.get("status") != "passed":
+            raise AssertionError(start)
+        if not preexisting:
+            if outcome in ("passed", "failed"):
+                fixture.run_selected_scenario(self, expected_outcome=outcome)
+            else:
+                fixture.write_junit([fixture.case_id], outcome=outcome)
+        after = fixture.capture_after(
+            self, runner_exit_code=runner_exit_code,
+            log_path=(
+                "build/kent-workflow/OSM-112/verification.log"
+                if not preexisting and outcome in ("passed", "failed") else None
+            ),
+        )
+        packet, envelope, path = fixture.packet(start, after)
+        return packet, envelope, path
+
+    def test_valid_changed_scenario_passes(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            packet, envelope, _ = self.valid_applicable_packet(fixture)
+            result = fixture.validate(self, envelope)
+            self.assertEqual("passed", result["status"], result)
+            self.assertEqual(1, result["behavior_count"])
+            self.assertEqual(packet["source_sha256"], result["source_sha256"])
+        finally:
+            fixture.close()
+
+    def test_fixture_only_scenario_update_can_pass(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_fixture_only()
+            start = fixture.capture_before(self, [fixture.case_id])
+            fixture.run_selected_scenario(self)
+            after = fixture.capture_after(
+                self, log_path="build/kent-workflow/OSM-112/verification.log"
+            )
+            packet, envelope, _ = fixture.packet(
+                start,
+                after,
+                scenario_paths=["src/test/resources/label.json"],
+            )
+            behavior = packet["behaviors"][0]
+            self.assertEqual([], behavior["source_paths"])
+            self.assertEqual(
+                ["src/test/resources/label.json"],
+                [item["path"] for item in packet["source_delta"]["files"]],
+            )
+            # Unchanged case body actually consumes the fixture. A bad expected
+            # value makes that same executable assertion fail, not check(true).
+            fixture.fixture_path.write_text('{"label":"new","expected":"OLD"}\n', encoding="utf-8")
+            failure = subprocess.run(
+                [sys.executable, fixture.scenario_path], cwd=fixture.root,
+                capture_output=True, text=True, timeout=2,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            self.assertNotEqual(0, failure.returncode)
+            self.assertIn("AssertionError", failure.stderr)
+            fixture.change_fixture_only()
+            result = fixture.validate(self, envelope)
+            self.assertEqual("passed", result["status"], result)
+        finally:
+            fixture.close()
+
+    def test_all_six_work_kinds_allow_concrete_non_applicability(self) -> None:
+        for work_kind in sorted(
+            {"feature", "bugfix", "refactor", "migration", "dependency", "test"}
+        ):
+            with self.subTest(work_kind=work_kind):
+                fixture = self.make_fixture(work_kind)
+                try:
+                    fixture.change_non_applicable()
+                    start = fixture.capture_before(self, [])
+                    self.assertEqual("passed", start["status"])
+                    after = fixture.capture_after(self)
+                    packet, envelope, _ = fixture.packet(
+                        start,
+                        after,
+                        applicable=False,
+                    )
+                    self.assertEqual(work_kind, packet["work_kind"])
+                    result = fixture.validate(self, envelope)
+                    self.assertEqual("passed", result["status"], result)
+                finally:
+                    fixture.close()
+
+    def test_selected_failure_is_failed(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            packet, envelope, _ = self.valid_applicable_packet(
+                fixture,
+                outcome="failed",
+                runner_exit_code=1,
+            )
+            self.assertEqual("failed", packet["verification"]["result"])
+            result = fixture.validate(self, envelope)
+            self.assertEqual("failed", result["status"], result)
+        finally:
+            fixture.close()
+
+    def test_skipped_selected_case_is_blocked(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_app_behavior()
+            start = fixture.capture_before(self, [fixture.case_id])
+            fixture.write_junit([fixture.case_id], outcome="skipped")
+            after = fixture.capture_after(self)
+            packet, envelope, _ = fixture.packet(start, after)
+            self.assertEqual("blocked", packet["verification"]["result"])
+            self.assertEqual("blocked", fixture.validate(self, envelope)["status"])
+        finally:
+            fixture.close()
+
+    def test_missing_selected_case_is_blocked(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_app_behavior()
+            start = fixture.capture_before(self, [fixture.case_id])
+            fixture.write_junit(["com.example.LabelScenario#anotherCase"])
+            after = fixture.capture_after(self)
+            _, envelope, _ = fixture.packet(start, after)
+            self.assertEqual("blocked", fixture.validate(self, envelope)["status"])
+        finally:
+            fixture.close()
+
+    def test_unchanged_preexisting_junit_xml_is_stale(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            packet, envelope, _ = self.valid_applicable_packet(
+                fixture,
+                preexisting=True,
+            )
+            self.assertEqual("blocked", packet["verification"]["result"])
+            self.assertEqual("blocked", fixture.validate(self, envelope)["status"])
+        finally:
+            fixture.close()
+
+    def test_source_drift_between_capture_and_run_blocks(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_app_behavior()
+            start = fixture.capture_before(self, [fixture.case_id])
+            self.assertEqual("passed", start["status"])
+            fixture.source.write_text('fun label() = "drifted"\n', encoding="utf-8")
+            after = fixture.capture_after(self)
+            self.assertEqual("blocked", after["status"])
+            self.assertEqual("source_drift", after["reason_code"])
+        finally:
+            fixture.close()
+
+    def test_source_mode_drift_between_capture_and_run_blocks(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_app_behavior()
+            start = fixture.capture_before(self, [fixture.case_id])
+            self.assertEqual("passed", start["status"])
+            fixture.source.chmod(0o755)
+            after = fixture.capture_after(self)
+            self.assertEqual("blocked", after["status"])
+            self.assertEqual("source_drift", after["reason_code"])
+        finally:
+            fixture.close()
+
+    def test_result_drift_after_receipt_blocks(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            _, envelope, _ = self.valid_applicable_packet(fixture)
+            result_file = fixture.root / fixture.results_dir / "TEST-selected.xml"
+            result_file.write_text(
+                '<testsuite><testcase classname="com.example.LabelScenario" '
+                'name="showsUpdatedLabel"><failure>late change</failure>'
+                "</testcase></testsuite>\n",
+                encoding="utf-8",
+            )
+            result = fixture.validate(self, envelope)
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("result_drift", result["reason_code"])
+        finally:
+            fixture.close()
+
+    def test_stale_receipt_and_changed_log_are_blocked(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            packet, envelope, _ = self.valid_applicable_packet(fixture)
+            receipt_path = fixture.root / str(packet["execution_receipt"]["path"])
+            receipt_path.write_bytes(receipt_path.read_bytes() + b" ")
+            result = fixture.validate(self, envelope)
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("receipt_digest_mismatch", result["reason_code"])
+        finally:
+            fixture.close()
+
+    def test_new_packet_cannot_reuse_an_older_execution_receipt(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            _, envelope, evidence_path = self.valid_applicable_packet(fixture)
+            packet = json.loads(evidence_path.read_text(encoding="utf-8"))
+            packet["execution_id"] = "f" * 32
+            evidence_path.write_text(
+                json.dumps(packet, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            envelope["evidence_sha256"] = sha256(evidence_path.read_bytes())
+            result = fixture.validate(self, envelope)
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("receipt_identity_mismatch", result["reason_code"])
+        finally:
+            fixture.close()
+
+        fixture = self.make_fixture()
+        try:
+            _, envelope, _ = self.valid_applicable_packet(fixture)
+            log = fixture.artifact_dir / "verification.log"
+            log.write_text("late log change\n", encoding="utf-8")
+            result = fixture.validate(self, envelope)
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("log_digest_mismatch", result["reason_code"])
+        finally:
+            fixture.close()
+
+    def test_missing_envelope_and_missing_infrastructure_are_blocked(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            self.assertEqual("blocked", fixture.validate(self, None)["status"])
+            fixture.change_app_behavior()
+            shutil.rmtree(fixture.root / fixture.results_dir)
+            result = fixture.capture_before(self, [fixture.case_id])
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("path_missing", result["reason_code"])
+        finally:
+            fixture.close()
+
+    def test_unknown_work_kind_is_rejected(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_non_applicable()
+            request = {
+                "workspace_path": str(fixture.root),
+                "task_short_id": "OSM-112",
+                "work_kind": "story",
+                "baseline": fixture.baseline,
+                "results_dir": fixture.results_dir,
+                "selected_case_ids": [],
+                "output_path": "build/kent-workflow/OSM-112/start.json",
+            }
+            result = fixture.run_helper(self, "capture-before", request)
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("work_kind_invalid", result["reason_code"])
+        finally:
+            fixture.close()
+
+    def test_nonzero_runner_without_a_case_failure_is_blocked(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_app_behavior()
+            start = fixture.capture_before(self, [fixture.case_id])
+            fixture.write_junit([fixture.case_id])
+            after = fixture.capture_after(self, runner_exit_code=7)
+            packet, envelope, _ = fixture.packet(start, after)
+            self.assertEqual("blocked", packet["verification"]["result"])
+            self.assertEqual("blocked", fixture.validate(self, envelope)["status"])
+        finally:
+            fixture.close()
+
+    def test_test_only_delta_without_scenario_mapping_is_rejected(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_app_behavior()
+            start = fixture.capture_before(self, [fixture.case_id])
+            fixture.write_junit([fixture.case_id])
+            after = fixture.capture_after(self)
+            _, envelope, evidence_path = fixture.packet(
+                start,
+                after,
+                scenario_paths=[],
+            )
+            packet = json.loads(evidence_path.read_text(encoding="utf-8"))
+            packet["behaviors"][0]["scenario_paths"] = []
+            evidence_path.write_text(
+                json.dumps(packet, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            envelope["evidence_sha256"] = sha256(evidence_path.read_bytes())
+            self.assertEqual("blocked", fixture.validate(self, envelope)["status"])
+        finally:
+            fixture.close()
+
+    def test_incomplete_delta_mapping_is_rejected(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            packet, envelope, evidence_path = self.valid_applicable_packet(fixture)
+            packet["behaviors"][0]["delta_paths"] = ["src/main/Label.kt"]
+            evidence_path.write_text(
+                json.dumps(packet, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            envelope["evidence_sha256"] = sha256(evidence_path.read_bytes())
+            self.assertEqual("blocked", fixture.validate(self, envelope)["status"])
+        finally:
+            fixture.close()
+
+    def test_blank_non_applicability_rationale_is_rejected(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_non_applicable()
+            start = fixture.capture_before(self, [])
+            after = fixture.capture_after(self)
+            _, envelope, evidence_path = fixture.packet(start, after, applicable=False)
+            packet = json.loads(evidence_path.read_text(encoding="utf-8"))
+            packet["behaviors"][0]["rationale"] = "   "
+            evidence_path.write_text(
+                json.dumps(packet, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            envelope["evidence_sha256"] = sha256(evidence_path.read_bytes())
+            self.assertEqual("blocked", fixture.validate(self, envelope)["status"])
+        finally:
+            fixture.close()
+
+    def test_unknown_packet_field_is_rejected(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            _, envelope, evidence_path = self.valid_applicable_packet(fixture)
+            packet = json.loads(evidence_path.read_text(encoding="utf-8"))
+            packet["unreviewed_status"] = "passed"
+            evidence_path.write_text(
+                json.dumps(packet, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            envelope["evidence_sha256"] = sha256(evidence_path.read_bytes())
+            result = fixture.validate(self, envelope)
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("packet_schema_invalid", result["reason_code"])
+        finally:
+            fixture.close()
+
+    def test_duplicate_packet_key_is_rejected(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            _, envelope, evidence_path = self.valid_applicable_packet(fixture)
+            evidence_path.write_text(
+                '{"schema":"mock-scenario-evidence-v1",'
+                '"schema":"mock-scenario-evidence-v1"}\n',
+                encoding="utf-8",
+            )
+            envelope["evidence_sha256"] = sha256(evidence_path.read_bytes())
+            result = fixture.validate(self, envelope)
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("json_duplicate_key", result["reason_code"])
+        finally:
+            fixture.close()
+
+    def test_packet_command_is_inert(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            _, envelope, evidence_path = self.valid_applicable_packet(fixture)
+            marker = fixture.artifact_dir / "command-was-run"
+            packet = json.loads(evidence_path.read_text(encoding="utf-8"))
+            packet["verification"]["command"] = f"touch {marker}"
+            evidence_path.write_text(
+                json.dumps(packet, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            envelope["evidence_sha256"] = sha256(evidence_path.read_bytes())
+            self.assertEqual("passed", fixture.validate(self, envelope)["status"])
+            self.assertFalse(marker.exists())
+        finally:
+            fixture.close()
+
+    def test_traversal_and_symlink_paths_are_blocked(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            outside = Path(fixture.temporary.name) / "outside.json"
+            outside.write_text("{}", encoding="utf-8")
+            invalid = {
+                "schema": "mock-scenario-review-context-v1",
+                "evidence_path": "../outside.json",
+                "evidence_sha256": "0" * 64,
+                "narrative": "review context",
+            }
+            result = fixture.validate(self, invalid)
+            self.assertEqual("blocked", result["status"])
+
+            link = fixture.artifact_dir / "linked.json"
+            link.symlink_to(outside)
+            invalid["evidence_path"] = "build/kent-workflow/OSM-112/linked.json"
+            result = fixture.validate(self, invalid)
+            self.assertEqual("blocked", result["status"])
+        finally:
+            fixture.close()
+
+    def test_duplicate_envelope_keys_and_oversized_envelope_are_blocked(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            duplicate = (
+                '{"schema":"mock-scenario-review-context-v1",'
+                '"schema":"mock-scenario-review-context-v1",'
+                '"evidence_path":"build/kent-workflow/OSM-112/missing.json",'
+                f'"evidence_sha256":"{"0" * 64}","narrative":"context"}}'
+            )
+            result = fixture.validate(self, duplicate)
+            self.assertEqual("blocked", result["status"])
+            long_narrative = "x" * (32 * 1024)
+            oversized = {
+                "schema": "mock-scenario-review-context-v1",
+                "evidence_path": "build/kent-workflow/OSM-112/missing.json",
+                "evidence_sha256": "0" * 64,
+                "narrative": long_narrative,
+            }
+            result = fixture.validate(self, oversized)
+            self.assertEqual("blocked", result["status"])
+        finally:
+            fixture.close()
+
+    def test_symlink_source_and_oversized_source_are_blocked(self) -> None:
+        fixture = self.make_fixture()
+        try:
+            fixture.change_non_applicable()
+            external = Path(fixture.temporary.name) / "outside.kt"
+            external.write_text("outside\n", encoding="utf-8")
+            link = fixture.root / "src/main/external.kt"
+            link.symlink_to(external)
+            result = fixture.capture_before(self, [])
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("path_symlink", result["reason_code"])
+        finally:
+            fixture.close()
+
+        fixture = self.make_fixture()
+        try:
+            fixture.change_non_applicable()
+            large = fixture.root / "docs/large.txt"
+            large.parent.mkdir(parents=True, exist_ok=True)
+            large.write_bytes(b"x" * (4 * 1024 * 1024 + 1))
+            result = fixture.capture_before(self, [])
+            self.assertEqual("blocked", result["status"])
+            self.assertEqual("source_file_too_large", result["reason_code"])
+        finally:
+            fixture.close()
+
+
+def verify_manifest_fixtures() -> None:
+    """Resolve the actual project closure with the explicitly selected Kit."""
+    kit = Path(os.environ["KENT_ENGINEERING_KIT_ROOT"]).resolve(strict=True)
+    sys.path.insert(0, str(kit))
+    from workflowkit.profile import ProjectProfile
+    from workflowkit.release import ReleaseSpec
+    from workflowkit.revision import (
+        RevisionPreflightError, add_release_requirements, collect_runtime_external_captures,
+        preflight_project_revision, profile_requirements,
+    )
+
+    profile = ProjectProfile.load(ROOT)
+    spec = ReleaseSpec.from_toml(
+        (ROOT / profile.release.spec_path).read_text(), profile=profile
+    )
+    requirements = profile_requirements(profile)
+    add_release_requirements(requirements, spec)
+    manifest_path = spec.source_manifest.path
+    manifest = json.loads((ROOT / manifest_path).read_text())
+    assert manifest["additional_trees"] == []
+    paths = set(requirements) | set(manifest["additional_paths"]) | {manifest_path}
+    policy_paths = {
+        ".kent/commands/mock-scenario-policy.md",
+        ".kent/scripts/workflow-mock-scenario-evidence",
+        "tools/test-workflow-mock-scenario-evidence",
+        ".kent/scripts/tests/test-workflow-verify-report",
+    }
+    with tempfile.TemporaryDirectory(prefix="appsome-policy-manifest-") as directory:
+        root = Path(directory)
+        for relative in sorted(paths):
+            source = ROOT / relative
+            assert source.is_file() and not source.is_symlink(), relative
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        git("init", "-q", cwd=root)
+        git("config", "user.name", "Appsome manifest fixture", cwd=root)
+        git("config", "user.email", "manifest@example.invalid", cwd=root)
+
+        def commit() -> str:
+            git("add", ".", cwd=root)
+            git("-c", "core.hooksPath=/dev/null", "commit", "-qm", "Manifest fixture", cwd=root)
+            return git("rev-parse", "HEAD", cwd=root)
+
+        good = commit()
+        resolved = preflight_project_revision(root, good)
+        assert policy_paths <= {item.path for item in resolved.checked_paths}
+        inputs = resolved.selected_runtime_source_inputs
+        assert inputs is not None
+        captures = collect_runtime_external_captures(root, inputs)
+        captured = {
+            key.split("=", 1)[0] for kind, key, _ in captures if kind == "source-sha256"
+        }
+        assert policy_paths <= captured
+        print("manifest resolved closure: policy/helper/suite/wrapper paths and digests passed")
+
+        broken = json.loads(json.dumps(manifest))
+        broken["additional_paths"] = sorted(broken["additional_paths"] + ["missing-policy-file"])
+        (root / manifest_path).write_text(json.dumps(broken))
+        missing = commit()
+        try:
+            preflight_project_revision(root, missing)
+        except RevisionPreflightError as error:
+            assert "additional path not found" in str(error), error
+        else:
+            raise AssertionError("Manifest resolver accepted a missing additional path")
+
+        broken = json.loads(json.dumps(manifest))
+        for external in broken["external_roots"]:
+            if external["key"].startswith(".kent/scripts/workflow-mock-scenario-evidence="):
+                external["key"] = external["key"].split("=", 1)[0] + "=sha256:" + ":".join(["0" * 8] * 8)
+        broken["external_roots"].sort(key=lambda item: (item["kind"], item["key"]))
+        (root / manifest_path).write_text(json.dumps(broken))
+        mismatch = commit()
+        invalid_inputs = preflight_project_revision(root, mismatch).selected_runtime_source_inputs
+        try:
+            collect_runtime_external_captures(root, invalid_inputs)
+        except RevisionPreflightError as error:
+            assert "digest mismatch" in str(error), error
+        else:
+            raise AssertionError("Manifest external-capture resolver accepted a mismatched digest")
+        # Immutable good revision remains valid despite the two invalid tips.
+        recovered = preflight_project_revision(root, good)
+        assert captures == collect_runtime_external_captures(root, recovered.selected_runtime_source_inputs)
+        print("manifest missing-path/mismatched-digest negatives and pinned recovery: passed")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--baseline-red",
+        action="store_true",
+        help="reproduce the baseline's false pass without scenario evidence",
+    )
+    parser.add_argument(
+        "--manifest-fixtures", action="store_true",
+        help="also exercise source closure with explicit KENT_ENGINEERING_KIT_ROOT",
+    )
+    arguments, remaining = parser.parse_known_args()
+    if arguments.baseline_red:
+        if remaining:
+            parser.error("--baseline-red does not accept test filters")
+        evidence = capture_baseline_red()
+        print(json.dumps(evidence, sort_keys=True))
+        return 0
+    result = unittest.main(argv=[sys.argv[0], *remaining], exit=False).result
+    if result.wasSuccessful() and arguments.manifest_fixtures:
+        verify_manifest_fixtures()
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"test-workflow-mock-scenario-evidence: {error}")
+        raise SystemExit(1)

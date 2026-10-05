@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+IFS= read -r _kent_input || true
+
+log_dir="build/kent-workflow"
+log_path="$log_dir/compile-dev-debug.log"
+mkdir -p "$log_dir"
+
+_scenario_request="$(
+  printf '%s' "$_kent_input" | python3 -c '
+import json
+import sys
+
+def unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+try:
+    raw = sys.stdin.buffer.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError("input too large")
+    payload = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs)
+    if not isinstance(payload, dict):
+        raise ValueError("input is not an object")
+    workspace = payload.get("workspace_path")
+    review_context = payload.get("review_context")
+    if not isinstance(workspace, str) or not isinstance(review_context, str):
+        raise ValueError("review context is missing")
+    print(
+        json.dumps(
+            {"workspace_path": workspace, "review_context": review_context},
+            separators=(",", ":"),
+        )
+    )
+except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+    sys.exit(1)
+'
+)" || {
+  printf 'Mock-scenario evidence envelope is missing or invalid.\n' >&2
+  printf '{"transition":"blocked"}\n'
+  exit 0
+}
+
+_scenario_helper=".kent/scripts/workflow-mock-scenario-evidence"
+if [[ -L .kent || ! -d .kent || -L .kent/scripts || ! -d .kent/scripts ||
+      -L "$_scenario_helper" || ! -f "$_scenario_helper" || ! -x "$_scenario_helper" ]]; then
+  printf 'Mock-scenario evidence helper is missing or unsafe.\n' >&2
+  printf '{"transition":"blocked"}\n'
+  exit 0
+fi
+
+if ! _scenario_result="$(
+  printf '%s' "$_scenario_request" |
+    "$_scenario_helper" validate 2>/dev/null
+)"; then
+  printf 'Mock-scenario evidence validation is unavailable.\n' >&2
+  printf '{"transition":"blocked"}\n'
+  exit 0
+fi
+
+if ! _scenario_status="$(
+  printf '%s' "$_scenario_result" | python3 -c '
+import json
+import sys
+
+def unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+try:
+    result = json.loads(sys.stdin.read(), object_pairs_hook=unique_pairs)
+    status = result.get("status") if isinstance(result, dict) else None
+    if status not in {"passed", "failed", "blocked"}:
+        raise ValueError("validation result is invalid")
+    print(status)
+except (json.JSONDecodeError, ValueError, RecursionError):
+    sys.exit(1)
+'
+)"; then
+  printf 'Mock-scenario evidence validation returned an invalid result.\n' >&2
+  printf '{"transition":"blocked"}\n'
+  exit 0
+fi
+
+case "$_scenario_status" in
+  passed)
+    ;;
+  failed)
+    printf 'Mock-scenario evidence reports a failed selected scenario.\n' >&2
+    printf '{"transition":"failed"}\n'
+    exit 0
+    ;;
+  *)
+    printf 'Mock-scenario evidence is blocked or incomplete.\n' >&2
+    printf '{"transition":"blocked"}\n'
+    exit 0
+    ;;
+esac
+
+if [[ "$PWD" == *"/.kent/worktrees/"* ]]; then
+  command=(./tools/agentw :app:compileDevDebugKotlin)
+else
+  command=(./gradlew :app:compileDevDebugKotlin)
+fi
+
+if [[ ! -x "${command[0]}" ]]; then
+  printf 'Compile verifier could not find executable %s.\n' "${command[0]}" >&2
+  printf 'Command unavailable: %s\n' "${command[*]}" >&2
+  printf '{"transition":"failed"}\n'
+  exit 0
+fi
+
+if "${command[@]}" >"$log_path" 2>&1; then
+  transition="passed"
+  commentary="Dev debug Kotlin compilation passed."
+else
+  transition="failed"
+  commentary="Dev debug Kotlin compilation failed. Inspect $log_path."
+fi
+
+printf '%s\n' "$commentary" >&2
+printf 'Command: %s; log: %s\n' "${command[*]}" "$log_path" >&2
+printf '{"transition":"%s"}\n' "$transition"

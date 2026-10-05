@@ -1,0 +1,175 @@
+{
+  "schema": "release_source_manifest_v1",
+  "closure_algorithm": "project-instruction-closure-v1",
+  "project_name": "AppsomeAndroid",
+  "repository": "OsomePteLtd/AppsomeAndroid",
+  "topology_kind": "appsome-release-publication",
+  "additional_paths": [
+    ".github/workflows/close-stale.yml",
+    ".kent/commands/mock-scenario-policy.md",
+    ".kent/commands/release-publication.md",
+    ".kent/commands/release-tag.md",
+    ".kent/scripts/tests/test-release-publication-v2-2-graph",
+    ".kent/scripts/tests/test-runtime-v2-command-closure",
+    ".kent/scripts/tests/test-workflow-current-master-tag-release",
+    ".kent/scripts/tests/test-workflow-hotfix-task-janitor",
+    ".kent/scripts/tests/test-workflow-task-janitor",
+    ".kent/scripts/tests/test-workflow-verify-report",
+    ".kent/scripts/tests/test-workflow-watch-exact-tag-release",
+    ".kent/scripts/workflow-current-master-tag-release",
+    ".kent/scripts/workflow-hotfix-task-janitor",
+    ".kent/scripts/workflow-mock-scenario-evidence",
+    ".kent/scripts/workflow-watch-exact-tag-release",
+    ".kent/skills/appsome-android-workflow/SKILL.md",
+    ".kent/workflows/README.md",
+    ".kent/workflows/specs/appsome-engineering-delivery-v26.json",
+    "AGENTS.md",
+    "README.md",
+    "build.gradle.kts",
+    "core/agent-api/build.gradle.kts",
+    "core/network/build.gradle.kts",
+    "gradle/libs.versions.toml",
+    "tools/prefetch-private-apisdk.py",
+    "tools/test-workflow-mock-scenario-evidence"
+  ],
+  "additional_trees": [],
+  "declared_prompt_references": [],
+  "external_roots": [
+    {
+      "kind": "builder-sha256",
+      "key": "sha256:a26be8ab:68567822:3d8376eb:6b8ed110:453291d8:45c53203:f85898d4:d8089f03",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".github/workflows/close-stale.yml=sha256:6ac6599d:fa6c1fec:66e67d67:0377acde:8d4a9228:1c47b9ed:f176c963:e52b957f",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/commands/mock-scenario-policy.md=sha256:430d5bdb:380e5734:a46fc8e9:e26e8966:0cea81e2:27185f12:67c8ddef:3868b1f4",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/commands/release-publication.md=sha256:36dcb300:a5dd0a8e:ac425b60:bce7b933:6c8e1264:95bf0a78:4faabd32:fe8a0825",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/commands/release-tag.md=sha256:97e84157:bc29f6f3:b5498ac2:e6f62c36:c3602f31:fc6bf207:518127c7:e58e3b28",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/tests/test-release-publication-v2-2-graph=sha256:1f0b733e:5ec9cb66:c0199a00:5bd9d2f2:79d109b8:2f18140d:c0d7550c:dcce9bb2",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/tests/test-runtime-v2-command-closure=sha256:b2297826:514b2199:30bf1319:1a3131bc:0dc6e443:6c39c80d:785520bf:291546ed",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/tests/test-workflow-current-master-tag-release=sha256:037409a1:b9063b8e:df9456cb:6319dd5f:8d99478a:f0db3067:ca1d135b:89985d03",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/tests/test-workflow-hotfix-task-janitor=sha256:563bf0a9:142db365:5bd45ea6:070859c6:0b00c26a:3fff4f14:4f6e9e75:951a4e06",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/tests/test-workflow-task-janitor=sha256:16b729b1:a2efff70:0583c667:6dc07874:36715dfe:3aa37696:83f69a52:b459f868",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/tests/test-workflow-verify-report=sha256:899f1762:49126d35:5a266b0f:8fb8e03c:06bff204:07609b18:7a0bc750:c779289f",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/tests/test-workflow-watch-exact-tag-release=sha256:c173f208:0889dfea:1e440acb:5e8f72a5:ebd532a5:323ea32b:6522a555:6b993741",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/workflow-current-master-tag-release=sha256:2020ece5:46e6882a:4272ad4f:f6798461:f4352fea:d27cebba:b0d38376:d389cfa7",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/workflow-hotfix-task-janitor=sha256:cd8e4cb2:308a89d8:2779e26a:2c337b3f:bfdad8c6:54951a9a:b8b778f6:ca0f809b",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/workflow-mock-scenario-evidence=sha256:27430032:1cb4f3e2:33b98be1:c3b6dad5:90470aae:4b3b759b:5edf2807:7229aef2",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/scripts/workflow-watch-exact-tag-release=sha256:de073a81:7107ddb4:e4bba635:fa7ed0e3:451b1480:f4100dce:eb07d808:94948ee5",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/skills/appsome-android-workflow/SKILL.md=sha256:d27e96a8:28831d5d:8ab7ae68:747ec6f6:7ae95ac6:5bab258f:54a93c87:93a963b7",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/workflows/README.md=sha256:3bb846ec:b2478926:a6b131d0:9038eedc:825cac98:cb6e2591:5a15d98c:902f39c3",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": ".kent/workflows/specs/appsome-engineering-delivery-v26.json=sha256:ffb7719f:9d84ddf6:90ffe798:2734643a:9266db0c:a91a6720:02219893:2e9694df",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": "AGENTS.md=sha256:3b926fcc:4bd64e29:e873f54e:69fd611c:31227738:35b75d18:fdb0b765:9b383318",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": "README.md=sha256:8bd9f5fe:e439ffe9:4d03a745:c2c9f9c0:f1d7b7d8:6c089564:d8e10493:fbb8539d",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": "build.gradle.kts=sha256:b51d17ef:29c14de0:7f56aef5:cd4d0335:caff4059:01aa6060:b613b2a4:088121f0",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": "core/agent-api/build.gradle.kts=sha256:db95a119:5e4c2e16:24fc8ff6:d2f14a80:58777052:06b179a9:09961ce4:3c49b39e",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": "core/network/build.gradle.kts=sha256:b102629b:5f1e2da3:d77eed67:ddf4eaed:bfeeb14c:6a81fc29:2313288d:27dbb927",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": "gradle/libs.versions.toml=sha256:b40c6be6:aff69c1d:255c9b16:9f31ecd6:da43045d:0adf975e:32457db4:d490ffd6",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": "tools/prefetch-private-apisdk.py=sha256:15a42409:75305d0c:c83b1f2c:3702d6e4:b0583c9d:d50719f0:83d0f520:f738ebec",
+      "runtime_digest_required": true
+    },
+    {
+      "kind": "source-sha256",
+      "key": "tools/test-workflow-mock-scenario-evidence=sha256:92aa2b23:20740698:6c5e62e7:688a3fb3:cf3c9306:5d29caa3:3a13bad9:f32307a9",
+      "runtime_digest_required": true
+    }
+  ],
+  "runtime_attested": false
+}
