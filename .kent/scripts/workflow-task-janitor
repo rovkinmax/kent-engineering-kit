@@ -986,6 +986,171 @@ def _validate_retained_tombstone(
         raise
 
 
+def _admit_managed_runtime_parent(
+    workspace: Path,
+    task_short_id: str,
+    *,
+    cleanup_report: str,
+) -> tuple[bool, str]:
+    """Admit only this Task's bounded runtime-parent state before retirement."""
+
+    v2_declared = _declares_terminal_evidence(cleanup_report)
+    support_module = Path(__file__).with_name("workflow_runtime_contracts.py")
+    v2_supported = support_module.is_file() and not support_module.is_symlink()
+    if v2_declared and not v2_supported:
+        return False, "declared v2 runtime support is missing or unsafe"
+
+    try:
+        runtime = runtime_contracts() if v2_supported else None
+    except (ImportError, OSError, RuntimeError, ValueError, AttributeError) as error:
+        return False, f"runtime contract support is unavailable: {error}"
+    reported_marker = None
+    expected_tombstone = None
+    if v2_declared:
+        try:
+            reported_marker = _cleanup_marker(runtime, cleanup_report, task_short_id)
+            expected_tombstone = (
+                ".evidence-cleanup-" + runtime.canonical_sha256(reported_marker)
+            )
+        except (ValueError, json.JSONDecodeError) as error:
+            return False, f"terminal marker is invalid: {error}"
+
+    lock_name, sentinel_name = runtime_state_names(task_short_id)
+    descriptors: list[int] = []
+    file_descriptors: dict[str, tuple[int, os.stat_result]] = {}
+    admission = None
+    try:
+        root_fd = os.open(
+            workspace,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        descriptors.append(root_fd)
+        try:
+            kent_fd = open_child_directory(root_fd, ".kent")
+        except FileNotFoundError:
+            if v2_declared:
+                return False, "sealed v2 runtime parent is missing"
+            return True, "legacy runtime parent is absent"
+        descriptors.append(kent_fd)
+        try:
+            runtime_fd = open_child_directory(kent_fd, "runtime")
+        except FileNotFoundError:
+            if v2_declared:
+                return False, "sealed v2 runtime parent is missing"
+            return True, "legacy runtime parent is absent"
+        descriptors.append(runtime_fd)
+        _revalidate_directory_link(root_fd, ".kent", kent_fd)
+        _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+
+        entries = _bounded_inventory(runtime_fd)
+        allowed = {task_short_id, lock_name}
+        if v2_declared and expected_tombstone is not None:
+            allowed.add(expected_tombstone)
+        unknown = sorted(set(entries) - allowed - {sentinel_name})
+        if unknown:
+            return False, f"unadmitted entry {unknown[0]!r} in runtime-parent"
+        if sentinel_name in entries and (
+            not v2_declared
+            or expected_tombstone is None
+            or expected_tombstone not in entries
+        ):
+            return False, "task-derived terminal sentinel has no validated tombstone"
+
+        active_present = task_short_id in entries
+        tombstone_present = (
+            expected_tombstone is not None and expected_tombstone in entries
+        )
+        if active_present and tombstone_present:
+            return False, "active runtime conflicts with terminal tombstone"
+        if active_present and sentinel_name in entries:
+            return False, "active runtime conflicts with terminal sentinel"
+
+        state_name = ""
+        if active_present:
+            state_name = task_short_id
+        elif tombstone_present:
+            state_name = expected_tombstone
+        if state_name:
+            state_fd = open_child_directory(runtime_fd, state_name)
+            descriptors.append(state_fd)
+            _revalidate_directory_link(runtime_fd, state_name, state_fd)
+            if v2_declared:
+                admission = _validate_retained_tombstone(
+                    workspace,
+                    runtime,
+                    state_fd,
+                    state_name,
+                    task_short_id,
+                    reported_marker,
+                    runtime_fd,
+                )
+
+        for name in (lock_name, sentinel_name):
+            if name not in entries:
+                continue
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=runtime_fd,
+            )
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_uid != os.getuid()
+                    or metadata.st_mode & 0o077
+                ):
+                    raise ValueError(f"task-derived runtime file is unsafe: {name}")
+                if _bounded_file_bytes(descriptor, 0):
+                    raise ValueError(
+                        f"task-derived runtime file is not empty: {name}"
+                    )
+                _revalidate_file_link(runtime_fd, name, descriptor)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            file_descriptors[name] = (descriptor, metadata)
+
+        if _bounded_inventory(runtime_fd) != entries:
+            raise ValueError("runtime-parent inventory changed during admission")
+        _revalidate_directory_link(root_fd, ".kent", kent_fd)
+        _revalidate_directory_link(kent_fd, "runtime", runtime_fd)
+        for name, (descriptor, saved) in file_descriptors.items():
+            _revalidate_file_link(runtime_fd, name, descriptor)
+            current = os.fstat(descriptor)
+            if any(
+                getattr(current, key) != getattr(saved, key)
+                for key in RUNTIME_FILE_METADATA
+            ):
+                raise ValueError("task-derived runtime file changed during admission")
+        if admission is not None:
+            admission.revalidate()
+        return True, "managed runtime-parent admission passed"
+    except (
+        FileNotFoundError,
+        NotADirectoryError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.TimeoutExpired,
+    ) as error:
+        return False, f"managed runtime-parent admission failed: {error}"
+    finally:
+        if admission is not None:
+            admission.close()
+        for descriptor, _ in file_descriptors.values():
+            os.close(descriptor)
+        close_descriptors(*descriptors)
+
+
 def _remove_v2_runtime_state(
     workspace: Path,
     task_short_id: str,
@@ -2257,6 +2422,24 @@ def main() -> int:
         )
         return 0
 
+    runtime_parent_ok, runtime_parent_report = _admit_managed_runtime_parent(
+        workspace,
+        task_short_id,
+        cleanup_report=previous_report,
+    )
+    if not runtime_parent_ok:
+        complete(
+            "task_janitor_blocked",
+            f"{previous_report}\nJanitor preserved {workspace}: "
+            f"{runtime_parent_report}.",
+            "Managed cleanup is blocked by unadmitted runtime-parent material. "
+            "Identify its actual owner from retained Task evidence; if another "
+            "Session owns it, coordinate release with that owner through the "
+            "supported path. Do not remove or signal foreign state. Retry only "
+            "after release is confirmed and fresh safety checks pass.",
+        )
+        return 0
+
     managed_v2 = _prepare_v2_managed_runtime_state(
         workspace,
         task_short_id,
@@ -2329,6 +2512,24 @@ def main() -> int:
             f"Kent registration preflight failed: {error}",
             "The exact managed Kent record could not be captured; no worktree "
             "or branch was removed.",
+        )
+        return 0
+
+    runtime_parent_ok, runtime_parent_report = _admit_managed_runtime_parent(
+        workspace,
+        task_short_id,
+        cleanup_report=previous_report,
+    )
+    if not runtime_parent_ok:
+        complete(
+            "task_janitor_blocked",
+            f"{previous_report}\nJanitor preserved {workspace}: "
+            f"{runtime_parent_report}.",
+            "Managed cleanup is blocked by unadmitted runtime-parent material. "
+            "Identify its actual owner from retained Task evidence; if another "
+            "Session owns it, coordinate release with that owner through the "
+            "supported path. Do not remove or signal foreign state. Retry only "
+            "after release is confirmed and fresh safety checks pass.",
         )
         return 0
 

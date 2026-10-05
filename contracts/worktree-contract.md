@@ -32,6 +32,80 @@ making a fresh checkout usable without silently copying unrelated local state.
   Kent does not manage.
 - Never move or rename a Kent-managed worktree behind the service.
 
+## Bounded cross-Session cleanup coordination
+
+Use this bounded cross-Session cleanup coordination protocol only when retiring
+a managed task worktree may affect
+another Session's child process or runtime material. It adds no authority to
+stop another Session, signal an unknown process, or delete resources outside
+the current task. Never infer ownership from a working directory or process
+ancestry alone.
+
+1. Freeze the exact Task ID, project, canonical worktree root, and branch from
+   the current task carrier. Recover prior contact, timeout, blocker, and
+   Question records before retrying. Close only safe children proven to belong
+   to this Task through their existing tool handles.
+2. Inspect both the owner Session's current target and retained child cwd
+   evidence. A parent move, old PID exit, or successful tool call does not
+   prove that the child released this root. Unknown ownership preserves the
+   worktree.
+3. For a verified active foreign owner, retain a request record in the exact
+   cleanup Task before contact. Then use the supported
+   `kent run steer <owner-session-id>` path to ask that owner to release only
+   its own children using this exact root, move its own Session elsewhere,
+   handle its runtime material under its own authority, and not re-enter during
+   cleanup. Identify the canonical Task, project, root, and current request
+   reference in the message. Require a fresh Task comment attributed to the
+   owner Session that references this request and exact root, identifies the
+   released children, and states the runtime-material disposition. Read
+   comments with the supported
+   `kent task comment list <task> --project <project> --limit <n> --offset <n>`
+   interface. Do not hardcode a Task, project, Session, root, or historical
+   process identity.
+4. Bound the entire attempt—including commands and waiting—to one monotonic
+   60-second deadline, at most two bounded Task-comment observations, and no
+   more than 30 seconds between observations. Bound each observer subprocess
+   to the remaining deadline. An incomplete page or unavailable readback is
+   an evidence gap, not proof that the owner is unavailable. Do not use
+   `kent run watch` or `wait` as an acknowledgement channel. Questions,
+   approvals, interruptions, and unrelated run outcomes are not
+   acknowledgements. If a materially new blocker appears, raise it to the
+   owner at most once during this same attempt and only if the deadline
+   permits; do not restart the deadline. On expiry, stop only the task-owned
+   observer if needed; never stop or signal the owner Session.
+5. After an acknowledgement, freshly recheck the exact owner target, known
+   child cwd, clean/recoverable worktree state, runtime inventory, and existing
+   evidence immediately before terminal preparation and again before leave or
+   handoff. Owner re-entry, new activity in this root, a retained child cwd, or
+   changed relevant runtime/evidence invalidates the previous all-clear.
+   Independent owner activity in another worktree does not invalidate release
+   of this root.
+6. Retain the attempt identity (Task/root/owner/blocker), start and deadline,
+   contact outcome, exhausted budget, and any original Question reference in
+   existing Task records outside the retiring root. An identical retry reuses
+   that record and existing escalation carrier; elapsed time alone does not
+   justify another Question. A materially changed owner, blocker, release
+   proof, or human decision can justify a new bounded attempt after the
+   previous attempt concludes or its basis materially changes.
+7. When release is confirmed and fresh safety checks pass, continue through
+   the existing terminal preparation, supported `kent worktree leave`, and
+   normal post-Session Janitor handoff. A native `scheduled` result is not
+   deletion success.
+8. On refusal, timeout, unavailable or unknown ownership, incomplete evidence,
+   or unsupported action, preserve the worktree and report the exact blocker
+   through the existing route. Ask the user only for a real cross-owner
+   decision or unavailable external action, not for safe task-owned cleanup.
+
+A Task comment acknowledgement and the last observation are not an atomic
+reservation. Existing native managed-process checks cover supported managed
+shells with retained launch workdirs, and supported Session Enter/Delete
+operations share the existing workspace mutation lane. They do not establish
+exclusion for arbitrary OS processes, unknown ownership, arbitrary same-UID
+filesystem writes, or arbitrary child startup between checks. Preserve and
+report any case requiring unavailable native exclusion; do not claim
+race-free protection, add a global lock service or process sweeper, or
+automatically stop another Session.
+
 ## Setup hook
 
 - The setup script is idempotent and safe to rerun after partial failure.

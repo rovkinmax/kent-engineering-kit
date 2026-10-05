@@ -17,6 +17,59 @@ from workflowkit.profile import ProjectProfile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+REVALIDATION_EDGE_CONTRACTS = {
+    "plan_review_revalidate": (
+        "plan_review",
+        "plan_review_needs_changes",
+    ),
+    "plan_contract_continue_revalidate": (
+        "plan_contract_continue",
+        "plan_contract_continue_changed",
+    ),
+    "plan_contract_verify_revalidate": (
+        "plan_contract_verify",
+        "plan_contract_verify_changed",
+    ),
+}
+REVALIDATION_PROMPT_REQUIREMENTS = (
+    (
+        "grill timing",
+        "Consult a bounded read-only grill leaf before freeze and formal review",
+    ),
+    (
+        "material-change triggers",
+        "only when materially revising requirements, API/UX, architecture, "
+        "authority, safety/effects, cost, or evidence strategy",
+    ),
+    (
+        "execution-disproof trigger",
+        "or when execution disproves the chosen approach",
+    ),
+    (
+        "grill non-triggers",
+        "Hash drift, checkbox progress, typos, operational waiting, and "
+        "repeated identical failures alone do not require another grill call.",
+    ),
+    (
+        "unavailable eligibility blocker",
+        "Report unavailable effective leaf eligibility as a concrete blocker "
+        "rather than claiming critique occurred.",
+    ),
+    (
+        "linked proposal and human acceptance",
+        "Keep the exact proposal plus human acceptance when that pair grants authority.",
+    ),
+    (
+        "discoverable durable authority",
+        "Store durable references in the authoritative plan or discoverable "
+        "project-permitted report-only evidence, not only `review_context`;",
+    ),
+    (
+        "no agent-summary consent substitution",
+        "An agent summary or truncated historical source cannot fill missing consent.",
+    ),
+)
+
 
 def runtime_v2_profile(*, ci: bool, source_ci: bool = False) -> ProjectProfile:
     contents = (REPO_ROOT / "contracts" / "project-profile.example.toml").read_text()
@@ -206,6 +259,36 @@ def direct_parameter_references(prompt: str) -> set[str]:
 
 
 class DeliveryContinuityTest(unittest.TestCase):
+    def test_revalidation_grill_contract_in_runtime_v2_profiles(self) -> None:
+        profiles = {
+            "runtime-v2-with-ci": runtime_v2_profile(ci=True, source_ci=True),
+            "runtime-v2-without-ci": runtime_v2_profile(ci=False),
+        }
+        for profile_name, profile in profiles.items():
+            edges = edge_map(profile)
+            for key, (source, transition) in REVALIDATION_EDGE_CONTRACTS.items():
+                with self.subTest(profile=profile_name, edge=key):
+                    edge = edges.get(key)
+                    self.assertIsNotNone(edge, key)
+                    self.assertEqual(edge.source, source, key)
+                    self.assertEqual(edge.transition, transition, key)
+                    self.assertEqual(edge.target, "plan_revalidation", key)
+                    self.assertEqual(edge.context, "continue_session", key)
+                    self.assertEqual(edge.context_source, "node:plan", key)
+                    self.assertIsInstance(edge.prompt, str, key)
+                    normalized = " ".join(edge.prompt.split())
+                    for label, required_text in REVALIDATION_PROMPT_REQUIREMENTS:
+                        with self.subTest(
+                            profile=profile_name,
+                            edge=key,
+                            requirement=label,
+                        ):
+                            self.assertIn(
+                                " ".join(required_text.split()),
+                                normalized,
+                                f"{key}: missing {label} clause",
+                            )
+
     def test_shared_lifecycle_edges_carry_delivery_context(self) -> None:
         profiles = {
             "runtime-v2-with-ci": runtime_v2_profile(ci=True, source_ci=True),
