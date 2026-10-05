@@ -3545,6 +3545,8 @@ class WorkflowKitTest(unittest.TestCase):
 
         profile_path = REPO_ROOT / ".kent" / "workflow-profile.toml"
         profile_before = profile_path.read_bytes()
+        v5_path = REPO_ROOT / builder.SPEC_PATH
+        v5_before = v5_path.read_bytes()
         profile = builder.profile_at(REPO_ROOT)
         self.assertEqual(profile.coder_selection_policy(), "disabled")
 
@@ -3575,11 +3577,7 @@ class WorkflowKitTest(unittest.TestCase):
             ("new_session", "immediate_source", "previous_node", "previous_node"),
         )
 
-        v5_path = REPO_ROOT / builder.SPEC_PATH
-        self.assertEqual(
-            hashlib.sha256(v5_path.read_bytes()).hexdigest(),
-            "f5d65a34576b18ee813466c42b31afd79943ad1849f4a9d53d0437332f371ed4",
-        )
+        self.assertEqual(v5_path.read_bytes(), v5_before)
         self.assertEqual(builder.rendered_spec(), v5_path.read_text())
         candidate_path = REPO_ROOT / builder.CANDIDATE_SPEC_PATH
         self.assertEqual(builder.rendered_candidate_spec(), candidate_path.read_text())
