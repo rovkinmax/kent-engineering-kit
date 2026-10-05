@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import importlib.util
 from importlib.machinery import SourceFileLoader
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -24,13 +26,250 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / ".kent/workflows/kit_development.py"
 CHILD = ROOT / ".kent/scripts/workflow-compile-verify"
 IDENTITY = ROOT / ".kent/scripts/kit-verification-identity.py"
+FIXED_POINT = "4d0e514aebae5295c803693d72f6640ab2c7846d"
+QUALIFIED_TARGET = "38b40892dd688d181138890c9ae55d23aa715c95"
+TARGET_BUILDER_SHA256 = "6e06e0a7c97825e21bd93e99d04141305cc3cfbc25d44759f5a69554e3700773"
+TARGET_DELIVERY_SHA256 = "8e5432816b58aae7a6c4d06d64be6db25ca6150e46ef66e9d1ddb2122eddae77"
 module_spec = importlib.util.spec_from_file_location("kit_development", BUILDER)
 assert module_spec is not None and module_spec.loader is not None
 kit = importlib.util.module_from_spec(module_spec)
 module_spec.loader.exec_module(kit)
 
+# Exact-history acceptance is a separate, explicitly executed qualification.
+# Mandatory discovery retains portable production-main comparison controls.
+# Run both pinned cases with KEN22_RUN_LOCAL_QUALIFICATION=1; missing objects
+# are an error, never a skip or a substitute target.
+LOCAL_QUALIFICATION_TESTS = {
+    "test_fixed_point_v5_check_positive_and_inconsistent_controls_are_read_only",
+    "test_target_candidate_and_mode_checks_are_read_only",
+}
+
+
+def load_tests(loader, tests, pattern):
+    def included(suite):
+        for test in suite:
+            if isinstance(test, unittest.TestSuite):
+                yield from included(test)
+            elif (
+                not isinstance(test, KitDevelopmentWorkflowTest)
+                or test._testMethodName not in LOCAL_QUALIFICATION_TESTS
+                or os.environ.get("KEN22_RUN_LOCAL_QUALIFICATION") == "1"
+            ):
+                yield test
+
+    return unittest.TestSuite(included(tests))
+
 
 class KitDevelopmentWorkflowTest(unittest.TestCase):
+    def fixture_git_environment(self) -> dict[str, str]:
+        environment = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        environment.update(
+            GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+        )
+        return environment
+
+    def source_archive(self, revision: str) -> Path:
+        prerequisite = subprocess.run(
+            ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
+            cwd=ROOT, env=self.fixture_git_environment(),
+            capture_output=True, check=False,
+        )
+        self.assertEqual(
+            prerequisite.returncode, 0,
+            f"explicit KEN-22 qualification requires exact commit {revision}: "
+            + prerequisite.stderr.decode(),
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        archive = subprocess.run(
+            ["git", "archive", "--format=tar", revision],
+            cwd=ROOT, env=self.fixture_git_environment(),
+            capture_output=True, check=True,
+        ).stdout
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
+            bundle.extractall(root)
+        # Contained TMPDIR fixtures must not inherit the task's Git boundary:
+        # git apply can otherwise report success while skipping every path.
+        subprocess.run(
+            ["git", "init", "-q", str(root)],
+            env=self.fixture_git_environment(), capture_output=True, check=True,
+        )
+        discovered = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=root, env=self.fixture_git_environment(),
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(Path(discovered).resolve(), root)
+        return root
+
+    def tree_snapshot(self, root: Path) -> dict[str, tuple[str, int, str]]:
+        import hashlib
+
+        observed = {}
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(root).as_posix()
+            mode = stat.S_IMODE(path.lstat().st_mode)
+            if path.is_symlink():
+                observed[relative] = ("symlink", mode, os.readlink(path))
+            elif path.is_file():
+                observed[relative] = (
+                    "file", mode, hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+            elif path.is_dir():
+                observed[relative] = ("directory", mode, "")
+        return observed
+
+    def run_builder(
+        self, root: Path, *arguments: str, builder_path: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        return subprocess.run(
+            [
+                sys.executable, "-B",
+                str(builder_path or root / ".kent/workflows/kit_development.py"),
+                *arguments,
+            ],
+            cwd=root, env=environment, capture_output=True, text=True, check=False,
+        )
+
+    def run_task_candidate_builder(
+        self, root: Path, task_builder: Path, *arguments: str,
+    ) -> subprocess.CompletedProcess[str]:
+        probe = """
+import importlib.util
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+task_builder = Path(sys.argv[2]).resolve()
+arguments = sys.argv[3:]
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+qualified = load(
+    "qualified_kit",
+    root / ".kent/workflows/kit_development.py",
+)
+task = load("task_kit", task_builder)
+task.rendered_candidate_spec = qualified.rendered_candidate_spec
+sys.argv = [str(task_builder), *arguments]
+try:
+    result = task.main()
+except (OSError, ValueError) as error:
+    print(f"Kit development workflow: {error}", file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(result)
+"""
+        environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        return subprocess.run(
+            [
+                sys.executable, "-B", "-c", probe,
+                str(root), str(task_builder), *arguments,
+            ],
+            cwd=root, env=environment, capture_output=True, text=True, check=False,
+        )
+
+    def run_target_candidate_profile_probe(
+        self, root: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        probe = """
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+path = root / ".kent/workflows/kit_development.py"
+spec = importlib.util.spec_from_file_location("qualified_kit", path)
+assert spec is not None and spec.loader is not None
+kit = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(kit)
+profile = kit.profile_at(root)
+policies = dict(profile.policies)
+assert policies.get("coder_selection") != "complexity"
+default_before = json.loads(kit.rendered_spec(root))
+candidate_workflow = kit.build_complexity_candidate_workflow(profile)
+assert profile.policies == policies
+assert candidate_workflow.nodes
+default_after = json.loads(kit.rendered_spec(root))
+candidate = json.loads(kit.rendered_candidate_spec(root))
+nodes = {node["key"]: node for node in candidate["nodes"]}
+edges = {edge["key"]: edge for edge in candidate["edges"]}
+assert default_before == default_after
+assert default_before["name"] == "Kit Engineering Delivery v5"
+assert {node["key"]: node for node in default_before["nodes"]}["plan"]["agent"] != "complexity-planner"
+assert nodes["plan"]["agent"] == "complexity-planner"
+assert nodes["plan_revalidation"]["agent"] == "complexity-planner"
+assert edges["plan_review_accept"]["requires_approval"] is True
+"""
+        environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        return subprocess.run(
+            [sys.executable, "-B", "-c", probe, str(root)],
+            cwd=root, env=environment, capture_output=True, text=True, check=False,
+        )
+
+    def apply_task_source_delta(
+        self, root: Path, path: str, expected_target_sha256: str,
+    ) -> None:
+        import hashlib
+
+        target = root / path
+        preimage = target.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(preimage).hexdigest(),
+            expected_target_sha256,
+        )
+        patch = subprocess.run(
+            ["git", "diff", "--binary", FIXED_POINT, "--", path],
+            cwd=ROOT, env=self.fixture_git_environment(),
+            capture_output=True, check=True,
+        ).stdout
+        self.assertTrue(patch, f"expected task delta for {path}")
+        checked = subprocess.run(
+            ["git", "apply", "--check", "--binary", "-"],
+            cwd=root, input=patch, env=self.fixture_git_environment(),
+            capture_output=True, check=False,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr.decode())
+        applied = subprocess.run(
+            ["git", "apply", "--binary", "-"],
+            cwd=root, input=patch, env=self.fixture_git_environment(),
+            capture_output=True, check=False,
+        )
+        self.assertEqual(applied.returncode, 0, applied.stderr.decode())
+        self.assertNotEqual(
+            target.read_bytes(), preimage, "git apply must change the target",
+        )
+        reversed_check = subprocess.run(
+            ["git", "apply", "--reverse", "--check", "--binary", "-"],
+            cwd=root, input=patch, env=self.fixture_git_environment(),
+            capture_output=True, check=False,
+        )
+        self.assertEqual(
+            reversed_check.returncode, 0, reversed_check.stderr.decode(),
+        )
+
+    def install_task_builder_fixture(self, root: Path) -> Path:
+        import hashlib
+
+        target_builder = root / ".kent/workflows/kit_development.py"
+        self.assertEqual(
+            hashlib.sha256(target_builder.read_bytes()).hexdigest(),
+            TARGET_BUILDER_SHA256,
+        )
+        task_builder = root / ".kent/workflows/kit_development_task.py"
+        shutil.copyfile(BUILDER, task_builder)
+        return task_builder
+
     def test_execution_repairs_do_not_enable_ci_monitoring(self) -> None:
         profile = kit.profile_at(ROOT)
         self.assertFalse(profile.capability("ci_monitoring"))
@@ -139,6 +378,7 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
         self.assertEqual(profile.branch_identity_policy(), "task")
         self.assertEqual(profile.pr_merge_strategy(), "rebase")
         self.assertEqual(profile.smoke_policy(), "disabled")
+        self.assertNotEqual(profile.policies.get("coder_selection"), "complexity")
         self.assertEqual(profile.release_topology, "none")
         self.assertFalse(profile.runtime_contracts_v2())
         self.assertFalse(profile.adapters)
@@ -231,7 +471,7 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
                 self.assertIn("unmodified", edge.prompt)
                 self.assertIn("KENT_RUN_ID", edge.prompt)
 
-    def test_v5_preserves_historical_v1_through_v4_snapshots(self) -> None:
+    def test_v5_preserves_historical_v1_through_v5_snapshots(self) -> None:
         import hashlib
 
         historical_v1 = ROOT / ".kent/workflows/kit-engineering-delivery-v1.spec.json"
@@ -258,27 +498,355 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
             hashlib.sha256(raw_v4).hexdigest(),
             "fead032959ae10b569a99c68dd2d524b8374c1882d821a049000113bba674924",
         )
+        historical_v5 = ROOT / ".kent/workflows/kit-engineering-delivery-v5.spec.json"
+        raw_v5 = historical_v5.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw_v5).hexdigest(),
+            "b4ad79a3499d1a65ab749b8f3a98f2837a4b519eb8f4a0629d240dd6e9efcd55",
+        )
+        self.assertEqual(json.loads(raw_v5)["name"], "Kit Engineering Delivery v5")
         current = json.loads(kit.rendered_spec())
         self.assertEqual(current["name"], "Kit Engineering Delivery v5")
         self.assertNotEqual(current, json.loads(raw_v2))
 
-    def test_snapshot_is_exact_and_check_is_read_only(self) -> None:
+    def test_v5_snapshot_is_exact_and_g1_g2_delta_is_bounded(self) -> None:
+        import hashlib
+
         snapshot = ROOT / kit.SPEC_PATH
         before = snapshot.read_bytes()
-        self.assertEqual(before.decode(), kit.rendered_spec())
         self.assertEqual(
-            json.loads(before),
-            json.loads(json.dumps(spec_as_json(
-                kit.build_workflow(kit.profile_at(ROOT)),
-            ))),
+            hashlib.sha256(before).hexdigest(),
+            "b4ad79a3499d1a65ab749b8f3a98f2837a4b519eb8f4a0629d240dd6e9efcd55",
         )
-        result = subprocess.run(
-            [sys.executable, str(BUILDER), "--check"],
-            capture_output=True, text=True, check=False,
+        historical = json.loads(before)
+        rendered = json.loads(json.dumps(spec_as_json(
+            kit.build_workflow(kit.profile_at(ROOT)),
+        )))
+        self.assertEqual(rendered, json.loads(kit.rendered_spec()))
+        self.assertEqual(historical.keys(), rendered.keys())
+        self.assertEqual(historical["nodes"], rendered["nodes"])
+        for field in historical.keys() - {"edges"}:
+            self.assertEqual(historical[field], rendered[field], field)
+        historical_edges = {edge["key"]: edge for edge in historical["edges"]}
+        rendered_edges = {edge["key"]: edge for edge in rendered["edges"]}
+        self.assertEqual(historical_edges.keys(), rendered_edges.keys())
+        changed_fields = {}
+        for key in sorted(historical_edges):
+            before_edge = historical_edges[key]
+            after_edge = rendered_edges[key]
+            fields = {
+                field
+                for field in before_edge.keys() | after_edge.keys()
+                if before_edge.get(field) != after_edge.get(field)
+            }
+            if fields:
+                changed_fields[key] = fields
+        self.assertEqual(changed_fields, {
+            "gate_delivery_ready": {"prompt"},
+            "merge_watch_cleanup": {"parameters"},
+        })
+        self.assertEqual(
+            [param["key"] for param in rendered_edges["merge_watch_cleanup"]["parameters"]],
+            [
+                "workspace_path", "pr_url", "branch_name", "merge_strategy",
+                "merge_report", "pr_feedback_cursor",
+            ],
+        )
+        self.assertIn(
+            "Git actions require exact current human approval",
+            rendered_edges["gate_delivery_ready"]["prompt"],
+        )
+
+        self.assertEqual(before, snapshot.read_bytes())
+
+    def test_fixed_point_v5_check_positive_and_inconsistent_controls_are_read_only(self) -> None:
+        root = self.source_archive(FIXED_POINT)
+        snapshot = root / ".kent/workflows/kit-engineering-delivery-v5.spec.json"
+        original_v5 = snapshot.read_bytes()
+        before = self.tree_snapshot(root)
+
+        default = self.run_builder(root)
+        self.assertEqual(default.returncode, 0, default.stderr)
+        default_spec = json.loads(default.stdout)
+        self.assertEqual(default_spec["name"], "Kit Engineering Delivery v5")
+        default_nodes = {node["key"]: node for node in default_spec["nodes"]}
+        self.assertNotEqual(default_nodes["plan"]["agent"], "complexity-planner")
+        self.assertEqual(before, self.tree_snapshot(root))
+
+        write_spec = self.run_builder(root, "--write-spec")
+        self.assertEqual(write_spec.returncode, 0, write_spec.stderr)
+        self.assertEqual(snapshot.read_bytes(), original_v5)
+        self.assertFalse(
+            (root / ".kent/workflows/kit-engineering-delivery-v6.spec.json").exists()
+        )
+
+        result = self.run_builder(root, "--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, self.tree_snapshot(root))
+
+        snapshot.write_bytes(snapshot.read_bytes() + b" ")
+        inconsistent = self.tree_snapshot(root)
+        result = self.run_builder(root, "--check")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("semantic workflow spec is stale", result.stderr)
+        self.assertEqual(inconsistent, self.tree_snapshot(root))
+
+    def test_candidate_check_fails_closed_without_qualified_target_renderer(self) -> None:
+        before = {
+            path: path.read_bytes()
+            for path in (
+                BUILDER,
+                ROOT / ".kent/workflows/kit-engineering-delivery-v5.spec.json",
+                ROOT / ".kent/workflows/kit-engineering-delivery-v6.spec.json",
+            )
+        }
+        result = self.run_builder(ROOT, "--check-candidate")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("qualified target fixture required", result.stderr)
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_checkout_local_legacy_comparison_controls_are_read_only(self) -> None:
+        # Portable comparison/closure coverage, not fixed-point parity
+        # acceptance. The exact fixed-point qualification remains mandatory
+        # for this repair's handoff and is executed separately.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            snapshot = root / kit.SPEC_PATH
+            snapshot.parent.mkdir(parents=True)
+            # Preserve real command-closure validation: main's temporary
+            # source root contains the checkout-local authoritative templates.
+            for relative in (kit.SCHEMA3_COPIES | kit.PROJECT_COPIES).values():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, target)
+            expected = json.dumps(
+                spec_as_json(kit.build_workflow(kit.profile_at(ROOT))),
+                indent=2, ensure_ascii=False,
+            ) + "\n"
+            snapshot.write_text(expected)
+            sync = kit.load_synchronizer()
+            with (
+                mock.patch.object(kit, "ROOT", root),
+                mock.patch.object(kit, "load_synchronizer", return_value=sync),
+                mock.patch.object(sys, "argv", [str(BUILDER), "--check"]),
+            ):
+                before = self.tree_snapshot(root)
+                self.assertEqual(kit.main(), 0)
+                self.assertEqual(before, self.tree_snapshot(root))
+                snapshot.write_text(expected + " ")
+                altered = self.tree_snapshot(root)
+                with self.assertRaisesRegex(SpecError, "semantic workflow spec is stale"):
+                    kit.main()
+                self.assertEqual(altered, self.tree_snapshot(root))
+
+    def test_checkout_local_candidate_comparison_and_mode_controls_are_read_only(self) -> None:
+        # An independent synthetic renderer isolates the production main()
+        # comparison. It does not qualify the real v6 artifact; the pinned
+        # target-plus-task test below is the separate acceptance proof.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            candidate = root / ".kent/workflows/kit-engineering-delivery-v6.spec.json"
+            candidate.parent.mkdir(parents=True)
+            expected = '{"fixture": "portable comparison control"}\n'
+            candidate.write_text(expected)
+            sync = kit.load_synchronizer()
+            renderer = mock.Mock(return_value=expected)
+            with (
+                mock.patch.object(kit, "ROOT", root),
+                mock.patch.object(kit, "load_synchronizer", return_value=sync),
+                mock.patch.dict(kit.__dict__, rendered_candidate_spec=renderer),
+                mock.patch.object(sys, "argv", [str(BUILDER), "--check-candidate"]),
+            ):
+                before = self.tree_snapshot(root)
+                self.assertEqual(kit.main(), 0)
+                renderer.assert_called_once_with()
+                self.assertEqual(before, self.tree_snapshot(root))
+                candidate.write_text(expected + " ")
+                altered = self.tree_snapshot(root)
+                with self.assertRaisesRegex(SpecError, "complexity candidate spec is stale"):
+                    kit.main()
+                self.assertEqual(altered, self.tree_snapshot(root))
+                candidate.write_text(expected)
+                for flag in ("--bootstrap", "--write-spec", "--write-candidate-spec"):
+                    with (
+                        self.subTest(flag=flag),
+                        mock.patch.object(
+                            sys, "argv", [str(BUILDER), "--check-candidate", flag],
+                        ),
+                        mock.patch.object(kit, "bootstrap") as bootstrap,
+                        mock.patch.object(kit, "rendered_spec") as legacy_renderer,
+                        mock.patch("sys.stderr", new_callable=io.StringIO),
+                    ):
+                        renderer.reset_mock()
+                        before = self.tree_snapshot(root)
+                        with self.assertRaises((SpecError, SystemExit)):
+                            kit.main()
+                        renderer.assert_not_called()
+                        legacy_renderer.assert_not_called()
+                        bootstrap.assert_not_called()
+                        self.assertEqual(before, self.tree_snapshot(root))
+
+            comparison = 'if target.read_bytes() != candidate_renderer().encode("utf-8"):\n'
+            source = BUILDER.read_text()
+            self.assertEqual(source.count(comparison), 1)
+            mutated_path = root / ".kent/workflows/kit_development_mutated.py"
+            mutated_path.write_text(source.replace(
+                comparison,
+                'if target.read_bytes() == candidate_renderer().encode("utf-8"):\n',
+                1,
+            ))
+            spec = importlib.util.spec_from_file_location("mutated_kit", mutated_path)
+            assert spec is not None and spec.loader is not None
+            mutated = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mutated)
+            with (
+                mock.patch.object(mutated, "load_synchronizer", return_value=sync),
+                mock.patch.dict(mutated.__dict__, rendered_candidate_spec=renderer),
+                mock.patch.object(sys, "argv", [str(mutated_path), "--check-candidate"]),
+            ):
+                before = self.tree_snapshot(root)
+                with self.assertRaisesRegex(SpecError, "complexity candidate spec is stale"):
+                    mutated.main()
+                self.assertEqual(before, self.tree_snapshot(root))
+
+    def test_target_candidate_and_mode_checks_are_read_only(self) -> None:
+        root = self.source_archive(QUALIFIED_TARGET)
+        self.apply_task_source_delta(
+            root, "workflowkit/delivery.py", TARGET_DELIVERY_SHA256,
+        )
+        task_builder = self.install_task_builder_fixture(root)
+        shutil.copyfile(
+            ROOT / ".kent/workflows/kit-engineering-delivery-v6.spec.json",
+            root / ".kent/workflows/kit-engineering-delivery-v6.spec.json",
+        )
+        candidate = root / ".kent/workflows/kit-engineering-delivery-v6.spec.json"
+
+        before = self.tree_snapshot(root)
+        profile_probe = self.run_target_candidate_profile_probe(root)
+        self.assertEqual(profile_probe.returncode, 0, profile_probe.stderr)
+        self.assertEqual(before, self.tree_snapshot(root))
+
+        default = self.run_builder(root, builder_path=task_builder)
+        self.assertEqual(default.returncode, 0, default.stderr)
+        default_spec = json.loads(default.stdout)
+        self.assertEqual(default_spec["name"], "Kit Engineering Delivery v5")
+        default_nodes = {node["key"]: node for node in default_spec["nodes"]}
+        self.assertNotEqual(default_nodes["plan"]["agent"], "complexity-planner")
+        self.assertEqual(before, self.tree_snapshot(root))
+
+        result = self.run_task_candidate_builder(
+            root, task_builder, "--check-candidate",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(before, snapshot.read_bytes())
+        self.assertEqual(before, self.tree_snapshot(root))
+
+        # Mutation control: invert the actual Task comparison and confirm the
+        # exact production main() path rejects a matching candidate.
+        task_source = task_builder.read_text()
+        comparison = (
+            'if target.read_bytes() != candidate_renderer().encode("utf-8"):\n'
+        )
+        self.assertEqual(task_source.count(comparison), 1)
+        mutated_source = task_source.replace(
+            comparison,
+            'if target.read_bytes() == candidate_renderer().encode("utf-8"):\n',
+            1,
+        )
+        mutated_builder = root / ".kent/workflows/kit_development_task_mutated.py"
+        mutated_builder.write_text(mutated_source)
+        before_mutation_check = self.tree_snapshot(root)
+        mutation = self.run_task_candidate_builder(
+            root, mutated_builder, "--check-candidate",
+        )
+        self.assertEqual(mutation.returncode, 1, mutation.stderr)
+        self.assertIn(
+            "source-only complexity candidate spec is stale", mutation.stderr,
+        )
+        self.assertEqual(before_mutation_check, self.tree_snapshot(root))
+
+        candidate.write_bytes(candidate.read_bytes() + b" ")
+        altered = self.tree_snapshot(root)
+        result = self.run_task_candidate_builder(
+            root, task_builder, "--check-candidate",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("source-only complexity candidate spec is stale", result.stderr)
+        self.assertEqual(altered, self.tree_snapshot(root))
+
+        candidate.write_bytes(candidate.read_bytes()[:-1])
+        for arguments in (
+            ("--check-candidate", "--bootstrap"),
+            ("--check-candidate", "--write-spec"),
+            ("--check-candidate", "--write-candidate-spec"),
+        ):
+            with self.subTest(arguments=arguments):
+                rejected = self.tree_snapshot(root)
+                result = self.run_task_candidate_builder(
+                    root, task_builder, *arguments,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(rejected, self.tree_snapshot(root))
+                if "--bootstrap" in arguments:
+                    self.assertIn(
+                        "cannot be combined with --bootstrap", result.stderr,
+                    )
+
+        # A v6 artifact change does not alter the legacy v5 --check result.
+        candidate.write_bytes(candidate.read_bytes() + b" ")
+        altered_v6 = self.tree_snapshot(root)
+        result = self.run_builder(root, "--check", builder_path=task_builder)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("semantic workflow spec is stale", result.stderr)
+        self.assertNotIn("complexity candidate spec is stale", result.stderr)
+        self.assertEqual(altered_v6, self.tree_snapshot(root))
+
+    def test_v6_candidate_captures_approved_delivery_delta_and_complexity_graph(self) -> None:
+        import hashlib
+
+        path = ROOT / ".kent/workflows/kit-engineering-delivery-v6.spec.json"
+        raw = path.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            "c08c666607fccd627c29db241ab8436975fae9f30c4cb711f4866cd97d01a7ff",
+        )
+        candidate = json.loads(raw)
+        historical = json.loads(
+            (ROOT / ".kent/workflows/kit-engineering-delivery-v5.spec.json").read_text()
+        )
+        self.assertEqual(candidate["name"], "Kit Engineering Delivery v6")
+        self.assertEqual(candidate["execution_target"], "default-branch")
+        candidate_nodes = {node["key"]: node for node in candidate["nodes"]}
+        historical_nodes = {node["key"]: node for node in historical["nodes"]}
+        self.assertEqual(candidate_nodes.keys(), historical_nodes.keys())
+        self.assertEqual(candidate_nodes["plan"]["agent"], "complexity-planner")
+        self.assertEqual(
+            candidate_nodes["plan_revalidation"]["agent"],
+            "complexity-planner",
+        )
+        candidate_edges = {edge["key"]: edge for edge in candidate["edges"]}
+        historical_edges = {edge["key"]: edge for edge in historical["edges"]}
+        self.assertEqual(
+            candidate_edges.keys() - historical_edges.keys(),
+            {"implement_revalidate", "plan_contract_revalidate"},
+        )
+        self.assertTrue(candidate_edges["plan_review_accept"]["requires_approval"])
+        self.assertEqual(
+            len({(edge["source"], edge["transition"]) for edge in candidate["edges"]}),
+            54,
+        )
+        self.assertEqual(len(candidate["nodes"]), 21)
+        self.assertEqual(len(candidate["edges"]), 55)
+        self.assertEqual(
+            [param["key"] for param in candidate_edges["merge_watch_cleanup"]["parameters"]],
+            [
+                "workspace_path", "pr_url", "branch_name", "merge_strategy",
+                "merge_report", "pr_feedback_cursor",
+            ],
+        )
+        self.assertIn(
+            "Git actions require exact current human approval",
+            candidate_edges["gate_delivery_ready"]["prompt"],
+        )
 
     def test_default_emits_only_json_without_materialization(self) -> None:
         with mock.patch.object(kit, "bootstrap") as bootstrap:

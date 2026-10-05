@@ -173,22 +173,47 @@ def main() -> int:
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--write-spec", action="store_true")
     output.add_argument("--check", action="store_true")
+    output.add_argument(
+        "--check-candidate",
+        action="store_true",
+        help="Read-only parity check for the qualified v6 candidate.",
+    )
     args = parser.parse_args()
+    if args.check_candidate and args.bootstrap:
+        raise SpecError("--check-candidate cannot be combined with --bootstrap")
     if args.bootstrap:
         bootstrap()
-    rendered = rendered_spec()
     sync = load_synchronizer()
-    target = sync.project_target(ROOT, SPEC_PATH)
-    if args.write_spec:
+    if args.check_candidate:
+        candidate_renderer = globals().get("rendered_candidate_spec")
+        if not callable(candidate_renderer):
+            raise SpecError(
+                "qualified target fixture required for candidate check"
+            )
+        candidate_spec_path = globals().get(
+            "CANDIDATE_SPEC_PATH",
+            ".kent/workflows/kit-engineering-delivery-v6.spec.json",
+        )
+        target = sync.project_target(ROOT, candidate_spec_path)
+        if target.is_symlink() or not target.is_file():
+            raise SpecError(
+                f"candidate spec target is not a regular file: {target}"
+            )
+        if target.read_bytes() != candidate_renderer().encode("utf-8"):
+            raise SpecError("source-only complexity candidate spec is stale")
+    elif args.write_spec:
+        rendered = rendered_spec()
+        target = sync.project_target(ROOT, SPEC_PATH)
         if target.exists() and not target.is_file():
             raise SpecError(f"spec target is not a regular file: {target}")
         target.write_text(rendered)
     elif args.check:
         verify_command_closure()
-        if target.read_text() != rendered:
+        target = sync.project_target(ROOT, SPEC_PATH)
+        if target.read_text() != rendered_spec():
             raise SpecError("semantic workflow spec is stale")
     else:
-        sys.stdout.write(rendered)
+        sys.stdout.write(rendered_spec())
     return 0
 
 

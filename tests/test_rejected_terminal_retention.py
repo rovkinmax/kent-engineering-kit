@@ -50,7 +50,7 @@ NATIVE_GRAPH_SHA256 = (
     "fd8cfb44aaeb1e48a4b82de98c22112a60cfb0f3e571d3d3ddecaff35e0a45c9"
 )
 PROMPT_ARTIFACT_SHA256 = (
-    "9defdaf838825f8b583930645f30503b737bb6cad09c61b30974e5d00d9e8969"
+    "23b63231c88d4e90cc7f1b91ac5ebcbaef5e4dc31c09e3b66805459804c48372"
 )
 PROMPT_HASHES = {
     "prepare_pr_waiting_pr": (
@@ -1268,15 +1268,33 @@ os.execv(real_git, [real_git, *args])
             self.assertIn("`cleanup_run_janitor`", targets[key])
             self.assertIn("`cleanup_needs_user_action`", targets[key])
             self.assertIn("effect approval", targets[key])
+        cleanup_prompt = targets["waiting_pr_cleanup"]
+        self.assertIn(
+            "Only a separately approved, bounded external executor may apply "
+            "the exact patch",
+            cleanup_prompt,
+        )
+        self.assertIn(
+            "Cleanup is not the executor: it must not apply the patch or modify "
+            "the Janitor or consumer source",
+            cleanup_prompt,
+        )
+        self.assertIn(
+            "Cleanup is read-only with respect to source",
+            cleanup_prompt,
+        )
+        self.assertIn(
+            "verify the exact executor postimage and unchanged originals",
+            cleanup_prompt,
+        )
         for target in targets.values():
             self.assertIn("append", target)
         self.assertIn("owner/leave", targets["cleanup_needs_user_action"])
         self.assertIn("every flat carrier unchanged", targets["task_janitor_blocked"])
 
     def test_portable_patched_consumer_validates_receipt_and_preserves_state(self) -> None:
-        # Apply the actual one-time patch to checkout-local compatible source.
-        # Synthetic caller/native readbacks test its executable receipt/owner
-        # contract without claiming incident hashes or real effect authority.
+        # Simulate the separately approved executor's patch in this disposable
+        # root; the later Cleanup/Janitor path must only observe that postimage.
         self.assertEqual(hashlib.sha256(PATCH_PATH.read_bytes()).hexdigest(), PATCH_FILE_SHA256)
         with tempfile.TemporaryDirectory(prefix="ken22-portable-consumer-") as temporary:
             home = Path(temporary).resolve() / "home"
@@ -1311,6 +1329,9 @@ os.execv(real_git, [real_git, *args])
                 cwd=directory, env=_git_environment(), check=True, capture_output=True,
             )
             self.assertNotEqual(script.read_bytes(), original_source)
+            executor_postimage_sha256 = hashlib.sha256(
+                script.read_bytes()
+            ).hexdigest()
             source = script.read_text(encoding="utf-8")
             compile(source, str(script), "exec")
             guard = source.index("is_ken21_recovery = (")
@@ -1446,6 +1467,11 @@ os.execv(real_git, [real_git, *args])
                             {"cleanup_report": report}, directory, owner,
                         )
             self.assertEqual(before, self._fixture_tree_state(directory))
+            self.assertEqual(
+                hashlib.sha256(script.read_bytes()).hexdigest(),
+                executor_postimage_sha256,
+                "Cleanup/Janitor changed the executor's exact source postimage",
+            )
 
     def test_janitor_patch_applies_to_exact_frozen_preimage_and_compiles(self) -> None:
         patch_bytes = PATCH_PATH.read_bytes()

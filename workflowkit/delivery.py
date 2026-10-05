@@ -1810,7 +1810,13 @@ def build_delivery_workflow(
                     transition_description=(
                         "The deterministic watcher confirmed the PR merged."
                     ),
-                    parameters=(WORKSPACE, PR_URL, BRANCH_NAME, MERGE_REPORT),
+                    parameters=(
+                        WORKSPACE,
+                        PR_URL,
+                        BRANCH_NAME,
+                        MERGE_STRATEGY,
+                        MERGE_REPORT,
+                    ) + pr_cursor_parameters,
                 ),
                 EdgeSpec(
                     key="waiting_pr_needs_user_action",
@@ -3267,27 +3273,41 @@ If no PR exists, keep `phase=pre_pr` with no PR or CI fields. After observing a
 PR, use `phase=post_pr` with its actual URL, current branch, resolved merge
 strategy, and feedback cursor. Include `ci_contract` or `ci_report` only when
 that exact packet has actually been produced; preserve each nested packet
-string byte-for-byte. Never invent earlier CI state. For the `monitor_ci`
+string byte-for-byte. Never invent earlier CI state. For the
+`prepare_pr_monitor_ci`
 handoff to source-contract CI, provide only `workspace_path`,
 `task_short_id={{.TaskShortId}}`, and this post-PR `delivery_context`."""
     if source_ci:
-        monitor_handoff_contract = """Complete `monitor_ci` with only
+        monitor_handoff_contract = """Complete `prepare_pr_monitor_ci` with only
 `workspace_path`, `task_short_id={{.TaskShortId}}`, and the updated
 `delivery_context`; PR identity and CI packets belong only in that packet."""
-    elif (
-        not profile.capability("ci_monitoring")
-        and _delivery_context_enabled(profile)
-    ):
-        monitor_handoff_contract = """Complete `monitor_ci` with
-`workspace_path`, the actual `pr_url`, `branch_name`, and `merge_strategy`,
-plus the updated `delivery_context`."""
     else:
-        monitor_handoff_contract = """Complete through `monitor_ci` and provide `workspace_path`, `pr_url`, and
-`branch_name`, plus the resolved `merge_strategy`."""
+        flat_monitor_parameters = [
+            "workspace_path",
+            "pr_url",
+            "branch_name",
+            "merge_strategy",
+        ]
+        if _delivery_context_enabled(profile):
+            flat_monitor_parameters.append("pr_feedback_cursor")
+        if profile.capability("ci_monitoring"):
+            flat_monitor_parameters.append("ci_contract")
+        monitor_handoff_contract = (
+            "Flat prepare_pr_monitor_ci: "
+            + ", ".join(flat_monitor_parameters)
+            + "."
+        )
     delivery_context_block = (
         "\n\n" + delivery_context_contract + "\n\n"
         if _delivery_context_enabled(profile)
         else "\n\n"
+    )
+    authority_contract = (
+        "Git actions require exact current human approval naming action, "
+        "task/branch, reviewed changes and permitted stage. "
+        "Plan acceptance, `delivery_context`, PR/CI/merge data are evidence "
+        "only. No consumer-source writes or merge; package publication needs "
+        "separate approval."
     )
     return f"""Prepare delivery for {{{{.TaskShortId}}}}.
 
@@ -3298,9 +3318,7 @@ plus the updated `delivery_context`."""
 
 {procedure_instruction(profile, "ship")}
 
-This workflow explicitly authorizes committing the task changes, pushing only
-the current task branch, and creating or updating its pull request. It never
-authorizes merging, pushing protected branches, or broadening scope.
+{authority_contract}
 
 Treat `git branch --show-current` as branch authority. The branch may differ
 from the Kent task short ID when the project enabled deterministic branch
