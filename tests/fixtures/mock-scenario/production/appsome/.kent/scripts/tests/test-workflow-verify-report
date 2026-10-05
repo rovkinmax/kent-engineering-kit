@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""Exercise the Appsome compile-child to published verifier wire."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import sys
+
+
+sys.dont_write_bytecode = True
+
+
+ROOT = Path(__file__).resolve().parents[3]
+KIT = Path(os.environ["KENT_ENGINEERING_KIT_ROOT"]).resolve(strict=True)
+KIT_COMMIT = "b9de82c42ad097f31ac9e865dc49d59f916248bf"
+CHILD = ROOT / ".kent/scripts/workflow-compile-verify"
+HELPER = ROOT / ".kent/scripts/workflow-mock-scenario-evidence"
+TEMPLATE = ROOT / ".kent/scripts/workflow-verify-report"
+RUNTIME = ROOT / ".kent/scripts/workflow_runtime_contracts.py"
+PROFILE = ROOT / ".kent/workflow-profile.toml"
+TASK = ":app:compileDevDebugKotlin"
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def git(*args: str, cwd: Path) -> None:
+    subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def initialize_repository(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    git("init", "-q", cwd=root)
+    git("config", "user.name", "Appsome verifier fixture", cwd=root)
+    git("config", "user.email", "verifier@example.invalid", cwd=root)
+    (root / ".gitignore").write_text("/build/\n", encoding="utf-8")
+    (root / "fixture.txt").write_text("fixture\n", encoding="utf-8")
+    git("add", ".gitignore", "fixture.txt", cwd=root)
+    git("commit", "-q", "-m", "fixture", cwd=root)
+
+
+def install_fixture(root: Path, child: str | None = None) -> Path:
+    scripts = root / ".kent/scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(TEMPLATE, scripts / "workflow-verify-report")
+    shutil.copy2(RUNTIME, scripts / "workflow_runtime_contracts.py")
+    shutil.copy2(HELPER, scripts / "workflow-mock-scenario-evidence")
+    verifier = scripts / "workflow-compile-verify"
+    if child is None:
+        shutil.copy2(CHILD, verifier)
+    else:
+        verifier.write_text(child, encoding="utf-8")
+    for path in (
+        scripts / "workflow-verify-report",
+        scripts / "workflow-mock-scenario-evidence",
+        verifier,
+    ):
+        path.chmod(0o755)
+    return scripts
+
+
+def install_build_tool(root: Path, *, managed: bool, exit_code: int = 0) -> Path:
+    relative = Path("tools/agentw") if managed else Path("gradlew")
+    command = root / relative
+    command.parent.mkdir(parents=True, exist_ok=True)
+    command.write_text(
+        "#!/bin/sh\n"
+        "mkdir -p build/kent-workflow\n"
+        "printf '%s\\n' \"$*\" > build/kent-workflow/invocation-args.txt\n"
+        "printf 'mock compile output\\n'\n"
+        f"exit {exit_code}\n",
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    return command
+
+
+def run_helper(
+    root: Path,
+    command: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    result = subprocess.run(
+        [str(root / ".kent/scripts/workflow-mock-scenario-evidence"), command],
+        cwd=root,
+        input=json.dumps(payload, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        env=wrapper_environment(),
+        check=True,
+    )
+    response = json.loads(result.stdout)
+    if response.get("status") != "passed":
+        raise AssertionError(f"{command} failed: {response}")
+    return response
+
+
+def install_valid_non_applicable_evidence(root: Path) -> str:
+    task = "fixture-task"
+    artifact_dir = root / "build/kent-workflow" / task
+    results_dir = root / "build/test-results/mock-scenarios"
+    artifact_dir.mkdir(parents=True)
+    results_dir.mkdir(parents=True)
+    log_path = f"build/kent-workflow/{task}/alternative-verification.log"
+    log_file = root / log_path
+    start_path = f"build/kent-workflow/{task}/execution-start.json"
+    receipt_path = f"build/kent-workflow/{task}/execution-receipt.json"
+    evidence_path = f"build/kent-workflow/{task}/evidence.json"
+
+    baseline = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    start = run_helper(
+        root,
+        "capture-before",
+        {
+            "workspace_path": str(root),
+            "task_short_id": task,
+            "work_kind": "migration",
+            "baseline": baseline,
+            "results_dir": "build/test-results/mock-scenarios",
+            "selected_case_ids": [],
+            "output_path": start_path,
+        },
+    )
+
+    syntax_check = subprocess.run(
+        ["bash", "-n", ".kent/scripts/workflow-compile-verify"],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    log_file.write_text(
+        "bash -n .kent/scripts/workflow-compile-verify: passed\n"
+        + syntax_check.stdout
+        + syntax_check.stderr,
+        encoding="utf-8",
+    )
+    receipt = run_helper(
+        root,
+        "capture-after",
+        {
+            "workspace_path": str(root),
+            "start_path": start_path,
+            "output_path": receipt_path,
+            "runner_exit_code": 0,
+            "log_path": log_path,
+        },
+    )
+    delta = start["source_delta"]
+    files = delta["files"]
+    paths = [str(item["path"]) for item in files]
+    packet = {
+        "schema": "mock-scenario-evidence-v1",
+        "execution_id": start["execution_id"],
+        "task_short_id": task,
+        "work_kind": "migration",
+        "baseline": baseline,
+        "source_delta": delta,
+        "source_sha256": start["source_sha256"],
+        "behaviors": [
+            {
+                "behavior_id": "synthetic-tooling-fixture",
+                "applicability": "not_applicable",
+                "delta_paths": paths,
+                "source_paths": paths,
+                "rationale": (
+                    "The isolated wrapper fixture changes delivery tooling, "
+                    "not Android UI behavior, so the mock-backed UI harness "
+                    "cannot meaningfully exercise it."
+                ),
+                "alternative_verification": [
+                    "bash -n .kent/scripts/workflow-compile-verify passed "
+                    "in the synthetic Git workspace."
+                ],
+            }
+        ],
+        "verification": {
+            "result": receipt["result"],
+            "command": "bash -n .kent/scripts/workflow-compile-verify",
+            "log_path": log_path,
+            "log_sha256": sha256(log_file),
+        },
+        "execution_receipt": {
+            "path": receipt["receipt_path"],
+            "sha256": receipt["receipt_sha256"],
+        },
+    }
+    packet_file = root / evidence_path
+    packet_file.write_text(
+        json.dumps(packet, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    envelope = {
+        "schema": "mock-scenario-review-context-v1",
+        "evidence_path": evidence_path,
+        "evidence_sha256": sha256(packet_file),
+        "narrative": "Synthetic tooling fixture evidence for verifier compatibility.",
+    }
+    return json.dumps(envelope, separators=(",", ":"))
+
+
+def wrapper_environment() -> dict[str, str]:
+    # The copied wrapper must suppress its own and its child's bytecode without
+    # relying on the test runner's environment.
+    environment = dict(os.environ)
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    return environment
+
+
+def run_child(root: Path, payload: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(root / ".kent/scripts/workflow-compile-verify")],
+        cwd=root,
+        input=payload,
+        text=True,
+        capture_output=True,
+        env=wrapper_environment(),
+        check=True,
+    )
+
+
+def run_wrapper(
+    root: Path,
+    payload: dict[str, object] | None = None,
+) -> tuple[dict[str, object], dict[str, object], subprocess.CompletedProcess[str]]:
+    value = payload or {"workspace_path": str(root)}
+    result = subprocess.run(
+        [str(root / ".kent/scripts/workflow-verify-report")],
+        cwd=root,
+        input=json.dumps(value, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        env=wrapper_environment(),
+        check=True,
+    )
+    envelope = json.loads(result.stdout)
+    report = json.loads(envelope["verification_report"])
+    return envelope, report, result
+
+
+def report_log(root: Path, report: dict[str, object]) -> bytes:
+    relative = report["log_path"]
+    assert isinstance(relative, str), report
+    log = (root / relative).read_bytes()
+    assert hashlib.sha256(log).hexdigest() == report["log_sha256"]
+    return log
+
+
+def no_bytecode(scripts: Path) -> bool:
+    return not any(
+        path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+        for path in scripts.rglob("*")
+    )
+
+
+def temporary_root(*, managed: bool) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+    temporary = tempfile.TemporaryDirectory(prefix="appsome-workflow-wire-")
+    base = Path(temporary.name)
+    root = base / ".kent/worktrees/fixture" if managed else base
+    initialize_repository(root)
+    return temporary, root
+
+
+def map_scenario_and_wrapper_tooling(packet: dict, scenario_path: str) -> None:
+    behavior = packet["behaviors"][0]
+    scenario_paths = ["src/main/Label.kt", scenario_path, "src/test/resources/label.json"]
+    tooling_paths = sorted(set(behavior["delta_paths"]) - set(scenario_paths))
+    behavior["delta_paths"] = sorted(scenario_paths)
+    packet["behaviors"].append({
+        "behavior_id": "wrapper.tooling", "applicability": "not_applicable",
+        "delta_paths": tooling_paths, "source_paths": tooling_paths,
+        "rationale": "Copied verifier tooling cannot be exercised as application UI behavior.",
+        "alternative_verification": ["Real FD-backed wrapper and fake compile protocol assertions."],
+    })
+
+
+def main() -> int:
+    assert subprocess.run(
+        ["git", "-C", str(KIT), "rev-parse", "HEAD"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip() == KIT_COMMIT
+    assert not subprocess.run(
+        ["git", "-C", str(KIT), "status", "--porcelain=v1", "--untracked-files=all"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout
+    assert sha256(TEMPLATE) == sha256(KIT / "templates/project/workflow-verify-report")
+    assert sha256(RUNTIME) == sha256(KIT / "workflowkit/runtime.py")
+    profile = PROFILE.read_text(encoding="utf-8")
+    assert "schema_version = 4" in profile
+    assert 'runtime_contracts = "2.0.0"' in profile
+
+    cases: list[str] = []
+
+    # Exercise actual applicable execution through the unchanged FD-backed
+    # wrapper, not only a documentation exemption.
+    loader = importlib.machinery.SourceFileLoader(
+        "appsome_scenario_fixtures", str(ROOT / "tools/test-workflow-mock-scenario-evidence")
+    )
+    module_spec = importlib.util.spec_from_loader(loader.name, loader)
+    scenario_module = importlib.util.module_from_spec(module_spec)
+    loader.exec_module(scenario_module)
+    fixture = scenario_module.ScenarioFixture("bugfix")
+    try:
+        scripts = install_fixture(fixture.root)
+        install_build_tool(fixture.root, managed=False)
+        assertions = scenario_module.MockScenarioEvidenceTest()
+        packet, context, packet_path = assertions.valid_applicable_packet(fixture)
+        map_scenario_and_wrapper_tooling(packet, fixture.scenario_path)
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        context["evidence_sha256"] = sha256(packet_path)
+        narrative = "Original review context:\r\n- applicable label fix\n\tTooling assertions retained.\n"
+        context["narrative"] = narrative
+        retained = json.dumps(context, separators=(",", ":"))
+        payload = {"workspace_path": str(fixture.root), "review_context": retained}
+        envelope, report, _ = run_wrapper(fixture.root, payload)
+        assert envelope["verification_status"] == "passed", report
+        assert payload["review_context"] == retained
+        assert json.loads(retained)["narrative"] == narrative
+        assert no_bytecode(scripts)
+        cases.append("applicable-mixed-multiline")
+        for invalid in (" \r\n\t", "x" * (16 * 1024 + 1)):
+            context["narrative"] = invalid
+            payload["review_context"] = json.dumps(context, separators=(",", ":"))
+            invocation = fixture.root / "build/kent-workflow/invocation-args.txt"
+            invocation.unlink()
+            envelope, report, _ = run_wrapper(fixture.root, payload)
+            assert envelope["verification_status"] == "blocked", report
+            assert not invocation.exists(), "Invalid narrative invoked compile"
+            cases.append("invalid-narrative")
+            # Only the first invalid attempt follows a successful compile.
+            invocation.write_text("fixture marker\n", encoding="utf-8")
+    finally:
+        fixture.close()
+
+    fixture = scenario_module.ScenarioFixture("feature")
+    try:
+        install_fixture(fixture.root)
+        install_build_tool(fixture.root, managed=False, exit_code=0)
+        packet, context, path = assertions.valid_applicable_packet(
+            fixture, outcome="failed", runner_exit_code=1
+        )
+        map_scenario_and_wrapper_tooling(packet, fixture.scenario_path)
+        path.write_text(json.dumps(packet), encoding="utf-8")
+        context["evidence_sha256"] = sha256(path)
+        payload = {
+            "workspace_path": str(fixture.root),
+            "review_context": json.dumps(context, separators=(",", ":")),
+        }
+        direct = run_child(fixture.root, json.dumps(payload) + "\n")
+        assert json.loads(direct.stdout) == {"transition": "failed"}
+        envelope, report, _ = run_wrapper(fixture.root, payload)
+        assert envelope["verification_status"] == "needs_changes", report
+        assert report["code"] == "verification_failed"
+        assert not (fixture.root / "build/kent-workflow/invocation-args.txt").exists()
+        cases.append("failed-scenario-before-successful-compiler")
+    finally:
+        fixture.close()
+
+    temporary, root = temporary_root(managed=False)
+    try:
+        scripts = install_fixture(root)
+        tool = install_build_tool(root, managed=False)
+        review_context = install_valid_non_applicable_evidence(root)
+        payload = {
+            "workspace_path": str(root),
+            "review_context": review_context,
+            "stdin": "preserved",
+        }
+        direct = run_child(root, json.dumps(payload, separators=(",", ":")) + "\n")
+        assert json.loads(direct.stdout) == {"transition": "passed"}
+        assert direct.stderr == (
+            "Dev debug Kotlin compilation passed.\n"
+            "Command: ./gradlew :app:compileDevDebugKotlin; "
+            "log: build/kent-workflow/compile-dev-debug.log\n"
+        )
+        assert tool.read_text(encoding="utf-8").startswith("#!/bin/sh")
+        assert (
+            root / "build/kent-workflow/invocation-args.txt"
+        ).read_text(encoding="utf-8").strip() == TASK
+        assert b"mock compile output" in (
+            root / "build/kent-workflow/compile-dev-debug.log"
+        ).read_bytes()
+        envelope, report, wrapper_result = run_wrapper(root, payload)
+        assert envelope["transition"] == "deterministic_verify_reported"
+        assert envelope["verification_status"] == "passed"
+        assert report["code"] == "passed"
+        assert wrapper_result.stderr == ""
+        assert b"Dev debug Kotlin compilation passed." in report_log(root, report)
+        assert no_bytecode(scripts)
+        cases.append("pass")
+    finally:
+        temporary.cleanup()
+
+    temporary, root = temporary_root(managed=True)
+    try:
+        scripts = install_fixture(root)
+        tool = install_build_tool(root, managed=True, exit_code=7)
+        review_context = install_valid_non_applicable_evidence(root)
+        payload = {"workspace_path": str(root), "review_context": review_context}
+        direct = run_child(root, json.dumps(payload, separators=(",", ":")) + "\n")
+        assert json.loads(direct.stdout) == {"transition": "failed"}
+        assert "Dev debug Kotlin compilation failed." in direct.stderr
+        assert "./tools/agentw " + TASK in direct.stderr
+        assert (
+            root / "build/kent-workflow/invocation-args.txt"
+        ).read_text(encoding="utf-8").strip() == TASK
+        _, report, wrapper_result = run_wrapper(root, payload)
+        assert report["code"] == "verification_failed"
+        assert wrapper_result.stderr == ""
+        assert b"mock compile output" in (
+            root / "build/kent-workflow/compile-dev-debug.log"
+        ).read_bytes()
+        assert b"Dev debug Kotlin compilation failed." in report_log(root, report)
+        assert no_bytecode(scripts)
+        cases.append("fail-agentw")
+    finally:
+        temporary.cleanup()
+
+    temporary, root = temporary_root(managed=False)
+    try:
+        scripts = install_fixture(root)
+        review_context = install_valid_non_applicable_evidence(root)
+        payload = {"workspace_path": str(root), "review_context": review_context}
+        direct = run_child(root, json.dumps(payload, separators=(",", ":")) + "\n")
+        assert json.loads(direct.stdout) == {"transition": "failed"}
+        assert "could not find executable ./gradlew." in direct.stderr
+        assert f"Command unavailable: ./gradlew {TASK}" in direct.stderr
+        _, report, wrapper_result = run_wrapper(root, payload)
+        assert report["code"] == "verification_failed"
+        assert wrapper_result.stderr == ""
+        assert (
+            f"Command unavailable: ./gradlew {TASK}".encode()
+            in report_log(root, report)
+        )
+        assert b"Compile verifier could not find executable ./gradlew." in report_log(
+            root, report
+        )
+        assert no_bytecode(scripts)
+        cases.append("missing-executable")
+    finally:
+        temporary.cleanup()
+
+    for case_name, payload in (
+        ("missing-envelope", lambda root: {"workspace_path": str(root)}),
+        (
+            "invalid-envelope",
+            lambda root: {
+                "workspace_path": str(root),
+                "review_context": "{}",
+            },
+        ),
+    ):
+        temporary, root = temporary_root(managed=False)
+        try:
+            scripts = install_fixture(root)
+            install_build_tool(root, managed=False)
+            request = payload(root)
+            direct = run_child(
+                root,
+                json.dumps(request, separators=(",", ":")) + "\n",
+            )
+            assert json.loads(direct.stdout) == {"transition": "blocked"}
+            _, report, wrapper_result = run_wrapper(root, request)
+            assert report["code"] == "verification_blocked"
+            assert wrapper_result.stderr == ""
+            assert not (root / "build/kent-workflow/invocation-args.txt").exists()
+            assert b"Mock-scenario evidence" in report_log(root, report)
+            assert no_bytecode(scripts)
+            cases.append(case_name)
+        finally:
+            temporary.cleanup()
+
+    temporary, root = temporary_root(managed=False)
+    try:
+        scripts = install_fixture(root)
+        install_build_tool(root, managed=False)
+        review_context = install_valid_non_applicable_evidence(root)
+        helper = scripts / "workflow-mock-scenario-evidence"
+        marker = root / "build/kent-workflow/helper-was-executed"
+        target = root / "helper-target.sh"
+        target.write_text(
+            "#!/bin/sh\n"
+            "mkdir -p build/kent-workflow\n"
+            f"printf executed > '{marker.relative_to(root)}'\n",
+            encoding="utf-8",
+        )
+        target.chmod(0o755)
+        helper.unlink()
+        helper.symlink_to(target)
+        payload = {"workspace_path": str(root), "review_context": review_context}
+        direct = run_child(root, json.dumps(payload, separators=(",", ":")) + "\n")
+        assert json.loads(direct.stdout) == {"transition": "blocked"}
+        assert "helper is missing or unsafe" in direct.stderr
+        _, report, wrapper_result = run_wrapper(root, payload)
+        assert report["code"] == "verification_blocked"
+        assert wrapper_result.stderr == ""
+        assert not marker.exists()
+        assert not (root / "build/kent-workflow/invocation-args.txt").exists()
+        assert b"helper is missing or unsafe" in report_log(root, report)
+        assert no_bytecode(scripts)
+        cases.append("unsafe-helper-symlink")
+    finally:
+        temporary.cleanup()
+
+    blocked_child = (
+        "#!/bin/sh\n"
+        "IFS= read -r payload || true\n"
+        "printf '%s\\n' '{\"transition\":\"blocked\"}'\n"
+    )
+    temporary, root = temporary_root(managed=False)
+    try:
+        scripts = install_fixture(root, blocked_child)
+        direct = run_child(root, "{}\n")
+        assert json.loads(direct.stdout) == {"transition": "blocked"}
+        _, report, wrapper_result = run_wrapper(root)
+        assert report["code"] == "verification_blocked"
+        assert wrapper_result.stderr == ""
+        assert no_bytecode(scripts)
+        cases.append("blocked-child")
+    finally:
+        temporary.cleanup()
+
+    legacy_child = (
+        "#!/bin/sh\n"
+        "IFS= read -r payload || true\n"
+        "printf '%s\\n' "
+        "'{\"transition\":\"passed\",\"commentary\":\"legacy\","
+        "\"verification_report\":\"legacy\"}'\n"
+    )
+    temporary, root = temporary_root(managed=False)
+    try:
+        scripts = install_fixture(root, legacy_child)
+        _, report, wrapper_result = run_wrapper(root, {"workspace_path": str(root)})
+        assert report["code"] == "child_output_invalid"
+        assert wrapper_result.stderr == ""
+        assert no_bytecode(scripts)
+        cases.append("legacy-rejected")
+    finally:
+        temporary.cleanup()
+
+    stdin_child = (
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "from pathlib import Path\n"
+        "payload = json.loads(__import__('sys').stdin.read())\n"
+        "Path('stdin-capture.json').write_text(json.dumps(payload, sort_keys=True))\n"
+        "print('{\"transition\":\"passed\"}')\n"
+    )
+    temporary, root = temporary_root(managed=False)
+    try:
+        scripts = install_fixture(root, stdin_child)
+        payload = {"workspace_path": str(root), "stdin": "preserved"}
+        _, report, wrapper_result = run_wrapper(root, payload)
+        assert report["code"] == "passed"
+        assert wrapper_result.stderr == ""
+        assert json.loads((root / "stdin-capture.json").read_text()) == payload
+        assert no_bytecode(scripts)
+        cases.append("stdin-preserved")
+    finally:
+        temporary.cleanup()
+
+    temporary, root = temporary_root(managed=False)
+    try:
+        scripts = install_fixture(root, "#!/bin/sh\nprintf '%s\\n' '{\"transition\":\"passed\"}'\n")
+        invalid = subprocess.run(
+            [str(root / ".kent/scripts/workflow-verify-report")],
+            cwd=root,
+            input='{"workspace_path":',
+            text=True,
+            capture_output=True,
+            env=wrapper_environment(),
+            check=True,
+        )
+        assert json.loads(invalid.stdout)["verification_report"].find(
+            '"code":"input_invalid"'
+        ) >= 0
+        _, report, _ = run_wrapper(root)
+        assert report["code"] == "passed"
+        assert no_bytecode(scripts)
+        cases.append("bytecode-guard")
+    finally:
+        temporary.cleanup()
+
+    print(json.dumps({"status": "passed", "cases": cases}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (AssertionError, OSError, subprocess.SubprocessError) as error:
+        print(f"test-workflow-verify-report: {error}")
+        raise SystemExit(1)

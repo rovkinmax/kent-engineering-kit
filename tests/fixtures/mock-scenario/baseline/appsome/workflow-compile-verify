@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+IFS= read -r _kent_input || true
+
+log_dir="build/kent-workflow"
+log_path="$log_dir/compile-dev-debug.log"
+mkdir -p "$log_dir"
+
+if [[ "$PWD" == *"/.kent/worktrees/"* ]]; then
+  command=(./tools/agentw :app:compileDevDebugKotlin)
+else
+  command=(./gradlew :app:compileDevDebugKotlin)
+fi
+
+if [[ ! -x "${command[0]}" ]]; then
+  printf 'Compile verifier could not find executable %s.\n' "${command[0]}" >&2
+  printf 'Command unavailable: %s\n' "${command[*]}" >&2
+  printf '{"transition":"failed"}\n'
+  exit 0
+fi
+
+if "${command[@]}" >"$log_path" 2>&1; then
+  transition="passed"
+  commentary="Dev debug Kotlin compilation passed."
+else
+  transition="failed"
+  commentary="Dev debug Kotlin compilation failed. Inspect $log_path."
+fi
+
+printf '%s\n' "$commentary" >&2
+printf 'Command: %s; log: %s\n' "${command[*]}" "$log_path" >&2
+printf '{"transition":"%s"}\n' "$transition"
