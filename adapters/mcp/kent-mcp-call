@@ -25,12 +25,15 @@ Safe output modes:
   --digest-output
   --assert-contains <literal>
   --assert-not-contains <literal>
+  --assert-json-true <JSON-pointer>
   --hash-matches <extended-regex>
   --marker-present <literal>
 
-Raw responses are not written to a separate artifact by default, but normal
-stdout is still retained by the Kent shell transcript. Mobile tools other than
-device therefore require a safe output mode.
+Safe modes except --quiet emit the sanitized kent-mcp-result-v1 outcome
+contract. --quiet remains process-exit-only. Raw responses are not written to
+a separate artifact by default, but normal stdout is still retained by the
+Kent shell transcript. Mobile tools other than device therefore require a
+safe output mode.
 EOF
 }
 
@@ -53,6 +56,7 @@ output_mode="text"
 safe_output_mode="raw"
 assert_contains=()
 assert_not_contains=()
+assert_json_true=()
 hash_matches_regex=""
 marker_literals=()
 args=()
@@ -99,6 +103,15 @@ while [[ $# -gt 0 ]]; do
         exit 2
       }
       assert_not_contains+=("$value")
+      shift 2
+      ;;
+    --assert-json-true)
+      set_safe_output_mode json_assertion
+      [[ $# -ge 2 ]] || {
+        printf 'missing_value: --assert-json-true requires a JSON pointer\n' >&2
+        exit 2
+      }
+      assert_json_true+=("$2")
       shift 2
       ;;
     --hash-matches)
@@ -165,6 +178,70 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if ! python3 - "$hash_matches_regex" \
+  "${#assert_contains[@]}" "${assert_contains[@]}" \
+  "${#assert_not_contains[@]}" "${assert_not_contains[@]}" \
+  "${#assert_json_true[@]}" "${assert_json_true[@]}" \
+  "${#marker_literals[@]}" "${marker_literals[@]}" <<'PY'
+import sys
+
+MAX_SELECTORS = 32
+MAX_SELECTOR_BYTES = 4096
+
+try:
+    pattern = sys.argv[1]
+    index = 2
+
+    def take_values():
+        global index
+        count = int(sys.argv[index])
+        index += 1
+        values = sys.argv[index:index + count]
+        if len(values) != count:
+            raise ValueError
+        index += count
+        return values
+
+    contains = take_values()
+    not_contains = take_values()
+    json_pointers = take_values()
+    markers = take_values()
+    if index != len(sys.argv):
+        raise ValueError
+
+    selectors = contains + not_contains + json_pointers + markers
+    if pattern:
+        selectors.append(pattern)
+    if len(selectors) > MAX_SELECTORS:
+        raise ValueError
+    if any(len(value.encode("utf-8")) > MAX_SELECTOR_BYTES for value in selectors):
+        raise ValueError
+
+    for pointer in json_pointers:
+        if pointer == "":
+            continue
+        if not pointer.startswith("/"):
+            raise ValueError
+        position = 0
+        while position < len(pointer):
+            if pointer[position] == "~":
+                if (
+                    position + 1 >= len(pointer)
+                    or pointer[position + 1] not in "01"
+                ):
+                    raise ValueError
+                position += 2
+            else:
+                position += 1
+except (IndexError, UnicodeError, ValueError):
+    print("safe_output_arguments_invalid", file=sys.stderr)
+    raise SystemExit(2)
+PY
+then
+  printf 'safe_output_arguments_invalid: selector, pointer, or count limit\n' >&2
+  exit 2
+fi
 
 server="${target%%.*}"
 tool="${target#*.}"
@@ -408,7 +485,7 @@ assert_mobile_exact_target "$server" "$tool"
 
 if is_mobile_server "$server" && [[ "$tool" != "device" ]] &&
   [[ "$safe_output_mode" == "raw" ]]; then
-  printf 'sensitive_mobile_output_requires_safe_mode: use --quiet, --digest-output, or --assert-contains/--assert-not-contains\n' >&2
+  printf 'sensitive_mobile_output_requires_safe_mode: use a safe output mode, including --assert-json-true for known boolean state\n' >&2
   exit 2
 fi
 
@@ -469,101 +546,438 @@ set -e
 effective_exit_code="$exit_code"
 error_code=""
 
-if [[ $exit_code -ne 0 ]]; then
-  if [[ "$safe_output_mode" == "raw" ]]; then
-    cat "$tmp_out"
-    [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
-  else
-    printf 'mcp_call_failed: %s exited %s; raw output suppressed\n' \
-      "$target" "$exit_code" >&2
-  fi
-  error_code="mcporter_call_failed"
-else
-  case "$safe_output_mode" in
-    raw)
-      cat "$tmp_out"
-      [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
-      ;;
-    quiet)
-      ;;
-    digest)
-      if command -v sha256sum >/dev/null 2>&1; then
-        digest="$(sha256sum "$tmp_out" | awk '{print $1}')"
-      elif command -v shasum >/dev/null 2>&1; then
-        digest="$(shasum -a 256 "$tmp_out" | awk '{print $1}')"
-      else
-        digest="$(openssl dgst -sha256 -r "$tmp_out" | awk '{print $1}')"
-      fi
-      bytes="$(wc -c <"$tmp_out" | tr -d '[:space:]')"
-      lines="$(wc -l <"$tmp_out" | tr -d '[:space:]')"
-      printf '{"status":"passed","sha256":"%s","bytes":%s,"lines":%s}\n' \
-        "$digest" "$bytes" "$lines"
-      ;;
-    assertion)
-      failed_contains=0
-      failed_not_contains=0
-      for value in "${assert_contains[@]}"; do
-        grep -Fq -- "$value" "$tmp_out" || ((failed_contains += 1))
-      done
-      for value in "${assert_not_contains[@]}"; do
-        grep -Fq -- "$value" "$tmp_out" && ((failed_not_contains += 1))
-      done
-      if ((failed_contains == 0 && failed_not_contains == 0)); then
-        assertion_status="passed"
-      else
-        assertion_status="failed"
-        effective_exit_code=3
-        error_code="mcp_output_assertion_failed"
-      fi
-      printf '{"status":"%s","contains":%d,"notContains":%d,"failedContains":%d,"failedNotContains":%d}\n' \
-        "$assertion_status" "${#assert_contains[@]}" \
-        "${#assert_not_contains[@]}" "$failed_contains" \
-        "$failed_not_contains"
-      ;;
-    extract)
-      if python3 - "$tmp_out" "$hash_matches_regex" \
-        "${marker_literals[@]}" >"$tmp_safe_out" 2>"$tmp_safe_err" <<'PY'
+render_safe_result() {
+  python3 - "$safe_output_mode" "$tmp_out" "$exit_code" \
+    "${#assert_contains[@]}" "${assert_contains[@]}" \
+    "${#assert_not_contains[@]}" "${assert_not_contains[@]}" \
+    "${#assert_json_true[@]}" "${assert_json_true[@]}" \
+    "$hash_matches_regex" \
+    "${#marker_literals[@]}" "${marker_literals[@]}" <<'PY'
 import hashlib
 import json
+import math
 import re
+import subprocess
 import sys
-from pathlib import Path
 
-path, pattern, *markers = sys.argv[1:]
-text = Path(path).read_text(encoding="utf-8", errors="replace")
-matches = list(re.finditer(pattern, text)) if pattern else []
-hashes = []
-seen = set()
-for match in matches:
-    value = match.group(0)
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-    if digest not in seen:
-        seen.add(digest)
-        hashes.append(digest)
+MAX_DOCUMENT_BYTES = 1024 * 1024
+MAX_UNIQUE_HASHES = 256
 
-print(
-    json.dumps(
-        {
-            "status": "passed",
-            "occurrenceCount": len(matches),
-            "uniqueCount": len(hashes),
-            "hashes": hashes,
-            "markerCount": len(markers),
-            "markersPresent": [marker in text for marker in markers],
-        },
-        separators=(",", ":"),
+try:
+    mode, path = sys.argv[1:3]
+    transport_exit = int(sys.argv[3])
+    index = 4
+
+    def take_values():
+        global index
+        count = int(sys.argv[index])
+        index += 1
+        values = sys.argv[index:index + count]
+        if len(values) != count:
+            raise ValueError
+        index += count
+        return values
+
+    contains = take_values()
+    not_contains = take_values()
+    json_pointers = take_values()
+    pattern = sys.argv[index]
+    index += 1
+    markers = take_values()
+    if index != len(sys.argv):
+        raise ValueError
+except (IndexError, ValueError):
+    print("processing_failed", file=sys.stderr)
+    raise SystemExit(3)
+
+literal_count = len(contains) + len(not_contains)
+assertion_kind = {
+    "assertion": "literal",
+    "json_assertion": "json_boolean",
+}.get(mode, "none")
+assertion_requested = mode in {"assertion", "json_assertion"}
+
+
+def result_base(transport, processing, assertion, kind):
+    return {
+        "schema": "kent-mcp-result-v1",
+        "transport": transport,
+        "processing": processing,
+        "action": "unknown",
+        "assertion": assertion,
+        "assertionKind": kind,
+    }
+
+
+def add_unavailable_mode_fields(result):
+    if mode == "assertion":
+        result.update(
+            {
+                "contains": len(contains),
+                "notContains": len(not_contains),
+                "failedContains": 0,
+                "failedNotContains": 0,
+                "assertionResults": ["unknown"] * literal_count,
+            }
+        )
+    elif mode == "json_assertion":
+        result.update(
+            {
+                "assertionCount": len(json_pointers),
+                "failedAssertions": 0,
+                "unknownAssertions": len(json_pointers),
+                "assertionResults": ["unknown"] * len(json_pointers),
+            }
+        )
+    elif mode == "extract":
+        result["markerCount"] = len(markers)
+
+
+def emit(result):
+    sys.stdout.write(json.dumps(result, separators=(",", ":"), allow_nan=False))
+    sys.stdout.write("\n")
+
+
+if transport_exit != 0:
+    result = result_base(
+        "failed",
+        "not_attempted",
+        "unknown" if assertion_requested else "not_requested",
+        assertion_kind,
     )
-)
+    add_unavailable_mode_fields(result)
+    emit(result)
+    raise SystemExit(0)
+
+
+def bounded_bytes():
+    with open(path, "rb") as source:
+        data = source.read(MAX_DOCUMENT_BYTES + 1)
+    if len(data) > MAX_DOCUMENT_BYTES:
+        raise ValueError
+    return data
+
+
+def processing_failure():
+    result = result_base(
+        "succeeded",
+        "failed",
+        "unknown" if assertion_requested else "not_requested",
+        assertion_kind,
+    )
+    add_unavailable_mode_fields(result)
+    emit(result)
+    print("processing_failed", file=sys.stderr)
+    raise SystemExit(3)
+
+
+def reject_constant(_value):
+    raise ValueError
+
+
+def parse_finite_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError
+    return parsed
+
+
+def object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def decode_pointer(pointer):
+    if pointer == "":
+        return []
+    decoded = []
+    for token in pointer[1:].split("/"):
+        value = []
+        position = 0
+        while position < len(token):
+            char = token[position]
+            if char != "~":
+                value.append(char)
+                position += 1
+                continue
+            escaped = token[position + 1]
+            value.append("~" if escaped == "0" else "/")
+            position += 2
+        decoded.append("".join(value))
+    return decoded
+
+
+def select_boolean(document, tokens):
+    selected = document
+    for token in tokens:
+        if isinstance(selected, dict):
+            if token not in selected:
+                return "unknown"
+            selected = selected[token]
+        elif isinstance(selected, list):
+            if (
+                token == "-"
+                or not token.isascii()
+                or not token.isdecimal()
+                or (len(token) > 1 and token.startswith("0"))
+            ):
+                return "unknown"
+            if len(token) > len(str(len(selected))):
+                return "unknown"
+            position = int(token)
+            if position >= len(selected):
+                return "unknown"
+            selected = selected[position]
+        else:
+            return "unknown"
+    if selected is True:
+        return "passed"
+    if selected is False:
+        return "failed"
+    return "unknown"
+
+
+try:
+    if mode == "digest":
+        digest = hashlib.sha256()
+        byte_count = 0
+        line_count = 0
+        with open(path, "rb") as source:
+            while True:
+                chunk = source.read(65536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                byte_count += len(chunk)
+                line_count += chunk.count(b"\n")
+        result = result_base(
+            "succeeded", "succeeded", "not_requested", "none"
+        )
+        result.update(
+            {
+                "sha256": digest.hexdigest(),
+                "bytes": byte_count,
+                "lines": line_count,
+            }
+        )
+        emit(result)
+        raise SystemExit(0)
+
+    raw = bounded_bytes()
+    if mode == "assertion":
+        outcomes = []
+        failed_contains = 0
+        failed_not_contains = 0
+        for value in contains:
+            completed = subprocess.run(
+                ["grep", "-Fq", "--", value, path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if completed.returncode not in (0, 1):
+                raise ValueError
+            passed = completed.returncode == 0
+            outcomes.append("passed" if passed else "failed")
+            failed_contains += not passed
+        for value in not_contains:
+            completed = subprocess.run(
+                ["grep", "-Fq", "--", value, path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if completed.returncode not in (0, 1):
+                raise ValueError
+            passed = completed.returncode == 1
+            outcomes.append("passed" if passed else "failed")
+            failed_not_contains += not passed
+        aggregate = "failed" if "failed" in outcomes else "passed"
+        result = result_base("succeeded", "succeeded", aggregate, "literal")
+        result.update(
+            {
+                "contains": len(contains),
+                "notContains": len(not_contains),
+                "failedContains": failed_contains,
+                "failedNotContains": failed_not_contains,
+                "assertionResults": outcomes,
+            }
+        )
+        emit(result)
+        if aggregate == "failed":
+            print("assertion_failed", file=sys.stderr)
+            raise SystemExit(4)
+        raise SystemExit(0)
+
+    if mode == "json_assertion":
+        document = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=object_without_duplicate_keys,
+            parse_constant=reject_constant,
+            parse_float=parse_finite_float,
+        )
+        outcomes = [
+            select_boolean(document, decode_pointer(pointer))
+            for pointer in json_pointers
+        ]
+        if "failed" in outcomes:
+            aggregate = "failed"
+        elif "unknown" in outcomes:
+            aggregate = "unknown"
+        else:
+            aggregate = "passed"
+        result = result_base(
+            "succeeded", "succeeded", aggregate, "json_boolean"
+        )
+        result.update(
+            {
+                "assertionCount": len(outcomes),
+                "failedAssertions": outcomes.count("failed"),
+                "unknownAssertions": outcomes.count("unknown"),
+                "assertionResults": outcomes,
+            }
+        )
+        emit(result)
+        if aggregate == "failed":
+            print("assertion_failed", file=sys.stderr)
+            raise SystemExit(4)
+        if aggregate == "unknown":
+            print("assertion_unknown", file=sys.stderr)
+            raise SystemExit(5)
+        raise SystemExit(0)
+
+    if mode == "extract":
+        text = raw.decode("utf-8", errors="strict")
+        expression = re.compile(pattern) if pattern else None
+        occurrence_count = 0
+        hashes = []
+        seen = set()
+        if expression is not None:
+            for match in expression.finditer(text):
+                occurrence_count += 1
+                digest = hashlib.sha256(
+                    match.group(0).encode("utf-8")
+                ).hexdigest()
+                if digest in seen:
+                    continue
+                if len(hashes) >= MAX_UNIQUE_HASHES:
+                    raise ValueError
+                seen.add(digest)
+                hashes.append(digest)
+        result = result_base(
+            "succeeded", "succeeded", "not_requested", "none"
+        )
+        result.update(
+            {
+                "occurrenceCount": occurrence_count,
+                "uniqueCount": len(hashes),
+                "hashes": hashes,
+                "markerCount": len(markers),
+                "markersPresent": [marker in text for marker in markers],
+            }
+        )
+        emit(result)
+        raise SystemExit(0)
+
+    raise ValueError
+except SystemExit:
+    raise
+except Exception:
+    processing_failure()
 PY
-      then
-        cat "$tmp_safe_out"
-      else
-        printf 'mcp_safe_extract_failed: raw output suppressed\n' >&2
+}
+
+if [[ "$safe_output_mode" != "raw" && "$safe_output_mode" != "quiet" ]]; then
+  set +e
+  render_safe_result >"$tmp_safe_out" 2>"$tmp_safe_err"
+  renderer_exit=$?
+  set -e
+
+  if [[ -s "$tmp_safe_out" ]]; then
+    cat "$tmp_safe_out"
+  else
+    fallback_transport="succeeded"
+    fallback_processing="failed"
+    fallback_assertion="not_requested"
+    fallback_kind="none"
+    if [[ $exit_code -ne 0 ]]; then
+      fallback_transport="failed"
+      fallback_processing="not_attempted"
+    fi
+    case "$safe_output_mode" in
+      assertion)
+        fallback_assertion="unknown"
+        fallback_kind="literal"
+        ;;
+      json_assertion)
+        fallback_assertion="unknown"
+        fallback_kind="json_boolean"
+        ;;
+    esac
+    printf '{"schema":"kent-mcp-result-v1","transport":"%s","processing":"%s","action":"unknown","assertion":"%s","assertionKind":"%s"}\n' \
+      "$fallback_transport" "$fallback_processing" \
+      "$fallback_assertion" "$fallback_kind"
+    renderer_exit=3
+  fi
+
+  if [[ $exit_code -ne 0 ]]; then
+    printf 'mcp_call_failed: %s exited %s; raw output suppressed\n' \
+      "$target" "$exit_code" >&2
+    effective_exit_code="$exit_code"
+    error_code="mcporter_call_failed"
+  else
+    case "$renderer_exit" in
+      0)
+        effective_exit_code=0
+        ;;
+      3)
+        printf 'mcp_safe_processing_failed: raw output suppressed\n' >&2
         effective_exit_code=3
-        error_code="mcp_safe_extract_failed"
-      fi
-      ;;
-  esac
+        error_code="mcp_safe_processing_failed"
+        ;;
+      4)
+        printf 'mcp_output_assertion_failed: raw output suppressed\n' >&2
+        effective_exit_code=3
+        error_code="mcp_output_assertion_failed"
+        ;;
+      5)
+        printf 'mcp_output_assertion_unknown: raw output suppressed\n' >&2
+        effective_exit_code=3
+        error_code="mcp_output_assertion_unknown"
+        ;;
+      *)
+        printf 'mcp_safe_processing_failed: raw output suppressed\n' >&2
+        effective_exit_code=3
+        error_code="mcp_safe_processing_failed"
+        ;;
+    esac
+  fi
+
+  raw_path=""
+  append_call_log "$root" "$server" "$tool" "$config_display" "$output_mode" \
+    "$raw_path" "$effective_exit_code" "$error_code" "$safe_output_mode"
+  exit "$effective_exit_code"
+fi
+
+effective_exit_code="$exit_code"
+error_code=""
+
+if [[ "$safe_output_mode" == "raw" ]]; then
+  cat "$tmp_out"
+  if [[ $exit_code -ne 0 ]]; then
+    [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
+    error_code="mcporter_call_failed"
+  else
+    [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
+  fi
+elif [[ $exit_code -ne 0 ]]; then
+    printf 'mcp_call_failed: %s exited %s; raw output suppressed\n' \
+      "$target" "$exit_code" >&2
+  error_code="mcporter_call_failed"
 fi
 
 raw_path=""
