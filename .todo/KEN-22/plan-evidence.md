@@ -2143,3 +2143,44 @@ acceptance, not effects already approved or performed.
   Later normal Delivery owns the approved conditional fast-forward KEN-22
   publication after those gates; remote drift or continued GitHub
   `canBeRebased=false` must stop there without strategy fallback.
+
+### Forward integration settlement
+
+- Authorized local merge commit:
+  `9192be7d97cdd73d38f7629f0720ac198ef70e60`; parents exactly
+  published `787f683499f60bedd7b1acede729507b575bafc1` and incoming
+  `38b40892dd688d181138890c9ae55d23aa715c95`. Both inputs and immutable
+  `4d0e514aebae5295c803693d72f6640ab2c7846d` are verified ancestors.
+  Commit settlement was clean, with no unresolved merge or publication.
+- Final exact-hash union proof:
+  `build/kent-workflow/KEN-22/forward-integration-20261006/settled-union-proof.json`,
+  SHA-256 `6bbdee3ede25481299e735dda2ee789ee9c02f4fe2af43d69a91f73d3e545fe4`;
+  target229 non-authored blobs/modes and compatible Task/historical paths
+  remain preserved. Only bounded builder and two existing test modules were
+  authored during integration; v6 regenerated to identical approved bytes.
+- Postcommit contained baseline/target exact qualification, real integrated
+  candidate controls and repaired KEN-18 compatibility case: **four PASS,
+  zero skips**, 2.006s; log
+  `build/kent-workflow/KEN-22/forward-integration-20261006/postcommit-exact-controls.log`,
+  SHA-256 `ce32d068291c4e81f62e0d8e686f629503468f36e74d52206336aef55a2abaac`.
+- No remaining in-scope repair finding. This append-only settlement and the
+  final ledger receipt are postcommit bookkeeping for fresh source gates;
+  normal Delivery may publish only after the newly required gates and exact
+  remote/ruleset/rebase-feasibility checks. No fresh union full-verifier,
+  Standards, updated-head CI or GitHub rebase result is claimed by Fix.
+
+### Forward integration evidence-ledger receipt
+
+- Appended current native Run `node_key=fix`, `evidence_type=implementation`
+  through the profile command: sequence **44**, event hash
+  `b9d42ff3ec3e66197bdde426687f9ba6caad12e3abcd6b9b090cf80b8f0c4afa`,
+  `duplicate_suppressed=false`. Receipt:
+  `build/kent-workflow/KEN-22/forward-integration-20261006/fix-ledger-receipt.json`.
+- Manifest is recorded only as `context.manifest_path`; instruction files
+  follow actual read order, with explicit repeated reads. Model/compaction
+  counters remain null; repeated questions zero, verification loops ten.
+  No secrets, fabricated identity or broad raw evidence were stored.
+- All approved local integration work is complete. Canonical Fix checkpoint
+  and refreshed handoff retain the commit, union proof, fresh bounded checks,
+  unchanged complete pre-integration positive packet and exact delivery carrier.
+  Full verifier and independent source gates must cover final bookkeeping.
