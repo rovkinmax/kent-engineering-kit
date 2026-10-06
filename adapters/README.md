@@ -27,19 +27,48 @@ therefore select one safe output mode:
 --digest-output
 --assert-contains <literal>
 --assert-not-contains <literal>
+--assert-json-true <JSON-pointer>
 --hash-matches <extended-regex>
 --marker-present <literal>
 ```
 
 Safe modes suppress the raw response and are incompatible with `--save-raw` or
-`--raw-dir`. Mobile tools other than `device` fail closed without a safe mode.
-Use output assertions for known acceptance facts and digests for before/after
-equivalence without disclosing content. `--hash-matches` emits only unique
-SHA-256 values for matched semantic tokens; combine it with one or more
-`--marker-present` checks for bounded pagination proof. Neither matched values
-nor marker literals are copied from the response to stdout. Never opt in to raw
-output for an unexpected authenticated UI tree, credentials, headers, broad
-device logs, or unredacted network payloads.
+`--raw-dir`. Except for `--quiet`, safe modes emit a sanitized
+`kent-mcp-result-v1` JSON object with separate `transport`, `processing`,
+`action`, `assertion`, and `assertionKind` fields. Transport describes only the
+mcporter process result; processing describes the adapter's bounded handling
+of its output; `action` remains `unknown` because this adapter has no provider
+completion decoder. A successful digest or extraction is not an assertion.
+`--marker-present` remains an observation and can report false markers while
+processing succeeds.
+
+`--assert-contains` and `--assert-not-contains` are byte-literal checks,
+reported as `assertionKind: literal`; they do not establish UI state or
+authentication. Repeat `--assert-json-true <JSON-pointer>` to assert that each
+selected value is exactly JSON boolean `true`. Pointers use RFC 6901 escaping;
+an empty pointer selects the document root. A selected `false` fails;
+missing, null, wrong-type, or unsupported values are `unknown`. Duplicate JSON
+keys, invalid UTF-8, malformed JSON, and non-finite numbers fail processing.
+The sanitized result includes only fixed outcome enums and bounded counts, not
+selectors, selected values, or raw parse errors.
+
+Only a consumer that knows the relevant provider/state schema and accounts for
+its error conditions may use a passed JSON-boolean assertion as destination
+evidence. A true value alone is not a universal provider-success decoder or
+proof that an action completed. Without that known schema, the state remains
+unknown. Quiet remains empty and process-exit-only; digest, literal checks,
+hashes, and marker booleans cannot establish authentication or a passed Smoke
+checkpoint. Existing authorized bounded visual or other observation paths
+remain available under the Mobile Smoke contract.
+
+The adapter limits interpretation to 32 combined predicates/markers, 4096
+UTF-8 bytes per selector/literal, 1 MiB per parsed/asserted/extracted response,
+and 256 unique extracted hashes. Exceeding argument limits is a usage error;
+oversized or invalid processing returns a sanitized failure, never truncated
+success. Digest hashing is streaming. These limits do not bound the existing
+temporary stdout/stderr capture of the initial tool process. Neither that
+capture nor safe output is an authorization to persist raw UI, authentication,
+credential, header, broad-log, or unredacted network content.
 
 Portable servers are added separately:
 

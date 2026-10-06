@@ -88,6 +88,50 @@ audited task artifact also requires no additional approval. Publishing it
 outside the workflow evidence boundary or committing it to source control
 requires the normal authorization for that external action.
 
+## MCP Outcome Evidence
+
+This gate applies only when a Smoke claim relies on the safe result from
+`kent-mcp-call`; it does not replace the existing authorized visual or other
+bounded observation paths.
+
+- Safe modes other than `--quiet` emit `schema: kent-mcp-result-v1` with
+  separate `transport`, `processing`, `action`, `assertion`, and
+  `assertionKind` outcomes. Require a valid complete outcome object, successful
+  transport, and successful processing before considering its assertion.
+- `action` is always `unknown` in this adapter contract. Do not infer action
+  completion, navigation, or authentication from process exit, a successful
+  parse, a digest, extracted hashes, marker booleans, literal checks, or agent
+  narrative.
+- Promote an authenticated or passed checkpoint from this result only when a
+  task's known provider/state schema supports a `json_boolean` assertion that
+  passed for the intended destination/state, the caller can account for all
+  schema-defined error conditions, and the required interaction/navigation
+  evidence is present. The consumer must know what the selected boolean means;
+  an arbitrary true field is not provider-success proof. If the schema or its
+  error conditions cannot be established or expressed, keep the state unknown.
+- `--assert-json-true` selects exact JSON boolean values. False is a failed
+  assertion; missing, null, or a non-boolean value is unknown. Per-selector
+  results contain only fixed outcome enums. Do not persist or echo the response
+  body, selected values, pointers, raw parse errors, or provider stderr to
+  resolve ambiguity. This adapter does not guess fields such as `ok` or
+  `error`.
+- A negative destination assertion does not by itself prove that the app is
+  unauthenticated or identify the screen currently shown. A positive state
+  assertion can support a checkpoint only under the known-schema and
+  interaction requirements above.
+- `--quiet` remains empty and process-exit-only. An assertion based on literal
+  text is byte-presence evidence, not semantic state evidence. Digest and
+  extraction results, including false or mixed `markersPresent`, describe
+  processing or observation only and cannot establish authentication or pass a
+  checkpoint. If another authorized bounded observation path supplies the
+  required positive evidence, it remains usable with the existing interaction
+  proof rules.
+- Parsing, literal assertion, and extraction inputs are limited to 1 MiB;
+  selector/predicate count and size and extracted-hash count are bounded by the
+  adapter contract. These interpretation bounds do not limit the initial
+  temporary stdout/stderr capture by the tool process and must not be described
+  as bounded transport storage.
+
 ## Interaction Proof
 
 - Apply the project/task form-factor constraint before locking a runtime target.
