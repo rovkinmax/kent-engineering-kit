@@ -2057,3 +2057,89 @@ acceptance, not effects already approved or performed.
   questions zero, verification loops eight. No secrets or broad raw evidence
   were recorded. Fresh configured verification must include this final
   append-only bookkeeping.
+
+## Fix — approved forward integration — October 6, 2026
+
+- [x] Verify exact authority: preview prepared October 5, raw SHA-256
+  `3ad8686000558fefb738678f5544b88bd49b67c5a6c26c6ba0d1a55d4d7302c4`;
+  original supervisor Session `98351c2e-c7e4-4151-9e17-0bc65f9f4289`,
+  Step `10b78040-5140-4940-aec0-c66dcff711c6`,
+  Question `call_fnGgaSS8VA5m8OlAymfi4odw`, proposal8462/native8463
+  option1 at `2026-10-06T03:07:04.496Z`. Native Question readback independently
+  confirms the archived original answer. Its effect supersedes only the
+  actual-target-integration prohibition; accepted Plan remains byte-identical
+  `60abdfe73025921d3283f68742199e350c19d388b728fa8049f140ed6ac66568`.
+- [x] Read the complete current positive12590-byte packet, raw SHA-256
+  `91ed3dedc952bc35b6259fd4eaaacf04b8b0b8963d10649a8e8b5a29a149998b`.
+  Full954/858.536s PASS, log954dd298, Standards41 PASS and Gate42 PASS
+  remain **pre-integration evidence only**, never qualification of this union.
+  Original packet, approval and accepted preview/Plan are retained unchanged
+  under `build/kent-workflow/KEN-22/forward-integration-20261006/`.
+- [x] Execute exactly one local `git merge --no-ff --no-commit` of
+  `38b40892dd688d181138890c9ae55d23aa715c95` into clean published
+  KEN-22@`787f683499f60bedd7b1acede729507b575bafc1`. Actual conflicts:
+  builder and add/add prospective v6 only. No replay, rebase, reset, new
+  production branch, push or main write. Immutable Task baseline stays
+  `4d0e514aebae5295c803693d72f6640ab2c7846d`.
+- [x] Resolve builder by combining target renderer/copied candidate profile,
+  disabled-default complexity, write-candidate and symlink/write guards with
+  Task explicit read-only candidate check. Legacy render/write/check remain
+  v5-only per accepted G3. Regenerate v6 from that combined renderer:
+  exact existing approved artifact bytes `c08c6666` are preserved. Against
+  incoming target, only G2 delivery prompt and G1 merged-watcher parameter
+  fields differ; nodes, metadata, other fields and 55-edge graph are unchanged.
+- [x] Reproduce and repair obsolete test assumptions, within the full approved
+  ten paths: missing-renderer negative expected exit1 although integrated
+  candidate now returns0; full fixed-point-to-integrated delivery overlay
+  failed applicability at line146 because target already contains KEN-18.
+  Use genuinely unqualified disposable actual-main fixture and the pinned
+  `4d..787f` Task-only overlay; assert overlaid target delivery equals actual
+  integrated production bytes. Preserve actual-main comparison-inversion
+  mutation controls, portable discovery, explicit pinned-history qualification
+  and informative missing-object errors without skip/fallback.
+- [x] First four-suite qualification reproduced one additional integration
+  failure: incoming KEN-18 test required default renderer equality with frozen
+  v5, contradicting approved G3. Repair only that assertion in already approved
+  `tests/test_workflowkit.py`: immutable v5 hash plus exact two G1/G2
+  edge-field differences, keeping all target opt-out/profile/candidate/shape
+  assertions intact. No product criterion, Plan or file-budget expansion.
+- [x] Final affected four-suite explicit qualification under contained
+  `TMPDIR`: **240 tests, OK (one inherited KEN-18 pre-edit skip)**,
+  58.504s. Both exact-history Kit acceptance tests, incident qualifications,
+  real configured report wrapper, terminal helpers and integrated candidate
+  controls actually ran. The target's existing pre-edit-red skip remains
+  unchanged; no new test was skipped.
+- [x] Exact staged-union snapshot over a genuine depth-1 checkout:
+  mandatory Kit module **54 PASS, zero skips**, 41.934s. Explicit pinned
+  qualification there correctly rejects both absent baseline/target commits
+  (two expected failures, no skip/fallback). Actual integrated CLI passes the
+  unaltered candidate and rejects a deliberately altered artifact in that
+  disposable checkout, without changing its complete tracked diff/status.
+  Added mandatory real integrated renderer/CLI/main positive, altered-artifact,
+  rejected-write-mode, symlink and source/profile no-mutation coverage.
+- [x] Read-only union audit: **229 incoming non-authored blobs and Git modes**
+  preserved exactly, including KEN-18/KEN-23/KEN-11 target-only inputs;
+  compatible Task-only paths and historical v1-v5 bytes/modes are unchanged.
+  Target-relative delta is confined to ten approved source paths and existing
+  Plan/evidence bookkeeping. No authored config/profile/contract changes.
+  Staged proof, test logs and read-only proof script are retained in the
+  integration archive. `git diff --check` and cached whitespace checks pass.
+- Source hashes: builder
+  `5538feeb4d608baf9476865d73a429616f7b52dce7e493d9fb9ad418dab1c093`;
+  integrated delivery
+  `c74f6998bcb8a93dd11bfd5569ed182555b67be711a373898d27f927763f9d29`;
+  Kit tests
+  `479f735959f2fdad0187c2caaedfb7173719b191993c3fc7b83ae17ae277f75e`;
+  workflowkit tests
+  `fb5aedd2c1c41737fc9ea10f4e9b149d660b18f581f6028ccd238193a5cfe5ff`;
+  v6 remains
+  `c08c666607fccd627c29db241ab8436975fae9f30c4cb711f4866cd97d01a7ff`.
+- The authorized local merge commit and final ancestry readback follow this
+  record; append-only receipt/handoff records do not change production bytes.
+  Fresh configured full verification and independent Standards/Gate are
+  required after final bookkeeping. Fix does not run the full validator or
+  Smoke, publish, classify CI/rebase feasibility, apply KEN-21 recovery,
+  mutate live graph/config/Task placement, install or restart anything.
+  Later normal Delivery owns the approved conditional fast-forward KEN-22
+  publication after those gates; remote drift or continued GitHub
+  `canBeRebased=false` must stop there without strategy fallback.

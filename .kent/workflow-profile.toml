@@ -16,6 +16,7 @@ default_target = "default-branch"
 [policies]
 smoke = "disabled"
 writer_sessions = "continuous"
+coder_selection = "disabled"
 pr_merge_strategy = "rebase"
 branch_identity = "task"
 

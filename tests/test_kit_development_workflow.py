@@ -27,6 +27,7 @@ BUILDER = ROOT / ".kent/workflows/kit_development.py"
 CHILD = ROOT / ".kent/scripts/workflow-compile-verify"
 IDENTITY = ROOT / ".kent/scripts/kit-verification-identity.py"
 FIXED_POINT = "4d0e514aebae5295c803693d72f6640ab2c7846d"
+TASK_SOURCE = "787f683499f60bedd7b1acede729507b575bafc1"
 QUALIFIED_TARGET = "38b40892dd688d181138890c9ae55d23aa715c95"
 TARGET_BUILDER_SHA256 = "6e06e0a7c97825e21bd93e99d04141305cc3cfbc25d44759f5a69554e3700773"
 TARGET_DELIVERY_SHA256 = "8e5432816b58aae7a6c4d06d64be6db25ca6150e46ef66e9d1ddb2122eddae77"
@@ -228,8 +229,12 @@ assert edges["plan_review_accept"]["requires_approval"] is True
             hashlib.sha256(preimage).hexdigest(),
             expected_target_sha256,
         )
+        # The integrated checkout already contains KEN-18. Its complete
+        # baseline delta cannot be applied over that same incoming target.
+        # Pin the approved pre-integration Task-only overlay instead, retaining
+        # the immutable Task baseline separately from the incoming target.
         patch = subprocess.run(
-            ["git", "diff", "--binary", FIXED_POINT, "--", path],
+            ["git", "diff", "--binary", FIXED_POINT, TASK_SOURCE, "--", path],
             cwd=ROOT, env=self.fixture_git_environment(),
             capture_output=True, check=True,
         ).stdout
@@ -248,6 +253,10 @@ assert edges["plan_review_accept"]["requires_approval"] is True
         self.assertEqual(applied.returncode, 0, applied.stderr.decode())
         self.assertNotEqual(
             target.read_bytes(), preimage, "git apply must change the target",
+        )
+        self.assertEqual(
+            target.read_bytes(), (ROOT / path).read_bytes(),
+            "qualified target plus Task-only overlay must match integrated source",
         )
         reversed_check = subprocess.run(
             ["git", "apply", "--reverse", "--check", "--binary", "-"],
@@ -592,18 +601,23 @@ assert edges["plan_review_accept"]["requires_approval"] is True
         self.assertEqual(inconsistent, self.tree_snapshot(root))
 
     def test_candidate_check_fails_closed_without_qualified_target_renderer(self) -> None:
-        before = {
-            path: path.read_bytes()
-            for path in (
-                BUILDER,
-                ROOT / ".kent/workflows/kit-engineering-delivery-v5.spec.json",
-                ROOT / ".kent/workflows/kit-engineering-delivery-v6.spec.json",
-            )
-        }
-        result = self.run_builder(ROOT, "--check-candidate")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("qualified target fixture required", result.stderr)
-        self.assertEqual(before, {path: path.read_bytes() for path in before})
+        # Actual integration now supplies the renderer. Test the missing
+        # prerequisite in a genuinely unqualified disposable main() fixture.
+        sync = kit.load_synchronizer()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            before = self.tree_snapshot(root)
+            with (
+                mock.patch.object(kit, "ROOT", root),
+                mock.patch.object(kit, "load_synchronizer", return_value=sync),
+                mock.patch.dict(kit.__dict__, rendered_candidate_spec=None),
+                mock.patch.object(sys, "argv", [str(BUILDER), "--check-candidate"]),
+            ):
+                with self.assertRaisesRegex(
+                    SpecError, "qualified target fixture required",
+                ):
+                    kit.main()
+            self.assertEqual(before, self.tree_snapshot(root))
 
     def test_checkout_local_legacy_comparison_controls_are_read_only(self) -> None:
         # Portable comparison/closure coverage, not fixed-point parity
@@ -708,6 +722,70 @@ assert edges["plan_review_accept"]["requires_approval"] is True
                 with self.assertRaisesRegex(SpecError, "complexity candidate spec is stale"):
                     mutated.main()
                 self.assertEqual(before, self.tree_snapshot(root))
+
+    def test_integrated_candidate_renderer_and_main_controls_are_read_only(self) -> None:
+        # This is the actual combined checkout renderer, not the synthetic
+        # comparison seam or the separately pinned historical acceptance.
+        artifact = ROOT / kit.CANDIDATE_SPEC_PATH
+        source_roots = (
+            ROOT / "workflowkit",
+            ROOT / ".kent/workflows",
+            ROOT / ".kent/scripts",
+        )
+        before_source = {path: self.tree_snapshot(path) for path in source_roots}
+        profile_before = (ROOT / ".kent/workflow-profile.toml").read_bytes()
+        self.assertEqual(artifact.read_bytes(), kit.rendered_candidate_spec().encode())
+        result = self.run_builder(ROOT, "--check-candidate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        probe = self.run_target_candidate_profile_probe(ROOT)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+
+        sync = kit.load_synchronizer()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            candidate = root / kit.CANDIDATE_SPEC_PATH
+            candidate.parent.mkdir(parents=True)
+            shutil.copyfile(artifact, candidate)
+            # Only the artifact lookup is redirected. The real renderer's
+            # default root remains the actual integrated source/profile.
+            with (
+                mock.patch.object(kit, "ROOT", root),
+                mock.patch.object(kit, "load_synchronizer", return_value=sync),
+                mock.patch.object(sys, "argv", [str(BUILDER), "--check-candidate"]),
+            ):
+                before = self.tree_snapshot(root)
+                self.assertEqual(kit.main(), 0)
+                self.assertEqual(before, self.tree_snapshot(root))
+                candidate.write_bytes(candidate.read_bytes() + b" ")
+                altered = self.tree_snapshot(root)
+                with self.assertRaisesRegex(SpecError, "complexity candidate spec is stale"):
+                    kit.main()
+                self.assertEqual(altered, self.tree_snapshot(root))
+                for flag in ("--bootstrap", "--write-spec", "--write-candidate-spec"):
+                    with (
+                        self.subTest(flag=flag),
+                        mock.patch.object(
+                            sys, "argv", [str(BUILDER), "--check-candidate", flag],
+                        ),
+                        mock.patch.object(kit, "bootstrap") as bootstrap,
+                        mock.patch("sys.stderr", new_callable=io.StringIO),
+                    ):
+                        rejected = self.tree_snapshot(root)
+                        with self.assertRaises((SpecError, SystemExit)):
+                            kit.main()
+                        bootstrap.assert_not_called()
+                        self.assertEqual(rejected, self.tree_snapshot(root))
+                candidate.unlink()
+                candidate.symlink_to(artifact)
+                linked = self.tree_snapshot(root)
+                with self.assertRaises((OSError, ValueError)):
+                    kit.main()
+                self.assertEqual(linked, self.tree_snapshot(root))
+
+        self.assertEqual(
+            before_source, {path: self.tree_snapshot(path) for path in source_roots},
+        )
+        self.assertEqual(profile_before, (ROOT / ".kent/workflow-profile.toml").read_bytes())
 
     def test_target_candidate_and_mode_checks_are_read_only(self) -> None:
         root = self.source_archive(QUALIFIED_TARGET)

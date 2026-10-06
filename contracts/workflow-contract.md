@@ -141,6 +141,20 @@ For workflow updates, read [the authoritative policy](workflow-update-compatibil
   resolves every compatible root-cause group before re-verification. It does
   not create a new session for each symptom or bookkeeping handoff.
 
+### Complexity-selected Implement
+
+`coder_selection` defaults to `disabled`; `complexity` requires continuous
+writers and a source candidate, not frozen/live graphs.
+
+Review and human approval cover the task-bound choice. Plan Contract maps its
+digest to protected role/thinking values; models/roles are not self-selected.
+Only the new first Implement Session uses native `previous_node` selectors;
+later hops carry task/digest.
+
+Start requires no writer; continuation exactly one match. Missing/drift returns
+to retained Plan. A changed writer choice needs explicit recovery; no route
+replaces it. Recovery resumes Implement; Fix and mandatory gates are unchanged.
+
 ## Portable parameters
 
 - `workspace_path` — repository or managed-worktree root, never a `.todo`

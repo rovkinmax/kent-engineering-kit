@@ -7,23 +7,49 @@ import json
 import os
 from pathlib import Path
 import re
-import stat
+import shutil
 import subprocess
+import stat
 import sys
 import tempfile
-
-sys.dont_write_bytecode = True
+import tomllib
 
 sys.dont_write_bytecode = True
 
 
 TASK_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 CHECKBOX = re.compile(
     r"^(\s*(?:(?:[-*+]|\d+[.)])\s+|#{1,6}\s+)\[)[ xX](\])"
 )
 MODES = {"accept", "check"}
 ROUTES = {"start", "continue", "verify", "fix_continue"}
 ROUTE_CONTEXT_DEFAULT = "not-applicable"
+CODER_SELECTION_SCHEMA = "coder-selection-v1"
+CODER_SELECTION_FIELDS = {
+    "schema",
+    "task_short_id",
+    "complexity",
+    "rationale",
+}
+CODER_SELECTION_FENCE = re.compile(
+    r"(?ms)^```json[ \t]*\r?\n(.*?)^```[ \t]*$"
+)
+CODER_SELECTION_TARGETS = {
+    "simple": ("implementation-simple", "xhigh"),
+    "complex": ("implementation-complex", "medium"),
+}
+IMPLEMENTATION_ROLES = {
+    "implementation-worker",
+    "implementation-simple",
+    "implementation-complex",
+}
+NOT_APPLICABLE = "not-applicable"
+DEFAULT_KENT_PATHS = (
+    str(Path.home() / ".kent" / "bin" / "kent"),
+    "/opt/homebrew/bin/kent",
+    "/usr/local/bin/kent",
+)
 
 
 def supplied_delivery_context(payload: dict[str, object]) -> str | None:
@@ -57,6 +83,234 @@ def require_environment(key: str) -> str:
     value = os.environ.get(key, "").strip()
     if not value:
         raise ValueError(f"{key} must be a non-empty environment value")
+    return value
+
+
+def coder_selection_policy(root: Path) -> str:
+    kent_directory = root / ".kent"
+    if kent_directory.is_symlink() or not kent_directory.is_dir():
+        raise ValueError(
+            f"project Kent directory is missing or unsafe: {kent_directory}"
+        )
+    path = kent_directory / "workflow-profile.toml"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"project workflow profile is missing or unsafe: {path}")
+    try:
+        profile = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as error:
+        raise ValueError(f"project workflow profile is invalid: {error}") from error
+    policies = profile.get("policies")
+    if not isinstance(policies, dict):
+        raise ValueError("project workflow profile has no policies table")
+    policy = policies.get("coder_selection", "disabled")
+    if not isinstance(policy, str):
+        raise ValueError("policies.coder_selection must be a string")
+    policy = policy.strip()
+    if policy not in {"disabled", "complexity"}:
+        raise ValueError(
+            "policies.coder_selection must be 'disabled' or 'complexity'"
+        )
+    if (
+        policy == "complexity"
+        and (
+            not isinstance(policies.get("writer_sessions", "continuous"), str)
+            or policies.get("writer_sessions", "continuous").strip()
+            != "continuous"
+        )
+    ):
+        raise ValueError(
+            "policies.coder_selection = 'complexity' requires "
+            "policies.writer_sessions = 'continuous'"
+        )
+    return policy
+
+
+def branch_identity_enabled(root: Path) -> bool:
+    path = root / ".kent" / "workflow-profile.toml"
+    profile = tomllib.loads(path.read_text(encoding="utf-8"))
+    policies = profile.get("policies")
+    if not isinstance(policies, dict):
+        raise ValueError("project workflow profile has no policies table")
+    policy = policies.get("branch_identity", "task")
+    if not isinstance(policy, str) or policy not in {
+        "task",
+        "jira",
+        "github_issue",
+    }:
+        raise ValueError("policies.branch_identity is unsupported")
+    return policy != "task"
+
+
+def resolve_kent_bin() -> str:
+    configured = os.environ.get("KENT_BIN", "").strip()
+    candidates = (
+        (configured,)
+        if configured
+        else ("kent", *DEFAULT_KENT_PATHS)
+    )
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if os.path.sep in candidate:
+            path = Path(candidate).expanduser()
+            if path.is_file() and os.access(path, os.X_OK):
+                return str(path)
+            continue
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    raise ValueError("Kent CLI is unavailable for retained-writer validation")
+
+
+def implementation_session_issue(
+    workspace: Path,
+    *,
+    task: str,
+    payload: dict[str, object],
+    expected_role: str,
+    route: str,
+) -> str | None:
+    identity = payload.get("_kent")
+    if not isinstance(identity, dict):
+        raise ValueError("workflow input is missing _kent identity")
+    native_task_id = identity.get("task_id")
+    if not isinstance(native_task_id, str) or not native_task_id.strip():
+        raise ValueError("workflow input is missing _kent.task_id")
+    result = subprocess.run(
+        [
+            resolve_kent_bin(),
+            "task",
+            "sessions",
+            task,
+            "--project",
+            str(workspace),
+            "--json",
+        ],
+        cwd=workspace,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise ValueError(f"cannot read retained Task Sessions: {detail}")
+    response = json.loads(result.stdout)
+    if not isinstance(response, dict) or response.get("task_id") != native_task_id:
+        raise ValueError("retained Session readback belongs to a different Task")
+    items = response.get("items")
+    if not isinstance(items, list):
+        raise ValueError("retained Session readback has no items list")
+    writers: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("retained Session readback contains a malformed item")
+        session_id = item.get("session_id")
+        role = item.get("agent_role")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("retained Session readback has no Session identity")
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError("retained Session readback has no assigned role")
+        if role.startswith("implementation-"):
+            writers.append({"session_id": session_id, "agent_role": role})
+    if route == "start":
+        if writers:
+            return (
+                "a retained implementation Session already exists; first-entry "
+                "start is rejected to prevent a second writer"
+            )
+        return None
+    if route == "continue":
+        if len(writers) != 1:
+            return (
+                "continuation requires exactly one retained implementation "
+                f"Session; found {len(writers)}"
+            )
+        if writers[0]["agent_role"] != expected_role:
+            return (
+                "the retained writer role differs from the accepted coder "
+                "selection; automatic replacement is not authorized"
+            )
+        return None
+    return None
+
+
+def json_object_without_duplicate_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        value[key] = item
+    return value
+
+
+def validate_coder_selection(value: object, task: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("coder selection must be a JSON object")
+    missing = CODER_SELECTION_FIELDS - set(value)
+    unknown = set(value) - CODER_SELECTION_FIELDS
+    if missing or unknown:
+        raise ValueError(
+            "coder selection must declare exactly "
+            f"{sorted(CODER_SELECTION_FIELDS)}; "
+            f"missing={sorted(missing)}, unknown={sorted(unknown)}"
+        )
+    if value["schema"] != CODER_SELECTION_SCHEMA:
+        raise ValueError(f"coder selection schema must be {CODER_SELECTION_SCHEMA!r}")
+    task_short_id = value["task_short_id"]
+    if (
+        not isinstance(task_short_id, str)
+        or not task_short_id.strip()
+        or task_short_id != task
+    ):
+        raise ValueError(
+            "coder selection task_short_id does not match the current task"
+        )
+    complexity = value["complexity"]
+    if not isinstance(complexity, str) or complexity not in {"simple", "complex"}:
+        raise ValueError("coder selection complexity must be 'simple' or 'complex'")
+    rationale = value["rationale"]
+    if not isinstance(rationale, str) or not rationale.strip():
+        raise ValueError("coder selection rationale must be non-empty")
+    return {
+        "schema": CODER_SELECTION_SCHEMA,
+        "task_short_id": task_short_id,
+        "complexity": complexity,
+        "rationale": rationale.strip(),
+    }
+
+
+def plan_coder_selection(plan: Path | None, task: str) -> dict[str, str]:
+    if plan is None:
+        raise ValueError("coder selection requires an implementation plan")
+    contents = plan.read_text(encoding="utf-8")
+    selections: list[dict[str, str]] = []
+    for match in CODER_SELECTION_FENCE.finditer(contents):
+        source = match.group(1)
+        if CODER_SELECTION_SCHEMA not in source:
+            continue
+        try:
+            decoded = json.loads(
+                source,
+                object_pairs_hook=json_object_without_duplicate_keys,
+            )
+        except (json.JSONDecodeError, ValueError) as error:
+            raise ValueError(f"coder selection JSON is malformed: {error}") from error
+        if isinstance(decoded, dict) and decoded.get("schema") == CODER_SELECTION_SCHEMA:
+            selections.append(validate_coder_selection(decoded, task))
+    if len(selections) != 1:
+        raise ValueError(
+            "the accepted plan must contain exactly one fenced "
+            f"{CODER_SELECTION_SCHEMA} object; found {len(selections)}"
+        )
+    return selections[0]
+
+
+def require_sha256(value: object, label: str) -> str:
+    if not isinstance(value, str) or SHA256.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
     return value
 
 
@@ -154,12 +408,45 @@ def ensure_safe_directory(path: Path, root: Path, *, create: bool) -> None:
         current.mkdir(mode=0o700)
 
 
-def load_snapshot(path: Path) -> dict[str, object]:
+def load_snapshot(
+    path: Path,
+    *,
+    task: str,
+    require_coder_selection: bool,
+) -> dict[str, object]:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"accepted plan snapshot is missing or unsafe: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=json_object_without_duplicate_keys,
+    )
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise ValueError("accepted plan snapshot has unsupported schema")
+    if payload.get("task_short_id") != task:
+        raise ValueError(
+            "accepted plan snapshot task_short_id does not match the current task"
+        )
+    normalized = payload.get("normalized_plan")
+    accepted_digest = payload.get("normalized_sha256")
+    if not isinstance(normalized, str):
+        raise ValueError("accepted plan snapshot has no normalized_plan")
+    if not isinstance(accepted_digest, str) or hashlib.sha256(
+        normalized.encode("utf-8")
+    ).hexdigest() != accepted_digest:
+        raise ValueError(
+            "accepted plan snapshot normalized_plan digest is invalid"
+        )
+    if require_coder_selection:
+        selection = validate_coder_selection(payload.get("coder_selection"), task)
+        selection_digest = require_sha256(
+            payload.get("coder_selection_sha256"),
+            "accepted coder_selection_sha256",
+        )
+        if selection_digest != accepted_digest:
+            raise ValueError(
+                "accepted coder selection is not bound to the normalized plan digest"
+            )
+        payload["coder_selection"] = selection
     return payload
 
 
@@ -172,6 +459,7 @@ def write_snapshot(
     work_kind: str,
     normalized: str,
     digest: str,
+    coder_selection: dict[str, str] | None,
 ) -> None:
     ensure_safe_directory(path.parent, root, create=True)
     payload = {
@@ -182,6 +470,9 @@ def write_snapshot(
         "normalized_sha256": digest,
         "normalized_plan": normalized,
     }
+    if coder_selection is not None:
+        payload["coder_selection"] = coder_selection
+        payload["coder_selection_sha256"] = digest
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -209,6 +500,12 @@ def complete_route(
     review_context: str,
     route_context: str,
     delivery_context: str | None,
+    task: str | None = None,
+    accepted_digest: str | None = None,
+    coder_selection: dict[str, str] | None = None,
+    coder_selection_enabled: bool = False,
+    use_branch_identity: bool = False,
+    plan_route: str | None = None,
 ) -> None:
     payload: dict[str, str] = {
         "transition": transition,
@@ -224,6 +521,26 @@ def complete_route(
                 "work_kind": work_kind,
             }
         )
+        if coder_selection_enabled:
+            if task is None or accepted_digest is None or coder_selection is None:
+                raise ValueError(
+                    "accepted coder-selection route is missing its task-bound snapshot"
+                )
+            payload.update(
+                {
+                    "task_short_id": task,
+                    "accepted_plan_sha256": accepted_digest,
+                    "plan_route": plan_route or route,
+                    "plan_route_context": route_context,
+                    "review_context": review_context,
+                }
+            )
+            if route == "start" and not use_branch_identity:
+                role, effort = CODER_SELECTION_TARGETS[
+                    coder_selection["complexity"]
+                ]
+                payload["target_assignee"] = role
+                payload["target_thinking"] = effort
     elif route == "verify":
         payload.update(
             {
@@ -243,6 +560,43 @@ def complete_route(
     print(json.dumps(payload, ensure_ascii=False))
 
 
+def complete_accept_revalidation(
+    *,
+    workspace: Path,
+    plan_path: str,
+    work_kind: str,
+    review_context: str,
+    route: str,
+    route_context: str,
+    task: str,
+    delivery_context: str | None,
+    reason: str,
+    accepted_plan_sha256: str | None = None,
+) -> None:
+    payload: dict[str, str] = {
+        "transition": "plan_contract_revalidate",
+        "commentary": (
+            "Выбор исполнителя или его связь с проверенным планом "
+            "не подтверждены; требуется повторная сверка плана."
+        ),
+        "workspace_path": str(workspace),
+        "plan_path": plan_path,
+        "work_kind": work_kind,
+        "plan_route": route,
+        "plan_route_context": route_context,
+        "plan_change_report": (
+            "Accepted coder selection could not be validated: " + reason
+        ),
+        "review_context": review_context,
+        "task_short_id": task,
+    }
+    if delivery_context is not None:
+        payload["delivery_context"] = delivery_context
+    if accepted_plan_sha256 is not None:
+        payload["accepted_plan_sha256"] = accepted_plan_sha256
+    print(json.dumps(payload, ensure_ascii=False))
+
+
 def main() -> int:
     payload = json.load(sys.stdin)
     if not isinstance(payload, dict):
@@ -250,6 +604,7 @@ def main() -> int:
     delivery_context = supplied_delivery_context(payload)
 
     workspace = repository_root(require_string(payload, "workspace_path"))
+    selection_policy = coder_selection_policy(workspace)
     mode = require_environment("KENT_PLAN_CONTRACT_MODE")
     if mode not in MODES:
         raise ValueError("KENT_PLAN_CONTRACT_MODE must be accept or check")
@@ -264,7 +619,11 @@ def main() -> int:
         route_context = require_string(payload, "plan_route_context")
     else:
         route = require_environment("KENT_PLAN_CONTRACT_ROUTE")
-        accepted = load_snapshot(snapshot_path)
+        accepted = load_snapshot(
+            snapshot_path,
+            task=task,
+            require_coder_selection=selection_policy == "complexity",
+        )
         configured_plan = accepted.get("plan_path")
         work_kind = accepted.get("work_kind")
         if not isinstance(configured_plan, str) or not configured_plan:
@@ -285,6 +644,105 @@ def main() -> int:
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
     if mode == "accept":
+        selection = None
+        if selection_policy == "complexity":
+            accepted_plan_sha256 = require_string(
+                payload,
+                "accepted_plan_sha256",
+            )
+            prior_digest: str | None = None
+            if snapshot_path.exists() or snapshot_path.is_symlink():
+                prior_snapshot = load_snapshot(
+                    snapshot_path,
+                    task=task,
+                    require_coder_selection=True,
+                )
+                prior_digest = prior_snapshot.get("normalized_sha256")
+                if not isinstance(prior_digest, str):
+                    raise ValueError("prior accepted plan snapshot has no digest")
+                if accepted_plan_sha256 != prior_digest:
+                    complete_accept_revalidation(
+                        workspace=workspace,
+                        plan_path=configured_plan,
+                        work_kind=work_kind,
+                        review_context=review_context,
+                        route=route,
+                        route_context=route_context,
+                        task=task,
+                        delivery_context=delivery_context,
+                        accepted_plan_sha256=prior_digest,
+                        reason=(
+                            "accepted_plan_sha256 does not match the prior "
+                            "task-bound snapshot"
+                        ),
+                    )
+                    return 0
+            elif accepted_plan_sha256 != NOT_APPLICABLE:
+                complete_accept_revalidation(
+                    workspace=workspace,
+                    plan_path=configured_plan,
+                    work_kind=work_kind,
+                    review_context=review_context,
+                    route=route,
+                    route_context=route_context,
+                    task=task,
+                    delivery_context=delivery_context,
+                    accepted_plan_sha256=NOT_APPLICABLE,
+                    reason=(
+                        "a prior accepted digest was supplied but no accepted "
+                        "snapshot exists"
+                    ),
+                )
+                return 0
+            try:
+                selection = plan_coder_selection(plan, task)
+                reviewed_digest = require_sha256(
+                    payload.get("reviewed_normalized_sha256"),
+                    "reviewed_normalized_sha256",
+                )
+                if reviewed_digest != digest:
+                    raise ValueError(
+                        "reviewed normalized-plan digest does not match current plan"
+                    )
+            except ValueError as error:
+                complete_accept_revalidation(
+                    workspace=workspace,
+                    plan_path=configured_plan,
+                    work_kind=work_kind,
+                    review_context=review_context,
+                    route=route,
+                    route_context=route_context,
+                    task=task,
+                    delivery_context=delivery_context,
+                    reason=str(error),
+                    accepted_plan_sha256=prior_digest or NOT_APPLICABLE,
+                )
+                return 0
+            if route in {"start", "continue"}:
+                expected_role = CODER_SELECTION_TARGETS[
+                    selection["complexity"]
+                ][0]
+                writer_issue = implementation_session_issue(
+                    workspace,
+                    task=task,
+                    payload=payload,
+                    expected_role=expected_role,
+                    route=route,
+                )
+                if writer_issue is not None:
+                    complete_accept_revalidation(
+                        workspace=workspace,
+                        plan_path=configured_plan,
+                        work_kind=work_kind,
+                        review_context=review_context,
+                        route=route,
+                        route_context=route_context,
+                        task=task,
+                        delivery_context=delivery_context,
+                        reason=writer_issue,
+                        accepted_plan_sha256=prior_digest or NOT_APPLICABLE,
+                    )
+                    return 0
         write_snapshot(
             snapshot_path,
             root=workspace,
@@ -293,6 +751,7 @@ def main() -> int:
             work_kind=work_kind,
             normalized=normalized,
             digest=digest,
+            coder_selection=selection,
         )
         complete_route(
             route,
@@ -303,13 +762,74 @@ def main() -> int:
             review_context=review_context,
             route_context=route_context,
             delivery_context=delivery_context,
+            task=task,
+            accepted_digest=digest,
+            coder_selection=selection,
+            coder_selection_enabled=selection_policy == "complexity",
+            use_branch_identity=(
+                selection_policy == "complexity"
+                and branch_identity_enabled(workspace)
+            ),
+            plan_route=route,
         )
         return 0
 
     ensure_safe_directory(snapshot_path.parent, workspace, create=False)
     accepted_digest = accepted.get("normalized_sha256")
     accepted_path = accepted.get("plan_path")
-    if accepted_digest == digest and accepted_path == portable_plan_path:
+    selection_error: str | None = None
+    selection_stable = True
+    accepted_selection: dict[str, str] | None = None
+    if selection_policy == "complexity":
+        try:
+            current_selection = plan_coder_selection(plan, task)
+            raw_accepted_selection = accepted["coder_selection"]
+            if not isinstance(raw_accepted_selection, dict):
+                raise ValueError("accepted coder selection is invalid")
+            accepted_selection = validate_coder_selection(
+                raw_accepted_selection,
+                task,
+            )
+            if route == "continue":
+                supplied_digest = require_string(
+                    payload,
+                    "accepted_plan_sha256",
+                )
+                if supplied_digest != accepted_digest:
+                    raise ValueError(
+                        "accepted_plan_sha256 does not match the task-bound snapshot"
+                    )
+            if current_selection != accepted_selection:
+                selection_error = (
+                    "current coder selection differs from the accepted "
+                    "digest-bound choice"
+                )
+                selection_stable = False
+            else:
+                selection_stable = accepted_digest == digest
+        except ValueError as error:
+            selection_error = str(error)
+            selection_stable = False
+        if selection_stable and route == "continue":
+            assert accepted_selection is not None
+            expected_role = CODER_SELECTION_TARGETS[
+                accepted_selection["complexity"]
+            ][0]
+            writer_issue = implementation_session_issue(
+                workspace,
+                task=task,
+                payload=payload,
+                expected_role=expected_role,
+                route="continue",
+            )
+            if writer_issue is not None:
+                selection_error = writer_issue
+                selection_stable = False
+    if (
+        accepted_digest == digest
+        and accepted_path == portable_plan_path
+        and selection_stable
+    ):
         complete_route(
             route,
             transition=require_environment(
@@ -321,6 +841,17 @@ def main() -> int:
             review_context=review_context,
             route_context=route_context,
             delivery_context=delivery_context,
+            task=task,
+            accepted_digest=(
+                accepted_digest if isinstance(accepted_digest, str) else None
+            ),
+            coder_selection=accepted_selection,
+            coder_selection_enabled=selection_policy == "complexity",
+            use_branch_identity=(
+                selection_policy == "complexity"
+                and branch_identity_enabled(workspace)
+            ),
+            plan_route=route,
         )
         return 0
 
@@ -330,6 +861,8 @@ def main() -> int:
         f"accepted_sha256={accepted_digest!r}; current_sha256={digest!r}. "
         "Checkbox-only progress is excluded from both digests."
     )
+    if selection_error is not None:
+        change_report += f" Coder selection requires revalidation: {selection_error}"
     changed_payload = {
         "transition": require_environment(
             "KENT_PLAN_CONTRACT_CHANGED_TRANSITION"
@@ -347,6 +880,8 @@ def main() -> int:
         "review_context": review_context,
         "task_short_id": task,
     }
+    if isinstance(accepted_digest, str):
+        changed_payload["accepted_plan_sha256"] = accepted_digest
     if delivery_context is not None:
         changed_payload["delivery_context"] = delivery_context
     print(json.dumps(changed_payload, ensure_ascii=False))

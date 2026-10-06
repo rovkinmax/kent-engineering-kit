@@ -1,0 +1,1154 @@
+#!/usr/bin/env python3
+"""Validate bounded mock-scenario evidence without running packet commands."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import xml.etree.ElementTree as ElementTree
+
+
+WORK_KINDS = {
+    "feature",
+    "bugfix",
+    "refactor",
+    "migration",
+    "dependency",
+    "test",
+}
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GIT_OBJECT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+EXECUTION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+MAX_REQUEST_BYTES = 256 * 1024
+MAX_JSON_BYTES = 256 * 1024
+MAX_SOURCE_FILES = 500
+MAX_SOURCE_FILE_BYTES = 4 * 1024 * 1024
+MAX_SOURCE_TOTAL_BYTES = 32 * 1024 * 1024
+MAX_RESULT_FILES = 500
+MAX_RESULT_BYTES = 2 * 1024 * 1024
+MAX_RESULTS_TOTAL_BYTES = 20 * 1024 * 1024
+MAX_DIRECTORY_ENTRIES = 5000
+MAX_BEHAVIORS = 100
+MAX_CASES = 200
+MAX_TEXT_BYTES = 4096
+MAX_LOG_BYTES = 4 * 1024 * 1024
+
+
+class EvidenceError(Exception):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def emit(status: str, **values: object) -> None:
+    payload: dict[str, object] = {"status": status, **values}
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+
+def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise EvidenceError("json_duplicate_key")
+        result[key] = value
+    return result
+
+
+def parse_json(data: bytes, *, limit: int = MAX_JSON_BYTES) -> object:
+    if len(data) > limit:
+        raise EvidenceError("json_too_large")
+    try:
+        text = data.decode("utf-8")
+        return json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        raise EvidenceError("json_invalid") from None
+
+
+def read_request() -> dict[str, object]:
+    data = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    if len(data) > MAX_REQUEST_BYTES:
+        raise EvidenceError("request_too_large")
+    value = parse_json(data, limit=MAX_REQUEST_BYTES)
+    if not isinstance(value, dict):
+        raise EvidenceError("request_invalid")
+    return value
+
+
+def exact_keys(value: object, expected: set[str], code: str) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise EvidenceError(code)
+    return value
+
+
+def require_text(
+    value: object, *, maximum: int = MAX_TEXT_BYTES, multiline: bool = False
+) -> str:
+    if not isinstance(value, str):
+        raise EvidenceError("field_invalid")
+    encoded = value.encode("utf-8")
+    if not value.strip() or len(encoded) > maximum:
+        raise EvidenceError("field_invalid")
+    allowed_controls = "\t\r\n" if multiline else "\t"
+    if any(ord(char) < 0x20 and char not in allowed_controls for char in value):
+        raise EvidenceError("field_invalid")
+    return value
+
+
+def require_string_list(
+    value: object,
+    *,
+    maximum_items: int,
+    maximum_text: int = MAX_TEXT_BYTES,
+    allow_empty: bool = False,
+) -> list[str]:
+    if not isinstance(value, list) or len(value) > maximum_items:
+        raise EvidenceError("list_invalid")
+    if not value and not allow_empty:
+        raise EvidenceError("list_invalid")
+    result = [require_text(item, maximum=maximum_text) for item in value]
+    if len(set(result)) != len(result):
+        raise EvidenceError("list_duplicate")
+    return result
+
+
+def require_sha256(value: object) -> str:
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        raise EvidenceError("digest_invalid")
+    return value
+
+
+def require_task(value: object) -> str:
+    if not isinstance(value, str) or not TASK_RE.fullmatch(value):
+        raise EvidenceError("task_invalid")
+    return value
+
+
+def require_work_kind(value: object) -> str:
+    if not isinstance(value, str) or value not in WORK_KINDS:
+        raise EvidenceError("work_kind_invalid")
+    return value
+
+
+def require_baseline(value: object) -> str:
+    if not isinstance(value, str) or not GIT_OBJECT_RE.fullmatch(value):
+        raise EvidenceError("baseline_invalid")
+    return value
+
+
+def workspace_root(value: object) -> Path:
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise EvidenceError("workspace_invalid")
+    supplied = Path(value).expanduser()
+    try:
+        metadata = supplied.lstat()
+        resolved = supplied.resolve(strict=True)
+    except OSError:
+        raise EvidenceError("workspace_invalid") from None
+    if stat.S_ISLNK(metadata.st_mode) or not resolved.is_dir():
+        raise EvidenceError("workspace_invalid")
+    result = run_git(resolved, "rev-parse", "--show-toplevel")
+    if result.strip() != str(resolved):
+        raise EvidenceError("workspace_invalid")
+    return resolved
+
+
+def run_git(root: Path, *arguments: str) -> str:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                *arguments,
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise EvidenceError("git_unavailable") from None
+    if completed.returncode != 0 or len(completed.stdout) > 1024 * 1024:
+        raise EvidenceError("git_failed")
+    try:
+        return completed.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        raise EvidenceError("git_output_invalid") from None
+
+
+def valid_baseline(root: Path, baseline: str) -> None:
+    resolved = run_git(root, "rev-parse", "--verify", f"{baseline}^{{commit}}")
+    if resolved.strip() != baseline:
+        raise EvidenceError("baseline_unknown")
+
+
+def relative_path(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 1024:
+        raise EvidenceError("path_invalid")
+    if "\\" in value or "\x00" in value:
+        raise EvidenceError("path_invalid")
+    path = PurePosixPath(value)
+    if (
+        not path.parts
+        or path.as_posix() == "."
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise EvidenceError("path_invalid")
+    if path.as_posix() != value:
+        raise EvidenceError("path_invalid")
+    return value
+
+
+def safe_path(root: Path, value: object, *, must_exist: bool = True) -> tuple[str, Path]:
+    relative = relative_path(value)
+    candidate = root
+    for part in PurePosixPath(relative).parts:
+        candidate = candidate / part
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            if must_exist:
+                raise EvidenceError("path_missing") from None
+            continue
+        except OSError:
+            raise EvidenceError("path_invalid") from None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise EvidenceError("path_symlink")
+    resolved = candidate.resolve(strict=must_exist)
+    if not resolved.is_relative_to(root):
+        raise EvidenceError("path_escape")
+    return relative, resolved
+
+
+def is_build_path(relative: str) -> bool:
+    return "build" in PurePosixPath(relative).parts
+
+
+def require_output_path(root: Path, value: object) -> tuple[str, Path]:
+    relative, target = safe_path(root, value, must_exist=False)
+    if not relative.startswith("build/kent-workflow/") or target.exists():
+        raise EvidenceError("output_path_invalid")
+    run_git(root, "check-ignore", "--", relative)
+    parent = target.parent
+    if not parent.exists():
+        raise EvidenceError("output_directory_missing")
+    if not parent.is_dir():
+        raise EvidenceError("output_path_invalid")
+    return relative, target
+
+
+def require_task_artifact_path(relative: str, task: str) -> None:
+    if not relative.startswith(f"build/kent-workflow/{task}/"):
+        raise EvidenceError("task_artifact_path_invalid")
+
+
+def write_new_json(path: Path, payload: dict[str, object]) -> bytes:
+    data = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    if len(data) > MAX_JSON_BYTES:
+        raise EvidenceError("json_too_large")
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+    except FileExistsError:
+        raise EvidenceError("output_exists") from None
+    except OSError:
+        raise EvidenceError("output_write_failed") from None
+    return data
+
+
+def read_bounded(path: Path, maximum: int, code: str) -> bytes:
+    parent_fd = None
+    descriptor = None
+    try:
+        # Resolve components through no-follow descriptors, not another pathname
+        # open after safe_path's checks. O_NONBLOCK makes a FIFO open return
+        # immediately; fstat rejects it before any potentially blocking read.
+        parent_fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+        for part in path.parts[1:-1]:
+            child_fd = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
+            os.close(parent_fd)
+            parent_fd = child_fd
+        descriptor = os.open(
+            path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise EvidenceError("field_invalid")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = None
+            data = source.read(maximum + 1)
+    except OSError:
+        raise EvidenceError("path_read_failed") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_fd is not None:
+            os.close(parent_fd)
+    if len(data) > maximum:
+        raise EvidenceError(code)
+    return data
+
+
+def excluded_source_path(value: str) -> bool:
+    parts = PurePosixPath(value).parts
+    return "build" in parts or parts[:2] == (".kent", "runtime")
+
+
+def git_changes(root: Path, baseline: str) -> dict[str, str]:
+    raw = run_git(root, "diff", "--name-status", "-z", "--no-renames", baseline, "--")
+    tokens = raw.split("\x00")
+    changes: dict[str, str] = {}
+    index = 0
+    while index < len(tokens) and tokens[index]:
+        status = tokens[index]
+        index += 1
+        if index >= len(tokens):
+            raise EvidenceError("git_diff_invalid")
+        path = relative_path(tokens[index])
+        index += 1
+        if status not in {"A", "M", "D", "T"}:
+            raise EvidenceError("git_diff_invalid")
+        if not excluded_source_path(path):
+            changes[path] = {
+                "A": "added",
+                "M": "modified",
+                "D": "deleted",
+                "T": "type_changed",
+            }[status]
+
+    untracked = run_git(root, "ls-files", "--others", "--exclude-standard", "-z")
+    for item in untracked.split("\x00"):
+        if not item:
+            continue
+        path = relative_path(item)
+        if not excluded_source_path(path):
+            changes.setdefault(path, "added")
+    if len(changes) > MAX_SOURCE_FILES:
+        raise EvidenceError("source_file_limit")
+    return changes
+
+
+def source_delta(root: Path, baseline: str) -> dict[str, object]:
+    valid_baseline(root, baseline)
+    changes = git_changes(root, baseline)
+    files: list[dict[str, object]] = []
+    total_bytes = 0
+    for relative, change in sorted(changes.items()):
+        if change == "deleted":
+            safe_path(root, relative, must_exist=False)
+            files.append(
+                {"path": relative, "status": change, "mode": None, "sha256": None}
+            )
+            continue
+        _, path = safe_path(root, relative)
+        try:
+            metadata = path.stat()
+        except OSError:
+            raise EvidenceError("source_file_invalid") from None
+        if not stat.S_ISREG(metadata.st_mode):
+            raise EvidenceError("source_file_invalid")
+        data = read_bounded(path, MAX_SOURCE_FILE_BYTES, "source_file_too_large")
+        total_bytes += len(data)
+        if total_bytes > MAX_SOURCE_TOTAL_BYTES:
+            raise EvidenceError("source_total_too_large")
+        mode = "100755" if metadata.st_mode & 0o111 else "100644"
+        files.append(
+            {
+                "path": relative,
+                "status": change,
+                "mode": mode,
+                "sha256": sha256(data),
+            }
+        )
+    canonical = {
+        "baseline": baseline,
+        "files": files,
+        "schema": "mock-scenario-source-delta-v1",
+    }
+    digest = sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return {"files": files, "sha256": digest}
+
+
+def validate_case_ids(value: object, *, allow_empty: bool) -> list[str]:
+    values = require_string_list(
+        value,
+        maximum_items=MAX_CASES,
+        maximum_text=512,
+        allow_empty=allow_empty,
+    )
+    for item in values:
+        if item.count("#") != 1:
+            raise EvidenceError("test_case_invalid")
+        class_name, method_name = item.split("#", 1)
+        if not class_name.strip() or not method_name.strip():
+            raise EvidenceError("test_case_invalid")
+    return values
+
+
+def list_result_files(root: Path, relative: str) -> list[dict[str, object]]:
+    if not is_build_path(relative):
+        raise EvidenceError("results_directory_invalid")
+    run_git(root, "check-ignore", "--", relative)
+    _, directory = safe_path(root, relative)
+    if not directory.is_dir():
+        raise EvidenceError("results_directory_invalid")
+    pending = [(directory, 0)]
+    entries_seen = 0
+    total_bytes = 0
+    files: list[dict[str, object]] = []
+    while pending:
+        current, depth = pending.pop()
+        if depth > 16:
+            raise EvidenceError("results_depth_limit")
+        try:
+            with os.scandir(current) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+        except OSError:
+            raise EvidenceError("results_directory_invalid") from None
+        entries_seen += len(entries)
+        if entries_seen > MAX_DIRECTORY_ENTRIES:
+            raise EvidenceError("results_entry_limit")
+        for entry in entries:
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError:
+                raise EvidenceError("result_file_invalid") from None
+            if stat.S_ISLNK(metadata.st_mode):
+                raise EvidenceError("result_symlink")
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append((Path(entry.path), depth + 1))
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or not entry.name.lower().endswith(".xml"):
+                continue
+            path = Path(entry.path)
+            relative_path_value = path.relative_to(root).as_posix()
+            data = read_bounded(path, MAX_RESULT_BYTES, "result_file_too_large")
+            total_bytes += len(data)
+            if total_bytes > MAX_RESULTS_TOTAL_BYTES:
+                raise EvidenceError("results_total_too_large")
+            files.append(
+                {
+                    "path": relative_path_value,
+                    "sha256": sha256(data),
+                    "size": len(data),
+                }
+            )
+            if len(files) > MAX_RESULT_FILES:
+                raise EvidenceError("result_file_limit")
+    return sorted(files, key=lambda item: str(item["path"]))
+
+
+def validate_file_inventory(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list) or len(value) > MAX_RESULT_FILES:
+        raise EvidenceError("result_inventory_invalid")
+    output: list[dict[str, object]] = []
+    previous = ""
+    for item in value:
+        record = exact_keys(item, {"path", "sha256", "size"}, "result_inventory_invalid")
+        path = relative_path(record["path"])
+        digest = require_sha256(record["sha256"])
+        size = record["size"]
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise EvidenceError("result_inventory_invalid")
+        if path <= previous:
+            raise EvidenceError("result_inventory_invalid")
+        previous = path
+        output.append({"path": path, "sha256": digest, "size": size})
+    return output
+
+
+def parse_junit_files(root: Path, inventory: list[dict[str, object]]) -> dict[str, dict[str, str]]:
+    cases: dict[str, dict[str, str]] = {}
+    total_nodes = 0
+    for item in inventory:
+        relative = str(item["path"])
+        if not relative.lower().endswith(".xml"):
+            raise EvidenceError("junit_path_invalid")
+        _, path = safe_path(root, relative)
+        data = read_bounded(path, MAX_RESULT_BYTES, "result_file_too_large")
+        if sha256(data) != item["sha256"] or len(data) != item["size"]:
+            raise EvidenceError("result_drift")
+        lowered = data.lower()
+        if b"<!doctype" in lowered or b"<!entity" in lowered:
+            raise EvidenceError("junit_declaration_invalid")
+        try:
+            document = ElementTree.fromstring(data)
+        except (ElementTree.ParseError, RecursionError):
+            raise EvidenceError("junit_invalid") from None
+        for case in document.iter():
+            if case.tag.rsplit("}", 1)[-1] != "testcase":
+                continue
+            total_nodes += 1
+            if total_nodes > 20_000:
+                raise EvidenceError("junit_case_limit")
+            class_name = case.attrib.get("classname", "")
+            method_name = case.attrib.get("name", "")
+            if not class_name or not method_name:
+                raise EvidenceError("junit_case_invalid")
+            identifier = f"{class_name}#{method_name}"
+            children = {child.tag.rsplit("}", 1)[-1] for child in case}
+            if children & {"failure", "error"}:
+                outcome = "failed"
+            elif "skipped" in children:
+                outcome = "skipped"
+            else:
+                outcome = "passed"
+            if identifier in cases:
+                raise EvidenceError("junit_case_duplicate")
+            cases[identifier] = {"outcome": outcome, "path": relative}
+    return cases
+
+
+def changed_result_paths(
+    before: list[dict[str, object]],
+    after: list[dict[str, object]],
+) -> set[str]:
+    previous = {str(item["path"]): str(item["sha256"]) for item in before}
+    return {
+        str(item["path"])
+        for item in after
+        if previous.get(str(item["path"])) != str(item["sha256"])
+    }
+
+
+def classify_cases(
+    root: Path,
+    selected: list[str],
+    before: list[dict[str, object]],
+    after: list[dict[str, object]],
+    runner_exit_code: int,
+) -> tuple[list[dict[str, str]], str]:
+    parsed = parse_junit_files(root, after)
+    changed = changed_result_paths(before, after)
+    results: list[dict[str, str]] = []
+    for identifier in selected:
+        result = parsed.get(identifier)
+        if result is None:
+            results.append({"id": identifier, "outcome": "missing", "path": ""})
+        elif result["path"] not in changed:
+            results.append(
+                {"id": identifier, "outcome": "stale", "path": result["path"]}
+            )
+        else:
+            results.append(
+                {
+                    "id": identifier,
+                    "outcome": result["outcome"],
+                    "path": result["path"],
+                }
+            )
+    if any(item["outcome"] == "failed" for item in results):
+        status = "failed"
+    elif any(item["outcome"] != "passed" for item in results):
+        status = "blocked"
+    elif runner_exit_code != 0:
+        status = "blocked"
+    else:
+        status = "passed"
+    return results, status
+
+
+def verify_log(root: Path, value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) not in (
+        {"path", "sha256"},
+        {"path", "sha256", "size"},
+    ):
+        raise EvidenceError("log_reference_invalid")
+    record = value
+    relative, path = safe_path(root, record["path"])
+    if not is_build_path(relative):
+        raise EvidenceError("log_path_invalid")
+    run_git(root, "check-ignore", "--", relative)
+    data = read_bounded(path, MAX_LOG_BYTES, "log_too_large")
+    digest = require_sha256(record["sha256"])
+    if sha256(data) != digest:
+        raise EvidenceError("log_digest_mismatch")
+    if "size" in record:
+        size = record["size"]
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or size != len(data)
+        ):
+            raise EvidenceError("log_size_mismatch")
+    return {"path": relative, "sha256": digest, "size": len(data)}
+
+
+def capture_before(request: dict[str, object]) -> dict[str, object]:
+    required = {
+        "workspace_path",
+        "task_short_id",
+        "work_kind",
+        "baseline",
+        "results_dir",
+        "selected_case_ids",
+        "output_path",
+    }
+    exact_keys(request, required, "request_invalid")
+    root = workspace_root(request["workspace_path"])
+    task = require_task(request["task_short_id"])
+    work_kind = require_work_kind(request["work_kind"])
+    baseline = require_baseline(request["baseline"])
+    results_dir = relative_path(request["results_dir"])
+    before_files = list_result_files(root, results_dir)
+    selected = validate_case_ids(request["selected_case_ids"], allow_empty=True)
+    delta = source_delta(root, baseline)
+    if not delta["files"]:
+        raise EvidenceError("source_delta_empty")
+    output_relative, output_path = require_output_path(root, request["output_path"])
+    require_task_artifact_path(output_relative, task)
+    start: dict[str, object] = {
+        "schema": "mock-scenario-execution-start-v1",
+        "execution_id": secrets.token_hex(16),
+        "task_short_id": task,
+        "work_kind": work_kind,
+        "baseline": baseline,
+        "source_delta": delta,
+        "source_sha256": delta["sha256"],
+        "results_dir": results_dir,
+        "result_files_before": before_files,
+        "selected_case_ids": selected,
+    }
+    data = write_new_json(output_path, start)
+    return {
+        "start_path": output_relative,
+        "start_sha256": sha256(data),
+        "execution_id": start["execution_id"],
+        "source_sha256": delta["sha256"],
+        "source_delta": delta,
+        "selected_case_ids": selected,
+    }
+
+
+def load_start_snapshot(root: Path, value: object) -> tuple[str, dict[str, object], str]:
+    relative, path = safe_path(root, value)
+    if not relative.startswith("build/kent-workflow/"):
+        raise EvidenceError("start_path_invalid")
+    run_git(root, "check-ignore", "--", relative)
+    data = read_bounded(path, MAX_JSON_BYTES, "json_too_large")
+    parsed = exact_keys(
+        parse_json(data),
+        {
+            "schema",
+            "execution_id",
+            "task_short_id",
+            "work_kind",
+            "baseline",
+            "source_delta",
+            "source_sha256",
+            "results_dir",
+            "result_files_before",
+            "selected_case_ids",
+        },
+        "start_schema_invalid",
+    )
+    if parsed["schema"] != "mock-scenario-execution-start-v1":
+        raise EvidenceError("start_schema_invalid")
+    if (
+        not isinstance(parsed["execution_id"], str)
+        or not EXECUTION_ID_RE.fullmatch(parsed["execution_id"])
+    ):
+        raise EvidenceError("start_schema_invalid")
+    require_task(parsed["task_short_id"])
+    require_task_artifact_path(relative, str(parsed["task_short_id"]))
+    require_work_kind(parsed["work_kind"])
+    baseline = require_baseline(parsed["baseline"])
+    valid_baseline(root, baseline)
+    delta = validate_delta_record(parsed["source_delta"])
+    if parsed["source_sha256"] != delta["sha256"]:
+        raise EvidenceError("start_schema_invalid")
+    if relative_path(parsed["results_dir"]) != parsed["results_dir"]:
+        raise EvidenceError("start_schema_invalid")
+    if not is_build_path(str(parsed["results_dir"])):
+        raise EvidenceError("start_schema_invalid")
+    validate_file_inventory(parsed["result_files_before"])
+    validate_case_ids(parsed["selected_case_ids"], allow_empty=True)
+    digest = sha256(data)
+    return relative, parsed, digest
+
+
+def validate_delta_record(value: object) -> dict[str, object]:
+    record = exact_keys(value, {"files", "sha256"}, "source_delta_invalid")
+    files_value = record["files"]
+    if not isinstance(files_value, list) or len(files_value) > MAX_SOURCE_FILES:
+        raise EvidenceError("source_delta_invalid")
+    files: list[dict[str, object]] = []
+    previous = ""
+    for item in files_value:
+        file_record = exact_keys(
+            item,
+            {"path", "status", "mode", "sha256"},
+            "source_file_invalid",
+        )
+        path = relative_path(file_record["path"])
+        status = file_record["status"]
+        mode = file_record["mode"]
+        digest = file_record["sha256"]
+        if path <= previous or excluded_source_path(path):
+            raise EvidenceError("source_file_invalid")
+        previous = path
+        if status not in {"added", "modified", "deleted", "type_changed"}:
+            raise EvidenceError("source_file_invalid")
+        if status == "deleted":
+            if mode is not None or digest is not None:
+                raise EvidenceError("source_file_invalid")
+        else:
+            if mode not in {"100644", "100755"}:
+                raise EvidenceError("source_file_invalid")
+            require_sha256(digest)
+        files.append(
+            {"path": path, "status": status, "mode": mode, "sha256": digest}
+        )
+    return {"files": files, "sha256": require_sha256(record["sha256"])}
+
+
+def validate_behaviors(
+    value: object,
+    delta_files: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], set[str]]:
+    if not isinstance(value, list) or not value or len(value) > MAX_BEHAVIORS:
+        raise EvidenceError("behavior_inventory_invalid")
+    delta_by_path = {str(item["path"]): item for item in delta_files}
+    behavior_ids: set[str] = set()
+    mapped_paths: set[str] = set()
+    selected_cases: set[str] = set()
+    output: list[dict[str, object]] = []
+    for value_item in value:
+        if not isinstance(value_item, dict):
+            raise EvidenceError("behavior_invalid")
+        behavior_id = value_item.get("behavior_id")
+        if not isinstance(behavior_id, str) or not IDENTIFIER_RE.fullmatch(behavior_id):
+            raise EvidenceError("behavior_id_invalid")
+        if behavior_id in behavior_ids:
+            raise EvidenceError("behavior_id_duplicate")
+        behavior_ids.add(behavior_id)
+        applicability = value_item.get("applicability")
+        common = {"behavior_id", "applicability", "delta_paths", "source_paths"}
+        if applicability == "applicable":
+            exact_keys(
+                value_item,
+                common
+                | {
+                    "scenario_paths",
+                    "mock_seam",
+                    "assertions",
+                    "test_case_ids",
+                },
+                "behavior_schema_invalid",
+            )
+        elif applicability == "not_applicable":
+            exact_keys(
+                value_item,
+                common | {"rationale", "alternative_verification"},
+                "behavior_schema_invalid",
+            )
+        else:
+            raise EvidenceError("applicability_invalid")
+
+        delta_paths = require_string_list(
+            value_item["delta_paths"],
+            maximum_items=MAX_SOURCE_FILES,
+            maximum_text=1024,
+        )
+        source_paths = require_string_list(
+            value_item["source_paths"],
+            maximum_items=MAX_SOURCE_FILES,
+            maximum_text=1024,
+            allow_empty=True,
+        )
+        for item_path in delta_paths:
+            normalized = relative_path(item_path)
+            if normalized not in delta_by_path:
+                raise EvidenceError("behavior_path_unmapped")
+            mapped_paths.add(normalized)
+        if not set(source_paths).issubset(set(delta_paths)):
+            raise EvidenceError("behavior_source_unmapped")
+        if applicability == "applicable":
+            scenario_paths = require_string_list(
+                value_item["scenario_paths"],
+                maximum_items=MAX_SOURCE_FILES,
+                maximum_text=1024,
+            )
+            if not set(scenario_paths).issubset(set(delta_paths)):
+                raise EvidenceError("scenario_path_unmapped")
+            for scenario_path in scenario_paths:
+                file_record = delta_by_path.get(scenario_path)
+                if file_record is None or file_record["status"] == "deleted":
+                    raise EvidenceError("scenario_path_unmapped")
+            seam = require_text(value_item["mock_seam"], maximum=2048)
+            assertions = require_string_list(
+                value_item["assertions"],
+                maximum_items=32,
+                maximum_text=2048,
+            )
+            case_ids = validate_case_ids(value_item["test_case_ids"], allow_empty=False)
+            selected_cases.update(case_ids)
+            output.append(
+                {
+                    "behavior_id": behavior_id,
+                    "applicability": applicability,
+                    "delta_paths": delta_paths,
+                    "source_paths": source_paths,
+                    "scenario_paths": scenario_paths,
+                    "mock_seam": seam,
+                    "assertions": assertions,
+                    "test_case_ids": case_ids,
+                }
+            )
+        else:
+            rationale = require_text(value_item["rationale"], maximum=2048)
+            alternatives = require_string_list(
+                value_item["alternative_verification"],
+                maximum_items=16,
+                maximum_text=2048,
+            )
+            output.append(
+                {
+                    "behavior_id": behavior_id,
+                    "applicability": applicability,
+                    "delta_paths": delta_paths,
+                    "source_paths": source_paths,
+                    "rationale": rationale,
+                    "alternative_verification": alternatives,
+                }
+            )
+    if mapped_paths != set(delta_by_path):
+        raise EvidenceError("behavior_inventory_incomplete")
+    return output, selected_cases
+
+
+def validate_receipt(
+    root: Path,
+    value: object,
+    packet: dict[str, object],
+    current_delta: dict[str, object],
+) -> tuple[dict[str, object], str]:
+    reference = exact_keys(value, {"path", "sha256"}, "receipt_reference_invalid")
+    receipt_path, receipt_file = safe_path(root, reference["path"])
+    if not receipt_path.startswith("build/kent-workflow/"):
+        raise EvidenceError("receipt_path_invalid")
+    run_git(root, "check-ignore", "--", receipt_path)
+    data = read_bounded(receipt_file, MAX_JSON_BYTES, "json_too_large")
+    expected_digest = require_sha256(reference["sha256"])
+    if sha256(data) != expected_digest:
+        raise EvidenceError("receipt_digest_mismatch")
+    receipt = exact_keys(
+        parse_json(data),
+        {
+            "schema",
+            "execution_id",
+            "task_short_id",
+            "work_kind",
+            "baseline",
+            "source_sha256_pre",
+            "source_sha256_post",
+            "source_delta_sha256",
+            "start_snapshot",
+            "results_dir",
+            "result_files_before",
+            "result_files_after",
+            "selected_case_ids",
+            "selected_cases",
+            "runner_exit_code",
+            "verification_log",
+            "result",
+        },
+        "receipt_schema_invalid",
+    )
+    if receipt["schema"] != "mock-scenario-execution-v1":
+        raise EvidenceError("receipt_schema_invalid")
+    for field in ("execution_id", "task_short_id", "work_kind", "baseline"):
+        if receipt[field] != packet[field]:
+            raise EvidenceError("receipt_identity_mismatch")
+    require_task_artifact_path(receipt_path, str(packet["task_short_id"]))
+    current_sha = current_delta["sha256"]
+    if (
+        receipt["source_sha256_pre"] != receipt["source_sha256_post"]
+        or receipt["source_sha256_post"] != current_sha
+        or receipt["source_delta_sha256"] != current_sha
+        or packet["source_sha256"] != current_sha
+    ):
+        raise EvidenceError("source_drift")
+
+    start_ref = exact_keys(
+        receipt["start_snapshot"],
+        {"path", "sha256"},
+        "start_reference_invalid",
+    )
+    start_path, start, start_digest = load_start_snapshot(root, start_ref["path"])
+    require_task_artifact_path(start_path, str(packet["task_short_id"]))
+    if start_digest != require_sha256(start_ref["sha256"]):
+        raise EvidenceError("start_digest_mismatch")
+    for field in (
+        "task_short_id",
+        "work_kind",
+        "baseline",
+        "execution_id",
+        "source_sha256",
+        "results_dir",
+        "selected_case_ids",
+    ):
+        if start[field] != receipt[
+            {
+                "source_sha256": "source_sha256_pre",
+                "selected_case_ids": "selected_case_ids",
+            }.get(field, field)
+        ]:
+            raise EvidenceError("start_receipt_mismatch")
+    if start["source_delta"] != current_delta:
+        raise EvidenceError("source_drift")
+    before_files = validate_file_inventory(start["result_files_before"])
+    if before_files != validate_file_inventory(receipt["result_files_before"]):
+        raise EvidenceError("start_receipt_mismatch")
+
+    selected = validate_case_ids(receipt["selected_case_ids"], allow_empty=True)
+    before_results = validate_file_inventory(receipt["result_files_before"])
+    after_results = validate_file_inventory(receipt["result_files_after"])
+    current_results = list_result_files(root, str(receipt["results_dir"]))
+    if after_results != current_results:
+        raise EvidenceError("result_drift")
+    log_info = verify_log(root, receipt["verification_log"])
+    require_task_artifact_path(str(log_info["path"]), str(packet["task_short_id"]))
+    exit_code = receipt["runner_exit_code"]
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool) or not 0 <= exit_code <= 255:
+        raise EvidenceError("runner_exit_invalid")
+    case_results, derived_result = classify_cases(
+        root,
+        selected,
+        before_results,
+        after_results,
+        exit_code,
+    )
+    if receipt["selected_cases"] != case_results or receipt["result"] != derived_result:
+        raise EvidenceError("receipt_result_mismatch")
+    if start_path != str(start_ref["path"]):
+        raise EvidenceError("start_path_invalid")
+    return receipt, derived_result
+
+
+def validate_packet(root: Path, envelope_text: object) -> dict[str, object]:
+    if not isinstance(envelope_text, str) or len(envelope_text.encode("utf-8")) > 32 * 1024:
+        raise EvidenceError("envelope_invalid")
+    envelope = exact_keys(
+        parse_json(envelope_text.encode("utf-8"), limit=32 * 1024),
+        {"schema", "evidence_path", "evidence_sha256", "narrative"},
+        "envelope_schema_invalid",
+    )
+    if envelope["schema"] != "mock-scenario-review-context-v1":
+        raise EvidenceError("envelope_schema_invalid")
+    narrative = require_text(envelope["narrative"], maximum=16 * 1024, multiline=True)
+    evidence_path, evidence_file = safe_path(root, envelope["evidence_path"])
+    if not evidence_path.startswith("build/kent-workflow/"):
+        raise EvidenceError("evidence_path_invalid")
+    run_git(root, "check-ignore", "--", evidence_path)
+    evidence_data = read_bounded(evidence_file, MAX_JSON_BYTES, "json_too_large")
+    evidence_digest = require_sha256(envelope["evidence_sha256"])
+    if sha256(evidence_data) != evidence_digest:
+        raise EvidenceError("evidence_digest_mismatch")
+    packet = exact_keys(
+        parse_json(evidence_data),
+        {
+            "schema",
+            "execution_id",
+            "task_short_id",
+            "work_kind",
+            "baseline",
+            "source_delta",
+            "source_sha256",
+            "behaviors",
+            "verification",
+            "execution_receipt",
+        },
+        "packet_schema_invalid",
+    )
+    if packet["schema"] != "mock-scenario-evidence-v1":
+        raise EvidenceError("packet_schema_invalid")
+    if (
+        not isinstance(packet["execution_id"], str)
+        or not EXECUTION_ID_RE.fullmatch(packet["execution_id"])
+    ):
+        raise EvidenceError("execution_id_invalid")
+    require_task(packet["task_short_id"])
+    require_work_kind(packet["work_kind"])
+    require_task_artifact_path(evidence_path, str(packet["task_short_id"]))
+    baseline = require_baseline(packet["baseline"])
+    delta = validate_delta_record(packet["source_delta"])
+    if packet["source_sha256"] != delta["sha256"]:
+        raise EvidenceError("source_digest_mismatch")
+    expected_delta = source_delta(root, baseline)
+    if expected_delta != delta:
+        raise EvidenceError("source_drift")
+    behaviors, behavior_cases = validate_behaviors(packet["behaviors"], delta["files"])
+    verification = exact_keys(
+        packet["verification"],
+        {"result", "command", "log_path", "log_sha256"},
+        "verification_schema_invalid",
+    )
+    if verification["result"] not in {"passed", "failed", "blocked"}:
+        raise EvidenceError("verification_result_invalid")
+    require_text(verification["command"], maximum=4096)
+    verification_log = verify_log(
+        root,
+        {"path": verification["log_path"], "sha256": verification["log_sha256"]},
+    )
+    require_task_artifact_path(
+        str(verification_log["path"]),
+        str(packet["task_short_id"]),
+    )
+    receipt, result = validate_receipt(
+        root,
+        packet["execution_receipt"],
+        packet,
+        expected_delta,
+    )
+    if verification["result"] != result:
+        raise EvidenceError("verification_result_mismatch")
+    receipt_log = receipt["verification_log"]
+    if verification_log != verify_log(root, receipt_log):
+        raise EvidenceError("verification_log_mismatch")
+    if behavior_cases != set(receipt["selected_case_ids"]):
+        raise EvidenceError("selected_cases_mismatch")
+    return {
+        "status": result,
+        "task_short_id": packet["task_short_id"],
+        "work_kind": packet["work_kind"],
+        "source_sha256": packet["source_sha256"],
+        "behavior_count": len(behaviors),
+        "narrative_present": bool(narrative.strip()),
+        "receipt_sha256": packet["execution_receipt"]["sha256"],
+    }
+
+
+def capture_after(request: dict[str, object]) -> dict[str, object]:
+    required = {
+        "workspace_path",
+        "start_path",
+        "output_path",
+        "runner_exit_code",
+        "log_path",
+    }
+    exact_keys(request, required, "request_invalid")
+    root = workspace_root(request["workspace_path"])
+    start_path, start, start_digest = load_start_snapshot(root, request["start_path"])
+    output_relative, output_path = require_output_path(root, request["output_path"])
+    require_task_artifact_path(output_relative, str(start["task_short_id"]))
+    delta = source_delta(root, str(start["baseline"]))
+    if delta != start["source_delta"] or delta["sha256"] != start["source_sha256"]:
+        raise EvidenceError("source_drift")
+    after_files = list_result_files(root, str(start["results_dir"]))
+    before_files = validate_file_inventory(start["result_files_before"])
+    selected = validate_case_ids(start["selected_case_ids"], allow_empty=True)
+    exit_code = request["runner_exit_code"]
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool) or not 0 <= exit_code <= 255:
+        raise EvidenceError("runner_exit_invalid")
+    log_path, log_file = safe_path(root, request["log_path"])
+    if not is_build_path(log_path):
+        raise EvidenceError("log_path_invalid")
+    log_data = read_bounded(log_file, MAX_LOG_BYTES, "log_too_large")
+    if not log_data:
+        raise EvidenceError("log_empty")
+    log_info = {"path": log_path, "sha256": sha256(log_data)}
+    require_task_artifact_path(log_path, str(start["task_short_id"]))
+    log_info = verify_log(root, log_info)
+    cases, result = classify_cases(root, selected, before_files, after_files, exit_code)
+    receipt: dict[str, object] = {
+        "schema": "mock-scenario-execution-v1",
+        "execution_id": start["execution_id"],
+        "task_short_id": start["task_short_id"],
+        "work_kind": start["work_kind"],
+        "baseline": start["baseline"],
+        "source_sha256_pre": start["source_sha256"],
+        "source_sha256_post": delta["sha256"],
+        "source_delta_sha256": delta["sha256"],
+        "start_snapshot": {"path": start_path, "sha256": start_digest},
+        "results_dir": start["results_dir"],
+        "result_files_before": before_files,
+        "result_files_after": after_files,
+        "selected_case_ids": selected,
+        "selected_cases": cases,
+        "runner_exit_code": exit_code,
+        "verification_log": log_info,
+        "result": result,
+    }
+    data = write_new_json(output_path, receipt)
+    return {
+        "status": result,
+        "receipt_path": output_relative,
+        "receipt_sha256": sha256(data),
+        "source_sha256": delta["sha256"],
+        "selected_cases": cases,
+        "result": result,
+    }
+
+
+def dispatch(command: str, request: dict[str, object]) -> dict[str, object]:
+    if command == "capture-before":
+        return capture_before(request)
+    if command == "capture-after":
+        return capture_after(request)
+    if command == "validate":
+        required = {"workspace_path", "review_context"}
+        exact_keys(request, required, "request_invalid")
+        root = workspace_root(request["workspace_path"])
+        return validate_packet(root, request["review_context"])
+    raise EvidenceError("command_invalid")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "command",
+        choices={"capture-before", "capture-after", "validate"},
+    )
+    arguments = parser.parse_args()
+    try:
+        result = dispatch(arguments.command, read_request())
+    except EvidenceError as error:
+        emit("blocked", reason_code=error.code)
+        return 0
+    except (OSError, ValueError, TypeError, ElementTree.ParseError, RecursionError):
+        emit("blocked", reason_code="evidence_invalid")
+        return 0
+    emit(str(result.pop("status", "passed")), **result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

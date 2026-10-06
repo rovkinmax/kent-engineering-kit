@@ -1,0 +1,186 @@
+{
+  "schema": "mock-scenario-production-fixtures-v1",
+  "task_short_id": "KEN-11",
+  "accepted_scope_sha256": "de0b5a1f75164db70ef4510d2244019418dee68aefbc54058fadbb48e71bdb59",
+  "supported_work_kinds": [
+    "bugfix",
+    "dependency",
+    "feature",
+    "migration",
+    "refactor",
+    "test"
+  ],
+  "projects": {
+    "appsome": {
+      "repository": "OsomePteLtd/AppsomeAndroid",
+      "branch": "release/4.31.0",
+      "immutable_task_baseline": "bf4a29c288410be93321bd53406c424d13024e71",
+      "delivered_revision": "397244248eb1ecd62fd40f412a7f233d2a589802",
+      "observed_target_revision": "532797e49a6b37f0da295d06150f3217297bee16",
+      "source_delta_sha256": "82a7db79992e4d538577ca923c4329cb0ea198278cb1414ed30b576bf1b92eb2",
+      "files": [
+        {
+          "path": ".kent/commands/bugfix-implement.md",
+          "sha256": "2156760051bcb34e3cacc0bf3fc597f720b6a92d29c8a90d2bcb1af7b617d723",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/bugfix-start.md",
+          "sha256": "9177ee514bf9dd8b782b06b4b3fe26893f91b030c1bdf00d1d4c4b13defcb6e0",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/dependency-update.md",
+          "sha256": "7372f3a5b815ef7974b06a6b84f162bc75c67f26edb0f72cefea0682ff1c6136",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/feature-implement.md",
+          "sha256": "4e40eac6574c12398d848363eb92a7bfacd650c9d42beb02b72bd5b89344b48b",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/feature-start.md",
+          "sha256": "945d6b531770f08d8b459a3f94b92fc2d73a1d61e48611f6bd229526ed042c8b",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/migration-start.md",
+          "sha256": "8726d7eb8d23db7fe8db21e3b4bce77769fed4c7dfb5e0eeafea29b4961704ab",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/mock-scenario-policy.md",
+          "sha256": "430d5bdb380e5734a46fc8e9e26e89660cea81e227185f1267c8ddef3868b1f4",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/refactor-start.md",
+          "sha256": "a174d662ea999c7beebd0022637c82d7092acaf1c7c603e5e46ed464b1935fad",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/test-coverage.md",
+          "sha256": "8a44b7cd8ba11b6cdc42b14f512f0c27d3ca2c287b2b0ead5a04e28f4eec6a27",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/project-contract.md",
+          "sha256": "7ed5d2b44e6112dcbdd1f358974106af2a6a88e949bd4635ebf2c1859a0675f2",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/scripts/tests/test-workflow-verify-report",
+          "sha256": "899f176249126d355a266b0f8fb8e03c06bff20407609b187a0bc750c779289f",
+          "mode": "100755"
+        },
+        {
+          "path": ".kent/scripts/workflow-compile-verify",
+          "sha256": "a9d510caca9eed5d4640d2fed473f22c333dead16194bf48f03397e680262342",
+          "mode": "100755"
+        },
+        {
+          "path": ".kent/scripts/workflow-mock-scenario-evidence",
+          "sha256": "274300321cb4f3e233b98be1c3b6dad590470aae4b3b759b5edf28077229aef2",
+          "mode": "100755"
+        },
+        {
+          "path": ".kent/workflows/appsome-release-publication-v22.manifest.json",
+          "sha256": "e4020818f5e54aea9be233709b419fddaba9e5aa84acab2013b1c0b88383efea",
+          "mode": "100644"
+        },
+        {
+          "path": "tools/test-workflow-mock-scenario-evidence",
+          "sha256": "92aa2b23207406986c5e62e7688a3fb3cf3c93065d29caa33a13bad9f32307a9",
+          "mode": "100644"
+        }
+      ]
+    },
+    "puber": {
+      "repository": "rovkinmax/Puber",
+      "branch": "master",
+      "immutable_task_baseline": "f640524f31696592f8532bda1162953601b9fa9f",
+      "delivered_revision": "b755826c5d2cbfd73949d6d6fc41a7cba6bb6741",
+      "observed_target_revision": "d51d489222e63c9ff215864b48b5022be99692ee",
+      "source_delta_sha256": "335eacc0981008bc5716eaed98f2640a06ff73d7e0a46c6076fe82ece4805600",
+      "source_state": "PR #91 and PR #92 merged to origin/master; current 15-file source bytes verified against the PR #92 tree",
+      "files": [
+        {
+          "path": ".kent/commands/bugfix-implement.md",
+          "sha256": "e10a38d86e9e9ed0a811008235544c742199c9ac49b0cceb8e0269b1ccfff1e3",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/bugfix-start.md",
+          "sha256": "bb64d9d5d45be817afc7cb425c9554d9a2208e511be6230404032d0bbebe7488",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/dependency-update.md",
+          "sha256": "7f002d1b92a5476992f6a0850b4ecfd87433242f35d1cbbb1d2cdc613154d8c7",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/feature-implement.md",
+          "sha256": "f63ab517b632b5e6137b16e6464da4b39a32c4f28f2677932a550546506ac628",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/feature-start.md",
+          "sha256": "1276610b5a214e6e9e0d08acff8ec49fbfc9b7cdd72bbb0b9a9f1b6ec8cf36d1",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/migration-start.md",
+          "sha256": "dc89dc5e9395fd344e54a171cd5a2d45466bc18371fc933a72a2e16399cc52e5",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/mock-scenario-policy.md",
+          "sha256": "36b364ef83b15ee4f323a6df9698e71172c3f0ecdfffefa9bd08d2de6a386b2c",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/refactor-start.md",
+          "sha256": "4e6ca9baac8f94503c53b40cace6a4fdd8f15ee180fece813fe54d19c621c1b0",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/commands/test-coverage.md",
+          "sha256": "a8e75896f66efdba6075654a0a5b2cc8dfa69ea8728dd3f657638e6bf45d42a8",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/project-contract.md",
+          "sha256": "dcf35a0762548dd95a0711a78a9f265178d09fad3caafe397803081b0be014b7",
+          "mode": "100644"
+        },
+        {
+          "path": ".kent/scripts/tests/test-workflow-verify-report",
+          "sha256": "bd45a31fcf0b5574563f07b9c670cf2e16a0e1413bef91f51ca69a9f48cbac61",
+          "mode": "100755"
+        },
+        {
+          "path": ".kent/scripts/workflow-compile-verify",
+          "sha256": "13ebda0c0e4771ec1bfe2c4d529fab3de2a56e30df58339bc66a6742fe312670",
+          "mode": "100755"
+        },
+        {
+          "path": ".kent/scripts/workflow-mock-scenario-evidence",
+          "sha256": "aaab2315473cd9ea1d4d410ca69ac3fa0e7096fb735e980c94c8524699c55b77",
+          "mode": "100755"
+        },
+        {
+          "path": ".kent/workflows/puber-release.manifest.json",
+          "sha256": "b9b005131f207af6af557462a79e53294073a706d16ec4ae04ddcab8dac22364",
+          "mode": "100644"
+        },
+        {
+          "path": "tools/test-workflow-mock-scenario-evidence",
+          "sha256": "157824a6e3f232bef37260eaf03e54ef9d127479e36f209e9bb98bb183c1fd61",
+          "mode": "100755"
+        }
+      ]
+    }
+  }
+}
