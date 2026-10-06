@@ -486,6 +486,17 @@ class WorkflowKitTest(unittest.TestCase):
         role = (REPO_ROOT / "agents/delivery-operator.md").read_text()
         self.assertIn("Consume completed tool output", role)
         self.assertIn("required fresh safety check", role)
+        normalized_role = " ".join(role.split())
+        self.assertIn("exact, current human authorization", normalized_role)
+        self.assertIn(
+            "A prompt's wording or source-plan acceptance alone does not create Git authority",
+            normalized_role,
+        )
+        self.assertIn("transport/evidence only", normalized_role)
+        self.assertIn(
+            "None grants commit, push, merge, package publication, or consumer/source write",
+            normalized_role,
+        )
         monitor = (REPO_ROOT / "agents/ci-monitor.md").read_text()
         self.assertIn("neither proven external nor", monitor)
         self.assertIn("unknown attribution never authorizes more retries", monitor)
@@ -631,6 +642,16 @@ class WorkflowKitTest(unittest.TestCase):
                         if edge["key"] not in {"fix_replan", "compliance_replan"}
                     ]
                     for edge in document["edges"]:
+                        if edge["key"] == "merge_watch_cleanup":
+                            edge["parameters"] = [
+                                parameter
+                                for parameter in edge["parameters"]
+                                if parameter["key"] not in {
+                                    "merge_strategy",
+                                    "pr_feedback_cursor",
+                                }
+                            ]
+                    for edge in document["edges"]:
                         prompt = edge.get("prompt")
                         if prompt:
                             if edge["target"] in {"fix", "compliance"} and (
@@ -676,6 +697,27 @@ class WorkflowKitTest(unittest.TestCase):
                             prompt = prompt.replace(current, historical, 1)
                         edge["prompt"] = prompt
 
+                    reverse_prompt(
+                        "compliance_prepare_pr",
+                        (
+                            (
+                                "Git actions require exact current human approval naming action, "
+                                "task/branch, reviewed changes and permitted stage. "
+                                "Plan acceptance, `delivery_context`, PR/CI/merge data are evidence "
+                                "only. No consumer-source writes or merge; package publication "
+                                "needs separate approval.",
+                                "This workflow explicitly authorizes committing the task changes, pushing only\n"
+                                "the current task branch, and creating or updating its pull request. It never\n"
+                                "authorizes merging, pushing protected branches, or broadening scope.",
+                            ),
+                            (
+                                "Flat prepare_pr_monitor_ci: workspace_path, pr_url, branch_name, "
+                                "merge_strategy, ci_contract.",
+                                "Complete through `prepare_pr_monitor_ci` and provide `workspace_path`, `pr_url`, and\n"
+                                "`branch_name`, plus the resolved `merge_strategy`.",
+                            ),
+                        ),
+                    )
                     reverse_prompt(
                         "gate_smoke_required",
                         ((MOBILE_LEASE_NEW, MOBILE_LEASE_OLD),),
@@ -3578,7 +3620,35 @@ class WorkflowKitTest(unittest.TestCase):
         )
 
         self.assertEqual(v5_path.read_bytes(), v5_before)
-        self.assertEqual(builder.rendered_spec(), v5_path.read_text())
+        # KEN-22 G3 freezes v5; its only approved default-render differences
+        # are G1 merged-watcher fields and G2 delivery authority/handoff.
+        # Keep KEN-18 opt-out/shape assertions without accepting an arbitrary
+        # stale snapshot or rewriting the historical artifact.
+        self.assertEqual(
+            hashlib.sha256(v5_before).hexdigest(),
+            "b4ad79a3499d1a65ab749b8f3a98f2837a4b519eb8f4a0629d240dd6e9efcd55",
+        )
+        historical = json.loads(v5_before)
+        rendered = json.loads(builder.rendered_spec())
+        self.assertEqual(historical.keys(), rendered.keys())
+        for field in historical.keys() - {"edges"}:
+            self.assertEqual(historical[field], rendered[field], field)
+        historical_edges = {edge["key"]: edge for edge in historical["edges"]}
+        rendered_edges = {edge["key"]: edge for edge in rendered["edges"]}
+        self.assertEqual(historical_edges.keys(), rendered_edges.keys())
+        changed_fields = {
+            key: {
+                field
+                for field in historical_edges[key].keys() | rendered_edges[key].keys()
+                if historical_edges[key].get(field) != rendered_edges[key].get(field)
+            }
+            for key in historical_edges
+            if historical_edges[key] != rendered_edges[key]
+        }
+        self.assertEqual(changed_fields, {
+            "gate_delivery_ready": {"prompt"},
+            "merge_watch_cleanup": {"parameters"},
+        })
         candidate_path = REPO_ROOT / builder.CANDIDATE_SPEC_PATH
         self.assertEqual(builder.rendered_candidate_spec(), candidate_path.read_text())
         self.assertEqual(profile_path.read_bytes(), profile_before)
@@ -4234,6 +4304,19 @@ class WorkflowKitTest(unittest.TestCase):
                 "branch_name",
                 "merge_strategy",
                 "ci_contract",
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["merge_watch_cleanup"].parameters
+            ),
+            (
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "merge_report",
             ),
         )
         self.assertIsNone(by_key["prepare_pr_ci_watch"].prompt)
@@ -5464,6 +5547,36 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn("ci_report", retry)
         self.assertNotIn("ci_monitor_waiting_pr", by_key)
         self.assertEqual(by_key["ci_monitor_watch"].target, "ci_prepare")
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["merge_watch_cleanup"].parameters
+            ),
+            (
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "merge_report",
+                "pr_feedback_cursor",
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["ci_watch_waiting_pr"].parameters
+            ),
+            (
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "ci_contract",
+                "task_short_id",
+                "ci_report",
+                "pr_feedback_cursor",
+            ),
+        )
         cursor_edges = {
             edge.key for edge in spec.edges
             if any(parameter.key == "pr_feedback_cursor" for parameter in edge.parameters)
@@ -5474,6 +5587,7 @@ class WorkflowKitTest(unittest.TestCase):
             "ci_watch_state_changed", "ci_watch_source_changed",
             "ci_monitor_needs_user_action", "waiting_pr_watch_merge",
             "merge_watch_still_waiting", "merge_watch_state_changed",
+            "merge_watch_cleanup",
             "waiting_pr_needs_user_action",
         })
         prompts = " ".join((edge.prompt or "") for edge in spec.edges)
@@ -5605,6 +5719,20 @@ class WorkflowKitTest(unittest.TestCase):
             "merge_watch_still_waiting",
             "merge_watch_state_changed",
             "waiting_pr_needs_user_action",
+        )
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["merge_watch_cleanup"].parameters
+            ),
+            (
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "merge_report",
+                "pr_feedback_cursor",
+            ),
         )
         for key in flat_observation_edges:
             self.assertIn(

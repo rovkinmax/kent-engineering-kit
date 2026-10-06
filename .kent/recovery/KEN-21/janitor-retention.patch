@@ -1,0 +1,668 @@
+diff --git a/.kent/scripts/workflow-task-janitor b/.kent/scripts/workflow-task-janitor
+--- a/.kent/scripts/workflow-task-janitor
++++ b/.kent/scripts/workflow-task-janitor
+@@ -1722,6 +1722,623 @@
+     if blocker:
+         payload["blocker_reason"] = blocker
+     print(json.dumps(payload, ensure_ascii=False))
+-
+-
++
++
++KEN21_RETENTION_TASK_ID = "task-942deecd-ed03-450c-8183-9c3edfa06b8e"
++KEN21_RETENTION_PROJECT_ID = "project-135413f9-2454-4d04-969e-3831b1527f18"
++KEN21_RETENTION_ROOT = "/Users/rovkinmax/.kent/worktrees/kent-engineering-kit/KEN-21"
++KEN21_RETENTION_PREPARATION_ROOT = "/Users/rovkinmax/.kent/worktrees/kent-engineering-kit/KEN-21"
++KEN21_RETENTION_HEAD = "c6d429ae8761c13f2d1f16624e7aeb6c687ae855"
++KEN21_RETENTION_WORKTREE_ID = "5dadde9d-2b63-4c8d-b2f4-dd1f7a9741f5"
++KEN21_RETENTION_JANITOR = ".kent/scripts/workflow-task-janitor"
++KEN21_RETENTION_PREFIX = "KEN21_REJECTED_TERMINAL_RETENTION_V1 "
++KEN21_RETENTION_SUMMARY = (
++    "invalid evidence rejected; source delivery independently proven; resources retained"
++)
++KEN21_RETENTION_ORIGINALS = {
++    "receipt_sha256": "c6017a723c51c8774974f0396efb2e136afc5389003f75075590463b3ce87d9f",
++    "archive_sha256": "4d467b5b868579460e871afac52d5e8631e385c5de6624e92e5a3a9c8b25e8a9",
++    "ledger_sha256": "4db9acdf2f692bd9f339875cf19771c2a2d75c909a2d33119549560e0e987ef8",
++    "seal_event_hash": "d942d855aea0716c895e6054ddeab21cd10d81268c3ba961cf1298041807f213",
++    "prefix_sha256": "1c1880a042dbf817ec7f967fd41ef6e079a970ebce9c803a75024a048b77e0c7",
++    "report_sha256": "4f39e3f132047d6cf27197d2f4f18ccf2a9861448049a0d4197f44e3c90cee97",
++    "janitor_sha256": "fe09b51b60b5e6dfd0ef188ed0c89533a47581dbcc5fdc1d8b0d0647bff24ebe",
++}
++KEN21_RETENTION_DELIVERY = {
++    "pr_url": "https://github.com/rovkinmax/kent-engineering-kit/pull/36",
++    "merge_commit": "1b24004e19d6c59c693d37b2a1a6710ba7020e21",
++    "proof_ref": "comment-c7417cc6-6a19-4866-af79-d9851ee2e576",
++}
++KEN21_RETENTION_AUTHORITY = {
++    "original_consent_ref": (
++        "Supervisor Session 98351c2e-c7e4-4151-9e17-0bc65f9f4289 Question "
++        "call_wj38XX6XJg9mt1quuKShyYHU answer event 3131 Step "
++        "10b78040-5140-4940-aec0-c66dcff711c6"
++    ),
++    "first_review_ref": (
++        "Session 6aef935b-4ea8-48c3-b0d8-a4c63d0f7e0e event 111 Step "
++        "bacca2a6-1f5f-4fea-a698-675625ee5bd0"
++    ),
++    "second_review_ref": (
++        "Session 4e0aa812-414c-4d3c-9d9d-51f0ff358e3d Step "
++        "cc0ef11b-194f-4963-bab2-079c01e21af7 ledger sequence 2 event "
++        "bcab9ca18d39d97dbb63cac1f827d35b617e043c11696df08cc9e674ae06b3fa"
++    ),
++    "preview_sha256": "332a6481e5ce199ba93d114895dfcbbc671f5e3d21d744fcbd2ec2b53d3762c0",
++    "acceptance_ref": (
++        "Supervisor Session 98351c2e-c7e4-4151-9e17-0bc65f9f4289 Question "
++        "call_NhTzZAUv4LMBRudo48ybLOrE answer event 3495 Step "
++        "10b78040-5140-4940-aec0-c66dcff711c6"
++    ),
++    "pending_snapshot_ref": "dc8aa6c4-bdfd-4730-b7ad-1cdf423817af",
++}
++
++
++def _ken21_retention_closed(value, keys, label):
++    if type(value) is not dict or set(value) != set(keys):
++        raise ValueError(f"{label} has missing or unknown fields")
++    return value
++
++
++def _ken21_retention_text(value, label, limit=1024):
++    if (
++        not isinstance(value, str)
++        or not value
++        or len(value.encode("utf-8")) > limit
++        or any(ord(character) < 0x20 for character in value)
++    ):
++        raise ValueError(f"{label} must be bounded printable text")
++    return value
++
++
++def _ken21_retention_sha(value, label):
++    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
++        raise ValueError(f"{label} must be a lowercase SHA-256")
++    return value
++
++
++def _ken21_retention_identity(metadata):
++    return (
++        metadata.st_dev,
++        metadata.st_ino,
++        metadata.st_uid,
++        metadata.st_mode,
++        metadata.st_nlink,
++        metadata.st_size,
++        metadata.st_mtime_ns,
++        metadata.st_ctime_ns,
++    )
++
++
++def _ken21_retention_check_directory(metadata, label):
++    if (
++        not stat.S_ISDIR(metadata.st_mode)
++        or metadata.st_uid != os.getuid()
++        or stat.S_IMODE(metadata.st_mode) & 0o7022
++    ):
++        raise ValueError(f"{label} is not an owned safe directory")
++
++
++def _ken21_retention_open_directory(parent, name, label):
++    descriptor = os.open(
++        name,
++        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
++        dir_fd=parent,
++    )
++    try:
++        _ken21_retention_check_directory(os.fstat(descriptor), label)
++        return descriptor
++    except BaseException:
++        os.close(descriptor)
++        raise
++
++
++def _ken21_retention_read_at(parent, name, label, limit):
++    descriptor = os.open(
++        name,
++        os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
++        dir_fd=parent,
++    )
++    try:
++        before = os.fstat(descriptor)
++        if (
++            not stat.S_ISREG(before.st_mode)
++            or before.st_uid != os.getuid()
++            or before.st_nlink != 1
++            or stat.S_IMODE(before.st_mode) & 0o7022
++            or before.st_size < 0
++            or before.st_size > limit
++        ):
++            raise ValueError(f"{label} is not an owned safe bounded file")
++        chunks = []
++        remaining = limit + 1
++        while remaining:
++            chunk = os.read(descriptor, min(65536, remaining))
++            if not chunk:
++                break
++            chunks.append(chunk)
++            remaining -= len(chunk)
++        raw = b"".join(chunks)
++        after = os.fstat(descriptor)
++        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
++        if (
++            len(raw) > limit
++            or _ken21_retention_identity(before) != _ken21_retention_identity(after)
++            or _ken21_retention_identity(after) != _ken21_retention_identity(current)
++        ):
++            raise ValueError(f"{label} changed during bounded read")
++        return raw, after
++    finally:
++        os.close(descriptor)
++
++
++def _ken21_retention_read(workspace, relative, limit):
++    parts = relative.split("/")
++    if (
++        not relative
++        or relative.startswith("/")
++        or any(part in {"", ".", ".."} for part in parts)
++    ):
++        raise ValueError("retention file path is not fixed and relative")
++    root_fd = os.open(
++        workspace,
++        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
++    )
++    _ken21_retention_check_directory(os.fstat(root_fd), "task root")
++    opened = [root_fd]
++    try:
++        parent = root_fd
++        for part in parts[:-1]:
++            parent = _ken21_retention_open_directory(parent, part, relative)
++            opened.append(parent)
++        raw, _ = _ken21_retention_read_at(parent, parts[-1], relative, limit)
++        return raw
++    finally:
++        for descriptor in reversed(opened):
++            os.close(descriptor)
++
++
++def _ken21_retention_json(raw, label):
++    try:
++        value = json.loads(
++            raw.decode("utf-8"),
++            object_pairs_hook=_unique_json_pairs,
++            parse_constant=_invalid_json_constant,
++        )
++    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
++        raise ValueError(f"{label} is not duplicate-free UTF-8 JSON: {error}") from error
++    if type(value) is not dict:
++        raise ValueError(f"{label} must be one JSON object")
++    return value
++
++
++def _ken21_retention_validate_receipt(payload, workspace, cleanup_session_id):
++    report = payload["cleanup_report"]
++    raw_report = report.encode("utf-8")
++    if (
++        len(raw_report) > 256 * 1024
++        or not report.startswith(KEN21_RETENTION_PREFIX)
++        or "TERMINAL_EVIDENCE_V1" in report
++    ):
++        raise ValueError("rejection carrier is missing, oversized, or contains the old marker")
++    raw = raw_report[len(KEN21_RETENTION_PREFIX.encode("ascii")):]
++    outer = _ken21_retention_json(raw, "rejection carrier")
++    _ken21_retention_closed(
++        outer, {"schema", "summary", "receipt_ref", "receipt_sha256", "receipt"},
++        "rejection carrier",
++    )
++    runtime = runtime_contracts()
++    if raw != runtime.canonical_bytes(outer):
++        raise ValueError("rejection carrier JSON is not canonical")
++    if outer["schema"] != "ken21-rejected-terminal-retention-report-v1":
++        raise ValueError("rejection carrier schema is not recognized")
++    if outer["summary"] != KEN21_RETENTION_SUMMARY:
++        raise ValueError("rejection carrier summary is not the fixed disposition")
++    receipt_ref = _ken21_retention_text(outer["receipt_ref"], "receipt_ref", 128)
++    if not re.fullmatch(r"comment-[0-9a-f-]{36}", receipt_ref):
++        raise ValueError("receipt_ref is not a native Task comment identity")
++    receipt = outer["receipt"]
++    _ken21_retention_closed(
++        receipt,
++        {"schema", "task", "original", "disposition", "delivery", "authority", "application"},
++        "retention receipt",
++    )
++    if receipt["schema"] != "ken21-rejected-terminal-retention-v1":
++        raise ValueError("retention receipt schema is not recognized")
++    if receipt["disposition"] != "invalid_evidence_rejected_resources_retained":
++        raise ValueError("retention receipt disposition is not the fixed rejection")
++    receipt_bytes = runtime.canonical_bytes(receipt)
++    receipt_sha256 = _ken21_retention_sha(outer["receipt_sha256"], "receipt_sha256")
++    if hashlib.sha256(receipt_bytes).hexdigest() != receipt_sha256:
++        raise ValueError("retention receipt digest does not match carried bytes")
++
++    task = _ken21_retention_closed(
++        receipt["task"],
++        {"id", "short_id", "project_id", "workspace_path", "managed_worktree_id", "branch_name", "head"},
++        "receipt.task",
++    )
++    expected_task = {
++        "id": KEN21_RETENTION_TASK_ID,
++        "short_id": "KEN-21",
++        "project_id": KEN21_RETENTION_PROJECT_ID,
++        "workspace_path": KEN21_RETENTION_ROOT,
++        "managed_worktree_id": KEN21_RETENTION_WORKTREE_ID,
++        "branch_name": "KEN-21",
++        "head": KEN21_RETENTION_HEAD,
++    }
++    if task != expected_task or str(workspace) != KEN21_RETENTION_ROOT:
++        raise ValueError("retention receipt task/root identity does not match KEN-21")
++
++    original = _ken21_retention_closed(
++        receipt["original"],
++        {"receipt_sha256", "archive_sha256", "ledger_sha256", "seal_event_hash",
++         "prefix_sha256", "report_sha256", "janitor_sha256"},
++        "receipt.original",
++    )
++    if original != KEN21_RETENTION_ORIGINALS:
++        raise ValueError("retention receipt does not bind the exact rejected originals")
++
++    delivery = _ken21_retention_closed(
++        receipt["delivery"], {"pr_url", "merge_commit", "proof_ref"}, "receipt.delivery",
++    )
++    if delivery != KEN21_RETENTION_DELIVERY:
++        raise ValueError("retention receipt delivery proof does not match independent KEN-21 proof")
++
++    authority = _ken21_retention_closed(
++        receipt["authority"],
++        {"original_consent_ref", "first_review_ref", "second_review_ref", "preview_sha256",
++         "acceptance_ref", "effect_ref", "pending_snapshot_ref"},
++        "receipt.authority",
++    )
++    for key, expected in KEN21_RETENTION_AUTHORITY.items():
++        if authority[key] != expected:
++            raise ValueError(f"retention receipt {key} does not match verified authority")
++    effect_ref = _ken21_retention_text(authority["effect_ref"], "effect_ref", 512)
++    if not re.fullmatch(
++        r"Session [0-9a-f-]{36} Question [A-Za-z0-9_-]+ answer event [0-9]+ "
++        r"Step [0-9a-f-]{36}",
++        effect_ref,
++    ):
++        raise ValueError("effect_ref is not a native human approval locator")
++
++    application = _ken21_retention_closed(
++        receipt["application"],
++        {"cleanup_session_id", "patch_sha256", "janitor_postimage_sha256",
++         "prompt_artifact_sha256", "graph_before_sha256", "graph_after_sha256",
++         "packet_ref", "drift_readback_ref", "inventory_sha256"},
++        "receipt.application",
++    )
++    if application["cleanup_session_id"] != cleanup_session_id:
++        raise ValueError("retention receipt Cleanup owner does not match flat carrier")
++    for key in (
++        "patch_sha256", "janitor_postimage_sha256", "prompt_artifact_sha256",
++        "graph_before_sha256", "graph_after_sha256", "inventory_sha256",
++    ):
++        _ken21_retention_sha(application[key], f"application.{key}")
++    if application["graph_before_sha256"] == application["graph_after_sha256"]:
++        raise ValueError("retention receipt graph before/after readbacks are identical")
++    for key in ("packet_ref", "drift_readback_ref"):
++        _ken21_retention_text(application[key], f"application.{key}", 512)
++    return outer, receipt, receipt_ref, receipt_sha256, application
++
++
++def _ken21_retention_inventory(workspace):
++    root_fd = os.open(
++        workspace,
++        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
++    )
++    opened = [root_fd]
++    entries = []
++    total_bytes = 0
++
++    def record_directory(descriptor, relative):
++        metadata = os.fstat(descriptor)
++        _ken21_retention_check_directory(metadata, relative)
++        if len(entries) >= 4096:
++            raise ValueError("retention inventory exceeds fixed entry limit")
++        entries.append({
++            "path": relative,
++            "kind": "directory",
++            "mode": stat.S_IMODE(metadata.st_mode),
++            "uid": metadata.st_uid,
++        })
++
++    def walk(descriptor, relative):
++        nonlocal total_bytes
++        with os.scandir(descriptor) as scan:
++            children = []
++            for child in scan:
++                if len(entries) + len(children) >= 4096:
++                    raise ValueError("retention inventory exceeds fixed entry limit")
++                children.append(child)
++        children.sort(key=lambda item: item.name)
++        for child in children:
++            name = child.name
++            info = child.stat(follow_symlinks=False)
++            path = f"{relative}/{name}"
++            if stat.S_ISDIR(info.st_mode):
++                child_fd = _ken21_retention_open_directory(descriptor, name, path)
++                opened.append(child_fd)
++                record_directory(child_fd, path)
++                walk(child_fd, path)
++            elif stat.S_ISREG(info.st_mode):
++                raw, metadata = _ken21_retention_read_at(
++                    descriptor, name, path, 64 * 1024 * 1024,
++                )
++                total_bytes += len(raw)
++                if total_bytes > 256 * 1024 * 1024 or len(entries) >= 4096:
++                    raise ValueError("retention inventory exceeds fixed bounds")
++                entries.append({
++                    "path": path,
++                    "kind": "file",
++                    "mode": stat.S_IMODE(metadata.st_mode),
++                    "uid": metadata.st_uid,
++                    "nlink": metadata.st_nlink,
++                    "size": len(raw),
++                    "sha256": hashlib.sha256(raw).hexdigest(),
++                })
++            else:
++                raise ValueError(f"retention inventory contains unsafe entry: {path}")
++
++    try:
++        _ken21_retention_check_directory(os.fstat(root_fd), "task root")
++        kent_fd = _ken21_retention_open_directory(root_fd, ".kent", ".kent")
++        opened.append(kent_fd)
++        runtime_fd = _ken21_retention_open_directory(kent_fd, "runtime", ".kent/runtime")
++        opened.append(runtime_fd)
++        lock_name, sentinel_name = runtime_state_names("KEN-21")
++        with os.scandir(runtime_fd) as scan:
++            runtime_names = {item.name for item in scan}
++        if runtime_names != {lock_name, "KEN-21"} or sentinel_name in runtime_names:
++            raise ValueError("retention runtime inventory has unknown task state")
++        task_fd = _ken21_retention_open_directory(runtime_fd, "KEN-21", ".kent/runtime/KEN-21")
++        opened.append(task_fd)
++        record_directory(task_fd, ".kent/runtime/KEN-21")
++        with os.scandir(task_fd) as scan:
++            task_names = {item.name for item in scan}
++        if task_names != {"evidence-ledger.jsonl"}:
++            raise ValueError("retention runtime contains unknown KEN-21 entries")
++        for name, relative in (
++            (lock_name, f".kent/runtime/{lock_name}"),
++            ("evidence-ledger.jsonl", ".kent/runtime/KEN-21/evidence-ledger.jsonl"),
++        ):
++            raw, metadata = _ken21_retention_read_at(
++                runtime_fd if name == lock_name else task_fd,
++                name,
++                relative,
++                8 * 1024 * 1024,
++            )
++            total_bytes += len(raw)
++            entries.append({
++                "path": relative,
++                "kind": "file",
++                "mode": stat.S_IMODE(metadata.st_mode),
++                "uid": metadata.st_uid,
++                "nlink": metadata.st_nlink,
++                "size": len(raw),
++                "sha256": hashlib.sha256(raw).hexdigest(),
++            })
++
++        build_fd = _ken21_retention_open_directory(root_fd, "build", "build")
++        opened.append(build_fd)
++        workflow_fd = _ken21_retention_open_directory(
++            build_fd, "kent-workflow", "build/kent-workflow",
++        )
++        opened.append(workflow_fd)
++        task_build_fd = _ken21_retention_open_directory(
++            workflow_fd, "KEN-21", "build/kent-workflow/KEN-21",
++        )
++        opened.append(task_build_fd)
++        record_directory(task_build_fd, "build/kent-workflow/KEN-21")
++        walk(task_build_fd, "build/kent-workflow/KEN-21")
++        if total_bytes > 256 * 1024 * 1024 or len(entries) > 4096:
++            raise ValueError("retention inventory exceeds fixed bounds")
++        runtime = runtime_contracts()
++        entries.sort(key=lambda item: item["path"])
++        return runtime.canonical_sha256({
++            "schema": "ken21-retained-inventory-v1",
++            "files": entries,
++        })
++    finally:
++        for descriptor in reversed(opened):
++            os.close(descriptor)
++
++
++def _ken21_retention_git(workspace, receipt, application):
++    command, environment = _evidence_git_workspace(workspace)
++
++    def probe(*args, check=True):
++        return run(
++            [*command, *args],
++            cwd=workspace,
++            environment=environment,
++            check=check,
++        )
++
++    git_root = Path(probe("rev-parse", "--show-toplevel").stdout.strip()).resolve()
++    head = probe("rev-parse", "HEAD").stdout.strip()
++    branch = probe("symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip()
++    if (
++        git_root != workspace
++        or head != KEN21_RETENTION_HEAD
++        or branch != "KEN-21"
++        or receipt["task"]["head"] != head
++        or receipt["task"]["branch_name"] != branch
++    ):
++        raise ValueError("retention Git root, branch, or HEAD changed")
++
++    tracked = probe("diff", "--name-only", "--no-renames", "-z", "HEAD", "--").stdout
++    staged = probe(
++        "diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD", "--",
++    ).stdout
++    untracked = probe(
++        "ls-files", "--others", "--exclude-standard", "-z",
++    ).stdout
++    allowed = {KEN21_RETENTION_JANITOR}
++    if (
++        set(filter(None, tracked.split("\0"))) != allowed
++        or set(filter(None, staged.split("\0"))) - allowed
++        or untracked
++    ):
++        raise ValueError("retention worktree has changes outside the approved Janitor patch")
++
++    full_patch = probe(
++        "diff", "--binary", "--no-ext-diff", "HEAD", "--", KEN21_RETENTION_JANITOR,
++    ).stdout.encode("utf-8")
++    staged_patch = probe(
++        "diff", "--cached", "--binary", "--no-ext-diff", "HEAD", "--",
++        KEN21_RETENTION_JANITOR,
++    ).stdout.encode("utf-8")
++    unstaged_patch = probe(
++        "diff", "--binary", "--no-ext-diff", "--", KEN21_RETENTION_JANITOR,
++    ).stdout.encode("utf-8")
++    if (
++        hashlib.sha256(full_patch).hexdigest() != application["patch_sha256"]
++        or (staged_patch and (staged_patch != full_patch or unstaged_patch))
++        or (not staged_patch and unstaged_patch != full_patch)
++    ):
++        raise ValueError("retention tracked Janitor delta differs from approved patch")
++
++    original = probe("show", f"HEAD:{KEN21_RETENTION_JANITOR}").stdout.encode("utf-8")
++    if hashlib.sha256(original).hexdigest() != KEN21_RETENTION_ORIGINALS["janitor_sha256"]:
++        raise ValueError("frozen Janitor preimage does not match approved hash")
++    current = _ken21_retention_read(workspace, KEN21_RETENTION_JANITOR, 8 * 1024 * 1024)
++    if (
++        hashlib.sha256(current).hexdigest() != application["janitor_postimage_sha256"]
++        or not os.stat(workspace / KEN21_RETENTION_JANITOR, follow_symlinks=False).st_mode
++        & stat.S_IXUSR
++    ):
++        raise ValueError("patched Janitor postimage is not the approved executable")
++    return probe, original, current
++
++
++def _ken21_retention_originals(workspace):
++    expected = KEN21_RETENTION_ORIGINALS
++    preparation_path = "build/kent-workflow/KEN-21/cleanup-preparation.json"
++    archive_path = (
++        "build/kent-workflow/KEN-21/plan-contract-"
++        "4d467b5b868579460e871afac52d5e8631e385c5de6624e92e5a3a9c8b25e8a9.json"
++    )
++    preparation_raw = _ken21_retention_read(workspace, preparation_path, 4 * 1024 * 1024)
++    if hashlib.sha256(preparation_raw).hexdigest() != expected["receipt_sha256"]:
++        raise ValueError("original completed receipt bytes changed")
++    preparation = _ken21_retention_json(preparation_raw, "original preparation receipt")
++    if preparation.get("state") != "completed":
++        raise ValueError("original preparation receipt is not the known completed artifact")
++    request = preparation.get("request")
++    if (
++        type(request) is not dict
++        or request.get("workspace_path") != KEN21_RETENTION_PREPARATION_ROOT
++        or request.get("task_short_id") != "KEN-21"
++    ):
++        raise ValueError("original preparation receipt task identity changed")
++    report = preparation.get("cleanup_report")
++    if (
++        not isinstance(report, str)
++        or hashlib.sha256(report.encode("utf-8")).hexdigest() != expected["report_sha256"]
++    ):
++        raise ValueError("original false cleanup report bytes changed")
++    pieces = report.rsplit("\nTERMINAL_EVIDENCE_V1 ", 1)
++    lines = report.splitlines()
++    if (
++        len(pieces) != 2
++        or hashlib.sha256(pieces[0].encode("utf-8")).hexdigest() != expected["prefix_sha256"]
++        or not lines
++        or not lines[-1].startswith("TERMINAL_EVIDENCE_V1 ")
++        or sum(line.startswith("TERMINAL_EVIDENCE_V1 ") for line in lines) != 1
++    ):
++        raise ValueError("original false prefix or rejected marker bytes changed")
++    archive = _ken21_retention_read(workspace, archive_path, 4 * 1024 * 1024)
++    if hashlib.sha256(archive).hexdigest() != expected["archive_sha256"]:
++        raise ValueError("original plan-contract archive bytes changed")
++    ledger = _ken21_retention_read(
++        workspace, ".kent/runtime/KEN-21/evidence-ledger.jsonl", 8 * 1024 * 1024,
++    )
++    if hashlib.sha256(ledger).hexdigest() != expected["ledger_sha256"]:
++        raise ValueError("original evidence ledger bytes changed")
++    records = [
++        _ken21_retention_json(line, "original evidence record")
++        for line in ledger.splitlines()
++    ]
++    if (
++        not records
++        or records[-1].get("record_kind") != "terminal_evidence_seal_v1"
++        or records[-1].get("event_hash") != expected["seal_event_hash"]
++    ):
++        raise ValueError("original rejected seal reference changed")
++
++
++def _ken21_rejected_retention_report(
++    payload,
++    workspace,
++    branch,
++    pr_url,
++    cleanup_mode,
++    cleanup_session_id,
++    task_short_id,
++):
++    native = payload.get("_kent")
++    if (
++        type(native) is not dict
++        or set(native) != {"task_id", "node_id"}
++        or native.get("task_id") != KEN21_RETENTION_TASK_ID
++        or native.get("node_id") != "407ed282-e435-4ab1-a644-b511b749c0d7"
++    ):
++        raise ValueError("native _kent Task/Janitor identity is missing or mismatched")
++    if (
++        task_short_id != "KEN-21"
++        or workspace != Path(KEN21_RETENTION_ROOT)
++        or branch != "KEN-21"
++        or pr_url != KEN21_RETENTION_DELIVERY["pr_url"]
++        or cleanup_mode != "merged"
++        or not re.fullmatch(r"[0-9a-f-]{36}", cleanup_session_id)
++    ):
++        raise ValueError("flat KEN-21 recovery identity is missing or mismatched")
++
++    _, receipt, receipt_ref, receipt_sha256, application = _ken21_retention_validate_receipt(
++        payload, workspace, cleanup_session_id,
++    )
++    if receipt["original"].get("report_sha256") != KEN21_RETENTION_ORIGINALS["report_sha256"]:
++        raise ValueError("retention receipt does not bind the rejected report")
++    _ken21_retention_originals(workspace)
++    probe, _, _ = _ken21_retention_git(workspace, receipt, application)
++    primary_lines = probe("worktree", "list", "--porcelain").stdout.splitlines()
++    primary = next(
++        (Path(line.removeprefix("worktree ")).resolve()
++         for line in primary_lines if line.startswith("worktree ")),
++        None,
++    )
++    if (
++        primary is None
++        or workspace == primary
++        or not workspace.is_relative_to((Path.home() / ".kent/worktrees").resolve())
++        or not any(line == f"worktree {workspace}" for line in primary_lines)
++    ):
++        raise ValueError("KEN-21 is not the exact registered managed worktree")
++
++    wrapper = os.environ.get(
++        "KENT_WORKTREE_WRAPPER",
++        str(Path.home() / ".kent" / "bin" / "kent-worktree"),
++    )
++    worktree = capture_kent_worktree_record(
++        wrapper, primary, workspace, cleanup_session_id,
++    )
++    if (
++        worktree.get("worktree_id") != KEN21_RETENTION_WORKTREE_ID
++        or worktree.get("root") != str(workspace)
++        or cleanup_session_uses_workspace(
++            wrapper, primary, cleanup_session_id, workspace,
++        )
++    ):
++        raise ValueError("fresh Cleanup owner or managed worktree leave is not proven")
++
++    inventory_sha256 = _ken21_retention_inventory(workspace)
++    if inventory_sha256 != application["inventory_sha256"]:
++        raise ValueError("retained runtime/build inventory changed after Cleanup readback")
++    return (
++        f"{KEN21_RETENTION_SUMMARY}. Receipt {receipt_ref} "
++        f"(SHA-256 {receipt_sha256}); Cleanup owner {cleanup_session_id}."
++    )
++
++
+ def deletion_result_kind(payload: dict) -> str:
+@@ -2119,6 +2736,37 @@ def main() -> int:
+     previous_report = require_string(payload, "cleanup_report")
+     task_short_id = require_string(payload, "task_short_id")
+-
++
++    native = payload.get("_kent")
++    is_ken21_recovery = (
++        task_short_id == "KEN-21"
++        or workspace == Path(KEN21_RETENTION_ROOT)
++        or (isinstance(native, dict) and native.get("task_id") == KEN21_RETENTION_TASK_ID)
++        or previous_report.startswith(KEN21_RETENTION_PREFIX)
++    )
++    if is_ken21_recovery:
++        try:
++            report = _ken21_rejected_retention_report(
++                payload,
++                workspace,
++                branch,
++                pr_url,
++                cleanup_mode,
++                cleanup_session_id,
++                task_short_id,
++            )
++        except (
++            OSError, RuntimeError, ValueError, TypeError, KeyError,
++            subprocess.TimeoutExpired,
++        ) as error:
++            complete(
++                "task_janitor_blocked",
++                f"KEN-21 rejected-evidence retention failed closed; resources retained: {error}",
++                "Сохраните KEN-21 и устраните конкретное несоответствие квитанции или владельца; не повторяйте обычную очистку.",
++            )
++        else:
++            complete("task_janitor_done", report)
++        return 0
++
+     if not workspace.is_dir():
+         complete(
+             "task_janitor_blocked",
