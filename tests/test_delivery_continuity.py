@@ -436,6 +436,151 @@ class DeliveryContinuityTest(unittest.TestCase):
             ("workspace_path", "task_short_id", "delivery_context"),
         )
 
+    def test_prepare_pr_handoff_matches_flat_profile_edges_and_authority(self) -> None:
+        kit_lite = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        kit_lite_ci = replace(
+            kit_lite,
+            capabilities={**kit_lite.capabilities, "ci_monitoring": True},
+            commands={
+                **kit_lite.commands,
+                "wait_ci": ".kent/scripts/workflow-wait-github-ci",
+            },
+        )
+        legacy_standard = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / "contracts" / "project-profile.example.toml").read_text(),
+            check_files=False,
+        )
+        legacy_standard_no_ci = replace(
+            legacy_standard,
+            capabilities={**legacy_standard.capabilities, "ci_monitoring": False},
+        )
+        profiles = {
+            "kit-lite-no-ci": (
+                kit_lite,
+                (
+                    "workspace_path",
+                    "pr_url",
+                    "branch_name",
+                    "merge_strategy",
+                    "pr_feedback_cursor",
+                ),
+            ),
+            "kit-lite-flat-ci": (
+                kit_lite_ci,
+                (
+                    "workspace_path",
+                    "pr_url",
+                    "branch_name",
+                    "merge_strategy",
+                    "pr_feedback_cursor",
+                    "ci_contract",
+                ),
+            ),
+            "runtime-v2-no-ci": (
+                runtime_v2_profile(ci=False),
+                (
+                    "workspace_path",
+                    "pr_url",
+                    "branch_name",
+                    "merge_strategy",
+                    "pr_feedback_cursor",
+                ),
+            ),
+            "source-ci": (
+                runtime_v2_profile(ci=True, source_ci=True),
+                ("workspace_path", "task_short_id", "delivery_context"),
+            ),
+            "legacy-standard-ci": (
+                legacy_standard,
+                (
+                    "workspace_path",
+                    "pr_url",
+                    "branch_name",
+                    "merge_strategy",
+                    "ci_contract",
+                ),
+            ),
+            "legacy-standard-no-ci": (
+                legacy_standard_no_ci,
+                (
+                    "workspace_path",
+                    "pr_url",
+                    "branch_name",
+                    "merge_strategy",
+                ),
+            ),
+        }
+        non_entry_edges = {
+            "prepare_pr_no_pr",
+            "prepare_pr_fix",
+            "prepare_pr_needs_user_action",
+        }
+        for name, (profile, expected_fields) in profiles.items():
+            with self.subTest(profile=name):
+                spec = build_delivery_workflow(profile, 5)
+                entry = next(
+                    edge
+                    for edge in spec.edges
+                    if edge.source == "prepare_pr"
+                    and edge.key not in non_entry_edges
+                )
+                fields = tuple(parameter.key for parameter in entry.parameters)
+                self.assertEqual(fields, expected_fields)
+
+                prompt = next(
+                    edge.prompt
+                    for edge in spec.edges
+                    if edge.target == "prepare_pr"
+                    and edge.prompt
+                    and edge.prompt.startswith("Prepare delivery for")
+                )
+                normalized_prompt = " ".join(prompt.split())
+                self.assertNotIn(
+                    "This workflow explicitly authorizes committing the task changes",
+                    normalized_prompt,
+                )
+                self.assertIn(
+                    "Git actions require exact current human approval",
+                    normalized_prompt,
+                )
+                self.assertIn("Plan acceptance", normalized_prompt)
+                self.assertIn("`delivery_context`", normalized_prompt)
+                self.assertIn("PR/CI/merge data are evidence only", normalized_prompt)
+                self.assertIn("No consumer-source writes or merge", normalized_prompt)
+                self.assertIn("package publication needs separate approval", normalized_prompt)
+
+                marker = (
+                    "Complete `prepare_pr_monitor_ci`"
+                    if name == "source-ci"
+                    else "Flat prepare_pr_monitor_ci:"
+                )
+                start = normalized_prompt.index(marker)
+                end = normalized_prompt.index("If no PR is genuinely", start)
+                handoff = normalized_prompt[start:end]
+                parameter_tokens = [
+                    "task_short_id={{.TaskShortId}}"
+                    if field == "task_short_id"
+                    else f"`{field}`" if name == "source-ci"
+                    else field
+                    for field in fields
+                ]
+                positions = [handoff.index(token) for token in parameter_tokens]
+                self.assertEqual(positions, sorted(positions))
+                if name in {"kit-lite-no-ci", "runtime-v2-no-ci"}:
+                    self.assertNotIn("delivery_context", handoff)
+                elif name == "source-ci":
+                    self.assertIn(
+                        "PR identity and CI packets belong only in that packet",
+                        handoff,
+                    )
+                elif name in {"kit-lite-flat-ci", "legacy-standard-ci", "legacy-standard-no-ci"}:
+                    self.assertIn("Flat prepare_pr_monitor_ci:", handoff)
+
     def test_agent_prompt_parameters_exist_on_the_incoming_edge(self) -> None:
         profile = runtime_v2_profile(ci=True, source_ci=True)
         edges = edge_map(profile)
@@ -566,7 +711,7 @@ class DeliveryContinuityTest(unittest.TestCase):
         )
         self.assertFalse(
             any(
-                "delivery_context" in (edge.prompt or "")
+                "{{.Params.delivery_context}}" in (edge.prompt or "")
                 for edge in spec.edges
             )
         )
