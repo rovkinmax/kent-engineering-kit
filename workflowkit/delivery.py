@@ -2699,6 +2699,65 @@ Task worktree. Do not call relative project adapters from pinned primary
 after leave or re-read its branch as the Task branch."""
 
 
+def cleanup_without_preparation_instruction(
+    profile: ProjectProfile,
+    manifest: str,
+    evidence_type: str,
+) -> str:
+    evidence = profile.command("evidence")
+    runtime = profile.command("runtime_contracts")
+    evidence_command = evidence or "configured evidence command"
+    runtime_support = (
+        f"`{runtime}`" if runtime else "the configured runtime-contract support module"
+    )
+    return f"""Read `{manifest}` first and stay inside its required and
+conditionally triggered sources.
+
+This profile has no non-empty `prepare_cleanup` opt-in. Do not call or invent
+a preparation helper. Before recording Cleanup evidence, inspect the original
+Task runtime in the original workspace with
+`{evidence_command} validate --task {{{{.TaskShortId}}}} --workspace <workspace>`
+and, when a ledger exists, `read` it to identify its actual final record.
+
+If the ledger already ends in a terminal seal, recover the original successful request/report/marker
+from their actually retained Task or Session sources.
+Validate the ledger chain with the existing
+`validate_terminal_chain`, validate the original request with
+`validate_terminal_seal_request`, and validate the original report with
+`validate_cleanup_report` from {runtime_support}. Require matching task
+identity, an identical original report marker and ledger marker, and an exact
+match between the frozen request and the marker's operation-report digests,
+redaction proof and retention class. Check those digests against the retained
+operation reports and read back the final ordinary event's actual Kent Session/Run/Step records;
+non-empty identity strings alone are not proof. Use
+only this existing read-only validation path. Reuse a valid prior success
+without another append or seal; do not fabricate a marker or reconstruct
+missing original proof from the seal.
+
+Only for a genuinely new successful Cleanup with a validated unsealed ledger,
+with no earlier Cleanup final event or partial seal attempt, record its one
+ordinary event before transition using
+`{evidence_command} append --task {{{{.TaskShortId}}}} --workspace <workspace>`.
+Set `node_key=cleanup`, `evidence_type={evidence_type}`, and
+`context.manifest_path={manifest}`; use real unmodified current
+`KENT_SESSION_ID`, `KENT_RUN_ID` and `KENT_STEP_ID`. Include the exact files
+read, actual checks, repeated questions and verification loops, and null for
+unavailable model/compaction counters. Then use the existing evidence
+command's `seal` operation:
+`{evidence_command} seal --task {{{{.TaskShortId}}}} --workspace <workspace>`.
+Supply the truthful request derived from actual operation reports and
+redaction evidence, and use the exact returned terminal marker as the final
+line of the truthful cleanup report. Do not append or seal merely to report a
+blocker. Treat an existing Cleanup final event without a valid seal as partial
+history and block; do not append another event or retry the seal.
+
+Missing, malformed, conflicting, unreferenced or unverifiable history,
+request/report/marker bytes, native identities or provenance is a blocker:
+preserve the resources and original evidence, make no append/seal attempt,
+and name the concrete missing proof or external action. Never replace native
+identities, discard history or reseal."""
+
+
 def context_instruction(
     profile: ProjectProfile,
     manifest_key: str,
@@ -2713,6 +2772,15 @@ def context_instruction(
 conditionally triggered sources.
 
 {owner}"""
+        # Schema-3 profiles can explicitly supply runtime support without
+        # adopting runtime-v2. Legacy profiles with neither capability must
+        # retain ordinary Cleanup completion, not invent a seal protocol.
+        if profile.runtime_contracts_v2() or profile.command("runtime_contracts"):
+            return cleanup_without_preparation_instruction(
+                profile,
+                manifest,
+                evidence_type,
+            )
     return f"""Read `{manifest}` first and stay inside its required and
 conditionally triggered sources.
 

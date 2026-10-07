@@ -252,7 +252,44 @@ def records_at(path, task, ledger, janitor):
     return records
 
 
-def runtime_inventory(root, task, janitor):
+def validated_sealed_report(prepared, records, runtime, task, seal_request):
+    if (
+        not records
+        or records[-1].get("record_kind") != runtime.TERMINAL_SEAL_SCHEMA
+    ):
+        raise ValueError("terminal evidence seal is missing")
+    assert_final_record(records, prepared)
+    marker = runtime.validate_terminal_chain(records, task_short_id=task)
+    if marker["event_count"] != prepared["baseline"]["sequence"] + 2:
+        raise ValueError("terminal marker event count conflicts with preparation")
+    recorded_request = {
+        "schema": runtime.TERMINAL_SEAL_REQUEST_SCHEMA,
+        **{
+            key: marker[key]
+            for key in (
+                "operation_report_digests",
+                "redaction",
+                "retention_class",
+            )
+        },
+    }
+    if runtime.validate_terminal_seal_request(recorded_request) != seal_request:
+        raise ValueError("terminal seal differs from the frozen request")
+    report = (
+        prepared["request"]["cleanup_report_prefix"].rstrip()
+        + "\n"
+        + runtime.terminal_marker_line(marker)
+    )
+    runtime.validate_cleanup_report(report)
+    if (
+        prepared["state"] == "completed"
+        and prepared["cleanup_report"] != report
+    ):
+        raise ValueError("completed cleanup report differs from terminal evidence")
+    return marker, report
+
+
+def runtime_inventory(root, task, janitor, ledger, runtime):
     directory = safe_path(root, f".kent/runtime/{task}/evidence-ledger.jsonl").parent
     metadata = directory.lstat()
     if metadata.st_mode & 0o077:
@@ -262,14 +299,69 @@ def runtime_inventory(root, task, janitor):
         names = janitor._bounded_inventory(descriptor)
     finally:
         os.close(descriptor)
+    records = records_at(
+        directory / "evidence-ledger.jsonl",
+        task,
+        ledger,
+        janitor,
+    )
+    references = set()
+    for record in records:
+        artifacts = record.get("artifacts", [])
+        if not isinstance(artifacts, list) or any(
+            not isinstance(item, str) for item in artifacts
+        ):
+            raise ValueError("ledger artifacts must be strings")
+        for artifact in artifacts:
+            name = artifact.rsplit("/", 1)[-1]
+            if not name.startswith(janitor.CI_REPORT_PREFIX):
+                continue
+            if (
+                not janitor.CI_REPORT_NAME.fullmatch(name)
+                or artifact != f".kent/runtime/{task}/{name}"
+            ):
+                raise ValueError(
+                    "CI report reference is not a logical Task artifact"
+                )
+            references.add(name)
+            if len(references) > janitor.MAX_CI_ARTIFACTS:
+                raise ValueError("CI report reference count exceeds limit")
     allowed = {
         "plan-contract.json", "evidence-ledger.jsonl",
         "fix-checkpoint.json", "smoke-checkpoint.json",
-    }
+    } | references
     if set(names) - allowed:
         raise ValueError(f"unknown restricted runtime entries: {sorted(set(names) - allowed)}")
+    missing = references - set(names)
+    if missing:
+        raise ValueError(f"referenced CI archives are missing: {sorted(missing)}")
+    total_ci_bytes = 0
     for name in names:
-        read_file(directory / name, limit=8 * 1024 * 1024)
+        limit = (
+            runtime.MAX_CI_REPORT_BYTES
+            if name in references
+            else 8 * 1024 * 1024
+        )
+        raw, _ = read_file(directory / name, limit=limit)
+        if name not in references:
+            continue
+        total_ci_bytes += len(raw)
+        if total_ci_bytes > janitor.MAX_CI_ARTIFACT_BYTES:
+            raise ValueError("total CI report bytes exceed limit")
+        report = runtime.validate_ci_archive(
+            runtime.parse_canonical_json(
+                raw,
+                label="CI archive",
+                max_bytes=runtime.MAX_CI_REPORT_BYTES,
+            )
+        )
+        match = janitor.CI_REPORT_NAME.fullmatch(name)
+        if (
+            runtime.canonical_bytes(report) != raw
+            or hashlib.sha256(raw).hexdigest() != match.group(1)
+        ):
+            raise ValueError("CI archive bytes or filename digest do not match")
+    return records
 
 
 def invoke_ledger(root, task, action, payload, environment):
@@ -360,28 +452,40 @@ def prepare(request):
         if prepared is None or prepared["state"] != "completed":
             raise ValueError("missing runtime requires a completed preparation receipt")
         marker = runtime.validate_cleanup_report(prepared["cleanup_report"])
-        recorded_request = {
-            "schema": runtime.TERMINAL_SEAL_REQUEST_SCHEMA,
-            **{key: marker[key] for key in
-               ("operation_report_digests", "redaction", "retention_class")},
-        }
-        if (marker["task_short_id"] != task
-                or marker["event_count"] != prepared["baseline"]["sequence"] + 2
-                or runtime.validate_terminal_seal_request(recorded_request) != seal_request
-                or prepared["cleanup_report"] != prefix.rstrip() + "\n" + runtime.terminal_marker_line(marker)):
+        if (
+            marker["task_short_id"] != task
+            or marker["event_count"] != prepared["baseline"]["sequence"] + 2
+        ):
             raise ValueError("completed marker/report conflicts with the frozen request")
         expected = ".evidence-cleanup-" + runtime.canonical_sha256(marker)
         tombstone = safe_path(root, f".kent/runtime/{expected}/evidence-ledger.jsonl")
         if not tombstone.parent.is_dir():
             raise ValueError("completed preparation has no retained Janitor tombstone")
-        # Janitor freshly validates its retained ledger and sentinel itself.
-        return {"cleanup_report": prepared["cleanup_report"],
-                "receipt_path": str(receipt_path.relative_to(root))}
+        records = records_at(tombstone, task, ledger, janitor)
+        retained_marker, report = validated_sealed_report(
+            prepared,
+            records,
+            runtime,
+            task,
+            seal_request,
+        )
+        if retained_marker != marker or report != prepared["cleanup_report"]:
+            raise ValueError("retained tombstone differs from completed receipt")
+        admitted, reason = janitor._admit_managed_runtime_parent(
+            root,
+            task,
+            cleanup_report=report,
+        )
+        if not admitted:
+            raise ValueError(f"completed tombstone is not admitted: {reason}")
+        return {
+            "cleanup_report": report,
+            "receipt_path": str(receipt_path.relative_to(root)),
+        }
 
-    runtime_inventory(root, task, janitor)
     source = safe_path(root, f".kent/runtime/{task}/plan-contract.json")
     evidence_path = source.with_name("evidence-ledger.jsonl")
-    records = records_at(evidence_path, task, ledger, janitor)
+    records = runtime_inventory(root, task, janitor, ledger, runtime)
     if prepared is None:
         if records[-1].get("record_kind") == runtime.TERMINAL_SEAL_SCHEMA:
             raise ValueError("an existing seal requires its preparation receipt")
@@ -403,17 +507,36 @@ def prepare(request):
     else:
         source_identity = None
     if source_identity is not None:
-        runtime_inventory(root, task, janitor)
+        if records[-1].get("record_kind") == runtime.TERMINAL_SEAL_SCHEMA:
+            raise ValueError(
+                "plan-contract source remains after terminal evidence seal"
+            )
+        records = runtime_inventory(root, task, janitor, ledger, runtime)
         current_raw, current_identity = read_file(source)
         if current_identity != source_identity or current_raw != raw:
             raise ValueError("snapshot identity changed before retirement")
         source.unlink()
         fsync_directory(source.parent)
+    if records[-1].get("record_kind") == runtime.TERMINAL_SEAL_SCHEMA:
+        _, report = validated_sealed_report(
+            prepared,
+            records,
+            runtime,
+            task,
+            seal_request,
+        )
+        if prepared["state"] == "prepared":
+            prepared.update(state="completed", cleanup_report=report)
+            write_private(receipt_path, canonical(prepared), replace=True)
+        return {
+            "cleanup_report": report,
+            "receipt_path": str(receipt_path.relative_to(root)),
+        }
+    if prepared["state"] == "completed":
+        raise ValueError("completed preparation lost its terminal evidence seal")
     baseline = prepared["baseline"]
     if (len(records) == baseline["sequence"]
             and records[-1]["event_hash"] == baseline["event_hash"]):
-        if prepared["state"] == "completed":
-            raise ValueError("completed preparation lost its terminal evidence")
         for identity in ("KENT_RUN_ID", "KENT_SESSION_ID", "KENT_STEP_ID"):
             if not os.environ.get(identity) or os.environ[identity] == "unknown":
                 raise ValueError("real current Kent event identities are required")
@@ -422,15 +545,16 @@ def prepare(request):
     assert_final_record(records, prepared)
     sealed = invoke_ledger(root, task, "seal", seal_request, environment)
     records = records_at(evidence_path, task, ledger, janitor)
-    assert_final_record(records, prepared)
-    marker = runtime.validate_terminal_chain(records, task_short_id=task)
+    marker, report = validated_sealed_report(
+        prepared,
+        records,
+        runtime,
+        task,
+        seal_request,
+    )
     line = runtime.terminal_marker_line(marker)
     if sealed["terminal_marker"] != line:
         raise ValueError("seal output does not match actual terminal ledger")
-    report = prefix.rstrip() + "\n" + line
-    runtime.validate_cleanup_report(report)
-    if prepared["state"] == "completed" and prepared["cleanup_report"] != report:
-        raise ValueError("completed cleanup report differs")
     prepared.update(state="completed", cleanup_report=report)
     write_private(receipt_path, canonical(prepared), replace=True)
     return {"cleanup_report": report, "receipt_path": str(receipt_path.relative_to(root))}

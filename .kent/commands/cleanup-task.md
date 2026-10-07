@@ -61,9 +61,13 @@ this owner can safely complete.
 
 Cleanup also owns the redaction and operation-report proofs required by
 `seal_request`, using actual evidence and genuine current identities. These
-are agent preparation work, not documents the user must write. The existing
-helper remains the sole owner of the final ordinary append and seal; none
-of this recovery relaxes its admission, recovery or Janitor checks.
+are agent preparation work, not documents the user must write. When configured,
+the existing helper remains the sole owner of the final ordinary append and
+seal; none of this recovery relaxes its admission, recovery or Janitor checks.
+
+The following helper request and recovery protocol applies only when
+`commands.prepare_cleanup` is non-empty. If the opt-in is absent or empty, do
+not guess or install a helper; use the no-helper fallback below.
 
 Invoke the profile's `prepare_cleanup` command with one JSON object on stdin:
 
@@ -121,6 +125,57 @@ already-completed receipt containing invalid evidence.
 Completed receipt/marker reuse after Janitor tombstoning does not recreate
 runtime evidence: the unchanged Janitor must freshly validate its retained
 ledger. Preserve/report blockers; do not sweep unknown files to force success.
+
+## Cleanup without a preparation helper
+
+This fallback applies only when `commands.prepare_cleanup` is absent or empty.
+The ordinary final-event instruction in the Cleanup context remains applicable
+to a genuinely new successful Cleanup with a valid unsealed ledger. A
+non-empty helper remains the sole final-event/seal owner when explicitly
+configured.
+
+If `.kent/runtime/<task>/plan-contract.json` exists, retain its exact bytes and
+required authority references in an existing Task record or ignored
+`build/kent-workflow/<task>/` artifact outside the restricted runtime. Read the
+retained bytes back and verify their SHA-256 before retiring only that exact
+cache. Do not delete or relocate any other runtime entry; preserve unknown
+entries and report the owner-led classification/retention action they require.
+
+Before any append or seal, inspect the original task runtime with the existing
+evidence command's `validate --task <task> --workspace <workspace>` and, when
+present, `read` the ledger. Inspect only the records needed for this decision;
+do not copy a broad ledger dump into Task comments or retained artifacts.
+
+If the final ledger record is a terminal seal, recover the original successful
+seal request, cleanup report and marker from their actual retained Task or
+Session sources. Use the existing runtime-contract support module's
+`validate_terminal_chain`, `validate_terminal_seal_request` and
+`validate_cleanup_report` functions, together with ledger validation/readback.
+Require the same task identity; the original cleanup report must validate and
+end with exactly the same marker as the validated ledger chain. The original
+frozen request must validate and exactly match the marker's operation-report
+digests, redaction proof and retention class; verify those digests against the
+actual retained operation reports and redaction evidence. Read back the final
+ordinary event's actual Kent Session/Run/Step records and confirm its
+identities are unchanged. Local non-empty identity strings do not establish
+native provenance.
+
+Only after all original proof is present and consistent may Cleanup reuse the
+successful result. Do not append or invoke `seal` again, derive a replacement
+request or report from the marker, fabricate a marker, replace native
+identities, or reconstruct missing proof. If the ledger, request, report,
+marker, operation evidence, native records or provenance is missing, malformed
+or conflicting, preserve the evidence and resources and report the exact
+blocker without append/seal.
+
+For a genuinely new successful Cleanup with a valid unsealed ledger, append
+the one ordinary final event required by the active Cleanup context only when
+there is no earlier Cleanup final event or partial seal attempt. Then use the
+existing evidence command's `seal` operation with the truthful
+`terminal-evidence-seal-request-v1` built from actual operation reports and
+redaction evidence. Preserve the exact marker returned by `seal` as the final
+line of `cleanup_report`. Do not append or seal merely to report a blocker. An
+uncertain or partial terminal history is not a new unsealed completion.
 
 Emit the complete existing `cleanup_run_janitor` carrier for successful
 delivery, including `cleanup_session_id` and `cleanup_report`, preserving

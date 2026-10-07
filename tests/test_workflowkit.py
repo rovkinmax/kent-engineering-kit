@@ -654,6 +654,34 @@ class WorkflowKitTest(unittest.TestCase):
                     for edge in document["edges"]:
                         prompt = edge.get("prompt")
                         if prompt:
+                            cleanup_context = context_instruction(
+                                profile,
+                                "delivery",
+                                "cleanup",
+                                "delivery",
+                            )
+                            if cleanup_context in prompt:
+                                # Preserve the frozen graph baseline while
+                                # removing only this approved no-helper
+                                # recovery-instruction delta.
+                                prior_cleanup_context = f"""Read `.kent/context/delivery.md` first and stay inside its required and
+conditionally triggered sources.
+
+Before transition, pipe one non-empty JSON object to
+`{profile.command("evidence")} append --task {{{{.TaskShortId}}}} --workspace
+<workspace>`. Set `node_key` to `cleanup`, `evidence_type` to
+`delivery`, and `context.manifest_path` to `.kent/context/delivery.md`.
+`context.files_read` lists other project instruction files in actual read
+order; do not repeat the manifest there. Record repeated questions and
+verification loops, use null for unavailable model/compaction counters, and
+exclude secrets or broad raw evidence. Append is idempotent for the current
+Kent run; on recovery, reuse the returned sequence/hash and continue."""
+                                self.assertEqual(prompt.count(cleanup_context), 1)
+                                prompt = prompt.replace(
+                                    cleanup_context,
+                                    prior_cleanup_context,
+                                    1,
+                                )
                             if edge["target"] in {"fix", "compliance"} and (
                                 edge["key"] != "dispatch_invalid_workspace"
                             ):
@@ -821,6 +849,106 @@ class WorkflowKitTest(unittest.TestCase):
                         context_instruction(profile, "implement", "implement", "implementation"),
                         context_instruction(baseline_profile, "implement", "implement", "implementation"),
                     )
+
+    def test_cleanup_without_terminal_capability_preserves_legacy_completion(self) -> None:
+        legacy = self.cleanup_profile(managed=False, published=False)
+        self.assertEqual(legacy.schema_version, 3)
+        self.assertFalse(legacy.runtime_contracts_v2())
+        self.assertEqual(legacy.command("runtime_contracts"), "")
+        self.assertFalse((legacy.project_root / ".kent/scripts").exists())
+        for helper in (None, ""):
+            with self.subTest(prepare_cleanup=helper):
+                profile = legacy if helper is None else replace(
+                    legacy,
+                    commands={**legacy.commands, "prepare_cleanup": helper},
+                )
+                prompt = context_instruction(
+                    profile, "delivery", "cleanup", "delivery",
+                )
+                # No terminal support was installed or adopted. Preserve the
+                # ordinary successful Cleanup append/completion contract.
+                expected = context_instruction(
+                    profile, "delivery", "implement", "delivery",
+                ).replace("`implement`", "`cleanup`")
+                self.assertEqual(prompt, expected)
+                self.assertIn("append --task {{.TaskShortId}} --workspace", prompt)
+                for unsupported in (
+                    " seal --task", "terminal marker", "validate_terminal_chain",
+                    "validate_terminal_seal_request", "validate_cleanup_report",
+                    "configured runtime-contract support module",
+                ):
+                    self.assertNotIn(unsupported, prompt)
+
+    def test_cleanup_without_preparation_helper_guides_sealed_recovery(self) -> None:
+        missing = self.cleanup_profile(managed=False, published=False)
+        missing = replace(
+            missing,
+            commands={
+                **missing.commands,
+                "runtime_contracts": ".kent/scripts/workflow_runtime_contracts.py",
+            },
+        )
+        empty = replace(
+            missing,
+            commands={**missing.commands, "prepare_cleanup": ""},
+        )
+        self.assertEqual(
+            context_instruction(missing, "delivery", "cleanup", "delivery"),
+            context_instruction(empty, "delivery", "cleanup", "delivery"),
+        )
+        for name, profile in (("missing", missing), ("empty", empty)):
+            with self.subTest(opt_in=name):
+                prompt = context_instruction(
+                    profile,
+                    "delivery",
+                    "cleanup",
+                    "delivery",
+                )
+                for requirement in (
+                    "original successful request/report/marker",
+                    "without another append or seal",
+                    "existing read-only validation path",
+                    "validate_terminal_chain",
+                    "validate_terminal_seal_request",
+                    "validate_cleanup_report",
+                    "actual Kent Session/Run/Step records",
+                    "KENT_SESSION_ID",
+                    "exact returned terminal marker as the final",
+                    "Missing, malformed, conflicting, unreferenced or unverifiable history",
+                    "genuinely new successful Cleanup with a validated unsealed ledger",
+                    "no earlier Cleanup final event or partial seal attempt",
+                    "append --task {{.TaskShortId}} --workspace <workspace>",
+                    "seal --task {{.TaskShortId}} --workspace <workspace>",
+                ):
+                    with self.subTest(requirement=requirement):
+                        self.assertIn(requirement, prompt)
+                self.assertIn(
+                    "workflow-evidence-ledger",
+                    prompt,
+                )
+
+        enabled = replace(
+            missing,
+            commands={
+                **missing.commands,
+                "prepare_cleanup": ".kent/scripts/project-terminal-preparation",
+            },
+        )
+        enabled_prompt = context_instruction(
+            enabled,
+            "delivery",
+            "cleanup",
+            "delivery",
+        )
+        self.assertIn("project-terminal-preparation", enabled_prompt)
+        self.assertNotIn(
+            "This profile has no non-empty `prepare_cleanup` opt-in",
+            enabled_prompt,
+        )
+        self.assertNotIn(
+            "genuinely new successful Cleanup with a validated unsealed ledger",
+            enabled_prompt,
+        )
 
     def load_profile(
         self,

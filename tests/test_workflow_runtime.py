@@ -9793,9 +9793,13 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     result = self.ci_cleanup(fixture, managed=case == "managed")
                 self.assertEqual(
                     result[0],
-                    case in ("success", "unknown", "managed"),
+                    case in ("success", "managed"),
                     result,
                 )
+                if case == "unknown":
+                    self.assertIn("unknown", result[1])
+                    self.assertTrue(active.is_dir())
+                    self.assertTrue((active / "unknown").is_file())
                 self.assertEqual(opened, set())
 
     def test_ci_git_admission_rejects_actual_tracked_reports_under_foreign_routing(self):
@@ -10724,6 +10728,100 @@ class WorkflowJanitorTest(GitRepositoryTest):
             self.run_git(root, "ls-remote", "--heads", "origin", "refs/heads/TASK-1").stdout,
         )
 
+    def test_managed_legacy_runtime_unknown_blocks_before_native_delete(self) -> None:
+        root, worktree, scripts, _ = self.make_managed_worktree(with_v2=False)
+        runtime = worktree / ".kent" / "runtime" / "TASK-1"
+        runtime.mkdir(parents=True)
+        self._write_valid_runtime_file(
+            runtime / "evidence-ledger.jsonl",
+            b"legacy ledger\n",
+        )
+        unknown = runtime / "payload.bin"
+        self._write_valid_runtime_file(unknown, b"preserve\n")
+        (scripts / "workflow_runtime_contracts.py").unlink()
+        janitor = load_template_module(
+            scripts / "workflow-task-janitor",
+            "janitor_managed_legacy_unknown",
+        )
+        delete_calls = []
+        native_delete_called = root / "native-delete-called"
+
+        with mock.patch.object(
+            janitor,
+            "delete_managed_worktree",
+            side_effect=lambda *args, **kwargs: delete_calls.append(args),
+        ):
+            code, payload = self.run_managed_janitor_module(
+                janitor,
+                root,
+                worktree,
+                cleanup_report="Legacy cleanup fixture.",
+                native_delete_called=native_delete_called,
+            )
+
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["transition"], "task_janitor_blocked")
+        self.assertIn("payload.bin", payload["cleanup_report"])
+        self.assertEqual(delete_calls, [])
+        self.assertEqual(unknown.read_bytes(), b"preserve\n")
+        self.assertEqual(
+            {path.name for path in runtime.iterdir()},
+            {"evidence-ledger.jsonl", "payload.bin"},
+        )
+        self.assertTrue(worktree.is_dir())
+
+    def test_managed_legacy_runtime_admits_named_entries_before_native_delete(
+        self,
+    ) -> None:
+        root, worktree, scripts, _ = self.make_managed_worktree(with_v2=False)
+        runtime = worktree / ".kent" / "runtime" / "TASK-1"
+        runtime.mkdir(parents=True)
+        self._write_valid_runtime_file(
+            runtime / "evidence-ledger.jsonl",
+            b"legacy ledger\n",
+        )
+        self._write_valid_runtime_file(
+            runtime / "fix-checkpoint.json",
+            b"legacy checkpoint\n",
+        )
+        (scripts / "workflow_runtime_contracts.py").unlink()
+        janitor = load_template_module(
+            scripts / "workflow-task-janitor",
+            "janitor_managed_legacy_named",
+        )
+        delete_calls = []
+        native_delete_called = root / "native-delete-called"
+
+        def native_refusal(*args, **kwargs):
+            delete_calls.append(args)
+            return False, "injected native refusal", "native refused"
+
+        with mock.patch.object(
+            janitor,
+            "delete_managed_worktree",
+            side_effect=native_refusal,
+        ):
+            code, payload = self.run_managed_janitor_module(
+                janitor,
+                root,
+                worktree,
+                cleanup_report="Legacy cleanup fixture.",
+                native_delete_called=native_delete_called,
+            )
+
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["transition"], "task_janitor_blocked")
+        self.assertIn("injected native refusal", payload["cleanup_report"])
+        self.assertEqual(len(delete_calls), 1)
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in runtime.iterdir()},
+            {
+                "evidence-ledger.jsonl": b"legacy ledger\n",
+                "fix-checkpoint.json": b"legacy checkpoint\n",
+            },
+        )
+        self.assertTrue(worktree.is_dir())
+
     def test_managed_completed_wrapper_without_tombstone_reports_ambiguous_evidence(
         self,
     ) -> None:
@@ -11402,7 +11500,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertTrue((runtime_dir / "TASK-1").exists())
         self.assertTrue(sentinel.exists())
 
-    def test_v2_opaque_tombstone_entries_are_deleted(self) -> None:
+    def test_v2_tombstone_preserves_unknown_entries_and_blocks(self) -> None:
         root = self.create_repository()
         scripts, marker_line = self.make_v2_terminal_state(root)
         runtime_dir = root / ".kent" / "runtime"
@@ -11428,6 +11526,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 ".evidence-terminal-" + hashlib.sha256(b"TASK-1").hexdigest()
             ),
         )
+        before = {name: (tombstone / name).read_bytes() for name in opaque}
         result = subprocess.run(
             [str(scripts / "workflow-task-janitor")],
             input=self.janitor_input(root, cleanup_report=marker_line),
@@ -11437,10 +11536,17 @@ class WorkflowJanitorTest(GitRepositoryTest):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["transition"], "task_janitor_done")
-        self.assertFalse(tombstone.exists())
+        self.assertEqual(
+            json.loads(result.stdout)["transition"],
+            "task_janitor_blocked",
+        )
+        self.assertTrue(tombstone.is_dir())
+        self.assertEqual(
+            {name: (tombstone / name).read_bytes() for name in opaque},
+            before,
+        )
 
-    def test_v2_managed_retention_preserves_opaque_bytes(self) -> None:
+    def test_v2_managed_retention_blocks_unknown_entries_without_mutation(self) -> None:
         root = self.create_repository()
         scripts, marker_line = self.make_v2_terminal_state(root)
         active = root / ".kent" / "runtime" / "TASK-1"
@@ -11470,18 +11576,92 @@ class WorkflowJanitorTest(GitRepositoryTest):
             "TASK-1",
             cleanup_report=marker_line,
         )
-        self.assertTrue(result[0], result)
-        self.assertFalse(active.exists())
         self.assertEqual(
-            {name: (tombstone / name).read_bytes() for name in opaque},
+            result[0],
+            False,
+            result,
+        )
+        self.assertTrue(active.is_dir())
+        self.assertEqual(
+            {name: (active / name).read_bytes() for name in opaque},
             before,
         )
+        self.assertFalse(tombstone.exists())
 
-    def test_v2_opaque_payload_is_not_read_and_metadata_drift_blocks(self) -> None:
+    def test_v2_managed_admission_does_not_write_runtime_bytecode(self) -> None:
+        root = self.create_repository()
+        scripts, marker_line = self.make_v2_terminal_state(root)
+        self.run_git(
+            root,
+            "add",
+            ".kent/scripts/workflow-evidence-ledger",
+            ".kent/scripts/workflow-task-janitor",
+            ".kent/scripts/workflow_runtime_contracts.py",
+        )
+        self.run_git(root, "commit", "-q", "-m", "Track runtime commands")
+        cache = scripts / "__pycache__"
+        if cache.exists():
+            for bytecode in cache.glob("*.pyc"):
+                bytecode.unlink()
+            if not any(cache.iterdir()):
+                cache.rmdir()
+        before_status = self.run_git(
+            root,
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ).stdout
+        self.assertEqual(before_status, "")
+        environment = dict(os.environ)
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        command = (
+            "import json, sys; from pathlib import Path; "
+            "from importlib.machinery import SourceFileLoader; "
+            "from importlib.util import cache_from_source, module_from_spec, spec_from_loader; "
+            "assert not sys.dont_write_bytecode; "
+            "path = Path(sys.argv[1]); "
+            "loader = SourceFileLoader('janitor_bytecode_test', str(path)); "
+            "spec = spec_from_loader(loader.name, loader); "
+            "module = module_from_spec(spec); loader.exec_module(module); "
+            "cache = Path(cache_from_source(str(path))); cache.unlink(missing_ok=True); "
+            "cache.parent.rmdir() if cache.parent.is_dir() and not any(cache.parent.iterdir()) else None; "
+            "result = module._prepare_v2_managed_runtime_state("
+            "Path(sys.argv[2]), 'TASK-1', cleanup_report=sys.argv[3]); "
+            "print(json.dumps(result))"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                command,
+                str(scripts / "workflow-task-janitor"),
+                str(root),
+                marker_line,
+            ],
+            cwd=root,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)[0], result.stdout)
+        self.assertEqual(
+            self.run_git(
+                root,
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            ).stdout,
+            before_status,
+        )
+
+    def test_v2_checkpoint_payload_is_not_read_and_metadata_drift_blocks(self) -> None:
         root = self.create_repository()
         scripts, marker_line = self.make_v2_terminal_state(root)
         active = root / ".kent" / "runtime" / "TASK-1"
-        sparse = active / "large-binary.tmp"
+        sparse = active / "fix-checkpoint.json"
         descriptor = os.open(
             sparse,
             os.O_RDWR | os.O_CREAT | os.O_TRUNC,
@@ -11495,13 +11675,13 @@ class WorkflowJanitorTest(GitRepositoryTest):
             os.close(descriptor)
         janitor = load_template_module(
             scripts / "workflow-task-janitor",
-            "janitor_opaque_unread_test",
+            "janitor_checkpoint_unread_test",
         )
         real_read = janitor.os.read
 
         def reject_opaque_read(fd: int, size: int) -> bytes:
             if janitor.os.fstat(fd).st_ino == sparse_inode:
-                raise AssertionError("Janitor read opaque payload bytes")
+                raise AssertionError("Janitor read checkpoint payload bytes")
             return real_read(fd, size)
 
         with mock.patch.object(janitor.os, "read", side_effect=reject_opaque_read):
@@ -11516,18 +11696,18 @@ class WorkflowJanitorTest(GitRepositoryTest):
         root = self.create_repository()
         scripts, marker_line = self.make_v2_terminal_state(root)
         active = root / ".kent" / "runtime" / "TASK-1"
-        opaque = active / "metadata-only.tmp"
-        self._write_valid_runtime_file(opaque, b"opaque")
+        checkpoint = active / "smoke-checkpoint.json"
+        self._write_valid_runtime_file(checkpoint, b"{}")
         janitor = load_template_module(
             scripts / "workflow-task-janitor",
-            "janitor_opaque_metadata_drift_test",
+            "janitor_checkpoint_metadata_drift_test",
         )
 
         def mutate_metadata(phase: str) -> None:
             if phase == "after_evidence_admission":
-                metadata = opaque.stat()
+                metadata = checkpoint.stat()
                 os.utime(
-                    opaque,
+                    checkpoint,
                     ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
                 )
 
@@ -11539,22 +11719,21 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         self.assertFalse(outcome[0], outcome)
         self.assertTrue(active.exists())
-        self.assertTrue(opaque.exists())
+        self.assertTrue(checkpoint.exists())
 
-    def test_v2_opaque_partial_unlink_failure_retries(self) -> None:
+    def test_v2_checkpoint_partial_unlink_failure_retries(self) -> None:
         root = self.create_repository()
         scripts, marker_line = self.make_v2_terminal_state(root)
         active = root / ".kent" / "runtime" / "TASK-1"
-        opaque = {
-            "plan-contract.json": b'{"opaque":true}\n',
-            "payload.bin": b"\x00\xffopaque\n",
-            ".tmp-producer-7": b"temporary",
+        checkpoints = {
+            "fix-checkpoint.json": b'{"fix":true}\n',
+            "smoke-checkpoint.json": b'{"smoke":true}\n',
         }
-        for name, content in opaque.items():
+        for name, content in checkpoints.items():
             self._write_valid_runtime_file(active / name, content)
         runtime = load_template_module(
             REPO_ROOT / "workflowkit" / "runtime.py",
-            "runtime_opaque_retry_test",
+            "runtime_checkpoint_retry_test",
         )
         marker = json.loads(marker_line.removeprefix("TERMINAL_EVIDENCE_V1 "))
         runtime_dir = root / ".kent" / "runtime"
@@ -11563,25 +11742,27 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         janitor = load_template_module(
             scripts / "workflow-task-janitor",
-            "janitor_opaque_retry_test",
+            "janitor_checkpoint_retry_test",
         )
         fired = False
 
-        def fail_after_opaque(phase: str) -> None:
+        def fail_after_fix_checkpoint(phase: str) -> None:
             nonlocal fired
-            if phase == "after_opaque_unlink_fsync" and not fired:
+            if phase == "after_fix_checkpoint_unlink_fsync" and not fired:
                 fired = True
-                raise OSError("opaque unlink failure")
+                raise OSError("checkpoint unlink failure")
 
         first = janitor._remove_v2_runtime_state(
             root.resolve(),
             "TASK-1",
             cleanup_report=marker_line,
-            _phase_hook=fail_after_opaque,
+            _phase_hook=fail_after_fix_checkpoint,
         )
         self.assertFalse(first[0], first)
         self.assertTrue(fired)
         self.assertTrue(tombstone.exists())
+        self.assertFalse((tombstone / "fix-checkpoint.json").exists())
+        self.assertTrue((tombstone / "smoke-checkpoint.json").exists())
         self.assertTrue((tombstone / "evidence-ledger.jsonl").exists())
         retry = janitor._remove_v2_runtime_state(
             root.resolve(),
@@ -11591,7 +11772,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertTrue(retry[0], retry)
         self.assertFalse(tombstone.exists())
 
-    def test_legacy_cleanup_accepts_opaque_files_and_removes_ledger_last(
+    def test_legacy_cleanup_blocks_unknown_files_without_retirement(
         self,
     ) -> None:
         root = self.create_repository()
@@ -11613,18 +11794,57 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         legacy_script.chmod(0o755)
         janitor = load_template_module(legacy_script, "legacy_opaque_test")
+        before = {
+            path.name: path.read_bytes()
+            for path in runtime.iterdir()
+        }
+        outcome = janitor.remove_runtime_state(
+            root.resolve(),
+            "TASK-1",
+        )
+        self.assertFalse(outcome[0], outcome)
+        self.assertTrue(runtime.is_dir())
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in runtime.iterdir()
+            },
+            before,
+        )
+
+    def test_legacy_cleanup_removes_named_entries_with_ledger_last(self) -> None:
+        root = self.create_repository()
+        runtime = root / ".kent" / "runtime" / "TASK-1"
+        runtime.mkdir(parents=True)
+        self._write_valid_runtime_file(
+            runtime / "evidence-ledger.jsonl",
+            b"legacy ledger\n",
+        )
+        self._write_valid_runtime_file(
+            runtime / "fix-checkpoint.json",
+            b"legacy checkpoint\n",
+        )
+        legacy_dir = root / "legacy-scripts"
+        legacy_dir.mkdir()
+        legacy_script = legacy_dir / "workflow-task-janitor"
+        shutil.copyfile(JANITOR, legacy_script)
+        legacy_script.chmod(0o755)
+        janitor = load_template_module(
+            legacy_script,
+            "legacy_named_cleanup_test",
+        )
         phases: list[str] = []
+
         outcome = janitor.remove_runtime_state(
             root.resolve(),
             "TASK-1",
             _phase_hook=phases.append,
         )
+
         self.assertTrue(outcome[0], outcome)
         self.assertFalse(runtime.exists())
-        self.assertIn("after_opaque_unlink_fsync", phases)
         self.assertLess(
-            max(i for i, phase in enumerate(phases)
-                if phase == "after_opaque_unlink_fsync"),
+            phases.index("after_fix_checkpoint_unlink_fsync"),
             phases.index("after_ledger_unlink_fsync"),
         )
 

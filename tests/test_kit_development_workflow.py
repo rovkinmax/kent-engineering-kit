@@ -1370,11 +1370,31 @@ class VerifierEnvironmentFixtureTest(unittest.TestCase):
 
 
 class CleanupPreparationTest(unittest.TestCase):
-    def fixture(self, *, plan: bool = False) -> Path:
+    def fixture(
+        self,
+        *,
+        plan: bool = False,
+        prepare_cleanup: bool = True,
+    ) -> Path:
         fixture_owner = KitDevelopmentWorkflowTest()
         self.addCleanup(fixture_owner.doCleanups)
         root = fixture_owner.fixture()
         kit.bootstrap(root)
+        if not prepare_cleanup:
+            profile_path = root / ".kent/workflow-profile.toml"
+            profile_contents = profile_path.read_text()
+            profile_contents = re.sub(
+                r"(?m)^prepare_cleanup\s*=\s*[^\n]*\n",
+                "",
+                profile_contents,
+            )
+            profile_path.write_text(profile_contents)
+            import tomllib
+
+            self.assertNotIn(
+                "prepare_cleanup",
+                tomllib.loads(profile_contents).get("commands", {}),
+            )
         (root / ".gitignore").write_text("/.kent/runtime/\n/build/kent-workflow/\n")
         subprocess.run(["git", "init", "-q", str(root)], check=True)
         # Only a disposable fixture repository receives this initial commit.
@@ -1466,6 +1486,68 @@ class CleanupPreparationTest(unittest.TestCase):
             environment={**self.environment, "KENT_RUN_ID": run_id},
         )
 
+    def add_ci_archive(
+        self,
+        root: Path,
+        *,
+        referenced: bool,
+        wrong_digest: bool = False,
+        invalid_schema: bool = False,
+    ) -> tuple[Path, bytes, str]:
+        import hashlib
+
+        from tests.test_runtime_contracts import ci_report
+        from workflowkit import runtime
+
+        report = {"schema": "unsupported-ci-report"} if invalid_schema else ci_report()
+        if not invalid_schema:
+            report["attempts"][0]["head_oid"] = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        raw = runtime.canonical_bytes(report)
+        content_digest = hashlib.sha256(raw).hexdigest()
+        filename_digest = "0" * 64 if wrong_digest else content_digest
+        name = f"ci-report-{filename_digest}.json"
+        archive = root / ".kent/runtime/TASK-1" / name
+        archive.write_bytes(raw)
+        archive.chmod(0o600)
+        if referenced:
+            artifact = f".kent/runtime/TASK-1/{name}"
+            event = {
+                "node_key": "ci_prepare",
+                "evidence_type": "ci_report",
+                "summary": "Retained validated CI archive fixture",
+                "artifacts": [artifact],
+                "checks": ["Synthetic canonical CI archive"],
+                "decisions": [],
+                "context": {
+                    "manifest_path": ".kent/context/delivery.md",
+                    "files_read": [],
+                    "model_calls": 0,
+                    "compaction_count": 0,
+                },
+            }
+            append = self.command(
+                root,
+                "workflow-evidence-ledger",
+                event,
+                "append",
+                "--task",
+                "TASK-1",
+                "--workspace",
+                str(root),
+                environment={
+                    **self.environment,
+                    "KENT_RUN_ID": "fixture-ci-archive",
+                    "KENT_STEP_ID": "fixture-ci-archive-step",
+                },
+            )
+            self.assertEqual(append.returncode, 0, append.stderr)
+        return archive, raw, name
+
     def test_actual_preparation_to_janitor_admission_and_tombstone_replay(self) -> None:
         for regular_plan in (False, True):
             with self.subTest(regular_plan=regular_plan):
@@ -1490,18 +1572,177 @@ class CleanupPreparationTest(unittest.TestCase):
                     json.loads(archive.read_text())["normalized_sha256"],
                 )
                 original = (state / "evidence-ledger.jsonl").read_bytes()
-                repeated = self.prepare(root, request, run_id="fixture-retry")
-                self.assertEqual(repeated.returncode, 0, repeated.stderr)
-                self.assertEqual(json.loads(repeated.stdout)["cleanup_report"], report)
+                actions = []
+                invoke = helper.invoke_ledger
+
+                def record_ledger_action(root, task, action, payload, environment):
+                    actions.append(action)
+                    return invoke(root, task, action, payload, environment)
+
+                with mock.patch.object(
+                    helper,
+                    "invoke_ledger",
+                    side_effect=record_ledger_action,
+                ):
+                    with mock.patch.dict(
+                        os.environ,
+                        {
+                            **self.environment,
+                            "KENT_RUN_ID": "fixture-retry",
+                        },
+                    ):
+                        repeated = helper.prepare(request)
+                self.assertEqual(repeated["cleanup_report"], report)
                 self.assertEqual((state / "evidence-ledger.jsonl").read_bytes(), original)
+                self.assertEqual(actions, [])
                 admitted = self.admission(root, report)
                 self.assertTrue(admitted[0], admitted)
                 self.assertFalse(state.exists())
-                after_tombstone = self.prepare(root, request, run_id="fixture-after-janitor")
-                self.assertEqual(after_tombstone.returncode, 0, after_tombstone.stderr)
-                self.assertEqual(json.loads(after_tombstone.stdout)["cleanup_report"], report)
+                tombstones = list(
+                    (root / ".kent/runtime").glob(".evidence-cleanup-*")
+                )
+                self.assertEqual(len(tombstones), 1)
+                retained_ledger = tombstones[0] / "evidence-ledger.jsonl"
+                retained_bytes = retained_ledger.read_bytes()
+                retained_records = [
+                    json.loads(line)
+                    for line in retained_bytes.decode().splitlines()
+                ]
+                original_ids = tuple(
+                    retained_records[-2][key]
+                    for key in ("run_id", "session_id", "step_id")
+                )
+                actions = []
+                with mock.patch.object(
+                    helper,
+                    "invoke_ledger",
+                    side_effect=lambda root, task, action, payload, environment: (
+                        actions.append(action),
+                        invoke(root, task, action, payload, environment),
+                    )[1],
+                ):
+                    with mock.patch.dict(
+                        os.environ,
+                        {
+                            **self.environment,
+                            "KENT_RUN_ID": "fixture-after-janitor",
+                        },
+                    ):
+                        after_tombstone = helper.prepare(request)
+                self.assertEqual(after_tombstone["cleanup_report"], report)
+                self.assertEqual(actions, [])
+                self.assertEqual(retained_ledger.read_bytes(), retained_bytes)
+                replayed_records = [
+                    json.loads(line)
+                    for line in retained_ledger.read_text().splitlines()
+                ]
+                self.assertEqual(
+                    tuple(
+                        replayed_records[-2][key]
+                        for key in ("run_id", "session_id", "step_id")
+                    ),
+                    original_ids,
+                )
                 self.assertTrue(self.admission(root, report)[0])
                 self.assertTrue(root.exists())  # Admission only; never native Delete.
+
+    def test_referenced_ci_archive_flows_through_preparation_and_janitor(self) -> None:
+        root = self.fixture()
+        archive, expected, _ = self.add_ci_archive(root, referenced=True)
+        request = self.request(root)
+        source = root / ".kent/runtime/TASK-1/plan-contract.json"
+        result = self.prepare(root, request)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)["cleanup_report"]
+        self.assertFalse(source.exists())
+        self.assertEqual(archive.read_bytes(), expected)
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+        admitted = self.admission(root, report)
+        self.assertTrue(admitted[0], admitted)
+        tombstones = list(
+            (root / ".kent/runtime").glob(".evidence-cleanup-*")
+        )
+        self.assertEqual(len(tombstones), 1)
+        self.assertEqual(
+            (tombstones[0] / archive.name).read_bytes(),
+            expected,
+        )
+
+    def test_ci_archive_requires_ledger_reference_digest_and_schema(self) -> None:
+        for defect in ("unreferenced", "wrong_digest", "invalid_schema"):
+            with self.subTest(defect=defect):
+                root = self.fixture()
+                archive, archive_before, _ = self.add_ci_archive(
+                    root,
+                    referenced=defect != "unreferenced",
+                    wrong_digest=defect == "wrong_digest",
+                    invalid_schema=defect == "invalid_schema",
+                )
+                request = self.request(root)
+                source = root / ".kent/runtime/TASK-1/plan-contract.json"
+                source_before = source.read_bytes()
+                ledger = source.with_name("evidence-ledger.jsonl")
+                ledger_before = ledger.read_bytes()
+
+                result = self.prepare(root, request)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(source.is_file())
+                self.assertEqual(source.read_bytes(), source_before)
+                self.assertEqual(ledger.read_bytes(), ledger_before)
+                self.assertTrue(archive.is_file())
+                self.assertEqual(archive.read_bytes(), archive_before)
+
+    def test_completed_tombstone_replay_blocks_corrupt_chain_without_ledger_effects(
+        self,
+    ) -> None:
+        from workflowkit import runtime
+
+        root = self.fixture()
+        request = self.request(root)
+        prepared = self.prepare(root, request)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        report = json.loads(prepared.stdout)["cleanup_report"]
+        self.assertTrue(self.admission(root, report)[0])
+        tombstones = list(
+            (root / ".kent/runtime").glob(".evidence-cleanup-*")
+        )
+        self.assertEqual(len(tombstones), 1)
+        ledger = tombstones[0] / "evidence-ledger.jsonl"
+        records = [
+            json.loads(line)
+            for line in ledger.read_text().splitlines()
+        ]
+        records[-2]["summary"] += " changed"
+        ledger.write_bytes(
+            b"".join(runtime.canonical_bytes(record) + b"\n" for record in records)
+        )
+        corrupted = ledger.read_bytes()
+        helper = self.helper(root)
+        actions = []
+        invoke = helper.invoke_ledger
+
+        def record_action(root, task, action, payload, environment):
+            actions.append(action)
+            return invoke(root, task, action, payload, environment)
+
+        with mock.patch.object(
+            helper,
+            "invoke_ledger",
+            side_effect=record_action,
+        ):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    **self.environment,
+                    "KENT_RUN_ID": "fixture-corrupt-tombstone-retry",
+                },
+            ):
+                with self.assertRaisesRegex(ValueError, "invalid hash"):
+                    helper.prepare(request)
+
+        self.assertEqual(actions, [])
+        self.assertEqual(ledger.read_bytes(), corrupted)
 
     def test_unknown_runtime_entry_blocks_without_retirement(self) -> None:
         root = self.fixture()
@@ -1596,8 +1837,25 @@ class CleanupPreparationTest(unittest.TestCase):
         ledger = root / ".kent/runtime/TASK-1/evidence-ledger.jsonl"
         before = ledger.read_text().splitlines()
         self.assertEqual(len(before), 2)
-        retry = self.prepare(root, request, run_id="fixture-new-run")
-        self.assertEqual(retry.returncode, 0, retry.stderr)
+        actions = []
+        invoke = helper.invoke_ledger
+
+        def record_ledger_action(root, task, action, payload, environment):
+            actions.append(action)
+            return invoke(root, task, action, payload, environment)
+
+        with mock.patch.dict(
+            os.environ,
+            {**self.environment, "KENT_RUN_ID": "fixture-new-run"},
+        ):
+            with mock.patch.object(
+                helper,
+                "invoke_ledger",
+                side_effect=record_ledger_action,
+            ):
+                retry = helper.prepare(request)
+        self.assertTrue(retry["cleanup_report"])
+        self.assertEqual(actions, ["seal"])
         after = ledger.read_text().splitlines()
         self.assertEqual(after[:2], before)
         self.assertEqual(len(after), 3)
@@ -1611,10 +1869,11 @@ class CleanupPreparationTest(unittest.TestCase):
                 write = helper.write_private
 
                 def fail_after_write(path, raw, *, replace=False):
+                    if boundary == "seal" and replace:
+                        raise ValueError("injected retained-write boundary")
                     write(path, raw, replace=replace)
                     if ((boundary == "archive" and path.name.startswith("plan-contract-"))
-                            or (boundary == "receipt" and path.name == "cleanup-preparation.json")
-                            or (boundary == "seal" and replace)):
+                            or (boundary == "receipt" and path.name == "cleanup-preparation.json")):
                         raise ValueError("injected retained-write boundary")
 
                 with mock.patch.dict(os.environ, {**self.environment, "KENT_RUN_ID": "cleanup-start"}):
@@ -1625,10 +1884,63 @@ class CleanupPreparationTest(unittest.TestCase):
                 self.assertEqual(source.exists(), boundary != "seal")
                 archive = root / f"build/kent-workflow/TASK-1/plan-contract-{request['snapshot_sha256']}.json"
                 original = archive.read_bytes()
-                retried = self.prepare(root, request, run_id="cleanup-recovery")
-                self.assertEqual(retried.returncode, 0, retried.stderr)
+                if boundary == "seal":
+                    ledger = root / ".kent/runtime/TASK-1/evidence-ledger.jsonl"
+                    ledger_before = ledger.read_bytes()
+                    records_before = [
+                        json.loads(line)
+                        for line in ledger_before.decode().splitlines()
+                    ]
+                    original_ids = tuple(
+                        records_before[-2][key]
+                        for key in ("run_id", "session_id", "step_id")
+                    )
+                    actions = []
+                    invoke = helper.invoke_ledger
+
+                    def record_ledger_action(
+                        root, task, action, payload, environment,
+                    ):
+                        actions.append(action)
+                        return invoke(root, task, action, payload, environment)
+
+                    with mock.patch.object(
+                        helper,
+                        "invoke_ledger",
+                        side_effect=record_ledger_action,
+                    ):
+                        with mock.patch.dict(
+                            os.environ,
+                            {
+                                **self.environment,
+                                "KENT_RUN_ID": "cleanup-recovery",
+                            },
+                        ):
+                            retried = helper.prepare(request)
+                    self.assertEqual(actions, [])
+                    retried_report = retried["cleanup_report"]
+                    self.assertEqual(ledger.read_bytes(), ledger_before)
+                    records_after = [
+                        json.loads(line)
+                        for line in ledger.read_text().splitlines()
+                    ]
+                    self.assertEqual(
+                        tuple(
+                            records_after[-2][key]
+                            for key in ("run_id", "session_id", "step_id")
+                        ),
+                        original_ids,
+                    )
+                else:
+                    retried = self.prepare(
+                        root, request, run_id="cleanup-recovery",
+                    )
+                    self.assertEqual(retried.returncode, 0, retried.stderr)
+                    retried_report = json.loads(
+                        retried.stdout,
+                    )["cleanup_report"]
                 self.assertEqual(archive.read_bytes(), original)
-                self.assertTrue(self.admission(root, json.loads(retried.stdout)["cleanup_report"])[0])
+                self.assertTrue(self.admission(root, retried_report)[0])
 
     def test_plan_path_and_archive_parent_symlinks_block(self) -> None:
         for defect in ("plan", "archive_parent"):
@@ -1705,7 +2017,7 @@ class CleanupPreparationTest(unittest.TestCase):
         self.assertIn("not a sealed", result[1])
         self.assertTrue((root / ".kent/runtime/TASK-1/plan-contract.json").exists())
 
-    def test_real_sealed_plan_snapshot_is_admitted_by_janitor(self) -> None:
+    def test_real_sealed_plan_snapshot_is_blocked_by_janitor(self) -> None:
         root = self.fixture()
         source = root / ".kent/runtime/TASK-1/plan-contract.json"
         expected = source.read_bytes()
@@ -1716,14 +2028,307 @@ class CleanupPreparationTest(unittest.TestCase):
         self.assertEqual(sealed.returncode, 0, sealed.stderr)
         report = "Fixture retained authority\n" + json.loads(sealed.stdout)["terminal_marker"]
         result = self.admission(root, report)
-        self.assertTrue(result[0], result)
-        self.assertIn("sealed evidence retained", result[1])
-        self.assertFalse((root / ".kent/runtime/TASK-1").exists())
+        self.assertFalse(result[0], result)
+        self.assertIn("plan-contract.json", result[1])
+        self.assertTrue((root / ".kent/runtime/TASK-1").exists())
+        self.assertEqual(source.read_bytes(), expected)
         tombstones = list((root / ".kent/runtime").glob(".evidence-cleanup-*"))
-        self.assertEqual(len(tombstones), 1)
+        self.assertEqual(tombstones, [])
+
+    def test_absent_preparation_opt_in_recovers_original_seal_read_only(self) -> None:
+        import hashlib
+
+        root = self.fixture(plan=True, prepare_cleanup=False)
+        task = "TASK-1"
+        source = root / f".kent/runtime/{task}/plan-contract.json"
+        source_bytes = source.read_bytes()
+        source_digest = hashlib.sha256(source_bytes).hexdigest()
+        retained_directory = root / f"build/kent-workflow/{task}"
+        retained_directory.mkdir(parents=True)
+        retained_cache = retained_directory / "plan-contract-no-helper.json"
+        retained_cache.write_bytes(source_bytes)
+        retained_cache.chmod(0o600)
+        self.assertEqual(retained_cache.read_bytes(), source_bytes)
         self.assertEqual(
-            (tombstones[0] / "plan-contract.json").read_bytes(),
-            expected,
+            hashlib.sha256(retained_cache.read_bytes()).hexdigest(),
+            source_digest,
+        )
+        source.unlink()
+
+        cleanup_environment = {
+            **self.environment,
+            "KENT_RUN_ID": "fixture-no-helper-cleanup",
+            "KENT_STEP_ID": "fixture-no-helper-step",
+        }
+        final_event = {
+            "node_key": "cleanup",
+            "evidence_type": "delivery",
+            "summary": "Completed synthetic no-helper Cleanup",
+            "artifacts": [],
+            "checks": ["Original retention and readback passed"],
+            "decisions": ["No preparation helper is configured"],
+            "context": {
+                "manifest_path": ".kent/context/delivery.md",
+                "files_read": [".kent/commands/cleanup-task.md"],
+                "model_calls": None,
+                "compaction_count": None,
+                "repeated_questions": 0,
+                "verification_loops": 0,
+            },
+        }
+        appended = self.command(
+            root,
+            "workflow-evidence-ledger",
+            final_event,
+            "append",
+            "--task",
+            task,
+            "--workspace",
+            str(root),
+            environment=cleanup_environment,
+        )
+        self.assertEqual(appended.returncode, 0, appended.stderr)
+
+        runtime = command_module(
+            root / ".kent/scripts/workflow_runtime_contracts.py",
+            "kit_fixture_no_helper_runtime",
+        )
+        redaction_evidence = "synthetic redaction proof passed"
+        seal_request = {
+            "schema": runtime.TERMINAL_SEAL_REQUEST_SCHEMA,
+            "operation_report_digests": [],
+            "redaction": {
+                "status": "passed",
+                "report_sha256": hashlib.sha256(
+                    redaction_evidence.encode("utf-8")
+                ).hexdigest(),
+            },
+            "retention_class": "cleanup_report_only",
+        }
+        sealed = self.command(
+            root,
+            "workflow-evidence-ledger",
+            seal_request,
+            "seal",
+            "--task",
+            task,
+            "--workspace",
+            str(root),
+            environment=cleanup_environment,
+        )
+        self.assertEqual(sealed.returncode, 0, sealed.stderr)
+        marker_line = json.loads(sealed.stdout)["terminal_marker"]
+        cleanup_report = (
+            "Synthetic no-helper Cleanup completed from retained proof.\n"
+            + marker_line
+        )
+        marker = runtime.validate_cleanup_report(cleanup_report)
+        ledger = root / f".kent/runtime/{task}/evidence-ledger.jsonl"
+        original_ledger = ledger.read_bytes()
+        records = [
+            json.loads(line)
+            for line in original_ledger.decode("utf-8").splitlines()
+        ]
+        final_record = records[-2]
+        original_ids = {
+            key: final_record[key]
+            for key in ("session_id", "run_id", "step_id")
+        }
+        retained_source = {
+            "task_short_id": task,
+            "plan_contract_sha256": source_digest,
+            "seal_request": seal_request,
+            "cleanup_report": cleanup_report,
+            "marker": marker,
+            "marker_line": marker_line,
+            "operation_reports": [],
+            "redaction_evidence": redaction_evidence,
+            # Synthetic identity provenance is a fixture input, not Kent
+            # authentication.
+            "native_provenance": original_ids,
+        }
+        retained_source_path = retained_directory / "no-helper-cleanup-proof.json"
+        retained_source_bytes = runtime.canonical_bytes(retained_source)
+        retained_source_path.write_bytes(retained_source_bytes)
+        retained_source_path.chmod(0o600)
+        proof = json.loads(retained_source_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            hashlib.sha256(retained_source_path.read_bytes()).hexdigest(),
+            hashlib.sha256(retained_source_bytes).hexdigest(),
+        )
+
+        def recover(original_proof):
+            required = {
+                "task_short_id",
+                "plan_contract_sha256",
+                "seal_request",
+                "cleanup_report",
+                "marker",
+                "marker_line",
+                "operation_reports",
+                "redaction_evidence",
+                "native_provenance",
+            }
+            missing = required - set(original_proof)
+            if missing:
+                raise ValueError("missing original retained Cleanup proof")
+            if original_proof["task_short_id"] != task:
+                raise ValueError("retained Cleanup proof task identity conflicts")
+            if (
+                not retained_cache.is_file()
+                or hashlib.sha256(retained_cache.read_bytes()).hexdigest()
+                != original_proof["plan_contract_sha256"]
+            ):
+                raise ValueError("retained Plan Contract bytes are missing or conflicting")
+
+            validation = self.command(
+                root,
+                "workflow-evidence-ledger",
+                {},
+                "validate",
+                "--task",
+                task,
+                "--workspace",
+                str(root),
+            )
+            if validation.returncode != 0:
+                raise ValueError("original evidence ledger does not validate")
+            readback = self.command(
+                root,
+                "workflow-evidence-ledger",
+                {},
+                "read",
+                "--task",
+                task,
+                "--workspace",
+                str(root),
+            )
+            if readback.returncode != 0:
+                raise ValueError("original evidence ledger cannot be read")
+            current_records = json.loads(readback.stdout)
+            chain_marker = runtime.validate_terminal_chain(
+                current_records,
+                task_short_id=task,
+            )
+            request = runtime.validate_terminal_seal_request(
+                original_proof["seal_request"]
+            )
+            report_marker = runtime.validate_cleanup_report(
+                original_proof["cleanup_report"]
+            )
+            retained_marker = runtime.validate_terminal_marker(
+                original_proof["marker"]
+            )
+            actual_report_digests = sorted(
+                (
+                    {
+                        "kind": operation["kind"],
+                        "sha256": hashlib.sha256(
+                            operation["report"].encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    for operation in original_proof["operation_reports"]
+                ),
+                key=lambda item: item["kind"],
+            )
+            if actual_report_digests != request["operation_report_digests"]:
+                raise ValueError("retained operation report digests conflict")
+            if hashlib.sha256(
+                original_proof["redaction_evidence"].encode("utf-8")
+            ).hexdigest() != request["redaction"]["report_sha256"]:
+                raise ValueError("retained redaction proof digest conflicts")
+            request_from_marker = runtime.validate_terminal_seal_request({
+                "schema": runtime.TERMINAL_SEAL_REQUEST_SCHEMA,
+                "operation_report_digests": chain_marker["operation_report_digests"],
+                "redaction": chain_marker["redaction"],
+                "retention_class": chain_marker["retention_class"],
+            })
+            if request != request_from_marker:
+                raise ValueError("original frozen request conflicts with seal marker")
+            if report_marker != chain_marker or retained_marker != chain_marker:
+                raise ValueError("original report or marker conflicts with ledger")
+            canonical_marker = runtime.terminal_marker_line(chain_marker)
+            if (
+                original_proof["marker_line"] != canonical_marker
+                or original_proof["cleanup_report"].splitlines()[-1]
+                != canonical_marker
+            ):
+                raise ValueError("original report marker bytes conflict")
+            final = current_records[-2]
+            current_ids = {
+                key: final.get(key)
+                for key in ("session_id", "run_id", "step_id")
+            }
+            if final.get("node_key") != "cleanup":
+                raise ValueError("original final ordinary event is not Cleanup")
+            if current_ids != original_proof["native_provenance"]:
+                raise ValueError("original final-event native provenance conflicts")
+            return original_proof["cleanup_report"]
+
+        actions = []
+        helper_calls = []
+        invoke_command = self.command
+
+        def record_command(root, name, payload, *args, **kwargs):
+            if name == "workflow-prepare-cleanup":
+                helper_calls.append(name)
+            if (
+                name == "workflow-evidence-ledger"
+                and args
+                and args[0] in {"append", "seal"}
+            ):
+                actions.append(args[0])
+            return invoke_command(root, name, payload, *args, **kwargs)
+
+        missing_proof = dict(proof)
+        missing_proof.pop("seal_request")
+        conflicting_proof = dict(proof)
+        conflicting_proof["marker"] = {
+            **proof["marker"],
+            "final_hash": "f" * 64,
+        }
+        with mock.patch.object(self, "command", side_effect=record_command):
+            with mock.patch.object(
+                self,
+                "prepare",
+                side_effect=AssertionError("no-helper recovery must not invoke helper"),
+            ):
+                with self.assertRaisesRegex(ValueError, "missing"):
+                    recover(missing_proof)
+                with self.assertRaisesRegex(ValueError, "conflicts"):
+                    recover(conflicting_proof)
+                reused_report = recover(proof)
+                self.assertEqual(ledger.read_bytes(), original_ledger)
+                admitted = self.admission(root, reused_report)
+
+        self.assertEqual(actions, [])
+        self.assertEqual(helper_calls, [])
+        self.assertTrue(admitted[0], admitted)
+        self.assertFalse(ledger.exists())
+        self.assertEqual(retained_cache.read_bytes(), source_bytes)
+        tombstones = list(
+            (root / ".kent/runtime").glob(".evidence-cleanup-*")
+        )
+        self.assertEqual(len(tombstones), 1)
+        retained_ledger = tombstones[0] / "evidence-ledger.jsonl"
+        self.assertEqual(retained_ledger.read_bytes(), original_ledger)
+        replayed_records = [
+            json.loads(line)
+            for line in retained_ledger.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(
+            {
+                key: replayed_records[-2][key]
+                for key in ("session_id", "run_id", "step_id")
+            },
+            original_ids,
+        )
+        self.assertEqual(
+            runtime.validate_cleanup_report(reused_report),
+            runtime.validate_terminal_chain(
+                replayed_records,
+                task_short_id=task,
+            ),
         )
 
 
