@@ -134,3 +134,176 @@ without replacing the original findings or acceptance records.
 - At this source snapshot, publication/merge and final installed-state audit
   are still pending. Their later receipts belong to the requesting Session
   and ignored delivery reports, not a fabricated pre-publication success here.
+
+## Delivered original slice
+
+The prior status above is the historical pre-publication source snapshot.
+PR46 subsequently merged by rebase at
+`06613498984a081eb9cf2c1a121563e6c1dee62b`; its tree matches the verified
+original source tree. The final macOS verifier passed 1014 tests/one skip;
+PR/main Linux CI passed 1014 tests/two skips. Detailed post-publication receipts
+remain in the requesting Session and ignored delivery artifacts. Installed
+adoption was not performed or inferred from those checks.
+
+## Five-Session follow-up authority
+
+The same requesting Session's original human event491 accepts assistant490's
+useful validation-only no-op boundary and asks to study OSM-105/106/108/109/110,
+combine delivered and pending changes, then set a goal. Human497 requires PR
+delivery; human569 requires Grill.
+
+The architecture choice is native Question
+`call_ZcctM3bkq6ADLSF00SFJbcUD`, answered option1 at requesting event708.
+It selects one bounded standalone diagnostic mode in the existing runtime role,
+with project compatibility required and no Appsome edits. It is not the source
+approval. The Russian Session goal was set after the five-Session study and
+combined synthesis.
+
+The frozen combined preview is the exact full-byte artifact
+`build/kent-workflow/task-supervisor/combined-preview.md` retained in managed
+worktree285, SHA-256
+`0df54b5e48d4e042019e72907c2cc9e5e370742eeca4793b1a7a2d239214ba38`.
+Combined Grill Session `f3658734-87a4-494e-ab2b-800619160103`, assistant167,
+supplies substantive criticism and dispositions, not either formal PASS.
+Independent same-hash PASS receipts are:
+
+- Architecture Designer `6fe5735c-e148-47c7-9d71-7f53bd094d7b`, assistant147;
+- Researcher `2bd8b1d4-35f8-41c7-99e4-e703cf68b8c7`, assistant168.
+
+Subsequent human approval is native Question
+`call_qh05j4cVPj9uDdb1Fo7xlNMn`, answered option1 at requesting event767.
+It authorizes the nine-file combined source scope, verification, task-branch
+publication, follow-up PR and checked head-bound rebase merge. This does not
+authorize installation/restart or production Task/runtime qualification.
+The older strict preview430 and its reviews were never approved and are
+explicitly superseded, not implementation authority.
+
+The immutable follow-up baseline is merged PR46
+`06613498984a081eb9cf2c1a121563e6c1dee62b`, separate from moving main.
+Development uses managed worktree `fa55387d-63ed-45bd-8bda-87a9bc061016`,
+branch `improve-task-supervisor-followup`; PR46 is not amended.
+
+## Follow-up evidence and dispositions
+
+Exact ordinary Task Supervisor Session identities and relevant events:
+
+- OSM-105 v2: `12c86154-aa16-4b7b-89f3-4b54f86d4096`.
+  Events640/757/769 establish unavailable subscription rather than missing login;
+  human782 and relay833 establish accepted alternative evidence. Credential
+  protection and human stop996/final1005 remain correct.
+- OSM-106 v2: `fcb712f0-c52f-4604-b762-3a6dba5d881d`.
+  Question749/correction770/775 projected supervisor Git restrictions onto
+  a capable owner. Question790/answer791/API868/894/question903/admission912
+  show an initially invented billing gate; the user's later accepted condition
+  remains binding. Human904/final912 stopped Task messaging correctly.
+- MBL-783 aka OSM-108: `31ae9b23-91b1-48b4-9551-feb8a2a2779a`.
+  Events34/54/58/59 show a known-failing startup recommendation, already
+  addressed by PR46. Report gaps768->1924 include active monitoring followed
+  by cancellation; another2297->2811 active gap was about87 minutes.
+  Events2811/2820/2829 conflate independent manual/provider prerequisites.
+  Executions2865/3147/3407 actually run;3449/3561 explain prerequisite-ready
+  edges are not diagnostic. Human3574's diagnostic permission does not alone
+  override the old child prohibition.
+- MBL-825 aka OSM-109: `a24cd60d-a942-494b-9d07-a82249972e8a`.
+  Repeated lease capture failures at2160/2218/2222 and cleanup Questions
+  1104/1238/1248/2352/2409 are one cause across lease IDs. Event2192 records
+  a guessed run-inspect command creating a real Session. Events2783 and
+  3274/3285/3308/3348 distinguish transport/wrapper/schema errors from semantic
+  UI proof. Event3254 distinguishes current Task HEAD from pinned source.
+  Human4884 waived Chinese verification, not the failed UI CI retained at
+  5097/5218. Data resets and closed-file expansions remain real decisions.
+- MBL-891 aka OSM-110: `ef6df271-c8d7-4966-8a7b-8f47d1c6e391`.
+  Human85/160/240 grants CI/preparation authority, not unlimited runs.
+  Events737/747/748/759/775 show a false PR-vs-diagnostic operator choice;
+  owner/replan alternatives remain preferred. Events3146/3151/3156/3165/3180
+  establish waiting ownership, rejected same-node move and actual alternative
+  continuation. Human2812 requires native Question UI. Events1711/1758/1976
+  distinguish validation failure from actual measured tests and exact-source
+  preflight. Later trigger/controller/branch effects and run caps remain real
+  scope limits.
+
+The combined investigation and redacted independent researcher reports are
+retained in requesting evidence and the ignored study record in worktree285.
+Historical human-only start boundaries, security rules, genuine missing identity
+and explicit stops are not retroactively relabelled defects.
+
+Grill dispositions accepted:
+
+- Preserve PR46 and add useful, attempt-qualified no-op classification; one
+  Resume invocation, one qualified native alternative after a no-op, no third
+  automatic route. Actual effects/provider requests spend the shared budget,
+  unknown reserves it; failure/cleanup do not reset it. Existing matching
+  qualification is reusable, current settlement is not assumed.
+- Waiting reentry is only for an already-resolved technical condition with
+  incompatible retained routing. Prefer ordinary answer/approve/owner/replan;
+  native pending-object/owner settlement must exclude late continuation and
+  preserve every judgment/review/input/source/resource/cleanup obligation.
+- Standalone runtime diagnosis is a distinct existing-role mode with exact
+  prior runtime authority and qualified project eligibility, genuine identity,
+  own permitted persistence/cleanup, no Task checkpoint/lifecycle/Git writes,
+  official Smoke PASS, children or extra run/recovery budget.
+- Preserve scheduled reports and semantic diagnosis, fixture-check token capture
+  before another acquisition, verify CLI/source anchors and separate independent
+  prerequisites and owner capabilities. Use native UI for real new decisions.
+- Reject generic/default operational children, prompt overrides, new scheduler/
+  role/config/graph, fake identity, unsupported token recovery and a claim that
+  Kit-only publication qualifies Appsome standalone operation.
+
+The implementation follow-up from the same Grill Session, assistant211, found
+three bounded contract ambiguities. They were corrected within approved scope:
+explicit child budget/intent handoff and exclusive delegation with action
+settlement readback; retained failure forbids repeated Resume but not the proved
+no-op native alternative; preflight checks identity/conflicts/procedure while
+serialized acquisition establishes ownership before runtime actions. Static
+regressions reject the contradictory former wording. No new architecture,
+adapter, authority or production effect is introduced by these corrections.
+Grill assistant225 verified closure of all three findings in the corrected
+source, without claiming formal governance or native/runtime qualification.
+
+## Follow-up closed scope and verification
+
+Nine files: the two existing role prompts, role contract, README, decision-closure
+documentation, two supervisor test modules, operational-case fixture and this
+append-only plan. Graph delta zero; model/tools/depth/config, generated commands,
+Appsome, installed primary and live Tasks remain unchanged. Original Workflow
+Smoke requirements remain in their mode-specific section.
+
+Static regressions cover invocation/effect/late-work limits, waiting gate/owner
+settlement, compatible/incompatible helper modes, identity/persistence/cleanup,
+report deadline restoration, token-parser incidents, CLI grammar, source anchors,
+semantic results, independent Stage/provider prerequisites, owner Git capability,
+alternative evidence, accepted budgets and real human decisions/stops.
+They bind text and modes; they do not run an LLM or qualify native/runtime effects.
+The existing validation-only watcher experiment rejects invalid cursor before
+observer construction; it does not establish native queue settlement.
+
+Run focused affected checks, then the configured final
+`.kent/scripts/workflow-verify-report` with source/environment identity and
+content-addressed log, followed by current PR/main CI. Source changes or
+moving-target integration require fresh verification when identity is stale.
+No production recovery, helper or runtime canary is authorized.
+Future separately authorized qualification must exercise pending-object
+supersession/late-answer exclusion and standalone identity/persistence/cleanup
+with effect-disabled traces or isolated disposable native/runtime fixtures.
+
+Normal Kit rollout owns adoption; existing Sessions keep locked instructions
+and new supervisor/diagnostic Sessions require adopted mode text. Appsome's
+standalone checkpoint/identity compatibility remains unproved. No manual
+install/restart is included. Delivery is the approved PR/rebase path, not
+direct-main/force/admin/queue bypass or branch deletion. Rollback is a corrective
+source commit or subsequently authorized forward revert, never history reset.
+
+### Follow-up source snapshot status
+
+- [x] Investigate all five Sessions and preserve original authority.
+- [x] Combine delivered/pending improvements and obtain substantive Grill.
+- [x] Set the requested goal and resolve diagnostic-helper architecture.
+- [x] Obtain two same-hash reviews and subsequent source/delivery approval.
+- [x] Implement the two modes and coupled safety contracts.
+- [x] Resolve the three bounded implementation Grill findings.
+- [x] Run 17 focused checks covering 48 static operational scenarios.
+- [ ] Complete final configured verification of the committed source.
+- [ ] Publish and merge the checked follow-up PR; retain delivery receipts.
+
+Later validation/delivery receipts are append-only requesting evidence and
+ignored reports, not a fabricated pre-verification result in this source snapshot.

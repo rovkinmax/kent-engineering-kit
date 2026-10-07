@@ -284,8 +284,9 @@ Desktop. Skills, prompts, and `AGENTS.md` are consumed by new sessions.
 
 ### Task supervisor
 
-After separately approved installation of `agents/task-supervisor.md`, its
-source config stanza, and a Kent restart, start a new interactive Session:
+For initial setup, follow the separately approved role/config installation and
+restart procedure. After normal Kit adoption of prompt-only updates, start a
+fresh interactive Session; this source change does not alter configuration:
 
 ```sh
 kent --agent task-supervisor
@@ -301,7 +302,10 @@ There is no overall supervision time limit. Each round checks **all selected
 Tasks** before deep diagnosis or a long wait, then gives each incident a bounded
 action slice. Waiting for one executor or critic does not replace the group
 scan. Scope, authority and unfinished actions are restored after answers,
-restart and compaction. Individual observations and effects remain bounded;
+restart and compaction, including any requested report interval/deadline.
+Scheduled reports occur while the Session is alive even without changes;
+after an interruption it gives one current catch-up, not fictional missed
+reports. Individual observations and effects remain bounded;
 long planning or a build is not itself a hang.
 
 The role resolves facts, applicable existing decisions and explicitly delegated
@@ -316,8 +320,8 @@ an earlier permission.
 
 For a material unresolved doubt, it may consult one read-only `grill` outside
 Workflow when Kent permits the child depth. Routine facts and unchanged blockers
-need no critic. It cannot launch operational children or increase depth to make
-delegation work; a headless supervisor invoked at the depth limit may therefore
+need no critic. It cannot launch generic operational children or increase depth
+to make delegation work; a headless supervisor invoked at the depth limit may therefore
 need its caller's help for a genuinely material critique.
 
 It may directly execute a merge you already authorized for a selected Task's
@@ -336,6 +340,32 @@ CLI help alone is insufficient. No forced Done, arbitrary movement or graph
 edits. Resume and native recovery share one automatic effect budget per incident;
 unknown effects are reconciled before retry. A proved no-op permits only a
 verified equivalent already-authorized route, not transition enumeration.
+One automatic Resume invocation and at most one qualified native alternative
+after a proved no-op are allowed; never a second Resume or third route.
+A completed validation-only Script can be a no-op only with exact code/setup,
+attempt-specific settlement and no effects or late work. Actual effects/provider
+requests spend the budget, unknown reserves it, and cleanup does not erase it.
+
+There is one waiting-state exception: a selected other's exact technical pending
+condition is already resolved, but its retained route is incompatible.
+Answer/approve and owner/replan remain preferred. A project-qualified native
+procedure must settle the old pending object/execution, exclude late answers
+and competing continuation, and preserve human judgments, review/approval,
+inputs, source, resources and cleanup. Waiting still means ownership.
+This is not permission to move around an approval or an unmet prerequisite,
+and does not qualify any production Task's route by itself.
+
+Outside Workflow, a bounded standalone diagnosis may use the existing
+`runtime-smoke-tester` when direct diagnosis and capable owner routes are
+insufficient. Verify already-existing runtime authority, the effective installed
+diagnostic mode and a compatible project procedure before launching one helper
+per unchanged incident. It uses genuine identity, exclusive leases, its own
+minimal state/evidence and cleanup; no Task checkpoint/lifecycle, product/Git
+writes, children or official Smoke PASS. Full-Smoke build/install defaults
+do not grant diagnostic effects. It adds no run/spend or recovery-effect budget.
+The supervisor keeps observing the whole selection and verifies cleanup.
+Kit publication does not prove Appsome standalone compatibility: incompatible
+project checkpoint/identity rules remain a specific blocker, not a prompt override.
 
 The requested outcome controls completion. Done and merge do not prove installed
 adoption. Installation, configuration and restart require separate effect
@@ -348,6 +378,12 @@ adopt existing branches, override human-only restrictions or invent a target.
 Facts and existing decisions are resolved with provenance; technical ordering
 within scope goes to the capable owner/planner, not another user choice.
 Repeated approval IDs for one unchanged blocker remain one incident.
+The same applies to repeated lease-token parser failures: fixture-check the
+exact owner command/output before another acquisition. A prerequisite-ready
+transition is not a diagnostic entry. Check semantic outcomes rather than exit0,
+verify CLI grammar, and distinguish the initial source pin from current Task
+commits. Do not invent CI billing-access prerequisites or conflate independent
+manual Stage/provider conditions; accepted limits and security rules still apply.
 
 Generated Fix and Compliance can return a substantive execution-plan discrepancy
 to existing Plan Revalidation before source edits. The normal review/acceptance
