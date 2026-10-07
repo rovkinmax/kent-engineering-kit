@@ -1,0 +1,635 @@
+{
+  "schema": "mobile-login-recovery-v1",
+  "synthetic_inputs_only": true,
+  "trace_profiles": {
+    "authenticated-shortcut": [
+      "reconcile_checkpoint",
+      "observe_authenticated_destination"
+    ],
+    "standard-phone-code": [
+      "reconcile_checkpoint",
+      "resolve_existing_authorization",
+      "verify_phone_target",
+      "verify_phone_focus",
+      "verify_secret_safe_input_channel",
+      "clear_phone_control",
+      "replace_phone_full_value",
+      "verify_phone_normalization",
+      "persist_phone_submission_intent",
+      "submit_phone_once",
+      "observe_phone_submission",
+      "verify_code_target",
+      "verify_code_focus",
+      "verify_secret_safe_code_input_channel",
+      "clear_code_control",
+      "replace_code_full_value",
+      "verify_code_normalization",
+      "persist_code_submission_intent",
+      "submit_code_once",
+      "observe_code_submission",
+      "verify_authenticated_destination"
+    ],
+    "phone-safe-input-gate": [
+      "reconcile_checkpoint",
+      "resolve_existing_authorization",
+      "verify_phone_target",
+      "verify_phone_focus",
+      "verify_secret_safe_input_channel"
+    ],
+    "phone-submission-unknown": [
+      "reconcile_checkpoint",
+      "resolve_existing_authorization",
+      "verify_phone_target",
+      "verify_phone_focus",
+      "verify_secret_safe_input_channel",
+      "clear_phone_control",
+      "replace_phone_full_value",
+      "verify_phone_normalization",
+      "persist_phone_submission_intent",
+      "submit_phone_once",
+      "observe_phone_submission",
+      "inspect_after_unknown_submission"
+    ],
+    "resumed-code-only": [
+      "reconcile_checkpoint",
+      "resolve_existing_authorization",
+      "inspect_prior_phone_submission",
+      "observe_code_prompt",
+      "verify_code_target",
+      "verify_code_focus",
+      "verify_secret_safe_code_input_channel",
+      "clear_code_control",
+      "replace_code_full_value",
+      "verify_code_normalization",
+      "persist_code_submission_intent",
+      "submit_code_once",
+      "observe_code_submission",
+      "verify_authenticated_destination"
+    ],
+    "external-challenge": [
+      "reconcile_checkpoint",
+      "resolve_existing_authorization",
+      "verify_phone_target",
+      "verify_phone_focus",
+      "verify_secret_safe_input_channel",
+      "clear_phone_control",
+      "replace_phone_full_value",
+      "verify_phone_normalization",
+      "persist_phone_submission_intent",
+      "submit_phone_once",
+      "observe_phone_submission",
+      "stop_for_external_challenge"
+    ],
+    "missing-consent": [
+      "reconcile_checkpoint",
+      "resolve_existing_authorization",
+      "request_genuine_consent"
+    ]
+  },
+  "coverage_bindings": [
+    {
+      "clause_id": "MR-01",
+      "fixture_id": "already-authenticated",
+      "trace_profile": "authenticated-shortcut",
+      "prohibited_action": "submit_phone_once"
+    },
+    {
+      "clause_id": "MR-01",
+      "fixture_id": "valid-authorization-reuse",
+      "trace_profile": "standard-phone-code",
+      "prohibited_action": "request_genuine_consent"
+    },
+    {
+      "clause_id": "MR-02",
+      "fixture_id": "unsafe-secret-input-channel",
+      "trace_profile": "phone-safe-input-gate",
+      "prohibited_action": "replace_phone_full_value"
+    },
+    {
+      "clause_id": "MR-03",
+      "fixture_id": "prefixed-full-value-replacement",
+      "trace_profile": "standard-phone-code",
+      "prohibited_action": "append_phone_to_prefix"
+    },
+    {
+      "clause_id": "MR-04",
+      "fixture_id": "prefixed-full-value-replacement",
+      "trace_profile": "standard-phone-code",
+      "prohibited_action": "retain_secret_value"
+    },
+    {
+      "clause_id": "MR-05",
+      "fixture_id": "phone-submission-unknown",
+      "trace_profile": "phone-submission-unknown",
+      "prohibited_action": "submit_phone_twice"
+    },
+    {
+      "clause_id": "MR-05",
+      "fixture_id": "interrupted-observed-code-prompt",
+      "trace_profile": "resumed-code-only",
+      "prohibited_action": "submit_phone_once"
+    },
+    {
+      "clause_id": "MR-06",
+      "fixture_id": "code-entry-only",
+      "trace_profile": "standard-phone-code",
+      "prohibited_action": "classify_authenticated"
+    },
+    {
+      "clause_id": "MR-07",
+      "fixture_id": "semantic-assertion-failed",
+      "trace_profile": "standard-phone-code",
+      "prohibited_action": "classify_unauthenticated_from_negative_assertion"
+    },
+    {
+      "clause_id": "MR-08",
+      "fixture_id": "authorization-absent",
+      "trace_profile": "missing-consent",
+      "prohibited_action": "submit_phone_once"
+    },
+    {
+      "clause_id": "MR-08",
+      "fixture_id": "external-only-challenge",
+      "trace_profile": "external-challenge",
+      "prohibited_action": "bypass_external_challenge"
+    }
+  ],
+  "cases": [
+    {
+      "id": "already-authenticated",
+      "app_state": "authenticated",
+      "expected": {
+        "outcome": "authenticated",
+        "must_include": ["observe_authenticated_destination"],
+        "must_not_include": ["replace_phone_full_value", "submit_phone_once", "submit_code_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "prefixed-full-value-replacement",
+      "synthetic_inputs": {
+        "existing_prefix": "opaque-prefix-token-alpha",
+        "authorized_full_value": "opaque-authorized-input-token-alpha",
+        "expected_normalized_value": "opaque-normalized-input-token-alpha"
+      },
+      "expected": {
+        "outcome": "authenticated",
+        "must_include": ["clear_phone_control", "replace_phone_full_value", "verify_phone_normalization"],
+        "must_not_include": ["append_phone_to_prefix", "retain_secret_value"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "separate-country-code",
+      "country_control": "separate",
+      "synthetic_inputs": {
+        "authorized_full_value": "opaque-authorized-input-token-beta",
+        "expected_normalized_value": "opaque-normalized-input-token-beta"
+      },
+      "expected": {
+        "outcome": "authenticated",
+        "must_include": ["select_country_code", "clear_phone_control", "verify_phone_normalization"],
+        "must_not_include": ["append_phone_to_prefix"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "failed-target",
+      "target": "failed",
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["verify_phone_target"],
+        "must_not_include": ["verify_phone_focus", "replace_phone_full_value", "submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "unavailable-target",
+      "target": "unavailable",
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["verify_phone_target"],
+        "must_not_include": ["replace_phone_full_value", "submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "unavailable-focus",
+      "focus": "unavailable",
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["verify_phone_target", "verify_phone_focus"],
+        "must_not_include": ["replace_phone_full_value", "submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "failed-clear-proof",
+      "phone_clear": "failed",
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["clear_phone_control"],
+        "must_not_include": ["replace_phone_full_value", "submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "unavailable-normalization-proof",
+      "phone_normalization": "unavailable",
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["clear_phone_control", "replace_phone_full_value", "verify_phone_normalization"],
+        "must_not_include": ["submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "unsafe-secret-input-channel",
+      "safe_input_channel": "unsafe",
+      "mcp_result_sanitized": true,
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["verify_secret_safe_input_channel"],
+        "must_not_include": ["clear_phone_control", "replace_phone_full_value", "submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "normal-phone-then-code",
+      "expected": {
+        "outcome": "authenticated",
+        "must_include": ["persist_phone_submission_intent", "submit_phone_once", "persist_code_submission_intent", "submit_code_once", "verify_authenticated_destination"],
+        "must_not_include": ["request_genuine_consent", "submit_phone_twice", "submit_code_twice"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "valid-authorization-reuse",
+      "authorization": "valid",
+      "expected": {
+        "outcome": "authenticated",
+        "must_include": ["resolve_existing_authorization", "submit_phone_once"],
+        "must_not_include": ["request_genuine_consent"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "authorization-absent",
+      "authorization": "absent",
+      "expected": {
+        "outcome": "authorization_required",
+        "must_include": ["request_genuine_consent"],
+        "must_not_include": ["replace_phone_full_value", "submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 1
+      }
+    },
+    {
+      "id": "authorization-expired",
+      "authorization": "expired",
+      "expected": {
+        "outcome": "authorization_required",
+        "must_include": ["request_genuine_consent"],
+        "must_not_include": ["submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 1
+      }
+    },
+    {
+      "id": "authorization-revoked",
+      "authorization": "revoked",
+      "expected": {
+        "outcome": "authorization_required",
+        "must_include": ["request_genuine_consent"],
+        "must_not_include": ["submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 1
+      }
+    },
+    {
+      "id": "authorization-out-of-scope",
+      "authorization": "out-of-scope",
+      "expected": {
+        "outcome": "authorization_required",
+        "must_include": ["request_genuine_consent"],
+        "must_not_include": ["submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 1
+      }
+    },
+    {
+      "id": "authorization-source-unavailable",
+      "authorization": "unknown",
+      "expected": {
+        "outcome": "authorization_unknown",
+        "must_not_include": ["request_genuine_consent", "submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "phone-submission-unknown",
+      "phone_submission": "unknown",
+      "expected": {
+        "outcome": "submission_unknown",
+        "must_include": ["persist_phone_submission_intent", "submit_phone_once", "inspect_after_unknown_submission"],
+        "must_not_include": ["submit_phone_twice", "submit_code_once"],
+        "phone_submissions": 1,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "interrupted-observed-code-prompt",
+      "phone_attempts_used": 1,
+      "recovery_state": "code-prompt",
+      "expected": {
+        "outcome": "authenticated",
+        "must_include": ["inspect_prior_phone_submission", "observe_code_prompt", "submit_code_once"],
+        "must_not_include": ["submit_phone_once"],
+        "phone_submissions": 0,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "attempt-budget-persists-across-sessions",
+      "session_resumed": true,
+      "phone_attempts_used": 1,
+      "recovery_state": "unknown",
+      "expected": {
+        "outcome": "submission_unknown",
+        "must_include": ["inspect_prior_phone_submission"],
+        "must_not_include": ["submit_phone_once", "request_genuine_consent"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "external-only-challenge",
+      "external_challenge": true,
+      "expected": {
+        "outcome": "external_challenge",
+        "must_include": ["submit_phone_once", "stop_for_external_challenge"],
+        "must_not_include": ["submit_code_once", "bypass_external_challenge"],
+        "phone_submissions": 1,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "explicit-unauthenticated-state",
+      "destination": {
+        "semantic_state": "unauthenticated",
+        "assertion": "missing"
+      },
+      "expected": {
+        "outcome": "unauthenticated",
+        "must_include": ["verify_authenticated_destination"],
+        "must_not_include": ["classify_authenticated"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "unavailable-code-target",
+      "phone_attempts_used": 1,
+      "recovery_state": "code-prompt",
+      "code_target": "unavailable",
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["verify_code_target"],
+        "must_not_include": ["replace_code_full_value", "submit_code_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "unavailable-code-focus",
+      "phone_attempts_used": 1,
+      "recovery_state": "code-prompt",
+      "code_focus": "unavailable",
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["verify_code_target", "verify_code_focus"],
+        "must_not_include": ["replace_code_full_value", "submit_code_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "unsafe-code-input-channel",
+      "phone_attempts_used": 1,
+      "recovery_state": "code-prompt",
+      "code_safe_input_channel": "unsafe",
+      "mcp_result_sanitized": true,
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["verify_secret_safe_code_input_channel"],
+        "must_not_include": ["clear_code_control", "replace_code_full_value", "submit_code_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "failed-code-clear-proof",
+      "phone_attempts_used": 1,
+      "recovery_state": "code-prompt",
+      "code_clear": "failed",
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["clear_code_control"],
+        "must_not_include": ["replace_code_full_value", "submit_code_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "unavailable-code-normalization-proof",
+      "phone_attempts_used": 1,
+      "recovery_state": "code-prompt",
+      "code_normalization": "unavailable",
+      "expected": {
+        "outcome": "input_prerequisite_failed",
+        "must_include": ["clear_code_control", "replace_code_full_value", "verify_code_normalization"],
+        "must_not_include": ["submit_code_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "semantic-assertion-failed",
+      "destination": {
+        "assertion": "false"
+      },
+      "expected": {
+        "outcome": "failed_assertion",
+        "must_include": ["verify_authenticated_destination"],
+        "must_not_include": ["classify_unauthenticated_from_negative_assertion"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "unknown-destination-schema",
+      "destination": {
+        "schema": "unknown"
+      },
+      "expected": {
+        "outcome": "unknown_destination",
+        "must_include": ["verify_authenticated_destination"],
+        "must_not_include": ["classify_authenticated"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "uncovered-destination-errors",
+      "destination": {
+        "errors_covered": false
+      },
+      "expected": {
+        "outcome": "unknown_destination",
+        "must_not_include": ["classify_authenticated"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "code-entry-only",
+      "destination": {
+        "schema": "unknown",
+        "assertion": "missing"
+      },
+      "expected": {
+        "outcome": "unknown_destination",
+        "must_include": ["submit_phone_once", "submit_code_once", "verify_authenticated_destination"],
+        "must_not_include": ["classify_authenticated"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "mcp-transport-failure",
+      "destination": {
+        "transport": "failed"
+      },
+      "expected": {
+        "outcome": "unknown_destination",
+        "must_not_include": ["classify_authenticated"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "mcp-processing-failure",
+      "destination": {
+        "processing": "failed"
+      },
+      "expected": {
+        "outcome": "unknown_destination",
+        "must_not_include": ["classify_authenticated"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "mcp-assertion-failure",
+      "destination": {
+        "assertion": "false"
+      },
+      "expected": {
+        "outcome": "failed_assertion",
+        "must_not_include": ["classify_authenticated", "classify_unauthenticated_from_negative_assertion"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "nonsemantic-success-signals",
+      "destination": {
+        "schema": "unknown",
+        "assertion": "missing",
+        "action": "unknown",
+        "process_exit": "success",
+        "digest_signal": "present",
+        "literal_signal": "present"
+      },
+      "expected": {
+        "outcome": "unknown_destination",
+        "must_not_include": ["classify_authenticated"],
+        "phone_submissions": 1,
+        "code_submissions": 1,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "attempt-budget-exhausted",
+      "phone_attempts_used": 1,
+      "recovery_state": "phone-form",
+      "expected": {
+        "outcome": "attempt_budget_exhausted",
+        "must_include": ["inspect_prior_phone_submission", "stop_at_phone_attempt_budget"],
+        "must_not_include": ["submit_phone_once", "submit_code_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    },
+    {
+      "id": "code-attempt-budget-exhausted",
+      "phone_attempts_used": 1,
+      "recovery_state": "code-prompt",
+      "code_attempts_used": 1,
+      "expected": {
+        "outcome": "attempt_budget_exhausted",
+        "must_include": ["inspect_prior_phone_submission", "observe_code_prompt", "stop_at_code_attempt_budget"],
+        "must_not_include": ["submit_phone_once", "submit_code_once"],
+        "phone_submissions": 0,
+        "code_submissions": 0,
+        "authorization_questions": 0
+      }
+    }
+  ]
+}

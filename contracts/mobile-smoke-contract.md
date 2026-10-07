@@ -132,6 +132,101 @@ bounded observation paths.
   temporary stdout/stderr capture by the tool process and must not be described
   as bounded transport storage.
 
+## Authorized Login Recovery
+
+This procedure supplements Default Authorization, MCP Outcome Evidence,
+Interaction Proof, and Evidence and Recovery. It does not itself authorize
+credential entry, MFA approval, or an account mutation; require the applicable
+task-scoped authorization and project-owned procedure.
+
+### MR-01 — Checkpoint And Authorization
+
+Reconcile the checkpoint and inspect the current authentication state before
+recovery. If the intended authenticated destination is already proven, skip
+credential entry. Reuse applicable authorization for the exact task, account,
+environment, and action. Existing authorization does not prove authentication.
+An explicitly absent, expired, revoked, or out-of-scope authorization blocks
+secret entry. If its source is unavailable, authorization is unknown; do not
+infer expiry, invalid credentials, or backend rejection from a UI symptom.
+
+### MR-02 — Target, Focus, And Safe Input
+
+Before entering any value, prove the exact eligible target and the identity and
+focus of the phone control. Before any secret entry, establish a
+project-supported secret-safe input and readback path covering transcripts,
+logs, temporary capture, and intermediate storage. A sanitized MCP result
+alone does not prove that the input path is safe. If target, focus, or safe
+input capability is failed or unavailable, stop before input and record a
+sanitized capability finding. Do not ask a human to repeat work that is
+already authorized and safely executable.
+
+### MR-03 — Full-Value Replacement And Normalization
+
+Derive country-code and number normalization from the project-owned input
+contract. Full-value replacement requires explicitly clearing the entire
+phone control, including any existing prefix, before entering the authorized
+full value. Never append a full value to a prefilled prefix. If country-code
+entry uses a separate control, verify its identity and role, select the
+authorized country code, and prove the combined value has the expected
+normalization before submission. Apply the same target, focus, full-value
+replacement, and normalization proof to code entry. Failed or unavailable
+clear or normalization proof stops submission.
+
+### MR-04 — Secret-Safe Observation And Retention
+
+Use the narrowest safe observation to prove replacement and normalization.
+Retain only sanitized categorical results such as target, focus, clear,
+normalization, and destination proof as proven, failed, or unknown. Never
+retain a secret-bearing UI tree, screenshot, log, transcript, command
+argument, response body, credential value, or low-entropy hashes of a phone
+number or code. Sanitize persisted external-action intents and outcomes too.
+
+### MR-05 — Bounded Submission And Recovery
+
+For one authorized login attempt, permit one phone submission (code request)
+and one code submission as separate bounded actions. Before each possible
+submission, persist its sanitized intent in the existing checkpoint or
+external-action ledger; record only its proven or unknown outcome afterward.
+Resuming a Session or reopening a form does not reset either attempt budget.
+After interruption or a lost response, inspect current state before any
+further action; on an unknown outcome, never automatically replay the
+submission. A failed targeting observation permits at most one bounded
+reinspection and replan before input. Do not automatically resend a rejected
+code. Bound observations by the existing action and time budgets; exhausted
+unknown evidence is a finding, not an invented external prerequisite.
+
+### MR-06 — Authenticated Destination Proof
+
+Code entry or submission is not proof of authentication. Prove the intended
+authenticated destination using a known provider/state schema, its covered
+error conditions, and the required interaction evidence. For
+`kent-mcp-result-v1`, require successful transport and processing plus a
+schema-bound `json_boolean` proving the intended destination and the required
+interaction/navigation evidence. The adapter's `action` remains unknown.
+Process exit, parsing, a digest, extracted values, literal matching, or agent
+narrative cannot replace authenticated destination proof. Another
+already-authorized bounded observation is acceptable only when it provides
+equivalent state and interaction evidence.
+
+### MR-07 — Honest Outcome Classification
+
+Classify proven authentication, explicit unauthenticated state, unknown
+destination, failed assertion, targeting or input prerequisite failure, and
+genuine missing consent separately. An unknown destination or failed
+assertion is not proof of an unauthenticated state. An invalid-code UI message
+is a symptom, not proof of backend cause, code expiry, or invalid credentials.
+Never attribute an outcome to the backend, credentials, expiry, or user
+without independent evidence.
+
+### MR-08 — Consent And External Challenges
+
+A genuine missing consent, revoked, expired, or out-of-scope authorization
+requires a consent question; do not ask again when applicable authorization
+already exists.
+Stop immediately at an external challenge requiring human completion and
+request only that external action. Do not bypass an external challenge, MFA,
+or another security control.
+
 ## Interaction Proof
 
 - Apply the project/task form-factor constraint before locking a runtime target.
