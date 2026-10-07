@@ -1,5 +1,89 @@
 # Decision closure and executable replanning
 
+## Operational supervision
+
+The current `task-supervisor` retains its name, model and tool configuration.
+It now owns a whole-selection operating cycle: scan every selected Task,
+classify incidents, perform one bounded diagnosis/action slice per incident,
+verify settlement, then return to observation. A focused follow-up, pending
+critic or operator response cannot replace the group scan. Failed reads remain
+explicit unknowns. Scope, authority and incident budgets survive compaction
+through existing Session goals and Task audit references, not another lifecycle
+database.
+
+Facts, applicable existing decisions and explicitly delegated operational
+choices do not become fresh human Questions. Mandatory human judgment remains
+with its owning approval. Do not duplicate that object in the supervisor
+Session. In autonomous/overnight mode, keep isolated human gates at their owners
+and continue independent help; a truly new supervisor Question can still pause
+its entire Session. No role prompt provides a scheduler or uninterrupted uptime.
+
+Three narrow contracts replace the former blanket restrictions:
+
+- A material unresolved decision may receive one read-only Grill consultation
+  outside Workflow when child depth permits it. No operational child or depth
+  increase is allowed. Grill is not a formal governance review.
+- An already-authorized selected Task's accepted PR may be merged directly,
+  with exact repository/PR/base/head, method, checks, applicable authority and
+  provider head binding. No other Git writes, `--admin`, branch deletion,
+  method fallback or queue bypass. A project-specific CI waiver stays local.
+  Provider queue acceptance is not merge.
+- An interrupted selected other Task may use an existing project-qualified
+  native recovery route when retained Resume would repeat a diagnosed failure
+  or execution is missing. Edge existence and CLI help do not prove semantics.
+  Verify input/context provenance, ownership, authority, locked target and
+  preservation of approval/review, fan-out/Join and cleanup. Resume/native
+  recovery share one automatic effect budget per unchanged incident.
+  A proved no-op permits only a verified equivalent route; an unknown effect
+  requires reconciliation, not replay.
+
+These contracts do not authorize source/config/graph edits, terminal shortcuts,
+human-only endpoint bypass, installation or restart. Requested outcome controls
+completion: Done and merge do not establish installed adoption.
+
+The October 7, 2026 investigation and exact authority/review pointers are
+retained in [the implementation plan](../.todo/task-supervisor/plan.md).
+The acceptance scenarios in
+`tests/fixtures/supervisor-operational-cases.json` and the contract checks in
+`tests/test_task_supervisor_contract.py` are static, not execution of an LLM,
+Task recovery or remote merge. They additionally reject contradictory former
+blanket rules and bind the observation order and effect preconditions to their
+actual sections.
+
+### Qualification after normal rollout
+
+This is a future, separately authorized qualification procedure, not performed
+by source validation or by installing a prompt:
+
+1. After ordinary Kit adoption, start a fresh interactive supervisor Session.
+   Verify the installed prompt digest and effective model/tool/depth settings;
+   existing Sessions keep their locked instructions.
+2. For controlled decision exercises, supply the acceptance scenarios through
+   a harness with tool effects disabled or enforced fixture-only CLI responses.
+   Check the actual action trace: whole-selection fairness, factual/delegated
+   answers, no duplicate gate, one bounded Grill, catch-up and truthful outcome.
+   Instruction-only claims that a real shell is sandboxed are insufficient.
+3. Qualify native recovery separately in an isolated disposable Kent persistence
+   root/project with an explicitly approved test graph and Tasks. Exercise
+   retained interruption, diagnosed invalid input, missing Session, proved no-op,
+   pending approval, deliberate stop and competing ownership. Read back native
+   execution/context and preserved group/cleanup obligations. Do not recover
+   production Tasks for this test or fabricate their actor identities.
+4. Exercise merge decision logic with fixture-only provider responses for changed
+   head, project-specific CI waiver, queue acceptance and lost response.
+   A mock verifies decision handling, not the provider's actual atomicity.
+   Any real disposable-repository merge needs separate remote-effect authority.
+5. Retain traces, installed/source digests, failed as well as passed cases, and
+   explicit unresolved limits. Unsafe or unqualified project routes remain
+   unavailable; neither a green static test nor a critic's advice qualifies them.
+
+The source change has graph delta zero. Normal rollout owns installed adoption;
+no direct symlink/primary/config edits or restart accompany source delivery.
+Rollback after merge is a forward source revert through normal Kit delivery,
+not reset, Task-history deletion or an attempt to refresh old Session locks.
+
+## Existing replanning integration
+
 This source update distinguishes new human decisions from facts, enactment of
 prior decisions, technical planning and missing execution capabilities.
 `agents/task-supervisor.md` owns the operational behavior;

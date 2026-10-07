@@ -67,7 +67,8 @@ roles.
 
 Steer permission does not permit `kent run stop`, continuation of other
 Sessions, Task or Workflow management, approvals, or creating children.
-Only grill has the narrower additional permission to attempt
+Apart from Task Supervisor's own Grill-child contract below, only grill has
+the narrower additional permission to attempt
 `kent run --session <session-id> '<bounded critique request>'` once for an
 explicitly specified, demonstrably idle ordinary Session that is not owned by
 a Workflow Task if either (a) the previous run completed normally, or (b) the
@@ -126,13 +127,33 @@ below do not expand the Session Communication permissions of other roles.
 The installed role prompt carries these boundaries without depending on this
 maintainer document in a consumer workspace.
 
-The caller selects Tasks and their project identities. Selection permits
-resolving their current owning Sessions, not unrelated recipients or
+The caller selects Tasks and their project identities, or explicitly requests
+a bounded backlog selection. The latter permits inspecting that project's
+backlog and selecting within the supplied criteria and start limit, not
+unlimited execution or project-wide authority. Recover scope/defaults from
+the assignment instead of asking the human to repeat accessible facts.
+Selection permits resolving their current owning Sessions, not unrelated recipients or
 project-wide authority. Prefer a dedicated interactive Session: observe until
-all selected Tasks are terminal or the user stops supervision, without an
+the requested outcome is evidenced or the user stops supervision, without an
 overall time limit. Bound individual inspections/waits and recovery attempts,
 back off on unchanged normal work, and do not classify long planning as a hang.
+Terminal Tasks, publication, merge and installation are distinct outcomes.
+Installation requires project-owned adoption evidence and separately approved
+effects; requesting that outcome does not authorize config/install/restart.
 The role provides no scheduler, restart mechanism or uptime guarantee.
+
+The operational cycle is a whole-selection scan, incident classification,
+one bounded diagnosis/action slice per incident, verified settlement and
+return to observation. Scan all selected Tasks before deep diagnosis or a
+long wait; a focused follow-up is not a substitute. Keep failed reads as
+explicit unknowns, not silently dropped Tasks. Waiting for a Task, operator
+or Grill must not starve the rest. Restore the selection, outcome, authority
+and outstanding intents after an answer, restart or compaction.
+Accessible facts, applicable existing decisions and explicitly delegated
+operational choices are resolved by the supervisor. Technical product work
+stays with its owner; new scope/cost/risk and mandatory independent human
+judgment stay human. Operational discretion does not accept unknown results
+or override governance. Cite the mandate for an agent-made operational choice.
 
 An explicit request to start a selected other Task permits one public native
 initial start only when project policy allows agent enactment. Recheck
@@ -142,7 +163,8 @@ project default. Respect human-only restrictions and ask-on-first-execution.
 Do not invent replacement targets, ignore dependencies, adopt existing refs or
 recommend a command already known to fail. Record intent and read back native
 root/source/execution; reconcile ambiguous effects before retry. This exception
-does not grant Git mutation, Task movement or reconstruction through Resume.
+does not grant other Git mutation, arbitrary Task movement or reconstruction
+through Resume. PR merge and qualified recovery have separate narrow contracts.
 
 Before escalation identify the exact decision delta. Accessible facts and
 already-made decisions need provenance, not another human choice. Technical
@@ -156,12 +178,13 @@ route is a capability gap, not another product-ordering decision.
 Before asking the human to open another operator Session, compare supported
 project-level alternatives read-only and disclose their authority delta, such
 as diagnostic trigger/source/run-count changes. This neither authorizes those
-edits nor grants delegation. A missing current route does not prove that an
-external executor is the only viable design.
+edits nor grants operational delegation. A missing current route does not
+prove that an external executor is the only viable design.
 
-The role may inspect relevant evidence, steer the verified active executor,
-answer a demonstrably factual Question with authoritative provenance and agent
-authorship, and perform a guarded `kent task resume` after classified recoverable
+The role may inspect relevant evidence, steer the verified active executor or
+a human-selected auxiliary operator, answer a demonstrably factual Question or
+an explicitly delegated operational choice with provenance and agent authorship,
+and perform a guarded `kent task resume` after classified recoverable
 interruption. A factual answer may unblock already-authorized effects but
 cannot create authority. New human decisions and required independent human
 judgments remain human; a supervisor may enact an already-made decision.
@@ -226,16 +249,78 @@ Record compact intent/result evidence through existing authorized mechanisms
 or Task comments, never per-poll chatter, secrets or a parallel lifecycle.
 Comments are audit, not live control; cooperative deduplication is not a lock.
 Retained evidence preserves incident budgets across supervisor invocations.
-Do not add source/config edits, child agents, Git delivery, Workflow mutation,
-manual move/complete, stopping runs or direct continuation of Workflow
-Sessions to the recovery permission.
+Do not add source/config edits, operational children, general Git delivery,
+Workflow mutation, arbitrary move/complete, stopping runs or direct
+continuation of Workflow Sessions to the recovery permission. Only the
+bounded Grill, authorized PR merge and qualified native recovery exceptions
+below expand the former blanket restrictions.
 Initial start uses its separate explicit-request contract above. Technical
 restoration to an already-authorized state may be communicated to its owner
-after identity/conflict/procedure checks; it does not grant direct source/Git
-mutation to the supervisor.
+after identity/conflict/procedure checks; it does not grant direct source
+mutation or Git writes beyond the authorized PR merge exception.
 
-When independent help is exhausted, ask the user one concrete decision with
-options and a recommendation, then wait without polling that stopped incident.
+### Bounded Grill consultation
+
+Outside Workflow and within Kent's child-depth limit, the supervisor may
+launch one bounded read-only Grill child for a material unresolved decision.
+Supply evidence, authority, alternatives and a concrete critique request.
+Reusing its own normally completed Grill child requires materially changed
+facts or substantive follow-up; a stopped child needs fresh authority.
+Grill remains childless, cannot enact operations or grant authority, and does
+not replace either formal governance review. Routine facts/ordering and
+unchanged blockers need no critic. No other children, operational fallback,
+depth increase or config changes are permitted. Continue whole-selection
+observation while criticism is pending; bound local observers.
+
+### Authorized PR merge
+
+The supervisor may enact verified existing human/standing merge authority for
+a selected Task's accepted PR result when project policy permits its actor.
+Verify exact repository/PR/base/head, accepted scope/result, method, applicable
+checks and any narrowly applicable CI waiver. A waiver for one project does
+not transfer to another or bypass repository protections and mandatory review.
+Recheck just before effect and bind the provider request to the verified head
+(GitHub `--match-head-commit` with explicit repository/PR). Follow current-base
+validation: the head guard does not freeze the base. No `--admin`, merge-queue
+bypass, method fallback, source edits, commit/push/local rebase, conflict
+repair, branch deletion or implied install/config/restart. Record intent and
+verify provider merge evidence. Queued/auto-merge-enabled is not merged;
+unknown settlement requires reconciliation before retry.
+
+### Qualified native recovery
+
+Prefer the active owner or valid retained Resume. A diagnosed failure that
+Resume would repeat, or missing retained execution, may use an existing
+project-qualified native route on an interrupted selected other Task.
+Verify no active/competing owner, pending human gate or unauthorized deliberate stop, exact
+nodes/group/context mode, input provenance, locked target/root, checkpoint,
+resource ownership and cleanup obligations. A fresh exact human instruction
+after a deliberate stop remains necessary.
+
+An edge's existence or CLI help alone does not qualify its effect semantics.
+The project procedure must prove satisfied prerequisites, equivalent authority,
+preserved approval/review and fan-out/Join invariants. No fabricated success,
+unfinished-stage bypass, forced terminal state, Cleanup bypass or independent
+fan-out sibling. Missing retained execution needs a supported incoming
+`new_session` route. Use only native `kent task move` with the verified
+transition/values, record intent and read back real ownership/execution.
+No graph/database writes, locked-target changes, actor bypass or stopping an
+owner to manufacture eligibility.
+
+Resume and native recovery share one automatic recovery-effect budget per
+incident without evidenced progress. A proved no-op must be diagnosed but
+does not consume an effect or erase authority; only a verified equivalent
+authorized route may follow without repeated consent. An unknown effect
+blocks new effects until reconciled. No transition enumeration; budgets
+survive restart/compaction. Unqualified semantics remain a capability gap.
+
+Never duplicate a Task's existing Question/Approval with a supervisor Question.
+Notify the caller of its exact decision once and continue independent help.
+In autonomous/overnight mode, isolated human gates remain at their owners
+while observation continues elsewhere. Ask one concrete new decision with
+options and a recommendation only without an existing owning decision object
+and when a Session-wide pause is necessary or matches the caller's mode;
+then wait without polling that stopped incident.
 The native Question may pause observation of all selected Tasks, not the Tasks
 themselves. After an answer or restart, first re-read **all selected Tasks**,
 discard stale/resolved work, reconcile unknown effects and fairly complete

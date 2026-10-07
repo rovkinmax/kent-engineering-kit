@@ -297,16 +297,49 @@ questions and safe technical interruptions; ask me when a decision is needed."
 The source policy is `gpt-6.1-sol` with `high` reasoning. This role is distinct
 from the built-in edit reviewer and from grill.
 
-There is no overall supervision time limit. Individual reads, waits and
-recovery attempts are bounded; observation backs off on unchanged normal work.
-Long planning or a build is not itself a hang. The role may answer factual
-Questions using authoritative project sources, attempt safe Resume, and help
-restore resources under project policy. It may execute a matching Approval
-when your already-made decision covers its exact consequences and prerequisites,
-then verify continuation. It cannot make new decisions for you, accept unknown
-results, bypass mandatory review, impersonate resource owners, edit source/
-config, or change Workflow graphs. Approval IDs, effects and authority are
-rechecked; a new gate does not automatically inherit a previous permission.
+There is no overall supervision time limit. Each round checks **all selected
+Tasks** before deep diagnosis or a long wait, then gives each incident a bounded
+action slice. Waiting for one executor or critic does not replace the group
+scan. Scope, authority and unfinished actions are restored after answers,
+restart and compaction. Individual observations and effects remain bounded;
+long planning or a build is not itself a hang.
+
+The role resolves facts, applicable existing decisions and explicitly delegated
+operational choices without asking you to repeat them. Technical product work
+stays with its owner. It may answer factual Questions, attempt safe Resume and
+restore resources under project policy. It may enact a matching Approval when
+your already-made decision covers its exact consequences and prerequisites,
+then verify continuation. It cannot accept unknown results, replace mandatory
+human judgment, impersonate owners, edit source/config or change Workflow graphs. Fresh targets,
+effects and authority are checked; a new gate does not automatically inherit
+an earlier permission.
+
+For a material unresolved doubt, it may consult one read-only `grill` outside
+Workflow when Kent permits the child depth. Routine facts and unchanged blockers
+need no critic. It cannot launch operational children or increase depth to make
+delegation work; a headless supervisor invoked at the depth limit may therefore
+need its caller's help for a genuinely material critique.
+
+It may directly execute a merge you already authorized for a selected Task's
+accepted PR result, after repository/PR/base/head, method and checks are verified.
+The provider request is bound to the verified head. Project-specific CI waivers
+stay project-specific; no `--admin`, merge-queue bypass, method fallback,
+commit/push/local rebase, conflict edits or branch deletion is permitted.
+Queued/auto-merge-enabled is not merged. It need not ask you to open another
+Session for an operation its own contract allows.
+
+A project-qualified existing native route may recover an interrupted selected
+other Task when retained Resume would repeat a diagnosed failure or execution
+is missing. This requires proven input/context/ownership/authority and preserved
+review, approval, fan-out/Join and cleanup obligations. An edge's existence or
+CLI help alone is insufficient. No forced Done, arbitrary movement or graph
+edits. Resume and native recovery share one automatic effect budget per incident;
+unknown effects are reconciled before retry. A proved no-op permits only a
+verified equivalent already-authorized route, not transition enumeration.
+
+The requested outcome controls completion. Done and merge do not prove installed
+adoption. Installation, configuration and restart require separate effect
+authority and project procedures; accompaniment is not implicit permission.
 
 An explicit request to start a selected Task may be enacted through native
 `kent task start` after identity, source/branch, dependency and no-competing-run
@@ -343,18 +376,22 @@ not waive a required lease. Release/reacquire is not atomic transfer, and the
 executor must acquire its valid runtime lease before app/device work.
 
 If independent recovery cannot resolve an interruption, the supervisor first
-helps the other selected Tasks where possible, then asks you for one decision
-with options and a recommendation. It waits without repeatedly checking the
-same stopped incident. While that Question is pending, observation of all
-selected Tasks may pause; the Tasks themselves continue their own execution.
+helps the other selected Tasks. It does not duplicate an existing Task Question
+or Approval: it identifies the pending decision once and continues elsewhere.
+In autonomous/overnight operation, isolated human gates remain at their owners.
+Only a genuinely new decision without an owning object may become a supervisor
+Question, when a Session-wide pause is necessary or matches your chosen mode.
+While that Question is pending, observation of all selected Tasks may pause;
+the Tasks themselves continue their own execution.
 After your answer, it checks **all selected Tasks**, discards stale incidents
 and processes accumulated authorized work before asking the next Question.
 It does not wait for long builds to finish just to complete that catch-up pass.
 
 `kent run --agent task-supervisor '<selected Tasks and project>'` is the
 caller-mediated headless alternative: it cannot ask native interactive
-Questions. When human input is needed, it returns the blocker/options and
-ends; the caller must obtain your decision and arrange continuation. Neither
+Questions. When human input is needed and independent assistance is exhausted,
+it returns the blocker/options and ends; the caller must obtain your decision
+and arrange continuation. Neither
 mode installs a scheduler or guarantees observation after the Session exits
 or crashes. A restarted supervisor reconciles current state and retained
 action evidence before acting; it does not reset retry budgets.

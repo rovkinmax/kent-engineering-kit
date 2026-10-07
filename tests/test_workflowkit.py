@@ -2977,7 +2977,8 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                 self.assertTrue(case["input"] and case["expected"])
                 self.assertIn(case["guard"], text)
         self.assertNotIn("manually start, move or complete Tasks", role)
-        self.assertIn("manually move or complete Tasks", role)
+        self.assertIn("arbitrarily", role)
+        self.assertIn("move or complete Tasks", role)
         self.assertIn("no retained/live execution or competing start/recovery", role)
         for prompt in (
             plan_prompt(self.load_profile()),
@@ -3004,12 +3005,12 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                 "return the blocker and options to the caller and end the run",
             ),
             "catch_up": (
-                "Re-read all selected Tasks before executing any old queued action",
+                "Re-read all selected Tasks before deep diagnosis",
                 "Discard stale, answered or resolved incidents",
                 "must not reset incident retry budgets",
                 "Fairly process the discovered independently actionable work",
                 "Defer blocked actions while helping other Tasks",
-                "before the next human Question",
+                "before another human Question",
                 "does not mean finishing the Tasks",
             ),
             "factual_question_not_approval": (
@@ -3046,7 +3047,8 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                 "record the observed result afterward",
                 "cooperative duplicate prevention, not an atomic distributed lock",
                 "Do not edit product source",
-                "Do not create child agents",
+                "Do not create other children",
+                "operational child agents remain prohibited",
                 "no new permissions",
                 "Do not promise uninterrupted uptime",
             ),
@@ -3092,6 +3094,42 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             ),
         }
         for scenario, requirements in expanded_scenarios.items():
+            with self.subTest(scenario=scenario):
+                for requirement in requirements:
+                    self.assertIn(requirement, normalized)
+        operational_scenarios = {
+            "whole_selection_and_delegation": (
+                "a focused follow-up never replaces the whole-selection scan",
+                "explicit operational delegation covers that choice",
+                "an auxiliary operator Session explicitly selected by the human",
+                "Verify a proposed operator's actual role",
+                "kent run --agent grill",
+                "Do not create other children",
+                "Grill cannot enact operations",
+            ),
+            "nonduplicating_escalation_and_outcome": (
+                "Do not duplicate an existing Question or Approval",
+                "In autonomous/overnight operation",
+                "requested outcome is evidenced",
+                "do not declare success from Done or merge alone",
+            ),
+            "authorized_merge": (
+                "accepted PR result",
+                "--match-head-commit",
+                "Do not use `--admin`",
+                "Head binding does not atomically freeze the base",
+                "Queued or auto-merge-enabled is not merged",
+                "A project-specific CI waiver does not transfer",
+            ),
+            "qualified_recovery": (
+                "Before `kent task move`",
+                "A supported edge alone does not qualify a route",
+                "one automatic recovery-effect budget",
+                "A proved no-op does not consume an effect",
+                "Do not enumerate transitions",
+            ),
+        }
+        for scenario, requirements in operational_scenarios.items():
             with self.subTest(scenario=scenario):
                 for requirement in requirements:
                     self.assertIn(requirement, normalized)
