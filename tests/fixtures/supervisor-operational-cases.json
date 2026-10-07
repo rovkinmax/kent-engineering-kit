@@ -1,0 +1,137 @@
+{
+  "description": "Static acceptance scenarios and prompt anchors, not execution of an LLM or native Kent effects.",
+  "cases": [
+    {
+      "id": "whole-selection",
+      "input": "Task A needs deep diagnosis; Task B has a factual Question; Task C is healthy.",
+      "expected": "Scan A/B/C, answer B from authoritative evidence, bound A's diagnosis and continue the group cycle.",
+      "guards": ["Re-read all selected Tasks before deep diagnosis", "one bounded diagnosis/action slice", "a focused follow-up never replaces the whole-selection scan"]
+    },
+    {
+      "id": "failed-read",
+      "input": "Task A is temporarily unreadable while B and C can be inspected.",
+      "expected": "Keep A explicitly unknown in the selection; process B/C without treating A as removed or complete.",
+      "guards": ["A failed read remains an explicit unknown", "never silently drop that Task"]
+    },
+    {
+      "id": "existing-owner-gate",
+      "input": "In overnight mode A already has a mandatory human Approval; B needs permitted factual help.",
+      "expected": "Retain A's Approval, notify once, help B and continue observation without a duplicate supervisor Question.",
+      "guards": ["Do not duplicate an existing Question or Approval", "In autonomous/overnight operation", "continue observing the rest"]
+    },
+    {
+      "id": "existing-authority",
+      "input": "A pending permission Question repeats an exact applicable original human decision.",
+      "expected": "Verify original provenance and current target, relay the decision as an agent and read back resolution; do not ask for the same consent.",
+      "guards": ["Do not demand the same decision", "Immediately before `kent question answer`", "Read back the Question/execution outcome"]
+    },
+    {
+      "id": "delegated-choice",
+      "input": "The caller delegated routine operational choices; two safe diagnostic orders satisfy the same authorized procedure.",
+      "expected": "Choose and cite the operational mandate without a human Question or routine Grill call.",
+      "guards": ["Choose routine diagnostic order", "explicit operational delegation covers that choice", "not a human answer"]
+    },
+    {
+      "id": "mandatory-judgment",
+      "input": "Routine decisions were delegated, but a previously unaccepted governance plan needs independent human judgment.",
+      "expected": "Preserve its actual owning approval; delegation does not accept the new plan or waive governance.",
+      "guards": ["cannot accept an unknown plan/result", "Mandatory governance reviews and independent human judgments", "not permission to decide for the user"]
+    },
+    {
+      "id": "backlog-limit",
+      "input": "The caller selected a project backlog and authorized four starts; five candidates exist.",
+      "expected": "Resolve stable selection and dependencies within the four-start mandate, not unlimited project execution.",
+      "guards": ["within the caller's criteria and start limit", "it is not unlimited execution authority", "no retained/live execution or competing start/recovery"]
+    },
+    {
+      "id": "material-grill",
+      "input": "A material unresolved operational choice has evidence and alternatives; child depth permits a critic.",
+      "expected": "Start one bounded read-only Grill with evidence/authority/options, continue the group scan and retain responsibility.",
+      "guards": ["kent run --agent grill", "one bounded read-only", "Keep inspecting the whole Task selection", "does not replace mandatory independent governance reviews"]
+    },
+    {
+      "id": "unavailable-grill",
+      "input": "The headless supervisor is already at the configured child-depth limit.",
+      "expected": "Keep the precise critique gap or use permitted owner communication; no depth/config change or operational fallback.",
+      "guards": ["At a prohibited child depth or in Workflow", "Do not create other children", "substitute an operational role when Grill is unavailable"]
+    },
+    {
+      "id": "operator-capability",
+      "input": "The human identifies an auxiliary fix-worker Session, but its locked role prohibits the requested merge.",
+      "expected": "Verify the role before routing; use the supervisor's own qualified merge permission if applicable, not a known-incapable recipient.",
+      "guards": ["Verify a proposed operator's actual role", "Do not recommend a known-incapable owner", "Do not ask the human to open an operator Session"]
+    },
+    {
+      "id": "authorized-merge",
+      "input": "The accepted selected PR, repository, base/head, permitted rebase method, current checks and original merge authority match.",
+      "expected": "Record intent, perform a head-bound provider merge and verify provider evidence; no repeat consent or branch deletion.",
+      "guards": ["accepted PR result", "--match-head-commit", "explicit repository/PR", "Record intent and read back provider state"]
+    },
+    {
+      "id": "changed-head",
+      "input": "The PR head changes between preflight and effect.",
+      "expected": "The head guard prevents stale merge; recheck accepted content and authority before any subsequent request.",
+      "guards": ["bind the request to the verified head", "Changed or unaccepted PR content requires renewed authority/result checks"]
+    },
+    {
+      "id": "project-ci-waiver",
+      "input": "Only project A has permission not to await CI; project B's checks are pending.",
+      "expected": "Do not transfer the waiver to B or bypass provider protections.",
+      "guards": ["A project-specific CI waiver does not transfer", "Do not use `--admin`"]
+    },
+    {
+      "id": "merge-queue",
+      "input": "The provider accepts a request into a merge queue or enables auto-merge.",
+      "expected": "Report queued, continue group observation and do not claim merge, Done or installation.",
+      "guards": ["Queued or auto-merge-enabled is not merged", "Verified merge does not prove Task cleanup or installed adoption"]
+    },
+    {
+      "id": "qualified-recovery",
+      "input": "An interrupted selected other Task has a diagnosed input failure and a project-qualified native route with preserved inputs, context, ownership and gates.",
+      "expected": "Use the exact existing route within the shared incident budget, then verify real ownership/execution.",
+      "guards": ["Before `kent task move`", "provenance of every required input", "verify native ownership and actual execution", "one automatic recovery-effect budget"]
+    },
+    {
+      "id": "unqualified-edge",
+      "input": "A graph edge exists and CLI help accepts move, but preservation of approval/context semantics has not been qualified.",
+      "expected": "Keep a concrete capability gap; do not move or invent success evidence.",
+      "guards": ["A supported edge alone does not qualify a route", "Unknown semantics remain a capability gap", "Do not supply fabricated success values"]
+    },
+    {
+      "id": "deliberate-stop",
+      "input": "The human deliberately stopped A; an older general observation mandate remains.",
+      "expected": "Do not automatically recover A; a fresh exact post-stop instruction is required.",
+      "guards": ["Never automatically resume a deliberate human stop", "A fresh explicit instruction to resume an exact deliberately stopped Task"]
+    },
+    {
+      "id": "ambiguous-effect",
+      "input": "A Resume or native recovery response is lost; its effect may already have occurred.",
+      "expected": "Reconcile native state before any replay; preserve the unsettled incident budget after compaction.",
+      "guards": ["one effective or unsettled attempt", "Do not enumerate transitions or retry an unknown effect", "preserve budgets across compaction/restart"]
+    },
+    {
+      "id": "proved-noop",
+      "input": "A same-node recovery was proved to have no effect; another project-qualified equivalent route satisfies the same authority and preconditions.",
+      "expected": "Diagnose the no-op, verify equivalence and enact at most the remaining permitted effect without asking for the same consent.",
+      "guards": ["A proved no-op does not consume an effect", "all its preconditions are proved", "Do not enumerate transitions"]
+    },
+    {
+      "id": "fanout-invariants",
+      "input": "One fan-out branch failed and a tempting target would omit its siblings and Join.",
+      "expected": "Do not independently start the sibling or bypass Join; use only a qualified group-preserving recovery.",
+      "guards": ["preservation of approval/review and fan-out/Join invariants", "launch one fan-out sibling independently"]
+    },
+    {
+      "id": "installation-unproved",
+      "input": "All selected Tasks are Done and PRs merged, but the requested installed adoption is unproved.",
+      "expected": "Report the unmet outcome and missing authorized adoption evidence; no success claim or implicit installation/restart.",
+      "guards": ["do not declare success from Done or merge alone", "Installation/configuration/restart still need separately approved effects"]
+    },
+    {
+      "id": "compaction-catchup",
+      "input": "After compaction, A has an unfinished intent, B progressed and C has an existing human gate.",
+      "expected": "Restore the entire selection/authority/budgets, reconcile A, process B and retain C's gate before any new Question.",
+      "guards": ["After an answer, restart or compaction", "Reconcile unknown effects before any retry", "must not reset incident retry budgets", "before another human Question"]
+    }
+  ]
+}
