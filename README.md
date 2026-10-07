@@ -93,6 +93,25 @@ execution context and external-root source envelope in same-process sealed
 proof objects. Canonicalization rejects serialized, foreign-module, stale, or
 authority-substituted proof chains.
 
+### Terminal evidence ownership
+
+Plan acceptance continues to write its private `plan-contract.json` cache, but
+that cache is not terminal Janitor input. The project-owned Cleanup preparation
+path must retain and read back its exact bytes before retiring only that
+cache. A non-empty `prepare_cleanup` is an explicit opt-in to the existing
+helper; without it, the project owns byte-verified retention and retirement
+before sealing. A valid prior seal can be recovered only from the original
+retained request, report, marker, validated chain and actual final-event
+provenance, without another append or seal. Missing or conflicting proof is a
+blocker, not a retry opportunity.
+
+Janitor admits only its named evidence, supported checkpoints and
+digest/reference-validated CI archives. Keep ad hoc reports and scripts in
+project-owned ignored private storage outside `.kent/runtime/<task>/`, with a
+named owner and retention lifetime. Preserve unknown runtime entries and
+classify/relocate them only through an owner-led, separately authorized
+operation. Credentials and device tokens never belong in fixtures or reports.
+
 ## Advisory effect steps
 
 Effect-job contracts remain strict by default: a step with

@@ -240,15 +240,14 @@ flat result contracts.
 - Before Agent transitions: one nonempty event via profile evidence, Git-ignored,
   hash-chained append-only JSONL. No rewrites; provider recovery/repeated
   completion reuses active `KENT_RUN_ID` sequence/hash; no append.
-- Cleanup/recovery: nonempty `commands.prepare_cleanup` owns final
-  event/metrics/seal; no standalone append before/after it or for blockers.
-  Preflight/blockers stay in Task records; project-owned payload/archive
-  protocols. Missing/empty opt-in and other nodes are unchanged.
-  Real unmodified current Kent Session/Run/Step IDs; no dedup bypass.
-  Preserve/block invalid history; no acceptance, reconstruction or resealing.
-  Only genuine success permits validated frozen-request/report reuse
-  without append. Freeze original root/branch/report before leave; no relative
-  adapters from primary afterward. No native authentication added.
+- Cleanup/recovery: nonempty `commands.prepare_cleanup` owns the final
+  event/seal; blockers stay in Task records. Without it, reuse a prior seal
+  only under `.kent/commands/cleanup-task.md`'s no-helper proof checks, without
+  append/seal. A new unsealed completion with no prior Cleanup event/partial
+  seal attempt keeps ordinary append/seal ownership; invalid proof blocks.
+  Other nodes retain ordinary append. Use real unmodified Kent Session/Run/Step
+  IDs; no dedup bypass, history reconstruction or native authentication.
+  Freeze root/branch/report before leave; no primary-relative adapters.
 - Events: Task/node/Kent-run IDs, HEAD, summary, artifacts, checks, decisions,
   exact instruction files/bytes read, repeated reads/questions, verification
   loops. `model_calls`/`compaction_count`: stable Kent telemetry or `null`;

@@ -2,11 +2,12 @@
 """Terminal evidence admission under the existing cooperative POSIX lock.
 
 One scoped admission owns the directory and file descriptors through rename,
-retention or deletion. Any non-CI ordinary entry is admitted only as a private,
-owned regular file; its bytes remain opaque. CI names are reserved:
-canonical validated bytes, their digest and an exact logical Task reference in
-the sealed chain authorize each report. Tombstone paths never become logical
-artifact identities.
+retention or deletion. Only named ledger/checkpoint files and validated
+referenced CI reports are admitted; unknown entries are preserved and block
+cleanup. Legacy cleanup has its own closed ledger/checkpoint/lock set. CI
+names are reserved: canonical validated bytes, their digest and an exact
+logical Task reference in the sealed chain authorize each report. Tombstone
+paths never become logical artifact identities.
 Admission Git probes resolve and bind the selected workspace's own Git directory,
 worktree and index, including linked worktrees. Inherited GIT_* routing, object,
 namespace and config injection are removed; ordinary on-disk Git exclusions
@@ -20,8 +21,8 @@ Initial and managed admission require every referenced report. Only a matching
 tombstone with a verified durable sentinel and matching ledger/report marker may
 resume with already-absent reports; that checkpoint cannot distinguish prior
 deletion from unrelated loss. No absent bytes are claimed to have been verified.
-Managed cleanup retains all admitted bytes. Primary cleanup removes ordinary
-opaque files, then lexically ordered validated reports, then the ledger last,
+Managed cleanup retains all admitted bytes. Primary cleanup removes
+checkpoints, lexically ordered validated reports, then the ledger last,
 fsyncing after each unlink.
 FD/link/byte checks detect cooperative drift, not hostile same-UID stat/unlink
 races: POSIX unlink is not an atomic inode compare-and-swap.
@@ -51,6 +52,14 @@ MAX_CI_ARTIFACTS = 64
 MAX_CI_ARTIFACT_BYTES = 4 * 1024 * 1024
 MAX_LEDGER_BYTES = 8 * 1024 * 1024
 MAX_LEDGER_RECORDS = 8192
+RUNTIME_EVIDENCE_ENTRIES = frozenset({
+    "evidence-ledger.jsonl",
+    "fix-checkpoint.json",
+    "smoke-checkpoint.json",
+})
+LEGACY_RUNTIME_ENTRIES = RUNTIME_EVIDENCE_ENTRIES | frozenset({
+    "runtime.lock",
+})
 RUNTIME_FILE_METADATA = (
     "st_dev", "st_ino", "st_uid", "st_mode", "st_nlink",
     "st_size", "st_mtime_ns", "st_ctime_ns",
@@ -71,15 +80,20 @@ def runtime_contracts():
     sibling = Path(__file__).with_name("workflow_runtime_contracts.py")
     if sibling.is_symlink() or not sibling.is_file():
         raise RuntimeError("runtime contract support module is unsafe")
-    spec = importlib.util.spec_from_file_location(
-        "workflow_runtime_contracts",
-        sibling,
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("runtime contract support module is unavailable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    previous_bytecode_policy = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "workflow_runtime_contracts",
+            sibling,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("runtime contract support module is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.dont_write_bytecode = previous_bytecode_policy
 
 
 def run(
@@ -744,6 +758,46 @@ def _evidence_git_workspace(workspace: Path) -> tuple[list[str], dict[str, str]]
     ], environment
 
 
+def _verify_runtime_git_paths(
+    workspace: Path,
+    paths: list[str],
+    git_command: list[str],
+    git_environment: dict[str, str],
+) -> None:
+    if not paths:
+        return
+    ignored = run(
+        [*git_command, "check-ignore", "-z", "--stdin"],
+        cwd=workspace,
+        check=False,
+        environment=git_environment,
+        input_text="".join(path + "\0" for path in paths),
+    )
+    tracked = run(
+        [
+            *git_command,
+            "--literal-pathspecs",
+            "ls-files",
+            "-z",
+            "--",
+            *paths,
+        ],
+        cwd=workspace,
+        check=False,
+        environment=git_environment,
+    )
+    if (
+        ignored.returncode != 0
+        or not ignored.stdout.endswith("\0")
+        or ignored.stdout.split("\0")[:-1] != paths
+        or tracked.returncode != 0
+        or tracked.stdout
+    ):
+        raise ValueError(
+            "runtime entries are tracked or not ignored in selected workspace"
+        )
+
+
 class _EvidenceAdmission:
     """Janitor-local FD ownership; no caller-supplied recovery phase."""
 
@@ -795,6 +849,10 @@ class _EvidenceAdmission:
                     self.references.add(name)
                     if len(self.references) > MAX_CI_ARTIFACTS:
                         raise ValueError("CI report reference count exceeds limit")
+            allowed = RUNTIME_EVIDENCE_ENTRIES | self.references
+            unknown = sorted(set(entries) - allowed)
+            if unknown:
+                raise ValueError(f"unexpected tombstone entries: {unknown}")
             if state_name == self.tombstone:
                 _, self.sentinel_name = runtime_state_names(task_short_id)
                 try:
@@ -1019,6 +1077,12 @@ def _admit_managed_runtime_parent(
     descriptors: list[int] = []
     file_descriptors: dict[str, tuple[int, os.stat_result]] = {}
     admission = None
+    legacy_state_fd = -1
+    legacy_state_entries: list[str] = []
+    legacy_state_files: dict[str, tuple[int, os.stat_result]] = {}
+    legacy_git_command: list[str] | None = None
+    legacy_git_environment: dict[str, str] | None = None
+    legacy_paths: list[str] = []
     try:
         root_fd = os.open(
             workspace,
@@ -1087,6 +1151,40 @@ def _admit_managed_runtime_parent(
                     reported_marker,
                     runtime_fd,
                 )
+            else:
+                legacy_state_fd = state_fd
+                legacy_state_entries = _bounded_inventory(state_fd)
+                unexpected = sorted(
+                    set(legacy_state_entries) - LEGACY_RUNTIME_ENTRIES
+                )
+                if unexpected:
+                    raise ValueError(
+                        f"unexpected runtime entries: {unexpected}"
+                    )
+                legacy_git_command, legacy_git_environment = (
+                    _evidence_git_workspace(workspace)
+                )
+                legacy_paths = sorted(
+                    f".kent/runtime/{task_short_id}/{name}"
+                    for name in legacy_state_entries
+                )
+                _verify_runtime_git_paths(
+                    workspace,
+                    legacy_paths,
+                    legacy_git_command,
+                    legacy_git_environment,
+                )
+                for name in legacy_state_entries:
+                    descriptor = _open_evidence_file(state_fd, name)
+                    legacy_state_files[name] = (
+                        descriptor,
+                        os.fstat(descriptor),
+                    )
+                    if name == "runtime.lock" and _bounded_file_bytes(
+                        descriptor,
+                        0,
+                    ):
+                        raise ValueError("legacy runtime lock is not empty")
 
         for name in (lock_name, sentinel_name):
             if name not in entries:
@@ -1130,6 +1228,32 @@ def _admit_managed_runtime_parent(
                 for key in RUNTIME_FILE_METADATA
             ):
                 raise ValueError("task-derived runtime file changed during admission")
+        if legacy_state_fd >= 0:
+            _revalidate_directory_link(
+                runtime_fd,
+                state_name,
+                legacy_state_fd,
+            )
+            if _bounded_inventory(legacy_state_fd) != legacy_state_entries:
+                raise ValueError("legacy runtime inventory changed during admission")
+            for name, (descriptor, saved) in legacy_state_files.items():
+                _revalidate_file_link(legacy_state_fd, name, descriptor)
+                current = os.fstat(descriptor)
+                if any(
+                    getattr(current, key) != getattr(saved, key)
+                    for key in RUNTIME_FILE_METADATA
+                ):
+                    raise ValueError(
+                        "legacy runtime file changed during admission"
+                    )
+            assert legacy_git_command is not None
+            assert legacy_git_environment is not None
+            _verify_runtime_git_paths(
+                workspace,
+                legacy_paths,
+                legacy_git_command,
+                legacy_git_environment,
+            )
         if admission is not None:
             admission.revalidate()
         return True, "managed runtime-parent admission passed"
@@ -1146,6 +1270,8 @@ def _admit_managed_runtime_parent(
     finally:
         if admission is not None:
             admission.close()
+        for descriptor, _ in legacy_state_files.values():
+            os.close(descriptor)
         for descriptor, _ in file_descriptors.values():
             os.close(descriptor)
         close_descriptors(*descriptors)
@@ -1775,20 +1901,19 @@ def remove_runtime_state(
         if _phase_hook is not None:
             _phase_hook("after_task_fd_before_link_revalidation")
 
-        lock_fd = os.open(
-            "runtime.lock",
-            os.O_RDWR
-            | os.O_CREAT
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=task_fd,
-        )
+        lock_fd, lock_created = _open_stable_lock(task_fd, "runtime.lock")
         descriptors.append(lock_fd)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         entries = _bounded_inventory(task_fd)
-        if "terminal-sentinel" in entries:
-            runtime_contracts()
+        unexpected = sorted(set(entries) - LEGACY_RUNTIME_ENTRIES)
+        if unexpected:
+            if lock_created:
+                _revalidate_file_link(task_fd, "runtime.lock", lock_fd)
+                os.close(lock_fd)
+                descriptors.remove(lock_fd)
+                os.unlink("runtime.lock", dir_fd=task_fd)
+                os.fsync(task_fd)
+            return False, f"unexpected runtime entries: {unexpected}"
         for entry in entries:
             if entry.startswith(CI_REPORT_PREFIX):
                 return (
@@ -1796,6 +1921,9 @@ def remove_runtime_state(
                     f"CI evidence requires sealed v2 admission: {entry}",
                 )
             descriptor = _open_evidence_file(task_fd, entry)
+            if entry == "runtime.lock" and os.fstat(descriptor).st_size:
+                os.close(descriptor)
+                raise ValueError("legacy runtime lock is not empty")
             admitted[entry] = (descriptor, os.fstat(descriptor))
 
         git_command, git_environment = _evidence_git_workspace(workspace)

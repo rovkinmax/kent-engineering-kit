@@ -117,3 +117,25 @@ database rows or fragile CLI text.
 The workflow `delivery_context` is transport state, not plan content. Exclude it
 from the accepted-plan snapshot and digest so observed PR or CI state cannot
 trigger plan revalidation.
+
+## Accepted-plan cache terminal ownership
+
+Plan acceptance continues to produce the same private six-field
+`.kent/runtime/<task>/plan-contract.json`; this cache is not an admitted
+terminal artifact. Before sealing, its project-owned preparation owner must
+retain the exact bytes and required authority references outside the restricted
+task runtime, read them back, and retire only that exact cache through the
+existing project seam. A configured non-empty `prepare_cleanup` uses its
+existing helper contract. Without that opt-in, Cleanup owns the same
+byte-verified retention and retirement responsibility; it must not ask Janitor
+to accept or delete the cache.
+
+For recovery of an already successful seal, use only the original retained
+request, report, marker and native final-event provenance with existing
+read-only validators. Do not reconstruct these sources from the seal or append
+or reseal a valid prior success. Missing or conflicting proof blocks.
+Unrelated reports, scripts and credential/device artifacts belong in
+project-owned ignored private storage outside `.kent/runtime/<task>/`, with an
+explicit owner and retention lifetime. Unknown runtime entries remain
+preserved and block terminal cleanup; no wildcard admission or sweep is
+permitted.
