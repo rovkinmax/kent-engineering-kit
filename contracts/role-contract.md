@@ -149,6 +149,10 @@ long wait; a focused follow-up is not a substitute. Keep failed reads as
 explicit unknowns, not silently dropped Tasks. Waiting for a Task, operator
 or Grill must not starve the rest. Restore the selection, outcome, authority
 and outstanding intents after an answer, restart or compaction.
+An explicitly requested reporting interval and next deadline also survive
+answers/compaction/restart. Bound observer waits by the deadline and report
+while alive even without changes. After a gap give one current catch-up,
+not fictional missed reports or uninterrupted observation.
 Accessible facts, applicable existing decisions and explicitly delegated
 operational choices are resolved by the supervisor. Technical product work
 stays with its owner; new scope/cost/risk and mandatory independent human
@@ -180,6 +184,15 @@ project-level alternatives read-only and disclose their authority delta, such
 as diagnostic trigger/source/run-count changes. This neither authorizes those
 edits nor grants operational delegation. A missing current route does not
 prove that an external executor is the only viable design.
+Match diagnostic intent to actual transition prerequisites: a prerequisite-ready
+edge is not a diagnostic route. Separate independent factual prerequisites;
+manual Stage checks do not imply provider sandbox, and CI authorization does
+not invent a billing-access gate. Preserve accepted limits and preflight the
+exact source before a constrained run. Verify the owner's actual capabilities,
+accepted alternative evidence and remaining mandatory gates without projecting
+the supervisor's Git bans or claiming Smoke PASS. Semantic outcomes, not exit0,
+prove runtime results. Verify CLI grammar and distinguish initial source pin,
+current Task/PR head and moving target.
 
 The role may inspect relevant evidence, steer the verified active executor or
 a human-selected auxiliary operator, answer a demonstrably factual Question or
@@ -249,11 +262,11 @@ Record compact intent/result evidence through existing authorized mechanisms
 or Task comments, never per-poll chatter, secrets or a parallel lifecycle.
 Comments are audit, not live control; cooperative deduplication is not a lock.
 Retained evidence preserves incident budgets across supervisor invocations.
-Do not add source/config edits, operational children, general Git delivery,
+Do not add source/config edits, generic operational children, general Git delivery,
 Workflow mutation, arbitrary move/complete, stopping runs or direct
 continuation of Workflow Sessions to the recovery permission. Only the
-bounded Grill, authorized PR merge and qualified native recovery exceptions
-below expand the former blanket restrictions.
+bounded Grill, standalone diagnosis, authorized PR merge and qualified native
+recovery exceptions below expand the former blanket restrictions.
 Initial start uses its separate explicit-request contract above. Technical
 restoration to an already-authorized state may be communicated to its owner
 after identity/conflict/procedure checks; it does not grant direct source
@@ -268,9 +281,56 @@ Reusing its own normally completed Grill child requires materially changed
 facts or substantive follow-up; a stopped child needs fresh authority.
 Grill remains childless, cannot enact operations or grant authority, and does
 not replace either formal governance review. Routine facts/ordering and
-unchanged blockers need no critic. No other children, operational fallback,
-depth increase or config changes are permitted. Continue whole-selection
-observation while criticism is pending; bound local observers.
+unchanged blockers need no critic. No children outside the explicit
+Grill/standalone contracts, critic substitution, depth increase or config
+changes are permitted. Continue whole-selection observation while criticism is
+pending; bound local observers.
+
+### Standalone runtime diagnosis
+
+Outside Workflow and within the existing child-depth limit, one bounded
+`runtime-smoke-tester` assignment per unchanged incident may diagnose already-
+authorized runtime work when direct facts and capable owner/replan routes are
+insufficient. Code reads/parser fixtures need no helper. Verify exact authority
+for environment/data/actions/run limits and the effective installed diagnostic
+mode before launch; an old locked role does not acquire it from a caller prompt.
+
+Require a compatible project standalone procedure with genuine child identity,
+exclusive resource ownership, own durable minimal state/evidence, reliable token
+capture and cleanup without Task checkpoint/lifecycle writes. A waiting owner
+still owns resources. Existing documented procedures may suffice; unavailable
+permitted persistence or unknown safety is a preflight blocker. No invented
+Task ID, prompt override, default-child fallback, new adapter by assumption or
+depth/config change. A lost-token path requiring a Task ID remains unavailable
+when the child lacks it.
+
+The runtime role selects a distinct diagnostic mode: bounded diagnosis rather
+than full Smoke defaults; no product/config/Git writes, Task lifecycle/checkpoint
+actions, children, waivers or official Smoke PASS. Build/install/start/account
+changes need applicable diagnostic authority. Preserve shared targeting,
+privacy, evidence audit, tool, lease and restoration safety; project commands
+or permitted first-class tools own private state/evidence, not shell edits.
+Existing Workflow Smoke behavior stays unchanged.
+
+Supervisor records child identity/mandate/intent/settlement, continues fair
+whole-selection observation and verifies semantic diagnosis plus owned-process,
+restoration and resource settlement. Do not abandon or restart an equivalent
+child; reconcile unfinished work before continuation. Read-only clarification
+of a completed child grants no runtime retry. The helper grants no extra
+run/spend or recovery-effect budget: its technical recovery shares the same
+incident budget, while read-only diagnosis is not itself recovery. Preserve
+limits after compaction. Kit source rollout alone does not qualify a project's
+standalone procedure or authorize a production canary.
+Pass incident identity, exact authority locators, allowed actions, remaining
+run/recovery allowance, prior attempts and unfinished intents to the helper.
+Reserve a delegated recovery attempt; supervisor and child cannot recover that
+incident concurrently before settlement. The child receives the shared
+one-effective-or-unsettled-attempt definition, reports recovery actions and
+settlement, and blocks recovery on missing allowance/settlement without
+blocking permitted read-only diagnosis. Native alternatives remain supervisor-
+owned. Before acquisition verify identity/conflicts/procedure; the serialized
+acquire establishes ownership, which is verified with persisted token before
+runtime actions. A free resource does not require a pre-existing lease.
 
 ### Authorized PR merge
 
@@ -297,6 +357,18 @@ nodes/group/context mode, input provenance, locked target/root, checkpoint,
 resource ownership and cleanup obligations. A fresh exact human instruction
 after a deliberate stop remains necessary.
 
+The only waiting-state exception covers a selected other Task in
+`waiting_question`/`waiting_approval` whose exact technical pending condition is
+already resolved by verified authority/evidence but its retained route is proved
+incompatible. Prefer answer/approve and owner/replan first. Waiting is ownership.
+The project-qualified native procedure must settle/supersede the exact old
+pending object/execution and exclude late answers or competing continuation
+before replacement runs. Preserve human judgment, independent review/approval,
+source/root, checkpoint/resources, cleanup and fan-out/Join. Changed route
+selectors require exact provenance and equivalent authorized meaning. Unknown
+settlement/semantics, unmet prerequisites or unresolved human judgment block
+reentry; this is not approval bypass or another recovery budget.
+
 An edge's existence or CLI help alone does not qualify its effect semantics.
 The project procedure must prove satisfied prerequisites, equivalent authority,
 preserved approval/review and fan-out/Join invariants. No fabricated success,
@@ -308,11 +380,33 @@ No graph/database writes, locked-target changes, actor bypass or stopping an
 owner to manufacture eligibility.
 
 Resume and native recovery share one automatic recovery-effect budget per
-incident without evidenced progress. A proved no-op must be diagnosed but
-does not consume an effect or erase authority; only a verified equivalent
-authorized route may follow without repeated consent. An unknown effect
-blocks new effects until reconciled. No transition enumeration; budgets
-survive restart/compaction. Unqualified semantics remain a capability gap.
+incident without evidenced progress. Diagnose known same-input failure before
+Resume and use a qualified equivalent route directly where allowed.
+At most one automatic Resume invocation per incident. A proved no-op may include
+a completed validation-only Script, qualified against exact executed code,
+dependencies/setup, actual attempt-specific failure path/completion, no runtime/
+resource/checkpoint/source/external effects or queued/active/deferred late work.
+Process creation, read-only validation and settled enqueue/status/audit
+bookkeeping alone do not spend the effect budget. Provider requests or actual
+effects spend it; unknown settlement reserves it until reconciliation. Failure
+or cleanup does not erase an effect; actual work briefly returning to its
+blocker is not a no-op.
+
+After a proved no-op at most one equivalent qualified native alternative may
+follow under existing authority and proved preconditions. Never a second Resume
+or third automatic route, even if the alternative also proves no-op. Reuse a
+matching existing qualification rather than demand a complete audit/new adapter
+per attempt, but prove current settlement. Do not falsify cursors or provenance
+or enumerate transitions. Budgets survive restart/compaction.
+Unqualified semantics remain a capability gap.
+An equivalent failure forbids another Resume, not a qualified native alternative
+after a proved no-op. Do not escalate solely for validation-only failure when
+that existing-authority alternative satisfies its contract.
+
+Repeated token capture/persistence/cleanup failures remain one root-cause incident
+across lease/Session/approval IDs. Fixture-check the exact owner's command/output
+grammar before another acquisition; do not repeat a broken parser and request
+the same cleanup. This grants no source edits or forbidden identity/token recovery.
 
 Never duplicate a Task's existing Question/Approval with a supervisor Question.
 Notify the caller of its exact decision once and continue independent help.
@@ -321,6 +415,9 @@ while observation continues elsewhere. Ask one concrete new decision with
 options and a recommendation only without an existing owning decision object
 and when a Session-wide pause is necessary or matches the caller's mode;
 then wait without polling that stopped incident.
+Use native Question UI for a genuinely new interactive decision; do not end
+observation merely to present an unrelayed question. Preserve real human stops
+and the headless return contract.
 The native Question may pause observation of all selected Tasks, not the Tasks
 themselves. After an answer or restart, first re-read **all selected Tasks**,
 discard stale/resolved work, reconcile unknown effects and fairly complete

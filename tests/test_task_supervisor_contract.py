@@ -14,8 +14,9 @@ def normalized(text: str) -> str:
 
 
 def section(text: str, heading: str) -> str:
+    level = len(heading.split(" ", 1)[0])
     match = re.search(
-        rf"(?m)^{re.escape(heading)}\n(?P<body>.*?)(?=^# |\Z)",
+        rf"(?m)^{re.escape(heading)}\n(?P<body>.*?)(?=^#{{1,{level}}} |\Z)",
         text,
         re.DOTALL,
     )
@@ -32,6 +33,7 @@ class TaskSupervisorContractTests(unittest.TestCase):
         cls.contract = normalized(
             (REPO_ROOT / "contracts/role-contract.md").read_text()
         )
+        cls.runtime = (REPO_ROOT / "agents/runtime-smoke-tester.md").read_text()
         cls.cases = json.loads(
             (REPO_ROOT / "tests/fixtures/supervisor-operational-cases.json").read_text()
         )
@@ -62,6 +64,17 @@ class TaskSupervisorContractTests(unittest.TestCase):
                 "unqualified-edge", "deliberate-stop", "ambiguous-effect",
                 "proved-noop", "fanout-invariants", "installation-unproved",
                 "compaction-catchup",
+                "known-futile-resume", "validation-only-script", "provider-effect",
+                "late-work-unknown", "alternate-also-noop", "reusable-qualification",
+                "running-is-not-noop", "qualified-waiting-reentry",
+                "waiting-human-gate", "diagnosis-not-ready", "diagnostic-helper",
+                "incompatible-helper", "waiting-resource-owner",
+                "helper-persistence", "helper-cleanup-open", "helper-shared-budget",
+                "report-deadline", "token-parser-incident", "native-cli-grammar",
+                "task-head-not-source-pin", "semantic-outcome",
+                "stage-provider-independent", "billing-and-run-limit",
+                "owner-git-capability", "stage-alternative-evidence",
+                "native-question-and-stop",
             },
         )
 
@@ -93,13 +106,14 @@ class TaskSupervisorContractTests(unittest.TestCase):
             "continue until all selected Tasks are terminal",
         ):
             self.assertNotIn(old_prohibition, self.text)
-        self.assertIn("Other Git writes and operational child agents remain prohibited", self.text)
+        self.assertIn("Other Git writes and generic operational children remain prohibited", self.text)
         self.assertIn("Do not edit product source, configuration, role prompts or Workflow graphs", self.text)
         self.assertIn("arbitrarily move or complete Tasks", self.text)
         self.assertIn("Do not create other children", self.text)
         for heading in (
             "# Operating cycle", "# Grill consultation", "# Authorized PR merge",
             "## Qualified native recovery",
+            "# Standalone runtime diagnosis", "# Diagnostic qualification",
         ):
             self.assertEqual(self.role.count(heading), 1)
 
@@ -140,6 +154,142 @@ class TaskSupervisorContractTests(unittest.TestCase):
         self.assertNotIn("contracts/role-contract.md", self.role)
         self.assertNotRegex(self.role, r"(?m)^\s*(model|tools)\s*:")
         self.assertNotIn("task-supervisor-v2", self.role)
+
+    def test_noop_budget_requires_attempt_settlement_and_bounds_invocations(self) -> None:
+        recovery = section(self.role, "## Qualified native recovery")
+        for guard in (
+            "completed validation-only Script", "exact executed code",
+            "relevant dependencies/setup", "actual attempt-specific failure path",
+            "no queued, active or deferred late work",
+            "settled enqueue/status/audit bookkeeping alone",
+            "Provider requests or actual effects spend it",
+            "unknown settlement reserves it until reconciled",
+            "Failure or cleanup does not erase an effect",
+            "A brief actual execution returning to its blocker is not a no-op",
+            "at most one equivalent qualified native alternative",
+            "Never a second Resume or a third automatic route",
+            "even if the alternative also proves no-op",
+            "Reuse a matching existing project qualification",
+            "prove current settlement separately",
+            "Do not falsify a cursor or input provenance",
+        ):
+            with self.subTest(guard=guard):
+                self.assertIn(guard, recovery)
+        retained = section(self.role, "## Retained execution")
+        self.assertIn("one automatic resume attempt per incident", retained)
+        self.assertIn("Diagnose a known same-input failure before Resume", retained)
+        self.assertIn("An equivalent failure does not permit another Resume", retained)
+        self.assertIn("do not escalate solely because a qualified validation-only", retained)
+        self.assertNotIn("blocks further automatic retries", retained)
+        self.assertNotIn("The only waiting-state exception", retained)
+
+    def test_waiting_reentry_is_not_gate_or_ownership_bypass(self) -> None:
+        recovery = section(self.role, "## Qualified native recovery")
+        for guard in (
+            "The only waiting-state exception", "`waiting_question`",
+            "`waiting_approval`", "exact technical pending condition",
+            "retained route is proved incompatible",
+            "Prefer ordinary answer/approve and owner/replan routes",
+            "Waiting is ownership",
+            "settle or supersede the exact old pending object/execution",
+            "exclude late answers or competing continuation",
+            "before replacement work runs", "required human judgment",
+            "independent approval/review", "Any changed route selector",
+            "exact provenance and equivalent authorized meaning",
+            "unqualified pending-object semantics block reentry",
+            "not permission to move around an approval",
+            "shares the recovery budget",
+        ):
+            with self.subTest(guard=guard):
+                self.assertIn(guard, recovery)
+
+    def test_supervisor_and_runtime_diagnosis_modes_are_coupled(self) -> None:
+        helper = section(self.role, "# Standalone runtime diagnosis")
+        for guard in (
+            "Outside Workflow", "kent run --agent runtime-smoke-tester",
+            "per unchanged incident", "when child depth permits",
+            "effective installed role's diagnostic mode",
+            "compatible project standalone procedure",
+            "own durable minimal state/evidence", "reliable token capture",
+            "without Task checkpoint/lifecycle writes",
+            "A waiting owner still owns its resources",
+            "Do not borrow its Task ID", "default-role fallback",
+            "unavailable permitted persistence is a preflight blocker",
+            "No product/config/Git writes", "official Smoke PASS",
+            "Keep inspecting the whole selection while it runs",
+            "A report without cleanup proof leaves an incident open",
+            "do not abandon a live child", "restart an equivalent helper",
+            "technical recovery uses the same incident budget",
+            "remaining run/recovery allowance, prior attempts and unfinished intents",
+            "Reserve any delegated recovery attempt",
+            "do not recover the same incident concurrently",
+            "Source rollout alone does not prove project compatibility",
+        ):
+            with self.subTest(guard=guard):
+                self.assertIn(guard, helper)
+        diagnosis = section(self.runtime, "# Standalone diagnosis")
+        for guard in (
+            "genuine Session identity", "exclusive resource ownership",
+            "own durable minimal diagnostic state/evidence",
+            "Do not borrow a Task ID", "touch an owner's checkpoint",
+            "Do not edit product source/configuration",
+            "act on Task lifecycle", "write Task checkpoints",
+            "grant waivers or create children",
+            "unavailable required persistence does not permit shell file edits",
+            "Never use a lost-token recovery path",
+            "Reconcile retained intent and effects",
+            "shares the supervisor incident's budget",
+            "One effective or unsettled recovery attempt",
+            "Missing allowance or settlement blocks recovery",
+            "continuing permitted read-only observations",
+            "recovery actions and their settlement",
+            "serialized lease operation",
+            "persisted token before runtime actions",
+            "processes/kept-open shells before resource release",
+            "Never return official Smoke PASS or a Workflow transition",
+            "Unknown cleanup leaves an open incident",
+        ):
+            with self.subTest(guard=guard):
+                self.assertIn(guard, diagnosis)
+        modes = section(self.runtime, "# Execution modes")
+        self.assertIn("defaults apply only to Workflow Smoke", modes)
+        self.assertIn("incompatible standalone procedure blocks diagnosis", modes)
+        smoke = section(self.runtime, "# Workflow Smoke")
+        self.assertIn("Exercise only the runtime scope selected by the workflow gate", smoke)
+        self.assertIn("smoke-checkpoint.json", smoke)
+        self.assertIn("first-class patch tool", smoke)
+        self.assertNotRegex(self.runtime, r"(?m)^\s*(model|tools)\s*:")
+        self.assertNotIn("start an operational child", self.text)
+        self.assertNotIn("No other children, operational fallback", self.contract)
+        self.assertNotIn("Before acquisition establish", diagnosis)
+
+    def test_reporting_and_diagnostics_are_bound_to_their_sections(self) -> None:
+        observation = section(self.role, "# Observation and escalation")
+        for guard in (
+            "report interval and next deadline", "Bound waits by that deadline",
+            "report while alive even when progress is unchanged",
+            "exception to change-only notifications",
+            "without inventing missed reports", "Use the native Question UI",
+            "Preserve real human stops and the headless return contract",
+        ):
+            self.assertIn(guard, observation)
+        qualification = section(self.role, "# Diagnostic qualification")
+        for guard in (
+            "A prerequisite-ready edge", "it is not a diagnostic route",
+            "Do not invent a mandatory billing-access gate",
+            "Respect accepted spend/run limits", "preflight exact-source readiness",
+            "Manual Stage checks do not require provider sandbox",
+            "Check the owner's actual capabilities",
+            "Alternative test evidence is not a mandatory Smoke PASS",
+            "Verify semantic outcome evidence", "Verify CLI grammar",
+            "Task-owned commits do not themselves invalidate the initial source pin",
+        ):
+            self.assertIn(guard, qualification)
+        resource = section(self.role, "# Resource recovery")
+        self.assertIn("one root-cause incident across new lease, Session and approval IDs", resource)
+        self.assertIn("fixture check of the exact owner's command and output grammar", resource)
+        evidence = section(self.role, "# Evidence and reporting")
+        self.assertIn("plus explicitly scheduled reports", evidence)
 
 
 if __name__ == "__main__":

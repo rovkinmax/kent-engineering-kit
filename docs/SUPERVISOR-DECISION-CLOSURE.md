@@ -18,10 +18,10 @@ Session. In autonomous/overnight mode, keep isolated human gates at their owners
 and continue independent help; a truly new supervisor Question can still pause
 its entire Session. No role prompt provides a scheduler or uninterrupted uptime.
 
-Three narrow contracts replace the former blanket restrictions:
+Narrow contracts replace the former blanket restrictions:
 
 - A material unresolved decision may receive one read-only Grill consultation
-  outside Workflow when child depth permits it. No operational child or depth
+  outside Workflow when child depth permits it. No generic operational child or depth
   increase is allowed. Grill is not a formal governance review.
 - An already-authorized selected Task's accepted PR may be merged directly,
   with exact repository/PR/base/head, method, checks, applicable authority and
@@ -36,6 +36,18 @@ Three narrow contracts replace the former blanket restrictions:
   recovery share one automatic effect budget per unchanged incident.
   A proved no-op permits only a verified equivalent route; an unknown effect
   requires reconciliation, not replay.
+- A selected other's waiting technical condition may use qualified native
+  reentry only when it is already resolved and retained routing is incompatible.
+  Waiting remains ownership: native settlement/supersession must exclude late
+  responses or competing continuation and preserve all judgments, review,
+  inputs, source, resource and cleanup obligations. Answer/approve/owner routes
+  come first; unknown semantics or unmet prerequisites remain blockers.
+- One bounded outside-Workflow standalone diagnosis may use the existing runtime
+  role when ordinary diagnosis/owner routes are insufficient. Its effective role
+  and project procedure must support genuine identity, exclusive lease, own
+  permitted persistence/evidence and cleanup without Task checkpoint/lifecycle
+  writes. Diagnosis is not official Smoke PASS or full-Smoke effect authority.
+  No source/Git writes, children, new run/spend or recovery budget.
 
 These contracts do not authorize source/config/graph edits, terminal shortcuts,
 human-only endpoint bypass, installation or restart. Requested outcome controls
@@ -49,6 +61,38 @@ The acceptance scenarios in
 Task recovery or remote merge. They additionally reject contradictory former
 blanket rules and bind the observation order and effect preconditions to their
 actual sections.
+
+### Five-Session follow-up
+
+The plan retains original Session/event locators for OSM-105/106/108/109/110,
+the combined Grill dispositions, frozen preview hash, two independent review
+receipts and subsequent human approval. Existing PR46 is preserved.
+
+The clarified budget allows one automatic Resume invocation and, after a proved
+no-op, at most one equivalent qualified native alternative. A completed local
+validation-only Script may be a no-op, but qualification binds exact executed
+code/dependencies/setup and the specific attempt's completion and absence of
+effects or queued/active/deferred late work. Process creation or settled control
+bookkeeping alone does not spend the effect budget; actual effects/provider
+requests do, and unknown settlement reserves it. Failure/cleanup, compaction or
+another approval ID never reset it. Existing matching qualification is reusable;
+current settlement is still required. Never a second Resume or third route.
+
+Operational clarifications preserve requested report deadlines, including
+unchanged-progress reports while alive and honest catch-up after a gap. They
+match diagnosis to transition prerequisites, fixture-check repeated token
+capture failures before reacquisition, verify CLI grammar and semantic evidence,
+and distinguish starting pin/current head/target. Independent Stage/provider
+conditions, actual owner capabilities, accepted alternative evidence and real
+run/security/scope limits remain separate; no invented billing-access gate.
+Interactive decisions use native Question UI rather than ending observation
+with an unrelayed question. Real user stops and headless boundaries remain.
+
+Kit-only source publication does not prove Appsome's standalone checkpoint/
+identity procedure compatible with diagnostic mode. No Appsome adapter edits,
+production operations or runtime canary are included. The runtime role remains
+shell-enabled and patch-disabled: permitted project commands must support any
+required persistence, otherwise eligibility fails before resource acquisition.
 
 ### Qualification after normal rollout
 
@@ -69,11 +113,19 @@ by source validation or by installing a prompt:
    pending approval, deliberate stop and competing ownership. Read back native
    execution/context and preserved group/cleanup obligations. Do not recover
    production Tasks for this test or fabricate their actor identities.
+   For waiting reentry, also prove settlement of the exact old pending object,
+   rejection of a late answer and preservation of mandatory independent review.
 4. Exercise merge decision logic with fixture-only provider responses for changed
    head, project-specific CI waiver, queue acceptance and lost response.
    A mock verifies decision handling, not the provider's actual atomicity.
    Any real disposable-repository merge needs separate remote-effect authority.
-5. Retain traces, installed/source digests, failed as well as passed cases, and
+5. Qualify standalone diagnosis with an explicitly authorized disposable runtime
+   procedure. Verify the adopted mode, real child identity, serialized acquisition,
+   permitted private persistence, budget handoff, no Task checkpoint writes,
+   semantic observations and cleanup. Exercise missing budget, conflicting
+   waiting owner, lost token and unfinished processes without production effects.
+   Neither role text nor an instruction-only sandbox assertion proves ownership.
+6. Retain traces, installed/source digests, failed as well as passed cases, and
    explicit unresolved limits. Unsafe or unqualified project routes remain
    unavailable; neither a green static test nor a critic's advice qualifies them.
 
