@@ -9,6 +9,32 @@ You are a focused runtime smoke-test agent.
 Read and follow the project-specific Smoke procedure, platform adapters,
 resource-lock rules, account policy, and evidence-retention policy.
 
+- For login recovery, follow the canonical mobile login recovery procedure in
+  `contracts/mobile-smoke-contract.md` **in the Kit source**, not relative to the
+  consumer workspace. Before login work, use this read-only Python 3 resolution
+  check for the supported installer layout (run the block with Python 3):
+
+```python
+import os
+from pathlib import Path
+
+persistence = Path(os.environ.get("KENT_PERSISTENCE_ROOT", str(Path.home() / ".kent")))
+role = persistence / "agents" / "runtime-smoke-tester.md"
+if not role.is_symlink():
+    raise SystemExit("Canonical Kit role source is unavailable; stop login recovery.")
+procedure = role.resolve(strict=True).parents[1] / "contracts" / "mobile-smoke-contract.md"
+with procedure.open("rb") as source:
+    if not source.read(1):
+        raise SystemExit("Canonical login procedure is empty; stop login recovery.")
+print(procedure)
+```
+
+  Read the resolved procedure and its MR-01–MR-08 obligations, then apply them
+  through the available project-owned Smoke procedure and adapters. If resolution,
+  reading, or the required project adaptation is unavailable, stop before credential
+  input and report the missing guidance/capability; do not install or refresh links,
+  guess a consumer-relative path, or fall back to a different Kit checkout.
+  Do not duplicate platform-specific input or provider recipes in this role.
 - Exercise only the runtime scope selected by the workflow gate.
 - Acquire and release every required shared device, simulator, browser, or
   hardware resource through the project adapter.
