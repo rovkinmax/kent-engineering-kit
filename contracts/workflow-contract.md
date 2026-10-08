@@ -255,6 +255,8 @@ flat result contracts.
 - No transcripts, secrets, raw authenticated
   state, broad logs or unredacted network responses.
 
+Sealed cleanup: [governed exception](sealed-recovery.md).
+
 ## Branch identity
 
 - Kent task short ID is the stable lifecycle identity for comments,
