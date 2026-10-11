@@ -1102,6 +1102,19 @@ sys.exit(released.returncode)
         self.assertIn("owner_kind=UnknownOwner\n", inspect_interrupted.stdout)
         self.assertIn("owner_sha256=unknown\n", inspect_interrupted.stdout)
 
+    def test_seeded_runtime_is_private_under_permissive_umask(self) -> None:
+        previous_umask = os.umask(0o022)
+        try:
+            owner = self.seed_lock(task_id="KEN-6")
+        finally:
+            os.umask(previous_umask)
+        runtime_stat = self.runtime_root.stat()
+        self.assertEqual(runtime_stat.st_mode & 0o7777, 0o700)
+        self.assertEqual(runtime_stat.st_uid, os.getuid())
+        self.assertEqual(owner.parent.stat().st_mode & 0o7777, 0o700)
+        status = self.run_adapter("status", RESOURCE)
+        self.assertEqual(status.returncode, 0, status.stderr)
+
     def lock_path(self, resource: str = RESOURCE) -> Path:
         return self.runtime_root / f"mobile-{resource}.lock"
 
@@ -1113,6 +1126,7 @@ sys.exit(released.returncode)
         token: str = FIXTURE_TOKEN,
         created_at: int | None = None,
     ) -> Path:
+        self.runtime_root.mkdir(mode=0o700, exist_ok=True)
         directory = self.lock_path(resource)
         directory.mkdir(parents=True)
         directory.chmod(0o700)
