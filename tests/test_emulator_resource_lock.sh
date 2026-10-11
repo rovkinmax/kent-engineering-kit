@@ -158,6 +158,7 @@ set -e
 
 stale_token="$("$adapter" acquire emulator-5554 0 7200)"
 stale_dir="$KENT_RESOURCE_LOCK_DIR/mobile-emulator-5554.lock"
+python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); data=p.read_bytes(); p.write_bytes(data.replace(b"created_at=" + next(line.split(b"=",1)[1] for line in data.splitlines() if line.startswith(b"created_at=")) + b"\n", b"created_at=1\n"))' "$stale_dir/owner"
 printf '1\n' >"$stale_dir/created_at"
 replacement_file="$temporary/replacement-token"
 "$adapter" acquire emulator-5554 5 1 \
@@ -176,38 +177,55 @@ replacement_token="$(cat "$replacement_file")"
 [[ "$("$adapter" status emulator-5554 | head -1)" == "locked" ]]
 "$adapter" release emulator-5554 "$replacement_token"
 
-if command -v flock >/dev/null 2>&1; then
-  flock_token="$(
-    KENT_RESOURCE_LOCK_BACKEND=flock \
-      "$adapter" acquire emulator-5557 0 7200
-  )"
-  [[ -n "$flock_token" ]]
-  [[ "$(
-    KENT_RESOURCE_LOCK_BACKEND=flock \
-      "$adapter" status emulator-5557 | head -1
-  )" == "locked" ]]
-  KENT_RESOURCE_LOCK_BACKEND=flock \
-    "$adapter" release emulator-5557 "$flock_token"
-  echo "flock backend tests passed"
-else
-  echo "flock backend unavailable"
-fi
+case "$(uname -s)" in
+  Darwin)
+    backend=lockf
+    incompatible_backend=flock
+    ;;
+  Linux)
+    backend=flock
+    incompatible_backend=lockf
+    ;;
+  *)
+    echo "unsupported test host for shared resource locking" >&2
+    exit 69
+    ;;
+esac
 
-if command -v lockf >/dev/null 2>&1; then
-  lockf_token="$(
-    KENT_RESOURCE_LOCK_BACKEND=lockf \
-      "$adapter" acquire emulator-5558 0 7200
-  )"
-  [[ -n "$lockf_token" ]]
-  [[ "$(
-    KENT_RESOURCE_LOCK_BACKEND=lockf \
-      "$adapter" status emulator-5558 | head -1
-  )" == "locked" ]]
-  KENT_RESOURCE_LOCK_BACKEND=lockf \
-    "$adapter" release emulator-5558 "$lockf_token"
-  echo "lockf backend tests passed"
-else
-  echo "lockf backend unavailable"
-fi
+set +e
+KENT_RESOURCE_LOCK_BACKEND="$incompatible_backend" \
+  "$adapter" acquire emulator-5557 0 7200 >/dev/null 2>&1
+incompatible_status=$?
+set -e
+[[ "$incompatible_status" -eq 69 ]]
+
+stable_token="$(
+  KENT_RESOURCE_LOCK_BACKEND="$backend" \
+    "$adapter" acquire emulator-5557 0 7200
+)"
+guard_file="$KENT_RESOURCE_LOCK_DIR/.guards/mobile-emulator-5557.guard"
+guard_inode_before="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$guard_file")"
+KENT_RESOURCE_LOCK_BACKEND="$backend" \
+  "$adapter" release emulator-5557 "$stable_token"
+guard_inode_after="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$guard_file")"
+[[ "$guard_inode_before" == "$guard_inode_after" ]]
+[[ -f "$guard_file" && ! -L "$guard_file" ]]
+echo "$backend canonical backend and stable guard tests passed"
+
+shadow="$temporary/shadow"
+mkdir -p "$shadow"
+cat >"$shadow/$backend" <<'SHADOW'
+#!/usr/bin/env sh
+echo shadow-backend-ran >&2
+exit 91
+SHADOW
+chmod 700 "$shadow/$backend"
+set +e
+PATH="$shadow:$PATH" "$adapter" acquire emulator-5558 0 7200 >/dev/null 2>"$temporary/shadow.err"
+shadow_status=$?
+set -e
+[[ "$shadow_status" -eq 69 ]]
+! grep -q 'shadow-backend-ran' "$temporary/shadow.err"
+[[ ! -d "$KENT_RESOURCE_LOCK_DIR/mobile-emulator-5558.lock" ]]
 
 echo "emulator resource lock tests passed"

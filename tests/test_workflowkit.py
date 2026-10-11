@@ -6683,6 +6683,52 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             ).read_bytes(),
         )
 
+    def test_mobile_script_lease_contract_and_kernel_surface_are_present(
+        self,
+    ) -> None:
+        contract = (
+            REPO_ROOT / "contracts" / "mobile-script-lease-contract.md"
+        ).read_text(encoding="utf-8")
+        mobile_contract = (
+            REPO_ROOT / "contracts" / "mobile-smoke-contract.md"
+        ).read_text(encoding="utf-8")
+        workflow_contract = (
+            REPO_ROOT / "contracts" / "workflow-contract.md"
+        ).read_text(encoding="utf-8")
+        kernel = (
+            REPO_ROOT
+            / "templates"
+            / "project"
+            / "emulator-resource-lock.sh"
+        ).read_text(encoding="utf-8")
+
+        for phrase in (
+            "LegacySessionOwner",
+            "ScriptOwnerV1",
+            "UnknownOwner",
+            "acquire-script-any",
+            "release-script",
+            "inspect-script-recovery",
+            "owner_sha256",
+            "lockf -k",
+            "PATH-shadowed executables",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, contract)
+        self.assertNotIn("resume-script", contract)
+        self.assertIn("mobile-script-lease-contract.md", mobile_contract)
+        self.assertIn("must not impersonate a Session", workflow_contract)
+        for operation in (
+            "acquire-script",
+            "acquire-script-any",
+            "release-script",
+            "inspect-script-recovery",
+        ):
+            with self.subTest(operation=operation):
+                self.assertIn(operation, kernel)
+        self.assertIn("proc_pidinfo", kernel)
+        self.assertIn("/proc/sys/kernel/random/boot_id", kernel)
+
     def test_sync_schema4_runtime_v2_copies_byte_identical_support_module(
         self,
     ) -> None:
