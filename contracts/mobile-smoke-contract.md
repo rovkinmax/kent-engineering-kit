@@ -229,6 +229,11 @@ or another security control.
 
 ## Interaction Proof
 
+- Session-owned Smoke leases keep their existing checkpoint and recovery
+  protocol. Script-owned work must use the shared typed Script-owner protocol
+  in `contracts/mobile-script-lease-contract.md`; it must not impersonate a
+  Session or place a Script token in workflow evidence. Unknown or ambiguous
+  Script ownership preserves the shared record and blocks recovery.
 - Apply the project/task form-factor constraint before locking a runtime target.
   Never send a mixed phone/TV/watch/automotive candidate list to
   `acquire-any`. Resolve eligible serials deterministically, acquire one exact

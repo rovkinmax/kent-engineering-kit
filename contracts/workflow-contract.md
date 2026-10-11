@@ -367,9 +367,8 @@ Sealed cleanup: [governed exception](sealed-recovery.md).
   original evidence before escalating missing bookkeeping, following
   `contracts/plan-contract.md`. Use `needs_user_action` only for necessary
   authority still unavailable or a real unresolved decision.
-- Resource-owning nodes such as Smoke must release locks, preserve required
-  authentication and app data, record whether any destructive action began,
-  and finish evidence hygiene before returning `needs_changes`.
+- Smoke follows [contract](mobile-smoke-contract.md); record destructive-action
+  status. Scripts use [lease](mobile-script-lease-contract.md) and must not impersonate a Session; on ambiguity preserve state and block recovery.
 - Do not use a manual task move merely to inject feedback into an active node;
   it can bypass node-owned cleanup and evidence reporting.
 

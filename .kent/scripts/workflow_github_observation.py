@@ -20,6 +20,8 @@ MAX_QUERY_BYTES = 4 * 1024 * 1024
 MAX_FEEDBACK_ITEMS = 1000
 MAX_CHECKS = 10000
 MAX_BODY_BYTES = 64 * 1024
+GROUP_SETTLEMENT_SECONDS = 0.2
+GROUP_SETTLEMENT_PROBES = 40
 PR_FIELDS = (
     "state,mergedAt,mergeCommit,headRefName,headRefOid,baseRefName,baseRefOid,"
     "url,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup"
@@ -93,20 +95,55 @@ def resolve_gh_bin() -> str:
     raise ObservationError("github_cli_unavailable")
 
 
+def _signal_owned_group(process: subprocess.Popen[bytes], operation: int) -> bool:
+    try:
+        os.killpg(process.pid, operation)
+    except ProcessLookupError:
+        return False
+    except PermissionError as original:
+        # A disappearing zombie-only group can report EPERM on Darwin.
+        # Only an explicit subsequent ESRCH proves disappearance.
+        deadline = time.monotonic() + GROUP_SETTLEMENT_SECONDS
+        for _ in range(GROUP_SETTLEMENT_PROBES):
+            try:
+                process.poll()
+            except OSError:
+                raise original
+            if time.monotonic() >= deadline:
+                raise original
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                try:
+                    process.poll()
+                except OSError:
+                    raise original
+                return False
+            except PermissionError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise original
+                time.sleep(min(0.005, remaining))
+            except OSError:
+                raise original
+            else:
+                raise original
+        raise original
+    return True
+
+
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
     # The group is owned by this invocation, including pipe-holding descendants.
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    if not _signal_owned_group(process, signal.SIGTERM):
+        process.poll()
+        return
     try:
         process.wait(timeout=0.2)
     except subprocess.TimeoutExpired:
         pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    if not _signal_owned_group(process, signal.SIGKILL):
+        process.poll()
+        return
     process.wait()
 
 
@@ -161,18 +198,15 @@ def _read_transport(
             process.wait(timeout=max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             failure = "query_timeout"
-    if failure:
-        _stop_process(process)
-    else:
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            pass
-        else:
+    try:
+        if failure:
+            _stop_process(process)
+        elif _signal_owned_group(process, 0):
             _stop_process(process)
             failure = "query_failed"
-    process.stdout.close()
-    process.stderr.close()
+    finally:
+        process.stdout.close()
+        process.stderr.close()
     stdout, stderr = bytes(output["stdout"]), bytes(output["stderr"])
     if failure or process.returncode not in accepted_exit_codes:
         raise ObservationError(

@@ -4,11 +4,15 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+
+from workflowkit import github_observation as observation
 
 from workflowkit.github_observation import (
     GitHubObserver,
@@ -22,6 +26,183 @@ from workflowkit.github_observation import (
 URL = "https://github.com/owner/repository/pull/12"
 HEAD = "a" * 40
 BASE = "b" * 40
+
+
+class OwnedGroupSettlementTest(unittest.TestCase):
+    def process(self):
+        process = mock.Mock()
+        process.pid = 424242
+        process.returncode = 0
+        process.poll.return_value = 0
+        return process
+
+    def site(self, process, site):
+        if site == "probe":
+            return observation._signal_owned_group(process, 0)
+        observation._stop_process(process)
+        return False
+
+    def prefix(self, site):
+        return [None] if site == "kill" else []
+
+    def expected_operations(self, site):
+        return {"term": [signal.SIGTERM, 0], "kill": [signal.SIGTERM, signal.SIGKILL, 0],
+                "probe": [0, 0]}[site]
+
+    def test_confirmed_absence_settles_each_site_without_another_signal(self):
+        for site in ("term", "kill", "probe"):
+            with self.subTest(site=site):
+                process = self.process()
+                denied = PermissionError(1, "fixture permission denial")
+                with mock.patch.object(observation.os, "killpg",
+                    side_effect=self.prefix(site) + [denied, ProcessLookupError()]) as signals:
+                    self.assertFalse(self.site(process, site))
+                self.assertEqual([call.args[1] for call in signals.call_args_list],
+                                 self.expected_operations(site))
+                self.assertEqual(process.wait.call_count, int(site == "kill"))
+                self.assertTrue(process.poll.called)
+
+    def test_accessible_survivor_preserves_original_denial_at_each_site(self):
+        for site in ("term", "kill", "probe"):
+            with self.subTest(site=site):
+                denied = PermissionError(1, "fixture original permission denial")
+                with mock.patch.object(observation.os, "killpg",
+                    side_effect=self.prefix(site) + [denied, None]) as signals:
+                    with self.assertRaises(PermissionError) as raised:
+                        self.site(self.process(), site)
+                self.assertIs(raised.exception, denied)
+                self.assertEqual([call.args[1] for call in signals.call_args_list],
+                                 self.expected_operations(site))
+
+    def test_persistent_denial_has_a_probe_bound_at_each_site(self):
+        for site in ("term", "kill", "probe"):
+            with self.subTest(site=site):
+                denied = PermissionError(1, "fixture original permission denial")
+                with mock.patch.object(observation.os, "killpg",
+                    side_effect=self.prefix(site) + [denied] * 41) as signals, \
+                     mock.patch.object(observation.time, "monotonic", return_value=100.0), \
+                     mock.patch.object(observation.time, "sleep") as sleep:
+                    with self.assertRaises(PermissionError) as raised:
+                        self.site(self.process(), site)
+                self.assertIs(raised.exception, denied)
+                self.assertEqual(signals.call_count, len(self.prefix(site)) + 41)
+                self.assertEqual(sleep.call_count, 40)
+                self.assertEqual([call.args[1] for call in signals.call_args_list[1 + len(self.prefix(site)):]],
+                                 [0] * 40)
+
+    def test_persistent_denial_has_a_monotonic_deadline_at_each_site(self):
+        for site in ("term", "kill", "probe"):
+            with self.subTest(site=site):
+                denied = PermissionError(1, "fixture original permission denial")
+                with mock.patch.object(observation.os, "killpg",
+                    side_effect=self.prefix(site) + [denied]), \
+                     mock.patch.object(observation.time, "monotonic",
+                                       side_effect=[100.0, 100.2]), \
+                     mock.patch.object(observation.time, "sleep") as sleep:
+                    with self.assertRaises(PermissionError) as raised:
+                        self.site(self.process(), site)
+                self.assertIs(raised.exception, denied)
+                sleep.assert_not_called()
+
+    def test_ordinary_absence_and_other_errors_remain_distinct(self):
+        for site in ("term", "kill", "probe"):
+            with self.subTest(site=site, outcome="absent"):
+                with mock.patch.object(observation.os, "killpg",
+                    side_effect=self.prefix(site) + [ProcessLookupError()]) as signals:
+                    self.assertFalse(self.site(self.process(), site))
+                self.assertEqual(signals.call_count, 1 + len(self.prefix(site)))
+            with self.subTest(site=site, outcome="unexpected"):
+                unexpected = OSError(5, "fixture IO error")
+                with mock.patch.object(observation.os, "killpg",
+                    side_effect=self.prefix(site) + [unexpected]):
+                    with self.assertRaises(OSError) as raised:
+                        self.site(self.process(), site)
+                self.assertIs(raised.exception, unexpected)
+
+    def test_unknown_probe_error_does_not_replace_original_denial(self):
+        for site in ("term", "kill", "probe"):
+            with self.subTest(site=site):
+                denied = PermissionError(1, "fixture original permission denial")
+                with mock.patch.object(observation.os, "killpg",
+                    side_effect=self.prefix(site) + [denied, OSError(5, "probe")]):
+                    with self.assertRaises(PermissionError) as raised:
+                        self.site(self.process(), site)
+                self.assertIs(raised.exception, denied)
+
+    def test_transport_closes_pipes_and_preserves_each_site_exception(self):
+        class EmptySelector:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def register(self, *_):
+                pass
+
+            def get_map(self):
+                return {}
+
+        for site in ("term", "kill", "probe"):
+            with self.subTest(site=site):
+                process = self.process()
+                denied = PermissionError(1, "fixture original permission denial")
+                process.wait.side_effect = [None] if site == "probe" else [
+                    subprocess.TimeoutExpired("fixture", 1), None,
+                ]
+                with mock.patch.object(observation.subprocess, "Popen", return_value=process), \
+                     mock.patch.object(observation.selectors, "DefaultSelector", EmptySelector), \
+                     mock.patch.object(observation.os, "killpg",
+                                       side_effect=self.prefix(site) + [denied, None]):
+                    with self.assertRaises(PermissionError) as raised:
+                        observation.read_bytes("fixture", Path.cwd(), [], timeout=1)
+                self.assertIs(raised.exception, denied)
+                process.stdout.close.assert_called_once()
+                process.stderr.close.assert_called_once()
+
+    def test_settled_cleanup_preserves_timeout_and_observation_hashes(self):
+        process = self.process()
+        process.wait.side_effect = subprocess.TimeoutExpired("fixture", 1)
+        denied = PermissionError(1, "fixture original permission denial")
+        with mock.patch.object(observation.subprocess, "Popen", return_value=process), \
+             mock.patch.object(observation.selectors, "DefaultSelector") as selector, \
+             mock.patch.object(observation.os, "killpg", side_effect=[denied, ProcessLookupError()]):
+            selector.return_value.__enter__.return_value.get_map.return_value = {}
+            with self.assertRaises(ObservationError) as raised:
+                observation.read_bytes("fixture", Path.cwd(), [], timeout=1)
+        self.assertEqual(raised.exception.code, "query_timeout")
+        self.assertEqual(raised.exception.stdout_sha256,
+                         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        self.assertEqual(raised.exception.stderr_sha256, raised.exception.stdout_sha256)
+        process.stdout.close.assert_called_once()
+        process.stderr.close.assert_called_once()
+
+    def test_settled_cleanup_preserves_output_limit_and_query_failure(self):
+        for failure in ("observation_limit", "query_failed"):
+            with self.subTest(failure=failure):
+                process = self.process()
+                denied = PermissionError(1, "fixture original permission denial")
+                output = b"xy" if failure == "observation_limit" else b""
+                operations = [denied, ProcessLookupError()]
+                if failure == "query_failed":
+                    operations.insert(0, None)
+                with mock.patch.object(observation.subprocess, "Popen", return_value=process), \
+                     mock.patch.object(observation.selectors, "DefaultSelector") as selector, \
+                     mock.patch.object(observation.os, "killpg", side_effect=operations) as signals, \
+                     mock.patch.object(observation.os, "read", return_value=b"xyz"):
+                    active = selector.return_value.__enter__.return_value
+                    active.get_map.return_value = failure == "observation_limit"
+                    active.select.return_value = [
+                        (type("Event", (), {"fileobj": process.stdout, "data": "stdout"})(), 1),
+                    ]
+                    with self.assertRaises(ObservationError) as raised:
+                        observation.read_bytes("fixture", Path.cwd(), [], timeout=1, limit=1)
+                self.assertEqual(raised.exception.code, failure)
+                self.assertEqual(raised.exception.stdout_sha256, observation.hashlib.sha256(output).hexdigest())
+                self.assertEqual(raised.exception.stderr_sha256, observation.hashlib.sha256(b"").hexdigest())
+                self.assertNotIn(signal.SIGKILL, [call.args[1] for call in signals.call_args_list])
+                process.stdout.close.assert_called_once()
+                process.stderr.close.assert_called_once()
 
 
 def pr(**changes):

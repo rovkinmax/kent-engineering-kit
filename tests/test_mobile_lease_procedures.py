@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
+import platform
 import re
+import selectors
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 
@@ -20,9 +25,11 @@ CHECKPOINT_TOKEN = "synthetic-checkpoint-token"
 SESSION_ONE = "11111111-1111-4111-8111-111111111111"
 SESSION_TWO = "22222222-2222-4222-8222-222222222222"
 NATIVE_TASK_ID = "task-b6672872-8aaf-4dc9-ba9c-dfab7393a5b4"
+SCRIPT_CONTEXT_SHA256 = "a" * 64
 FIXED_NOW = 1_800_000_000
 RESOURCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SCRIPT_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
 def incident_fixture(name: str) -> dict[str, object]:
@@ -124,7 +131,12 @@ def parse_locked_status(output: str, *, expected_resource: str) -> dict[str, str
 
 class MobileLeaseRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.private_root = ROOT / "build" / "kent-workflow" / "KEN-6"
+        self.private_root = Path(
+            os.environ.get(
+                "KENT_MOBILE_LEASE_TEST_ROOT",
+                str(ROOT / "build" / "kent-workflow" / "KEN-6"),
+            )
+        ).resolve()
         self.private_root.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=self.private_root)
         self.temporary_root = Path(self.temporary.name)
@@ -178,14 +190,17 @@ esac
         task_id: str | None | object = "KEN-6",
         session_id: str | None | object = SESSION_ONE,
         backend: str = "auto",
+        stdin_text: str | None = None,
+        path_prefix: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        prefix = path_prefix or self.fake_bin
         environment = os.environ.copy()
         environment.update(
             {
                 "KENT_RESOURCE_LOCK_DIR": str(self.runtime_root),
                 "KENT_RESOURCE_LOCK_OWNER_PID": "424242",
                 "KENT_RESOURCE_LOCK_BACKEND": backend,
-                "PATH": f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "PATH": f"{prefix}{os.pathsep}{os.environ['PATH']}",
             }
         )
         for key, value in (
@@ -202,7 +217,42 @@ esac
             capture_output=True,
             text=True,
             env=environment,
+            input=stdin_text,
         )
+
+    def script_request(
+        self,
+        *,
+        task_id: str = NATIVE_TASK_ID,
+        context_sha256: str = SCRIPT_CONTEXT_SHA256,
+        pid: int | None = None,
+        token: str | None = None,
+        owner_sha256: str | None = None,
+    ) -> str:
+        fields = [
+            "schema=mobile-script-lease-request-v1",
+            f"task_id={task_id}",
+            f"context_sha256={context_sha256}",
+            f"pid={os.getpid() if pid is None else pid}",
+        ]
+        if token is not None or owner_sha256 is not None:
+            fields.extend((f"token={token or ''}", f"owner_sha256={owner_sha256 or ''}"))
+        return "\n".join(fields) + "\n"
+
+    def acquire_script(self, resource: str = RESOURCE) -> dict[str, str]:
+        result = self.run_adapter(
+            "acquire-script",
+            resource,
+            "0",
+            stdin_text=self.script_request(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(
+            [line.split("=", 1)[0] for line in lines],
+            ["schema", "resource", "token", "owner_sha256"],
+        )
+        return dict(line.split("=", 1) for line in lines)
 
     def assert_backend_lease_round_trip(self, backend: str) -> None:
         acquired = self.run_adapter(
@@ -225,13 +275,832 @@ esac
         self.assertEqual(status.returncode, 0)
         self.assertEqual(status.stdout.strip(), "unlocked")
 
-    @unittest.skipUnless(shutil.which("flock"), "flock backend unavailable")
+    @unittest.skipUnless(
+        platform.system() == "Linux" and shutil.which("flock"),
+        "canonical flock backend is Linux-only",
+    )
     def test_flock_backend_lease_round_trip(self) -> None:
         self.assert_backend_lease_round_trip("flock")
 
-    @unittest.skipUnless(shutil.which("lockf"), "lockf backend unavailable")
+    @unittest.skipUnless(
+        platform.system() == "Darwin" and shutil.which("lockf"),
+        "canonical lockf backend is Darwin-only",
+    )
     def test_lockf_backend_lease_round_trip(self) -> None:
         self.assert_backend_lease_round_trip("lockf")
+
+    def test_noncanonical_or_mixed_path_backend_fails_closed(self) -> None:
+        unsupported = "flock" if platform.system() == "Darwin" else "lockf"
+        refused = self.run_adapter(
+            "acquire", RESOURCE, "0", "7200", backend=unsupported
+        )
+        self.assertEqual(refused.returncode, 69)
+        self.assertFalse(self.runtime_root.exists())
+
+        backend = "lockf" if platform.system() == "Darwin" else "flock"
+        shadow = self.temporary_root / "shadow"
+        shadow.mkdir()
+        self.write_executable(
+            shadow / backend,
+            "#!/bin/sh\necho shadow-backend-ran >&2\nexit 91\n",
+        )
+        mixed = self.run_adapter(
+            "acquire", RESOURCE, "0", "7200", path_prefix=shadow
+        )
+        self.assertEqual(mixed.returncode, 69)
+        self.assertIn("path_mismatch", mixed.stderr)
+        self.assertNotIn("shadow-backend-ran", mixed.stderr)
+        self.assertFalse(self.runtime_root.exists())
+
+    def test_script_acquire_release_and_inspect_use_private_shared_record(self) -> None:
+        result = self.acquire_script()
+        self.assertEqual(result["schema"], "mobile-script-lease-result-v1")
+        self.assertEqual(result["resource"], RESOURCE)
+        self.assertTrue(SCRIPT_TOKEN_PATTERN.fullmatch(result["token"]))
+
+        owner_file = self.lock_path() / "owner"
+        owner_bytes = owner_file.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(owner_bytes).hexdigest(),
+            result["owner_sha256"],
+        )
+        fields = dict(
+            line.split("=", 1)
+            for line in owner_bytes.decode("ascii").splitlines()
+        )
+        self.assertEqual(
+            tuple(fields),
+            (
+                "owner_schema",
+                "owner_kind",
+                "token",
+                "resource",
+                "task_id",
+                "context_sha256",
+                "pid",
+                "process_platform",
+                "boot_id",
+                "process_start",
+                "pgid",
+                "cwd",
+                "created_at",
+            ),
+        )
+        self.assertEqual(fields["owner_schema"], "mobile-script-owner-v1")
+        self.assertEqual(fields["owner_kind"], "script")
+        self.assertEqual(fields["task_id"], NATIVE_TASK_ID)
+        self.assertEqual(fields["context_sha256"], SCRIPT_CONTEXT_SHA256)
+        self.assertEqual(fields["pid"], str(os.getpid()))
+        self.assertNotIn("session_id", fields)
+
+        guard = self.runtime_root / ".guards" / f"mobile-{RESOURCE}.guard"
+        guard_inode = guard.stat().st_ino
+        status = self.run_adapter("status", RESOURCE)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("token=<redacted>", status.stdout)
+        self.assertNotIn(result["token"], status.stdout)
+
+        inspected = self.run_adapter("inspect-script-recovery", RESOURCE)
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        self.assertEqual(
+            inspected.stdout.splitlines(),
+            [
+                "schema=mobile-script-recovery-v1",
+                f"resource={RESOURCE}",
+                "owner_kind=ScriptOwnerV1",
+                f"owner_sha256={result['owner_sha256']}",
+            ],
+        )
+        self.assertNotIn(result["token"], inspected.stdout)
+
+        released = self.run_adapter(
+            "release-script",
+            RESOURCE,
+            stdin_text=self.script_request(
+                token=result["token"],
+                owner_sha256=result["owner_sha256"],
+            ),
+        )
+        self.assertEqual(released.returncode, 0, released.stderr)
+        self.assertEqual(released.stdout, "")
+        self.assertFalse(self.lock_path().exists())
+        self.assertTrue(guard.is_file())
+        self.assertEqual(guard.stat().st_ino, guard_inode)
+        self.assertEqual(guard.stat().st_size, 0)
+
+        absent = self.run_adapter("inspect-script-recovery", RESOURCE)
+        self.assertEqual(absent.returncode, 0, absent.stderr)
+        self.assertEqual(
+            absent.stdout.splitlines(),
+            [
+                "schema=mobile-script-recovery-v1",
+                f"resource={RESOURCE}",
+                "owner_kind=Absent",
+                "owner_sha256=none",
+            ],
+        )
+
+    def test_script_inspection_does_not_create_any_runtime_state(self) -> None:
+        inspected = self.run_adapter(
+            "inspect-script-recovery",
+            "emulator-inspect-absent",
+        )
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        self.assertEqual(
+            inspected.stdout.splitlines(),
+            [
+                "schema=mobile-script-recovery-v1",
+                "resource=emulator-inspect-absent",
+                "owner_kind=Absent",
+                "owner_sha256=none",
+            ],
+        )
+        self.assertFalse(self.runtime_root.exists())
+
+    def test_script_request_rejects_duplicate_unknown_reordered_and_oversized(self) -> None:
+        valid = self.script_request()
+        malformed = (
+            valid.replace(
+                "task_id=",
+                "unknown=value\ntask_id=",
+            ),
+            valid.replace(
+                f"task_id={NATIVE_TASK_ID}\n",
+                f"task_id={NATIVE_TASK_ID}\ntask_id={NATIVE_TASK_ID}\n",
+            ),
+            "\n".join(reversed(valid.splitlines())) + "\n",
+            valid + "unexpected=value\n",
+            valid + ("x" * 1025),
+            valid.replace("\n", "\r\n"),
+            valid.replace("task_id=", "\x00task_id="),
+        )
+        for request in malformed:
+            with self.subTest(request_size=len(request)):
+                result = self.run_adapter(
+                    "acquire-script",
+                    RESOURCE,
+                    "0",
+                    stdin_text=request,
+                )
+                self.assertEqual(result.returncode, 64)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse(self.runtime_root.exists())
+
+        invalid_task = self.run_adapter(
+            "acquire-script",
+            RESOURCE,
+            "0",
+            stdin_text=self.script_request(task_id="KEN-6"),
+        )
+        self.assertEqual(invalid_task.returncode, 64)
+        self.assertFalse(self.runtime_root.exists())
+
+    def test_script_acquisition_blocks_valid_session_owner_without_rewrite(self) -> None:
+        owner = self.seed_lock(task_id="KEN-6")
+        original = owner.read_bytes()
+        acquired = self.run_adapter(
+            "acquire-script",
+            RESOURCE,
+            "0",
+            stdin_text=self.script_request(),
+        )
+        self.assertEqual(acquired.returncode, 75)
+        self.assertEqual(owner.read_bytes(), original)
+
+    def test_script_acquisition_preserves_unknown_legacy_owner(self) -> None:
+        owner = self.seed_lock(task_id="KEN-6")
+        owner.write_bytes(
+            owner.read_bytes().replace(
+                f"session_id={SESSION_ONE}\n".encode("ascii"),
+                b"session_id=unknown\n",
+            )
+        )
+        original = owner.read_bytes()
+
+        acquired = self.run_adapter(
+            "acquire-script",
+            RESOURCE,
+            "0",
+            stdin_text=self.script_request(),
+        )
+        self.assertEqual(acquired.returncode, 75)
+        self.assertEqual(owner.read_bytes(), original)
+
+        inspected = self.run_adapter("inspect-script-recovery", RESOURCE)
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        self.assertIn("owner_kind=UnknownOwner\n", inspected.stdout)
+        self.assertIn("owner_sha256=unknown\n", inspected.stdout)
+
+    def test_session_operations_cannot_relabel_or_release_script_owner(self) -> None:
+        result = self.acquire_script()
+        owner = self.lock_path() / "owner"
+        original = owner.read_bytes()
+
+        for arguments in (
+            ("acquire", RESOURCE, "0", "0"),
+            ("resume", RESOURCE, result["token"]),
+            ("resume-owned", RESOURCE),
+            ("release", RESOURCE, result["token"]),
+        ):
+            with self.subTest(operation=arguments[0]):
+                refused = self.run_adapter(*arguments)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertEqual(owner.read_bytes(), original)
+
+        # A valid but old Script record remains Script-owned and is not TTL
+        # reclaimed by the existing Session acquisition path.
+        aged = original.replace(b"created_at=1800000000\n", b"created_at=1\n")
+        owner.write_bytes(aged)
+        (owner.parent / "created_at").write_text("1\n", encoding="ascii")
+        owner.chmod(0o600)
+        (owner.parent / "created_at").chmod(0o600)
+        original = owner.read_bytes()
+        refused = self.run_adapter("acquire", RESOURCE, "0", "0")
+        self.assertEqual(refused.returncode, 75)
+        self.assertEqual(owner.read_bytes(), original)
+
+        digest = hashlib.sha256(original).hexdigest()
+        released = self.run_adapter(
+            "release-script",
+            RESOURCE,
+            stdin_text=self.script_request(
+                token=result["token"],
+                owner_sha256=digest,
+            ),
+        )
+        self.assertEqual(released.returncode, 0, released.stderr)
+
+    def test_script_release_mismatches_preserve_owner_and_process_start(self) -> None:
+        result = self.acquire_script()
+        owner = self.lock_path() / "owner"
+        original = owner.read_bytes()
+        invalid_requests = (
+            self.script_request(
+                task_id="task-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                token=result["token"],
+                owner_sha256=result["owner_sha256"],
+            ),
+            self.script_request(
+                context_sha256="b" * 64,
+                token=result["token"],
+                owner_sha256=result["owner_sha256"],
+            ),
+            self.script_request(
+                pid=os.getpid() + 1,
+                token=result["token"],
+                owner_sha256=result["owner_sha256"],
+            ),
+            self.script_request(
+                token="B" * 43,
+                owner_sha256=result["owner_sha256"],
+            ),
+            self.script_request(
+                token=result["token"],
+                owner_sha256="c" * 64,
+            ),
+        )
+        for request in invalid_requests:
+            with self.subTest(request=request.splitlines()[1:]):
+                refused = self.run_adapter(
+                    "release-script",
+                    RESOURCE,
+                    stdin_text=request,
+                )
+                self.assertEqual(refused.returncode, 75)
+                self.assertEqual(owner.read_bytes(), original)
+
+        changed = original.replace(
+            f"process_start={dict(line.split('=', 1) for line in original.decode().splitlines())['process_start']}\n".encode(),
+            b"process_start=1\n",
+        )
+        owner.write_bytes(changed)
+        digest = hashlib.sha256(changed).hexdigest()
+        refused_identity = self.run_adapter(
+            "release-script",
+            RESOURCE,
+            stdin_text=self.script_request(
+                token=result["token"],
+                owner_sha256=digest,
+            ),
+        )
+        self.assertEqual(refused_identity.returncode, 75)
+        self.assertIn("process_identity_mismatch", refused_identity.stderr)
+        self.assertEqual(owner.read_bytes(), changed)
+
+    def test_script_acquire_any_selects_one_resource_and_reuses_shared_owner(self) -> None:
+        first = self.acquire_script("emulator-script-first")
+        request = self.script_request()
+        selected = self.run_adapter(
+            "acquire-script-any",
+            "emulator-script-first",
+            "emulator-script-second",
+            "--",
+            "0",
+            stdin_text=request,
+        )
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        fields = dict(line.split("=", 1) for line in selected.stdout.splitlines())
+        self.assertEqual(fields["resource"], "emulator-script-second")
+        self.assertTrue(SCRIPT_TOKEN_PATTERN.fullmatch(fields["token"]))
+        self.assertTrue(self.lock_path("emulator-script-first").exists())
+        self.assertTrue(self.lock_path("emulator-script-second").exists())
+
+        for resource, lease in (
+            ("emulator-script-first", first),
+            ("emulator-script-second", fields),
+        ):
+            released = self.run_adapter(
+                "release-script",
+                resource,
+                stdin_text=self.script_request(
+                    token=lease["token"],
+                    owner_sha256=lease["owner_sha256"],
+                ),
+            )
+            self.assertEqual(released.returncode, 0, released.stderr)
+
+    def test_script_crashed_owner_is_preserved_without_guessed_takeover(self) -> None:
+        child_source = r"""
+import os
+import subprocess
+import sys
+
+adapter, runtime_root, fake_bin = sys.argv[1:]
+environment = os.environ.copy()
+environment["KENT_RESOURCE_LOCK_DIR"] = runtime_root
+environment["PATH"] = fake_bin + os.pathsep + environment["PATH"]
+context = "a" * 64
+request = "\n".join((
+    "schema=mobile-script-lease-request-v1",
+    "task_id=task-b6672872-8aaf-4dc9-ba9c-dfab7393a5b4",
+    "context_sha256=" + context,
+    "pid=" + str(os.getpid()),
+    "",
+))
+acquired = subprocess.run(
+    [adapter, "acquire-script", "emulator-fixture", "0"],
+    check=False,
+    capture_output=True,
+    text=True,
+    env=environment,
+    input=request,
+)
+print(os.getpid(), acquired.returncode)
+sys.exit(acquired.returncode)
+"""
+        environment = os.environ.copy()
+        environment["KENT_RESOURCE_LOCK_DIR"] = str(self.runtime_root)
+        environment["PATH"] = (
+            f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}"
+        )
+        crashed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child_source,
+                str(ADAPTER),
+                str(self.runtime_root),
+                str(self.fake_bin),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=15,
+        )
+        self.assertEqual(crashed.returncode, 0, crashed.stderr)
+        crashed_pid, acquire_status = crashed.stdout.split()
+        self.assertEqual(acquire_status, "0")
+
+        owner = self.lock_path() / "owner"
+        original = owner.read_bytes()
+        fields = dict(
+            line.split("=", 1)
+            for line in original.decode("ascii").splitlines()
+        )
+        self.assertEqual(fields["pid"], crashed_pid)
+        self.assertEqual(fields["owner_kind"], "script")
+        original_hash = hashlib.sha256(original).hexdigest()
+        dead_owner_release = self.run_adapter(
+            "release-script",
+            RESOURCE,
+            stdin_text=self.script_request(
+                pid=int(crashed_pid),
+                token=fields["token"],
+                owner_sha256=original_hash,
+            ),
+        )
+        self.assertEqual(dead_owner_release.returncode, 75)
+        self.assertEqual(owner.read_bytes(), original)
+
+        session_attempt = self.run_adapter("acquire", RESOURCE, "0", "0")
+        self.assertEqual(session_attempt.returncode, 75)
+        script_attempt = self.run_adapter(
+            "acquire-script",
+            RESOURCE,
+            "0",
+            stdin_text=self.script_request(),
+        )
+        self.assertEqual(script_attempt.returncode, 75)
+        self.assertEqual(owner.read_bytes(), original)
+
+        inspected = self.run_adapter("inspect-script-recovery", RESOURCE)
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        self.assertIn("owner_kind=ScriptOwnerV1\n", inspected.stdout)
+        self.assertIn(f"owner_sha256={original_hash}\n", inspected.stdout)
+        self.assertNotIn(fields["token"], inspected.stdout)
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin",
+        "Darwin guard creation contention regression",
+    )
+    def test_parallel_first_guard_initialization_survives_create_race(self) -> None:
+        resource = "emulator-first-guard-create-race"
+        worker_source = r"""
+import json
+import os
+import subprocess
+import sys
+
+adapter, runtime_root, fake_bin, resource = sys.argv[1:]
+if sys.stdin.readline().strip() != "start":
+    sys.exit(64)
+environment = os.environ.copy()
+environment.update({
+    "KENT_RESOURCE_LOCK_DIR": runtime_root,
+    "KENT_RESOURCE_LOCK_OWNER_PID": "424242",
+    "KENT_TASK_ID": "KEN-6",
+    "KENT_SESSION_ID": "11111111-1111-4111-8111-111111111111",
+    "PATH": fake_bin + os.pathsep + environment["PATH"],
+})
+acquired = subprocess.run(
+    [adapter, "acquire", resource, "0", "7200"],
+    check=False,
+    capture_output=True,
+    text=True,
+    env=environment,
+)
+print(json.dumps({
+    "returncode": acquired.returncode,
+    "stdout": acquired.stdout,
+    "stderr": acquired.stderr,
+}), flush=True)
+"""
+        for attempt in range(20):
+            with self.subTest(attempt=attempt):
+                self.runtime_root = self.temporary_root / f"guard-race-{attempt}"
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "KENT_RESOURCE_LOCK_DIR": str(self.runtime_root),
+                        "KENT_RESOURCE_LOCK_OWNER_PID": "424242",
+                        "KENT_TASK_ID": "KEN-6",
+                        "KENT_SESSION_ID": SESSION_ONE,
+                        "PATH": (
+                            f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}"
+                        ),
+                    }
+                )
+                workers: list[subprocess.Popen[str]] = []
+                try:
+                    for _ in range(2):
+                        workers.append(
+                            subprocess.Popen(
+                                [
+                                    sys.executable,
+                                    "-c",
+                                    worker_source,
+                                    str(ADAPTER),
+                                    str(self.runtime_root),
+                                    str(self.fake_bin),
+                                    resource,
+                                ],
+                                stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                                env=environment,
+                            )
+                        )
+                    for worker in workers:
+                        assert worker.stdin is not None
+                        worker.stdin.write("start\n")
+                        worker.stdin.close()
+
+                    results = []
+                    for worker in workers:
+                        stdout, stderr = worker.communicate(timeout=30)
+                        self.assertEqual(worker.returncode, 0, stderr)
+                        results.append(json.loads(stdout))
+
+                    self.assertCountEqual(
+                        (result["returncode"] for result in results),
+                        (0, 75),
+                        f"parallel first guard initialization: {results}",
+                    )
+                    self.assertFalse(
+                        any(
+                            "resource_lock_guard_identity_invalid"
+                            in result["stderr"]
+                            for result in results
+                        ),
+                        f"guard creation contention was misclassified: {results}",
+                    )
+                    winner = next(
+                        result for result in results if result["returncode"] == 0
+                    )
+                    token = parse_acquire_token(winner["stdout"])
+                    guard = (
+                        self.runtime_root
+                        / ".guards"
+                        / f"mobile-{resource}.guard"
+                    )
+                    guard_inode = guard.stat().st_ino
+                    released = self.run_adapter("release", resource, token)
+                    self.assertEqual(released.returncode, 0, released.stderr)
+                    self.assertEqual(guard.stat().st_ino, guard_inode)
+                    self.assertEqual(
+                        self.run_adapter("status", resource).stdout.strip(),
+                        "unlocked",
+                    )
+                finally:
+                    for worker in workers:
+                        if worker.poll() is None:
+                            worker.terminate()
+                            worker.wait(timeout=5)
+                        for stream in (
+                            worker.stdin,
+                            worker.stdout,
+                            worker.stderr,
+                        ):
+                            if stream is not None:
+                                stream.close()
+
+    def test_session_and_script_processes_contend_on_one_shared_guard(self) -> None:
+        resource = "emulator-mixed-process-contention"
+        worker_source = r"""
+import os
+import subprocess
+import sys
+
+adapter, runtime_root, fake_bin, kind = sys.argv[1:]
+resource = "emulator-mixed-process-contention"
+if sys.stdin.readline().strip() != "start":
+    sys.exit(64)
+environment = os.environ.copy()
+environment["KENT_RESOURCE_LOCK_DIR"] = runtime_root
+environment["KENT_TASK_ID"] = "KEN-6"
+environment["KENT_SESSION_ID"] = "11111111-1111-4111-8111-111111111111"
+environment["PATH"] = fake_bin + os.pathsep + environment["PATH"]
+context = "a" * 64
+if kind == "session":
+    acquired = subprocess.run(
+        [adapter, "acquire", resource, "0", "7200"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+else:
+    request = "\n".join((
+        "schema=mobile-script-lease-request-v1",
+        "task_id=task-b6672872-8aaf-4dc9-ba9c-dfab7393a5b4",
+        "context_sha256=" + context,
+        "pid=" + str(os.getpid()),
+        "",
+    ))
+    acquired = subprocess.run(
+        [adapter, "acquire-script", resource, "0"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        input=request,
+    )
+print(
+    acquired.returncode,
+    acquired.stderr.strip().replace("\n", " "),
+    flush=True,
+)
+if acquired.returncode != 0:
+    sys.exit(acquired.returncode)
+if sys.stdin.readline().strip() != "release":
+    sys.exit(64)
+if kind == "session":
+    token = acquired.stdout.strip()
+    released = subprocess.run(
+        [adapter, "release", resource, token],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+else:
+    fields = dict(line.split("=", 1) for line in acquired.stdout.splitlines())
+    request = "\n".join((
+        "schema=mobile-script-lease-request-v1",
+        "task_id=task-b6672872-8aaf-4dc9-ba9c-dfab7393a5b4",
+        "context_sha256=" + context,
+        "pid=" + str(os.getpid()),
+        "token=" + fields["token"],
+        "owner_sha256=" + fields["owner_sha256"],
+        "",
+    ))
+    released = subprocess.run(
+        [adapter, "release-script", resource],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        input=request,
+    )
+print(released.returncode, flush=True)
+sys.exit(released.returncode)
+"""
+        environment = os.environ.copy()
+        environment["KENT_RESOURCE_LOCK_DIR"] = str(self.runtime_root)
+        environment["PATH"] = (
+            f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}"
+        )
+        workers: dict[str, subprocess.Popen[str]] = {}
+        statuses: dict[str, int] = {}
+        errors: dict[str, str] = {}
+        selector = selectors.DefaultSelector()
+        try:
+            for kind in ("session", "script"):
+                worker = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        worker_source,
+                        str(ADAPTER),
+                        str(self.runtime_root),
+                        str(self.fake_bin),
+                        kind,
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    env=environment,
+                )
+                workers[kind] = worker
+            for worker in workers.values():
+                assert worker.stdin is not None
+                worker.stdin.write("start\n")
+                worker.stdin.flush()
+            for kind, worker in workers.items():
+                assert worker.stdout is not None
+                selector.register(worker.stdout, selectors.EVENT_READ, kind)
+
+            deadline = time.monotonic() + 30
+            while len(statuses) < len(workers):
+                ready = selector.select(max(0, deadline - time.monotonic()))
+                if not ready:
+                    self.fail("mixed lease contenders did not finish acquisition")
+                for key, _ in ready:
+                    line = key.fileobj.readline()
+                    if not line:
+                        self.fail("a mixed lease contender exited without a result")
+                    status, _, error = line.rstrip("\n").partition(" ")
+                    statuses[key.data] = int(status)
+                    errors[key.data] = error
+                    selector.unregister(key.fileobj)
+
+            self.assertCountEqual(
+                statuses.values(),
+                (0, 75),
+                f"contender statuses={statuses}, errors={errors}",
+            )
+            winner_kind = next(kind for kind, status in statuses.items() if status == 0)
+            guard = (
+                self.runtime_root
+                / ".guards"
+                / f"mobile-{resource}.guard"
+            )
+            guard_inode = guard.stat().st_ino
+
+            winner = workers[winner_kind]
+            assert winner.stdin is not None
+            winner.stdin.write("release\n")
+            winner.stdin.flush()
+            for worker in workers.values():
+                worker.wait(timeout=15)
+            assert winner.stdout is not None
+            self.assertEqual(winner.stdout.readline().strip(), "0")
+            for worker in workers.values():
+                assert worker.stderr is not None
+                self.assertEqual(worker.stderr.read(), "")
+
+            inspected = self.run_adapter(
+                "inspect-script-recovery",
+                resource,
+            )
+            self.assertEqual(inspected.returncode, 0, inspected.stderr)
+            self.assertIn("owner_kind=Absent\n", inspected.stdout)
+            self.assertEqual(guard.stat().st_ino, guard_inode)
+            self.assertEqual(
+                self.run_adapter("status", resource).stdout.strip(),
+                "unlocked",
+            )
+        finally:
+            selector.close()
+            for worker in workers.values():
+                if worker.poll() is None:
+                    worker.terminate()
+                    worker.wait(timeout=5)
+                for stream in (worker.stdin, worker.stdout, worker.stderr):
+                    if stream is not None:
+                        stream.close()
+
+    def test_partial_duplicate_and_unsafe_owners_are_preserved(self) -> None:
+        owner = self.seed_lock(task_id="KEN-6")
+        original = owner.read_bytes()
+        owner.write_bytes(
+            original.replace(
+                b"token=synthetic-fixture-value\n",
+                b"token=synthetic-fixture-value\ntoken=duplicate-value\n",
+            )
+        )
+        duplicate = owner.read_bytes()
+        acquired = self.run_adapter("acquire", RESOURCE, "0", "0")
+        self.assertEqual(acquired.returncode, 75)
+        self.assertEqual(owner.read_bytes(), duplicate)
+        script_acquired = self.run_adapter(
+            "acquire-script",
+            RESOURCE,
+            "0",
+            stdin_text=self.script_request(),
+        )
+        self.assertEqual(script_acquired.returncode, 75)
+        self.assertEqual(owner.read_bytes(), duplicate)
+        status = self.run_adapter("status", RESOURCE)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("owner_kind=UnknownOwner", status.stdout)
+        self.assertNotIn("synthetic-fixture-value", status.stdout)
+
+        owner.unlink()
+        target = self.temporary_root / "unsafe-owner-target"
+        target.write_bytes(original)
+        owner.symlink_to(target)
+        unsafe = self.run_adapter("resume-owned", RESOURCE)
+        self.assertEqual(unsafe.returncode, 75)
+        self.assertTrue(owner.is_symlink())
+        self.assertEqual(target.read_bytes(), original)
+        script_unsafe = self.run_adapter(
+            "acquire-script",
+            RESOURCE,
+            "0",
+            stdin_text=self.script_request(),
+        )
+        self.assertEqual(script_unsafe.returncode, 75)
+        self.assertTrue(owner.is_symlink())
+        self.assertEqual(target.read_bytes(), original)
+
+        owner.unlink()
+        owner.write_bytes(original)
+        (owner.parent / "created_at").unlink()
+        partial = self.run_adapter("acquire", RESOURCE, "0", "0")
+        self.assertEqual(partial.returncode, 75)
+        self.assertEqual(owner.read_bytes(), original)
+        self.assertFalse((owner.parent / "created_at").exists())
+        script_partial = self.run_adapter(
+            "acquire-script",
+            RESOURCE,
+            "0",
+            stdin_text=self.script_request(),
+        )
+        self.assertEqual(script_partial.returncode, 75)
+        self.assertEqual(owner.read_bytes(), original)
+        self.assertFalse((owner.parent / "created_at").exists())
+
+        owner.unlink()
+        interrupted_temporary = owner.parent / ".tmp-000000000000000000000000"
+        interrupted_temporary.write_bytes(b"created_at=1800000000\n")
+        interrupted_temporary.chmod(0o600)
+        interrupted = self.run_adapter(
+            "acquire-script",
+            RESOURCE,
+            "0",
+            stdin_text=self.script_request(),
+        )
+        self.assertEqual(interrupted.returncode, 75)
+        self.assertEqual(
+            [path.name for path in owner.parent.iterdir()],
+            [interrupted_temporary.name],
+        )
+        self.assertEqual(
+            interrupted_temporary.read_bytes(),
+            b"created_at=1800000000\n",
+        )
+        inspect_interrupted = self.run_adapter(
+            "inspect-script-recovery",
+            RESOURCE,
+        )
+        self.assertEqual(inspect_interrupted.returncode, 0)
+        self.assertIn("owner_kind=UnknownOwner\n", inspect_interrupted.stdout)
+        self.assertIn("owner_sha256=unknown\n", inspect_interrupted.stdout)
 
     def lock_path(self, resource: str = RESOURCE) -> Path:
         return self.runtime_root / f"mobile-{resource}.lock"
@@ -246,6 +1115,7 @@ esac
     ) -> Path:
         directory = self.lock_path(resource)
         directory.mkdir(parents=True)
+        directory.chmod(0o700)
         (directory / "owner").write_text(
             "\n".join(
                 (
@@ -261,10 +1131,12 @@ esac
             ),
             encoding="utf-8",
         )
+        (directory / "owner").chmod(0o600)
         (directory / "created_at").write_text(
             f"{FIXED_NOW if created_at is None else created_at}\n",
             encoding="utf-8",
         )
+        (directory / "created_at").chmod(0o600)
         return directory / "owner"
 
     def read_native_identity(
@@ -685,35 +1557,20 @@ esac
             "failed recovery changed owner metadata",
         )
 
-    def test_resume_owned_accepts_unknown_historical_session(self) -> None:
+    def test_resume_owned_preserves_unknown_historical_session(self) -> None:
         owner = self.seed_lock(task_id="KEN-6")
         contents = owner.read_text(encoding="utf-8").replace(
             f"session_id={SESSION_ONE}\n",
             "session_id=unknown\n",
         )
         owner.write_text(contents, encoding="utf-8")
+        original = owner.read_bytes()
         result = self.run_adapter("resume-owned", RESOURCE, session_id=SESSION_TWO)
+        self.assertEqual(result.returncode, 75)
         self.assertEqual(
-            result.returncode,
-            0,
-            "unknown historical Session metadata blocked proven Task recovery",
-        )
-        self.assertTrue(
-            result.stdout.strip() == FIXTURE_TOKEN,
-            "recovery did not preserve the same-Task lease token",
-        )
-        self.assertTrue(
-            f"session_id={SESSION_TWO}"
-            in owner.read_text(encoding="utf-8"),
-            "successful recovery did not record the current Session",
-        )
-        released = self.run_adapter(
-            "release", RESOURCE, result.stdout.strip(), session_id=SESSION_TWO
-        )
-        self.assertEqual(
-            released.returncode,
-            0,
-            "synthetic recovered lease could not be released",
+            owner.read_bytes(),
+            original,
+            "unknown historical Session metadata was rewritten",
         )
 
     def test_token_resume_rejects_missing_task_before_creating_lock(self) -> None:
@@ -834,7 +1691,7 @@ esac
         )
         self.assertEqual(released.returncode, 0, "replacement release failed")
 
-    def test_osm_78_unknown_owner_expiry_sequence_is_preserved(self) -> None:
+    def test_osm_78_unknown_owner_expiry_is_blocked_and_preserved(self) -> None:
         fixture = incident_fixture("osm-78.json")
         self.assertFalse(fixture["checkpoint_token_present"])
         self.assertEqual(fixture["historical_owner_task_id"], "unknown")
@@ -842,22 +1699,17 @@ esac
             task_id=str(fixture["historical_owner_task_id"]),
             created_at=1,
         )
+        original = owner.read_bytes()
         result = self.run_adapter("acquire", RESOURCE, "0", "0")
         self.assertEqual(
             result.returncode,
-            0,
-            "normal caller-TTL replacement no longer succeeds after expiry",
+            75,
+            "unknown historical owner was reclaimed by caller TTL",
         )
-        self.assertTrue(result.stdout.strip(), "fresh acquisition emitted no token")
-        self.assertTrue(
-            "task_id=KEN-6" in owner.read_text(encoding="utf-8"),
-            "normal replacement did not record the supplied Task identity",
-        )
-        released = self.run_adapter("release", RESOURCE, result.stdout.strip())
         self.assertEqual(
-            released.returncode,
-            0,
-            "synthetic replacement could not be released",
+            owner.read_bytes(),
+            original,
+            "blocked unknown-owner expiry changed the original record",
         )
 
     def test_pub_70_returned_token_does_not_prove_unknown_task_ownership(self) -> None:
