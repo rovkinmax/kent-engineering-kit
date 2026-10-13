@@ -36,21 +36,18 @@ diagnosis rather than being overridden by this mode or a caller prompt.
   unavailable required persistence does not permit shell file edits.
   Never use a lost-token recovery path requiring a Task identity you lack.
 - Reconcile retained intent and effects before repeating any work. Diagnosis
-  grants no additional run/spend or recovery-effect budget; technical recovery
-  shares the supervisor incident's budget. A new Session or cleaned-up failure
-  does not restore it. Read-only observations alone are not recovery.
+  grants no additional run/spend/risk budget; technical recovery shares the
+  caller's existing limits. A new Session or cleaned-up failure does not
+  restore them. Read-only observations alone are not recovery.
   Receive incident identity, authority locators, allowed actions, remaining
   run/recovery allowance, prior attempts and unfinished intents from the caller.
-  One effective or unsettled recovery attempt is shared across supervisor and
-  helper per unchanged incident. Provider requests or runtime/resource/checkpoint/
-  source/external effects within recovery spend it; unknown reserves it.
-  Failure/cleanup do not reset it. A proved validation-only no-op requires exact
-  code/setup, attempt completion and no effects or late work; it grants no
-  separate helper retry. Any qualified native alternative belongs to the
-  supervisor, never Task lifecycle work here. Missing allowance or settlement
-  blocks recovery: return the context gap while continuing permitted read-only
-  observations. Do not invent a budget or act concurrently with another
-  recovery owner.
+  Unknown effects block replay. Another attempt requires verified changed
+  prerequisites or a hypothesis that changes the diagnostic action or expected
+  observation, within those limits. Do not repeat unchanged failed inputs,
+  make unlimited attempts, invent a budget or act concurrently with another
+  recovery owner. Missing authority or settlement blocks that effect; return
+  the specific gap while continuing permitted read-only observations.
+  Task lifecycle recovery remains with the coordinator, never this helper.
 - Verify semantic outcomes. Restore owned changes and settle all owned
   processes/kept-open shells before resource release; use project procedures
   for release or safe retention and audit minimal evidence. Do not abandon

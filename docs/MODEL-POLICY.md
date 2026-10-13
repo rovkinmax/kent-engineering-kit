@@ -19,6 +19,7 @@ running Session; live adoption remains separately authorized.
 | --- | --- | --- |
 | Interactive root | `gpt-6.1-sol` | high |
 | Headless/default role | `gpt-6.1-sol` | low |
+| Opt-in `defaultExtra` selector | `gpt-6-astra` | low |
 | Built-in reviewer/supervisor | `gpt-6-luna` | xhigh |
 | `fast` | `gpt-6-luna` | high |
 | `compliance_reviewer` | `gpt-6-luna` | high |
@@ -45,17 +46,23 @@ The interactive root's source settings include
 `context_compaction_threshold_tokens = 360000`. Per-role budget settings are
 declared individually in the TOML; do not infer them from model allocation or
 count selectors as a substitute for reading that source.
+The `defaultExtra` selector is opt-in for an explicitly requested
+extra/default-adjacent assignment; it does not replace `default`, alter other
+role settings, or guarantee runtime activation. Its source declaration also
+sets `model_verbosity = "low"`.
+
 The KEN-18 candidate roles use explicit working budgets: simple Luna
 372000/353400, complex Sol 400000/360000, and Astra planner 400000/360000.
 These are bounded harness budgets, not provider maximums or evidence of live
 availability.
 
 `task-supervisor` is explicitly callable outside Workflow, with shell enabled
-and first-class patch/edit disabled. Its role contract permits narrow
-operational effects; it is not read-only. Prefer an interactive Session for
-human escalation and waiting. There is no overall supervision time limit,
-while individual observations and recovery attempts remain bounded. It does
-not change root concurrency, delegation depth, or workflow routing.
+and first-class patch/edit disabled. It acts as an operational coordinator
+within its assigned scope; it is not read-only. Prefer an interactive Session
+for human escalation and waiting. There is no overall supervision time limit
+for an active assignment, while individual observations and recovery attempts
+remain bounded. It introduces no new role settings or guarantees and does not
+change root concurrency, delegation depth, or workflow routing.
 
 ## KEN-18 Portfolio Readiness Snapshot — October 4, 2026
 

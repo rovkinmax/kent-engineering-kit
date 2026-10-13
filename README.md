@@ -292,152 +292,40 @@ fresh interactive Session; this source change does not alter configuration:
 kent --agent task-supervisor
 ```
 
-Tell it the exact Tasks and projects to accompany, for example: "Supervise
-KENT-123 and KENT-124 in this project until they finish. Resolve factual
-questions and safe technical interruptions; ask me when a decision is needed."
-The source policy is `gpt-6.1-sol` with `high` reasoning. This role is distinct
-from the built-in edit reviewer and from grill.
+Tell it the exact Tasks and projects to accompany. The role is distinct from
+the built-in edit reviewer and grill. Its behavior is owned by
+[`agents/task-supervisor.md`](agents/task-supervisor.md); native targeting,
+settlement and handoff mechanics are in the installed
+[`task-supervision-operations.md`](skills/kent-engineering-kit/references/task-supervision-operations.md).
 
-There is no overall supervision time limit. Each round checks **all selected
-Tasks** before deep diagnosis or a long wait, then gives each incident a bounded
-action slice. Waiting for one executor or critic does not replace the group
-scan. Scope, authority and unfinished actions are restored after answers,
-restart and compaction, including any requested report interval/deadline.
-Scheduled reports occur while the Session is alive even without changes;
-after an interruption it gives one current catch-up, not fictional missed
-reports. Individual observations and effects remain bounded;
-long planning or a build is not itself a hang.
+The supervisor scans all selected Tasks, resolves facts and original human
+decisions, gives each incident a bounded action slice, and verifies settlement.
+It may steer an owner, use an authorized configured helper, or continue a
+human-selected idle ordinary Session that is not Workflow-owned. It never uses
+`kent run --session` for a Workflow-owned Session; delegation adds capability,
+not authority. A live Session provides no scheduler or post-exit observation.
 
-The role resolves facts, applicable existing decisions and explicitly delegated
-operational choices without asking you to repeat them. Technical product work
-stays with its owner. It may answer factual Questions, attempt safe Resume and
-restore resources under project policy. It may enact a matching Approval when
-your already-made decision covers its exact consequences and prerequisites,
-then verify continuation. It cannot accept unknown results, replace mandatory
-human judgment, impersonate owners, edit source/config or change Workflow graphs. Fresh targets,
-effects and authority are checked; a new gate does not automatically inherit
-an earlier permission.
+Product and repository changes remain with one qualified writer per root. An
+original human decision may authorize a bounded local preservation/checkpoint
+commit by the implementation/fix writer after the exact files, accepted
+plan/node and single-writer ownership are verified. This does not authorize
+unrelated changes, rebase, push, merge, publication or installation.
 
-For a material unresolved doubt, it may consult one read-only `grill` outside
-Workflow when Kent permits the child depth. Routine facts and unchanged blockers
-need no critic. It cannot launch generic operational children or increase depth
-to make delegation work; a headless supervisor invoked at the depth limit may therefore
-need its caller's help for a genuinely material critique.
-
-It may directly execute a merge you already authorized for a selected Task's
-accepted PR result, after repository/PR/base/head, method and checks are verified.
-The provider request is bound to the verified head. Project-specific CI waivers
-stay project-specific; no `--admin`, merge-queue bypass, method fallback,
-commit/push/local rebase, conflict edits or branch deletion is permitted.
-Queued/auto-merge-enabled is not merged. It need not ask you to open another
-Session for an operation its own contract allows.
-
-A project-qualified existing native route may recover an interrupted selected
-other Task when retained Resume would repeat a diagnosed failure or execution
-is missing. This requires proven input/context/ownership/authority and preserved
-review, approval, fan-out/Join and cleanup obligations. An edge's existence or
-CLI help alone is insufficient. No forced Done, arbitrary movement or graph
-edits. Resume and native recovery share one automatic effect budget per incident;
-unknown effects are reconciled before retry. A proved no-op permits only a
-verified equivalent already-authorized route, not transition enumeration.
-One automatic Resume invocation and at most one qualified native alternative
-after a proved no-op are allowed; never a second Resume or third route.
-A completed validation-only Script can be a no-op only with exact code/setup,
-attempt-specific settlement and no effects or late work. Actual effects/provider
-requests spend the budget, unknown reserves it, and cleanup does not erase it.
-
-There is one waiting-state exception: a selected other's exact technical pending
-condition is already resolved, but its retained route is incompatible.
-Answer/approve and owner/replan remain preferred. A project-qualified native
-procedure must settle the old pending object/execution, exclude late answers
-and competing continuation, and preserve human judgments, review/approval,
-inputs, source, resources and cleanup. Waiting still means ownership.
-This is not permission to move around an approval or an unmet prerequisite,
-and does not qualify any production Task's route by itself.
-
-Outside Workflow, a bounded standalone diagnosis may use the existing
-`runtime-smoke-tester` when direct diagnosis and capable owner routes are
-insufficient. Verify already-existing runtime authority, the effective installed
-diagnostic mode and a compatible project procedure before launching one helper
-per unchanged incident. It uses genuine identity, exclusive leases, its own
-minimal state/evidence and cleanup; no Task checkpoint/lifecycle, product/Git
-writes, children or official Smoke PASS. Full-Smoke build/install defaults
-do not grant diagnostic effects. It adds no run/spend or recovery-effect budget.
-The supervisor keeps observing the whole selection and verifies cleanup.
-Kit publication does not prove Appsome standalone compatibility: incompatible
-project checkpoint/identity rules remain a specific blocker, not a prompt override.
-
-The requested outcome controls completion. Done and merge do not prove installed
-adoption. Installation, configuration and restart require separate effect
-authority and project procedures; accompaniment is not implicit permission.
-
-An explicit request to start a selected Task may be enacted through native
-`kent task start` after identity, source/branch, dependency and no-competing-run
-checks, when project policy permits it. This is not permission to move Tasks,
-adopt existing branches, override human-only restrictions or invent a target.
-Facts and existing decisions are resolved with provenance; technical ordering
-within scope goes to the capable owner/planner, not another user choice.
-Repeated approval IDs for one unchanged blocker remain one incident.
-The same applies to repeated lease-token parser failures: fixture-check the
-exact owner command/output before another acquisition. A prerequisite-ready
-transition is not a diagnostic entry. Check semantic outcomes rather than exit0,
-verify CLI grammar, and distinguish the initial source pin from current Task
-commits. Do not invent CI billing-access prerequisites or conflate independent
-manual Stage/provider conditions; accepted limits and security rules still apply.
+The role and reference own native retry, helper, runtime and recovery mechanics.
+Their common boundary is settled, cause-based progress: preserve existing
+authority and limits, and treat unknown native effects or unqualified
+procedures as blockers. Original human Session/Question locators remain the
+authority; new scope, material risk/cost and mandatory human judgment remain
+human. Installation, merge and terminal Task state are distinct outcomes.
 
 Generated Fix and Compliance can return a substantive execution-plan discrepancy
-to existing Plan Revalidation before source edits. The normal review/acceptance
-chain remains; Kit's own candidate retains its human approval specialization.
-Read [decision closure and project coverage](docs/SUPERVISOR-DECISION-CLOSURE.md)
-for tests, limitations and the separately approved activation boundary.
-
-A verifiable original human Session message or Question answer remains the
-source of your decision. The supervisor can reference it in an agent-authored
-audit comment; you do not have to repeat it as a prescribed comment and manual
-click solely because another agent needs the same authority. Already-permitted
-reading and diagnostic preparation do not require another consent cycle.
-New scope, credentials, material cost/risk or ambiguity still needs a decision.
-
-Prefer project adapters/runbooks, but an absent custom wrapper alone no longer
-blocks an authorized operation using documented standard tools. For example,
-an explicitly permitted headless startup of an existing suitable virtual device
-does not require first writing a launcher. Resource conflicts, effective
-serialization, real actor identity, readiness and handoff must still be checked.
-This does not permit new device creation, wipe, configuration changes or taking
-another task's resource. Boot itself changes runtime state.
-
-A lost token, absent lease and foreign ownership are different cases, not
-interchangeable reasons to acquire a resource. Preparing a host resource does
-not waive a required lease. Release/reacquire is not atomic transfer, and the
-executor must acquire its valid runtime lease before app/device work.
-
-If independent recovery cannot resolve an interruption, the supervisor first
-helps the other selected Tasks. It does not duplicate an existing Task Question
-or Approval: it identifies the pending decision once and continues elsewhere.
-In autonomous/overnight operation, isolated human gates remain at their owners.
-Only a genuinely new decision without an owning object may become a supervisor
-Question, when a Session-wide pause is necessary or matches your chosen mode.
-While that Question is pending, observation of all selected Tasks may pause;
-the Tasks themselves continue their own execution.
-After your answer, it checks **all selected Tasks**, discards stale incidents
-and processes accumulated authorized work before asking the next Question.
-It does not wait for long builds to finish just to complete that catch-up pass.
-
-`kent run --agent task-supervisor '<selected Tasks and project>'` is the
-caller-mediated headless alternative: it cannot ask native interactive
-Questions. When human input is needed and independent assistance is exhausted,
-it returns the blocker/options and ends; the caller must obtain your decision
-and arrange continuation. Neither
-mode installs a scheduler or guarantees observation after the Session exits
-or crashes. A restarted supervisor reconciles current state and retained
-action evidence before acting; it does not reset retry budgets.
-
-Inspecting the same pending Question twice is not atomic targeting. Ambiguous
-or concurrent answers and recovery outcomes require reconciliation, not blind
-retries. Prompt-contract tests verify the packaged rules, not live recovery,
-uninterrupted uptime, or model compliance. Installation/config changes do not
-refresh existing Sessions; use a new Session after restart.
-Existing Sessions keep their locked prompts and execution settings.
+to existing Plan Revalidation before source edits. Read [decision closure and
+project coverage](docs/SUPERVISOR-DECISION-CLOSURE.md) for qualification limits.
+Headless invocation returns blocker/options when input is required; it does not
+provide automatic wakeup. Prompt-contract tests and read-only walkthroughs
+verify packaged policy, not model compliance or live Task recovery. Existing
+Sessions keep locked prompts and settings after installation/configuration
+changes; use a new Session.
 
 ## Workflow generation
 

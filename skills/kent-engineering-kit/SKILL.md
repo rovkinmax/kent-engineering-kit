@@ -8,6 +8,11 @@ Read the active node context manifest, `.kent/workflow-profile.toml`, and
 safety, sessions, worktrees, and language. Role prompts own behavior; Kent
 configuration owns model, reasoning, verbosity, tools, and delegation.
 
+For unfamiliar Task/Session targeting, continuation or resource handoff, read
+the relevant section of
+[Task supervision operations](references/task-supervision-operations.md).
+The role prompt owns authority; the reference supplies native mechanics.
+
 ## Boundaries
 
 The Kit is platform-neutral. Shared workflow owns lifecycle, approvals,

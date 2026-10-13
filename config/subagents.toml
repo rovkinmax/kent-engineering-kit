@@ -22,6 +22,11 @@ model = "gpt-6.1-sol"
 thinking_level = "low"
 model_verbosity = "low"
 
+[subagents.defaultExtra]
+model = "gpt-6-astra"
+thinking_level = "low"
+model_verbosity = "low"
+
 [subagents.fast]
 model = "gpt-6-luna"
 thinking_level = "high"
