@@ -3,7 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 adapter="$repo_root/templates/project/emulator-resource-lock.sh"
-temporary="$(mktemp -d)"
+temporary="$(mktemp -d "${TMPDIR:-/tmp}/kent-resource-lock-test.XXXXXXXX")"
+temporary="$(cd "$temporary" && pwd -P)"
 trap 'find "$temporary" -depth -delete' EXIT
 
 export KENT_RESOURCE_LOCK_DIR="$temporary/locks"
