@@ -2,56 +2,43 @@
 
 ## Operational supervision
 
-The current `task-supervisor` retains its name, model and tool configuration.
-It now owns a whole-selection operating cycle: scan every selected Task,
-classify incidents, perform one bounded diagnosis/action slice per incident,
-verify settlement, then return to observation. A focused follow-up, pending
-critic or operator response cannot replace the group scan. Failed reads remain
-explicit unknowns. Scope, authority and incident budgets survive compaction
-through existing Session goals and Task audit references, not another lifecycle
-database.
+The current `task-supervisor` is an operational coordinator: it scans the full
+selection, gives each actionable incident a bounded slice, verifies settlement
+and continues while authorized work or an actual producer of progress exists.
+Its behavioral contract is [`agents/task-supervisor.md`](../agents/task-supervisor.md);
+native targeting, settlement and resource handoff are described in the
+[task-supervision reference](../skills/kent-engineering-kit/references/task-supervision-operations.md).
+This document records the ownership boundary and qualification limits rather
+than duplicating that role's command policy.
 
-Facts, applicable existing decisions and explicitly delegated operational
-choices do not become fresh human Questions. Mandatory human judgment remains
-with its owning approval. Do not duplicate that object in the supervisor
-Session. In autonomous/overnight mode, keep isolated human gates at their owners
-and continue independent help; a truly new supervisor Question can still pause
-its entire Session. No role prompt provides a scheduler or uninterrupted uptime.
+The supervisor resolves facts, original human decisions and delegated
+operational choices. It may steer an owner, enact an already-authorized
+approval, use a configured helper, or continue a human-selected idle ordinary
+Session that is not Workflow-owned when actual identity, authority, role,
+depth, ownership and project procedure permit it. It never continues a
+Workflow-owned Session with `kent run --session`. A helper or operator adds
+capability, not authority.
 
-Narrow contracts replace the former blanket restrictions:
+Product and repository changes remain with one qualified writer per root. An
+original human decision may authorize a bounded local preservation/checkpoint
+commit by the implementation/fix writer after exact files, accepted plan/node,
+single-writer ownership and project restrictions are verified. This does not
+authorize rebase, push, merge, publication, installation or unrelated changes.
 
-- A material unresolved decision may receive one read-only Grill consultation
-  outside Workflow when child depth permits it. No generic operational child or depth
-  increase is allowed. Grill is not a formal governance review.
-- An already-authorized selected Task's accepted PR may be merged directly,
-  with exact repository/PR/base/head, method, checks, applicable authority and
-  provider head binding. No other Git writes, `--admin`, branch deletion,
-  method fallback or queue bypass. A project-specific CI waiver stays local.
-  Provider queue acceptance is not merge.
-- An interrupted selected other Task may use an existing project-qualified
-  native recovery route when retained Resume would repeat a diagnosed failure
-  or execution is missing. Edge existence and CLI help do not prove semantics.
-  Verify input/context provenance, ownership, authority, locked target and
-  preservation of approval/review, fan-out/Join and cleanup. Resume/native
-  recovery share one automatic effect budget per unchanged incident.
-  A proved no-op permits only a verified equivalent route; an unknown effect
-  requires reconciliation, not replay.
-- A selected other's waiting technical condition may use qualified native
-  reentry only when it is already resolved and retained routing is incompatible.
-  Waiting remains ownership: native settlement/supersession must exclude late
-  responses or competing continuation and preserve all judgments, review,
-  inputs, source, resource and cleanup obligations. Answer/approve/owner routes
-  come first; unknown semantics or unmet prerequisites remain blockers.
-- One bounded outside-Workflow standalone diagnosis may use the existing runtime
-  role when ordinary diagnosis/owner routes are insufficient. Its effective role
-  and project procedure must support genuine identity, exclusive lease, own
-  permitted persistence/evidence and cleanup without Task checkpoint/lifecycle
-  writes. Diagnosis is not official Smoke PASS or full-Smoke effect authority.
-  No source/Git writes, children, new run/spend or recovery budget.
+Retry is cause-based: settle the prior effect, require a changed verified
+precondition or a materially new diagnostic hypothesis, and remain within
+existing run/spend/risk limits. Unknown effects block replay; replacement
+helpers, new approval IDs and compaction do not reset budgets. Native recovery
+is limited by actual project-qualified semantics preserving source/root/context,
+pending-object settlement, human judgment, review/approval, fan-out/Join,
+resources and cleanup. Waiting remains ownership; an edge or CLI help is not
+semantic proof.
 
-These contracts do not authorize source/config/graph edits, terminal shortcuts,
-human-only endpoint bypass, installation or restart. Requested outcome controls
-completion: Done and merge do not establish installed adoption.
+Configured Grill, runtime diagnosis and selected ordinary operators use the
+role's bounded interfaces and current project procedures. They do not bypass
+human-only decisions, create a parallel lifecycle or qualify an unsafe route.
+Installation and restart remain separately authorized effects; Done and merge
+do not establish installed adoption.
 
 The October 7, 2026 investigation and exact authority/review pointers are
 retained in [the implementation plan](../.todo/task-supervisor/plan.md).
@@ -60,7 +47,9 @@ The acceptance scenarios in
 `tests/test_task_supervisor_contract.py` are static, not execution of an LLM,
 Task recovery or remote merge. They additionally reject contradictory former
 blanket rules and bind the observation order and effect preconditions to their
-actual sections.
+actual sections. A read-only walkthrough has the same boundary: it is design
+evidence, not live behavior, native recovery, remote merge or uninterrupted
+monitoring.
 
 ### Five-Session follow-up
 
@@ -68,25 +57,19 @@ The plan retains original Session/event locators for OSM-105/106/108/109/110,
 the combined Grill dispositions, frozen preview hash, two independent review
 receipts and subsequent human approval. Existing PR46 is preserved.
 
-The clarified budget allows one automatic Resume invocation and, after a proved
-no-op, at most one equivalent qualified native alternative. A completed local
-validation-only Script may be a no-op, but qualification binds exact executed
-code/dependencies/setup and the specific attempt's completion and absence of
-effects or queued/active/deferred late work. Process creation or settled control
-bookkeeping alone does not spend the effect budget; actual effects/provider
-requests do, and unknown settlement reserves it. Failure/cleanup, compaction or
-another approval ID never reset it. Existing matching qualification is reusable;
-current settlement is still required. Never a second Resume or third route.
+This historical record is not the current retry policy. Current retry is
+cause-based and settled: reconcile the prior outcome, require changed
+preconditions or a materially new hypothesis, and preserve the existing
+run/spend/risk limits. No universal numeric quota is current policy, and
+unknown settlement, failure cleanup, compaction or a new approval ID does not
+reset the incident. Native recovery remains available only where the actual
+project route proves its semantics and preserves ownership and gates.
 
-Operational clarifications preserve requested report deadlines, including
-unchanged-progress reports while alive and honest catch-up after a gap. They
-match diagnosis to transition prerequisites, fixture-check repeated token
-capture failures before reacquisition, verify CLI grammar and semantic evidence,
-and distinguish starting pin/current head/target. Independent Stage/provider
-conditions, actual owner capabilities, accepted alternative evidence and real
-run/security/scope limits remain separate; no invented billing-access gate.
-Interactive decisions use native Question UI rather than ending observation
-with an unrelayed question. Real user stops and headless boundaries remain.
+The follow-up also records report deadlines, catch-up after a gap, diagnosis
+versus readiness routes, token-capture evidence, CLI grammar, semantic outcomes,
+source-pin/current-head distinctions, independent provider conditions and
+headless/user-stop boundaries. Those factual clarifications remain useful, but
+the role prompt and installed reference are the current policy source.
 
 Kit-only source publication does not prove Appsome's standalone checkpoint/
 identity procedure compatible with diagnostic mode. No Appsome adapter edits,
@@ -105,14 +88,18 @@ by source validation or by installing a prompt:
 2. For controlled decision exercises, supply the acceptance scenarios through
    a harness with tool effects disabled or enforced fixture-only CLI responses.
    Check the actual action trace: whole-selection fairness, factual/delegated
-   answers, no duplicate gate, one bounded Grill, catch-up and truthful outcome.
-   Instruction-only claims that a real shell is sandboxed are insufficient.
+   answers, no duplicate gate, permitted Grill/helper use, selected idle
+   non-Workflow operator routing, single-writer preservation, local checkpoint
+   authority and truthful outcome. Do not treat a default-role trace, including
+   OSM-118/119 history, as task-supervisor qualification. Instruction-only
+   claims that a real shell is sandboxed are insufficient.
 3. Qualify native recovery separately in an isolated disposable Kent persistence
    root/project with an explicitly approved test graph and Tasks. Exercise
-   retained interruption, diagnosed invalid input, missing Session, proved no-op,
-   pending approval, deliberate stop and competing ownership. Read back native
-   execution/context and preserved group/cleanup obligations. Do not recover
-   production Tasks for this test or fabricate their actor identities.
+   retained interruption, diagnosed invalid input, missing Session, settled
+   effects, pending approval, deliberate stop and competing ownership. Read back
+   native execution/context, current authority, actual route semantics and
+   preserved group/cleanup obligations. Do not recover production Tasks for
+   this test or fabricate their actor identities.
    For waiting reentry, also prove settlement of the exact old pending object,
    rejection of a late answer and preservation of mandatory independent review.
 4. Exercise merge decision logic with fixture-only provider responses for changed

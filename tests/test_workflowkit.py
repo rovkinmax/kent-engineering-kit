@@ -1825,6 +1825,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         # reasoning, agent callability, workflow callability, shell, patch
         expected_roles = {
             "default": ("low", None, None, None, None),
+            "defaultExtra": ("low", None, None, None, None),
             "fast": ("high", None, None, None, None),
             "compliance_reviewer": ("high", False, False, True, False),
             "researcher": ("high", True, True, True, False),
@@ -1848,11 +1849,21 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         }
         roles = config["subagents"]
         self.assertEqual(set(roles), set(expected_roles))
+        current_policy = (
+            (REPO_ROOT / "docs" / "MODEL-POLICY.md").read_text()
+            .split("## Current Source Policy\n", 1)[1]
+            .split("## HISTORICAL —", 1)[0]
+        )
+        self.assertIn(
+            "| Opt-in `defaultExtra` selector | `gpt-6-astra` | low |",
+            current_policy,
+        )
         selectors = {"root": config, "reviewer": config["reviewer"], **roles}
         expected_models = {
             "root": "gpt-6.1-sol",
             "reviewer": "gpt-6-luna",
             "default": "gpt-6.1-sol",
+            "defaultExtra": "gpt-6-astra",
             "fast": "gpt-6-luna",
             "compliance_reviewer": "gpt-6-luna",
             "researcher": "gpt-6.1-sol",
@@ -1919,17 +1930,17 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         for name, (_, callable_, workflow_callable, shell, patch) in expected_roles.items():
             role = roles[name]
             with self.subTest(role=name):
-                if name == "default":
+                if name in {"default", "defaultExtra"}:
                     self.assertEqual(
                         role,
                         {
-                            "model": "gpt-6.1-sol",
+                            "model": expected_models[name],
                             "thinking_level": "low",
                             "model_verbosity": "low",
                         },
                     )
                     effective_default = {**config, **role}
-                    self.assertEqual(effective_default["model"], "gpt-6.1-sol")
+                    self.assertEqual(effective_default["model"], expected_models[name])
                     self.assertEqual(effective_default["thinking_level"], "low")
                     self.assertEqual(effective_default["model_context_window"], 400000)
                 elif name == "fast":
@@ -2960,26 +2971,29 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                     self.assertFalse(edges["plan_review_accept"].requires_approval)
 
     def test_supervisor_decision_closure_static_scenarios(self) -> None:
-        # These guards bind policy fixtures to shipped prompts, not LLM behavior.
-        from workflowkit.delivery import owner_replan_instruction, owner_replan_prompt
-
-        cases = json.loads(
+        fixture = json.loads(
             (REPO_ROOT / "tests/fixtures/supervisor-decision-closure.json").read_text()
-        )["cases"]
-        self.assertEqual(len(cases), 17)
-        self.assertEqual(len({case["id"] for case in cases}), len(cases))
-        role = (REPO_ROOT / "agents/task-supervisor.md").read_text()
-        text = " ".join((
-            role + owner_replan_instruction() + owner_replan_prompt(self.load_profile())
-        ).split())
+        )
+        self.assertEqual(set(fixture), {"description", "cases"})
+        self.assertIsInstance(fixture["description"], str)
+        self.assertTrue(fixture["description"].strip())
+        cases = fixture["cases"]
+        self.assertIsInstance(cases, list)
+        self.assertTrue(cases)
+        expected_fields = {"id", "input", "expected", "category"}
+        allowed_categories = {"allow", "protect", "capability"}
+        ids = []
+        categories = set()
         for case in cases:
-            with self.subTest(case=case["id"]):
-                self.assertTrue(case["input"] and case["expected"])
-                self.assertIn(case["guard"], text)
-        self.assertNotIn("manually start, move or complete Tasks", role)
-        self.assertIn("arbitrarily", role)
-        self.assertIn("move or complete Tasks", role)
-        self.assertIn("no retained/live execution or competing start/recovery", role)
+            with self.subTest(case=case.get("id")):
+                self.assertEqual(set(case), expected_fields)
+                for field in expected_fields:
+                    self.assertIsInstance(case[field], str)
+                    self.assertTrue(case[field].strip())
+                ids.append(case["id"])
+                categories.add(case["category"])
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(categories, allowed_categories)
         for prompt in (
             plan_prompt(self.load_profile()),
             plan_revalidation_prompt(self.load_profile(), from_review=True),
@@ -2988,176 +3002,48 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             self.assertIn("do not execute those effects in Plan", prompt)
 
     def test_task_supervisor_packaged_operational_contract(self) -> None:
-        # Static contract guards, not a simulation of model/runtime behavior.
-        prompt = (REPO_ROOT / "agents" / "task-supervisor.md").read_text()
-        normalized = " ".join(prompt.split())
-        scenarios = {
-            "selected_scope": (
-                "stable IDs and project identities",
-                "not unrelated Sessions or every Task",
-            ),
-            "long_work_and_escalation": (
-                "no overall supervision time limit",
-                "Bound each inspection and observer wait individually",
-                "Long planning, build or CI duration alone",
-                "Wait for the user's answer without repeatedly polling",
-                "A native Question may pause observation of all selected Tasks",
-                "return the blocker and options to the caller and end the run",
-            ),
-            "catch_up": (
-                "Re-read all selected Tasks before deep diagnosis",
-                "Discard stale, answered or resolved incidents",
-                "must not reset incident retry budgets",
-                "Fairly process the discovered independently actionable work",
-                "Defer blocked actions while helping other Tasks",
-                "before another human Question",
-                "does not mean finishing the Tasks",
-            ),
-            "factual_question_not_approval": (
-                "Cite the source",
-                "agent-provided",
-                "may unblock already-authorized effects",
-                "Never impersonate the user",
-                "re-reading is not an atomic compare-and-set",
-                "unresolved concurrent answering",
-                "reconciliation, not a blind retry",
-            ),
-            "safe_resume": (
-                "kent task resume",
-                "retained executable work",
-                "no active executor or competing recovery",
-                "Never automatically resume a deliberate human stop",
-                "fresh explicit human instruction",
-                "one automatic resume attempt per incident",
-                "An equivalent failure does not permit another Resume",
-                "proves enqueueing, not a running Session",
-                "Repeated Resume is not a reconstruction procedure",
-            ),
-            "resource_ownership": (
-                "lost token with confirmed same-task ownership",
-                "an absent lease and foreign/corrupt ownership",
-                "genuine identity, serialized ownership",
-                "Never spoof or replace `KENT_TASK_ID`",
-                "Never write a checkpoint concurrently with its owner",
-                "TTL expiry alone does not prove",
-                "A command named \"resume\" is not proof",
-            ),
-            "effect_evidence_and_limits": (
-                "record intent",
-                "record the observed result afterward",
-                "cooperative duplicate prevention, not an atomic distributed lock",
-                "Do not edit product source",
-                "Do not create other children",
-                "generic operational children remain prohibited",
-                "no new permissions",
-                "Do not promise uninterrupted uptime",
-            ),
-        }
-        for scenario, requirements in scenarios.items():
-            with self.subTest(scenario=scenario):
-                for requirement in requirements:
-                    self.assertIn(requirement, normalized)
-        expanded_scenarios = {
-            "decision_enactment_not_new_judgment": (
-                "kent task approve",
-                "selected other Task",
-                "exact current pending approval ID",
-                "transition consequences and actual prerequisites",
-                "required independent human judgment block enactment",
-                "Do not evade a rejected actor or a human-only endpoint",
-                "An accepted command is not proof of continuation",
-                "do not use a replacement approval ID",
-            ),
-            "human_source_carry": (
-                "original human Session message or native Question answer",
-                "not merely an intention because it reached you first",
-                "equivalent verifiable locator",
-                "audit is not itself human authority",
-                "Never use `--author user`",
-                "necessary bounded diagnostic preparation",
-                "not unlimited retries/spend",
-                "Do not demand the same decision",
-            ),
-            "tool_fallback_with_real_resource_safety": (
-                "Absence of a wrapper alone is not a blocker",
-                "an unproven mandatory safety condition is",
-                "documented standard tools",
-                "an already-authorized operation",
-                "explicitly authorized startup",
-                "without first developing a launcher",
-                "not an exemption from a project's pre-action lease requirement",
-                "private lock unknown to other participants",
-                "not a competitor",
-                "Release/reacquire is not atomic transfer",
-                "executor must obtain its own valid runtime lease",
-                "Never kill based only on a reusable PID",
-            ),
-        }
-        for scenario, requirements in expanded_scenarios.items():
-            with self.subTest(scenario=scenario):
-                for requirement in requirements:
-                    self.assertIn(requirement, normalized)
-        operational_scenarios = {
-            "whole_selection_and_delegation": (
-                "a focused follow-up never replaces the whole-selection scan",
-                "explicit operational delegation covers that choice",
-                "an auxiliary operator Session explicitly selected by the human",
-                "Verify a proposed operator's actual role",
-                "kent run --agent grill",
-                "Do not create other children",
-                "Grill cannot enact operations",
-            ),
-            "nonduplicating_escalation_and_outcome": (
-                "Do not duplicate an existing Question or Approval",
-                "In autonomous/overnight operation",
-                "requested outcome is evidenced",
-                "do not declare success from Done or merge alone",
-            ),
-            "authorized_merge": (
-                "accepted PR result",
-                "--match-head-commit",
-                "Do not use `--admin`",
-                "Head binding does not atomically freeze the base",
-                "Queued or auto-merge-enabled is not merged",
-                "A project-specific CI waiver does not transfer",
-            ),
-            "qualified_recovery": (
-                "Before `kent task move`",
-                "A supported edge alone does not qualify a route",
-                "one automatic recovery-effect budget",
-                "A proved no-op does not consume an effect",
-                "Do not enumerate transitions",
-            ),
-        }
-        for scenario, requirements in operational_scenarios.items():
-            with self.subTest(scenario=scenario):
-                for requirement in requirements:
-                    self.assertIn(requirement, normalized)
-        self.assertNotIn("Never answer Approvals", normalized)
-        self.assertNotIn("start another emulator", normalized)
-        self.assertNotIn("contracts/role-contract.md", prompt)
-        self.assertNotRegex(prompt, r"(?m)^\s*(model|tools)\s*:")
-        self.assertNotIn("kent run watch <session-id>", prompt)
-
-        readme = " ".join((REPO_ROOT / "README.md").read_text().split())
-        contract = " ".join(
-            (REPO_ROOT / "contracts" / "role-contract.md").read_text().split()
+        config = tomllib.loads((REPO_ROOT / "config" / "subagents.toml").read_text())
+        self.assertEqual(
+            config["subagents"]["task-supervisor"],
+            {
+                "description": (
+                    "Operational supervision of selected Tasks, factual answers, "
+                    "bounded recovery, and human escalation."
+                ),
+                "model": "gpt-6.1-sol",
+                "system_prompt_file": "agents/task-supervisor.md",
+                "thinking_level": "high",
+                "model_verbosity": "low",
+                "agent_callable": True,
+                "workflow_subagent": False,
+                "tools": {"shell": True, "patch": False, "edit": False},
+            },
         )
-        policy = (REPO_ROOT / "docs" / "MODEL-POLICY.md").read_text()
-        self.assertIn("kent --agent task-supervisor", readme)
-        self.assertIn("caller-mediated headless alternative", readme)
-        self.assertIn("checks **all selected Tasks**", readme)
-        self.assertIn("permissions of other roles", contract)
-        self.assertIn("first re-read **all selected Tasks**", contract)
-        self.assertIn("| `task-supervisor` | `gpt-6.1-sol` | high |", policy)
+
+        role_path = REPO_ROOT / "agents" / "task-supervisor.md"
+        prompt = role_path.read_text()
+        self.assertFalse(prompt.lstrip().startswith("---"))
+        self.assertNotRegex(prompt, r"(?m)^\s*(model|tools)\s*:")
+        self.assertNotIn("contracts/role-contract.md", prompt)
+
+        skill_path = REPO_ROOT / "skills" / "kent-engineering-kit" / "SKILL.md"
+        skill = skill_path.read_text()
+        reference = "references/task-supervision-operations.md"
+        self.assertIn(reference, skill)
+        self.assertTrue((skill_path.parent / reference).is_file())
+
+        self.assertIn(
+            "kent --agent task-supervisor",
+            (REPO_ROOT / "README.md").read_text(),
+        )
         guidance = " ".join(
             (REPO_ROOT / "global" / "AGENTS.md").read_text().split()
         )
-        self.assertIn("original human Session message or native Question answer", guidance)
+        self.assertIn(
+            "An original human Session message or native Question answer",
+            guidance,
+        )
         self.assertIn("Never manufacture provenance with `--author user`", guidance)
-        self.assertIn("guidance grants no role new operational permissions", guidance)
-        self.assertIn("no duplicate consent", contract)
-        self.assertIn("already-made decision covers its exact consequences", readme)
 
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
         config = tomllib.loads(

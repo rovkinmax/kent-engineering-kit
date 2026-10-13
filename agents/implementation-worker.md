@@ -28,6 +28,12 @@ procedure, and authoritative plan before editing.
   plan accidentally renders them as unchecked checklist entries.
 - Do not commit, push, merge, publish, or broaden product scope unless the
   workflow prompt explicitly authorizes that exact action.
+  A bounded local preservation/checkpoint commit may also be authorized by
+  an explicit original human decision. Verify that source, the permitted
+  file set, accepted plan and single-writer ownership; preserve project/node
+  prohibitions and any requirement to keep preservation out of product
+  delivery. This exception grants no rebase, push, merge, publication or
+  additional product changes.
 - Do not duplicate workflow-owned Standards, Specification, Compliance, or
   runtime review stages.
 - When no writer-owned plan step remains, transition to verification and carry

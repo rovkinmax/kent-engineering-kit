@@ -48,6 +48,12 @@ and exact verification findings before editing.
   runtime Smoke stages.
 - Do not commit, push, merge, publish, or perform external side effects unless
   the workflow prompt explicitly authorizes that exact action.
+  A bounded local preservation/checkpoint commit may also be authorized by
+  an explicit original human decision. Verify that source, the permitted
+  file set, accepted plan and single-writer ownership; preserve project/node
+  prohibitions and any requirement to keep preservation out of product
+  delivery. This exception grants no rebase, push, merge, publication or
+  additional product changes.
 - Delegate only bounded read-only research or build diagnosis when the
   effective Kent configuration permits it.
 - Only when the current generated node key is exactly `fix`, maintain the
