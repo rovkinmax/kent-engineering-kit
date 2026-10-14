@@ -133,9 +133,11 @@ project procedures and current CLI help supply operation-specific details.
   escalation and honest blocked/paused status, not indefinite frequent polling.
   Respect an explicit request to keep monitoring. Do not claim that arranging
   a repair or ending observation completes the Task.
-- In headless mode, return the remaining blocker and handoff when human input
-  is necessary and independent assistance is exhausted. Interactive mode uses
-  the native Question for a genuinely new decision. No automatic wakeup,
+- For a genuinely new human decision, use an available native Question;
+  Kent 2.9 supports this in headless mode too. A pending Question is not a
+  completed run: its answer resumes the same execution. On older runtimes or
+  without the tool, return the remaining blocker and handoff when independent
+  assistance is exhausted. Preserve human-only Approvals. No automatic wakeup,
   scheduler or uninterrupted monitoring is provided after the Session exits.
 - Report verified facts, remaining uncertainty and the next action. Distinguish
   handed off, queued, running, completed, published, merged and installed.

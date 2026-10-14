@@ -25,9 +25,20 @@ making a fresh checkout usable without silently copying unrelated local state.
   `kent worktree leave` before handing deletion to Task Janitor. Janitor
   verifies that the Cleanup session no longer targets the task worktree.
 - A zero exit code from `kent worktree delete --json` is not sufficient:
-  `scheduled` is non-terminal. Janitor accepts only `kind=completed` plus an
-  absent worktree path and Git registration; every other result returns to
-  Cleanup.
+  `scheduled` is non-terminal. Janitor accepts the known terminal
+  `kind=completed` form or a validated native delete-success payload, plus
+  an absent worktree path and Git registration. Retained `missing` metadata
+  must preserve the exact prior ID/root. Unknown or inconsistent results
+  return to Cleanup.
+- Kent 2.9 CLI JSON uses snake_case topology/status fields and lowercase
+  branch-cleanup outcomes; unchanged protobuf definitions do not prove CLI
+  compatibility. Qualify the actual consumer decoder against both dialects.
+- Kent 2.9 protects accepted runtime work during retirement. This does not
+  replace Kit evidence retention or accepted-plan preservation. Native
+  refusal must not be bypassed with force, foreign Session cancellation or
+  automatic replacement-target selection. A `delete_partial` failure may
+  already have retargeted idle Sessions: reconcile actual state before an
+  authorized retry; an error does not imply rollback.
 - Direct Git worktree commands are allowed only for project-local worktrees that
   Kent does not manage.
 - Never move or rename a Kent-managed worktree behind the service.

@@ -10038,6 +10038,8 @@ class WorkflowJanitorTest(GitRepositoryTest):
         *,
         cleanup_report: str,
         native_delete_called: Path,
+        cleanup_mode: str = "no_pr",
+        pr_url: str = "",
     ) -> tuple[int, dict[str, object]]:
         output = io.StringIO()
         wrapper = self.completed_wrapper(root)
@@ -10056,7 +10058,8 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     self.janitor_input(
                         worktree,
                         branch_name="TASK-1",
-                        cleanup_mode="no_pr",
+                        cleanup_mode=cleanup_mode,
+                        pr_url=pr_url,
                         cleanup_report=cleanup_report,
                     )
                 ),
@@ -10821,6 +10824,104 @@ class WorkflowJanitorTest(GitRepositoryTest):
             },
         )
         self.assertTrue(worktree.is_dir())
+
+    def test_partial_native_retarget_refusal_stops_before_branch_cleanup(self) -> None:
+        root, worktree, scripts, _ = self.make_managed_worktree(with_v2=False)
+        janitor = load_template_module(
+            scripts / "workflow-task-janitor",
+            "janitor_partial_retarget_refusal",
+        )
+        head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        remote_oid = self.run_git(root, "rev-parse", "refs/heads/TASK-1").stdout.strip()
+        simulated_cleanup_target = {"effective_workdir": str(worktree)}
+        deletion_calls = []
+
+        def refuse_after_partial_retarget(*args, **kwargs):
+            deletion_calls.append((args, kwargs))
+            simulated_cleanup_target["effective_workdir"] = str(root)
+            return (
+                False,
+                "Kent delete failed after partial Session retarget.",
+                "Reconcile actual state before retrying.",
+            )
+
+        pr_url = "https://github.com/example/repo/pull/1"
+        with (
+            mock.patch.object(
+                janitor,
+                "github_pr",
+                return_value={
+                    "state": "MERGED",
+                    "headRefName": "TASK-1",
+                    "headRefOid": head,
+                    "isCrossRepository": False,
+                },
+            ),
+            mock.patch.object(
+                janitor, "merged_pr_contains_head", return_value=True,
+            ),
+            mock.patch.object(
+                janitor, "remote_branch_oid", return_value=remote_oid,
+            ) as remote_branch_read,
+            mock.patch.object(
+                janitor, "cleanup_session_uses_workspace", return_value=False,
+            ),
+            mock.patch.object(
+                janitor,
+                "capture_kent_worktree_record",
+                return_value={
+                    "variant": "registered",
+                    "root": str(worktree),
+                    "worktree_id": "kent-test-record",
+                },
+            ),
+            mock.patch.object(
+                janitor, "_admit_managed_runtime_parent",
+                return_value=(True, "runtime parent admitted"),
+            ),
+            mock.patch.object(
+                janitor, "_prepare_v2_managed_runtime_state",
+                return_value=(True, "terminal state prepared"),
+            ),
+            mock.patch.object(
+                janitor,
+                "delete_managed_worktree",
+                side_effect=refuse_after_partial_retarget,
+            ),
+            mock.patch.object(janitor, "settle_local_branch") as local_cleanup,
+        ):
+            code, payload = self.run_managed_janitor_module(
+                janitor,
+                root,
+                worktree,
+                cleanup_report="Legacy cleanup fixture.",
+                native_delete_called=root / "native-delete-called",
+                cleanup_mode="merged",
+                pr_url=pr_url,
+            )
+
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["transition"], "task_janitor_blocked", payload)
+        self.assertIn("partial Session retarget", payload["cleanup_report"])
+        self.assertEqual(len(deletion_calls), 1)
+        self.assertEqual(
+            simulated_cleanup_target["effective_workdir"], str(root),
+        )
+        local_cleanup.assert_not_called()
+        remote_branch_read.assert_called_once_with(root.resolve(), "TASK-1")
+        self.assertTrue(worktree.is_dir())
+        self.assertIn(
+            str(worktree),
+            self.run_git(root, "worktree", "list", "--porcelain").stdout,
+        )
+        self.assertEqual(
+            self.run_git(root, "rev-parse", "refs/heads/TASK-1").stdout.strip(),
+            remote_oid,
+        )
+        self.assertIn(
+            "refs/heads/TASK-1",
+            self.run_git(root, "ls-remote", "--heads", "origin", "TASK-1").stdout,
+        )
 
     def test_managed_completed_wrapper_without_tombstone_reports_ambiguous_evidence(
         self,
