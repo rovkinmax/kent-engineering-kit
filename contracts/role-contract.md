@@ -24,6 +24,20 @@ agents, prompts, and skills but not this maintainer contract into consumer
 workspaces; a role must not require `contracts/role-contract.md` relative to
 the current project.
 
+Kent 2.9 additionally reads private `.kent/config.local.toml` from the main
+workspace, after shared workspace configuration and before environment/CLI
+overrides. Do not copy it into task worktrees or infer effective role policy
+from the global file alone. Provider connection declarations and
+`shell.max_concurrent` are server configuration, not project adapter policy.
+Changes to accounts, models, connections or concurrency require their own
+approval; documentation compatibility does not authorize migration.
+
+A Kent 2.9 headless run may return exit zero and `status: "ok"` with
+`outcome.kind: "question"` and no result. Pending Questions and Approvals are
+not completed helper results, independent reviews or resource releases.
+Inspect the pending decision and preserve its authority boundary; answering
+resumes the existing execution, not a replacement helper.
+
 The kit supplies contract-complete global implementations for canonical
 operational roles. Kent documents workspace config as higher precedence and it
 may specialize the same role name with platform or repository-specific

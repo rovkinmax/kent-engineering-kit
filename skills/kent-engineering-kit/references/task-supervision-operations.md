@@ -35,11 +35,31 @@ Re-read immediately before answering; this is not an atomic compare-and-set.
 Changed targeting or concurrent answers need reconciliation. Read back the
 actual response and continuation; successful transport is not decision closure.
 
+Kent 2.9 headless runs can exit zero with `status: "ok"` and
+`outcome.kind: "question"` but no result, even with `--quiet`. Inspect the
+pending Question or Approval rather than treating the helper as finished.
+An answer resumes that execution; do not start `--continue` or Task Resume
+to release this wait. On older runtimes or without a Question tool, return
+the unresolved blocker to the operator.
+
+Question history in 2.9 includes `answered_by_session_id`. An agent identity
+is useful provenance; a null value is sessionless/legacy presentation, not
+proof of human authorship. Verify the original human source and exact locator.
+Native rejection of a child's answer to its direct parent's ordinary Question
+does not protect all ancestors or Approvals and does not grant answer authority.
+
 ## Resume and route selection
 
 Re-read the node, retained execution, source/root, pending decisions and
 unfinished effects before recovery. A native Resume acknowledgement means
 queued work; check actual execution after a bounded delay.
+
+Kent 2.9 can recover a committed-but-unstarted Session with zero
+`LastSequence`, false `ConversationEstablished` and zero `ModelRequestCount`.
+Distinguish this from an absent binding or lost established history; neither
+is repaired by inventing a new retained execution. Plain continuation retains
+settings; compaction continuation may apply the target configuration under
+the same ID. Check the compaction event and refreshed lock, not ID rotation.
 
 For a route change, inspect the complete transition's prerequisites, context
 source/mode and required values. Preserve provenance and meaning of carried
@@ -71,6 +91,20 @@ after possible effects, reconcile those effects before retry or reassignment.
 Do not abandon a live helper or count a delivered assignment as completed work.
 
 ## Runtime and external effects
+
+Before a future Kent 2.9 upgrade, qualify CLI and server compatibility together;
+the CLI version alone is insufficient. Private main-workspace
+`.kent/config.local.toml` can override shared role settings. Inspect effective
+policy without copying private files or secrets into task roots. Connection
+definitions and shell concurrency remain server-owned; do not migrate them
+as part of project repair. Provider credential environment names may be
+excluded from child shells, so do not reuse those names for project credentials.
+
+Native worktree retirement may reject accepted work, or fail after partial
+idle-Session retargeting. Re-read actual state; do not force cleanup or retry
+destructive actions automatically. A retained Task with a missing root is not
+permission to select a replacement execution target. Preserve Task identity
+and request the necessary explicit selection through the supported interface.
 
 Before delegating runtime work, verify a compatible project acquisition,
 token-persistence and cleanup procedure and absence of a conflicting owner.

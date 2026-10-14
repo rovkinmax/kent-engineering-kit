@@ -294,6 +294,25 @@ for grill_guard in \
   }
 done
 
+for compatibility_guard in \
+  'outcome.kind: "question"' \
+  'committed-but-unstarted' \
+  'partial Session'; do
+  grep -F "$compatibility_guard" "$repo_root/contracts/workflow-contract.md" >/dev/null || {
+    echo "workflow contract must preserve Kent 2.9 compatibility: $compatibility_guard" >&2
+    exit 1
+  }
+done
+for authority_guard in \
+  'answered_by_session_id' \
+  'proof of human authorship' \
+  'config.local.toml'; do
+  grep -F "$authority_guard" "$repo_root/skills/kent-engineering-kit/references/task-supervision-operations.md" >/dev/null || {
+    echo "supervision reference must preserve compatibility authority: $authority_guard" >&2
+    exit 1
+  }
+done
+
 names_file="$(mktemp)"
 trap 'rm -f "$names_file"' EXIT
 

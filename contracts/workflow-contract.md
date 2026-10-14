@@ -347,16 +347,17 @@ Sealed cleanup: [governed exception](sealed-recovery.md).
 
 ## Active feedback and recovery
 
-- Task/run watch/wait are deterministic observers, not model polling.
-  `kent question`/`answer` own pending questions and approvals. Start, Move,
-  and Resume accept `--branch-name`; the short ID remains lifecycle identity.
-  Resume is asynchronous; re-read state and use retained-worktree recovery.
-  Kent 2.6.1 preserves Script stderr.
-- Task comments are durable records but do not interrupt or update the context
-  of an already running node.
-- User feedback for an active run is delivered through `kent run steer` or the
-  equivalent interactive session message. The node then exits through its
-  declared transition with refreshed structured context.
+- Task/run watch/wait observe deterministically. `kent question`/`answer`
+  handle decisions. Start/Move/Resume accept `--branch-name`; short ID owns
+  lifecycle. Resume is asynchronous: re-read state and recover the retained
+  worktree. Kent 2.6.1 preserves Script stderr.
+- Kent 2.9 `outcome.kind: "question"` is pending, not completion; an authorized
+  answer resumes the same execution. For committed-but-unstarted recovery,
+  attribution and configuration limits, follow the
+  [operations reference](../skills/kent-engineering-kit/references/task-supervision-operations.md).
+- Task comments are durable records, not active-node feedback.
+- Deliver active feedback through `kent run steer` or interactive messages;
+  the owner takes its declared transition with refreshed structured context.
 - Changed product decisions or acceptance require the next writer to update
   the authoritative plan first, citing the exact human source (Task comment,
   verifiable original Session message or native Question answer). Code,
@@ -374,19 +375,16 @@ Sealed cleanup: [governed exception](sealed-recovery.md).
 
 Plan Review, normalized plan snapshots, and material-change revalidation are
 defined by `contracts/plan-contract.md`.
-- Resuming an interrupted run may reuse the same session and therefore retains
-  its locked prompt and execution settings. Prompt-policy fixes apply only to a
-  newly created session. Repeated provider failures require checkpoint-aware
-  recovery rather than assuming Resume creates a clean runtime.
-- An approval-gated `compact_and_continue_session` recovery may compact in
-  place under the same session ID. Treat `context_compaction_completed` plus a
-  refreshed session lock as the recovery evidence. The lifetime
-  `model_request_count` remains cumulative and is not evidence that the
-  compacted context is still large.
-- Compaction proves context reduction and worktree continuity, not provider
-  reliability. A broad recovered node can grow large again and fail before its
-  transition persists. Pair compaction with durable checkpoints, authoritative
-  artifact updates, and bounded remaining work.
+- Resume retains locked prompts/settings; source prompt fixes require a new
+  Session. Repeated provider failures need checkpoint-aware recovery.
+- Approval-gated `compact_and_continue_session` may retain the Session ID.
+  Verify `context_compaction_completed` and a refreshed lock; cumulative
+  `model_request_count` does not measure post-compaction context.
+- Kent 2.9 plain continuation retains settings; compaction continuation applies
+  target configuration, potentially under the same ID.
+- Compaction proves context reduction/worktree continuity, not reliability.
+  Context can regrow before transition persistence; retain checkpoints,
+  authoritative artifacts and bounded remaining work.
 - Fix and Smoke checkpoints live under the ignored
   `.kent/runtime/<task-short-id>/` directory and are written atomically through
   the profile-owned checkpoint command. They contain one next action plus
@@ -626,11 +624,11 @@ link/default change, direct database edit, or caller-supplied effect is allowed.
   may be deleted only under the same exact merged-PR proof.
 - No-PR/report-only cleanup requires the clean HEAD to remain reachable from a
   remote ref. Closed-without-merge work is preserved.
-- Janitor treats `kind=scheduled` as non-terminal and accepts deletion only
-  after Kent returns `kind=completed` and both the worktree path and Git
-  registration are absent.
-- Preservation succeeds explicitly in `cleanup_report`; infrastructure failure
-  returns to Cleanup without touching the resource.
+- Janitor accepts validated terminal/native success only with absent path/Git
+  registration and exact retained metadata identity; `scheduled` is pending.
+- Record preservation in `cleanup_report`. Failure may follow partial Session
+  retargeting: reconcile in Cleanup; no automatic destructive retry or later
+  branch/remote cleanup. See [worktree contract](worktree-contract.md).
 - CI bounds, recovery and Git binding: `workflow-task-janitor` docstring.
 
 ## Project adapter boundary

@@ -262,6 +262,14 @@ kent run --agent grill 'Critique this design and list unresolved decisions'
 ```
 
 Give grill the ID of an existing Session to request independent criticism.
+
+Kent 2.9 compatibility includes pending headless Questions, answer attribution,
+first-start recovery and the CLI worktree JSON dialect. A successful CLI exit
+with a pending Question is not a completed review. Source-derived compatibility
+fixtures do not qualify an installed server; upgrade/restart and live workflow
+adoption remain separately approved operations. Existing minimum versions and
+serial workflow graphs are unchanged.
+
 It uses `kent run steer <session-id> '<message>'` for an active run; only grill
 and the six bounded roles may observe one next outcome of that same active run
 with a time-bounded read-only `kent run watch <session-id>` after steer.
@@ -321,8 +329,10 @@ human. Installation, merge and terminal Task state are distinct outcomes.
 Generated Fix and Compliance can return a substantive execution-plan discrepancy
 to existing Plan Revalidation before source edits. Read [decision closure and
 project coverage](docs/SUPERVISOR-DECISION-CLOSURE.md) for qualification limits.
-Headless invocation returns blocker/options when input is required; it does not
-provide automatic wakeup. Prompt-contract tests and read-only walkthroughs
+On Kent 2.9, an available native Question can suspend headless supervision
+until its answer resumes the same execution. Older runtimes or unavailable
+tools return blocker/options; neither supplies an independent wakeup scheduler.
+Prompt-contract tests and read-only walkthroughs
 verify packaged policy, not model compliance or live Task recovery. Existing
 Sessions keep locked prompts and settings after installation/configuration
 changes; use a new Session.
