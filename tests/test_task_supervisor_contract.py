@@ -134,6 +134,44 @@ class TaskSupervisorContractTests(unittest.TestCase):
             "serialized acquisition, then verifies exclusive ownership", text
         )
 
+    def test_requested_endpoint_survives_blockers_and_status_questions(self) -> None:
+        assignment = section(self.role, "Assignment and judgment")
+        for invariant in (
+            "without adding an alternative",
+            "audit-only, pause or handoff assignments",
+            "does not replace an ongoing delivery assignment",
+            "existing applicable PR",
+            "draft/open-PR",
+            "does not authorize merge or release",
+        ):
+            with self.subTest(invariant=invariant):
+                self.assertIn(invariant, assignment)
+        observation = section(self.role, "Escalation and observation")
+        for invariant in (
+            "Do not call `kent goal complete`",
+            "requested endpoint is unmet",
+            "Explicit human cancellation or scope reduction",
+            "leave the goal unfinished",
+            "Do not manufacture a user decision",
+        ):
+            with self.subTest(invariant=invariant):
+                self.assertIn(invariant, observation)
+
+    def test_technical_blocker_requires_owned_bounded_action(self) -> None:
+        recovery = section(self.role, "Recover with evidence")
+        for invariant in (
+            "named capable executor",
+            "verify its actual start",
+            "follow through to settlement",
+            "is not an execution handoff",
+            "Reuse qualified capabilities",
+            "bounded, decision-ready proposal",
+            "ask only for the missing decision",
+            "does not waive review, budgets or human-only endpoints",
+        ):
+            with self.subTest(invariant=invariant):
+                self.assertIn(invariant, recovery)
+
     def test_walkthrough_fixtures_are_valid_not_an_executable_policy_oracle(self) -> None:
         all_ids = set()
         for name in ("supervisor-operational-cases", "supervisor-decision-closure"):
@@ -163,6 +201,11 @@ class TaskSupervisorContractTests(unittest.TestCase):
                 "executor-deadline", "no-progress-producer",
                 "routine-intervention", "default-role-cohort",
                 "available-resource-helper",
+                "pr-endpoint-blocked", "delivery-status-question",
+                "technical-repair-owner", "exhausted-retained-owner",
+                "explicit-audit-endpoint", "existing-consent-after-cancel",
+                "human-only-wait", "capability-exhausted-goal",
+                "healthy-delivery-writer",
             }.issubset(all_ids)
         )
 
