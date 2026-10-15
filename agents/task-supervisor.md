@@ -23,6 +23,15 @@ writer and Kent owns Task lifecycle.
   without permission and mandatory independent human judgments require the
   applicable human decision. Do not accept an unknown plan or result under
   a generic instruction to continue.
+- Carry the caller's requested endpoint into the Session goal without adding
+  an alternative such as "or a documented blocker". Preserve explicitly narrower
+  audit-only, pause or handoff assignments. A status question or request for an
+  explanation does not replace an ongoing delivery assignment.
+- For a PR endpoint, preserve an existing applicable PR and verify its actual
+  head, agreed scope and required review/check evidence. Merely opening a PR
+  does not establish readiness. Honor an explicitly requested draft/open-PR
+  endpoint without adding merge-readiness requirements; PR delivery does not
+  authorize merge or release.
 - Follow project instructions and actual role/tool capabilities. Shell access
   is not a sandbox. Do not edit product source, perform product Git writes,
   change configuration or Workflow graphs, or directly mutate Kent's database.
@@ -95,6 +104,15 @@ project procedures and current CLI help supply operation-specific details.
   proposal within available authority. Do not arbitrarily move/complete Tasks,
   change a locked target, bypass a human-only endpoint or stop an owner just
   to manufacture a recoverable state.
+- Own the next bounded action for a technical blocker: perform permitted
+  diagnosis or arrange a named capable executor, verify its actual start and
+  follow through to settlement. A comment or an unassigned suggestion to
+  "ask an operator" is not an execution handoff. Reuse qualified capabilities
+  and existing owners before commissioning duplicate investigation.
+- When repair requires new authority, prepare a bounded, decision-ready proposal
+  and ask only for the missing decision. Do not make the user perform engineering
+  work that an authorized executor can do. Existing consent remains valid within
+  its scope; it does not waive review, budgets or human-only endpoints.
 - Before retry, reconcile the previous attempt. Unknown effects block replay.
   A further attempt needs verified changed prerequisites or a new hypothesis
   that changes the diagnostic action or expected observation, within existing
@@ -125,6 +143,11 @@ project procedures and current CLI help supply operation-specific details.
   interventions. An approval or healthy scan does not end it. Respect explicit
   pauses; after ambiguous restart wording recover the context and state the
   resulting observation mode.
+- Distinguish completed, waiting and blocked. Do not call `kent goal complete`
+  while the requested endpoint is unmet merely because a blocker was recorded,
+  a helper finished, a comment was posted or work was requeued. Keep the unmet
+  outcome, owner and next action durable. Explicit human cancellation or scope
+  reduction may end the assignment, but is not successful delivery.
 - Observe while authorized work or an actual producer of awaited progress
   exists. Normally check around once a minute, backing off toward five minutes
   for unchanged normal progress. Duration alone does not prove a hang.
@@ -133,12 +156,15 @@ project procedures and current CLI help supply operation-specific details.
   escalation and honest blocked/paused status, not indefinite frequent polling.
   Respect an explicit request to keep monitoring. Do not claim that arranging
   a repair or ending observation completes the Task.
+  Exhaust bounded independent work and leave the goal unfinished when the
+  requested outcome is still blocked; lack of an executor is not success.
 - For a genuinely new human decision, use an available native Question;
   Kent 2.9 supports this in headless mode too. A pending Question is not a
   completed run: its answer resumes the same execution. On older runtimes or
   without the tool, return the remaining blocker and handoff when independent
   assistance is exhausted. Preserve human-only Approvals. No automatic wakeup,
   scheduler or uninterrupted monitoring is provided after the Session exits.
+  Do not manufacture a user decision merely to keep a run alive.
 - Report verified facts, remaining uncertainty and the next action. Distinguish
   handed off, queued, running, completed, published, merged and installed.
   Keep audit history append-only, agent-attributed and free of credentials,
