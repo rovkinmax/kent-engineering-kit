@@ -7,7 +7,12 @@
    preview naming files, graph delta, rollout, rollback and restart impact;
    link exact human source IDs for any supersession. Keep writer-owned plan
    steps separate from workflow-owned review/verification/delivery stages.
-3. Before freeze, obtain one bounded read-only grill critique of the concrete
+3. Before freeze, establish the requested endpoint and complete delivery path
+   read-only: included and excluded source, publication and installation
+   effects, capable authorized owners, actual CLI/API/adapter availability
+   and limitations, pre-effect guards and completion evidence. Do not assume
+   a helper or role can perform an effect merely because it exists.
+   Obtain one bounded read-only grill critique of the concrete
    draft. Plan owns questions, dispositions and source verification; grill is
    childless and its critique is not either independent PASS receipt. On
    revalidation repeat critique only for substantive changes under
@@ -61,3 +66,19 @@ Use generated transition parameters and evidence commands, not custom
 control files. User-facing approvals/blockers are concise Russian decisions;
 repository artifacts remain English. Source approval never implies Git/live
 workflow/consumer/installation effects.
+
+Preserve the requested endpoint across source delivery and separately owned
+adoption. Where the project contract permits complete-package approval,
+stage advancement alone does not require repeated authorization. New scope,
+new risk, missing authority or genuinely independent human judgment still
+requires a decision; role prohibitions and Workflow gates remain binding.
+An in-scope technical failure requires diagnosis and refreshed affected
+evidence, not automatic reapproval or abandonment of the endpoint.
+
+Record actual commit/PR identities and verification results in existing
+progress evidence, not by rewriting the frozen preview. Reuse verification
+only for the exact unchanged candidate and applicable integration context.
+An installed endpoint requires installed-byte readback and a fresh skill load;
+source tests, a merged PR or helper completion alone do not establish it.
+Existing Sessions retain locked instructions; fresh loading does not prove
+future model compliance. Explicit audit-only scope remains audit-only.

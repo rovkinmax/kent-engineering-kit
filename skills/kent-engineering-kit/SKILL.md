@@ -23,7 +23,10 @@ database directly. Workflow updates follow
 [Execution-history and compatibility policy](../../contracts/workflow-contract.md#execution-history-and-compatibility-policy);
 source edits do not mutate live workflows. Do not install,
 activate, publish, push, restart, or mutate live Workflow/Task/default state
-without a separately approved effect gate.
+without explicit effect-specific authority and satisfied prerequisite checks.
+Where project governance permits a bounded combined package, one approval may
+explicitly enumerate those effects; source-only approval never grants them.
+The project contract owns scope, capable ownership and effect settlement.
 
 ## Operational CLIs
 
