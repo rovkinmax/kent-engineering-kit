@@ -295,6 +295,47 @@ assert edges["plan_review_accept"]["requires_approval"] is True
         self.assertIn("both independent reviews PASS", procedure)
         self.assertIn("not either independent PASS receipt", procedure)
 
+    def test_complete_package_authority_and_endpoint_contract(self) -> None:
+        # Static instruction coverage, not proof of future model behavior.
+        requirements = {
+            ".kent/project-contract.md": (
+                "one explicit human approval",
+                "two independent read-only reviews PASS on the same complete preview",
+                "Source-only approval grants no delivery or adoption authority",
+                "target branch and primary root",
+                "verified before effects",
+                "Adoption remains outside the source Workflow",
+                "Combined approval does not waive role prohibitions",
+                "Stop on dirty or divergent state",
+                "Reconcile unknown remote outcomes before retrying",
+                "This flow never merges a PR or pushes directly to main",
+            ),
+            "skills/kent-engineering-kit/SKILL.md": (
+                "explicit effect-specific authority and satisfied prerequisite checks",
+                "one approval may explicitly enumerate those effects",
+                "source-only approval never grants them",
+                "project contract owns scope, capable ownership and effect settlement",
+            ),
+            ".kent/commands/plan.md": (
+                "Before freeze, establish the requested endpoint",
+                "actual CLI/API/adapter availability and limitations",
+                "included and excluded source, publication and installation effects",
+                "stage advancement alone does not require repeated authorization",
+                "New scope, new risk, missing authority",
+                "in-scope technical failure requires diagnosis",
+                "not by rewriting the frozen preview",
+                "installed-byte readback and a fresh skill load",
+                "Existing Sessions retain locked instructions",
+                "Explicit audit-only scope remains audit-only",
+                "both independent reviews PASS on the same preview hash",
+            ),
+        }
+        for path, phrases in requirements.items():
+            content = " ".join((ROOT / path).read_text().split())
+            for phrase in phrases:
+                with self.subTest(path=path, phrase=phrase):
+                    self.assertIn(phrase, content)
+
     def test_evidence_custody_preserves_post_approval_sources(self) -> None:
         # Instruction-contract regression, not a simulation of agent behavior.
         plan = " ".join((ROOT / ".kent/commands/plan.md").read_text().split())

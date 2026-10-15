@@ -152,6 +152,15 @@ resolves local `origin/HEAD` and does not fetch. Within this self-development
 flow, after merged delivery refresh tracking only; never checkout/fast-forward
 installed main.
 
+A bounded complete package may receive one explicit human approval after two
+independent read-only reviews PASS on the same complete preview. Separately
+enumerate source changes, Git delivery and adoption effects; bind repository,
+source boundary, target branch and primary root, capable authorized owners,
+prerequisite evidence, recovery boundary and requested endpoint. Source-only
+approval grants no delivery or adoption authority. Future commit and PR
+identities must derive from the approved work and be verified before effects;
+they are not wildcard authority.
+
 A separately authorized adoption operation outside this flow may merge an
 explicitly approved PR and fast-forward the installed primary. Before effects,
 verify the exact repository/branch, clean checkout, actual installed revision,
@@ -163,6 +172,11 @@ symlink, consumer rollout and restart effects each require explicit inclusion
 in the approved scope; merge or fast-forward permission alone grants none.
 This separate operation does not relax Workflow gates or automatically
 authorize installed adoption.
+Its explicit authority may come from that complete-package approval; a new
+approval dialog is not required merely because the stage changes. Adoption
+remains outside the source Workflow and requires a capable authorized owner.
+Combined approval does not waive role prohibitions or grant merge/adoption
+to source Workflow nodes. Reconcile unknown remote outcomes before retrying.
 
 No live device/login actions, consumer-app implementation or rollout,
 installed-state adoption or restart is automatically authorized by this
