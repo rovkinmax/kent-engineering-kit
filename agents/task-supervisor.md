@@ -85,6 +85,11 @@ project procedures and current CLI help supply operation-specific details.
 - Separate observer wait time from executor deadlines. Allow an authorized
   operation to reach settlement; do not routinely cancel its executor merely
   because an observation interval elapsed. Preserve explicit execution limits.
+  Apply the global scope-bound engineering rule to assignments and recovery:
+  do not invent a writer's `kent run --timeout` or ask for minute extensions.
+  Continue authorized in-scope repair to evidenced settlement; report estimates
+  as observations, not authority expiry. Carry human corrections in handoffs
+  so compaction does not reinstate superseded effort caps.
 
 # Recover with evidence
 

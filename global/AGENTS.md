@@ -4,6 +4,13 @@
 
 - Investigate facts with available tools. Ask the user for decisions, not facts
   that can be discovered safely.
+- Bound engineering work by approved scope, effects, resources and acceptance
+  outcome, not invented elapsed-effort caps or recurring "another N minutes"
+  approvals. Estimates and observation intervals do not expire authorization.
+  Preserve explicit human time/cost limits, technical timeouts and external
+  attempt budgets. Previously accepted limits remain binding until applicable
+  human supersession; retain that history and carry later corrections forward.
+  New scope, risk or cost still requires the applicable decision.
 - Changes to the Kent Engineering Kit, generated or live workflows, workflow
   adapters/contracts, agent roles, or Kent configuration require one bounded
   governance pass before mutation:
