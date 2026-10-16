@@ -39,6 +39,44 @@ class TaskSupervisorContractTests(unittest.TestCase):
         self.assertNotIn("contracts/role-contract.md", self.role)
         self.assertNotRegex(self.role, r"(?m)^\s*(model|tools)\s*:")
 
+    def test_effort_estimates_do_not_create_authorization_expiry(self) -> None:
+        guidance = normalized((REPO_ROOT / "global/AGENTS.md").read_text())
+        for invariant in (
+            "approved scope, effects, resources and acceptance outcome",
+            'not invented elapsed-effort caps or recurring "another N minutes"',
+            "Estimates and observation intervals do not expire authorization",
+            "explicit human time/cost limits, technical timeouts and external attempt budgets",
+            "Previously accepted limits remain binding until applicable human supersession",
+            "New scope, risk or cost still requires the applicable decision",
+        ):
+            with self.subTest(invariant=invariant):
+                self.assertIn(invariant, guidance)
+        role = normalized(self.role)
+        for invariant in (
+            "Separate observer wait time from executor deadlines",
+            "Preserve explicit execution limits",
+            "do not invent a writer's `kent run --timeout`",
+            "Continue authorized in-scope repair to evidenced settlement",
+            "compaction does not reinstate superseded effort caps",
+        ):
+            with self.subTest(invariant=invariant):
+                self.assertIn(invariant, role)
+
+    def test_effort_limit_walkthrough_coverage(self) -> None:
+        data = json.loads(
+            (REPO_ROOT / "tests/fixtures/supervisor-operational-cases.json").read_text()
+        )
+        cases = {case["id"]: case for case in data["cases"]}
+        for case_id, category in (
+            ("no-effort-deadline", "allow"),
+            ("invented-minute-renewal", "allow"),
+            ("observer-not-executor-deadline", "allow"),
+            ("explicit-human-deadline", "protect"),
+            ("human-superseded-effort-cap", "allow"),
+        ):
+            with self.subTest(case_id=case_id):
+                self.assertEqual(cases[case_id]["category"], category)
+
     def test_assignment_retains_authority_and_product_ownership(self) -> None:
         assignment = section(self.role, "Assignment and judgment")
         for invariant in (
