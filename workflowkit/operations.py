@@ -11,10 +11,12 @@ import base64
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import selectors
+import shlex
 import stat
 import struct
 import subprocess
@@ -23,6 +25,7 @@ import tempfile
 import time
 import sqlite3
 import tomllib
+import uuid
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from .release import canonical_bytes as release_canonical_bytes
 from .release import ReleaseSpec
@@ -36,6 +39,7 @@ UUID_RE = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[89abAB][0-9a-fA-F]{3}-
 MAX_LIST = 256
 MAX_COMMAND = 64
 MAX_OUTPUT = 256 * 1024
+CANONICAL_GRAPH_MAX_OUTPUT = 8 * 1024 * 1024
 EXEC_ENTRY_LIMIT = 128 * 1024
 EXEC_AGGREGATE_LIMIT = 512 * 1024
 EXEC_FD_DECIMAL_RESERVE = 20
@@ -752,7 +756,8 @@ def _terminate_owned(process: subprocess.Popen[bytes]) -> None:
 
 def run_effect(journal: OperationJournal, *, effect_key: str, command: Sequence[str], cwd: Path, timeout: float=30.0,
         preimage_sha256: str | None=None, postimage_sha256: str | None=None, extra_env: Mapping[str, str] | None=None,
-        stdin_bytes: bytes | None=None, current_sha256: Callable[[], str] | None=None) -> EffectResult:
+        stdin_bytes: bytes | None=None, current_sha256: Callable[[], str] | None=None,
+        pre_release_check: Callable[[], Any] | None=None) -> EffectResult:
     if timeout <= 0 or timeout > 300:
         raise PlanValidationError('effect timeout must be between 0 and 300 seconds')
     if not callable(current_sha256):
@@ -810,6 +815,8 @@ def run_effect(journal: OperationJournal, *, effect_key: str, command: Sequence[
         persisted = ((journal.state or {}).get('effects') or {}).get(effect_key)
         if persisted != expected_entry:
             raise JournalError('effect child ownership readback mismatch')
+        if pre_release_check is not None:
+            pre_release_check()
         written = os.write(control_write, b'1')
         if type(written) is not int or written != 1:
             raise EffectBlocked('effect child release write was not confirmed')
@@ -921,7 +928,8 @@ def recover_effect(journal: OperationJournal, *, effect_key: str, command: Seque
 
 def _settle_or_run(journal: OperationJournal, *, effect_key: str, command: Sequence[str], cwd: Path, preimage_sha256:
         str, postimage_sha256: str, current_sha256: Callable[[], str], extra_env: Mapping[str, str] | None=None,
-        stdin_bytes: bytes | None=None, timeout: float=30.0) -> str:
+        stdin_bytes: bytes | None=None, timeout: float=30.0,
+        pre_release_check: Callable[[], Any] | None=None) -> str:
     entry = (journal.state.get('effects') or {}).get(effect_key)
     if isinstance(entry, dict) and entry.get('status') == 'verified':
         if current_sha256() != postimage_sha256:
@@ -933,25 +941,53 @@ def _settle_or_run(journal: OperationJournal, *, effect_key: str, command: Seque
                 stdin_bytes=stdin_bytes)
     return run_effect(journal, effect_key=effect_key, command=command, cwd=cwd, timeout=timeout,
             preimage_sha256=preimage_sha256, postimage_sha256=postimage_sha256, current_sha256=current_sha256,
-            extra_env=extra_env, stdin_bytes=stdin_bytes).settlement or ''
+            extra_env=extra_env, stdin_bytes=stdin_bytes, pre_release_check=pre_release_check).settlement or ''
 
-def _run(command: Sequence[str], *, cwd: Path, timeout: float=30.0, extra_env: Mapping[str, str] | None=None) -> \
-        tuple[int, bytes, bytes]:
+def _run(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: float = 30.0,
+    extra_env: Mapping[str, str] | None = None,
+    output_limit: int = MAX_OUTPUT,
+    stdin: int | None = None,
+) -> tuple[int, bytes, bytes]:
+    if (
+        not isinstance(output_limit, int)
+        or isinstance(output_limit, bool)
+        or output_limit < 1
+        or output_limit > CANONICAL_GRAPH_MAX_OUTPUT
+    ):
+        raise OperationError('internal command output bound is invalid')
+    if stdin not in (None, subprocess.DEVNULL):
+        raise OperationError('internal command stdin mode is unsupported')
     argv = _argv(list(command), 'internal command')
     if not Path(argv[0]).is_absolute():
         raise OperationError('internal command executable must be absolute')
-    process = subprocess.Popen(argv, cwd=str(cwd), env=_safe_env(extra_env), stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, close_fds=True)
+    process = subprocess.Popen(
+        argv,
+        cwd=str(cwd),
+        env=_safe_env(extra_env),
+        stdin=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+    )
     try:
-        out, err = _bounded_communicate(process, timeout)
+        out, err = _bounded_communicate(process, timeout, limit=output_limit)
     except subprocess.TimeoutExpired as error:
         process.kill()
         process.wait(timeout=2)
         raise OperationError('internal command timed out') from error
     return (process.returncode or 0, out, err)
 
-def _json_command(command: Sequence[str], *, cwd: Path) -> dict[str, Any]:
-    code, out, err = _run(command, cwd=cwd)
+def _json_command(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    output_limit: int = MAX_OUTPUT,
+) -> dict[str, Any]:
+    code, out, err = _run(command, cwd=cwd, output_limit=output_limit)
     if code:
         raise OperationError(err.decode(errors='replace') or 'command failed')
     try:
@@ -972,8 +1008,14 @@ def _verify_executable(path: Path, digest: str) -> None:
     if sha256_bytes(path.read_bytes()) != _sha256(digest, 'kent_sha256'):
         raise PlanValidationError('Kent executable bytes do not match the plan')
 
-def _kent_json(kent: Path, args: Sequence[str], *, cwd: Path) -> dict[str, Any]:
-    return _json_command([str(kent), *args], cwd=cwd)
+def _kent_json(
+    kent: Path,
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    output_limit: int = MAX_OUTPUT,
+) -> dict[str, Any]:
+    return _json_command([str(kent), *args], cwd=cwd, output_limit=output_limit)
 
 def _kent_optional(kent: Path, args: Sequence[str], *, cwd: Path) -> dict[str, Any]:
     code, out, err = _run([str(kent), *args], cwd=cwd)
@@ -2345,6 +2387,17 @@ CANONICAL_V2_SNAPSHOT_SCHEMA = 'canonical-workflow-compatibility-snapshot-v1'
 CANONICAL_V2_REVIEW_SCHEMA = 'canonical-workflow-compatibility-review-v1'
 CANONICAL_V2_MAX_PLAN = 1024 * 1024
 CANONICAL_V2_MAX_REFERENCE = 1024 * 1024
+NATIVE_EVIDENCE_SCHEMA = 'kent-native-evidence-v1'
+NATIVE_COMPONENTS_SCHEMA = 'kent-native-components-v1'
+NATIVE_MAX_TASKS = 4096
+NATIVE_MAX_TERMINAL_IDENTITIES = 4096
+NATIVE_MAX_EVENT_FILE_BYTES = 256 * 1024 * 1024
+NATIVE_MAX_EVENT_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+NATIVE_MAX_EVENT_LINE_BYTES = 8 * 1024 * 1024
+NATIVE_MAX_SELECTED_EVENTS_PER_SESSION = 256
+NATIVE_MAX_SELECTED_EVENT_BYTES = 32 * 1024 * 1024
+NATIVE_MAX_DB_JSON_BYTES = 8 * 1024 * 1024
+NATIVE_MAX_DB_COMPONENT_BYTES = 32 * 1024 * 1024
 SOURCE_ADMISSION_SCHEMA = 'delivery-source-admission-v1'
 SOURCE_RECEIPT_SCHEMA = 'delivery-runtime-publication-v1'
 SOURCE_BINDING_SCHEMA = 'r2-installation-binding-v2'
@@ -3150,13 +3203,1365 @@ def _v2_ref_list(
     return refs
 
 
-def _v2_snapshot(value: Any, label: str, *, verify_files: bool = True) -> dict[str, Any]:
+def _native_components(value: Any, label: str) -> dict[str, Any]:
     raw = _closed(value, {
+        'schema', 'approvals', 'questions', 'sessions', 'terminal_inventory_sha256',
+    }, label)
+    if raw.get('schema') != NATIVE_COMPONENTS_SCHEMA:
+        raise PlanValidationError(f'{label}.schema is unsupported')
+    approvals = []
+    for index, row_value in enumerate(_bounded_list(_required(raw, 'approvals', label), f'{label}.approvals')):
+        row_label = f'{label}.approvals[{index}]'
+        row = _closed(row_value, {'task_id', 'approval_id', 'record_sha256'}, row_label)
+        approvals.append({
+            'task_id': _string(_required(row, 'task_id', row_label), f'{row_label}.task_id'),
+            'approval_id': _string(_required(row, 'approval_id', row_label), f'{row_label}.approval_id'),
+            'record_sha256': _sha256(
+                _required(row, 'record_sha256', row_label), f'{row_label}.record_sha256',
+            ),
+        })
+    approvals.sort(key=lambda row: (row['task_id'], row['approval_id']))
+    _unique([f"{row['task_id']}:{row['approval_id']}" for row in approvals], f'{label}.approvals')
+    questions = []
+    for index, row_value in enumerate(_bounded_list(_required(raw, 'questions', label), f'{label}.questions')):
+        row_label = f'{label}.questions[{index}]'
+        row = _closed(row_value, {
+            'task_id', 'session_id', 'call_id', 'event_sequence', 'input_sha256',
+        }, row_label)
+        sequence = _required(row, 'event_sequence', row_label)
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            raise PlanValidationError(f'{row_label}.event_sequence is invalid')
+        questions.append({
+            'task_id': _string(_required(row, 'task_id', row_label), f'{row_label}.task_id'),
+            'session_id': _string(_required(row, 'session_id', row_label), f'{row_label}.session_id'),
+            'call_id': _string(_required(row, 'call_id', row_label), f'{row_label}.call_id'),
+            'event_sequence': sequence,
+            'input_sha256': _sha256(
+                _required(row, 'input_sha256', row_label), f'{row_label}.input_sha256',
+            ),
+        })
+    questions.sort(key=lambda row: (
+        row['task_id'], row['session_id'], row['call_id'], row['event_sequence'],
+    ))
+    _unique([
+        f"{row['session_id']}:{row['call_id']}:{row['event_sequence']}" for row in questions
+    ], f'{label}.questions')
+    sessions = []
+    for index, row_value in enumerate(_bounded_list(_required(raw, 'sessions', label), f'{label}.sessions')):
+        row_label = f'{label}.sessions[{index}]'
+        row = _closed(row_value, {'task_id', 'session_id', 'persisted_sha256', 'events'}, row_label)
+        events = []
+        for event_index, event_value in enumerate(_bounded_list(
+            _required(row, 'events', row_label), f'{row_label}.events',
+        )):
+            event_label = f'{row_label}.events[{event_index}]'
+            event = _closed(event_value, {'sequence', 'kind', 'sha256'}, event_label)
+            sequence = _required(event, 'sequence', event_label)
+            if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+                raise PlanValidationError(f'{event_label}.sequence is invalid')
+            events.append({
+                'sequence': sequence,
+                'kind': _string(_required(event, 'kind', event_label), f'{event_label}.kind'),
+                'sha256': _sha256(_required(event, 'sha256', event_label), f'{event_label}.sha256'),
+            })
+        if events != sorted(events, key=lambda event: (event['sequence'], event['kind'])):
+            raise PlanValidationError(f'{row_label}.events are not sorted')
+        _unique([str(event['sequence']) for event in events], f'{row_label}.events')
+        sessions.append({
+            'task_id': _string(_required(row, 'task_id', row_label), f'{row_label}.task_id'),
+            'session_id': _string(_required(row, 'session_id', row_label), f'{row_label}.session_id'),
+            'persisted_sha256': _sha256(
+                _required(row, 'persisted_sha256', row_label), f'{row_label}.persisted_sha256',
+            ),
+            'events': events,
+        })
+    if len(sessions) > MAX_LIST:
+        raise PlanValidationError(f'{label}.sessions exceeds the detailed Session bound')
+    sessions.sort(key=lambda row: (row['task_id'], row['session_id']))
+    _unique([row['session_id'] for row in sessions], f'{label}.sessions')
+    return {
+        'schema': NATIVE_COMPONENTS_SCHEMA,
+        'approvals': approvals,
+        'questions': questions,
+        'sessions': sessions,
+        'terminal_inventory_sha256': _sha256(
+            _required(raw, 'terminal_inventory_sha256', label),
+            f'{label}.terminal_inventory_sha256',
+        ),
+    }
+
+
+def _v2_native_descriptor(value: Any, label: str) -> dict[str, Any]:
+    raw = _closed(value, {
+        'schema', 'database_path', 'database_schema_sha256', 'session_roots',
+    }, label)
+    if raw.get('schema') != NATIVE_EVIDENCE_SCHEMA:
+        raise PlanValidationError(f'{label}.schema is unsupported')
+    database = _absolute_path(
+        _required(raw, 'database_path', label), f'{label}.database_path',
+    )
+    roots = []
+    for index, root_value in enumerate(_bounded_list(
+        _required(raw, 'session_roots', label), f'{label}.session_roots',
+    )):
+        roots.append(str(_absolute_path(root_value, f'{label}.session_roots[{index}]')))
+    roots.sort()
+    if not roots:
+        raise PlanValidationError(f'{label}.session_roots cannot be empty')
+    _unique(roots, f'{label}.session_roots')
+    return {
+        'schema': NATIVE_EVIDENCE_SCHEMA,
+        'database_path': str(database),
+        'database_schema_sha256': _sha256(
+            _required(raw, 'database_schema_sha256', label), f'{label}.database_schema_sha256',
+        ),
+        'session_roots': roots,
+    }
+
+
+def _native_path_stat(path: Path, label: str, *, directory: bool = False) -> os.stat_result:
+    path = _absolute_path(str(path), label)
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as error:
+            raise EffectBlocked(f'{label} is absent or inaccessible') from error
+        if stat.S_ISLNK(info.st_mode):
+            raise EffectBlocked(f'{label} traverses a symlink')
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise EffectBlocked(f'{label} is absent or inaccessible') from error
+    if (
+        info.st_uid != os.geteuid()
+        or (directory and not stat.S_ISDIR(info.st_mode))
+        or (not directory and not stat.S_ISREG(info.st_mode))
+        or (not directory and info.st_nlink != 1)
+    ):
+        raise EffectBlocked(f'{label} has an unsupported owner, kind, or link count')
+    return info
+
+
+def _native_open_nofollow(path: Path, label: str) -> int:
+    if not path.is_absolute() or not path.parts:
+        raise EffectBlocked(f'{label} is not an absolute path')
+    directory_flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    file_flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+    current = -1
+    try:
+        current = os.open(path.anchor, directory_flags)
+        for part in path.parts[1:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=current)
+            os.close(current)
+            current = next_fd
+        descriptor = os.open(path.parts[-1], file_flags, dir_fd=current)
+        return descriptor
+    except OSError as error:
+        raise EffectBlocked(f'{label} cannot be opened without following symlinks') from error
+    finally:
+        if current >= 0:
+            os.close(current)
+
+
+def _native_expected_paths(
+    descriptor: Mapping[str, Any],
+    project_id: str,
+) -> tuple[Path, Path, Path]:
+    environment = _safe_env()
+    home_value = environment.get('HOME')
+    if not isinstance(home_value, str) or not Path(home_value).is_absolute():
+        raise EffectBlocked('native evidence requires an absolute HOME in the replacement environment')
+    home = Path(home_value)
+    root = home / '.kent'
+    database = root / 'db' / 'main.sqlite3'
+    session_root = root / 'projects' / project_id / 'sessions'
+    if (
+        descriptor['database_path'] != str(database)
+        or descriptor['session_roots'] != [str(session_root)]
+    ):
+        raise EffectBlocked('native evidence paths do not bind the default local persistence root')
+    _native_path_stat(root, 'native persistence root', directory=True)
+    _native_path_stat(database, 'native persistence database')
+    _native_path_stat(session_root, 'native Session root', directory=True)
+    return root, database, session_root
+
+
+def _native_process_evidence(
+    pid: int,
+    kent: Path,
+    root: Path,
+    database: Path,
+    *,
+    system: str | None = None,
+    proc_root: Path = Path('/proc'),
+) -> dict[str, Any]:
+    system = sys.platform if system is None else system
+    try:
+        expected_executable = kent.resolve(strict=True)
+        executable_stat = expected_executable.stat()
+        database_stat = database.stat()
+    except OSError as error:
+        raise EffectBlocked('native process proof inputs are unavailable') from error
+    if system == 'darwin':
+        code, output, _ = _run([
+            '/bin/ps', '-ww', '-p', str(pid), '-o', 'pid=,uid=,lstart=,command=',
+        ], cwd=root, extra_env={'LANG': 'C', 'LC_ALL': 'C'})
+        if code != 0:
+            raise EffectBlocked('Darwin native process identity is unavailable')
+        try:
+            lines = output.decode('utf-8', errors='strict').splitlines()
+            parts = lines[0].split(None, 7) if len(lines) == 1 else []
+            if len(parts) != 8 or int(parts[0]) != pid or int(parts[1]) != os.geteuid():
+                raise ValueError
+            start = ' '.join(parts[2:7])
+            argv = shlex.split(parts[7], posix=True)
+            if not argv or Path(argv[0]).resolve(strict=True) != expected_executable:
+                raise ValueError
+        except (UnicodeDecodeError, ValueError, OSError) as error:
+            raise EffectBlocked('Darwin native process command is ambiguous') from error
+        if argv[1:] != ['serve', '--persistence-root', str(root)]:
+            raise EffectBlocked('Darwin native process serves a different root or command')
+        code, output, _ = _run([
+            '/usr/sbin/lsof', '-n', '-P', '-l', '-a', '-p', str(pid), '-FpcfutDin',
+        ], cwd=root)
+        if code != 0 or len(output) > MAX_OUTPUT:
+            raise EffectBlocked('Darwin native process descriptors are unavailable')
+        try:
+            records: list[dict[str, str]] = []
+            current: dict[str, str] = {}
+            process_id = None
+            process_uid = None
+            for line in output.decode('utf-8', errors='strict').splitlines():
+                if not line:
+                    continue
+                field, value = line[0], line[1:]
+                if field == 'p':
+                    process_id = int(value)
+                elif field == 'u':
+                    process_uid = int(value)
+                elif field == 'f':
+                    if current:
+                        records.append(current)
+                    current = {'fd': value}
+                elif field in {'t', 'D', 'i', 'n'}:
+                    current[field] = value
+            if current:
+                records.append(current)
+            if process_id != pid or process_uid != os.geteuid():
+                raise ValueError
+            executable_rows = [
+                row for row in records
+                if (
+                    row.get('fd') == 'txt'
+                    and row.get('n') == str(expected_executable)
+                    and row.get('t') == 'REG'
+                )
+            ]
+            database_rows = [
+                row for row in records
+                if row.get('n') == str(database) and row.get('t') == 'REG'
+            ]
+            if len(executable_rows) != 1 or not database_rows:
+                raise ValueError
+            executable_row = executable_rows[0]
+            exe_identity = (int(executable_row['D'], 0), int(executable_row['i']))
+            db_identities = {
+                (int(row['D'], 0), int(row['i']))
+                for row in database_rows
+            }
+            if (
+                exe_identity != (executable_stat.st_dev, executable_stat.st_ino)
+                or db_identities != {(database_stat.st_dev, database_stat.st_ino)}
+            ):
+                raise ValueError
+            db_identity = next(iter(db_identities))
+        except (UnicodeDecodeError, ValueError, KeyError) as error:
+            raise EffectBlocked('Darwin native process executable/database descriptors differ') from error
+        return {
+            'pid': pid,
+            'uid': os.geteuid(),
+            'start': start,
+            'argv': argv,
+            'executable': list(exe_identity),
+            'database': list(db_identity),
+        }
+    if system == 'linux':
+        process = proc_root / str(pid)
+        try:
+            process_stat = process.stat()
+            raw_cmdline = (process / 'cmdline').read_bytes()
+            raw_stat = (process / 'stat').read_text(encoding='ascii')
+            proc_executable = process / 'exe'
+            proc_executable_stat = proc_executable.stat()
+            descriptors = sorted(
+                (entry for entry in (process / 'fd').iterdir() if entry.name.isdigit()),
+                key=lambda entry: int(entry.name),
+            )
+            if process_stat.st_uid != os.geteuid() or len(descriptors) > 4096:
+                raise ValueError
+            if not raw_cmdline or not raw_cmdline.endswith(b'\x00') or len(raw_cmdline) > 32 * 1024:
+                raise ValueError
+            argv = [value.decode('utf-8', errors='strict') for value in raw_cmdline[:-1].split(b'\x00')]
+            if not argv or Path(argv[0]).resolve(strict=True) != expected_executable:
+                raise ValueError
+            if argv[1:] != ['serve', '--persistence-root', str(root)]:
+                raise ValueError
+            after_comm = raw_stat[raw_stat.rfind(')') + 1:].split()
+            start = int(after_comm[19])
+            if (
+                proc_executable_stat.st_dev != executable_stat.st_dev
+                or proc_executable_stat.st_ino != executable_stat.st_ino
+            ):
+                raise ValueError
+            db_matches = [
+                descriptor for descriptor in descriptors
+                if (
+                    descriptor.stat().st_dev == database_stat.st_dev
+                    and descriptor.stat().st_ino == database_stat.st_ino
+                )
+            ]
+            if not db_matches:
+                raise ValueError
+        except (OSError, UnicodeDecodeError, ValueError, IndexError) as error:
+            raise EffectBlocked('Linux native process identity or descriptors differ') from error
+        return {
+            'pid': pid,
+            'uid': os.geteuid(),
+            'start': start,
+            'argv': argv,
+            'executable': [executable_stat.st_dev, executable_stat.st_ino],
+            'database': [database_stat.st_dev, database_stat.st_ino],
+        }
+    raise EffectBlocked(f'native process proof is unsupported on {system}')
+
+
+def _native_process_binding(
+    parsed: Mapping[str, Any],
+    descriptor: Mapping[str, Any],
+    project_id: str,
+) -> dict[str, Any]:
+    root, database, _ = _native_expected_paths(descriptor, project_id)
+    try:
+        status = _kent_json(parsed['kent'], ['service', 'status', '--json'], cwd=parsed['project_root'])
+        command = status.get('command')
+        pid = status.get('health_pid')
+        if (
+            status.get('health_status') != 'ok'
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(command, list)
+            or len(command) != 4
+            or not isinstance(command[0], str)
+            or not Path(command[0]).is_absolute()
+            or Path(command[0]).resolve(strict=True) != parsed['kent'].resolve(strict=True)
+            or command[1:] != ['serve', '--persistence-root', str(root)]
+        ):
+            raise EffectBlocked('native service status does not bind the pinned executable and default root')
+        evidence = _native_process_evidence(pid, parsed['kent'], root, database)
+    except EffectBlocked:
+        raise
+    except (OperationError, OSError, subprocess.SubprocessError) as error:
+        raise EffectBlocked('native service/process identity could not be collected') from error
+    if not isinstance(evidence, dict):
+        raise EffectBlocked('native service status does not bind the pinned executable and default root')
+    return evidence
+
+
+def _native_schema_fingerprint(connection: sqlite3.Connection) -> str:
+    rows = connection.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+    ).fetchall()
+    if not rows:
+        raise EffectBlocked('native persistence schema is empty')
+    return canonical_sha256([list(row) for row in rows])
+
+
+def _native_json(raw: str | bytes, label: str) -> Any:
+    raw_size = len(raw) if isinstance(raw, bytes) else len(raw.encode('utf-8'))
+    if raw_size > NATIVE_MAX_DB_JSON_BYTES:
+        raise EffectBlocked(f'{label} exceeds 8 MiB')
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f'non-finite JSON constant: {value}')
+
+    def finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f'non-finite JSON number: {value}')
+        return parsed
+
+    try:
+        text = raw.decode('utf-8', errors='strict') if isinstance(raw, bytes) else raw
+        return json.loads(
+            text,
+            object_pairs_hook=_duplicate_free,
+            parse_constant=reject_constant,
+            parse_float=finite_float,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, PlanValidationError) as error:
+        raise EffectBlocked(f'{label} is malformed JSON') from error
+
+
+def _native_rows(
+    connection: sqlite3.Connection,
+    query: str,
+    parameters: Sequence[Any] = (),
+) -> list[dict[str, Any]]:
+    try:
+        cursor = connection.execute(query, tuple(parameters))
+        names = [column[0] for column in cursor.description or ()]
+        rows = []
+        while True:
+            chunk = cursor.fetchmany(256)
+            if not chunk:
+                break
+            rows.extend(dict(zip(names, row)) for row in chunk)
+            if len(rows) > NATIVE_MAX_TERMINAL_IDENTITIES:
+                raise EffectBlocked('native persistence result exceeds the identity bound')
+        return rows
+    except sqlite3.Error as error:
+        raise EffectBlocked(f'native read-only persistence query failed: {error}') from error
+
+
+def _native_rows_by_ids(
+    connection: sqlite3.Connection,
+    query_prefix: str,
+    ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for start in range(0, len(ids), 128):
+        chunk = ids[start:start + 128]
+        placeholders = ','.join('?' for _ in chunk)
+        rows.extend(_native_rows(connection, f'{query_prefix} ({placeholders})', chunk))
+    return rows
+
+
+def _native_event_selector(
+    event: Mapping[str, Any],
+    latest: dict[str, tuple[int, str, Mapping[str, Any], int]],
+) -> None:
+    seq = event.get('seq')
+    kind = event.get('kind')
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1 or not isinstance(kind, str):
+        raise EffectBlocked('native Session event identity is malformed')
+
+    def record(selector: str, source: Mapping[str, Any]) -> None:
+        digest_size = len(canonical_bytes(source))
+        previous = latest.get(selector)
+        if previous is None or seq >= previous[0]:
+            latest[selector] = (seq, kind, source, digest_size)
+            unique_events = {
+                (candidate[0], candidate[1]): candidate[3]
+                for candidate in latest.values()
+            }
+            if sum(unique_events.values()) > NATIVE_MAX_SELECTED_EVENT_BYTES:
+                raise EffectBlocked('native selected Session event components exceed 32 MiB')
+
+    if kind in {'generation_context', 'configuration_updated', 'history_replaced'}:
+        record(kind, event)
+    if kind == 'configuration_updated':
+        payload = event.get('payload')
+        item = payload.get('item') if isinstance(payload, Mapping) else None
+        raw = item.get('raw') if isinstance(item, Mapping) else None
+        reasoning = raw.get('reasoning') if isinstance(raw, Mapping) else None
+        if (
+            not isinstance(item, Mapping)
+            or item.get('type') != 'configuration_update'
+            or not isinstance(item.get('configuration_effort'), str)
+            or not isinstance(raw, Mapping)
+            or raw.get('type') != 'configuration_update'
+            or not isinstance(reasoning, Mapping)
+            or not isinstance(reasoning.get('effort'), str)
+        ):
+            raise EffectBlocked('native configuration event shape is unsupported')
+    if kind == 'history_replaced':
+        payload = event.get('payload')
+        cache_metadata_shape = (
+            isinstance(payload, Mapping)
+            and (
+                'cache_metadata' not in payload
+                or isinstance(payload.get('cache_metadata'), (Mapping, list))
+            )
+        )
+        compacted_output_shape = (
+            isinstance(payload, Mapping)
+            and (
+                isinstance(payload.get('compacted_output'), Mapping)
+                or isinstance(payload.get('items'), list)
+            )
+        )
+        if (
+            not isinstance(payload, Mapping)
+            or not {'committed_entry_start', 'compaction_number', 'engine', 'mode'}.issubset(payload)
+            or (
+                not isinstance(payload.get('committed_entry_start'), int)
+                or isinstance(payload.get('committed_entry_start'), bool)
+                or payload.get('committed_entry_start') < 0
+            )
+            or not isinstance(payload.get('compaction_number'), int)
+            or isinstance(payload.get('compaction_number'), bool)
+            or payload.get('compaction_number') < 1
+            or not isinstance(payload.get('engine'), str)
+            or not payload.get('engine')
+            or payload.get('mode') not in {'auto', 'handoff', 'manual', 'workflow_post_completion'}
+            or not cache_metadata_shape
+            or not compacted_output_shape
+        ):
+            raise EffectBlocked('native history-replacement event shape is unsupported')
+    if kind == 'message':
+        payload = event.get('payload')
+        if isinstance(payload, Mapping) and payload.get('role') == 'developer':
+            message_type = payload.get('message_type')
+            if message_type not in {'background_notice', 'compaction_soon_reminder'}:
+                record(f'developer:{seq}', event)
+            if message_type in {'environment', 'workflow_mode', 'subagents', 'skills', 'agents.md'}:
+                record(f'message:{message_type}', event)
+    if kind == 'generation_context':
+        payload = event.get('payload')
+        if not isinstance(payload, Mapping) or set(payload) != {'before_summary', 'after_summary'}:
+            raise EffectBlocked('native generation-context event shape is unsupported')
+        for field in ('before_summary', 'after_summary'):
+            messages = payload[field]
+            if not isinstance(messages, list):
+                raise EffectBlocked('native generation-context messages are malformed')
+            for message in messages:
+                if not isinstance(message, Mapping) or message.get('role') != 'developer':
+                    continue
+                message_type = message.get('message_type')
+                if message_type in {'environment', 'workflow_mode', 'subagents', 'skills', 'agents.md'}:
+                    record(f'message:{message_type}', event)
+
+
+def _native_scan_events(
+    path: Path,
+    *,
+    expected_last_sequence: int,
+    aggregate_bytes: list[int],
+    selected_bytes: list[int],
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    set[str],
+]:
+    before = _native_path_stat(path, 'native Session event file')
+    if before.st_size > NATIVE_MAX_EVENT_FILE_BYTES:
+        raise EffectBlocked('native Session event file exceeds 256 MiB')
+    aggregate_bytes[0] += before.st_size
+    if aggregate_bytes[0] > NATIVE_MAX_EVENT_TOTAL_BYTES:
+        raise EffectBlocked('native Session event inventory exceeds 2 GiB')
+    descriptor = _native_open_nofollow(path, 'native Session event file')
+    latest: dict[str, tuple[int, str, Mapping[str, Any], int]] = {}
+    last_event: dict[str, Any] | None = None
+    header_seen = False
+    last_sequence = 0
+    line_count = 0
+    bytes_read = 0
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino, opened.st_size)
+            != (before.st_dev, before.st_ino, before.st_size)
+        ):
+            raise EffectBlocked('native Session event file changed before reading')
+        with os.fdopen(descriptor, 'rb', closefd=False) as stream:
+            while True:
+                line = stream.readline(NATIVE_MAX_EVENT_LINE_BYTES + 1)
+                if not line:
+                    break
+                line_count += 1
+                if len(line) > NATIVE_MAX_EVENT_LINE_BYTES:
+                    raise EffectBlocked('native Session event record exceeds 8 MiB')
+                bytes_read += len(line)
+                if bytes_read > NATIVE_MAX_EVENT_FILE_BYTES:
+                    raise EffectBlocked('native Session event file exceeds 256 MiB while streaming')
+                if bytes_read > before.st_size:
+                    aggregate_bytes[0] += bytes_read - before.st_size
+                    if aggregate_bytes[0] > NATIVE_MAX_EVENT_TOTAL_BYTES:
+                        raise EffectBlocked('native Session event inventory exceeds 2 GiB while streaming')
+                if not line.endswith(b'\n'):
+                    raise EffectBlocked('native Session event record is not newline terminated')
+                record = line[:-1]
+                if record.endswith(b'\r'):
+                    record = record[:-1]
+                value = _native_json(record, 'native Session event')
+                if not isinstance(value, dict):
+                    raise EffectBlocked('native Session event is not an object')
+                if not header_seen:
+                    if line_count != 1 or value != {'contract': 'kent.session.events', 'version': 2}:
+                        raise EffectBlocked('native Session event contract header is absent or unsupported')
+                    header_seen = True
+                    continue
+                sequence = value.get('seq')
+                if (
+                    not isinstance(sequence, int)
+                    or isinstance(sequence, bool)
+                    or sequence <= last_sequence
+                    or not isinstance(value.get('kind'), str)
+                    or not isinstance(value.get('payload'), dict)
+                ):
+                    raise EffectBlocked('native Session event sequence or envelope is malformed')
+                last_sequence = sequence
+                last_event = value
+                _native_event_selector(value, latest)
+        after = os.fstat(descriptor)
+        path_after = _native_path_stat(path, 'native Session event file')
+        if (
+            (
+                opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
+                opened.st_ctime_ns, opened.st_mode, opened.st_uid, opened.st_nlink,
+            )
+            != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                after.st_ctime_ns, after.st_mode, after.st_uid, after.st_nlink,
+            )
+            or (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                after.st_ctime_ns, after.st_mode, after.st_uid, after.st_nlink,
+            )
+            != (
+                path_after.st_dev, path_after.st_ino, path_after.st_size, path_after.st_mtime_ns,
+                path_after.st_ctime_ns, path_after.st_mode, path_after.st_uid, path_after.st_nlink,
+            )
+        ):
+            raise EffectBlocked('native Session event file changed during reading')
+    finally:
+        os.close(descriptor)
+    if last_sequence != expected_last_sequence:
+        raise EffectBlocked('native Session event sequence differs from persisted last_sequence')
+    if not header_seen:
+        raise EffectBlocked('native Session event contract header is absent')
+    chosen = {
+        (sequence, kind): (event, size)
+        for sequence, kind, event, size in latest.values()
+    }
+    events = []
+    selected_size = 0
+    for identity, (event, size) in sorted(chosen.items()):
+        selected_size += size
+        events.append({
+            'sequence': identity[0],
+            'kind': identity[1],
+            'sha256': canonical_sha256(event),
+        })
+    if len(events) > NATIVE_MAX_SELECTED_EVENTS_PER_SESSION:
+        raise EffectBlocked('native selected Session event count exceeds 256')
+    if selected_size > NATIVE_MAX_SELECTED_EVENT_BYTES:
+        raise EffectBlocked('native selected Session event components exceed 32 MiB')
+    selected_bytes[0] += selected_size
+    if selected_bytes[0] > NATIVE_MAX_SELECTED_EVENT_BYTES:
+        raise EffectBlocked('native selected event components exceed 32 MiB')
+    history_event = latest.get('history_replaced')
+    return (
+        events,
+        last_event,
+        history_event[2] if history_event is not None else None,
+        set(latest),
+    )
+
+
+def _native_question_input(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        'question', 'suggestions', 'recommended_option_index',
+    }:
+        raise EffectBlocked('native pending Question input is malformed')
+    question = value.get('question')
+    suggestions = value.get('suggestions')
+    recommended = value.get('recommended_option_index')
+    if (
+        not isinstance(question, str)
+        or not question.strip()
+        or not isinstance(suggestions, list)
+        or len(suggestions) > MAX_LIST
+        or any(not isinstance(option, str) or not option for option in suggestions)
+        or (
+            recommended is not None
+            and (
+                not isinstance(recommended, int)
+                or isinstance(recommended, bool)
+                or not 1 <= recommended <= len(suggestions)
+            )
+        )
+    ):
+        raise EffectBlocked('native pending Question fields are malformed')
+    return dict(value)
+
+
+def _native_question_matches_cli(
+    kent: Path,
+    root: Path,
+    project_id: str,
+    session_id: str,
+    value: Any,
+) -> None:
+    question = _native_question_input(value)
+    lines = [question['question']]
+    if question['suggestions']:
+        lines.append('Suggestions:')
+        for index, suggestion in enumerate(question['suggestions'], start=1):
+            rendered = f'{index}. {suggestion}'
+            if question['recommended_option_index'] == index:
+                rendered += ' (recommended)'
+            lines.append(rendered)
+    expected = ('\n'.join(lines) + '\n').encode('utf-8')
+    code, output, error_output = _run(
+        [
+            str(kent),
+            'question',
+            '--session',
+            session_id,
+            '--project',
+            project_id,
+        ],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+    )
+    if code != 0 or error_output or output != expected:
+        raise EffectBlocked('native pending Question output differs from its persisted input')
+
+
+def _native_approval_payload(
+    approval: Mapping[str, Any],
+    branches: Sequence[Mapping[str, Any]],
+    task_nodes: Sequence[Mapping[str, Any]],
+    workflow_version: int,
+    workflow_id: str,
+    graph: Mapping[str, Any],
+) -> dict[str, Any]:
+    if approval.get('workflow_version') != workflow_version:
+        raise EffectBlocked('native pending Approval workflow version differs')
+    task_id = approval.get('source_task_id')
+    source_node = approval.get('source_node_id')
+    source_branch = approval.get('source_transition_branch_key')
+    matching_nodes = [
+        row for row in task_nodes
+        if row.get('node_id') == source_node
+        and row.get('transition_branch_key') == source_branch
+    ]
+    if len(matching_nodes) != 1:
+        raise EffectBlocked('native pending Approval source is not a current Task node')
+    if (
+        approval.get('source_session_id') is not None
+        and matching_nodes[0].get('session_id') != approval.get('source_session_id')
+    ):
+        raise EffectBlocked('native pending Approval Session differs from its current Task node')
+    decoded_approval: dict[str, Any] = {}
+    for column in ('transition_snapshot_json', 'materialized_values_json'):
+        value = _native_json(approval.get(column), f'native Approval {column}')
+        if not isinstance(value, dict):
+            raise EffectBlocked('native pending Approval JSON is not an object')
+        decoded_approval[column] = value
+    transition = decoded_approval['transition_snapshot_json']
+    groups = [
+        row for row in graph.get('transition_groups', [])
+        if isinstance(row, Mapping)
+        and row.get('id') == transition.get('id')
+        and row.get('transition_id') == transition.get('transition_id')
+    ]
+    if (
+        transition.get('workflow_id') != workflow_id
+        or transition.get('source_node_id') != source_node
+        or len(groups) != 1
+        or groups[0].get('source_node_id') != source_node
+    ):
+        raise EffectBlocked('native pending Approval transition differs from the current Workflow graph')
+    normalized_branches = []
+    if not branches:
+        raise EffectBlocked('native pending Approval has no transition branches')
+    for branch in branches:
+        decoded_branch: dict[str, Any] = {}
+        for column in (
+            'target_snapshot_json',
+            'effective_edge_configuration_json',
+            'context_source_resolution_json',
+        ):
+            value = _native_json(branch.get(column), f'native Approval branch {column}')
+            if not isinstance(value, dict):
+                raise EffectBlocked('native pending Approval branch JSON is not an object')
+            decoded_branch[column] = value
+        target = decoded_branch['target_snapshot_json']
+        edge = decoded_branch['effective_edge_configuration_json']
+        context = decoded_branch['context_source_resolution_json']
+        graph_edges = [
+            row for row in graph.get('edges', [])
+            if isinstance(row, Mapping) and row.get('id') == edge.get('id')
+        ]
+        graph_nodes = [
+            row for row in graph.get('nodes', [])
+            if isinstance(row, Mapping) and row.get('id', row.get('node_id')) == target.get('node_id')
+        ]
+        graph_edge_keys = set(graph_edges[0]) | {'workflow_id'} if len(graph_edges) == 1 else set()
+        extra_edge_keys = set(edge) - graph_edge_keys
+        edge_matches_graph = (
+            len(graph_edges) == 1
+            and graph_edge_keys.issubset(edge)
+            and extra_edge_keys.issubset({'input_bindings', 'output_requirements'})
+            and all(edge.get(key) == value for key, value in graph_edges[0].items())
+            and all(edge[key] is None for key in extra_edge_keys)
+        )
+        if (
+            branch.get('transition_branch_key') != transition.get('transition_id')
+            or len(graph_edges) != 1
+            or not edge_matches_graph
+            or edge.get('workflow_id') != workflow_id
+            or edge.get('transition_group_id') != groups[0].get('id')
+            or target.get('entered_by_edge_id') != edge.get('id')
+            or target.get('node_id') != edge.get('target_node_id')
+            or len(graph_nodes) != 1
+            or target.get('node_kind') != graph_nodes[0].get('kind')
+            or set(context) != {'active_source', 'target_session'}
+            or context.get('active_source') != {
+                'kind': 'exact',
+                'session_id': approval.get('source_session_id'),
+            }
+            or context.get('target_session') != {
+                'kind': 'reuse',
+                'session_id': approval.get('source_session_id'),
+            }
+        ):
+            raise EffectBlocked('native pending Approval branch differs from the reviewed Workflow context')
+        normalized_branches.append(dict(branch))
+    normalized_branches.sort(key=lambda row: row['transition_branch_key'])
+    if len({
+        row['transition_branch_key'] for row in normalized_branches
+    }) != len(normalized_branches):
+        raise EffectBlocked('native pending Approval branches are duplicated')
+    return {'approval': dict(approval), 'branches': normalized_branches}
+
+
+def _native_observe(
+    parsed: Mapping[str, Any],
+    item: Mapping[str, Any],
+    live: Mapping[str, Any],
+    task_facts: Sequence[Mapping[str, Any]],
+    raw_details: Mapping[str, Mapping[str, Any]],
+    cli_sessions: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    descriptor = parsed.get('native_evidence')
+    if not isinstance(descriptor, Mapping):
+        raise EffectBlocked('native evidence descriptor is absent')
+    root, database, session_root = _native_expected_paths(descriptor, item['project_id'])
+    database_before = _native_path_stat(database, 'native persistence database')
+    process_before = _native_process_binding(parsed, descriptor, item['project_id'])
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f'{database.as_uri()}?mode=ro',
+            uri=True,
+            timeout=1.0,
+            isolation_level=None,
+        )
+        connection.execute('PRAGMA query_only=ON')
+        connection.execute('PRAGMA busy_timeout=1000')
+        connection.execute('BEGIN')
+        if connection.execute('PRAGMA query_only').fetchone() != (1,):
+            raise EffectBlocked('native SQLite connection is not query-only')
+        if connection.execute('PRAGMA busy_timeout').fetchone() != (1000,):
+            raise EffectBlocked('native SQLite busy timeout differs')
+        database_rows = connection.execute('PRAGMA database_list').fetchall()
+        main_paths = [row[2] for row in database_rows if row[1] == 'main']
+        if main_paths != [str(database)]:
+            raise EffectBlocked('native SQLite connection opened a different database path')
+        observed_schema = _native_schema_fingerprint(connection)
+        if observed_schema != descriptor['database_schema_sha256']:
+            raise EffectBlocked('native SQLite schema fingerprint differs from the reviewed descriptor')
+
+        project_rows = _native_rows(
+            connection,
+            'SELECT id,primary_workspace_id FROM projects WHERE id=?',
+            (item['project_id'],),
+        )
+        if len(project_rows) != 1:
+            raise EffectBlocked('native project identity is absent or duplicated')
+        primary_workspace_id = project_rows[0]['primary_workspace_id']
+        workspaces = _native_rows(
+            connection,
+            'SELECT id,project_id,canonical_root_path FROM workspaces WHERE id=? AND project_id=?',
+            (primary_workspace_id, item['project_id']),
+        )
+        if (
+            len(workspaces) != 1
+            or Path(workspaces[0]['canonical_root_path']).resolve()
+            != Path(live['project_path']).resolve()
+        ):
+            raise EffectBlocked('native project workspace differs from the CLI project root')
+        workflow_bytes = bytes.fromhex(item['workflow_id'].replace('-', ''))
+        workflow_rows = _native_rows(
+            connection,
+            'SELECT id,name,description,version,execution_target_policy,execution_target_custom_ref '
+            'FROM workflows WHERE id=?',
+            (workflow_bytes,),
+        )
+        if len(workflow_rows) != 1:
+            raise EffectBlocked('native Workflow identity is absent or duplicated')
+        native_workflow = workflow_rows[0]
+        if (
+            native_workflow['version'] != live['version']
+            or native_workflow['name'] != live['metadata']['name']
+            or native_workflow['description'] != live['metadata']['description']
+            or _live_execution_target({
+                'mode': native_workflow['execution_target_policy'],
+                **(
+                    {'custom_ref': native_workflow['execution_target_custom_ref']}
+                    if native_workflow['execution_target_custom_ref'] is not None else {}
+                ),
+            }, 'native Workflow') != live['metadata']['execution_target']
+        ):
+            raise EffectBlocked('native Workflow metadata differs from the CLI')
+        native_links = _native_rows(
+            connection,
+            'SELECT l.project_id,l.workflow_id,l.id,p.default_project_workflow_link_id '
+            'FROM project_workflow_links l JOIN projects p ON p.id=l.project_id '
+            'WHERE l.workflow_id=?',
+            (workflow_bytes,),
+        )
+        normalized_links = []
+        for row in native_links:
+            workflow_id = (
+                str(uuid.UUID(bytes=bytes(row['workflow_id'])))
+                if isinstance(row['workflow_id'], bytes) else None
+            )
+            normalized_links.append({
+                'project_id': row['project_id'],
+                'workflow_id': workflow_id,
+                'is_default': row['id'] == row['default_project_workflow_link_id'],
+            })
+        normalized_links.sort(key=lambda row: (row['project_id'], row['workflow_id'] or ''))
+        if canonical_sha256(normalized_links) != canonical_sha256(live['all_links']):
+            raise EffectBlocked('native project Workflow links differ from the CLI')
+
+        task_rows = _native_rows(
+            connection,
+            'SELECT id,project_id,workflow_id,project_workflow_link_id,workflow_revision_seen '
+            'FROM task_records WHERE project_id=? AND workflow_id=? ORDER BY id',
+            (item['project_id'], workflow_bytes),
+        )
+        native_task_ids = [row['id'] for row in task_rows]
+        if (
+            len(native_task_ids) > NATIVE_MAX_TASKS
+            or len(native_task_ids) != len(set(native_task_ids))
+            or set(native_task_ids) != {row['id'] for row in live['tasks']}
+        ):
+            raise EffectBlocked('native task_records inventory differs from the CLI')
+        selected_link_ids = {
+            row['id'] for row in native_links if row['project_id'] == item['project_id']
+        }
+        if len(selected_link_ids) != 1 or any(
+            row['project_workflow_link_id'] not in selected_link_ids
+            for row in task_rows
+        ):
+            raise EffectBlocked('native Task Workflow-link ownership differs')
+        current_nodes = _native_rows_by_ids(
+            connection,
+            'SELECT task_id,node_id,transition_branch_key,current_input_values_json,'
+            'prior_node_values_json,session_id,scheduling_state,interruption_reason,'
+            'interruption_detail_json,interrupted_at_unix_ms,entered_by_edge_id,'
+            'effective_assignee,effective_thinking,assignee_origin '
+            'FROM task_current_nodes WHERE task_id IN',
+            native_task_ids,
+        )
+        nodes_by_task: dict[str, list[dict[str, Any]]] = {task_id: [] for task_id in native_task_ids}
+        for row in current_nodes:
+            for key in ('current_input_values_json', 'prior_node_values_json', 'interruption_detail_json'):
+                if row.get(key) is not None:
+                    parsed_json = _native_json(row[key], f'native current node {key}')
+                    if not isinstance(parsed_json, dict):
+                        raise EffectBlocked('native current-node JSON is not an object')
+            nodes_by_task[row['task_id']].append(row)
+        cli_task_by_id = {row['id']: row for row in task_facts}
+        graph_node_kinds = {
+            node.get('id', node.get('node_id')): node.get('kind')
+            for node in live['graph']['nodes']
+            if isinstance(node, Mapping)
+        }
+        for task_id, rows in nodes_by_task.items():
+            rows.sort(key=lambda row: (
+                row['node_id'], row['transition_branch_key'] or '',
+            ))
+            cli_detail = raw_details[task_id]
+            cli_current = cli_detail.get('current_nodes')
+            if cli_current is None:
+                summary = cli_detail.get('summary')
+                cli_current = summary.get('current_nodes', []) if isinstance(summary, Mapping) else []
+            if not isinstance(cli_current, list):
+                raise EffectBlocked('native CLI current-node inventory is malformed')
+            cli_node_ids = []
+            for cli_node in cli_current:
+                if isinstance(cli_node, str):
+                    node_id = cli_node
+                elif isinstance(cli_node, Mapping):
+                    node_id = cli_node.get('node_id', cli_node.get('id'))
+                else:
+                    raise EffectBlocked('native CLI current-node record is malformed')
+                if not isinstance(node_id, str) or not node_id:
+                    raise EffectBlocked('native CLI current-node identity is malformed')
+                cli_node_ids.append(node_id)
+            cli_node_ids.sort()
+            if cli_node_ids != sorted(row['node_id'] for row in rows):
+                raise EffectBlocked('native current-node ownership differs from the CLI')
+            cli_node_rows = [row for row in cli_current if isinstance(row, Mapping)]
+            if cli_node_rows:
+                cli_nodes_by_id = {
+                    row.get('node_id', row.get('id')): row for row in cli_node_rows
+                }
+                if len(cli_nodes_by_id) != len(cli_node_rows):
+                    raise EffectBlocked('native CLI current-node identities are duplicated')
+                for native_node in rows:
+                    cli_node = cli_nodes_by_id[native_node['node_id']]
+                    for column in (
+                        'transition_branch_key', 'session_id', 'scheduling_state',
+                        'interruption_reason', 'entered_by_edge_id', 'effective_assignee',
+                        'effective_thinking', 'assignee_origin',
+                    ):
+                        if column in cli_node and cli_node[column] != native_node.get(column):
+                            raise EffectBlocked(f'native current-node {column} differs from the CLI')
+            if cli_task_by_id[task_id]['terminal'] and any(
+                graph_node_kinds.get(row['node_id']) != 'terminal'
+                for row in rows
+            ):
+                raise EffectBlocked('native terminal Task retains a non-terminal current node')
+
+        approval_rows = _native_rows_by_ids(
+            connection,
+            'SELECT id,source_task_id,source_node_id,source_transition_branch_key,source_session_id,'
+            'workflow_version,transition_snapshot_json,materialized_values_json,created_at_unix_ms '
+            'FROM task_pending_approvals WHERE source_task_id IN',
+            native_task_ids,
+        )
+        approval_rows.sort(key=lambda row: (row['source_task_id'], row['id']))
+        approval_ids = [row['id'] for row in approval_rows]
+        branches = _native_rows_by_ids(
+            connection,
+            'SELECT approval_id,transition_branch_key,target_snapshot_json,'
+            'effective_edge_configuration_json,context_source_resolution_json '
+            'FROM task_pending_approval_branches WHERE approval_id IN',
+            approval_ids,
+        ) if approval_ids else []
+        branches_by_approval: dict[str, list[dict[str, Any]]] = {}
+        for row in branches:
+            branches_by_approval.setdefault(row['approval_id'], []).append(row)
+        approval_components = []
+        approvals_by_task: dict[str, list[dict[str, Any]]] = {task_id: [] for task_id in native_task_ids}
+        for approval in approval_rows:
+            task_id = approval['source_task_id']
+            envelope = _native_approval_payload(
+                approval,
+                branches_by_approval.get(approval['id'], []),
+                nodes_by_task[task_id],
+                native_workflow['version'],
+                item['workflow_id'],
+                live['graph'],
+            )
+            digest = canonical_sha256(envelope)
+            approvals_by_task[task_id].append({
+                'id': approval['id'],
+                'payload_sha256': digest,
+            })
+            approval_components.append({
+                'task_id': task_id,
+                'approval_id': approval['id'],
+                'record_sha256': digest,
+            })
+        for task_id, task in cli_task_by_id.items():
+            detail = raw_details[task_id]
+            summary = detail.get('summary') if isinstance(detail.get('summary'), Mapping) else {}
+            approvals_for_task = approvals_by_task[task_id]
+            if bool(approvals_for_task) != _canonical_v2_approval_signaled(detail, summary):
+                raise EffectBlocked('native approval rows differ from the CLI pending state')
+            task['pending_decisions'] = sorted(approvals_for_task, key=lambda row: row['id'])
+        sessions_rows = _native_rows_by_ids(
+            connection,
+            'SELECT id,project_id,workspace_id,worktree_id,artifact_relpath,continuation_json,'
+            'locked_json,metadata_json,previous_session_id,parent_agent_session_id,task_id,'
+            'completed_compaction_count,last_sequence '
+            'FROM sessions WHERE task_id IN',
+            native_task_ids,
+        )
+        if len(sessions_rows) > NATIVE_MAX_TERMINAL_IDENTITIES:
+            raise EffectBlocked('native Session/Task inventory exceeds 4096 identities')
+        session_ids = [row['id'] for row in sessions_rows]
+        associations = _native_rows_by_ids(
+            connection,
+            'SELECT session_id,node_id,transition_branch_key,associated_at_unix_ms '
+            'FROM session_workflow_node_associations WHERE session_id IN',
+            session_ids,
+        ) if session_ids else []
+        associations_by_session: dict[str, list[dict[str, Any]]] = {}
+        for row in associations:
+            associations_by_session.setdefault(row['session_id'], []).append(row)
+        task_by_id = {row['id']: row for row in task_rows}
+        cli_sessions_by_id = {row['id']: row for row in cli_sessions}
+        detailed_task_ids = {
+            task_id for task_id, row in cli_task_by_id.items()
+            if not row['terminal']
+        }
+        detailed_rows = [
+            row for row in sessions_rows if row['task_id'] in detailed_task_ids
+        ]
+        if set(cli_sessions_by_id) != {row['id'] for row in detailed_rows}:
+            raise EffectBlocked('native detailed Session inventory differs from the CLI')
+        if len(detailed_rows) > MAX_LIST:
+            raise EffectBlocked('native detailed Session inventory exceeds 256')
+        detailed_session_ids = {row['id'] for row in detailed_rows}
+        for task_id, task in cli_task_by_id.items():
+            if task['native_state'] != 'waiting_ask':
+                continue
+            current = nodes_by_task[task_id]
+            current_session_task = next(
+                (
+                    session['task_id'] for session in detailed_rows
+                    if len(current) == 1 and session['id'] == current[0].get('session_id')
+                ),
+                None,
+            )
+            if (
+                len(current) != 1
+                or not isinstance(current[0].get('session_id'), str)
+                or current[0]['session_id'] not in detailed_session_ids
+                or current_session_task != task_id
+            ):
+                raise EffectBlocked('native waiting Question is not bound to its current Task Session')
+        terminal_rows = [
+            row for row in sessions_rows if row['task_id'] not in detailed_task_ids
+        ]
+        terminal_tasks = [
+            {
+                'task_id': task_id,
+                'status': cli_task_by_id[task_id]['status'],
+                'native_state': cli_task_by_id[task_id]['native_state'],
+                'current_nodes': sorted(row['node_id'] for row in nodes_by_task[task_id]),
+                'session_ids': sorted(row['id'] for row in terminal_rows if row['task_id'] == task_id),
+            }
+            for task_id in native_task_ids if cli_task_by_id[task_id]['terminal']
+        ]
+        terminal_associations = sorted(
+            [
+                row for row in associations
+                if any(session['id'] == row['session_id'] for session in terminal_rows)
+            ],
+            key=lambda row: (
+                row['session_id'], row['node_id'], row['transition_branch_key'] or '',
+                row['associated_at_unix_ms'],
+            ),
+        )
+        terminal_identity_count = (
+            len(terminal_tasks)
+            + len(terminal_rows)
+            + len(terminal_associations)
+        )
+        if terminal_identity_count > NATIVE_MAX_TERMINAL_IDENTITIES:
+            raise EffectBlocked('native terminal inventory exceeds 4096 identities')
+        terminal_inventory_sha256 = canonical_sha256({
+            'tasks': terminal_tasks,
+            'sessions': sorted(
+                [{'task_id': row['task_id'], 'session_id': row['id']} for row in terminal_rows],
+                key=lambda row: (row['task_id'], row['session_id']),
+            ),
+            'associations': terminal_associations,
+            'terminal_anchors': live.get('terminal_anchors', []),
+            'anchors': item['anchors'],
+        })
+        session_components = []
+        question_components = []
+        session_facts_by_id = {row['id']: row for row in cli_sessions}
+        aggregate_bytes = [0]
+        selected_bytes = [0]
+        db_component_bytes = [0]
+        for row in sorted(detailed_rows, key=lambda value: (value['task_id'], value['id'])):
+            try:
+                _uuid(row['id'], 'native Session identity')
+            except PlanValidationError as error:
+                raise EffectBlocked('native Session identity is malformed') from error
+            if (
+                row['project_id'] != item['project_id']
+                or row['artifact_relpath']
+                != f"projects/{item['project_id']}/sessions/{row['id']}"
+            ):
+                raise EffectBlocked('native Session project/path ownership differs')
+            continuation = _native_json(row['continuation_json'], 'native Session continuation')
+            metadata = _native_json(row['metadata_json'], 'native Session metadata')
+            locked = _native_json(row['locked_json'], 'native Session lock')
+            if not isinstance(continuation, dict) or not isinstance(metadata, dict) or not isinstance(locked, dict):
+                raise EffectBlocked('native Session persisted state is not an object')
+            session_associations = sorted(
+                associations_by_session.get(row['id'], []),
+                key=lambda assoc: (
+                    assoc['node_id'], assoc['transition_branch_key'] or '',
+                    assoc['associated_at_unix_ms'],
+                ),
+            )
+            persisted = {
+                'session': {
+                    key: row[key] for key in (
+                        'id', 'project_id', 'workspace_id', 'worktree_id', 'artifact_relpath',
+                        'continuation_json', 'locked_json', 'metadata_json', 'previous_session_id',
+                        'parent_agent_session_id', 'task_id', 'completed_compaction_count',
+                    )
+                },
+                'task': {
+                    'id': task_by_id[row['task_id']]['id'],
+                    'project_id': task_by_id[row['task_id']]['project_id'],
+                    'workflow_id_hex': bytes(
+                        task_by_id[row['task_id']]['workflow_id']
+                    ).hex(),
+                    'project_workflow_link_id': task_by_id[row['task_id']]['project_workflow_link_id'],
+                    'workflow_revision_seen': task_by_id[row['task_id']]['workflow_revision_seen'],
+                },
+                'associations': session_associations,
+                'current_nodes': nodes_by_task[row['task_id']],
+            }
+            db_component_bytes[0] += len(canonical_bytes(persisted))
+            if db_component_bytes[0] > NATIVE_MAX_DB_COMPONENT_BYTES:
+                raise EffectBlocked('native persisted Session components exceed 32 MiB')
+            event_path = session_root / row['id'] / 'events.jsonl'
+            events, last_event, history_event, event_selectors = _native_scan_events(
+                event_path,
+                expected_last_sequence=row['last_sequence'],
+                aggregate_bytes=aggregate_bytes,
+                selected_bytes=selected_bytes,
+            )
+            if not locked:
+                history_payload = (
+                    history_event.get('payload')
+                    if isinstance(history_event, Mapping) else None
+                )
+                if (
+                    not isinstance(history_payload, Mapping)
+                    or history_payload.get('mode') != 'workflow_post_completion'
+                    or 'message:environment' not in event_selectors
+                    or not any(
+                        selector.startswith('developer:') or selector == 'generation_context'
+                        for selector in event_selectors
+                    )
+                ):
+                    raise EffectBlocked(
+                        'empty native Session lock lacks exact post-completion and instruction history'
+                    )
+            persisted_digest = canonical_sha256(persisted)
+            session_components.append({
+                'task_id': row['task_id'],
+                'session_id': row['id'],
+                'persisted_sha256': persisted_digest,
+                'events': events,
+            })
+            cli_session = session_facts_by_id.get(row['id'])
+            if cli_session is None or cli_session.get('task_id') != row['task_id']:
+                raise EffectBlocked('native Session Task ownership differs from the CLI')
+            if cli_task_by_id[row['task_id']]['native_state'] == 'waiting_ask':
+                current_nodes_for_task = nodes_by_task[row['task_id']]
+                # Retained historical Sessions remain evidence, but only the current node Session owns the Question.
+                current_session_nodes = [
+                    node for node in current_nodes_for_task
+                    if node.get('session_id') == row['id']
+                ]
+                if current_session_nodes:
+                    if last_event is None:
+                        raise EffectBlocked('native pending Question Session has no final event')
+                    payload = last_event.get('payload')
+                    tool_calls = payload.get('tool_calls') if isinstance(payload, Mapping) else None
+                    if (
+                        last_event.get('kind') != 'message'
+                        or not isinstance(payload, Mapping)
+                        or payload.get('role') != 'assistant'
+                        or not isinstance(tool_calls, list)
+                        or len(tool_calls) != 1
+                        or not isinstance(tool_calls[0], Mapping)
+                        or tool_calls[0].get('name') != 'ask_question'
+                        or not isinstance(tool_calls[0].get('call_id'), str)
+                    ):
+                        raise EffectBlocked('native waiting Question is not the final Session event')
+                    question_input = _native_question_input(tool_calls[0].get('input'))
+                    _native_question_matches_cli(
+                        parsed['kent'],
+                        Path(live['project_path']),
+                        item['project_id'],
+                        row['id'],
+                        question_input,
+                    )
+                    question_components.append({
+                        'task_id': row['task_id'],
+                        'session_id': row['id'],
+                        'call_id': tool_calls[0]['call_id'],
+                        'event_sequence': last_event['seq'],
+                        'input_sha256': canonical_sha256(question_input),
+                    })
+        session_components.sort(key=lambda row: (row['task_id'], row['session_id']))
+        approval_components.sort(key=lambda row: (row['task_id'], row['approval_id']))
+        question_components.sort(key=lambda row: (
+            row['task_id'], row['session_id'], row['call_id'], row['event_sequence'],
+        ))
+        components = {
+            'schema': NATIVE_COMPONENTS_SCHEMA,
+            'approvals': approval_components,
+            'questions': question_components,
+            'sessions': session_components,
+            'terminal_inventory_sha256': terminal_inventory_sha256,
+        }
+        detailed_cli_sessions = [
+            dict(row) for row in cli_sessions if row['task_id'] in detailed_task_ids
+        ]
+        component_by_session = {
+            row['session_id']: row for row in session_components
+        }
+        for row in detailed_cli_sessions:
+            component = component_by_session.get(row['id'])
+            if component is None:
+                raise EffectBlocked('native detailed Session component is absent')
+            row['contract_fingerprint'] = canonical_sha256(component)
+        connection.rollback()
+        connection.close()
+        connection = None
+        database_after = _native_path_stat(database, 'native persistence database')
+        if (
+            database_before.st_dev != database_after.st_dev
+            or database_before.st_ino != database_after.st_ino
+            or database_before.st_uid != database_after.st_uid
+            or database_before.st_nlink != database_after.st_nlink
+        ):
+            raise EffectBlocked('native SQLite database identity changed during observation')
+        after_process = _native_process_binding(parsed, descriptor, item['project_id'])
+        if after_process != process_before:
+            raise EffectBlocked('native Kent process identity drifted during observation')
+        if len(canonical_bytes(components)) > 1024 * 1024:
+            raise EffectBlocked('native compatibility component document exceeds the plan bound')
+        return components, detailed_cli_sessions
+    except sqlite3.Error as error:
+        raise EffectBlocked(f'native read-only SQLite observation failed: {error}') from error
+    finally:
+        if connection is not None:
+            try:
+                connection.rollback()
+            finally:
+                connection.close()
+
+
+def _v2_snapshot(
+    value: Any,
+    label: str,
+    *,
+    verify_files: bool = True,
+    native_mode: bool = False,
+) -> dict[str, Any]:
+    fields = {
         'schema', 'workflow_id', 'project_id', 'expected_version', 'execution_target',
         'execution_root', 'tasks', 'sessions', 'live_executions',
-    }, label)
+    }
+    if native_mode:
+        fields.add('native_components')
+    raw = _closed(value, fields, label)
     if raw.get('schema') != CANONICAL_V2_SNAPSHOT_SCHEMA:
         raise PlanValidationError(f'{label}.schema is unsupported')
+    components = (
+        _native_components(_required(raw, 'native_components', label), f'{label}.native_components')
+        if native_mode else None
+    )
     workflow_id = _uuid(_required(raw, 'workflow_id', label), f'{label}.workflow_id')
     project_id = _native_project_id(_required(raw, 'project_id', label), f'{label}.project_id')
     version = _required(raw, 'expected_version', label)
@@ -3236,15 +4641,29 @@ def _v2_snapshot(value: Any, label: str, *, verify_files: bool = True) -> dict[s
         refs = _v2_ref_list(
             _required(session, 'source_refs', session_label),
             f'{session_label}.source_refs',
-            verify_files=verify_files,
+            verify_files=verify_files and not native_mode,
         )
         fingerprint = _sha256(
             _required(session, 'contract_fingerprint', session_label),
             f'{session_label}.contract_fingerprint',
         )
         session_id = _string(_required(session, 'id', session_label), f'{session_label}.id')
-        if fingerprint != canonical_sha256({'session_id': session_id, 'source_refs': refs}):
-            raise PlanValidationError(f'{session_label}.contract_fingerprint does not bind its sources')
+        if components is None:
+            if fingerprint != canonical_sha256({'session_id': session_id, 'source_refs': refs}):
+                raise PlanValidationError(f'{session_label}.contract_fingerprint does not bind its sources')
+        else:
+            native_session = next(
+                (row for row in components['sessions'] if row['session_id'] == session_id),
+                None,
+            )
+            if (
+                native_session is None
+                or native_session['task_id'] != session.get('task_id')
+                or fingerprint != canonical_sha256(native_session)
+            ):
+                raise PlanValidationError(
+                    f'{session_label}.contract_fingerprint does not bind native Session components'
+                )
         sessions.append({
             'id': session_id,
             'task_id': _string(_required(session, 'task_id', session_label), f'{session_label}.task_id'),
@@ -3259,6 +4678,21 @@ def _v2_snapshot(value: Any, label: str, *, verify_files: bool = True) -> dict[s
     task_ids = {task['id'] for task in tasks}
     if any(session['task_id'] not in task_ids for session in sessions):
         raise PlanValidationError(f'{label}.sessions contains an unknown Task')
+    if components is not None:
+        session_owners = {session['id']: session['task_id'] for session in sessions}
+        component_owners = {
+            session['session_id']: session['task_id']
+            for session in components['sessions']
+        }
+        if component_owners != session_owners:
+            raise PlanValidationError(f'{label}.native_components Session inventory differs')
+        if any(row['task_id'] not in task_ids for row in components['approvals']):
+            raise PlanValidationError(f'{label}.native_components contains an unknown approval Task')
+        if any(
+            session_owners.get(row['session_id']) != row['task_id']
+            for row in components['questions']
+        ):
+            raise PlanValidationError(f'{label}.native_components contains an unknown Question Session')
     executions = []
     for index, raw_execution in enumerate(_bounded_list(
         _required(raw, 'live_executions', label), f'{label}.live_executions',
@@ -3271,7 +4705,7 @@ def _v2_snapshot(value: Any, label: str, *, verify_files: bool = True) -> dict[s
         })
     executions.sort(key=lambda row: row['id'])
     _unique([row['id'] for row in executions], f'{label}.live_executions')
-    return {
+    result = {
         'schema': CANONICAL_V2_SNAPSHOT_SCHEMA,
         'workflow_id': workflow_id,
         'project_id': project_id,
@@ -3282,6 +4716,9 @@ def _v2_snapshot(value: Any, label: str, *, verify_files: bool = True) -> dict[s
         'sessions': sessions,
         'live_executions': executions,
     }
+    if components is not None:
+        result['native_components'] = components
+    return result
 
 
 def _v2_graph_compatibility(
@@ -3569,6 +5006,7 @@ def _v2_review(
     snapshot: Mapping[str, Any],
     runtime_refs: Sequence[Mapping[str, Any]],
     source_admission_sha256: str | None,
+    native_evidence_sha256: str | None,
     required_paths: set[str],
 ) -> None:
     path, raw = _read_reference(value, 'compatibility_review_ref')
@@ -3581,8 +5019,16 @@ def _v2_review(
     review = _closed(review, {
         'schema', 'workflow_id', 'project_id', 'source_graph_sha256', 'source_metadata_sha256',
         'target_graph_sha256', 'target_metadata_sha256', 'compatibility_snapshot_sha256',
-        'runtime_refs_sha256', 'source_admission_sha256', 'outcome', 'reviewer_session_id', 'dispositions',
+        'runtime_refs_sha256', 'source_admission_sha256', 'native_evidence_sha256',
+        'outcome', 'reviewer_session_id', 'dispositions',
     }, 'compatibility review')
+    if native_evidence_sha256 is not None and 'native_evidence_sha256' not in review:
+        raise PlanValidationError('native compatibility review omits native_evidence_sha256')
+    if (
+        native_evidence_sha256 is None
+        and review.get('native_evidence_sha256') is not None
+    ):
+        raise PlanValidationError('legacy compatibility review cannot bind native evidence')
     expected = {
         'schema': CANONICAL_V2_REVIEW_SCHEMA,
         'workflow_id': workflow_id,
@@ -3596,6 +5042,8 @@ def _v2_review(
         'source_admission_sha256': source_admission_sha256,
         'outcome': 'PASS',
     }
+    if native_evidence_sha256 is not None:
+        expected['native_evidence_sha256'] = native_evidence_sha256
     if any(review.get(key) != expected_value for key, expected_value in expected.items()):
         raise PlanValidationError('compatibility review does not bind the exact v2 plan inputs')
     _uuid(_required(review, 'reviewer_session_id', 'compatibility review'), 'reviewer_session_id')
@@ -3625,7 +5073,7 @@ def _validate_canonical_v2_plan(
         raise PlanValidationError('v2 plan exceeds the bounded size')
     data = _closed(
         plan.value,
-        {'schema', 'state_dir', 'project_root', 'kent', 'workflows'},
+        {'schema', 'state_dir', 'project_root', 'kent', 'workflows', 'native_evidence'},
         'canonical v2 plan',
     )
     if data.get('schema') != CANONICAL_V2_SCHEMA:
@@ -3639,6 +5087,10 @@ def _validate_canonical_v2_plan(
     kent_path = _kent_path(_required(kent, 'path', 'kent'), 'kent.path')
     kent_sha = _sha256(_required(kent, 'sha256', 'kent'), 'kent.sha256')
     _verify_executable(kent_path, kent_sha)
+    native_descriptor = (
+        _v2_native_descriptor(data['native_evidence'], 'native_evidence')
+        if 'native_evidence' in data else None
+    )
     raw_workflows = _bounded_list(_required(data, 'workflows', 'canonical v2 plan'), 'workflows')
     if len(raw_workflows) != 1:
         raise PlanValidationError('canonical v2 plan must bind exactly one existing Workflow')
@@ -3654,6 +5106,8 @@ def _validate_canonical_v2_plan(
         }, label))
         item['workflow_id'] = _uuid(_required(item, 'workflow_id', label), f'{label}.workflow_id')
         item['project_id'] = _native_project_id(_required(item, 'project_id', label), f'{label}.project_id')
+        if native_descriptor is not None:
+            item['_native_evidence_sha256'] = canonical_sha256(native_descriptor)
         intent = _string(_required(item, 'intent', label), f'{label}.intent')
         if intent not in {'graph-only', 'metadata-only', 'graph-and-metadata'}:
             raise PlanValidationError('canonical v2 intent is unsupported')
@@ -3675,6 +5129,7 @@ def _validate_canonical_v2_plan(
         item['compatibility_snapshot'] = _v2_snapshot(
             _required(item, 'compatibility_snapshot', label), f'{label}.compatibility_snapshot',
             verify_files=verify_evidence,
+            native_mode=native_descriptor is not None,
         )
         snapshot = item['compatibility_snapshot']
         if (
@@ -3781,6 +5236,7 @@ def _validate_canonical_v2_plan(
         'project_root': project_root,
         'kent': kent_path,
         'kent_sha256': kent_sha,
+        'native_evidence': native_descriptor,
         'workflows': workflows,
     }
 
@@ -3921,6 +5377,7 @@ def _validate_canonical_v2_target(
                 canonical_sha256(source_admission)
                 if source_admission is not None else None
             ),
+            native_evidence_sha256=item.get('_native_evidence_sha256'),
             required_paths=_v2_required_review_paths(
                 source['graph'], graph, source['metadata'], metadata, item['compatibility_snapshot'],
             ),
@@ -3990,7 +5447,12 @@ def _canonical_read(
     summary = _workflow_summary(inspect, wid)
     if summary['revision'] != listed_version:
         raise EffectBlocked('canonical list/inspect revisions disagree')
-    graph_raw = _kent_json(kent, ['workflow', 'graph', 'inspect', wid, '--json'], cwd=root)
+    graph_raw = _kent_json(
+        kent,
+        ['workflow', 'graph', 'inspect', wid, '--json'],
+        cwd=root,
+        output_limit=CANONICAL_GRAPH_MAX_OUTPUT,
+    )
     graph = _canonical_graph(graph_raw, listed_version)
     validation = _kent_json(kent, ['workflow', 'validate', wid, '--json'], cwd=root)
     if validation.get('valid') is not True:
@@ -4029,6 +5491,266 @@ def _canonical_read(
             key=lambda row: _row_id(row, 'id', 'task_id'),
         )
     return result
+
+def _canonical_v2_pending_approvals(
+    detail: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> list[dict[str, Any]] | None:
+    approval_signaled = False
+    explicit_pending: list[bool] = []
+    for status in (detail.get('status'), summary.get('status')):
+        if isinstance(status, str):
+            approval_signaled = approval_signaled or status == 'waiting_approval'
+        elif isinstance(status, Mapping):
+            approval_signaled = approval_signaled or any(
+                status.get(key) == 'waiting_approval'
+                for key in ('kind', 'status', 'native_state')
+            )
+            if 'approval_pending' in status:
+                value = status['approval_pending']
+                if not isinstance(value, bool):
+                    raise EffectBlocked('v2 Task approval-pending flag is malformed')
+                approval_signaled = approval_signaled or value
+                explicit_pending.append(value)
+            if 'attention_types' in status:
+                attention = status['attention_types']
+                if not isinstance(attention, list) or len(attention) > MAX_LIST or any(
+                    not isinstance(value, str) for value in attention
+                ):
+                    raise EffectBlocked('v2 Task approval attention inventory is malformed')
+                approval_signaled = approval_signaled or 'approval' in attention
+        elif status is not None:
+            raise EffectBlocked('v2 Task approval status is malformed')
+    for source in (detail, summary):
+        if 'attention_types' in source:
+            attention = source['attention_types']
+            if not isinstance(attention, list) or len(attention) > MAX_LIST or any(
+                not isinstance(value, str) for value in attention
+            ):
+                raise EffectBlocked('v2 Task approval attention inventory is malformed')
+            approval_signaled = approval_signaled or 'approval' in attention
+
+    for source in (detail, summary):
+        if 'approval_pending' in source:
+            value = source['approval_pending']
+            if not isinstance(value, bool):
+                raise EffectBlocked('v2 Task approval-pending flag is malformed')
+            explicit_pending.append(value)
+            approval_signaled = approval_signaled or value
+    if len(set(explicit_pending)) > 1:
+        raise EffectBlocked('v2 Task approval-pending flags disagree')
+
+    present = [
+        source['pending_approvals']
+        for source in (detail, summary)
+        if 'pending_approvals' in source
+    ]
+    if len(present) == 2 and canonical_sha256(present[0]) != canonical_sha256(present[1]):
+        raise EffectBlocked('v2 Task pending approval payloads disagree')
+    if present:
+        rows = present[0]
+        if not isinstance(rows, list) or len(rows) > MAX_LIST:
+            raise EffectBlocked('v2 pending approval inventory is malformed')
+        if approval_signaled and not rows:
+            raise EffectBlocked('v2 pending approval inventory is missing or empty')
+        pending = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise EffectBlocked('v2 pending approval record is malformed')
+            pending.append({
+                'id': _row_id(row, 'id', 'approval_id'),
+                'payload_sha256': canonical_sha256(row),
+            })
+        pending.sort(key=lambda row: row['id'])
+        if len({row['id'] for row in pending}) != len(pending):
+            raise EffectBlocked('v2 pending approval identities are duplicated')
+        if explicit_pending and not explicit_pending[0] and pending:
+            raise EffectBlocked('v2 Task approval flag conflicts with its pending payload')
+        return pending
+    if approval_signaled:
+        raise EffectBlocked('v2 pending approval inventory is unavailable')
+    if explicit_pending and not explicit_pending[0]:
+        return []
+    return None
+
+
+def _canonical_v2_approval_signaled(
+    detail: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> bool:
+    signaled = False
+    pending_flags: list[bool] = []
+    for source in (detail, summary):
+        for status in (source.get('status'),):
+            if isinstance(status, str):
+                signaled = signaled or status == 'waiting_approval'
+            elif isinstance(status, Mapping):
+                signaled = signaled or any(
+                    status.get(key) == 'waiting_approval'
+                    for key in ('kind', 'status', 'native_state')
+                )
+                flag = status.get('approval_pending')
+                if flag is not None:
+                    if not isinstance(flag, bool):
+                        raise EffectBlocked('v2 Task approval-pending flag is malformed')
+                    pending_flags.append(flag)
+                    signaled = signaled or flag
+                attention = status.get('attention_types')
+                if attention is not None:
+                    if not isinstance(attention, list) or len(attention) > MAX_LIST or any(
+                        not isinstance(row, str) for row in attention
+                    ):
+                        raise EffectBlocked('v2 Task approval attention inventory is malformed')
+                    signaled = signaled or 'approval' in attention
+        flag = source.get('approval_pending')
+        if flag is not None:
+            if not isinstance(flag, bool):
+                raise EffectBlocked('v2 Task approval-pending flag is malformed')
+            pending_flags.append(flag)
+            signaled = signaled or flag
+        attention = source.get('attention_types')
+        if attention is not None:
+            if not isinstance(attention, list) or len(attention) > MAX_LIST or any(
+                not isinstance(row, str) for row in attention
+            ):
+                raise EffectBlocked('v2 Task approval attention inventory is malformed')
+            signaled = signaled or 'approval' in attention
+    if len(set(pending_flags)) > 1:
+        raise EffectBlocked('v2 Task approval-pending flags disagree')
+    if pending_flags and not pending_flags[0] and signaled:
+        raise EffectBlocked('v2 Task approval flag conflicts with its pending state')
+    return signaled
+
+
+def _canonical_v2_current_scripts(detail: Mapping[str, Any]) -> list[dict[str, Any]]:
+    scripts = detail.get('current_scripts')
+    if not isinstance(scripts, list) or len(scripts) > MAX_LIST:
+        raise EffectBlocked('v2 current Script inventory is absent or malformed')
+    for row in scripts:
+        if not isinstance(row, dict):
+            raise EffectBlocked('v2 current Script record is malformed')
+        current_node = row.get('current_node')
+        if (
+            not isinstance(row.get('path'), str) or not row['path']
+            or not isinstance(current_node, Mapping)
+            or not isinstance(current_node.get('node_id'), str)
+            or not current_node['node_id']
+            or (
+                'branch' in current_node
+                and current_node['branch'] is not None
+                and not isinstance(current_node['branch'], str)
+            )
+        ):
+            raise EffectBlocked('v2 current Script record is malformed')
+    if scripts:
+        raise EffectBlocked('v2 active native Script execution prevents reconciliation')
+    return scripts
+
+def _canonical_v2_live_executions(
+    detail: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    present = [
+        source['live_executions']
+        for source in (detail, summary)
+        if 'live_executions' in source
+    ]
+    if len(present) == 2 and canonical_sha256(present[0]) != canonical_sha256(present[1]):
+        raise EffectBlocked('v2 live execution inventories disagree')
+    if not present:
+        return []
+    executions = present[0]
+    if not isinstance(executions, list) or len(executions) > MAX_LIST:
+        raise EffectBlocked('v2 live execution inventory is malformed')
+    if executions:
+        raise EffectBlocked('v2 live native execution prevents reconciliation')
+    return []
+
+def _canonical_v2_unknown_approval_is_nonimpact(
+    item: Mapping[str, Any],
+    task_id: str,
+) -> bool:
+    try:
+        _, raw = _read_reference(item['compatibility_review_ref'], 'compatibility_review_ref')
+        review = json.loads(raw.decode('utf-8'), object_pairs_hook=_duplicate_free)
+        if (
+            not isinstance(review, dict)
+            or canonical_bytes(review) != raw
+            or review.get('schema') != CANONICAL_V2_REVIEW_SCHEMA
+            or review.get('workflow_id') != item['workflow_id']
+            or review.get('project_id') != item['project_id']
+            or review.get('compatibility_snapshot_sha256')
+            != canonical_sha256(item['compatibility_snapshot'])
+        ):
+            return False
+        path_key = f'task:{task_id}.pending_decisions'
+        for disposition in review.get('dispositions', []):
+            if not isinstance(disposition, dict) or disposition.get('path') != path_key:
+                continue
+            if disposition.get('disposition') != 'non-impact':
+                return False
+            return bool(_v2_ref_list(disposition.get('evidence'), path_key))
+    except (OSError, PlanValidationError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return False
+
+def _canonical_v2_inventory_matches(
+    item: Mapping[str, Any],
+    live_snapshot: Mapping[str, Any],
+) -> bool:
+    planned = item['compatibility_snapshot']
+    if any(
+        live_snapshot.get(key) != planned.get(key)
+        for key in ('schema', 'workflow_id', 'project_id', 'execution_target', 'execution_root')
+    ):
+        return False
+    planned_tasks = {row['id']: row for row in planned['tasks']}
+    observed_tasks = {
+        row['id']: row
+        for row in live_snapshot.get('tasks', [])
+        if isinstance(row, dict) and isinstance(row.get('id'), str)
+    }
+    if set(planned_tasks) != set(observed_tasks):
+        return False
+    task_keys = ('id', 'status', 'native_state', 'terminal', 'current_nodes')
+    for task_id, expected in planned_tasks.items():
+        actual = observed_tasks[task_id]
+        if any(actual.get(key) != expected.get(key) for key in task_keys):
+            return False
+        actual_pending = actual.get('pending_decisions')
+        if actual_pending is None:
+            # Unknown approval state remains explicit. The reader permits it only
+            # for terminal or Backlog Tasks, and only with a reviewed non-impact
+            # disposition for this exact Task fact.
+            if (
+                expected['pending_decisions']
+                or not _canonical_v2_unknown_approval_is_nonimpact(item, task_id)
+            ):
+                return False
+        elif canonical_sha256(actual_pending) != canonical_sha256(expected['pending_decisions']):
+            return False
+    planned_sessions = {row['id']: row for row in planned['sessions']}
+    observed_sessions = {
+        row['id']: row
+        for row in live_snapshot.get('sessions', [])
+        if isinstance(row, dict) and isinstance(row.get('id'), str)
+    }
+    if set(planned_sessions) != set(observed_sessions):
+        return False
+    session_keys = ('id', 'task_id', 'status', 'retained', 'live_owner')
+    for session_id, expected in planned_sessions.items():
+        actual = observed_sessions[session_id]
+        if any(actual.get(key) != expected.get(key) for key in session_keys):
+            return False
+    if ('native_components' in planned) != ('native_components' in live_snapshot):
+        return False
+    if 'native_components' in planned and canonical_sha256(
+        live_snapshot.get('native_components')
+    ) != canonical_sha256(planned['native_components']):
+        return False
+    return canonical_sha256(live_snapshot.get('live_executions')) == canonical_sha256(
+        planned['live_executions']
+    )
 
 def _canonical_gate(item: Mapping[str, Any], snapshot: Mapping[str, Any], expected_version: int) -> None:
     if snapshot.get('workflow_id') != item['workflow_id']:
@@ -4120,6 +5842,7 @@ def _canonical_assert_expected(parsed: Mapping[str, Any], item: Mapping[str, Any
     return live
 
 def _canonical_v2_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, Any]:
+    native_mode = isinstance(parsed.get('native_evidence'), Mapping)
     live = _canonical_read(parsed, item, include_raw_task_details=True)
     list_facts = [
         {key: task[key] for key in ('id', 'status', 'terminal')}
@@ -4148,11 +5871,16 @@ def _canonical_v2_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> di
         all_links.extend(links)
     if canonical_sha256(all_links) != canonical_sha256(item['links']):
         raise EffectBlocked('v2 Workflow linked-project ownership changed')
+    live['all_links'] = all_links
+    live['project_path'] = str(root)
     expected_sessions = {session['id']: session for session in item['compatibility_snapshot']['sessions']}
-    task_history = {task['id']: task for task in item['compatibility_snapshot']['tasks']}
     tasks: list[dict[str, Any]] = []
     sessions: list[dict[str, Any]] = []
     live_executions: list[dict[str, str]] = []
+    graph_node_keys = {
+        row.get('id', row.get('node_id')): row.get('key')
+        for row in live['graph']['nodes'] if isinstance(row, dict)
+    }
     for task in live['tasks']:
         detail = raw_details[task['id']]
         normalized = _task_state(detail, task['id'])
@@ -4162,6 +5890,7 @@ def _canonical_v2_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> di
         summary = detail.get('summary') if isinstance(detail.get('summary'), dict) else {}
         status_value = detail.get('status', summary.get('status'))
         native_state = status_value.get('native_state') if isinstance(status_value, dict) else None
+        pending = [] if native_mode else _canonical_v2_pending_approvals(detail, summary)
         current_nodes = detail.get('current_nodes', summary.get('current_nodes', []))
         if not isinstance(current_nodes, list):
             raise EffectBlocked('v2 Task current-node inventory is malformed')
@@ -4173,20 +5902,20 @@ def _canonical_v2_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> di
             if not isinstance(node_id, str) or not node_id:
                 raise EffectBlocked('v2 Task current-node identity is malformed')
             normalized_nodes.append(node_id)
+        normalized_nodes.sort()
+        if len(set(normalized_nodes)) != len(normalized_nodes):
+            raise EffectBlocked('v2 Task current-node identities are duplicated')
         if not normalized_nodes and not normalized['terminal']:
             current = detail.get('current_node', summary.get('current_node'))
             if isinstance(current, str) and current:
                 normalized_nodes.append(current)
-        pending_rows = detail.get('pending_approvals', summary.get('pending_approvals', []))
-        if not isinstance(pending_rows, list) or len(pending_rows) > MAX_LIST:
-            raise EffectBlocked('v2 pending approval inventory is malformed')
-        pending = []
-        for row in pending_rows:
-            if not isinstance(row, dict):
-                raise EffectBlocked('v2 pending approval record is malformed')
-            pending.append({'id': _row_id(row, 'id', 'approval_id'), 'payload_sha256': canonical_sha256(row)})
-        pending.sort(key=lambda row: row['id'])
-        planned_task = task_history.get(task['id'])
+        is_backlog = bool(normalized_nodes) and all(
+            graph_node_keys.get(node_id) == 'backlog' for node_id in normalized_nodes
+        )
+        if not native_mode and pending is None and not normalized['terminal'] and not is_backlog:
+            raise EffectBlocked('v2 pending approval inventory is unavailable for an active Task')
+        _canonical_v2_current_scripts(detail)
+        native_executions = _canonical_v2_live_executions(detail, summary)
         tasks.append({
             'id': task['id'],
             'status': normalized['status'],
@@ -4194,10 +5923,6 @@ def _canonical_v2_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> di
             'terminal': normalized['terminal'],
             'current_nodes': normalized_nodes,
             'pending_decisions': pending,
-            'history_classification': (
-                planned_task['history_classification'] if planned_task is not None else 'unreviewed'
-            ),
-            'history_refs': planned_task['history_refs'] if planned_task is not None else [],
         })
         live_rows = detail.get('live_sessions', [])
         if not isinstance(live_rows, list) or len(live_rows) > MAX_LIST:
@@ -4210,34 +5935,28 @@ def _canonical_v2_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> di
                 live_ids.add(_row_id(row, 'id', 'session_id'))
             else:
                 raise EffectBlocked('v2 live Session identity is malformed')
-        pages = _kent_pages(kent, ['task', 'sessions', task['id'], '--project', item['project_id']], cwd=root)
         task_sessions = []
-        for row in _page_rows(pages, ('items', 'sessions')):
-            native = _session_cli_state(row, task['id'], live_ids)
-            planned = expected_sessions.get(native['id'])
-            if planned is not None and planned['task_id'] != task['id']:
-                raise EffectBlocked('v2 Session Task association drifted')
-            task_sessions.append({
-                **native,
-                'contract_fingerprint': (
-                    planned['contract_fingerprint'] if planned is not None else 'unreviewed'
-                ),
-                'source_refs': planned['source_refs'] if planned is not None else [],
-            })
+        if not (native_mode and normalized['terminal']):
+            pages = _kent_pages(
+                kent,
+                ['task', 'sessions', task['id'], '--project', item['project_id']],
+                cwd=root,
+            )
+            for row in _page_rows(pages, ('items', 'sessions')):
+                native = _session_cli_state(row, task['id'], live_ids)
+                planned = expected_sessions.get(native['id'])
+                if planned is not None and planned['task_id'] != task['id']:
+                    raise EffectBlocked('v2 Session Task association drifted')
+                task_sessions.append(native)
         retained_count = detail.get('retained_session_count')
-        if retained_count is not None and retained_count != len(task_sessions):
+        if (
+            retained_count is not None
+            and not (native_mode and normalized['terminal'])
+            and retained_count != len(task_sessions)
+        ):
             raise EffectBlocked('v2 retained Session pagination is incomplete')
         sessions.extend(task_sessions)
-        executions = detail.get('live_executions', [])
-        if not isinstance(executions, list) or len(executions) > MAX_LIST:
-            raise EffectBlocked('v2 live execution inventory is malformed')
-        for row in executions:
-            if not isinstance(row, dict):
-                raise EffectBlocked('v2 live execution record is malformed')
-            live_executions.append({
-                'id': _row_id(row, 'id', 'execution_id'),
-                'state': _status_name(row.get('state', row.get('status'))),
-            })
+        live_executions.extend(native_executions)
     tasks.sort(key=lambda row: row['id'])
     sessions.sort(key=lambda row: row['id'])
     live_executions.sort(key=lambda row: row['id'])
@@ -4246,17 +5965,29 @@ def _canonical_v2_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> di
         or len({row['id'] for row in live_executions}) != len(live_executions)
     ):
         raise EffectBlocked('v2 native Session/execution identities are duplicated')
+    native_components = None
+    if native_mode:
+        native_components, sessions = _native_observe(
+            parsed,
+            item,
+            live,
+            tasks,
+            raw_details,
+            sessions,
+        )
     live['compatibility_snapshot'] = {
         'schema': CANONICAL_V2_SNAPSHOT_SCHEMA,
         'workflow_id': live['workflow_id'],
         'project_id': live['project_id'],
-        'expected_version': item['compatibility_snapshot']['expected_version'],
-        'execution_target': item['compatibility_snapshot']['execution_target'],
+        'expected_version': live['version'],
+        'execution_target': live['metadata']['execution_target'],
         'execution_root': str(root),
         'tasks': tasks,
         'sessions': sessions,
         'live_executions': live_executions,
     }
+    if native_components is not None:
+        live['compatibility_snapshot']['native_components'] = native_components
     return live
 
 def _canonical_v2_owned(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -4264,9 +5995,63 @@ def _canonical_v2_owned(value: Mapping[str, Any]) -> dict[str, Any]:
         'workflow_id', 'project_id', 'version', 'metadata', 'graph', 'links', 'default', 'valid',
     )}
 
+
+def _canonical_v2_owned_read(
+    parsed: Mapping[str, Any],
+    item: Mapping[str, Any],
+) -> dict[str, Any]:
+    kent = parsed['kent']
+    root = parsed['project_root']
+    project_id = item['project_id']
+    workflow_id = item['workflow_id']
+    projects = [
+        row for row in _project_rows(kent, root)
+        if row['id'] == project_id
+    ]
+    if len(projects) != 1 or Path(projects[0]['path']).resolve() != root.resolve():
+        raise EffectBlocked('canonical project identity/root drifted during owned readback')
+    pages = _kent_pages(kent, ['workflow', 'list', '--project', project_id], cwd=root)
+    links, default, listed_version = _workflow_link_state(
+        _page_rows(pages, ('items', 'workflows')),
+        project_id,
+        workflow_id,
+    )
+    if listed_version is None:
+        raise EffectBlocked('canonical Workflow is absent during owned readback')
+    inspect = _kent_json(kent, ['workflow', 'inspect', workflow_id, '--summary', '--json'], cwd=root)
+    summary = _workflow_summary(inspect, workflow_id)
+    if summary['revision'] != listed_version:
+        raise EffectBlocked('canonical list/inspect revisions disagree during owned readback')
+    graph_raw = _kent_json(
+        kent,
+        ['workflow', 'graph', 'inspect', workflow_id, '--json'],
+        cwd=root,
+        output_limit=CANONICAL_GRAPH_MAX_OUTPUT,
+    )
+    graph = _canonical_graph(graph_raw, listed_version)
+    validation = _kent_json(kent, ['workflow', 'validate', workflow_id, '--json'], cwd=root)
+    if validation.get('valid') is not True:
+        raise EffectBlocked('canonical Workflow validation failed during owned readback')
+    return {
+        'workflow_id': workflow_id,
+        'project_id': project_id,
+        'version': listed_version,
+        'metadata': _canonical_metadata(inspect),
+        'graph': graph,
+        'links': links,
+        'default': default,
+        'valid': True,
+    }
+
+
 def _canonical_v2_assert_owned(parsed: Mapping[str, Any], item: Mapping[str, Any],
         expected: Mapping[str, Any]) -> dict[str, Any]:
-    live = _canonical_v2_read(parsed, item)
+    native_mode = isinstance(parsed.get('native_evidence'), Mapping)
+    live = (
+        _canonical_v2_owned_read(parsed, item)
+        if native_mode else _canonical_v2_read(parsed, item)
+    )
+    _canonical_v2_gate(item, live, expected['version'], compare_inventory=False)
     if canonical_sha256(_canonical_v2_owned(live)) != canonical_sha256(_canonical_v2_owned(expected)):
         raise EffectBlocked(f"v2 effect-owned Workflow postimage drifted for {item['workflow_id']}")
     return live
@@ -4286,8 +6071,8 @@ def _canonical_v2_gate(item: Mapping[str, Any], snapshot: Mapping[str, Any], exp
             if isinstance(node, dict)}
     if any(node_kinds.get(anchor['id']) != anchor['kind'] for anchor in item['anchors']):
         raise EffectBlocked('v2 Workflow lost a reviewed anchor')
-    if compare_inventory and canonical_sha256(snapshot.get('compatibility_snapshot')) != canonical_sha256(
-            item['compatibility_snapshot']):
+    if compare_inventory and not _canonical_v2_inventory_matches(
+            item, snapshot.get('compatibility_snapshot', {})):
         raise EffectBlocked('v2 Task/Session/approval inventory drifted')
 
 def _canonical_v2_plan_check(parsed: Mapping[str, Any], item: Mapping[str, Any], preimage: Mapping[str, Any],
@@ -4300,10 +6085,11 @@ def _canonical_v2_plan_check(parsed: Mapping[str, Any], item: Mapping[str, Any],
                 refs = _v2_ref_list(task['history_refs'], f"task {task['id']} history")
                 if canonical_sha256(refs) != canonical_sha256(task['history_refs']):
                     raise EffectBlocked('v2 Task history evidence changed')
-            for session in snapshot['sessions']:
-                refs = _v2_ref_list(session['source_refs'], f"Session {session['id']} evidence")
-                if canonical_sha256(refs) != canonical_sha256(session['source_refs']):
-                    raise EffectBlocked('v2 Session source evidence changed')
+            if not isinstance(parsed.get('native_evidence'), Mapping):
+                for session in snapshot['sessions']:
+                    refs = _v2_ref_list(session['source_refs'], f"Session {session['id']} evidence")
+                    if canonical_sha256(refs) != canonical_sha256(session['source_refs']):
+                        raise EffectBlocked('v2 Session source evidence changed')
         except PlanValidationError as error:
             raise EffectBlocked(f'v2 history evidence drifted: {error}') from error
     _validate_canonical_v2_target(
@@ -4483,22 +6269,52 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
             pending_settlement = isinstance(existing_effect, dict) and existing_effect.get('status') in {
                 'attempted', 'unresolved', 'ambiguous', 'verified',
             }
-            live = _canonical_v2_read(parsed, item)
-            live_owned_sha = canonical_sha256(_canonical_v2_owned(live))
             before_sha = canonical_sha256(_canonical_v2_owned(stage['before']))
             after_sha = canonical_sha256(_canonical_v2_owned(stage['after']))
             if pending_settlement:
+                if isinstance(parsed.get('native_evidence'), Mapping):
+                    live = _canonical_v2_owned_read(parsed, item)
+                else:
+                    live = _canonical_v2_read(parsed, item)
+                live_owned_sha = canonical_sha256(_canonical_v2_owned(live))
                 allowed_owned = {after_sha} if existing_effect.get('status') == 'verified' else {
                     before_sha, after_sha,
                 }
                 if live_owned_sha not in allowed_owned:
                     raise EffectBlocked('v2 unresolved effect has an unknown Workflow postimage')
                 _canonical_v2_gate(item, live, live['version'], compare_inventory=False)
+                current = lambda: canonical_sha256(_canonical_v2_owned(
+                    _canonical_v2_owned_read(parsed, item)
+                    if isinstance(parsed.get('native_evidence'), Mapping)
+                    else _canonical_v2_read(parsed, item)
+                ))
+                settled = _settle_or_run(
+                    journal, effect_key=effect_key, command=stage['command'], cwd=parsed['project_root'],
+                    preimage_sha256=before_sha, postimage_sha256=after_sha,
+                    current_sha256=current, stdin_bytes=stage['stdin'],
+                )
+                if settled == 'preimage':
+                    return {**_canonical_report(plan, 'in_progress', journal), 'settled': 'preimage'}
+                after = _canonical_v2_assert_owned(parsed, item, stage['after'])
+                journal.persist({**journal.state, 'members': [{
+                    'workflow_id': item['workflow_id'], 'status': stage['status'],
+                }]})
+                if isinstance(parsed.get('native_evidence'), Mapping):
+                    return {
+                        **_canonical_report(plan, 'in_progress', journal),
+                        'settled': 'postimage',
+                    }
+                if (
+                    not _canonical_v2_inventory_matches(item, after['compatibility_snapshot'])
+                    and stage_index < len(progress) - 1
+                ):
+                    return {**_canonical_report(plan, 'in_progress', journal), 'settled': settled}
             else:
+                live = _canonical_v2_read(parsed, item)
+                live_owned_sha = canonical_sha256(_canonical_v2_owned(live))
                 _canonical_v2_gate(item, live, stage['before']['version'])
-            if not pending_settlement and live_owned_sha != before_sha:
-                raise EffectBlocked('v2 effect-owned state drifted before the next stage')
-            if not pending_settlement:
+                if live_owned_sha != before_sha:
+                    raise EffectBlocked('v2 effect-owned state drifted before the next stage')
                 _canonical_v2_plan_check(
                     parsed,
                     item,
@@ -4512,12 +6328,31 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                     admission_result,
                     effect_key=effect_key,
                 ))
-            current = lambda: canonical_sha256(_canonical_v2_owned(_canonical_v2_read(parsed, item)))
+                if isinstance(parsed.get('native_evidence'), Mapping):
+                    # Re-read all mutable native evidence after static plan/source
+                    # checks and immediately before recording the new effect.
+                    fresh = _canonical_v2_read(parsed, item)
+                    _canonical_v2_gate(item, fresh, stage['before']['version'])
+                    if canonical_sha256(_canonical_v2_owned(fresh)) != before_sha:
+                        raise EffectBlocked('v2 effect-owned state drifted before native dispatch')
+                current = lambda: canonical_sha256(_canonical_v2_owned(
+                    _canonical_v2_owned_read(parsed, item)
+                    if isinstance(parsed.get('native_evidence'), Mapping)
+                    else _canonical_v2_read(parsed, item)
+                ))
+            def process_pre_release() -> None:
+                if not isinstance(parsed.get('native_evidence'), Mapping):
+                    return
+                if current() != before_sha:
+                    raise EffectBlocked('native effect-owned Workflow changed before process release')
+                _native_process_binding(parsed, parsed['native_evidence'], item['project_id'])
+
             settled = _settle_or_run(
                 journal, effect_key=effect_key, command=stage['command'], cwd=parsed['project_root'],
                 preimage_sha256=canonical_sha256(_canonical_v2_owned(stage['before'])),
                 postimage_sha256=canonical_sha256(_canonical_v2_owned(stage['after'])),
                 current_sha256=current, stdin_bytes=stage['stdin'],
+                pre_release_check=process_pre_release,
             )
             if settled == 'preimage':
                 return {**_canonical_report(plan, 'in_progress', journal), 'settled': 'preimage'}
@@ -4526,14 +6361,24 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                 'workflow_id': item['workflow_id'], 'status': stage['status'],
             }]})
             if (
-                canonical_sha256(after['compatibility_snapshot'])
-                != canonical_sha256(item['compatibility_snapshot'])
+                not isinstance(parsed.get('native_evidence'), Mapping)
+                and not _canonical_v2_inventory_matches(
+                    item, after['compatibility_snapshot'],
+                )
+                and stage_index < len(progress) - 1
+            ):
+                return {**_canonical_report(plan, 'in_progress', journal), 'settled': settled}
+            if (
+                not isinstance(parsed.get('native_evidence'), Mapping)
+                and not _canonical_v2_inventory_matches(
+                    item, after['compatibility_snapshot'],
+                )
                 and stage_index < len(progress) - 1
             ):
                 return {**_canonical_report(plan, 'in_progress', journal), 'settled': settled}
         live = _canonical_v2_read(parsed, item)
         expected = progress[-1]['after'] if progress else preimage
-        _canonical_v2_gate(item, live, expected['version'], compare_inventory=False)
+        _canonical_v2_gate(item, live, expected['version'])
         if canonical_sha256(_canonical_v2_owned(live)) != canonical_sha256(_canonical_v2_owned(expected)):
             raise EffectBlocked('v2 final effect-owned Workflow state drifted')
         journal.persist({**journal.state, 'phase': 'complete', 'members': [{

@@ -130,6 +130,36 @@ its runtime sources. Exact restoration of an old gate-free graph is not
 supported. Pure metadata-only name/description updates may use explicit null
 admission, but execution-target changes require a graph update with the gate.
 
+### Native evidence when CLI output is incomplete
+
+A waiting approval without its payload is unknown evidence, not an empty
+decision list. Use the reviewed `native_evidence` binding when the CLI cannot
+provide the pending decisions or retained execution context needed for adoption.
+The reader supports the default local persistence root only. It verifies the
+running Kent process and its open database before reading SQLite in read-only
+mode. A healthy endpoint or an expected service command alone is insufficient.
+
+The compatibility review binds the descriptor through
+`native_evidence_sha256`. Its snapshot binds complete approval records and
+branches, original pending Question identities, persisted Session components,
+and selected original events. An empty lock after post-completion compaction
+requires the retained instruction and compaction evidence; it is not proof of
+lost context. Unrelated event append does not change a selected component.
+
+Detailed inspection covers nonterminal Tasks. Terminal state, anchors and
+Session ownership remain bound separately, without scanning every terminal
+Session journal. Unknown Backlog history stays unknown; it must not be relabeled
+never-started. Large journals are streamed under separate file, record and
+aggregate limits, without increasing source-receipt or ordinary-reference caps.
+
+Before rollout, demonstrate successful read-only qualification against the
+actual pending-decision and retained-Session inventory. Test both unchanged
+evidence and changes that must block dispatch. Missing local plan caches and
+unrelated journal append must not prevent otherwise valid adoption.
+Re-read selected evidence before every new effect. Recovery first settles an
+attempted graph effect through owned-state readback; unavailable mutable
+evidence blocks a new effect, not reporting the known outcome.
+
 ## Task and Session controls
 
 - `kent task start`, `kent task move`, and `kent task resume` accept
