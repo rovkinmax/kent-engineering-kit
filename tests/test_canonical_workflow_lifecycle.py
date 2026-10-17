@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-from contextlib import redirect_stderr, redirect_stdout
+import os
+import sqlite3
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 import stat
 import subprocess
@@ -11,6 +13,7 @@ import sys
 import tempfile
 import unittest
 import runpy
+import uuid
 from unittest import mock
 
 import workflowkit.operations as operations
@@ -301,6 +304,7 @@ def canonical_v2_plan(
     detail = workflow["details"]["TASK-1"]
     detail["live_sessions"] = []
     detail["current_nodes"] = [{"node_id": "node-terminal"}]
+    detail["current_scripts"] = []
     detail["pending_approvals"] = (
         [{"id": "approval-1", "proposal": {"transition": "plan_revalidation"}}]
         if pending_approval
@@ -547,7 +551,11 @@ def canonical_v2_plan(
                 "evidence": [session_ref],
             }
             for path in changed_paths
-        ],
+        ] + [{
+            "path": "task:TASK-1.pending_decisions",
+            "disposition": "non-impact",
+            "evidence": [session_ref],
+        }],
     }
     review_path = Path(fixture["root"]) / "compatibility-review.json"
     review_raw = canonical_bytes(review)
@@ -615,6 +623,505 @@ def write_canonical_v2_plan(
     )
 
 
+def make_native_persistence(
+    fixture: dict,
+    *,
+    production_shape: bool = False,
+    with_approvals: bool = False,
+    unknown_backlog: bool = False,
+) -> tuple[Path, Path, Path, sqlite3.Connection, list[dict], list[dict], dict]:
+    """Create a disposable, WAL-backed persistence DB matching native reader queries."""
+    root = Path(fixture["root"])
+    home = root / "test-home"
+    persistence = home / ".kent"
+    database_dir = persistence / "db"
+    sessions_root = persistence / "projects" / PROJECT_ID / "sessions"
+    database_dir.mkdir(parents=True)
+    sessions_root.mkdir(parents=True)
+
+    state = read_state(fixture)
+    workflow = state["workflows"][workflow_id(0)]
+    question_input = {
+        "question": "Choose a native test route",
+        "suggestions": ["Continue", "Pause"],
+        "recommended_option_index": 2,
+    }
+    if production_shape:
+        tasks: list[dict] = []
+        details: dict[str, dict] = {}
+        task_sessions: dict[str, list[dict]] = {}
+        next_session = 1
+        detailed_counts = [10, 10, 10, 10, 10, 10, 7]
+        terminal_counts = [37] * 15 + [36] * 2
+        for index in range(30):
+            task_id = f"TASK-{index + 1}"
+            terminal = index >= 13
+            status = {"kind": "done", "native_state": "terminal"} if terminal else (
+                {
+                    "kind": "waiting_approval",
+                    "native_state": "waiting_approval",
+                    "attention_types": ["approval"],
+                }
+                if with_approvals and index < 4
+                else {"kind": "doing", "native_state": "waiting"}
+                if unknown_backlog and index == 0
+                else
+                {
+                    "kind": "waiting_ask",
+                    "native_state": "waiting_ask",
+                    "attention_types": ["question"],
+                }
+                if index == 0
+                else {"kind": "doing", "native_state": "waiting"}
+            )
+            node_id = "node-terminal" if terminal else "node-backlog"
+            count = (
+                detailed_counts[index]
+                if index < len(detailed_counts)
+                else terminal_counts[index - 13]
+                if terminal
+                else 0
+            )
+            rows = []
+            for _ in range(count):
+                session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"native-session-{next_session}"))
+                next_session += 1
+                rows.append({"session_id": session_id, "status": "idle"})
+            tasks.append({"task_id": task_id, "status": status})
+            current_node = {"node_id": node_id}
+            if with_approvals and index < 4:
+                current_node["transition_branch_key"] = "backlog_plan"
+            elif index == 0 and rows and not unknown_backlog:
+                current_node["session_id"] = rows[0]["session_id"]
+            details[task_id] = {
+                "id": task_id,
+                "summary": {"id": task_id, "done": terminal, "status": status},
+                "status": status,
+                "current_nodes": [current_node],
+                "terminal_anchors": [{"node_id": node_id}],
+                "pending_approvals": [],
+                "live_sessions": [],
+                "retained_session_count": count,
+                "current_scripts": [],
+            }
+            if unknown_backlog and index == 0:
+                details[task_id].pop("pending_approvals")
+            task_sessions[task_id] = rows
+        workflow["tasks"] = tasks
+        workflow["details"] = details
+        workflow["sessions"] = task_sessions
+        write_state(fixture, state)
+    connection = sqlite3.connect(database_dir / "main.sqlite3")
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            primary_workspace_id TEXT,
+            default_project_workflow_link_id TEXT
+        );
+        CREATE TABLE workspaces (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            canonical_root_path TEXT NOT NULL
+        );
+        CREATE TABLE workflows (
+            id BLOB PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            execution_target_policy TEXT NOT NULL,
+            execution_target_custom_ref TEXT
+        );
+        CREATE TABLE project_workflow_links (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            workflow_id BLOB NOT NULL
+        );
+        CREATE TABLE task_records (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            workflow_id BLOB NOT NULL,
+            project_workflow_link_id TEXT NOT NULL,
+            workflow_revision_seen INTEGER NOT NULL
+        );
+        CREATE TABLE task_current_nodes (
+            task_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            transition_branch_key TEXT,
+            current_input_values_json TEXT,
+            prior_node_values_json TEXT,
+            session_id TEXT,
+            scheduling_state TEXT,
+            interruption_reason TEXT,
+            interruption_detail_json TEXT,
+            interrupted_at_unix_ms INTEGER,
+            entered_by_edge_id TEXT,
+            effective_assignee TEXT,
+            effective_thinking TEXT,
+            assignee_origin TEXT
+        );
+        CREATE TABLE task_pending_approvals (
+            id TEXT PRIMARY KEY,
+            source_task_id TEXT NOT NULL,
+            source_node_id TEXT NOT NULL,
+            source_transition_branch_key TEXT,
+            source_session_id TEXT,
+            workflow_version INTEGER NOT NULL,
+            transition_snapshot_json TEXT NOT NULL,
+            materialized_values_json TEXT NOT NULL,
+            created_at_unix_ms INTEGER NOT NULL
+        );
+        CREATE TABLE task_pending_approval_branches (
+            approval_id TEXT NOT NULL,
+            transition_branch_key TEXT NOT NULL,
+            target_snapshot_json TEXT NOT NULL,
+            effective_edge_configuration_json TEXT NOT NULL,
+            context_source_resolution_json TEXT NOT NULL
+        );
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            workspace_id TEXT,
+            worktree_id TEXT,
+            artifact_relpath TEXT NOT NULL,
+            continuation_json TEXT NOT NULL,
+            locked_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            previous_session_id TEXT,
+            parent_agent_session_id TEXT,
+            task_id TEXT,
+            completed_compaction_count INTEGER,
+            last_sequence INTEGER NOT NULL
+        );
+        CREATE TABLE session_workflow_node_associations (
+            session_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            transition_branch_key TEXT,
+            associated_at_unix_ms INTEGER NOT NULL
+        );
+        """
+    )
+    wid = workflow_id(0)
+    wid_bytes = bytes.fromhex(wid.replace("-", ""))
+    connection.execute(
+        "INSERT INTO projects VALUES (?, ?, ?)",
+        (PROJECT_ID, "workspace-1", "link-1"),
+    )
+    connection.execute(
+        "INSERT INTO workspaces VALUES (?, ?, ?)",
+        ("workspace-1", PROJECT_ID, str(root)),
+    )
+    connection.execute(
+        "INSERT INTO workflows VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            wid_bytes,
+            workflow["metadata"]["name"],
+            workflow["metadata"]["description"],
+            workflow["version"],
+            workflow["metadata"]["execution_target"],
+            None,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO project_workflow_links VALUES (?, ?, ?)",
+        ("link-1", PROJECT_ID, wid_bytes),
+    )
+    for task in workflow["tasks"]:
+        task_id = task["task_id"]
+        detail = workflow["details"][task_id]
+        connection.execute(
+            "INSERT INTO task_records VALUES (?, ?, ?, ?, ?)",
+            (task_id, PROJECT_ID, wid_bytes, "link-1", workflow["version"]),
+        )
+        current = detail["current_nodes"][0]
+        connection.execute(
+            """
+            INSERT INTO task_current_nodes VALUES (
+                ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+            )
+            """,
+            (
+                task_id,
+                current["node_id"],
+                current.get("transition_branch_key"),
+                current.get("session_id"),
+            ),
+        )
+    if with_approvals:
+        graph = workflow["graph"]
+        transition_group = next(
+            row for row in graph["transition_groups"]
+            if row["transition_id"] == "backlog_plan"
+        )
+        edge = next(row for row in graph["edges"] if row["key"] == "backlog_plan")
+        for index in range(4):
+            task_id = f"TASK-{index + 1}"
+            approval_id = str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"native-approval-{index + 1}")
+            )
+            transition = {
+                "workflow_id": workflow_id(0),
+                "id": transition_group["id"],
+                "source_node_id": "node-backlog",
+                "transition_id": "backlog_plan",
+                "commentary": f"Reviewed native approval {index + 1}",
+            }
+            connection.execute(
+                "INSERT INTO task_pending_approvals VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                (
+                    approval_id,
+                    task_id,
+                    "node-backlog",
+                    "backlog_plan",
+                    workflow["version"],
+                    canonical_bytes(transition).decode("utf-8"),
+                    canonical_bytes({"approval_index": index + 1}).decode("utf-8"),
+                    index + 1,
+                ),
+            )
+            target = {
+                "node_id": "node-plan",
+                "node_kind": "agent",
+                "entered_by_edge_id": edge["id"],
+            }
+            effective_edge = {**edge, "workflow_id": workflow_id(0)}
+            context = {
+                "active_source": {"kind": "exact", "session_id": None},
+                "target_session": {"kind": "reuse", "session_id": None},
+            }
+            connection.execute(
+                "INSERT INTO task_pending_approval_branches VALUES (?, ?, ?, ?, ?)",
+                (
+                    approval_id,
+                    "backlog_plan",
+                    canonical_bytes(target).decode("utf-8"),
+                    canonical_bytes(effective_edge).decode("utf-8"),
+                    canonical_bytes(context).decode("utf-8"),
+                ),
+            )
+    session_rows: list[dict] = []
+    detailed_task_ids = {
+        task["task_id"]
+        for task in workflow["tasks"]
+        if task["status"].get("native_state") != "terminal"
+    }
+    for task_id, rows in workflow["sessions"].items():
+        for row in rows:
+            session_id = row["session_id"]
+            session_path = sessions_root / session_id
+            session_path.mkdir(parents=True)
+            if task_id in detailed_task_ids:
+                event = (
+                    {
+                        "seq": 1,
+                        "kind": "message",
+                        "payload": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "name": "ask_question",
+                                "call_id": "call-native-question-1",
+                                "input": question_input,
+                            }],
+                        },
+                    }
+                    if task_id == "TASK-1" and not with_approvals and not unknown_backlog
+                    else {
+                        "seq": 1,
+                        "kind": "message",
+                        "payload": {"role": "assistant", "content": "retained"},
+                    }
+                )
+                (session_path / "events.jsonl").write_bytes(
+                    canonical_bytes({"contract": "kent.session.events", "version": 2})
+                    + b"\n"
+                    + canonical_bytes(event)
+                    + b"\n"
+                )
+            connection.execute(
+                """
+                INSERT INTO sessions VALUES (
+                    ?, ?, NULL, NULL, ?, '{}', '{"locked":true}', '{}',
+                    NULL, NULL, ?, 0, 1
+                )
+                """,
+                (
+                    session_id,
+                    PROJECT_ID,
+                    f"projects/{PROJECT_ID}/sessions/{session_id}",
+                    task_id,
+                ),
+            )
+            current_node = workflow["details"][task_id]["current_nodes"][0]["node_id"]
+            connection.execute(
+                "INSERT INTO session_workflow_node_associations VALUES (?, ?, NULL, ?)",
+                (session_id, current_node, len(session_rows) + 1),
+            )
+            session_rows.append({"id": session_id, "task_id": task_id})
+    connection.commit()
+    database = database_dir / "main.sqlite3"
+    return (
+        home,
+        database,
+        sessions_root,
+        connection,
+        session_rows,
+        workflow["tasks"],
+        question_input,
+    )
+
+
+@contextmanager
+def native_observer_patches(
+    context: dict,
+    *,
+    process_side_effect: list[dict] | None = None,
+):
+    original_run = operations._run
+    question_input = context["question_input"]
+    rendered = [question_input["question"], "Suggestions:"]
+    for index, suggestion in enumerate(question_input["suggestions"], start=1):
+        line = f"{index}. {suggestion}"
+        if question_input["recommended_option_index"] == index:
+            line += " (recommended)"
+        rendered.append(line)
+    question_output = ("\n".join(rendered) + "\n").encode("utf-8")
+
+    def run(command, **kwargs):
+        if len(command) > 1 and command[1] == "question":
+            if (
+                command[2:] != [
+                    "--session",
+                    context["question_session_id"],
+                    "--project",
+                    PROJECT_ID,
+                ]
+            ):
+                return 1, b"", b"unexpected question query"
+            return 0, question_output, b""
+        return original_run(command, **kwargs)
+
+    process_patch = (
+        mock.patch.object(
+            operations,
+            "_native_process_binding",
+            side_effect=process_side_effect,
+        )
+        if process_side_effect is not None
+        else mock.patch.object(
+            operations,
+            "_native_process_binding",
+            return_value=context["process_proof"],
+        )
+    )
+    with mock.patch.dict(os.environ, {"HOME": str(context["home"])}), process_patch, mock.patch.object(
+        operations,
+        "_run",
+        side_effect=run,
+    ):
+        yield
+
+
+def native_canonical_v2_plan(
+    fixture: dict,
+    testcase: unittest.TestCase,
+    *,
+    production_shape: bool = False,
+    with_approvals: bool = False,
+    unknown_backlog: bool = False,
+) -> tuple[operations.LoadedPlan, dict, dict]:
+    plan, value = canonical_v2_plan(fixture)
+    home, database, sessions_root, connection, sessions, _, question_input = make_native_persistence(
+        fixture,
+        production_shape=production_shape,
+        with_approvals=with_approvals,
+        unknown_backlog=unknown_backlog,
+    )
+    testcase.addCleanup(connection.close)
+    descriptor = {
+        "schema": operations.NATIVE_EVIDENCE_SCHEMA,
+        "database_path": str(database),
+        "database_schema_sha256": operations._native_schema_fingerprint(connection),
+        "session_roots": [str(sessions_root)],
+    }
+    parsed = operations._validate_canonical_v2_plan(plan)
+    parsed["native_evidence"] = descriptor
+    process_proof = {
+        "pid": 12345,
+        "uid": os.geteuid(),
+        "start": 67890,
+        "argv": [str(fixture["kent"]), "serve", "--persistence-root", str(home / ".kent")],
+        "executable": [1, 2],
+        "database": [3, 4],
+    }
+    context = {
+        "home": home,
+        "database": database,
+        "sessions_root": sessions_root,
+        "connection": connection,
+        "process_proof": process_proof,
+        "question_input": question_input,
+        "question_session_id": next(
+            (row["id"] for row in sessions if row["task_id"] == "TASK-1"),
+            "SESSION-1",
+        ),
+    }
+    with native_observer_patches(context):
+        observed = operations._canonical_v2_read(parsed, parsed["workflows"][0])
+
+    item = value["workflows"][0]
+    snapshot = item["compatibility_snapshot"]
+    history_refs = snapshot["tasks"][0]["history_refs"]
+    snapshot["tasks"] = [
+        {
+            **row,
+            "history_classification": "reviewed-compatible",
+            "history_refs": history_refs,
+        }
+        for row in observed["compatibility_snapshot"]["tasks"]
+    ]
+    snapshot["sessions"] = [
+        {
+            **row,
+            "source_refs": [{
+                "path": str(Path(fixture["root"]) / "absent-local-cache" / row["id"]),
+                "sha256": "0" * 64,
+            }],
+        }
+        for row in observed["compatibility_snapshot"]["sessions"]
+    ]
+    snapshot["native_components"] = observed["compatibility_snapshot"]["native_components"]
+    value["native_evidence"] = descriptor
+    review_path = Path(item["compatibility_review_ref"]["path"])
+    review = json.loads(review_path.read_text())
+    review["compatibility_snapshot_sha256"] = canonical_sha256(snapshot)
+    review["native_evidence_sha256"] = canonical_sha256(descriptor)
+    dispositions = {row["path"] for row in review["dispositions"]}
+    evidence = history_refs[0]
+    for row in snapshot["tasks"]:
+        path = f"task:{row['id']}"
+        if path not in dispositions:
+            review["dispositions"].append({
+                "path": path,
+                "disposition": "compatible",
+                "evidence": [evidence],
+            })
+    for row in snapshot["sessions"]:
+        path = f"session:{row['id']}"
+        if path not in dispositions:
+            review["dispositions"].append({
+                "path": path,
+                "disposition": "compatible",
+                "evidence": [evidence],
+            })
+    review_raw = canonical_bytes(review)
+    review_path.write_bytes(review_raw)
+    item["compatibility_review_ref"]["sha256"] = hashlib.sha256(review_raw).hexdigest()
+    native_plan = write_canonical_v2_plan(fixture, value)
+    context["review_path"] = review_path
+    return native_plan, context, observed
+
+
 def install_v2_unresolved_graph_postimage(
     fixture: dict,
     plan: operations.LoadedPlan,
@@ -622,7 +1129,8 @@ def install_v2_unresolved_graph_postimage(
     parsed = operations._validate_canonical_v2_plan(plan)
     item = parsed["workflows"][0]
     item["graph"] = item["target_graph"]
-    item["metadata"] = item["target_metadata"]
+    if "target_metadata" in item:
+        item["metadata"] = item["target_metadata"]
     with OperationJournal(
         Path(plan.value["state_dir"]),
         "canonical-workflow-reconcile",
@@ -776,6 +1284,1325 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                         primary_root=root,
                         kent_path=root / "kent",
                     )
+
+    def test_native_event_selection_is_append_stable_strict_and_bounded(self) -> None:
+        def event(sequence: int, kind: str, payload: dict) -> dict:
+            return {"seq": sequence, "kind": kind, "payload": payload}
+
+        header = canonical_bytes({"contract": "kent.session.events", "version": 2}) + b"\n"
+        records = [
+            event(1, "message", {
+                "role": "developer",
+                "message_type": "environment",
+                "content": "initial",
+            }),
+            event(2, "generation_context", {
+                "before_summary": [{"role": "developer", "message_type": "environment", "content": "current"}],
+                "after_summary": [{"role": "developer", "content": "untyped instruction"}],
+            }),
+            event(3, "configuration_updated", {
+                "item": {
+                    "type": "configuration_update",
+                    "configuration_effort": "medium",
+                    "raw": {
+                        "type": "configuration_update",
+                        "reasoning": {"effort": "medium"},
+                    },
+                },
+            }),
+            event(4, "history_replaced", {
+                "cache_metadata": {},
+                "committed_entry_start": 0,
+                "compacted_output": {},
+                "compaction_number": 1,
+                "engine": "remote",
+                "mode": "workflow_post_completion",
+            }),
+            event(5, "message", {"role": "assistant", "content": "unrelated append"}),
+        ]
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            path = Path(temporary) / "events.jsonl"
+            path.write_bytes(header + b"".join(canonical_bytes(row) + b"\n" for row in records[:4]))
+            first = operations._native_scan_events(
+                path,
+                expected_last_sequence=4,
+                aggregate_bytes=[0],
+                selected_bytes=[0],
+            )
+            with path.open("ab") as stream:
+                stream.write(canonical_bytes(records[4]) + b"\n")
+            appended = operations._native_scan_events(
+                path,
+                expected_last_sequence=5,
+                aggregate_bytes=[0],
+                selected_bytes=[0],
+            )
+            self.assertEqual(first[0], appended[0])
+            self.assertNotEqual(first[1], appended[1])
+            self.assertEqual(
+                first[2]["payload"]["mode"],
+                "workflow_post_completion",
+            )
+            self.assertIn("message:environment", first[3])
+            self.assertIn("configuration_updated", first[3])
+            self.assertIn("history_replaced", first[3])
+            self.assertLessEqual(len(first[0]), operations.NATIVE_MAX_SELECTED_EVENTS_PER_SESSION)
+
+            malformed = Path(temporary) / "malformed.jsonl"
+            malformed.write_bytes(
+                header
+                + b'{"seq":1,"seq":2,"kind":"message","payload":{}}\n'
+            )
+            with self.assertRaisesRegex(EffectBlocked, "malformed JSON"):
+                operations._native_scan_events(
+                    malformed,
+                    expected_last_sequence=1,
+                    aggregate_bytes=[0],
+                    selected_bytes=[0],
+                )
+
+            with mock.patch.object(operations, "NATIVE_MAX_EVENT_FILE_BYTES", 64):
+                with self.assertRaisesRegex(EffectBlocked, "event file exceeds"):
+                    operations._native_scan_events(
+                        path,
+                        expected_last_sequence=5,
+                        aggregate_bytes=[0],
+                        selected_bytes=[0],
+                    )
+            with mock.patch.object(operations, "NATIVE_MAX_EVENT_TOTAL_BYTES", 64):
+                with self.assertRaisesRegex(EffectBlocked, "event inventory exceeds"):
+                    operations._native_scan_events(
+                        path,
+                        expected_last_sequence=5,
+                        aggregate_bytes=[0],
+                        selected_bytes=[0],
+                    )
+
+            oversized = Path(temporary) / "oversized.jsonl"
+            oversized.write_bytes(header + canonical_bytes(event(
+                1, "message", {"role": "assistant", "content": "x" * 256},
+            )) + b"\n")
+            with mock.patch.object(operations, "NATIVE_MAX_EVENT_LINE_BYTES", 128):
+                with self.assertRaisesRegex(EffectBlocked, "record exceeds"):
+                    operations._native_scan_events(
+                        oversized,
+                        expected_last_sequence=1,
+                        aggregate_bytes=[0],
+                        selected_bytes=[0],
+                    )
+
+            linked = Path(temporary) / "linked.jsonl"
+            linked.symlink_to(path)
+            with self.assertRaisesRegex(EffectBlocked, "symlink"):
+                operations._native_scan_events(
+                    linked,
+                    expected_last_sequence=5,
+                    aggregate_bytes=[0],
+                    selected_bytes=[0],
+                )
+
+    def test_native_history_replacement_accepts_bounded_payload_encodings(self) -> None:
+        latest = {}
+        current_event = {
+            "seq": 4,
+            "kind": "history_replaced",
+            "payload": {
+                "committed_entry_start": 0,
+                "compaction_number": 1,
+                "engine": "remote",
+                "items": [],
+                "mode": "workflow_post_completion",
+            },
+        }
+        operations._native_event_selector(current_event, latest)
+        self.assertEqual(latest["history_replaced"][0], 4)
+
+        legacy_list_event = {
+            "seq": 5,
+            "kind": "history_replaced",
+            "payload": {
+                "cache_metadata": [],
+                "committed_entry_start": 1,
+                "compacted_output": {"summary": ""},
+                "compaction_number": 2,
+                "engine": "remote",
+                "mode": "workflow_post_completion",
+            },
+        }
+        operations._native_event_selector(legacy_list_event, latest)
+        self.assertEqual(latest["history_replaced"][0], 5)
+
+        compacted_only_event = {
+            "seq": 6,
+            "kind": "history_replaced",
+            "payload": {
+                "committed_entry_start": 2,
+                "compacted_output": {"summary": ""},
+                "compaction_number": 3,
+                "engine": "remote",
+                "mode": "workflow_post_completion",
+            },
+        }
+        operations._native_event_selector(compacted_only_event, latest)
+        self.assertEqual(latest["history_replaced"][0], 6)
+
+        invalid_event = {
+            **current_event,
+            "payload": {**legacy_list_event["payload"], "cache_metadata": "invalid"},
+        }
+        with self.assertRaisesRegex(EffectBlocked, "history-replacement event shape"):
+            operations._native_event_selector(invalid_event, {})
+
+    def test_native_event_selection_omits_only_transient_developer_notices(self) -> None:
+        latest = {}
+        for sequence, message_type in (
+            (1, "background_notice"),
+            (2, "compaction_soon_reminder"),
+        ):
+            operations._native_event_selector({
+                "seq": sequence,
+                "kind": "message",
+                "payload": {"role": "developer", "message_type": message_type},
+            }, latest)
+        self.assertEqual(latest, {})
+
+        operations._native_event_selector({
+            "seq": 3,
+            "kind": "message",
+            "payload": {"role": "developer", "message_type": "agent_steer"},
+        }, latest)
+        operations._native_event_selector({
+            "seq": 4,
+            "kind": "message",
+            "payload": {"role": "developer", "message_type": "workflow_mode"},
+        }, latest)
+        self.assertEqual(
+            set(latest),
+            {"developer:3", "developer:4", "message:workflow_mode"},
+        )
+
+    def test_native_event_scanner_streams_a_production_sized_file_over_196mb(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            path = Path(temporary) / "large-events.jsonl"
+            content = "x" * (7 * 1024 * 1024)
+            with path.open("wb") as stream:
+                stream.write(
+                    canonical_bytes({"contract": "kent.session.events", "version": 2})
+                    + b"\n"
+                )
+                for sequence in range(1, 29):
+                    event = {
+                        "seq": sequence,
+                        "kind": "message",
+                        "payload": {"role": "assistant", "content": content},
+                    }
+                    line = canonical_bytes(event) + b"\n"
+                    self.assertLessEqual(
+                        len(line),
+                        operations.NATIVE_MAX_EVENT_LINE_BYTES,
+                    )
+                    stream.write(line)
+            self.assertGreater(path.stat().st_size, 196_000_000)
+            aggregate = [0]
+            selected = [0]
+            events, last_event, _, _ = operations._native_scan_events(
+                path,
+                expected_last_sequence=28,
+                aggregate_bytes=aggregate,
+                selected_bytes=selected,
+            )
+            self.assertEqual(events, [])
+            self.assertEqual(last_event["seq"], 28)
+            self.assertEqual(aggregate[0], path.stat().st_size)
+            self.assertEqual(selected[0], 0)
+
+    def test_internal_readback_output_limit_is_bounded_and_graph_cap_is_opt_in(self) -> None:
+        output_size = operations.MAX_OUTPUT + 64
+        command = [
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdout.write('x' * {output_size})",
+        ]
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            cwd = Path(temporary)
+            code, default_output, stderr = operations._run(command, cwd=cwd)
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, b"")
+            self.assertEqual(len(default_output), operations.MAX_OUTPUT)
+
+            code, graph_output, stderr = operations._run(
+                command,
+                cwd=cwd,
+                output_limit=operations.CANONICAL_GRAPH_MAX_OUTPUT,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, b"")
+            self.assertEqual(len(graph_output), output_size)
+
+        with self.assertRaisesRegex(operations.OperationError, "output bound is invalid"):
+            operations._run(
+                command,
+                cwd=Path.home(),
+                output_limit=operations.CANONICAL_GRAPH_MAX_OUTPUT + 1,
+            )
+
+    def test_native_json_rejects_nonfinite_and_native_question_input_is_closed(self) -> None:
+        with self.assertRaisesRegex(EffectBlocked, "malformed JSON"):
+            operations._native_json(b'{"value":1e999}', "native test")
+        with self.assertRaisesRegex(EffectBlocked, "exceeds 8 MiB"):
+            operations._native_json(
+                " " * (operations.NATIVE_MAX_DB_JSON_BYTES + 1),
+                "oversized native JSON",
+            )
+        valid = {
+            "question": "Choose a route",
+            "suggestions": ["Continue", "Stop"],
+            "recommended_option_index": 1,
+        }
+        self.assertEqual(operations._native_question_input(valid), valid)
+        with self.assertRaisesRegex(EffectBlocked, "input is malformed"):
+            operations._native_question_input({**valid, "extra": True})
+
+    def test_native_pending_question_matches_rendered_cli_output_without_answering(self) -> None:
+        question = {
+            "question": "Choose a route",
+            "suggestions": ["Continue", "Stop"],
+            "recommended_option_index": 2,
+        }
+        expected = (
+            "Choose a route\n"
+            "Suggestions:\n"
+            "1. Continue\n"
+            "2. Stop (recommended)\n"
+        ).encode()
+        kent = Path("/opt/kent")
+        root = Path("/workspace")
+        with mock.patch.object(
+            operations,
+            "_run",
+            return_value=(0, expected, b""),
+        ) as run:
+            operations._native_question_matches_cli(
+                kent,
+                root,
+                PROJECT_ID,
+                "44444444-4444-4444-8444-444444444444",
+                question,
+            )
+        args, kwargs = run.call_args
+        self.assertEqual(
+            args[0],
+            [
+                str(kent),
+                "question",
+                "--session",
+                "44444444-4444-4444-8444-444444444444",
+                "--project",
+                PROJECT_ID,
+            ],
+        )
+        self.assertEqual(kwargs["cwd"], root)
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+
+        with mock.patch.object(
+            operations,
+            "_run",
+            return_value=(0, b"changed question\n", b""),
+        ):
+            with self.assertRaisesRegex(EffectBlocked, "output differs"):
+                operations._native_question_matches_cli(
+                    kent,
+                    root,
+                    PROJECT_ID,
+                    "44444444-4444-4444-8444-444444444444",
+                    question,
+                )
+
+    def test_native_approval_fingerprint_binds_all_five_raw_json_columns(self) -> None:
+        workflow_id_value = "11111111-1111-4111-8111-111111111111"
+        source_node = "22222222-2222-4222-8222-222222222222"
+        target_node = "33333333-3333-4333-8333-333333333333"
+        session_id = "44444444-4444-4444-8444-444444444444"
+        group_id = "55555555-5555-4555-8555-555555555555"
+        edge_id = "66666666-6666-4666-8666-666666666666"
+        transition_id = "needs_user_action"
+        graph_edge = {
+            "id": edge_id,
+            "key": transition_id,
+            "transition_group_id": group_id,
+            "target_node_id": target_node,
+            "assignee_selection": "configured",
+            "thinking_selection": "configured",
+            "requires_approval": True,
+            "context_mode": "reuse",
+            "context_source": {"kind": "current_session"},
+            "parameters": {},
+            "prompt_template": "Resume the same node.",
+        }
+        workflow_graph = {
+            "nodes": [
+                {"id": source_node, "kind": "agent"},
+                {"id": target_node, "kind": "agent"},
+            ],
+            "edges": [graph_edge],
+            "transition_groups": [{
+                "id": group_id,
+                "source_node_id": source_node,
+                "transition_id": transition_id,
+            }],
+        }
+        approval = {
+            "id": "77777777-7777-4777-8777-777777777777",
+            "source_task_id": "task-88888888-8888-4888-8888-888888888888",
+            "source_node_id": source_node,
+            "source_transition_branch_key": None,
+            "source_session_id": session_id,
+            "workflow_version": 16,
+            "transition_snapshot_json": json.dumps({
+                "workflow_id": workflow_id_value,
+                "id": group_id,
+                "source_node_id": source_node,
+                "transition_id": transition_id,
+                "commentary": "Preserve exact snapshot.",
+            }),
+            "materialized_values_json": json.dumps({"work_kind": "bugfix"}),
+            "created_at_unix_ms": 17,
+        }
+        branch = {
+            "approval_id": approval["id"],
+            "transition_branch_key": transition_id,
+            "target_snapshot_json": json.dumps({
+                "node_id": target_node,
+                "node_kind": "agent",
+                "entered_by_edge_id": edge_id,
+                "scheduling_state": "ready",
+                "current_input_values": {},
+                "prior_values": {},
+            }),
+            "effective_edge_configuration_json": json.dumps({
+                **graph_edge,
+                "workflow_id": workflow_id_value,
+            }),
+            "context_source_resolution_json": json.dumps({
+                "active_source": {"kind": "exact", "session_id": session_id},
+                "target_session": {"kind": "reuse", "session_id": session_id},
+            }),
+        }
+        nodes = [{
+            "node_id": source_node,
+            "transition_branch_key": None,
+            "session_id": session_id,
+        }]
+
+        def digest(current_approval: dict, current_branch: dict) -> str:
+            return canonical_sha256(operations._native_approval_payload(
+                current_approval,
+                [current_branch],
+                nodes,
+                16,
+                workflow_id_value,
+                workflow_graph,
+            ))
+
+        baseline = digest(approval, branch)
+        nullable_edge_branch = dict(branch)
+        nullable_edge = json.loads(branch["effective_edge_configuration_json"])
+        nullable_edge["input_bindings"] = None
+        nullable_edge["output_requirements"] = None
+        nullable_edge_branch["effective_edge_configuration_json"] = json.dumps(nullable_edge)
+        nullable_digest = digest(approval, nullable_edge_branch)
+        self.assertNotEqual(nullable_digest, baseline)
+        invalid_edge_branch = dict(nullable_edge_branch)
+        invalid_edge = dict(nullable_edge)
+        invalid_edge["input_bindings"] = {}
+        invalid_edge_branch["effective_edge_configuration_json"] = json.dumps(invalid_edge)
+        with self.assertRaisesRegex(EffectBlocked, "differs from the reviewed Workflow context"):
+            digest(approval, invalid_edge_branch)
+        invalid_edge_branch["effective_edge_configuration_json"] = json.dumps({
+            **nullable_edge,
+            "unknown_configuration": None,
+        })
+        with self.assertRaisesRegex(EffectBlocked, "differs from the reviewed Workflow context"):
+            digest(approval, invalid_edge_branch)
+
+        for column, source in (
+            ("transition_snapshot_json", approval),
+            ("materialized_values_json", approval),
+            ("target_snapshot_json", branch),
+            ("effective_edge_configuration_json", branch),
+            ("context_source_resolution_json", branch),
+        ):
+            changed_approval = dict(approval)
+            changed_branch = dict(branch)
+            raw = source[column]
+            if source is approval:
+                changed_approval[column] = raw.replace("{", "{ ", 1)
+            else:
+                changed_branch[column] = raw.replace("{", "{ ", 1)
+            self.assertNotEqual(
+                digest(changed_approval, changed_branch),
+                baseline,
+                column,
+            )
+
+        semantic_approval = dict(approval)
+        semantic_transition = json.loads(approval["transition_snapshot_json"])
+        semantic_transition["commentary"] = "Changed reviewed transition text."
+        semantic_approval["transition_snapshot_json"] = canonical_bytes(
+            semantic_transition
+        ).decode("utf-8")
+        self.assertNotEqual(digest(semantic_approval, branch), baseline)
+
+        semantic_approval = dict(approval)
+        semantic_approval["materialized_values_json"] = canonical_bytes({
+            "work_kind": "changed-setting",
+        }).decode("utf-8")
+        self.assertNotEqual(digest(semantic_approval, branch), baseline)
+
+        semantic_branch = dict(branch)
+        target_snapshot = json.loads(branch["target_snapshot_json"])
+        target_snapshot["current_input_values"] = {"choice": "different-target"}
+        semantic_branch["target_snapshot_json"] = canonical_bytes(
+            target_snapshot
+        ).decode("utf-8")
+        self.assertNotEqual(digest(approval, semantic_branch), baseline)
+
+        four_approvals = []
+        for index in range(4):
+            approval_row = {
+                **approval,
+                "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"native-approval-{index}")),
+            }
+            branch_row = {
+                **branch,
+                "approval_id": approval_row["id"],
+            }
+            four_approvals.append({
+                "task_id": approval_row["source_task_id"],
+                "approval_id": approval_row["id"],
+                "record_sha256": canonical_sha256(
+                    operations._native_approval_payload(
+                        approval_row,
+                        [branch_row],
+                        nodes,
+                        16,
+                        workflow_id_value,
+                        workflow_graph,
+                    )
+                ),
+            })
+        self.assertEqual(len(four_approvals), 4)
+        self.assertEqual(len({row["record_sha256"] for row in four_approvals}), 4)
+
+    def test_native_process_adapters_bind_executable_and_database_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            root = Path(temporary) / "persistence"
+            database_dir = root / "db"
+            database_dir.mkdir(parents=True)
+            database = database_dir / "main.sqlite3"
+            database.write_bytes(b"db")
+            kent = Path(temporary) / "kent"
+            kent.write_bytes(b"kent executable")
+            kent.chmod(0o755)
+            pid = 19342
+            proc_root = Path(temporary) / "proc"
+            process = proc_root / str(pid)
+            (process / "fd").mkdir(parents=True)
+            (process / "exe").symlink_to(kent)
+            (process / "fd" / "7").symlink_to(database)
+            (process / "cmdline").write_bytes(
+                os.fsencode(str(kent)) + b"\x00serve\x00--persistence-root\x00"
+                + os.fsencode(str(root)) + b"\x00"
+            )
+            stat_fields = ["S", *("0" for _ in range(18)), "9876"]
+            (process / "stat").write_text(
+                f"{pid} (kent) {' '.join(stat_fields)}",
+                encoding="ascii",
+            )
+            linux = operations._native_process_evidence(
+                pid,
+                kent,
+                root,
+                database,
+                system="linux",
+                proc_root=proc_root,
+            )
+            self.assertEqual(linux["pid"], pid)
+            self.assertEqual(linux["start"], 9876)
+
+            executable_stat = kent.stat()
+            database_stat = database.stat()
+            ps = (
+                f"{pid} {os.geteuid()} Thu Oct 15 15:56:00 2026 "
+                f"{kent} serve --persistence-root {root}\n"
+            ).encode()
+            lsof = (
+                f"p{pid}\nu{os.geteuid()}\n"
+                f"ftxt\ntREG\nD0x{executable_stat.st_dev:x}\n"
+                f"i{executable_stat.st_ino}\nn{kent}\n"
+                "ftxt\ntREG\nD0x1\ni999\nn/usr/lib/dyld\n"
+                f"f7\ntREG\nD0x{database_stat.st_dev:x}\n"
+                f"i{database_stat.st_ino}\nn{database}\n"
+                f"f14\ntREG\nD0x{database_stat.st_dev:x}\n"
+                f"i{database_stat.st_ino}\nn{database}\n"
+            ).encode()
+            with mock.patch.object(
+                operations,
+                "_run",
+                side_effect=[(0, ps, b""), (0, lsof, b"")],
+            ):
+                darwin = operations._native_process_evidence(
+                    pid,
+                    kent,
+                    root,
+                    database,
+                    system="darwin",
+                )
+            self.assertEqual(darwin["pid"], pid)
+            self.assertEqual(darwin["database"], [database_stat.st_dev, database_stat.st_ino])
+
+            copied_database = database_dir / "same-bytes.sqlite3"
+            copied_database.write_bytes(database.read_bytes())
+            (process / "fd" / "7").unlink()
+            (process / "fd" / "7").symlink_to(copied_database)
+            with self.assertRaisesRegex(EffectBlocked, "identity or descriptors differ"):
+                operations._native_process_evidence(
+                    pid,
+                    kent,
+                    root,
+                    database,
+                    system="linux",
+                    proc_root=proc_root,
+                )
+            (process / "fd" / "7").unlink()
+            (process / "fd" / "7").symlink_to(database)
+
+            wrong_kent = Path(temporary) / "different-kent"
+            wrong_kent.write_bytes(b"same status, different executable")
+            wrong_kent.chmod(0o755)
+            (process / "exe").unlink()
+            (process / "exe").symlink_to(wrong_kent)
+            with self.assertRaisesRegex(EffectBlocked, "identity or descriptors differ"):
+                operations._native_process_evidence(
+                    pid,
+                    kent,
+                    root,
+                    database,
+                    system="linux",
+                    proc_root=proc_root,
+                )
+            (process / "exe").unlink()
+            (process / "exe").symlink_to(kent)
+
+            changed_start_fields = ["S", *("0" for _ in range(18)), "9877"]
+            (process / "stat").write_text(
+                f"{pid} (kent) {' '.join(changed_start_fields)}",
+                encoding="ascii",
+            )
+            reused_pid = operations._native_process_evidence(
+                pid,
+                kent,
+                root,
+                database,
+                system="linux",
+                proc_root=proc_root,
+            )
+            self.assertNotEqual(reused_pid["start"], linux["start"])
+            with self.assertRaisesRegex(EffectBlocked, "identity or descriptors differ"):
+                operations._native_process_evidence(
+                    pid,
+                    kent,
+                    root,
+                    database,
+                    system="linux",
+                    proc_root=Path(temporary) / "missing-proc",
+                )
+
+            bad_lsof = lsof.replace(
+                f"i{database_stat.st_ino}\nn{database}".encode(),
+                f"i{database_stat.st_ino + 1}\nn{database}".encode(),
+            )
+            with mock.patch.object(
+                operations,
+                "_run",
+                side_effect=[(0, ps, b""), (0, bad_lsof, b"")],
+            ):
+                with self.assertRaisesRegex(
+                    EffectBlocked,
+                    "executable/database descriptors differ",
+                ):
+                    operations._native_process_evidence(
+                        pid,
+                        kent,
+                        root,
+                        database,
+                        system="darwin",
+                    )
+
+    def test_native_foreign_root_status_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self)
+            parsed = operations._validate_canonical_v2_plan(plan)
+            foreign_root = context["home"] / ".kent-foreign"
+            status = {
+                "health_status": "ok",
+                "health_pid": 999,
+                "command": [
+                    str(fixture["kent"]),
+                    "serve",
+                    "--persistence-root",
+                    str(foreign_root),
+                ],
+            }
+            with mock.patch.dict(os.environ, {"HOME": str(context["home"])}), mock.patch.object(
+                operations,
+                "_kent_json",
+                return_value=status,
+            ), mock.patch.object(operations, "_native_process_evidence") as process_evidence:
+                with self.assertRaisesRegex(EffectBlocked, "does not bind"):
+                    operations._native_process_binding(
+                        parsed,
+                        parsed["native_evidence"],
+                        PROJECT_ID,
+                    )
+                process_evidence.assert_not_called()
+
+    def test_native_wal_plan_prepare_and_fresh_new_effect_gate(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, observed = native_canonical_v2_plan(fixture, self)
+            database = context["database"]
+            db_digest = hashlib.sha256(database.read_bytes()).hexdigest()
+            wal_path = Path(str(database) + "-wal")
+            wal_digest = hashlib.sha256(wal_path.read_bytes()).hexdigest()
+            connection = context["connection"]
+            total_changes = connection.total_changes
+            self.assertEqual(
+                observed["compatibility_snapshot"]["native_components"]["sessions"],
+                [],
+            )
+
+            with native_observer_patches(context):
+                prepared = reconcile_canonical_workflows(plan, mode="prepare")
+                self.assertEqual(prepared["phase"], "prepared")
+
+                released = []
+
+                def refuse_effect(
+                    journal,
+                    *,
+                    current_sha256,
+                    preimage_sha256,
+                    pre_release_check,
+                    **kwargs,
+                ):
+                    del journal, kwargs
+                    self.assertEqual(current_sha256(), preimage_sha256)
+                    pre_release_check()
+                    released.append(True)
+                    return "preimage"
+
+                with mock.patch.object(
+                    operations,
+                    "_canonical_v2_read",
+                    wraps=operations._canonical_v2_read,
+                ) as full_read, mock.patch.object(
+                    operations,
+                    "_settle_or_run",
+                    side_effect=refuse_effect,
+                ) as settle:
+                    applied = reconcile_canonical_workflows(
+                        plan,
+                        mode="apply",
+                        confirm=plan.sha256,
+                    )
+                self.assertEqual(applied["settled"], "preimage")
+                self.assertGreaterEqual(full_read.call_count, 2)
+                self.assertEqual(settle.call_count, 1)
+                self.assertEqual(released, [True])
+
+            self.assertEqual(graph_apply_rows(fixture), [])
+            self.assertEqual(hashlib.sha256(database.read_bytes()).hexdigest(), db_digest)
+            self.assertEqual(hashlib.sha256(wal_path.read_bytes()).hexdigest(), wal_digest)
+            self.assertEqual(connection.total_changes, total_changes)
+
+    def test_native_changed_database_blocks_dispatch_and_review_digest_drift(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self)
+            with native_observer_patches(context):
+                reconcile_canonical_workflows(plan, mode="prepare")
+                context["connection"].execute(
+                    "UPDATE workflows SET description=?",
+                    ("changed outside the reviewed snapshot",),
+                )
+                context["connection"].commit()
+                with mock.patch.object(operations, "_settle_or_run") as dispatch:
+                    with self.assertRaisesRegex(EffectBlocked, "metadata differs"):
+                        reconcile_canonical_workflows(
+                            plan,
+                            mode="apply",
+                            confirm=plan.sha256,
+                        )
+                dispatch.assert_not_called()
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self)
+            value = json.loads(plan.raw)
+            item = value["workflows"][0]
+            review_path = Path(item["compatibility_review_ref"]["path"])
+            review = json.loads(review_path.read_text())
+            review["native_evidence_sha256"] = "0" * 64
+            review_raw = canonical_bytes(review)
+            review_path.write_bytes(review_raw)
+            item["compatibility_review_ref"]["sha256"] = hashlib.sha256(
+                review_raw
+            ).hexdigest()
+            invalid = write_canonical_v2_plan(fixture, value, name="bad-native-review.json")
+            with native_observer_patches(context):
+                with self.assertRaisesRegex(
+                    PlanValidationError,
+                    "review does not bind the exact v2 plan inputs",
+                ):
+                    reconcile_canonical_workflows(invalid, mode="prepare")
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self)
+            with native_observer_patches(context):
+                with mock.patch.object(
+                    operations.sqlite3,
+                    "connect",
+                    side_effect=sqlite3.OperationalError("database is locked"),
+                ):
+                    with self.assertRaisesRegex(
+                        EffectBlocked,
+                        "SQLite observation failed",
+                    ):
+                        reconcile_canonical_workflows(plan, mode="prepare")
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self)
+            with native_observer_patches(context):
+                reconcile_canonical_workflows(plan, mode="prepare")
+            context["connection"].close()
+            context["database"].unlink()
+            with native_observer_patches(context), mock.patch.object(
+                operations,
+                "_settle_or_run",
+            ) as dispatch:
+                with self.assertRaisesRegex(EffectBlocked, "absent or inaccessible"):
+                    reconcile_canonical_workflows(
+                        plan,
+                        mode="apply",
+                        confirm=plan.sha256,
+                    )
+                dispatch.assert_not_called()
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_settlement_uses_owned_graph_read_when_database_and_session_are_gone(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self)
+            with native_observer_patches(context):
+                reconcile_canonical_workflows(plan, mode="prepare")
+            stage = install_v2_unresolved_graph_postimage(fixture, plan)
+            context["connection"].close()
+            context["database"].unlink()
+            session_dir = context["sessions_root"] / "SESSION-1"
+            session_dir.rmdir()
+            with mock.patch.object(
+                operations,
+                "_canonical_v2_read",
+                side_effect=AssertionError("mutable native evidence read before settlement"),
+            ), mock.patch.object(
+                operations,
+                "_canonical_v2_plan_check",
+                side_effect=AssertionError("plan evidence checked before settlement"),
+            ):
+                report = reconcile_canonical_workflows(
+                    plan,
+                    mode="apply",
+                    confirm=plan.sha256,
+                )
+            self.assertEqual(report["settled"], "postimage")
+            self.assertEqual(report["phase"], "in_progress")
+            self.assertEqual(read_state(fixture)["workflows"][workflow_id(0)]["version"], 2)
+            self.assertEqual(graph_apply_rows(fixture), [])
+            self.assertEqual(stage["name"], "graph")
+
+    def test_native_inventory_matches_694_total_and_67_detailed_sessions(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, observed = native_canonical_v2_plan(
+                fixture,
+                self,
+                production_shape=True,
+            )
+            parsed = operations._validate_canonical_v2_plan(plan)
+            with native_observer_patches(context):
+                refreshed = operations._canonical_v2_read(
+                    parsed,
+                    parsed["workflows"][0],
+                )
+            self.assertEqual(len(refreshed["compatibility_snapshot"]["tasks"]), 30)
+            self.assertEqual(len(refreshed["compatibility_snapshot"]["sessions"]), 67)
+            self.assertEqual(
+                len(refreshed["compatibility_snapshot"]["native_components"]["sessions"]),
+                67,
+            )
+            self.assertEqual(
+                context["connection"].execute("SELECT count(*) FROM sessions").fetchone()[0],
+                694,
+            )
+            self.assertEqual(
+                sum(not row["terminal"] for row in refreshed["compatibility_snapshot"]["tasks"]),
+                13,
+            )
+            self.assertEqual(
+                len(observed["compatibility_snapshot"]["native_components"]["sessions"]),
+                67,
+            )
+            self.assertEqual(
+                observed["compatibility_snapshot"]["native_components"]["questions"],
+                [{
+                    "task_id": "TASK-1",
+                    "session_id": context["question_session_id"],
+                    "call_id": "call-native-question-1",
+                    "event_sequence": 1,
+                    "input_sha256": canonical_sha256(context["question_input"]),
+                }],
+            )
+            self.assertTrue(all(
+                not Path(ref["path"]).exists()
+                for session in plan.value["workflows"][0]["compatibility_snapshot"]["sessions"]
+                for ref in session["source_refs"]
+            ))
+
+    def test_native_four_database_approvals_and_branches_match_reviewed_components(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, observed = native_canonical_v2_plan(
+                fixture,
+                self,
+                production_shape=True,
+                with_approvals=True,
+            )
+            components = observed["compatibility_snapshot"]["native_components"]
+            self.assertEqual(len(components["approvals"]), 4)
+            self.assertEqual(
+                context["connection"].execute(
+                    "SELECT count(*) FROM task_pending_approvals"
+                ).fetchone()[0],
+                4,
+            )
+            self.assertEqual(
+                context["connection"].execute(
+                    "SELECT count(*) FROM task_pending_approval_branches"
+                ).fetchone()[0],
+                4,
+            )
+            with native_observer_patches(context):
+                prepared = reconcile_canonical_workflows(plan, mode="prepare")
+            self.assertEqual(prepared["phase"], "prepared")
+            self.assertEqual(
+                len(plan.value["workflows"][0]["compatibility_snapshot"]["native_components"]["approvals"]),
+                4,
+            )
+            removed_approval = components["approvals"][0]["approval_id"]
+            context["connection"].execute(
+                "DELETE FROM task_pending_approvals WHERE id=?",
+                (removed_approval,),
+            )
+            context["connection"].commit()
+            with native_observer_patches(context), mock.patch.object(
+                operations,
+                "_settle_or_run",
+            ) as dispatch:
+                with self.assertRaisesRegex(EffectBlocked, "approval rows differ"):
+                    reconcile_canonical_workflows(
+                        plan,
+                        mode="apply",
+                        confirm=plan.sha256,
+                    )
+                dispatch.assert_not_called()
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_unknown_backlog_without_cli_approval_payload_is_compatible(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, observed = native_canonical_v2_plan(
+                fixture,
+                self,
+                production_shape=True,
+                unknown_backlog=True,
+            )
+            task = next(
+                row for row in observed["compatibility_snapshot"]["tasks"]
+                if row["id"] == "TASK-1"
+            )
+            self.assertFalse(task["terminal"])
+            self.assertEqual(task["current_nodes"], ["node-backlog"])
+            self.assertEqual(task["pending_decisions"], [])
+            self.assertEqual(
+                observed["compatibility_snapshot"]["native_components"]["approvals"],
+                [],
+            )
+            state = read_state(fixture)
+            self.assertNotIn(
+                "pending_approvals",
+                state["workflows"][workflow_id(0)]["details"]["TASK-1"],
+            )
+            with native_observer_patches(context):
+                prepared = reconcile_canonical_workflows(plan, mode="prepare")
+            self.assertEqual(prepared["phase"], "prepared")
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_empty_lock_requires_and_accepts_exact_postcompletion_context(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(
+                fixture,
+                self,
+                production_shape=True,
+            )
+            parsed = operations._validate_canonical_v2_plan(plan)
+            session = next(
+                row
+                for row in parsed["workflows"][0]["compatibility_snapshot"]["sessions"]
+                if row["task_id"] == "TASK-2"
+            )
+            event_path = context["sessions_root"] / session["id"] / "events.jsonl"
+            header = canonical_bytes({"contract": "kent.session.events", "version": 2})
+            context_events = [
+                {
+                    "seq": 1,
+                    "kind": "message",
+                    "payload": {
+                        "role": "developer",
+                        "message_type": "environment",
+                        "content": "runtime context",
+                    },
+                },
+                {
+                    "seq": 2,
+                    "kind": "message",
+                    "payload": {
+                        "role": "developer",
+                        "message_type": "agent_steer",
+                        "content": "preserved instruction",
+                    },
+                },
+                {
+                    "seq": 3,
+                    "kind": "history_replaced",
+                    "payload": {
+                        "committed_entry_start": 0,
+                        "compaction_number": 1,
+                        "engine": "remote",
+                        "compacted_output": {},
+                        "mode": "workflow_post_completion",
+                    },
+                },
+            ]
+            event_path.write_bytes(
+                header
+                + b"\n"
+                + b"".join(canonical_bytes(event) + b"\n" for event in context_events)
+            )
+            context["connection"].execute(
+                "UPDATE sessions SET locked_json='{}', last_sequence=3 WHERE id=?",
+                (session["id"],),
+            )
+            context["connection"].commit()
+            with native_observer_patches(context):
+                live = operations._canonical_v2_read(
+                    parsed,
+                    parsed["workflows"][0],
+                )
+            component = next(
+                row for row in live["compatibility_snapshot"]["native_components"]["sessions"]
+                if row["session_id"] == session["id"]
+            )
+            self.assertEqual(
+                {row["sequence"] for row in component["events"]},
+                {1, 2, 3},
+            )
+
+            missing_context = [
+                {**context_events[1], "seq": 1},
+                {**context_events[2], "seq": 2},
+            ]
+            event_path.write_bytes(
+                header
+                + b"\n"
+                + b"".join(canonical_bytes(event) + b"\n" for event in missing_context)
+            )
+            context["connection"].execute(
+                "UPDATE sessions SET last_sequence=2 WHERE id=?",
+                (session["id"],),
+            )
+            context["connection"].commit()
+            with native_observer_patches(context):
+                with self.assertRaisesRegex(
+                    EffectBlocked,
+                    "empty native Session lock lacks exact post-completion and instruction history",
+                ):
+                    operations._canonical_v2_read(
+                        parsed,
+                        parsed["workflows"][0],
+                    )
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_selected_event_omission_and_terminal_state_drift_block(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(
+                fixture,
+                self,
+                production_shape=True,
+            )
+            parsed = operations._validate_canonical_v2_plan(plan)
+            first_session = parsed["workflows"][0]["compatibility_snapshot"]["sessions"][0]
+            event_path = (
+                context["sessions_root"] / first_session["id"] / "events.jsonl"
+            )
+            # The original file contains an unselected assistant message. Replace it
+            # with an instruction-bearing event that must alter reviewed components.
+            event_path.write_bytes(
+                canonical_bytes({"contract": "kent.session.events", "version": 2})
+                + b"\n"
+                + canonical_bytes({
+                    "seq": 1,
+                    "kind": "message",
+                    "payload": {
+                        "role": "developer",
+                        "message_type": "agent_steer",
+                        "content": "selected event omitted from reviewed evidence",
+                    },
+                })
+                + b"\n"
+            )
+            with native_observer_patches(context):
+                live = operations._canonical_v2_read(parsed, parsed["workflows"][0])
+            with self.assertRaisesRegex(EffectBlocked, "inventory drifted"):
+                operations._canonical_v2_gate(
+                    parsed["workflows"][0],
+                    live,
+                    parsed["workflows"][0]["expected_version"],
+                )
+
+            context["connection"].execute(
+                "UPDATE task_current_nodes SET node_id='node-backlog' WHERE task_id='TASK-14'"
+            )
+            context["connection"].commit()
+            with native_observer_patches(context):
+                with self.assertRaisesRegex(EffectBlocked, "current-node ownership differs"):
+                    operations._canonical_v2_read(parsed, parsed["workflows"][0])
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_schema_and_project_root_drift_fail_closed(self) -> None:
+        for mutation, message in (
+            ("schema", "schema fingerprint differs"),
+            ("root", "workspace differs"),
+            ("project", "project identity is absent"),
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(
+                dir=Path.home()
+            ) as temporary:
+                fixture = make_d9_fixture(Path(temporary))
+                plan, context, _ = native_canonical_v2_plan(fixture, self)
+                parsed = operations._validate_canonical_v2_plan(plan)
+                if mutation == "schema":
+                    context["connection"].execute(
+                        "CREATE TABLE unexpected_schema_change (id TEXT)"
+                    )
+                elif mutation == "project":
+                    context["connection"].execute(
+                        "UPDATE projects SET id=? WHERE id=?",
+                        ("project-223e4567-e89b-12d3-a456-426614174111", PROJECT_ID),
+                    )
+                else:
+                    context["connection"].execute(
+                        "UPDATE workspaces SET canonical_root_path=?",
+                        (str(Path(temporary) / "foreign-root"),),
+                    )
+                context["connection"].commit()
+                with native_observer_patches(context):
+                    with self.assertRaisesRegex(EffectBlocked, message):
+                        operations._canonical_v2_read(
+                            parsed,
+                            parsed["workflows"][0],
+                        )
+                self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_missing_script_inventory_blocks_even_without_execution_list(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self)
+            state = read_state(fixture)
+            detail = state["workflows"][workflow_id(0)]["details"]["TASK-1"]
+            detail.pop("current_scripts", None)
+            detail.pop("live_executions", None)
+            write_state(fixture, state)
+            parsed = operations._validate_canonical_v2_plan(plan)
+            with native_observer_patches(context):
+                with self.assertRaisesRegex(EffectBlocked, "current Script"):
+                    operations._canonical_v2_read(
+                        parsed,
+                        parsed["workflows"][0],
+                    )
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_added_event_components_do_not_inherit_missing_cache_files(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(
+                fixture,
+                self,
+                production_shape=True,
+            )
+            parsed = operations._validate_canonical_v2_plan(plan)
+            session = parsed["workflows"][0]["compatibility_snapshot"]["sessions"][0]
+            cache_ref = session["source_refs"][0]
+            self.assertFalse(Path(cache_ref["path"]).exists())
+            with native_observer_patches(context):
+                live = operations._canonical_v2_read(
+                    parsed,
+                    parsed["workflows"][0],
+                )
+            operations._canonical_v2_gate(
+                parsed["workflows"][0],
+                live,
+                parsed["workflows"][0]["expected_version"],
+            )
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_process_identity_drift_during_observation_blocks(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(
+                fixture,
+                self,
+                production_shape=True,
+            )
+            parsed = operations._validate_canonical_v2_plan(plan)
+            changed_process = {
+                **context["process_proof"],
+                "start": context["process_proof"]["start"] + 1,
+            }
+            with native_observer_patches(
+                context,
+                process_side_effect=[
+                    context["process_proof"],
+                    changed_process,
+                ],
+            ):
+                with self.assertRaisesRegex(
+                    EffectBlocked,
+                    "process identity drifted during observation",
+                ):
+                    operations._canonical_v2_read(
+                        parsed,
+                        parsed["workflows"][0],
+                    )
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_question_input_drift_and_missing_selected_event_block(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(
+                fixture,
+                self,
+                production_shape=True,
+            )
+            parsed = operations._validate_canonical_v2_plan(plan)
+            event_path = (
+                context["sessions_root"]
+                / context["question_session_id"]
+                / "events.jsonl"
+            )
+            question_event = {
+                "seq": 1,
+                "kind": "message",
+                "payload": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "name": "ask_question",
+                        "call_id": "call-native-question-1",
+                        "input": {
+                            **context["question_input"],
+                            "question": "A changed question",
+                        },
+                    }],
+                },
+            }
+            event_path.write_bytes(
+                canonical_bytes({"contract": "kent.session.events", "version": 2})
+                + b"\n"
+                + canonical_bytes(question_event)
+                + b"\n"
+            )
+            with native_observer_patches(context):
+                with self.assertRaisesRegex(EffectBlocked, "output differs"):
+                    operations._canonical_v2_read(
+                        parsed,
+                        parsed["workflows"][0],
+                    )
+
+            event_path.unlink()
+            with native_observer_patches(context):
+                with self.assertRaisesRegex(EffectBlocked, "absent or inaccessible"):
+                    operations._canonical_v2_read(
+                        parsed,
+                        parsed["workflows"][0],
+                    )
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_copy_db_and_symlink_hardlink_sources_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self)
+            parsed = operations._validate_canonical_v2_plan(plan)
+            copied_database = context["home"] / ".kent" / "db" / "copied.sqlite3"
+            copied = sqlite3.connect(copied_database)
+            context["connection"].backup(copied)
+            copied.close()
+            original_ids = context["connection"].execute(
+                "SELECT id FROM task_records ORDER BY id"
+            ).fetchall()
+            copied_conn = sqlite3.connect(copied_database)
+            self.assertEqual(
+                copied_conn.execute("SELECT id FROM task_records ORDER BY id").fetchall(),
+                original_ids,
+            )
+            copied_conn.close()
+            copied_descriptor = {
+                **parsed["native_evidence"],
+                "database_path": str(copied_database),
+            }
+            with mock.patch.dict(os.environ, {"HOME": str(context["home"])}):
+                with self.assertRaisesRegex(EffectBlocked, "default local persistence root"):
+                    operations._native_expected_paths(
+                        copied_descriptor,
+                        PROJECT_ID,
+                    )
+
+            hardlink = context["home"] / ".kent" / "db" / "linked.sqlite3"
+            os.link(context["database"], hardlink)
+            with self.assertRaisesRegex(EffectBlocked, "link count"):
+                operations._native_path_stat(hardlink, "native copied database")
+            symlink = context["home"] / ".kent" / "db" / "symlink.sqlite3"
+            symlink.symlink_to(context["database"])
+            with self.assertRaisesRegex(EffectBlocked, "symlink"):
+                operations._native_path_stat(symlink, "native linked database")
+            self.assertEqual(graph_apply_rows(fixture), [])
 
     def test_v2_source_gate_is_exactly_bound_and_only_in_backlog_plan_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1147,6 +2974,221 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     confirm=plan.sha256,
                 )
             self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_v2_waiting_approval_without_native_payload_blocks(self) -> None:
+        for payload in ("missing", "empty"):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_d9_fixture(Path(temporary))
+                plan, _ = canonical_v2_plan(fixture)
+                parsed = operations._validate_canonical_v2_plan(plan)
+                item = parsed["workflows"][0]
+                state = read_state(fixture)
+                workflow = state["workflows"][item["workflow_id"]]
+                waiting = {
+                    "kind": "waiting_approval",
+                    "native_state": "waiting_approval",
+                    "attention_types": ["approval"],
+                }
+                workflow["tasks"][0]["status"] = waiting
+                detail = workflow["details"]["TASK-1"]
+                detail["status"] = waiting
+                detail["summary"]["status"] = waiting
+                detail["summary"]["done"] = False
+                if payload == "missing":
+                    detail.pop("pending_approvals")
+                    detail["summary"].pop("pending_approvals", None)
+                else:
+                    detail["pending_approvals"] = []
+                write_state(fixture, state)
+
+                with self.assertRaisesRegex(EffectBlocked, "pending approval inventory"):
+                    operations._canonical_v2_read(parsed, item)
+
+    def test_v2_waiting_approval_with_native_payload_is_fingerprinted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, _ = canonical_v2_plan(fixture)
+            parsed = operations._validate_canonical_v2_plan(plan)
+            item = parsed["workflows"][0]
+            approval = {
+                "id": "approval-native",
+                "proposal": {"transition": "plan_revalidation"},
+            }
+            state = read_state(fixture)
+            workflow = state["workflows"][item["workflow_id"]]
+            waiting = {
+                "kind": "waiting_approval",
+                "native_state": "waiting_approval",
+                "attention_types": ["approval"],
+            }
+            workflow["tasks"][0]["status"] = waiting
+            detail = workflow["details"]["TASK-1"]
+            detail["status"] = waiting
+            detail["summary"]["status"] = waiting
+            detail["summary"]["done"] = False
+            detail["pending_approvals"] = [approval]
+            write_state(fixture, state)
+
+            live = operations._canonical_v2_read(parsed, item)
+
+            self.assertEqual(
+                live["compatibility_snapshot"]["tasks"][0]["pending_decisions"],
+                [{
+                    "id": "approval-native",
+                    "payload_sha256": canonical_sha256(approval),
+                }],
+            )
+
+    def test_v2_active_task_without_approval_payload_remains_unknown_and_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, _ = canonical_v2_plan(fixture)
+            parsed = operations._validate_canonical_v2_plan(plan)
+            item = parsed["workflows"][0]
+            state = read_state(fixture)
+            workflow = state["workflows"][item["workflow_id"]]
+            active = {"kind": "doing", "native_state": "active"}
+            workflow["tasks"][0]["status"] = active
+            detail = workflow["details"]["TASK-1"]
+            detail["status"] = active
+            detail["summary"].update({"status": active, "done": False})
+            detail["current_nodes"] = [{"node_id": "node-implement"}]
+            detail.pop("pending_approvals")
+            write_state(fixture, state)
+
+            with self.assertRaisesRegex(EffectBlocked, "approval inventory is unavailable"):
+                operations._canonical_v2_read(parsed, item)
+
+    def test_v2_current_scripts_are_required_and_active_scripts_block(self) -> None:
+        for script_state in ("missing", "malformed", "active"):
+            with self.subTest(script_state=script_state), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_d9_fixture(Path(temporary))
+                plan, _ = canonical_v2_plan(fixture)
+                parsed = operations._validate_canonical_v2_plan(plan)
+                item = parsed["workflows"][0]
+                state = read_state(fixture)
+                detail = state["workflows"][item["workflow_id"]]["details"]["TASK-1"]
+                if script_state == "missing":
+                    detail.pop("current_scripts")
+                elif script_state == "malformed":
+                    detail["current_scripts"] = {"path": ".kent/scripts/example"}
+                else:
+                    detail["current_scripts"] = [{
+                        "path": ".kent/scripts/example",
+                        "current_node": {"node_id": "node-implement"},
+                    }]
+                write_state(fixture, state)
+
+                with self.assertRaisesRegex(
+                    EffectBlocked,
+                    "current Script|active native Script",
+                ):
+                    operations._canonical_v2_read(parsed, item)
+
+    def test_v2_empty_current_scripts_prove_idle_without_live_executions_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, _ = canonical_v2_plan(fixture)
+            parsed = operations._validate_canonical_v2_plan(plan)
+            item = parsed["workflows"][0]
+            state = read_state(fixture)
+            detail = state["workflows"][item["workflow_id"]]["details"]["TASK-1"]
+            detail.pop("live_executions", None)
+            write_state(fixture, state)
+
+            live = operations._canonical_v2_read(parsed, item)
+
+            self.assertEqual(live["compatibility_snapshot"]["live_executions"], [])
+
+    def test_v2_live_inventory_does_not_echo_plan_only_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, _ = canonical_v2_plan(fixture)
+            parsed = operations._validate_canonical_v2_plan(plan)
+            item = parsed["workflows"][0]
+
+            live = operations._canonical_v2_read(parsed, item)
+            native_session = live["compatibility_snapshot"]["sessions"][0]
+            native_task = live["compatibility_snapshot"]["tasks"][0]
+
+            self.assertNotIn("contract_fingerprint", native_session)
+            self.assertNotIn("source_refs", native_session)
+            self.assertNotIn("history_classification", native_task)
+            self.assertNotIn("history_refs", native_task)
+            operations._canonical_v2_gate(item, live, item["expected_version"])
+
+    def test_v2_unknown_history_and_approval_state_do_not_block_terminal_or_backlog(self) -> None:
+        for state_name in ("terminal", "backlog"):
+            with self.subTest(state=state_name), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_d9_fixture(Path(temporary))
+                plan, _ = canonical_v2_plan(fixture)
+                parsed = operations._validate_canonical_v2_plan(plan)
+                item = parsed["workflows"][0]
+                item_task = item["compatibility_snapshot"]["tasks"][0]
+                item_task["history_classification"] = "unknown"
+                item_task["history_refs"] = []
+                state = read_state(fixture)
+                workflow = state["workflows"][item["workflow_id"]]
+                detail = workflow["details"]["TASK-1"]
+                detail.pop("pending_approvals")
+                if state_name == "backlog":
+                    active = {"kind": "doing", "native_state": "waiting"}
+                    workflow["tasks"][0]["status"] = active
+                    item_task.update({
+                        "status": "doing",
+                        "native_state": "waiting",
+                        "terminal": False,
+                        "current_nodes": ["node-backlog"],
+                    })
+                    detail.update({
+                        "status": active,
+                        "current_nodes": [{"node_id": "node-backlog"}],
+                    })
+                    detail["summary"].update({"status": active, "done": False})
+                review_path = Path(item["compatibility_review_ref"]["path"])
+                review = json.loads(review_path.read_text())
+                review["compatibility_snapshot_sha256"] = canonical_sha256(
+                    item["compatibility_snapshot"]
+                )
+                review_raw = canonical_bytes(review)
+                review_path.write_bytes(review_raw)
+                item["compatibility_review_ref"]["sha256"] = hashlib.sha256(
+                    review_raw
+                ).hexdigest()
+                write_state(fixture, state)
+
+                live = operations._canonical_v2_read(parsed, item)
+
+                self.assertIsNone(live["compatibility_snapshot"]["tasks"][0]["pending_decisions"])
+                operations._canonical_v2_gate(item, live, item["expected_version"])
+
+    def test_v2_unknown_approval_requires_exact_nonimpact_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, _ = canonical_v2_plan(fixture)
+            parsed = operations._validate_canonical_v2_plan(plan)
+            item = parsed["workflows"][0]
+            state = read_state(fixture)
+            state["workflows"][item["workflow_id"]]["details"]["TASK-1"].pop(
+                "pending_approvals"
+            )
+            write_state(fixture, state)
+            live = operations._canonical_v2_read(parsed, item)
+
+            review_path = Path(item["compatibility_review_ref"]["path"])
+            review = json.loads(review_path.read_text())
+            next(
+                row for row in review["dispositions"]
+                if row["path"] == "task:TASK-1.pending_decisions"
+            )["disposition"] = "compatible"
+            review_raw = canonical_bytes(review)
+            review_path.write_bytes(review_raw)
+            item["compatibility_review_ref"]["sha256"] = hashlib.sha256(
+                review_raw
+            ).hexdigest()
+
+            with self.assertRaisesRegex(EffectBlocked, "inventory drifted"):
+                operations._canonical_v2_gate(item, live, item["expected_version"])
 
     def test_v2_rejects_workflow_linked_from_an_unreviewed_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
