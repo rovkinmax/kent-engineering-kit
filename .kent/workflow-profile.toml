@@ -19,6 +19,13 @@ writer_sessions = "continuous"
 coder_selection = "disabled"
 pr_merge_strategy = "rebase"
 branch_identity = "task"
+delivery_reliability = "v1"
+
+[project_memory]
+root = "/Users/rovkinmax/dev/R2"
+project_key = "kent-engineering-kit"
+project_uid = "bd9ed394-c5df-4eff-9363-6e0616a54f9a"
+mode = "r2"
 
 [capabilities]
 managed_worktrees = true
@@ -44,6 +51,8 @@ plan_contract_fix_continue = ".kent/scripts/workflow-plan-contract-fix-continue"
 wait_pr = ".kent/scripts/workflow-wait-github-pr"
 github_observation = ".kent/scripts/workflow_github_observation.py"
 janitor = ".kent/scripts/workflow-task-janitor"
+project_memory = ".kent/scripts/workflow-project-memory"
+project_memory_core = ".kent/scripts/workflow_project_memory.py"
 
 [context_manifests]
 plan = ".kent/context/plan.md"

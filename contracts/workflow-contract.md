@@ -39,13 +39,12 @@ exempt.
   versioned contract. Runtime baseline: Kent 2.6.1 (August 13, 2026).
 - Graph apply is complete, previewed, confirmed, and atomic. Eligibility follows
   [policy](#execution-history-and-compatibility-policy).
-- The terminal-only canonical reconciliation driver supports an approved
-  release advancing the same linked/default
-  UUID once only with terminal tasks/anchors, settled approvals, quiescence,
-  exact source/target and link/default invariants, a live gate, and forward
-  restore. Preserve terminal IDs/statuses/anchors; forbid replacement,
-  link/default/create/promotion effects and concurrent allocation. Disclose
-  the absent canary at live approval.
+- V1 canonical reconciliation advances the same linked/default UUID once:
+  terminal tasks/anchors, settled approvals, quiescence, exact source/target,
+  unchanged links/defaults, live gate and forward restore. Preserve terminal
+  IDs/statuses/anchors. No replacement, create, promotion or concurrent
+  allocation; disclose the absent canary at live approval.
+- V2 compatibility plans follow the update policy.
 - Canonical reconciliation plans retain native `project-<lowercase UUID>`
   identities in both workflow ownership and project links. Workflow identities
   remain bare UUIDs. Legacy plans with bare project UUIDs must be rebuilt from

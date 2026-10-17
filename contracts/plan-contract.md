@@ -9,6 +9,18 @@ dispositions and the authoritative artifact. Grill cannot edit, ask the user,
 spawn children or supply a formal PASS receipt. Project-owned independent
 review and approval gates remain unchanged.
 
+Use [Durable context and recovery](../skills/kent-engineering-kit/references/durable-context.md)
+for the source-discovery procedure and the distinction between a reference,
+an accepted plan, and actual human authority. The `inspect` operation also
+searches `ledger.summary` for decision references;
+do not omit a decision pointer merely because it was stored there.
+
+For R2 acceptance, if the current review text and normalized plan contain no
+tagged source references, the adapter may preserve locators found in the
+validated logical Task ledger, including `summary`. This fallback recovers
+pointers only; it does not parse an untrusted suffix or verify authorship,
+scope, or consent. The existing review gate still owns source verification.
+
 Revalidation repeats grill critique only for substantive requirements, API/UX,
 architecture, authority, safety/effects, cost or evidence-strategy changes,
 or execution evidence disproving the approach. Hash drift, checkbox progress,
@@ -41,9 +53,11 @@ work. Reference recovery does not waive project-owned approval gates.
 
 Generated Fix and enabled Compliance expose `replan` to retained Plan
 Revalidation (`continue_session`, `node:plan`) before production edits. The
-producer reads the accepted task-bound snapshot in the native root, verifying
-schema, task short ID, normalized-plan UTF-8 digest, contained regular plan path
-(or authorized report-only sentinel), and profile work kind. Missing/conflicting
+producer reads the accepted task-bound snapshot from the legacy local cache or
+the admitted R2 external store, verifying schema, task identity,
+normalized-plan UTF-8 digest, plan locator (or authorized report-only
+sentinel), and profile work kind. In R2 mode the external accepted snapshot is
+authoritative; the local cache is only a validated locator. Missing/conflicting
 identity is an evidence blocker, never permission to invent a snapshot.
 `plan_change_report` distinguishes deterministic drift from agent-reported
 substantive findings. Ordinary within-contract fixes do not require replanning.
@@ -73,10 +87,24 @@ acceptance coverage, evidence ownership, dependency boundaries, and executable
 step ordering. Unsupported decisions return to the retained Plan session
 before code changes.
 
-After review, the graph-owned deterministic Plan Contract Accept node stores an
-ignored normalized snapshot and digest. Writer nodes cannot select this
-operation. Checkbox state is implementation progress and is excluded from
-normalization; all other plan content remains contract data.
+The graph-owned deterministic Plan Contract Accept node owns acceptance.
+Writer nodes cannot select this operation. This deterministic acceptance step
+does not add a universal human-approval gate: existing graph and project
+approval requirements remain in force, and a new decision still needs its
+original source. In R2 mode, the adapter verifies that the current native
+Script is the configured acceptance node before writing the external
+accepted-plan head. The generic storage core does not authenticate human
+authority.
+
+For legacy Tasks, acceptance stores the existing ignored normalized snapshot
+under `.kent/runtime/<task>/plan-contract.json`. For admitted R2 Tasks, the
+accepted snapshot and its head live in the bound external project store; see
+the durable-context reference for the closed snapshot and local locator
+schemas. Do not require or manufacture a legacy snapshot for an R2 Task.
+Checkbox progress is excluded from normalization; other plan content remains
+contract data. R2 also allows a new immutable working revision when only
+checkbox progress or formatting changes, without changing the accepted
+snapshot.
 
 For an explicitly enabled complexity-selected writer candidate, the plan
 contains exactly one fenced `coder-selection-v1` JSON object with only
@@ -109,10 +137,11 @@ contract stays in the active node. Feedback that changes requirements,
 architecture, acceptance criteria, safety boundaries, or planned evidence
 requires revalidation.
 
-The repository digest detects artifact drift. It does not provide task-comment
-ordering, a monotonic authority revision, or atomic transition compare-and-swap.
-Those require Kent runtime support and must not be inferred from private
-database rows or fragile CLI text.
+The accepted-plan digest detects plan drift. It does not provide
+task-comment ordering, a monotonic authority revision, or atomic transition
+compare-and-swap. References in a plan or snapshot do not authenticate their
+source. Those guarantees must not be inferred from private database rows or
+fragile CLI text.
 
 The workflow `delivery_context` is transport state, not plan content. Exclude it
 from the accepted-plan snapshot and digest so observed PR or CI state cannot
@@ -120,15 +149,26 @@ trigger plan revalidation.
 
 ## Accepted-plan cache terminal ownership
 
-Plan acceptance continues to produce the same private six-field
-`.kent/runtime/<task>/plan-contract.json`; this cache is not an admitted
-terminal artifact. Before sealing, its project-owned preparation owner must
-retain the exact bytes and required authority references outside the restricted
-task runtime, read them back, and retire only that exact cache through the
+Legacy Tasks keep the existing local snapshot format and cleanup contract.
+For R2 Tasks, the immutable external accepted snapshot is authoritative; the
+local `.kent/runtime/<task>/plan-contract.json` file is only a cache of its
+verified locator. It contains exactly the R2 cache fields documented in the
+durable-context reference, not plan text or a second copy of authority.
+Acceptance may publish or refresh that locator while acceptance remains open.
+Checks read and validate the external accepted snapshot directly when the
+cache is absent; they do not recreate the cache. A mismatch between a present
+cache and the external accepted head is an error.
+
+During terminal preparation, before preparation completes and before Janitor
+retirement, the existing Cleanup owner retains the exact cache bytes when
+present and the external snapshot locator and digest under the project's
+retention protocol, then retires only that cache through the
 existing project seam. A configured non-empty `prepare_cleanup` uses its
 existing helper contract. Without that opt-in, Cleanup owns the same
 byte-verified retention and retirement responsibility; it must not ask Janitor
-to accept or delete the cache.
+to accept or delete the cache. Once terminal preparation or a seal closes
+acceptance, neither report-only preparation nor plan acceptance may recreate
+the local cache.
 
 For recovery of an already successful seal, use only the original retained
 request, report, marker and native final-event provenance with existing

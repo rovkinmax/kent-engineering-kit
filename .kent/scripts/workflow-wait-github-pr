@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib.machinery
+from functools import partial
 import json
 import os
 from pathlib import Path
 import sys
-import time
 import tomllib
+import time
 from typing import Any
 
 sys.dont_write_bytecode = True
@@ -22,6 +24,7 @@ def _sibling(name: str) -> Any:
     spec = importlib.util.spec_from_file_location(
         "kent_{}".format(name.replace(".", "_")),
         path,
+        loader=importlib.machinery.SourceFileLoader("kent_{}".format(name.replace(".", "_")), str(path)),
     )
     if spec is None or spec.loader is None:
         raise RuntimeError("{} support module is unavailable".format(name))
@@ -179,15 +182,23 @@ def _emit(
     values: dict[str, object],
     *,
     cursor: str | None = None,
+    producer_payload: dict[str, object] | None = None,
 ) -> None:
     result = dict(values)
     if cursor is not None:
         result["pr_feedback_cursor"] = cursor
-    print(json.dumps(
+    encoded = (json.dumps(
         {"transition": transition, **result},
         ensure_ascii=False,
         sort_keys=True,
-    ))
+    ) + "\n").encode("utf-8")
+    root = Path.cwd().resolve()
+    profile_path = root / ".kent/workflow-profile.toml"
+    profile = tomllib.loads(profile_path.read_text()) if profile_path.is_file() else {}
+    if profile.get("policies", {}).get("delivery_reliability") is not None:
+        encoded = _sibling("workflow-checkpoint").emit_producer_result(
+            root, producer_payload, encoded, "wait-pr")
+    sys.stdout.buffer.write(encoded)
 
 
 def main() -> int:
@@ -197,6 +208,7 @@ def main() -> int:
         raise ValueError("stdin is not valid JSON: {}".format(error))
     if not isinstance(payload, dict):
         raise ValueError("stdin must be one JSON object")
+    emit = partial(_emit, producer_payload=payload)
 
     workspace = Path(_text(payload, "workspace_path")).expanduser().resolve()
     pr_url = _text(payload, "pr_url")
@@ -262,7 +274,7 @@ def main() -> int:
             head_oid = str(pr["headRefOid"])
             base_oid = str(pr["baseRefOid"])
             if state == "MERGED":
-                _emit(
+                emit(
                     "merge_watch_pr_merged",
                     {**values, "merge_report": _merge_report(pr)},
                     cursor=acknowledged_text,
@@ -352,14 +364,14 @@ def main() -> int:
                 }
                 if observed_text is not None:
                     report["observed_feedback_cursor"] = observed_text
-                _emit(
+                emit(
                     "merge_watch_state_changed",
                     report,
                     cursor=acknowledged_text,
                 )
                 return 0
             if max_polls and polls >= max_polls:
-                _emit(
+                emit(
                     "merge_watch_still_waiting",
                     {
                         **values,
@@ -375,7 +387,7 @@ def main() -> int:
             if errors < max_errors:
                 time.sleep(interval)
                 continue
-            _emit(
+            emit(
                 "merge_watch_state_changed",
                 {
                     **values,

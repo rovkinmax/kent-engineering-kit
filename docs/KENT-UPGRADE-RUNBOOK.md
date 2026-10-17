@@ -75,6 +75,61 @@ incompatible graphs.
 4. Check project-owned command implementations before synchronization. Generic
    kit sync must not replace a custom verifier or release wrapper.
 
+## Delivery reliability adoption
+
+This package updates Kit source, adapters and selected Workflow contracts; it
+does not require an engine upgrade or authorize a Kent restart. Use the
+approved package preview for repositories, publication targets and rollout
+effects. Do not apply the new-Workflow/default-promotion procedure above to
+an approved same-UUID update.
+
+Before activation:
+
+1. Qualify the published infrastructure closure and installed helper targets
+   with `scripts/inspect-delivery-source`. Source tests or a merged PR do not
+   prove installed bytes.
+2. Capture exact graph, task, retained-execution and pending-decision preimages.
+   Build the explicit compatibility plan under
+   [the update policy](../contracts/workflow-update-compatibility.md).
+3. Establish the approved stable boundary. A natural-stop requirement includes
+   shared activation affecting new Sessions; do not force-stop Tasks or settle
+   their approvals to obtain quiet. Coordinate starts, resumes and approvals
+   during the actual change window.
+4. Install the qualified helpers and fixed legacy/R2 routing, then apply the
+   complete approved graph through the compatibility driver. Preserve original
+   Task identities and decisions. Do not move old Tasks into R2 implicitly.
+5. Read back installed bytes, graph, Tasks and approvals. Use a fresh read-only
+   Session to verify loaded profile, skill and role sources. Existing Sessions
+   keep their locked instructions until the supported refresh boundary.
+
+Stop remaining effects on drift. Preserve the operation journal and reconcile
+unknown outcomes before retry. Rollback is a compatible forward restore using
+fresh task state, not a reset to an old graph regardless of intervening work.
+Keep preimages and verification evidence; do not claim adoption while rollout
+is deferred.
+
+For v2 graph changes, construct the complete source receipt first, then the
+private installation binding, final native graph, independent compatibility
+review and exact plan. `source_admission` binds the receipt and installation
+record; the review carries the canonical digest of `source_admission`.
+Source inventory allows 512
+files, with 8 MiB per file and 32 MiB in total; Task and retention caps are
+separate and unchanged. Never trim infrastructure from a receipt to fit a cap.
+
+Final project builders consume `VerifiedSourceAdmission` from the trusted Kit
+operation caller. They do not import an inspector from a caller-selected Kit
+directory or accept a raw JSON mapping as proof. The Appsome source CLI can
+render unactivated snapshots; published native rendering uses its callable
+builder after trusted Kit admission. The Kit current snapshot is also
+unactivated. Neither snapshot contains the eventual receipt or authorizes work.
+
+Before journal preparation and every new graph effect, the driver rechecks
+admission. Recovery first settles an attempted effect read-only; a new effect
+still needs fresh admission. A reverse plan must retain the gate and qualify
+its runtime sources. Exact restoration of an old gate-free graph is not
+supported. Pure metadata-only name/description updates may use explicit null
+admission, but execution-target changes require a graph update with the gate.
+
 ## Task and Session controls
 
 - `kent task start`, `kent task move`, and `kent task resume` accept

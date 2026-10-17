@@ -12,6 +12,10 @@ import tempfile
 import unittest
 
 from workflowkit.delivery import build_delivery_workflow
+from workflowkit.delivery import (
+    capture_producer, capture_script_producer, observe_script_identity,
+    pack_delivery, producer_reference_closure, reconstruct_producer, transition_contract_reference,
+)
 from workflowkit.profile import ProjectProfile
 
 
@@ -256,6 +260,415 @@ def direct_parameter_references(prompt: str) -> set[str]:
             prompt,
         )
     )
+
+
+class DeliveryPackingCommandTests(unittest.TestCase):
+    def test_native_interface_exact_bytes_historical_failure_and_no_completion(self):
+        root = create_repository(self)
+        scripts = materialize_templates(root, "workflow-checkpoint", "workflow-evidence-ledger")
+        home = root / "home"
+        bin_path = home / ".kent" / "bin"
+        bin_path.mkdir(parents=True)
+        (bin_path / "kent-prepare-github-ci").symlink_to(REPO_ROOT / "scripts" / "prepare-github-ci")
+        session = "11111111-1111-4111-8111-111111111111"
+        identity = {
+            "task_id": "native-task", "task_short_id": "KIT-1", "project_id": "native-project",
+            "workspace_path": str(root), "session_id": session,
+            "run_id": "22222222-2222-4222-8222-222222222222",
+            "step_id": "33333333-3333-4333-8333-333333333333",
+        }
+        workflow_id = "44444444-4444-4444-8444-444444444444"
+        detail = {
+            "summary": {
+                "id": "native-task", "short_id": "KIT-1", "project_id": "native-project",
+                "workflow_id": workflow_id,
+            },
+            "source_workspace": {
+                "is_primary": True, "workspace_id": "workspace", "root_path": str(root),
+            },
+            "current_nodes": [{"node_id": "source", "session_id": session}],
+        }
+        graph = {
+            "workflow_id": workflow_id, "expected_version": 1,
+            "graph": {
+                "nodes": [{"id": "source", "key": "gate", "kind": "agent"}],
+                "transition_groups": [{
+                    "id": "group", "source_node_id": "source", "transition_id": "failed",
+                }],
+                "edges": [{
+                    "id": "edge", "transition_group_id": "group", "target_node_id": "fix",
+                    "parameters": [{"key": "delivery_context"}, {"key": "ci_report"}],
+                }],
+            },
+        }
+        native = root / "native.json"
+        native.write_text(json.dumps({"detail": detail, "graph": graph}))
+        command_log = root / "native-calls.jsonl"
+        fake_kent = bin_path / "kent"
+        fake_kent.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "with open(os.environ['TEST_NATIVE_CALLS'], 'a') as log:\n"
+            "    log.write(json.dumps(args) + '\\n')\n"
+            "data = json.loads(Path(os.environ['TEST_NATIVE_DATA']).read_text())\n"
+            "if args[0] == 'project': print('native-project')\n"
+            "elif args[:2] == ['task', 'show']: print(json.dumps(data['detail']))\n"
+            "elif args[:3] == ['workflow', 'graph', 'inspect']: print(json.dumps(data['graph']))\n"
+            "else: sys.exit(18)\n"
+        )
+        fake_kent.chmod(0o700)
+        outer = ' { "schema":"workflow-delivery-context-v1", "phase":"pre_pr" }\n'
+        report = ' { "status": "failed", "head": "historical-before-repair" }\n'
+        locator, _ = capture_producer(
+            root, identity=identity, producer_kind="ci-watch", inputs={},
+            result={"transition": "failed", "delivery_context": outer, "ci_report": report},
+        )
+        request = {
+            "schema": "workflow-pack-delivery-v1", "transition": "failed",
+            "values": {}, "producer_refs": [locator], "delivery_mode": "preserve",
+            "transition_contract_ref": transition_contract_reference(identity, detail, graph, "failed"),
+        }
+        environment = {
+            **os.environ, "HOME": str(home), "PATH": str(bin_path) + os.pathsep + os.environ["PATH"],
+            "TEST_NATIVE_CALLS": str(command_log), "TEST_NATIVE_DATA": str(native),
+            **{"KENT_" + key.upper(): identity[key] for key in ("session_id", "run_id", "step_id")},
+        }
+        command = [
+            sys.executable, str(scripts / "workflow-checkpoint"), "pack-delivery",
+            "--task", "KIT-1", "--workspace", str(root),
+        ]
+        for attempt in range(2):
+            if attempt:
+                # A new native Run and graph version do not corrupt an original
+                # failed report or silently make it fresh/passing.
+                environment["KENT_RUN_ID"] = "55555555-5555-4555-8555-555555555555"
+                graph["expected_version"] = 2
+                native.write_text(json.dumps({"detail": detail, "graph": graph}))
+            result = subprocess.run(
+                command, cwd=root, env=environment, input=json.dumps(request),
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["delivery_context"], outer)
+            self.assertEqual(output["ci_report"], report)
+            self.assertEqual(output["transition"], "failed")
+            self.assertNotIn("values", output)
+        calls = [json.loads(line) for line in command_log.read_text().splitlines()]
+        self.assertTrue(calls)
+        self.assertFalse(any("complete" in args for args in calls))
+        denied = subprocess.run(
+            command, cwd=root, env=environment,
+            input=json.dumps({**request, "values": {"force": "true"}}),
+            capture_output=True, text=True, check=False,
+        )
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertEqual(denied.stdout, "")
+
+
+class ScriptProducerIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.root = create_repository(self)
+        self.context = {"task_id": "native-task", "node_id": "script-node"}
+        self.detail = {
+            "summary": {
+                "id": "native-task", "short_id": "KIT-1",
+                "project_id": "native-project",
+                "workflow_id": "44444444-4444-4444-8444-444444444444",
+            },
+            "source_workspace": {
+                "is_primary": True, "workspace_id": "primary", "root_path": str(self.root),
+            },
+            "project": {"default_workspace_id": "primary"},
+            "current_scripts": [{
+                "current_node": {"node_id": "script-node"},
+                "path": ".kent/scripts/workflow-plan-contract",
+            }],
+        }
+        self.graph = {
+            "workflow_id": self.detail["summary"]["workflow_id"], "expected_version": 3,
+            "graph": {"nodes": [{
+                "id": "script-node", "kind": "script",
+                "script_path": ".kent/scripts/workflow-plan-contract",
+            }]},
+        }
+        self.calls = []
+
+    def read(self, root, args, *, structured=True):
+        self.assertEqual(root, self.root)
+        self.calls.append(args)
+        if args[0] == "project":
+            self.assertFalse(structured)
+            return "native-project"
+        if args[:2] == ["task", "show"]:
+            return self.detail
+        if args[:3] == ["workflow", "graph", "inspect"]:
+            return self.graph
+        self.fail(f"unexpected native effect: {args}")
+
+    def observe(self):
+        return observe_script_identity(
+            self.root, "KIT-1", self.context, native_read=self.read,
+        )
+
+    def test_script_without_agent_environment_captures_and_agent_reads_historically(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=True):
+            identity = self.observe()
+            locator, emitted = capture_script_producer(
+                self.root, task="KIT-1", native_context=self.context,
+                producer_kind="plan-contract", inputs={"plan_path": "original"},
+                result={"transition": "failed", "review_context": " exact\nbytes "},
+                native_read=self.read,
+            )
+        self.assertEqual(identity, {
+            "task_id": "native-task", "task_short_id": "KIT-1", "project_id": "native-project",
+            "workspace_path": str(self.root), "invocation_kind": "script",
+            "node_id": "script-node", "transition_branch_key": None,
+        })
+        agent = {key: identity[key] for key in
+                 ("task_id", "task_short_id", "project_id", "workspace_path")}
+        agent.update(session_id="later-session", run_id="later-run", step_id="later-step")
+        self.assertEqual(reconstruct_producer(
+            self.root, locator, identity=agent,
+        )["emitted"], emitted)
+        self.assertEqual(reconstruct_producer(
+            self.root, locator, identity=identity,
+        )["result"]["review_context"], " exact\nbytes ")
+        self.assertFalse(any("list" in args or "sessions" in args for args in self.calls))
+
+    def test_script_branch_proof_and_unrelated_agent_environment(self):
+        from unittest.mock import patch
+        self.context["transition_branch_key"] = "branch"
+        self.detail["current_scripts"][0]["current_node"]["transition_branch_key"] = "branch"
+        self.detail["current_scripts"][0]["path"] = str(
+            self.root / ".kent/scripts/workflow-plan-contract",
+        )
+        with patch.dict(os.environ, {"KENT_SESSION_ID": "unrelated-parent-session"}):
+            identity = self.observe()
+        self.assertEqual(identity["transition_branch_key"], "branch")
+        self.assertNotIn("session_id", identity)
+        with self.assertRaises(ValueError):
+            pack_delivery(self.root, {}, identity=identity, task_detail=self.detail, graph=self.graph)
+        with self.assertRaises(ValueError):
+            capture_producer(
+                self.root, identity={**identity, "session_id": "forged"},
+                producer_kind="test", inputs={}, result={"transition": "failed"},
+            )
+
+    def test_script_observer_uses_production_bounded_native_reader_without_agent_ids(self):
+        import importlib.machinery
+        import importlib.util
+        from unittest.mock import patch
+
+        fake_bin = self.root / "native-bin"
+        fake_bin.mkdir()
+        fake_kent = fake_bin / "kent"
+        fake_kent.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            f"detail = {self.detail!r}\n"
+            f"graph = {self.graph!r}\n"
+            "args = sys.argv[1:]\n"
+            "if args[0] == 'project': print('native-project')\n"
+            "elif args[:2] == ['task', 'show']: print(json.dumps(detail))\n"
+            "elif args[:3] == ['workflow', 'graph', 'inspect']: print(json.dumps(graph))\n"
+            "else: sys.exit(19)\n"
+        )
+        fake_kent.chmod(0o700)
+        loader = importlib.machinery.SourceFileLoader(
+            "checkpoint_script_test", str(REPO_ROOT / "templates/project/workflow-checkpoint"),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        with patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=True):
+            locator, emitted = capture_script_producer(
+                self.root, task="KIT-1", native_context=self.context,
+                producer_kind="script-fixture", inputs={}, result={"transition": "failed"},
+                native_read=module.delivery_native_read,
+            )
+        self.assertEqual(reconstruct_producer(
+            self.root, locator, identity=self.observe(),
+        )["emitted"], emitted)
+
+    def test_missing_short_id_is_derived_from_exact_native_script_task(self):
+        identity = observe_script_identity(
+            self.root, None, self.context, native_read=self.read,
+        )
+        self.assertEqual(identity["task_short_id"], "KIT-1")
+        self.assertIn(["task", "show", "native-task", "--project", "native-project", "--json"], self.calls)
+
+    def test_shared_emitter_legacy_bytes_and_opted_in_capture_without_short_parameter(self):
+        import importlib.machinery
+        import importlib.util
+        from unittest.mock import patch
+
+        loader = importlib.machinery.SourceFileLoader(
+            "checkpoint_emitter_test", str(REPO_ROOT / "templates/project/workflow-checkpoint"),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        raw = b' { "transition": "failed", "review_context": " exact\\nbytes " } \n'
+        payload = {
+            "_kent": self.context, "workspace_path": str(self.root),
+            "review_context": "incoming exact\nbytes", "structured_aux": {"not": "a string"},
+        }
+        with patch.object(module, "delivery_module", side_effect=AssertionError("legacy resolved Kit")):
+            self.assertEqual(module.emit_producer_result(self.root, payload, raw, "dispatch"), raw)
+        profile = self.root / ".kent/workflow-profile.toml"
+        profile.write_text(profile.read_text() + 'delivery_reliability = "v1"\n')
+        import workflowkit.delivery as delivery
+        with patch.object(module, "delivery_module", return_value=delivery), \
+                patch.object(module, "delivery_native_read", side_effect=self.read):
+            emitted = module.emit_producer_result(self.root, payload, raw, "dispatch")
+        output = json.loads(emitted)
+        locator = delivery.producer_locator(output["commentary"])
+        stored = reconstruct_producer(self.root, locator, identity=self.observe())
+        self.assertEqual(stored["result"]["review_context"], " exact\nbytes ")
+        self.assertEqual(stored["inputs"]["review_context"], payload["review_context"])
+        self.assertNotIn("_kent", stored["inputs"])
+        self.assertNotIn("structured_aux", stored["inputs"])
+        self.assertEqual(stored["identity"]["task_short_id"], "KIT-1")
+        self.assertNotIn("task_short_id", payload)
+
+    def test_invalid_workspace_input_is_evidence_not_owner_identity_or_packed_result(self):
+        identity = self.observe()
+        foreign = str(self.root / "foreign-root")
+        locator, _ = capture_producer(
+            self.root, identity=identity, producer_kind="dispatch",
+            inputs={"workspace_path": foreign},
+            result={"transition": "invalid_workspace", "reported_workspace_path": foreign},
+        )
+        stored = reconstruct_producer(self.root, locator, identity=identity)
+        self.assertEqual(stored["inputs"]["workspace_path"], foreign)
+        self.assertEqual(stored["identity"]["workspace_path"], str(self.root))
+        self.assertNotIn("workspace_path", stored["result"])
+        with self.assertRaises(ValueError):
+            capture_producer(
+                self.root, identity=identity, producer_kind="dispatch", inputs={},
+                result={"transition": "passed", "workspace_path": foreign},
+            )
+        agent = {key: identity[key] for key in
+                 ("task_id", "task_short_id", "project_id", "workspace_path")}
+        agent.update(session_id="current-agent", run_id="run", step_id="step")
+        detail = {**self.detail, "current_nodes": [{
+            "node_id": "agent-node", "session_id": "current-agent",
+        }]}
+        graph = {
+            "workflow_id": self.graph["workflow_id"], "expected_version": 3,
+            "graph": {
+                "nodes": [{"id": "agent-node", "kind": "agent"}],
+                "transition_groups": [{
+                    "id": "retry", "source_node_id": "agent-node", "transition_id": "retry",
+                }],
+                "edges": [{
+                    "id": "retry-edge", "transition_group_id": "retry",
+                    "parameters": [{"key": "workspace_path"}],
+                }],
+            },
+        }
+        request = {
+            "schema": "workflow-pack-delivery-v1", "transition": "retry", "values": {},
+            "producer_refs": [locator], "delivery_mode": "preserve",
+            "transition_contract_ref": transition_contract_reference(agent, detail, graph, "retry"),
+        }
+        with self.assertRaises(ValueError):
+            pack_delivery(self.root, request, identity=agent, task_detail=detail, graph=graph)
+
+    def test_foreign_task_node_branch_script_path_and_agent_impersonation_fail(self):
+        import copy
+        changes = [
+            lambda: self.context.update(task_id="foreign"),
+            lambda: self.context.update(node_id="foreign"),
+            lambda: self.context.update(transition_branch_key="other"),
+            lambda: self.detail["summary"].update(project_id="foreign"),
+            lambda: self.detail.update(worktree_path=str(self.root / "foreign")),
+            lambda: self.detail["current_scripts"][0]["current_node"].update(session_id="agent"),
+            lambda: self.detail["current_scripts"][0].update(path=".kent/scripts/other"),
+            lambda: self.graph["graph"]["nodes"][0].update(kind="agent"),
+            lambda: self.context.update(session_id="forged"),
+            lambda: self.detail["current_scripts"].append(
+                copy.deepcopy(self.detail["current_scripts"][0])),
+        ]
+        context, detail, graph = (
+            copy.deepcopy(self.context), copy.deepcopy(self.detail), copy.deepcopy(self.graph),
+        )
+        for change in changes:
+            self.context, self.detail, self.graph = (
+                copy.deepcopy(context), copy.deepcopy(detail), copy.deepcopy(graph),
+            )
+            change()
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.observe()
+        self.assertFalse((self.root / "build").exists())
+
+    def test_retired_source_reconstruction_from_bounded_archive_bytes(self):
+        identity = self.observe()
+        locator, _ = capture_producer(
+            self.root, identity=identity, producer_kind="script",
+            inputs={}, result={"transition": "failed", "report": " original\nbytes "},
+        )
+        expected = reconstruct_producer(self.root, locator, identity=identity)
+        paths = producer_reference_closure(self.root, locator, identity=identity)
+        archive = {path: (self.root / path).read_bytes() for path in paths}
+        for path in paths:
+            (self.root / path).unlink()
+        reads = []
+
+        def read(relative):
+            reads.append(relative)
+            return archive[relative]
+
+        self.assertEqual(reconstruct_producer(
+            self.root, locator, identity=identity, read_relative=read,
+        ), expected)
+        self.assertEqual(producer_reference_closure(
+            self.root, locator, identity=identity, read_relative=read,
+        ), paths)
+        self.assertTrue(set(reads) <= set(paths))
+        with self.assertRaises(ValueError):
+            reconstruct_producer(self.root, locator, identity=identity)
+        for path in paths:
+            original = archive[path]
+            archive[path] = b"{}"
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                reconstruct_producer(self.root, locator, identity=identity, read_relative=read)
+            archive[path] = original
+        with self.assertRaises(ValueError):
+            reconstruct_producer(self.root, "../" + locator, identity=identity, read_relative=read)
+        self.assertTrue(set(reads) <= set(paths))
+
+    def test_nested_producer_closure_reconstructs_after_original_files_retire(self):
+        identity = self.observe()
+        original, _ = capture_producer(
+            self.root, identity=identity, producer_kind="original-script",
+            inputs={}, result={"transition": "failed", "report": "exact historical failure"},
+        )
+        packed, _ = capture_producer(
+            self.root, identity=identity, producer_kind="pack-delivery",
+            inputs={}, result={"transition": "failed", "report": "exact historical failure"},
+            binding={"producer_refs": json.dumps({"refs": [original]})},
+        )
+        paths = producer_reference_closure(self.root, packed, identity=identity)
+        self.assertEqual(len(paths), 4)
+        archive = {path: (self.root / path).read_bytes() for path in paths}
+        for path in paths:
+            (self.root / path).unlink()
+        self.assertEqual(producer_reference_closure(
+            self.root, packed, identity=identity, read_relative=archive.__getitem__,
+        ), paths)
+        for path in paths:
+            original = archive[path]
+            archive[path] = b"{}"
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                producer_reference_closure(
+                    self.root, packed, identity=identity, read_relative=archive.__getitem__,
+                )
+            archive[path] = original
 
 
 class DeliveryContinuityTest(unittest.TestCase):

@@ -1,5 +1,17 @@
 # Plan and Independent Preview Review
 
+Resolve task-fixed storage through the profile's project-memory adapter before
+choosing paths. A new R2 task initializes its native binding at ingress and
+publishes documents through the protected helper. Carry the immutable plan
+revision path; do not edit that file or create a `.todo` replacement. Legacy
+tasks keep their existing plan and snapshot contract.
+
+Before asking about a prior decision, use the Plan Contract's read-only
+inspection and follow the returned evidence and original-source pointers.
+Include `ledger.summary` references in that search. An incomplete inspection
+is not proof that consent is missing. Verify the original message or Question
+answer, its scope and any supersession; summaries only help locate it.
+
 1. Resolve exact task authority and inspect the selected Kent-managed root.
    Preserve `fixed_point` as the immutable task baseline, not the current
    remote target. Select the profile work kind and mapped procedure.

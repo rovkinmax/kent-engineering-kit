@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from workflowkit.delivery import build_delivery_workflow
+from workflowkit.delivery import UNACTIVATED_SOURCE, build_delivery_workflow
 from workflowkit.kent import spec_as_json
 from workflowkit.model import SpecError, WorkflowSpec
 from workflowkit.profile import ProjectProfile
@@ -24,6 +24,11 @@ from workflowkit.profile import ProjectProfile
 
 SPEC_PATH = ".kent/workflows/kit-engineering-delivery-v5.spec.json"
 CANDIDATE_SPEC_PATH = ".kent/workflows/kit-engineering-delivery-v6.spec.json"
+CURRENT_SPEC_PATH = ".kent/workflows/kit-engineering-delivery.current.spec.json"
+MEMORY_COPIES = {
+    "project_memory": "templates/project/workflow-project-memory",
+    "project_memory_core": "workflowkit/project_memory.py",
+}
 PROJECT_COPIES = {
     "evidence": "templates/project/workflow-evidence-ledger",
     "verify": "templates/project/workflow-verify-report",
@@ -51,6 +56,10 @@ COMMAND_TARGETS = {
     "runtime_contracts": ".kent/scripts/workflow_runtime_contracts.py",
     "compile_verify": ".kent/scripts/workflow-compile-verify",
     "prepare_cleanup": ".kent/scripts/workflow-prepare-cleanup",
+}
+CURRENT_COMMAND_TARGETS = COMMAND_TARGETS | {
+    "project_memory": ".kent/scripts/workflow-project-memory",
+    "project_memory_core": ".kent/scripts/workflow_project_memory.py",
 }
 PLAN_REVIEW_GUIDANCE = """
 Read `.kent/commands/plan.md` for the project preview-review procedure.
@@ -97,6 +106,7 @@ def _add_plan_approval(
 
 def build_workflow(profile: ProjectProfile) -> WorkflowSpec:
     """Build the unchanged v5 default Kit graph."""
+    profile = _historical_profile(profile)
     return _add_plan_approval(
         build_delivery_workflow(profile, 5),
         expected_shape=(21, 52, 53),
@@ -107,6 +117,7 @@ def build_complexity_candidate_workflow(
     profile: ProjectProfile,
 ) -> WorkflowSpec:
     """Build the source-only v6 candidate without changing the default profile."""
+    profile = _historical_profile(profile)
     if profile.writer_session_policy() != "continuous":
         raise SpecError(
             "the Kit complexity candidate requires continuous writer Sessions"
@@ -122,6 +133,66 @@ def build_complexity_candidate_workflow(
         build_delivery_workflow(candidate_profile, 6),
         expected_shape=(21, 54, 55),
     )
+
+
+def _historical_profile(profile: ProjectProfile) -> ProjectProfile:
+    """Keep opt-in current behavior out of historical source snapshots."""
+    return replace(
+        profile,
+        policies={
+            key: value for key, value in profile.policies.items()
+            if key != "delivery_reliability"
+        },
+    )
+
+
+def build_current_workflow(profile: ProjectProfile) -> WorkflowSpec:
+    """Build the approved same-identity graph from the selected Kit baseline."""
+    if profile.delivery_reliability_policy() != "v1":
+        raise SpecError("the current Kit graph requires delivery_reliability = 'v1'")
+    if profile.writer_session_policy() != "continuous":
+        raise SpecError("the current Kit graph requires continuous writer Sessions")
+    if profile.commands != CURRENT_COMMAND_TARGETS:
+        raise SpecError("the current Kit graph requires the complete command set")
+    complexity = profile.coder_selection_policy() == "complexity"
+    return _add_plan_approval(
+        build_delivery_workflow(profile, 6 if complexity else 5),
+        expected_shape=(21, 55, 56) if complexity else (21, 53, 54),
+    )
+
+
+def generated_copies(profile: ProjectProfile) -> dict[str, str]:
+    if (
+        profile.delivery_reliability_policy() == "v1"
+        and profile.commands != CURRENT_COMMAND_TARGETS
+    ):
+        raise SpecError("delivery_reliability v1 requires the complete closed command set")
+    if profile.commands == COMMAND_TARGETS:
+        return SCHEMA3_COPIES | PROJECT_COPIES
+    if profile.commands == CURRENT_COMMAND_TARGETS:
+        return SCHEMA3_COPIES | PROJECT_COPIES | MEMORY_COPIES
+    raise SpecError("bootstrap requires the closed Kit schema-3 command set")
+
+
+def build_published_current_workflow(profile: ProjectProfile, admission) -> WorkflowSpec:
+    """Render from a trusted Kit caller's verified admission; perform no effects."""
+    from workflowkit.operations import VerifiedSourceAdmission
+
+    if not isinstance(admission, VerifiedSourceAdmission):
+        raise SpecError("published rendering requires VerifiedSourceAdmission")
+    if (Path(admission.project_root) != profile.project_root.resolve()
+            or admission.project_id != "project-135413f9-2454-4d04-969e-3831b1527f18"
+            or admission.workflow_id != "4e7cea43-54f5-4662-8d5d-c8db3d816c74"
+            or Path(admission.kit_root) != ROOT.resolve()):
+        raise SpecError("verified admission belongs to a different Kit deployment")
+    spec = build_current_workflow(profile)
+    ingress = [edge for edge in spec.edges if edge.source == "backlog" and edge.target == "plan"]
+    if len(ingress) != 1:
+        raise SpecError("published Kit graph requires one Backlog to Plan ingress")
+    return replace(spec, edges=tuple(
+        replace(edge, prompt=admission.gate + "\n\n" + (edge.prompt or ""))
+        if edge is ingress[0] else edge for edge in spec.edges
+    ))
 
 
 def load_synchronizer():
@@ -148,12 +219,13 @@ def bootstrap(root: Path = ROOT) -> None:
     """Preflight the complete copy set before any generated target mutation."""
     sync = load_synchronizer()
     profile = profile_at(root)
-    if profile.schema_version != 3 or profile.commands != COMMAND_TARGETS:
+    if profile.schema_version != 3:
         raise SpecError("bootstrap requires the closed Kit schema-3 command set")
+    copies = generated_copies(profile)
     if profile.adapters:
         raise SpecError("Kit bootstrap does not materialize platform adapters")
     plans = {}
-    for key, source_path in (SCHEMA3_COPIES | PROJECT_COPIES).items():
+    for key, source_path in copies.items():
         source = sync.project_target(ROOT, source_path)
         target = sync.project_target(root, profile.command(key))
         plans[key] = sync.plan_synchronization(
@@ -162,19 +234,19 @@ def bootstrap(root: Path = ROOT) -> None:
     for key in ("compile_verify", "prepare_cleanup"):
         target = sync.project_target(root, profile.command(key))
         sync.validate_project_owned_target(target, kind=key)
-    # Schema 3 deliberately skips the five v2-named commands. Materializing
-    # these unchanged sources here does not declare runtime-v2 adoption.
+    # The schema-3 synchronizer does not own these additional explicit copies.
+    # Materializing them here does not declare runtime-v2 adoption.
     sync.synchronize_schema3(profile, root, update=False)
-    for key in PROJECT_COPIES:
-        sync.apply_synchronization(plans[key])
+    for key in copies:
+        if key not in SCHEMA3_COPIES:
+            sync.apply_synchronization(plans[key])
     verify_command_closure(root)
 
 
 def verify_command_closure(root: Path = ROOT) -> None:
     sync = load_synchronizer()
     profile = profile_at(root)
-    if profile.commands != COMMAND_TARGETS:
-        raise SpecError("verification requires the closed Kit command paths")
+    copies = generated_copies(profile)
     for key, configured_path in profile.commands.items():
         target = sync.project_target(root, configured_path)
         sync.validate_project_owned_target(target, kind=key)
@@ -184,7 +256,7 @@ def verify_command_closure(root: Path = ROOT) -> None:
             raise SpecError(
                 f"command must be owner-executable without unsafe permission bits: {target}"
             )
-    for key, source_path in (SCHEMA3_COPIES | PROJECT_COPIES).items():
+    for key, source_path in copies.items():
         source = sync.project_target(ROOT, source_path)
         expected = sync.read_template(source, key)
         target = sync.project_target(root, profile.command(key))
@@ -208,6 +280,19 @@ def rendered_candidate_spec(root: Path = ROOT) -> str:
     ) + "\n"
 
 
+def rendered_current_spec(root: Path = ROOT) -> str:
+    spec = build_current_workflow(profile_at(root))
+    spec = replace(spec, edges=tuple(
+        replace(edge, prompt=UNACTIVATED_SOURCE + "\n\n" + (edge.prompt or ""))
+        if edge.source == "backlog" and edge.target == "plan" else edge
+        for edge in spec.edges
+    ))
+    return json.dumps(
+        spec_as_json(spec),
+        indent=2, ensure_ascii=False,
+    ) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bootstrap", action="store_true",
@@ -225,13 +310,35 @@ def main() -> int:
         action="store_true",
         help="Read-only parity check for the qualified v6 candidate.",
     )
+    output.add_argument(
+        "--write-current-spec", action="store_true",
+        help="Write the opt-in current graph without creating a live Workflow.",
+    )
+    output.add_argument(
+        "--check-current", action="store_true",
+        help="Read-only current graph and generated command parity check.",
+    )
     args = parser.parse_args()
-    if args.check_candidate and args.bootstrap:
-        raise SpecError("--check-candidate cannot be combined with --bootstrap")
+    if (args.check_candidate or args.check_current) and args.bootstrap:
+        flag = "--check-current" if args.check_current else "--check-candidate"
+        raise SpecError(f"{flag} cannot be combined with --bootstrap")
     if args.bootstrap:
         bootstrap()
     sync = load_synchronizer()
-    if args.check_candidate:
+    if args.check_current:
+        verify_command_closure()
+        target = sync.project_target(ROOT, CURRENT_SPEC_PATH)
+        if target.is_symlink() or not target.is_file():
+            raise SpecError(f"current spec target is not a regular file: {target}")
+        if target.read_bytes() != rendered_current_spec().encode("utf-8"):
+            raise SpecError("current Kit workflow spec is stale")
+    elif args.write_current_spec:
+        rendered = rendered_current_spec()
+        target = sync.project_target(ROOT, CURRENT_SPEC_PATH)
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise SpecError(f"current spec target is not a regular file: {target}")
+        target.write_text(rendered)
+    elif args.check_candidate:
         candidate_renderer = globals().get("rendered_candidate_spec")
         if not callable(candidate_renderer):
             raise SpecError(

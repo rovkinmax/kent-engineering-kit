@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import os
 import re
 from typing import Any
@@ -16,8 +16,20 @@ WRITER_SESSION_POLICIES = {"continuous", "fresh_per_slice"}
 CODER_SELECTION_POLICIES = {"disabled", "complexity"}
 PR_MERGE_STRATEGIES = {"auto", "merge", "squash", "rebase"}
 BRANCH_IDENTITY_POLICIES = {"task", "jira", "github_issue"}
+DELIVERY_RELIABILITY_POLICIES = {"v1"}
 CONTEXT_MANIFEST_KEYS = {"plan", "implement", "review", "smoke", "delivery"}
 PACKAGE_PUBLISH_TOPOLOGY = "manual-package-publish-after-main"
+PROJECT_MEMORY_COMMANDS = {
+    "project_memory": ".kent/scripts/workflow-project-memory",
+    "project_memory_core": ".kent/scripts/workflow_project_memory.py",
+}
+PROJECT_MEMORY_COMMAND_VERSIONS = {
+    "project_memory": "1.0.0",
+    "project_memory_core": "1.0.0",
+}
+PROJECT_MEMORY_KEY_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+)
 SCHEMA4_ONLY_ROOT_KEYS = {
     "kit_managed_commands",
     "command_versions",
@@ -82,6 +94,14 @@ class ReleaseProfile:
 
 
 @dataclass(frozen=True)
+class ProjectMemoryProfile:
+    root: str
+    project_key: str
+    project_uid: str
+    mode: str
+
+
+@dataclass(frozen=True)
 class ProjectProfile:
     project_root: Path
     schema_version: int
@@ -98,6 +118,7 @@ class ProjectProfile:
     kit_managed_commands: tuple[str, ...]
     command_versions: dict[str, str]
     release: ReleaseProfile | None
+    project_memory: ProjectMemoryProfile | None
     execution_default: str
     execution_overrides: dict[str, str]
     policies: dict[str, str]
@@ -170,6 +191,11 @@ class ProjectProfile:
             )
             release = release_profile(require_table(raw, "release"))
         execution = require_table(raw, "execution")
+        project_memory = (
+            project_memory_profile(raw["project_memory"])
+            if "project_memory" in raw
+            else None
+        )
         capabilities = bool_table(
             require_table(raw, "capabilities"),
             "capabilities",
@@ -194,6 +220,7 @@ class ProjectProfile:
             kit_managed_commands=kit_managed_commands,
             command_versions=command_versions,
             release=release,
+            project_memory=project_memory,
             execution_default=require_string(execution, "default_target"),
             execution_overrides=string_table(
                 execution.get("overrides", {}),
@@ -230,6 +257,55 @@ class ProjectProfile:
             raise SpecError(
                 f"unsupported delivery_profile {self.delivery_profile!r}"
             )
+        delivery_reliability = self.policies.get("delivery_reliability")
+        if delivery_reliability is not None:
+            if delivery_reliability not in DELIVERY_RELIABILITY_POLICIES:
+                raise SpecError(
+                    "unsupported policies.delivery_reliability "
+                    f"{delivery_reliability!r}; expected one of "
+                    f"{sorted(DELIVERY_RELIABILITY_POLICIES)}"
+                )
+        configured_memory_commands = {
+            key: self.command(key) for key in PROJECT_MEMORY_COMMANDS
+        }
+        has_memory_command = any(configured_memory_commands.values())
+        if self.project_memory is not None:
+            memory_store = (
+                Path(self.project_memory.root)
+                / self.project_memory.project_key
+            )
+            if memory_store == self.project_root or memory_store.is_relative_to(
+                self.project_root
+            ):
+                raise SpecError(
+                    "project_memory storage must be outside the project checkout"
+                )
+        if self.project_memory is not None or has_memory_command:
+            for key, expected_path in PROJECT_MEMORY_COMMANDS.items():
+                if configured_memory_commands[key] != expected_path:
+                    raise SpecError(
+                        "project_memory source commands must use the exact "
+                        f"sibling closure; {key} must be {expected_path!r}"
+                    )
+            if self.schema_version == 4:
+                missing = set(PROJECT_MEMORY_COMMANDS) - set(
+                    self.kit_managed_commands
+                )
+                if missing:
+                    raise SpecError(
+                        "schema 4 project_memory requires both sibling "
+                        f"commands to be toolkit-managed: {sorted(missing)}"
+                    )
+                for key, expected_version in (
+                    PROJECT_MEMORY_COMMAND_VERSIONS.items()
+                ):
+                    actual_version = self.command_versions.get(key)
+                    if actual_version != expected_version:
+                        raise SpecError(
+                            f"command_versions.{key} must be "
+                            f"{expected_version!r} for the project_memory "
+                            "source closure"
+                        )
         if not self.platforms:
             raise SpecError("profile must declare at least one platform")
         validate_execution_target(self.execution_default)
@@ -710,6 +786,9 @@ class ProjectProfile:
     def branch_identity_policy(self) -> str:
         return self.policies.get("branch_identity", "task").strip()
 
+    def delivery_reliability_policy(self) -> str:
+        return self.policies.get("delivery_reliability", "").strip()
+
     def package_publish_after_main(self) -> bool:
         return (
             self.schema_version == 3
@@ -864,6 +943,88 @@ def release_profile(raw: Any) -> ReleaseProfile:
         builder_path=optional_string(raw, "builder_path"),
         snapshot_path=require_string(raw, "snapshot_path"),
     )
+
+
+def project_memory_profile(raw: Any) -> ProjectMemoryProfile:
+    if not isinstance(raw, dict):
+        raise SpecError("project_memory must be a TOML table")
+    expected_fields = {"root", "project_key", "project_uid", "mode"}
+    missing_fields = expected_fields - set(raw)
+    unknown_fields = set(raw) - expected_fields
+    if missing_fields or unknown_fields:
+        raise SpecError(
+            "project_memory must declare exactly "
+            f"{sorted(expected_fields)}; missing={sorted(missing_fields)}, "
+            f"unknown={sorted(unknown_fields)}"
+        )
+    root = strict_identifier(raw, "root")
+    validate_absolute_memory_root(root)
+    project_key = strict_memory_key(raw, "project_key")
+    project_uid = strict_memory_key(raw, "project_uid")
+    mode = strict_identifier(raw, "mode")
+    if mode != "r2":
+        raise SpecError("project_memory.mode must be 'r2'")
+    return ProjectMemoryProfile(
+        root=root,
+        project_key=project_key,
+        project_uid=project_uid,
+        mode=mode,
+    )
+
+
+def strict_identifier(raw: dict[str, Any], key: str) -> str:
+    value = raw.get(key)
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\x00" in value
+    ):
+        raise SpecError(f"project_memory.{key} must be a non-empty exact string")
+    return value
+
+
+def strict_memory_key(raw: dict[str, Any], key: str) -> str:
+    value = strict_identifier(raw, key)
+    if (
+        not PROJECT_MEMORY_KEY_PATTERN.fullmatch(value)
+        or value in {".", ".."}
+    ):
+        raise SpecError(
+            f"project_memory.{key} must be a traversal-free memory key"
+        )
+    return value
+
+
+def validate_absolute_memory_root(value: str) -> None:
+    if any(ord(character) < 32 for character in value):
+        raise SpecError(
+            "project_memory.root must be a normalized absolute path"
+        )
+    posix = PurePosixPath(value)
+    if posix.is_absolute():
+        if (
+            posix.as_posix() != value
+            or "\\" in value
+            or any(part in {".", ".."} for part in posix.parts)
+            or posix == PurePosixPath("/")
+        ):
+            raise SpecError(
+                "project_memory.root must be a normalized absolute path"
+            )
+        return
+    windows = PureWindowsPath(value)
+    if windows.is_absolute():
+        if (
+            str(windows) != value
+            or any(part in {".", ".."} for part in windows.parts)
+            or windows == PureWindowsPath(windows.anchor)
+        ):
+            raise SpecError(
+                "project_memory.root must be a normalized absolute path"
+            )
+        return
+    raise SpecError("project_memory.root must be an absolute path")
 
 
 def optional_string(raw: dict[str, Any], key: str) -> str:

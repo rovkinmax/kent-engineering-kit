@@ -17,7 +17,7 @@ source "$adapter_dir/mcp-common.sh"
 
 usage() {
   cat <<'EOF'
-Usage: kent-mcp-call <server.tool> [arguments] [safe-output-mode] [--save-raw] [--raw-dir <dir>] [--no-save-raw] [--allow-mutate]
+Usage: kent-mcp-call <server.tool> [arguments] [safe-output-mode] [--save-raw] [--raw-dir <dir>] [--no-save-raw] [--allow-mutate] [--invocation-id <uuid>] [--standalone-binding <json>] [--task-locator <native-task-id>]
        kent-mcp-call --self-test
 
 Safe output modes:
@@ -52,6 +52,9 @@ allow_mutate=false
 save_raw=false
 raw_save_requested=false
 raw_dir=""
+invocation_id=""
+standalone_binding=""
+task_locator=""
 output_mode="text"
 safe_output_mode="raw"
 assert_contains=()
@@ -73,6 +76,30 @@ set_safe_output_mode() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --invocation-id)
+      [[ -z "$invocation_id" && -n "${2-}" ]] || {
+        printf 'invalid_invocation_id: provide one --invocation-id <uuid>\n' >&2
+        exit 2
+      }
+      invocation_id="$2"
+      shift 2
+      ;;
+    --task-locator)
+      [[ -z "$task_locator" && -n "${2-}" ]] || {
+        printf 'invalid_task_locator: provide one --task-locator <native-task-id>\n' >&2
+        exit 2
+      }
+      task_locator="$2"
+      shift 2
+      ;;
+    --standalone-binding)
+      [[ -z "$standalone_binding" && -n "${2-}" ]] || {
+        printf 'invalid_standalone_binding: provide one --standalone-binding <json>\n' >&2
+        exit 2
+      }
+      standalone_binding="$2"
+      shift 2
+      ;;
     --allow-mutate)
       allow_mutate=true
       shift
@@ -496,6 +523,23 @@ if target_requires_mutation_approval "$target" "$action" &&
 fi
 
 root="$(workspace_root)"
+mcp_resolve_binding "$root" "$standalone_binding" "$task_locator"
+r2_mode=false
+# shellcheck disable=SC2154
+if [[ "$mcp_mode" == "r2" ]]; then
+  r2_mode=true
+  if ! mcp_validate_invocation_id "$invocation_id"; then
+    printf 'mcp_invocation_id_required: R2 calls require --invocation-id <uuid>\n' >&2
+    exit 2
+  fi
+  if [[ -n "$raw_dir" ]]; then
+    printf 'mcp_raw_dir_forbidden: R2 artifacts are stored only in the bound task\n' >&2
+    exit 2
+  fi
+elif [[ -n "$invocation_id" || -n "$standalone_binding" ]]; then
+  printf 'mcp_r2_binding_required: invocation controls cannot fall back to legacy mode\n' >&2
+  exit 2
+fi
 require_mcporter
 if [[ "$server" == "mobile" ]]; then
   config="$(mcporter_home_config_path)"
@@ -509,7 +553,6 @@ else
   config="$(resolve_mcp_config)"
   config_display="${config:-mcporter-default}"
 fi
-
 tmp_out="$(mktemp)"
 tmp_err="$(mktemp)"
 tmp_safe_out="$(mktemp)"
@@ -536,6 +579,37 @@ elif project_server_cmd="$(resolve_project_server_command "$root" "$server")"; t
 else
   [[ -z "$config" ]] || cmd+=(--config "$config")
   cmd+=(--root "$root" call "$target" "${args[@]}")
+fi
+
+config_sha256="$(mcp_config_sha256 "$config_display" "$config")"
+if [[ "$r2_mode" == true ]]; then
+  if [[ "$save_raw" == true ]]; then
+    r2_save_raw=true
+  else
+    r2_save_raw=false
+  fi
+  if [[ "$safe_output_mode" == raw ]]; then
+    r2_safe_mode=false
+  else
+    r2_safe_mode=true
+  fi
+  permitted_metadata="$(
+    mcp_make_permitted_metadata call "$server" "$tool" "$config_sha256" \
+      "$output_mode" "$r2_safe_mode" "$r2_save_raw"
+  )" || exit $?
+  request_sha256="$(
+    mcp_sha256_fields \
+      call "$target" "$config_display" "$config" "$config_sha256" \
+      "$output_mode" "$safe_output_mode" "$save_raw" "$allow_mutate" \
+      "${#args[@]}" "${args[@]}" \
+      "${#assert_contains[@]}" "${assert_contains[@]}" \
+      "${#assert_not_contains[@]}" "${assert_not_contains[@]}" \
+      "${#assert_json_true[@]}" "${assert_json_true[@]}" \
+      "$hash_matches_regex" "${#marker_literals[@]}" "${marker_literals[@]}" \
+      "${#cmd[@]}" "${cmd[@]}"
+  )" || exit $?
+  mcp_begin_invocation "$invocation_id" "$request_sha256" \
+    "$permitted_metadata" || exit $?
 fi
 
 set +e
@@ -898,7 +972,9 @@ if [[ "$safe_output_mode" != "raw" && "$safe_output_mode" != "quiet" ]]; then
   set -e
 
   if [[ -s "$tmp_safe_out" ]]; then
-    cat "$tmp_safe_out"
+    if [[ "$r2_mode" != true ]]; then
+      cat "$tmp_safe_out"
+    fi
   else
     fallback_transport="succeeded"
     fallback_processing="failed"
@@ -920,7 +996,10 @@ if [[ "$safe_output_mode" != "raw" && "$safe_output_mode" != "quiet" ]]; then
     esac
     printf '{"schema":"kent-mcp-result-v1","transport":"%s","processing":"%s","action":"unknown","assertion":"%s","assertionKind":"%s"}\n' \
       "$fallback_transport" "$fallback_processing" \
-      "$fallback_assertion" "$fallback_kind"
+      "$fallback_assertion" "$fallback_kind" >"$tmp_safe_out"
+    if [[ "$r2_mode" != true ]]; then
+      cat "$tmp_safe_out"
+    fi
     renderer_exit=3
   fi
 
@@ -958,6 +1037,12 @@ if [[ "$safe_output_mode" != "raw" && "$safe_output_mode" != "quiet" ]]; then
   fi
 
   raw_path=""
+  if [[ "$r2_mode" == true ]]; then
+    mcp_finish_invocation "$invocation_id" "$effective_exit_code" \
+      "$error_code" "" || exit $?
+    cat "$tmp_safe_out"
+    exit "$effective_exit_code"
+  fi
   append_call_log "$root" "$server" "$tool" "$config_display" "$output_mode" \
     "$raw_path" "$effective_exit_code" "$error_code" "$safe_output_mode"
   exit "$effective_exit_code"
@@ -967,28 +1052,55 @@ effective_exit_code="$exit_code"
 error_code=""
 
 if [[ "$safe_output_mode" == "raw" ]]; then
-  cat "$tmp_out"
+  if [[ "$r2_mode" != true ]]; then
+    cat "$tmp_out"
+  fi
   if [[ $exit_code -ne 0 ]]; then
-    [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
+    if [[ "$r2_mode" != true ]]; then
+      [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
+    fi
     error_code="mcporter_call_failed"
   else
-    [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
+    if [[ "$r2_mode" != true ]]; then
+      [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
+    fi
   fi
 elif [[ $exit_code -ne 0 ]]; then
+  if [[ "$r2_mode" != true ]]; then
     printf 'mcp_call_failed: %s exited %s; raw output suppressed\n' \
       "$target" "$exit_code" >&2
+  fi
   error_code="mcporter_call_failed"
 fi
 
 raw_path=""
 if [[ "$save_raw" == true ]]; then
-  if [[ -z "$raw_dir" ]]; then
-    raw_dir="$(artifact_root "$root")/_mcp-raw"
+  if [[ "$r2_mode" == true ]]; then
+    mcp_put_artifact "$invocation_id" raw "$tmp_out" || exit $?
+    # shellcheck disable=SC2154
+    raw_object_sha256="$mcp_object_sha256"
+  else
+    if [[ -z "$raw_dir" ]]; then
+      raw_dir="$(artifact_root "$root")/_mcp-raw"
+    fi
+    server_dir="$raw_dir/$(safe_name "$server")"
+    mkdir -p "$server_dir"
+    raw_path="$server_dir/$(safe_name "$tool")-$(timestamp_utc).$(output_ext "$output_mode")"
+    cp "$tmp_out" "$raw_path"
   fi
-  server_dir="$raw_dir/$(safe_name "$server")"
-  mkdir -p "$server_dir"
-  raw_path="$server_dir/$(safe_name "$tool")-$(timestamp_utc).$(output_ext "$output_mode")"
-  cp "$tmp_out" "$raw_path"
+fi
+
+if [[ "$r2_mode" == true ]]; then
+  mcp_finish_invocation "$invocation_id" "$effective_exit_code" \
+    "$error_code" "${raw_object_sha256-}" || exit $?
+  if [[ "$safe_output_mode" == raw ]]; then
+    cat "$tmp_out"
+    [[ ! -s "$tmp_err" ]] || cat "$tmp_err" >&2
+  elif [[ "$exit_code" -ne 0 ]]; then
+    printf 'mcp_call_failed: %s exited %s; raw output suppressed\n' \
+      "$target" "$exit_code" >&2
+  fi
+  exit "$effective_exit_code"
 fi
 
 append_call_log "$root" "$server" "$tool" "$config_display" "$output_mode" \

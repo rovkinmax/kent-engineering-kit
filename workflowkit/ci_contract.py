@@ -112,6 +112,7 @@ from .runtime import (
     delivery_context_fields,
     validate_delivery_context,
 )
+from . import runtime as runtime_contracts
 
 
 MAX_GITHUB_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -631,6 +632,13 @@ def archive_ci_report(root: Path, task: str, report: Mapping[str, Any]) -> str:
                     raise CiContractError("report_archive_limit")
         if len([item for item in names if item.startswith("ci-report-")]) >= 64 and name not in names:
             raise CiContractError("report_archive_limit")
+        entries = []
+        if set(names) & {"evidence-ledger.jsonl", *runtime_contracts.EVIDENCE_RECOVERY_FILES}:
+            entries = ledger.load_evidence_view(
+                task_fd, task=task, runtime=runtime_contracts,
+            )["records"]
+            if entries and entries[-1].get("record_kind") == runtime_contracts.TERMINAL_SEAL_SCHEMA:
+                raise CiContractError("report_archive_sealed")
         try:
             descriptor = ledger._open_runtime_file(task_fd, name, create=False)
         except FileNotFoundError:
@@ -652,17 +660,8 @@ def archive_ci_report(root: Path, task: str, report: Mapping[str, Any]) -> str:
                     raise CiContractError("report_archive_invalid")
             finally:
                 os.close(descriptor)
-        if "evidence-ledger.jsonl" in names:
-            descriptor = ledger._open_runtime_file(task_fd, "evidence-ledger.jsonl", create=False)
-            try:
-                if os.fstat(descriptor).st_size > MAX_PREPARATION_INPUT_BYTES:
-                    raise CiContractError("report_archive_limit")
-                with os.fdopen(os.dup(descriptor), encoding="utf-8") as stream:
-                    entries = ledger.load_entries(stream, task=task)
-                if any(artifact in entry.get("artifacts", []) for entry in entries):
-                    return artifact
-            finally:
-                os.close(descriptor)
+        if any(artifact in entry.get("artifacts", []) for entry in entries):
+            return artifact
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
@@ -676,23 +675,22 @@ def archive_ci_report(root: Path, task: str, report: Mapping[str, Any]) -> str:
     )
     if manifest_path is None:
         raise CiContractError("report_archive_context_invalid")
-    result = run_bounded_command(
-        [sys.executable, "-B", str(template), "append", "--task", task, "--workspace", str(root)],
-        stdin=canonical_bytes({
-            "node_key": "ci_prepare", "evidence_type": "ci_report",
-            "summary": "Validated CI cycle report retained before preparation re-entry.",
-            "artifacts": [artifact], "checks": ["github-ci-report-v3 validated"],
-            "context": {
-                "manifest_path": manifest_path,
-                "files_read": [], "model_calls": 0, "compaction_count": 0,
+    try:
+        _, duplicate_suppressed = ledger.append_entry(
+            root, path, task=task, _runtime=runtime_contracts,
+            _payload={
+                "node_key": "ci_prepare", "evidence_type": "ci_report",
+                "summary": "Validated CI cycle report retained before preparation re-entry.",
+                "artifacts": [artifact], "checks": ["github-ci-report-v3 validated"],
+                "context": {
+                    "manifest_path": manifest_path,
+                    "files_read": [], "model_calls": 0, "compaction_count": 0,
+                },
             },
-        }),
-        output_limit=4096,
-    )
-    if result.returncode:
-        raise CiContractError("report_archive_failed")
-    receipt = parse_preparation_json(result.stdout)
-    if receipt.get("duplicate_suppressed"):
+        )
+    except (OSError, ValueError) as error:
+        raise CiContractError("report_archive_failed") from error
+    if duplicate_suppressed:
         # The ledger owns run-level idempotency; never claim a different report
         # is archived merely because another event used the same run identity.
         raise CiContractError("report_archive_conflict")

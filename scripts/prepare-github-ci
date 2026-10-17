@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import importlib.machinery
+import importlib.util
 from pathlib import Path
 import sys
+import tomllib
 
 sys.dont_write_bytecode = True
 
@@ -21,8 +24,10 @@ from workflowkit.ci_contract import (
 
 def main() -> int:
     payload: dict[str, object] = {}
+    original_payload: dict[str, object] = {}
     try:
         payload = read_preparation_input(sys.stdin.buffer)
+        original_payload = dict(payload)
         payload = unwrap_delivery_context_payload(payload)
         if payload.get("operation") == "archive_ci_report":
             validate_preparation_identity(payload)
@@ -60,7 +65,23 @@ def main() -> int:
         except (CiContractError, ValueError):
             print('{"error":"ci_prepare_input_invalid"}')
             return 2
-    print(json.dumps(output, ensure_ascii=False))
+    encoded = (json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8")
+    workspace = Path.cwd().resolve()
+    profile_path = workspace / ".kent/workflow-profile.toml"
+    profile = tomllib.loads(profile_path.read_text()) if profile_path.is_file() else {}
+    if profile.get("policies", {}).get("delivery_reliability") is not None:
+        source = workspace / ".kent/scripts/workflow-checkpoint"
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("qualified producer adapter is unavailable")
+        loader = importlib.machinery.SourceFileLoader("prepare_ci_producer_adapter", str(source))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            raise ValueError("producer adapter cannot be loaded")
+        adapter = importlib.util.module_from_spec(spec)
+        loader.exec_module(adapter)
+        encoded = adapter.emit_producer_result(
+            workspace, original_payload, encoded, "prepare-ci")
+    sys.stdout.buffer.write(encoded)
     return 0
 
 

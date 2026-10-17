@@ -1,9 +1,715 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
 
 from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
 from .profile import ProjectProfile
+
+
+PACKET_LIMIT = 1024 * 1024
+PACKET_FOOTER = "KENT_PACKET_SOURCE_V1 "
+_PACKET_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_PACKET_LOCATOR = re.compile(
+    r"build/kent-workflow/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/"
+    r"packets/base-([0-9a-f]{64})\.json\Z"
+)
+_IDENTITY_KEYS = {
+    "task_id", "task_short_id", "project_id", "workspace_path",
+    "session_id", "run_id", "step_id",
+}
+_SCRIPT_IDENTITY_KEYS = {
+    "task_id", "task_short_id", "project_id", "workspace_path",
+    "invocation_kind", "node_id", "transition_branch_key",
+}
+_CONTROL_KEYS = {
+    "task", "task_id", "project_id", "workspace",
+    "session", "session_id", "run", "run_id", "step", "step_id",
+    "actor", "force", "target_node", "target", "node_id",
+    "invocation_kind", "transition_branch_key",
+}
+
+SOURCE_ADMISSION_BEGIN = "KENT_SOURCE_ADMISSION_V1_BEGIN"
+SOURCE_ADMISSION_END = "KENT_SOURCE_ADMISSION_V1_END"
+UNACTIVATED_SOURCE = """UNACTIVATED SOURCE CANDIDATE.
+Do not begin Task work or run project-local helpers from this candidate.
+Final native rendering requires qualified published sources, the installed
+binding, and an approved update with verified compatibility and a quiet window.
+A source snapshot or matching Workflow UUID is not activation proof."""
+
+
+def source_admission_gate(admission: dict[str, object], *,
+                          project_id: str, workflow_id: str, project_root: str) -> str:
+    """Render already validated deployment inputs without I/O or authority checks."""
+    canonical = json.dumps(admission, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), allow_nan=False).encode("utf-8")
+    receipt = admission["receipt_ref"]
+    command = [
+        "python3", str(Path(admission["kit_root"]) / "scripts/inspect-delivery-source"),
+        "--receipt", receipt["path"], "--receipt-sha256", receipt["sha256"],
+        "--project-id", project_id, "--workflow-id", workflow_id,
+        "--project-root", project_root, "--kit-root", admission["kit_root"],
+        "--primary-root", admission["primary_root"],
+        "--source-ref", admission["source_ref"], "--kit-ref", admission["kit_ref"],
+        "--ci-helper", admission["ci_helper"],
+    ]
+    for helper in sorted(admission["helper_bindings"], key=lambda item: item["link"]):
+        command.extend(("--installed-helper", helper["link"], helper["target"]))
+    marker = json.dumps({
+        "source_admission_sha256": hashlib.sha256(canonical).hexdigest(),
+        "receipt_sha256": receipt["sha256"],
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    invocation = shlex.join(command) + ' --workspace "$(git rev-parse --show-toplevel)"'
+    return f"""{SOURCE_ADMISSION_BEGIN}
+{marker}
+Published source admission comes before project-local helpers. At first storage
+ingress, use the qualified installed project-memory adapter's initialize-task
+interface with the actual Git root and inherited native Session identity.
+Supply the exact Task locator when available; never impersonate another Session.
+The adapter selects task-fixed legacy mode before R2 source inspection.
+
+An inventoried legacy Task retains its original infrastructure, paths, accepted
+contract and effect limits; do not impose this package on its old checkout.
+For an admitted R2 Task, run the exact read-only guard:
+
+```sh
+{invocation}
+```
+
+Proceed only on verified admission. A receipt proves byte closure, not Task
+approval, reader compatibility or permission for an external effect.
+Missing identity, source drift or incompatible retained readers requires
+preserving state and reporting the concrete gap. Do not fetch, provision,
+select another baseline or create a .todo fallback. This check is procedural,
+not an engine sandbox or a reservation against subsequent source changes.
+{SOURCE_ADMISSION_END}"""
+
+
+def packet_json(value: object) -> bytes:
+    """One deterministic wire encoding; string values are never normalized."""
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(raw) > PACKET_LIMIT:
+        raise ValueError("producer artifact exceeds its byte limit")
+    return raw
+
+
+def packet_decode(raw: bytes) -> dict:
+    if len(raw) > PACKET_LIMIT:
+        raise ValueError("producer artifact exceeds its byte limit")
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate producer artifact key")
+            result[key] = value
+        return result
+
+    def constant(value):
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs,
+                       parse_constant=constant)
+    if not isinstance(value, dict):
+        raise ValueError("producer artifact must be an object")
+    return value
+
+
+def _packet_strings(value: object, label: str) -> dict[str, str]:
+    if not isinstance(value, dict) or any(
+        not isinstance(k, str) or not _PACKET_KEY.fullmatch(k)
+        or not isinstance(v, str) for k, v in value.items()
+    ):
+        raise ValueError(f"{label} must contain only simple string fields")
+    if _CONTROL_KEYS.intersection(value):
+        raise ValueError(f"{label} contains native identity/control overrides")
+    for item in value.values():
+        item.encode("utf-8")
+    return dict(value)
+
+
+def _packet_identity(root: Path, identity: dict) -> dict:
+    if not isinstance(identity, dict) or set(identity) not in (
+        _IDENTITY_KEYS, _SCRIPT_IDENTITY_KEYS,
+    ):
+        raise ValueError("producer identity is incomplete")
+    strings = dict(identity)
+    if set(identity) == _SCRIPT_IDENTITY_KEYS:
+        branch = strings.pop("transition_branch_key")
+        if (identity["invocation_kind"] != "script"
+                or (branch is not None and (not isinstance(branch, str) or not branch))):
+            raise ValueError("invalid native Script invocation identity")
+    if any(not isinstance(v, str) or not v for v in strings.values()):
+        raise ValueError("producer identity is incomplete")
+    if identity["workspace_path"] != str(root) or not root.is_absolute():
+        raise ValueError("producer workspace identity mismatch")
+    if not _PACKET_KEY.fullmatch(identity["task_short_id"]):
+        raise ValueError("invalid producer task key")
+    return dict(identity)
+
+
+def _script_path(root: Path, value: object) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("native Script path is unavailable")
+    path = Path(value)
+    # Graphs may own qualified absolute helpers outside the source worktree.
+    # Normalize relative paths against the actual execution workspace.
+    return os.path.normpath(str(path if path.is_absolute() else root / path))
+
+
+def observe_script_identity(root: Path, task: str | None, native_context: dict, *,
+                            native_read) -> dict:
+    """Observe one native Script invocation from actual injected ``_kent``.
+
+    ``native_read`` is a trusted adapter's bounded read-only native CLI reader,
+    with (root, fixed_arguments, structured=True). No identity or arbitrary
+    command may come from a user packing request. Agent environment, including
+    unrelated inherited Session IDs, is not used as Script invocation proof.
+    """
+    if (not root.is_absolute() or root.resolve() != root
+            or (task is not None and (not isinstance(task, str) or not _PACKET_KEY.fullmatch(task)))):
+        raise ValueError("native Script workspace/Task is invalid")
+    if (not isinstance(native_context, dict) or set(native_context) not in (
+        {"task_id", "node_id"}, {"task_id", "node_id", "transition_branch_key"},
+    ) or any((not isinstance(value, str) or not value or len(value) > 256)
+             for key, value in native_context.items()
+             if not (key == "transition_branch_key" and value is None))):
+        raise ValueError("invalid native Script context")
+    project = native_read(root, ["project", str(root)], structured=False)
+    if not isinstance(project, str) or not _PACKET_KEY.fullmatch(project):
+        raise ValueError("native Script project is unresolved")
+    selector = task if task is not None else native_context["task_id"]
+    detail = native_read(root, ["task", "show", selector, "--project", project, "--json"])
+    if not isinstance(detail, dict):
+        raise ValueError("native Script Task readback is invalid")
+    summary, source = detail.get("summary"), detail.get("source_workspace")
+    if (not isinstance(summary, dict) or summary.get("id") != native_context["task_id"]
+            or (task is not None and summary.get("short_id") != task)
+            or not isinstance(summary.get("short_id"), str)
+            or not _PACKET_KEY.fullmatch(summary["short_id"])
+            or summary.get("project_id") != project
+            or not isinstance(source, dict) or source.get("is_primary") is not True
+            or not isinstance(source.get("workspace_id"), str) or not source["workspace_id"]
+            or not isinstance(source.get("root_path"), str)):
+        raise ValueError("native Script Task/project identity mismatch")
+    source_root = Path(source["root_path"])
+    project_detail = detail.get("project", {})
+    if (not source_root.is_absolute() or source_root.resolve() != source_root
+            or not isinstance(project_detail, dict)
+            or project_detail.get("default_workspace_id", source["workspace_id"]) != source["workspace_id"]
+            or (detail.get("worktree_path") or source["root_path"]) != str(root)
+            or native_read(root, ["project", str(source_root)], structured=False) != project):
+        raise ValueError("native Script workspace/source identity mismatch")
+    scripts = detail.get("current_scripts")
+    if (not isinstance(scripts, list) or len(scripts) > 256
+            or any(not isinstance(row, dict) or not isinstance(row.get("current_node"), dict)
+                   for row in scripts)):
+        raise ValueError("native Script observation is incomplete")
+    matches = [
+        row for row in scripts
+        if row["current_node"].get("node_id") == native_context["node_id"]
+        and row["current_node"].get("transition_branch_key") == native_context.get("transition_branch_key")
+    ]
+    if len(matches) != 1 or matches[0]["current_node"].get("session_id"):
+        raise ValueError("native current Script ownership is unresolved")
+    workflow = summary.get("workflow_id")
+    if not isinstance(workflow, str) or not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", workflow,
+    ):
+        raise ValueError("native Script Workflow is unresolved")
+    graph = native_read(root, ["workflow", "graph", "inspect", workflow, "--json"])
+    if (not isinstance(graph, dict) or graph.get("workflow_id") != workflow
+            or not isinstance(graph.get("graph"), dict)
+            or not isinstance(graph["graph"].get("nodes"), list)
+            or any(not isinstance(node, dict) for node in graph["graph"]["nodes"])):
+        raise ValueError("native Script graph identity mismatch")
+    nodes = [node for node in graph["graph"]["nodes"]
+             if node.get("id") == native_context["node_id"]]
+    if (len(nodes) != 1 or nodes[0].get("kind") != "script"
+            or _script_path(root, nodes[0].get("script_path"))
+            != _script_path(root, matches[0].get("path"))):
+        raise ValueError("native graph does not own the current Script path")
+    return _packet_identity(root, {
+        "task_id": summary["id"], "task_short_id": summary["short_id"], "project_id": project,
+        "workspace_path": str(root), "invocation_kind": "script",
+        "node_id": native_context["node_id"],
+        "transition_branch_key": native_context.get("transition_branch_key"),
+    })
+
+
+def capture_script_producer(root: Path, *, task: str | None, native_context: dict,
+                            producer_kind: str, inputs: dict[str, str],
+                            result: dict[str, str], native_read,
+                            binding: dict[str, str] | None = None) -> tuple[str, bytes]:
+    """Actual Script adapter seam; never synthesize Agent Session/Run/Step."""
+    identity = observe_script_identity(root, task, native_context, native_read=native_read)
+    return capture_producer(root, identity=identity, producer_kind=producer_kind,
+                            inputs=inputs, result=result, binding=binding)
+
+
+@contextmanager
+def _packet_directory(root: Path, task: str, *, create: bool):
+    """Admit each component relative to a pinned no-follow directory."""
+    descriptors = []
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        descriptor = os.open("/", flags)
+        descriptors.append(descriptor)
+        for name in root.parts[1:]:
+            if name in {".", ".."}:
+                raise ValueError("unsafe producer workspace")
+            descriptor = os.open(name, flags, dir_fd=descriptor)
+            descriptors.append(descriptor)
+        for index, name in enumerate(("build", "kent-workflow", task, "packets")):
+            if create:
+                try:
+                    os.mkdir(name, 0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                except FileExistsError:
+                    pass
+            descriptor = os.open(name, flags, dir_fd=descriptor)
+            descriptors.append(descriptor)
+            info = os.fstat(descriptor)
+            # build/ is shared with other build outputs; private packet ancestry
+            # starts at kent-workflow and may never be silently chmod-ed.
+            if info.st_uid != os.getuid() or (
+                index > 1 and stat.S_IMODE(info.st_mode) != 0o700
+            ) or info.st_mode & 0o022:
+                raise ValueError("unsafe producer artifact directory")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield descriptor
+    except FileNotFoundError as error:
+        raise ValueError("producer artifact is missing") from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _packet_read(fd: int, name: str, *, expected_links: int = 1) -> bytes:
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=fd)
+    except FileNotFoundError as error:
+        raise ValueError("producer artifact is missing") from error
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != expected_links
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > PACKET_LIMIT):
+            raise ValueError("unsafe producer artifact file")
+        raw = stream.read(PACKET_LIMIT + 1)
+        after = os.fstat(stream.fileno())
+        if len(raw) > PACKET_LIMIT or (
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns
+        ) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("producer artifact changed during read")
+        return raw
+
+
+def _packet_publish(fd: int, name: str, raw: bytes) -> None:
+    """Publish complete immutable bytes under the packet-directory lock.
+
+    A deterministic private temporary lets a retry settle a crash immediately
+    after link publication without accepting arbitrary hardlinks or scanning.
+    """
+    temporary = "." + name + ".tmp"
+    try:
+        info = os.stat(temporary, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink not in (1, 2)):
+            raise ValueError("unsafe interrupted producer publication")
+        try:
+            final = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            final = None
+        if final is not None:
+            if ((final.st_dev, final.st_ino) != (info.st_dev, info.st_ino)
+                    or info.st_nlink != 2
+                    or _packet_read(fd, temporary, expected_links=2) != raw):
+                raise ValueError("conflicting interrupted producer publication")
+        elif info.st_nlink != 1:
+            raise ValueError("unsafe interrupted producer hardlink")
+        os.unlink(temporary, dir_fd=fd)
+        os.fsync(fd)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, name, src_dir_fd=fd, dst_dir_fd=fd,
+                    follow_symlinks=False)
+        except FileExistsError:
+            if _packet_read(fd, name) != raw:
+                raise ValueError("conflicting immutable producer artifact")
+    finally:
+        os.unlink(temporary, dir_fd=fd)
+        os.fsync(fd)
+    if _packet_read(fd, name) != raw:
+        raise ValueError("producer artifact readback mismatch")
+
+
+def _packet_emitted(base: dict, locator: str) -> bytes:
+    result = dict(base["result"])
+    commentary = result.get("commentary", "")
+    if PACKET_FOOTER.strip() in commentary:
+        raise ValueError("producer commentary already contains a packet footer")
+    result["commentary"] = commentary + (
+        "" if not commentary or commentary.endswith("\n") else "\n"
+    ) + PACKET_FOOTER + locator
+    return packet_json(result)
+
+
+def capture_producer(
+    root: Path, *, identity: dict, producer_kind: str,
+    inputs: dict[str, str], result: dict[str, str],
+    binding: dict[str, str] | None = None,
+) -> tuple[str, bytes]:
+    """Trusted producer seam: observe native identity before calling this API.
+
+    Returns a relative base locator and the exact bytes to print only after both
+    immutable artifacts have passed durable publication/readback.
+    """
+    identity = _packet_identity(root, identity)
+    if not isinstance(producer_kind, str) or not _PACKET_KEY.fullmatch(producer_kind):
+        raise ValueError("invalid producer kind")
+    base = {
+        "schema": "workflow-producer-source-v1", "identity": identity,
+        "producer_kind": producer_kind,
+        "inputs": _packet_strings(inputs, "producer inputs"),
+        "result": _packet_strings(result, "producer result"),
+        "binding": _packet_strings(binding or {}, "producer binding"),
+    }
+    _packet_value_identity(base, identity)
+    raw = packet_json(base)
+    name = "base-" + hashlib.sha256(raw).hexdigest() + ".json"
+    locator = f"build/kent-workflow/{identity['task_short_id']}/packets/{name}"
+    emitted = _packet_emitted(base, locator)
+    with _packet_directory(root, identity["task_short_id"], create=True) as fd:
+        _packet_publish(fd, name, raw)
+        _packet_publish(fd, "emitted-" + hashlib.sha256(emitted).hexdigest() + ".json", emitted)
+    return locator, emitted
+
+
+@contextmanager
+def _producer_reader(root: Path, task: str, read_relative):
+    """Only fixed validated packet locators cross the archive-reader boundary."""
+    prefix = f"build/kent-workflow/{task}/packets/"
+
+    def bounded(reader):
+        def read(relative):
+            if (not relative.startswith(prefix)
+                    or not re.fullmatch(r"(?:base|emitted)-[0-9a-f]{64}\.json",
+                                        relative[len(prefix):])):
+                raise ValueError("unsafe producer artifact read locator")
+            raw = reader(relative)
+            if not isinstance(raw, bytes) or len(raw) > PACKET_LIMIT:
+                raise ValueError("invalid or oversized producer artifact bytes")
+            return raw
+        return read
+
+    if read_relative is None:
+        with _packet_directory(root, task, create=False) as fd:
+            yield bounded(lambda relative: _packet_read(fd, relative.rsplit("/", 1)[1]))
+    else:
+        yield bounded(read_relative)
+
+
+def reconstruct_producer(root: Path, locator: str, *, identity: dict,
+                         read_relative=None) -> dict:
+    """Historical transport authenticates Task/root, not current HEAD or Run.
+
+    An optional trusted archive reader supplies receipt-verified bytes after
+    retirement. It receives only fixed validated relative packet locators; it
+    does not waive digest, schema, owner or emitted-byte verification.
+    """
+    identity = _packet_identity(root, identity)
+    match = _PACKET_LOCATOR.fullmatch(locator)
+    if not match or match[1] != identity["task_short_id"]:
+        raise ValueError("unsafe or foreign producer locator")
+    with _producer_reader(root, match[1], read_relative) as read:
+        raw = read(locator)
+        if hashlib.sha256(raw).hexdigest() != match[2]:
+            raise ValueError("producer artifact digest mismatch")
+        base = packet_decode(raw)
+        if set(base) != {"schema", "identity", "producer_kind", "inputs", "result", "binding"}:
+            raise ValueError("invalid producer artifact fields")
+        if base["schema"] != "workflow-producer-source-v1":
+            raise ValueError("unsupported producer artifact schema")
+        stored = _packet_identity(root, base["identity"])
+        for key in ("task_id", "task_short_id", "project_id", "workspace_path"):
+            if stored[key] != identity[key]:
+                raise ValueError("foreign producer identity")
+        if not isinstance(base["producer_kind"], str) or not _PACKET_KEY.fullmatch(base["producer_kind"]):
+            raise ValueError("invalid producer kind")
+        for key in ("inputs", "result", "binding"):
+            _packet_strings(base[key], key)
+        _packet_value_identity(base, identity)
+        if packet_json(base) != raw:
+            raise ValueError("noncanonical producer artifact")
+        emitted = _packet_emitted(base, locator)
+        actual = read(str(Path(locator).with_name(
+            "emitted-" + hashlib.sha256(emitted).hexdigest() + ".json")))
+        if actual != emitted:
+            raise ValueError("emitted producer artifact mismatch")
+    return {**base, "emitted": emitted, "locator": locator}
+
+
+def producer_locator(commentary: str) -> str | None:
+    """Legacy commentary has no locator; malformed/duplicate footers fail."""
+    lines = commentary.splitlines()
+    candidates = [line for line in lines if PACKET_FOOTER.strip() in line]
+    if not candidates:
+        return None
+    if (len(candidates) != 1 or not candidates[0].startswith(PACKET_FOOTER)
+            or lines[-1] != candidates[0]):
+        raise ValueError("invalid or duplicate producer footer")
+    locator = candidates[0][len(PACKET_FOOTER):]
+    if not _PACKET_LOCATOR.fullmatch(locator):
+        raise ValueError("unsafe producer locator footer")
+    return locator
+
+
+def producer_reference_closure(root: Path, locator: str, *, identity: dict,
+                               read_relative=None) -> list[str]:
+    """Return exact base/emitted files, including packed original producers."""
+    pending = [locator]
+    seen: set[str] = set()
+    paths: set[str] = set()
+    inspected = 0
+    while pending:
+        reference = pending.pop()
+        if reference in seen:
+            continue
+        if len(seen) >= 32:
+            raise ValueError("producer retention closure exceeds file limit")
+        seen.add(reference)
+        producer = reconstruct_producer(root, reference, identity=identity,
+                                        read_relative=read_relative)
+        inspected += len(producer["emitted"]) + len(packet_json(producer["inputs"]))
+        if inspected > 32 * 1024 * 1024:
+            raise ValueError("producer retention closure exceeds byte limit")
+        paths.add(reference)
+        paths.add(str(Path(reference).with_name(
+            "emitted-" + hashlib.sha256(producer["emitted"]).hexdigest() + ".json")))
+        nested = producer["binding"].get("producer_refs")
+        if nested is not None:
+            value = packet_decode(nested.encode("utf-8"))
+            refs = value.get("refs")
+            if (set(value) != {"refs"} or not isinstance(refs, list) or len(refs) > 64
+                    or any(not isinstance(ref, str) for ref in refs)
+                    or len(set(refs)) != len(refs)):
+                raise ValueError("invalid nested producer references")
+            pending.extend(refs)
+    return sorted(paths)
+
+
+def _packet_value_identity(base: dict, identity: dict) -> None:
+    # Inputs are observations, including rejected foreign values. Only native
+    # observed identity owns the artifact. A produced completion may not adopt
+    # those rejected values as its execution root or Task identity.
+    for key in ("task_short_id", "workspace_path"):
+        if key in base["result"] and base["result"][key] != identity[key]:
+            raise ValueError("producer values override native identity")
+
+
+def _effective_transition(identity: dict, task_detail: dict, graph: dict,
+                          transition: str) -> tuple[dict, set[str]]:
+    """Project the complete native selected transition, not caller field lists."""
+    if set(identity) != _IDENTITY_KEYS:
+        raise ValueError("native completion packing requires an Agent identity")
+    if not isinstance(task_detail, dict) or not isinstance(graph, dict):
+        raise ValueError("native transition observation must be an object")
+    summary = task_detail.get("summary", {})
+    if not isinstance(summary, dict) or any(summary.get(key) != identity[expected] for key, expected in (
+        ("id", "task_id"), ("short_id", "task_short_id"), ("project_id", "project_id"),
+    )) or summary.get("workflow_id") != graph.get("workflow_id"):
+        raise ValueError("transition contract belongs to another Task/Workflow")
+    version = graph.get("expected_version")
+    if type(version) is not int or version < 0:
+        raise ValueError("invalid native graph version")
+    rows = (task_detail.get("current_nodes") or [], task_detail.get("live_sessions") or [])
+    if any(not isinstance(items, list) or len(items) > 256
+           or any(not isinstance(row, dict) for row in items) for items in rows):
+        raise ValueError("native current node observation is invalid")
+    current = rows[0] + rows[1]
+    source_ids = {
+        row.get("node_id") for row in current
+        if row.get("session_id") == identity["session_id"] and row.get("node_id")
+    }
+    if len(source_ids) != 1:
+        raise ValueError("native current Session source node is unresolved")
+    source_id = source_ids.pop()
+    definition = graph.get("graph", {})
+    if not isinstance(definition, dict) or any(
+        not isinstance(definition.get(key), list)
+        or any(not isinstance(item, dict) for item in definition[key])
+        for key in ("nodes", "transition_groups", "edges")
+    ):
+        raise ValueError("native transition graph is invalid")
+    nodes = [node for node in definition.get("nodes", []) if node.get("id") == source_id]
+    groups = [
+        group for group in definition.get("transition_groups", [])
+        if group.get("source_node_id") == source_id
+        and group.get("transition_id") == transition
+    ]
+    if len(nodes) != 1 or len(groups) != 1 or nodes[0].get("kind") != "agent":
+        raise ValueError("native selected transition is missing or ambiguous")
+    if not isinstance(groups[0].get("id"), str) or not groups[0]["id"]:
+        raise ValueError("native transition group identity is missing")
+    selected = [edge for edge in definition["edges"]
+                if edge.get("transition_group_id") == groups[0]["id"]]
+    if any(not isinstance(edge.get("id"), str) or not edge["id"] for edge in selected):
+        raise ValueError("native selected transition edge identity is missing")
+    edges = sorted(
+        selected,
+        key=lambda edge: edge["id"],
+    )
+    if not edges or len({edge["id"] for edge in edges}) != len(edges):
+        raise ValueError("native selected transition edges are missing or ambiguous")
+    contracts = []
+    for edge in edges:
+        parameters = edge.get("parameters", [])
+        if not isinstance(parameters, list) or any(
+            not isinstance(field, dict) or not isinstance(field.get("key"), str)
+            or not _PACKET_KEY.fullmatch(field["key"])
+            for field in parameters
+        ):
+            raise ValueError("native transition fields are invalid")
+        fields = [field["key"] for field in parameters]
+        if len(set(fields)) != len(fields):
+            raise ValueError("native transition repeats a field")
+        contracts.append(set(fields))
+    if any(fields != contracts[0] for fields in contracts):
+        raise ValueError("native fan-out transition field contracts disagree")
+    projection = {"source": nodes[0], "group": groups[0], "edges": edges}
+    return {
+        "task_id": identity["task_id"], "workflow_id": graph["workflow_id"],
+        "expected_version": version, "source_node_id": source_id,
+        "transition": transition,
+        "contract_sha256": hashlib.sha256(packet_json(projection)).hexdigest(),
+    }, contracts[0]
+
+
+def transition_contract_reference(identity: dict, task_detail: dict, graph: dict,
+                                  transition: str) -> dict:
+    """Freeze a contract from actual readbacks; use again after native refresh."""
+    return _effective_transition(identity, task_detail, graph, transition)[0]
+
+
+def pack_delivery(root: Path, request: dict, *, identity: dict,
+                  task_detail: dict, graph: dict) -> tuple[str, bytes]:
+    """Pack only; caller owns native completion and success/effect freshness.
+
+    All native observations are adapter-supplied, never request-controlled.
+    No historical report is classified as fresh or passing by this transport.
+    """
+    identity = _packet_identity(root, identity)
+    keys = {"schema", "transition", "values", "transition_contract_ref",
+            "delivery_mode", "producer_refs"}
+    if not isinstance(request, dict) or set(request) != keys:
+        raise ValueError("invalid completion packing fields")
+    if request["schema"] != "workflow-pack-delivery-v1":
+        raise ValueError("unsupported completion packing schema")
+    transition = request["transition"]
+    if not isinstance(transition, str) or not _PACKET_KEY.fullmatch(transition):
+        raise ValueError("invalid selected transition")
+    actual, required = _effective_transition(identity, task_detail, graph, transition)
+    reference = request["transition_contract_ref"]
+    if not isinstance(reference, dict) or set(reference) != set(actual):
+        raise ValueError("invalid exact transition contract reference")
+    if type(reference["expected_version"]) is not int or reference["expected_version"] < 0:
+        raise ValueError("invalid referenced native graph version")
+    # A graph-version change alone is not drift. Exact selected-contract digest
+    # and identities reconcile unchanged contracts without a version bypass.
+    if any(reference[key] != value for key, value in actual.items()
+           if key != "expected_version"):
+        raise ValueError("selected native transition contract changed")
+    if reference["expected_version"] > actual["expected_version"]:
+        raise ValueError("referenced graph version is from the future")
+    values = _packet_strings(request["values"], "completion values")
+    if set(values) - required - {"commentary"} or "transition" in values:
+        raise ValueError("completion values contain undeclared fields")
+    refs = request["producer_refs"]
+    if not isinstance(refs, list) or len(refs) > 64 or any(
+        not isinstance(ref, str) for ref in refs
+    ) or len(set(refs)) != len(refs):
+        raise ValueError("invalid completion producer references")
+    sources = {}
+    inspected = 0
+    for ref in refs:
+        producer = reconstruct_producer(root, ref, identity=identity)
+        inspected += len(producer["emitted"]) + len(packet_json(producer["inputs"]))
+        if inspected > 32 * 1024 * 1024:
+            raise ValueError("producer inspection exceeds aggregate byte limit")
+        # Outputs override inputs within one actual producer invocation. Across
+        # producers there is no implicit latest choice or conflict precedence.
+        fields = {**producer["inputs"], **producer["result"]}
+        for key, value in fields.items():
+            if key in {"transition", "commentary"}:
+                continue
+            if key in sources and sources[key] != value:
+                raise ValueError("producer references disagree on exact field bytes")
+            sources[key] = value
+    for key in ("ci_contract", "ci_report", "delivery_context"):
+        if key in values and (key not in sources or values[key] != sources[key]):
+            raise ValueError("packet values require exact producer-owned bytes")
+    mode = request["delivery_mode"]
+    if mode == "preserve":
+        if "delivery_context" in required and "delivery_context" not in sources:
+            raise ValueError("preserve mode requires original outer delivery context")
+    elif mode == "post_pr":
+        if "delivery_context" in values:
+            raise ValueError("post_pr mode cannot override assembled delivery context")
+        context = {"schema": "workflow-delivery-context-v1", "phase": "post_pr"}
+        for key in ("pr_url", "branch_name", "merge_strategy", "pr_feedback_cursor"):
+            value = sources.get(key, values.get(key))
+            if not isinstance(value, str) or not value:
+                raise ValueError("post_pr assembly lacks observed PR identity")
+            context[key] = value
+        for key in ("ci_contract", "ci_report"):
+            if key in sources:
+                context[key] = sources[key]
+        sources["delivery_context"] = packet_json(context).decode("utf-8")
+    else:
+        raise ValueError("unsupported delivery packing mode")
+    result = dict(values)
+    for key in required:
+        if key in sources:
+            if key in result and result[key] != sources[key]:
+                raise ValueError("completion values rewrite producer-owned strings")
+            result[key] = sources[key]
+    if set(result) - {"commentary"} != required:
+        raise ValueError("completion is missing declared native transition fields")
+    if "delivery_context" in result:
+        from .runtime import delivery_context_fields
+        delivery_context_fields(result)
+    for key in ("ci_report", "ci_contract"):
+        if key in result and len(result[key].encode("utf-8")) > 65536:
+            raise ValueError("nested CI packet exceeds its byte limit")
+    result["transition"] = transition
+    return capture_producer(
+        root, identity=identity, producer_kind="pack-delivery",
+        inputs={}, result=result,
+        binding={"transition_contract_sha256": actual["contract_sha256"],
+                 "native_graph_version": str(actual["expected_version"]),
+                 "producer_refs": packet_json({"refs": refs}).decode("utf-8")},
+    )
 
 
 WORKSPACE = ParameterSpec(
@@ -2088,7 +2794,12 @@ def build_delivery_workflow(
             ]
         )
 
-    for source in ("fix", "compliance"):
+    replan_owners = (
+        ("implement", "fix", "compliance")
+        if profile.delivery_reliability_policy() == "v1"
+        else ("fix", "compliance")
+    )
+    for source in replan_owners:
         if any(node.key == source for node in nodes):
             edges.append(
                 EdgeSpec(
@@ -2105,19 +2816,12 @@ def build_delivery_workflow(
                     ),
                     parameters=(
                         WORKSPACE, PLAN, WORK_KIND, REVIEW_CONTEXT, PLAN_CHANGE_REPORT,
-                    ) + delivery_context_parameters,
+                    ) + delivery_context_parameters + (
+                        (ACCEPTED_PLAN_SHA256,)
+                        if source == "implement" and coder_selection_enabled else ()
+                    ),
                 )
             )
-    # Recovery/PR/evidence-return prompts must expose the same owner route.
-    # Invalid-workspace recovery remains metadata-only until the root is valid.
-    edges = [
-        replace(edge, prompt=f"{edge.prompt}\n\n{owner_replan_instruction(profile)}")
-        if edge.target in {"fix", "compliance"}
-        and edge.prompt
-        and edge.key != "dispatch_invalid_workspace"
-        else edge
-        for edge in edges
-    ]
     if coder_selection_enabled:
         def add_parameters(
             edge: EdgeSpec,
@@ -2375,6 +3079,16 @@ re-lock another writer."""
                 ),
             ]
         )
+    # Add owner guidance after coder selection has finalized writer prompts.
+    # Invalid-workspace recovery remains metadata-only until the root is valid.
+    edges = [
+        replace(edge, prompt=f"{edge.prompt}\n\n{owner_replan_instruction(profile)}")
+        if edge.target in set(replan_owners)
+        and edge.prompt
+        and edge.key != "dispatch_invalid_workspace"
+        else edge
+        for edge in edges
+    ]
     edges = qualify_transition_keys(edges)
     spec = WorkflowSpec(
         name=profile.workflow_name("delivery", version),
@@ -3031,20 +3745,39 @@ def owner_replan_instruction(profile: ProjectProfile | None = None) -> str:
         if profile is not None and profile.coder_selection_policy() == "complexity"
         else ""
     )
-    return """Choose `replan` before production edits when a concrete finding or verified
-new authority requires substantive reconciliation of the accepted execution
-plan. This route returns work to its planner; it grants no expanded source,
-publication or resource authority. Ordinary within-contract repairs stay in
-Fix; packaging-only defects stay in Evidence Repair. Unknown human authority
-still requires its exact missing decision, not a fabricated approval.
-
+    snapshot_instruction = """
+Resolve task-fixed storage mode with the qualified `workflow-project-memory`
+workflow adapter and its `resolve-task` operation before reading a plan.
+Use the exact native Task/workspace binding; do not select a mode from a
+worktree's missing profile fields or guess an external path.
+For R2 mode, use `check-plan` with the accepted coder selection (or null when
+disabled) and `resolve-plan` with the supplied immutable plan_path. Validate
+the external accepted snapshot and current working head; preserve its original
+approval/review locators. Use the returned current immutable working_path and
+accepted work_kind for replanning. A missing local plan-contract cache does
+not mean missing approval: external accepted state is authoritative. These
+read-only operations must not recreate the cache or change accepted state.
+For a helper-resolved legacy task, read the accepted
+`.kent/runtime/{{.TaskShortId}}/plan-contract.json` without writing it. Verify
+schema_version=1, task_short_id={{.TaskShortId}}, and the normalized_plan UTF-8
+SHA-256 against normalized_sha256. Resolve its plan_path as a regular non-escaping
+workspace file (or the explicitly authorized not-applicable sentinel); verify
+work_kind is declared by the project profile.
+""" if profile is not None and profile.delivery_reliability_policy() == "v1" else """
 Read the accepted `.kent/runtime/{{.TaskShortId}}/plan-contract.json` in the
 native Task's repository root, without writing it. Verify schema_version=1,
 task_short_id={{.TaskShortId}}, and SHA-256 of normalized_plan UTF-8 against
 normalized_sha256. Resolve plan_path within that root as a regular non-escaping
 file (or the existing explicitly authorized not-applicable sentinel); verify
 work_kind is declared by the project profile. Do not guess from Session memory.
-If snapshot, identity, path or authority is missing or contradictory, report
+"""
+    return """Choose `replan` before production edits when a concrete finding or verified
+new authority requires substantive reconciliation of the accepted execution
+plan. This route returns work to its planner; it grants no expanded source,
+publication or resource authority. Ordinary within-contract repairs stay in
+Fix; packaging-only defects stay in Evidence Repair. Unknown human authority
+still requires its exact missing decision, not a fabricated approval.
+""" + snapshot_instruction + """If snapshot, identity, path or authority is missing or contradictory, report
 the precise evidence gap through needs_user_action without changing files.
 For replan provide workspace_path, snapshot plan_path and work_kind,
 review_context with remaining actionable findings/evidence/authority locators,
@@ -3403,6 +4136,20 @@ def plan_revalidation_prompt(
     from_review: bool,
     coder_selection: bool = False,
 ) -> str:
+    snapshot_instruction = (
+        "use the task-fixed storage mode. For R2, resolve the external accepted "
+        "snapshot through the project-memory helper and compare it with the "
+        "current external plan; `.kent/runtime/{{.TaskShortId}}/plan-contract.json` "
+        "is only a disposable cache, not required evidence. Do not recreate it "
+        "or switch to legacy storage when it is absent. For fixed legacy tasks, "
+        "compare with the prior normalized snapshot at "
+        "`.kent/runtime/{{.TaskShortId}}/plan-contract.json`. Checkbox state alone "
+        "is intentionally absent from the normalized contract."
+        if profile.delivery_reliability_policy() == "v1"
+        else "compare the current\nplan with the prior normalized snapshot at\n"
+        "`.kent/runtime/{{.TaskShortId}}/plan-contract.json`; checkbox state alone\n"
+        "is intentionally absent from that contract."
+    )
     finding_label = (
         "Independent Plan Review findings: {{.Params.plan_review_report}}"
         if from_review
@@ -3448,10 +4195,7 @@ and repeated identical failures alone do not require another grill call.
 Plan owns questions and dispositions; grill cannot edit, ask the user, spawn
 children, or replace independent review. Report unavailable effective leaf
 eligibility as a concrete blocker rather than claiming critique occurred.
-When revalidation was triggered by deterministic drift, compare the current
-plan with the prior normalized snapshot at
-`.kent/runtime/{{{{.TaskShortId}}}}/plan-contract.json`; checkbox state alone
-is intentionally absent from that contract.
+When revalidation was triggered by deterministic drift, {snapshot_instruction}
 
 Choose `review_plan` after reconciliation and provide `workspace_path`,
 `plan_path`, unchanged `work_kind`, unchanged `plan_route`,

@@ -1,0 +1,1272 @@
+#!/usr/bin/env python3
+"""Resolve workflow-owned project memory using the qualified sibling core."""
+from __future__ import annotations
+
+import importlib.util
+from dataclasses import asdict
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import tomllib
+import hashlib
+
+sys.dont_write_bytecode = True
+
+MAX_BOOTSTRAP_REQUEST = 64 * 1024
+MAX_NATIVE_OUTPUT = 1024 * 1024
+MAX_NATIVE_TASKS = 256
+NATIVE_TASK_PAGE_LIMIT = 100
+MAX_RECEIPT_BYTES = 1024 * 1024
+MAX_SOURCE_FILE_BYTES = 8 * 1024 * 1024
+MAX_SOURCE_FILES = 256
+MAX_SOURCE_RECEIPT_FILES = 512
+MAX_HELPERS = 64
+KEY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+OID_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
+INSTALLATION_BINDING_FIELDS = {
+    "schema", "project_id", "primary_root", "primary_workspace_id", "profile_sha256",
+    "receipt_path", "receipt_sha256", "kit_root", "source_ref", "kit_ref",
+    "ci_helper", "helper_bindings",
+}
+PUBLICATION_RECEIPT_FIELDS = {
+    "schema", "project_id", "workflow_id", "source_commit", "kit_commit",
+    "runtime_roots", "files", "policy", "project_memory",
+}
+PREADMISSION: dict[str, object] | None = None
+
+
+def bootstrap_json(raw: bytes):
+    def pairs(items):
+        result = {}
+        for name, value in items:
+            if name in result:
+                raise ValueError("duplicate JSON key")
+            result[name] = value
+        return result
+
+    def invalid_constant(_value):
+        raise ValueError("nonfinite JSON number")
+
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs,
+                          parse_constant=invalid_constant)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("invalid JSON") from error
+
+
+def bootstrap_key(value):
+    if not isinstance(value, str) or not KEY_PATTERN.fullmatch(value):
+        raise ValueError("invalid native identity")
+    return value
+
+
+def bootstrap_closed(value, fields, schema=None):
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise ValueError("invalid source-admission fields")
+    if schema is not None and value.get("schema") != schema:
+        raise ValueError("invalid source-admission schema")
+
+
+def canonical_root(value):
+    if (not isinstance(value, str) or not Path(value).is_absolute()
+            or ".." in Path(value).parts or str(Path(value)) != value):
+        raise ValueError("source root must be canonical and absolute")
+    path = Path(value)
+    if path.resolve(strict=True) != path:
+        raise ValueError("source root binding differs")
+    return path
+
+
+def read_fd(fd, name, *, maximum, private):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    descriptor = os.open(name, flags, dir_fd=fd)
+    try:
+        before = os.fstat(descriptor)
+        forbidden = (0o077 if private else 0o7022) | 0o7000
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_uid != os.getuid() or before.st_mode & forbidden
+                or before.st_size > maximum):
+            raise ValueError("unsafe source-admission file")
+        chunks = []
+        size = 0
+        while True:
+            block = os.read(descriptor, min(65536, maximum + 1 - size))
+            if not block:
+                break
+            size += len(block)
+            if size > maximum:
+                raise ValueError("source-admission file exceeds limit")
+            chunks.append(block)
+        after = os.fstat(descriptor)
+        identity = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink",
+                    "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, field) != getattr(after, field) for field in identity):
+            raise ValueError("source-admission file changed during read")
+        linked = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if (linked.st_dev, linked.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("source-admission file binding changed")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def load_core(kit_root: Path, receipt: dict):
+    source = kit_root / ".kent/scripts/workflow_project_memory.py"
+    info = source.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
+        raise ValueError("unsafe installed memory core")
+    item = next((item for item in receipt["files"]
+                 if item.get("root") == str(kit_root)
+                 and item.get("relative_path") == ".kent/scripts/workflow_project_memory.py"), None)
+    if not isinstance(item, dict):
+        raise ValueError("qualified installed memory core is absent")
+    raw = record_bytes(None, source, private=False)
+    if (len(raw) != item["byte_size"]
+            or hashlib.sha256(raw).hexdigest() != item["sha256"]):
+        raise ValueError("qualified installed memory core differs")
+    spec = importlib.util.spec_from_file_location("workflow_project_memory", source)
+    if spec is None or spec.loader is None:
+        raise ValueError("installed memory core unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def git_root(value: object) -> Path:
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise ValueError("workspace must be absolute")
+    path = Path(value)
+    if str(path.resolve()) != value:
+        raise ValueError("workspace must be canonical")
+    result = subprocess.run(["git", "-C", value, "rev-parse", "--show-toplevel"],
+                            capture_output=True, text=True, timeout=15, check=True)
+    if result.stdout.strip() != value:
+        raise ValueError("workspace must be Git root")
+    return path
+
+
+def native_json(arguments, workspace):
+    result = bootstrap_json(native_read(arguments, workspace))
+    if not isinstance(result, dict):
+        raise ValueError("invalid native readback")
+    return result
+
+
+def resolve_standalone(core, request):
+    workspace = git_root(request["workspace_path"])
+    expected = PREADMISSION
+    project_id = native_project_id(workspace)
+    primary = native_primary(project_id, workspace)
+    if (not isinstance(expected, dict) or expected.get("mode") != "r2"
+            or expected.get("standalone") is not True
+            or expected.get("project_id") != project_id
+            or expected.get("primary_root") != str(primary)
+            or expected.get("workspace") != str(workspace)):
+        raise ValueError("standalone source pre-admission identity changed")
+    if os.environ.get("KENT_TASK_ID"):
+        raise ValueError("standalone binding conflicts with native task")
+    binding = request["standalone_binding"]
+    if not isinstance(binding, dict) or set(binding) != {
+            "project_path", "project_uid", "task_key", "task_uid", "task_binding_sha256"}:
+        raise ValueError("invalid standalone binding")
+    binding_digest = hashlib.sha256(json.dumps(
+        binding, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False).encode("utf-8")).hexdigest()
+    if binding_digest != expected.get("standalone_binding_sha256"):
+        raise ValueError("standalone binding changed after source admission")
+    profile_path = workspace / ".kent/workflow-profile.toml"
+    profile = tomllib.loads(record_bytes(core, profile_path, private=False).decode())
+    config = profile.get("project_memory")
+    if not isinstance(config, dict) or set(config) != {
+            "root", "project_key", "project_uid", "mode"} or config["mode"] != "r2":
+        raise ValueError("R2 profile required")
+    store = core.ProjectMemory(Path(config["root"]), config["project_key"], config["project_uid"])
+    store._project()
+    task = store._task(binding["task_key"])
+    if (binding["project_path"] != str(store.path)
+            or binding["project_uid"] != store.project_uid
+            or binding["task_uid"] != task["task_uid"] or task["external_refs"]):
+        raise ValueError("standalone identity mismatch")
+    relative = f"tasks/{binding['task_key']}"
+    with store._directory(relative) as fd:
+        digest = core._digest(core._read(fd, "task.json"))
+    if digest != binding["task_binding_sha256"]:
+        raise ValueError("standalone task digest mismatch")
+    locator = {"path": str(store.path / relative / "task.json"), "sha256": digest}
+    return store, binding["task_key"], locator
+
+
+def native_read(arguments, workspace):
+    executable = shutil.which("kent")
+    if executable is None:
+        raise ValueError("Kent executable unavailable")
+    with tempfile.TemporaryFile() as output:
+        subprocess.run([executable, *arguments], cwd=workspace, stdout=output,
+                       stderr=subprocess.DEVNULL, timeout=30, check=True)
+        output.seek(0)
+        raw = output.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError("native readback exceeds limit")
+    return raw
+
+
+def legacy_admission(core, primary, project_id):
+    profile = primary / ".kent/workflow-profile.toml"
+    config = None
+    if os.path.lexists(profile):
+        config = tomllib.loads(record_bytes(core, profile, private=False).decode()).get("project_memory")
+    binding = Path.home() / ".kent/project-memory-bindings" / f"{project_id}.json"
+    if config is None and not os.path.lexists(binding):
+        return None, None, None
+    raise ValueError("native R2 source admission required")
+
+
+def record_bytes(core, path, *, private=True, maximum=8 * 1024 * 1024):
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("private record requires absolute path")
+    descriptors = [os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
+    chain = []
+    try:
+        for name in path.parent.parts[1:]:
+            parent = descriptors[-1]
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=parent)
+            descriptors.append(child)
+            chain.append((parent, name, child))
+        info = os.fstat(descriptors[-1])
+        forbidden = 0o077 if private else 0o022
+        if info.st_uid != os.getuid() or info.st_mode & forbidden or info.st_mode & 0o7000:
+            raise ValueError("record directory is unsafe")
+        raw = read_fd(descriptors[-1], path.name, maximum=maximum, private=private)
+        for parent, name, child in chain:
+            linked = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            opened = os.fstat(child)
+            if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ValueError("private record directory changed")
+        return raw
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def absolute_binding(value):
+    if (not isinstance(value, str) or not Path(value).is_absolute()
+            or ".." in Path(value).parts or str(Path(value)) != value):
+        raise ValueError("invalid absolute installation binding")
+    return Path(value)
+
+
+def installation_records(project_id, primary, primary_workspace_id=None):
+    profile_path = primary / ".kent/workflow-profile.toml"
+    binding_path = Path.home() / ".kent/project-memory-bindings" / f"{project_id}.json"
+    profile_raw = None
+    if os.path.lexists(profile_path):
+        profile_raw = record_bytes(None, profile_path, private=False,
+                                   maximum=MAX_NATIVE_OUTPUT)
+        profile = tomllib.loads(profile_raw.decode("utf-8"))
+    else:
+        profile = {}
+    config = profile.get("project_memory")
+    if not os.path.lexists(binding_path):
+        if config is None:
+            return {"mode": "legacy", "project_id": project_id,
+                    "primary_root": str(primary), "primary_workspace_id": primary_workspace_id,
+                    "binding_sha256": None, "receipt": None, "binding": None}
+        raise ValueError("native R2 source binding unavailable")
+
+    binding_raw = record_bytes(None, binding_path, private=True,
+                               maximum=MAX_NATIVE_OUTPUT)
+    binding = bootstrap_json(binding_raw)
+    bootstrap_closed(binding, INSTALLATION_BINDING_FIELDS, "r2-installation-binding-v2")
+    if (binding["project_id"] != project_id
+            or binding["primary_root"] != str(primary)
+            or (primary_workspace_id is not None
+                and binding["primary_workspace_id"] != primary_workspace_id)):
+        raise ValueError("installed project binding differs")
+    bootstrap_key(binding["project_id"])
+    bootstrap_key(binding["primary_workspace_id"])
+    if not isinstance(binding["profile_sha256"], str) or not SHA256_PATTERN.fullmatch(
+            binding["profile_sha256"]):
+        raise ValueError("invalid installed profile digest")
+    if profile_raw is None or hashlib.sha256(profile_raw).hexdigest() != binding["profile_sha256"]:
+        raise ValueError("qualified primary profile differs")
+    if not isinstance(config, dict) or set(config) != {
+            "root", "project_key", "project_uid", "mode"} or config["mode"] != "r2":
+        raise ValueError("installed R2 configuration incomplete")
+    absolute_binding(config["root"])
+    bootstrap_key(config["project_key"])
+    bootstrap_key(config["project_uid"])
+
+    receipt_path = absolute_binding(binding["receipt_path"])
+    kit_root = canonical_root(binding["kit_root"])
+    if (not isinstance(binding["receipt_sha256"], str)
+            or not SHA256_PATTERN.fullmatch(binding["receipt_sha256"])):
+        raise ValueError("invalid pinned receipt digest")
+    if not isinstance(binding["source_ref"], str) or not binding["source_ref"]:
+        raise ValueError("invalid pinned project publication ref")
+    if not isinstance(binding["kit_ref"], str) or not binding["kit_ref"]:
+        raise ValueError("invalid pinned Kit publication ref")
+    ci_helper = absolute_binding(binding["ci_helper"])
+    helper_bindings = binding["helper_bindings"]
+    if not isinstance(helper_bindings, list) or len(helper_bindings) > MAX_HELPERS:
+        raise ValueError("invalid installed helper inventory")
+    normalized_helpers = []
+    seen_links = set()
+    for item in helper_bindings:
+        bootstrap_closed(item, {"link", "target"})
+        link = absolute_binding(item["link"])
+        target = absolute_binding(item["target"])
+        if str(link) in seen_links:
+            raise ValueError("duplicate installed helper binding")
+        seen_links.add(str(link))
+        normalized_helpers.append((str(link), str(target)))
+    expected_adapter_link = Path.home() / ".kent/bin/kent-project-memory"
+    expected_adapter_target = kit_root / ".kent/scripts/workflow-project-memory"
+    if ((str(expected_adapter_link), str(expected_adapter_target)) not in normalized_helpers
+            or ci_helper != Path.home() / ".kent/bin/kent-prepare-github-ci"):
+        raise ValueError("installed Kit helper bindings differ")
+
+    receipt_raw = record_bytes(None, receipt_path, private=True, maximum=MAX_RECEIPT_BYTES)
+    if hashlib.sha256(receipt_raw).hexdigest() != binding["receipt_sha256"]:
+        raise ValueError("source receipt differs")
+    receipt = bootstrap_json(receipt_raw)
+    bootstrap_closed(receipt, PUBLICATION_RECEIPT_FIELDS, "delivery-runtime-publication-v1")
+    if (receipt["project_id"] != project_id
+            or receipt["policy"] != "delivery_reliability_v1"):
+        raise ValueError("source receipt binding differs")
+    bootstrap_key(receipt["workflow_id"])
+    for name in ("source_commit", "kit_commit"):
+        if not isinstance(receipt[name], str) or not OID_PATTERN.fullmatch(receipt[name]):
+            raise ValueError("invalid published commit")
+    roots = receipt["runtime_roots"]
+    if (not isinstance(roots, list) or not roots or len(roots) > MAX_SOURCE_FILES
+            or any(not isinstance(root, str) for root in roots)
+            or len(set(roots)) != len(roots)):
+        raise ValueError("invalid published runtime roots")
+    normalized_roots = [str(canonical_root(root)) for root in roots]
+    if (str(primary) not in normalized_roots or str(kit_root) not in normalized_roots):
+        raise ValueError("published roots differ from installed bindings")
+    memory = receipt["project_memory"]
+    bootstrap_closed(memory, {"root", "project_key", "project_uid", "legacy_task_ids"})
+    if any(memory[name] != config[name] for name in ("root", "project_key", "project_uid")):
+        raise ValueError("cutover memory configuration differs")
+    legacy = memory["legacy_task_ids"]
+    if (not isinstance(legacy, list) or len(legacy) > MAX_SOURCE_FILES
+            or any(not isinstance(item, str) for item in legacy)
+            or len(set(legacy)) != len(legacy)):
+        raise ValueError("invalid legacy task inventory")
+    for task_id in legacy:
+        bootstrap_key(task_id)
+    if (not isinstance(receipt["files"], list)
+            or len(receipt["files"]) > MAX_SOURCE_RECEIPT_FILES):
+        raise ValueError("invalid source receipt file inventory")
+    return {
+        "mode": "r2", "project_id": project_id, "primary_root": str(primary),
+        "primary_workspace_id": primary_workspace_id,
+        "binding": binding, "binding_sha256": hashlib.sha256(binding_raw).hexdigest(),
+        "profile_sha256": binding["profile_sha256"], "receipt": receipt,
+        "receipt_sha256": binding["receipt_sha256"], "kit_root": str(kit_root),
+        "normalized_helpers": normalized_helpers, "config": config,
+    }
+
+
+def native_project_id(workspace):
+    return bootstrap_key(native_read(["project", str(workspace)], workspace).decode().strip())
+
+
+def native_primary(project_id, workspace):
+    rows = native_read(["project", "list"], workspace).decode("utf-8").splitlines()
+    if len(rows) > 256:
+        raise ValueError("native project inventory incomplete")
+    matches = [row.split("\t") for row in rows
+               if row.split("\t", 1)[0] == project_id]
+    if len(matches) != 1 or len(matches[0]) != 3:
+        raise ValueError("native primary workspace unresolved")
+    primary = git_root(str(Path(matches[0][2]).expanduser()))
+    if native_project_id(primary) != project_id:
+        raise ValueError("native primary project mismatch")
+    return primary
+
+
+def native_current_session(task, session_id):
+    return any(isinstance(item, dict) and item.get("session_id") == session_id
+               for field in ("current_nodes", "live_sessions")
+               for item in (task.get(field) if isinstance(task.get(field), list) else []))
+
+
+def native_task_for_session(workspace, project_id, session_id):
+    task_ids = []
+    seen = set()
+    offset = 0
+    while True:
+        inventory = native_json([
+            "task", "list", "--project", project_id, "--limit",
+            str(NATIVE_TASK_PAGE_LIMIT), "--offset", str(offset), "--json",
+        ], workspace)
+        scope = inventory.get("scope")
+        tasks = inventory.get("tasks")
+        if (not isinstance(scope, dict) or scope.get("project_id") != project_id
+                or not isinstance(tasks, list) or len(tasks) > NATIVE_TASK_PAGE_LIMIT
+                or len(task_ids) + len(tasks) > MAX_NATIVE_TASKS):
+            raise ValueError("native task inventory incomplete")
+        page_ids = []
+        for item in tasks:
+            if not isinstance(item, dict):
+                raise ValueError("invalid native task inventory")
+            task_id = bootstrap_key(item.get("task_id"))
+            if task_id in seen:
+                raise ValueError("duplicate native task")
+            seen.add(task_id)
+            page_ids.append(task_id)
+        task_ids.extend(page_ids)
+
+        next_offset = inventory.get("next_offset")
+        expected_offset = offset + len(page_ids)
+        if next_offset is not None:
+            if (type(next_offset) is not int or not page_ids
+                    or next_offset != expected_offset):
+                raise ValueError("native task page offset differs")
+            offset = next_offset
+            continue
+        if not page_ids:
+            break
+        # Some Kent versions omit next_offset on exhausted pages. Probe the
+        # following offset even for a short page; a full page is never proof
+        # that the bounded inventory is complete.
+        offset = expected_offset
+
+    matches = []
+    for task_id in task_ids:
+        detail = native_json(
+            ["task", "show", task_id, "--project", project_id, "--json"], workspace)
+        summary = detail.get("summary")
+        if (not isinstance(summary, dict) or summary.get("id") != task_id
+                or summary.get("project_id") != project_id):
+            raise ValueError("native task identity differs")
+        if native_current_session(detail, session_id):
+            matches.append(detail)
+    if len(matches) > 1:
+        raise ValueError("ambiguous native Session ownership")
+    return matches[0] if matches else None
+
+
+def native_task_context(request, workspace, project_id):
+    script = request.get("native_context")
+    task_id = os.environ.get("KENT_TASK_ID")
+    session_id = os.environ.get("KENT_SESSION_ID")
+    locator = request.get("task_locator")
+    if locator is not None:
+        bootstrap_key(locator)
+        if script is not None or not session_id or (task_id and task_id != locator):
+            raise ValueError("Task locator conflicts with inherited ownership")
+        task_id = locator
+    initializing = request.get("operation") == "initialize-task"
+    if script is not None:
+        if (not isinstance(script, dict) or set(script) not in (
+                {"task_id", "node_id"},
+                {"task_id", "node_id", "transition_branch_key"})
+                or task_id or session_id or initializing):
+            raise ValueError("invalid native Script context")
+        for value in script.values():
+            bootstrap_key(value)
+        task_id = script["task_id"]
+    elif task_id:
+        bootstrap_key(task_id)
+    elif session_id:
+        bootstrap_key(session_id)
+        task = native_task_for_session(workspace, project_id, session_id)
+        task_id = task["summary"]["id"] if task is not None else None
+        if task is not None:
+            return task, script, session_id
+    if not task_id:
+        return None, script, None
+    if script is None and not session_id:
+        raise ValueError("native Session identity unavailable")
+    task = native_json(
+        ["task", "show", task_id, "--project", project_id, "--json"], workspace)
+    summary = task.get("summary")
+    if (not isinstance(summary, dict) or summary.get("id") != task_id
+            or summary.get("project_id") != project_id):
+        raise ValueError("native task identity differs")
+    if script is not None:
+        scripts = task.get("current_scripts")
+        if not isinstance(scripts, list) or not any(
+                isinstance(item, dict) and isinstance(item.get("current_node"), dict)
+                and item["current_node"].get("node_id") == script["node_id"]
+                and item["current_node"].get("transition_branch_key")
+                == script.get("transition_branch_key")
+                and not item["current_node"].get("session_id")
+                for item in scripts):
+            raise ValueError("native Script ownership differs")
+    elif not native_current_session(task, session_id):
+        raise ValueError("native Session ownership differs")
+    return task, script, session_id
+
+
+def run_source_inspector(installation, project_id, primary, workspace):
+    binding = installation["binding"]
+    receipt = installation["receipt"]
+    kit_root = Path(installation["kit_root"])
+    inspector = kit_root / "scripts/inspect-delivery-source"
+    inspector_entries = [item for item in receipt["files"]
+                         if isinstance(item, dict)
+                         and item.get("root") == str(kit_root)
+                         and item.get("relative_path") == "scripts/inspect-delivery-source"]
+    if len(inspector_entries) != 1:
+        raise ValueError("pinned source inspector is absent")
+    inspector_entry = inspector_entries[0]
+    bootstrap_closed(inspector_entry, {
+        "root", "relative_path", "sha256", "byte_size", "mode",
+    })
+    if (not isinstance(inspector_entry["sha256"], str)
+            or not SHA256_PATTERN.fullmatch(inspector_entry["sha256"])
+            or type(inspector_entry["byte_size"]) is not int
+            or not 0 <= inspector_entry["byte_size"] <= MAX_SOURCE_FILE_BYTES
+            or type(inspector_entry["mode"]) is not int
+            or not 0 <= inspector_entry["mode"] <= 0o777
+            or inspector_entry["mode"] & 0o022):
+        raise ValueError("invalid pinned source inspector metadata")
+    inspector_raw = record_bytes(None, inspector, private=False,
+                                 maximum=MAX_SOURCE_FILE_BYTES)
+    inspector_info = inspector.lstat()
+    if (hashlib.sha256(inspector_raw).hexdigest() != inspector_entry["sha256"]
+            or len(inspector_raw) != inspector_entry["byte_size"]
+            or not stat.S_ISREG(inspector_info.st_mode)
+            or bool(inspector_entry["mode"] & 0o100)
+            != bool(inspector_info.st_mode & 0o100)):
+        raise ValueError("installed source inspector differs from pinned receipt")
+    arguments = [
+        "--receipt", binding["receipt_path"],
+        "--receipt-sha256", binding["receipt_sha256"], "--project-id", project_id,
+        "--workflow-id", receipt["workflow_id"], "--project-root", str(primary),
+        "--kit-root", str(kit_root), "--primary-root", str(primary),
+        "--workspace", str(workspace), "--source-ref", binding["source_ref"],
+        "--kit-ref", binding["kit_ref"], "--ci-helper", binding["ci_helper"],
+    ]
+    for link, target in installation["normalized_helpers"]:
+        arguments.extend(("--installed-helper", link, target))
+    executor = (
+        "import sys\n"
+        "filename = sys.argv.pop(1)\n"
+        "sys.argv[0] = filename\n"
+        "source = sys.stdin.buffer.read(8388609)\n"
+        "if len(source) > 8388608:\n"
+        "    raise SystemExit(2)\n"
+        "namespace = {'__file__': filename, '__name__': '__main__'}\n"
+        "exec(compile(source, filename, 'exec'), namespace)\n"
+    )
+    command = [sys.executable, "-I", "-S", "-c", executor, str(inspector), *arguments]
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.run(command, cwd=workspace, input=inspector_raw,
+                                 stdout=output, stderr=subprocess.DEVNULL,
+                                 timeout=120, check=False)
+        output.seek(0)
+        raw = output.read(MAX_NATIVE_OUTPUT + 1)
+    if process.returncode != 0 or len(raw) > MAX_NATIVE_OUTPUT:
+        raise ValueError("delivery source is not admitted")
+    result = bootstrap_json(raw)
+    bootstrap_closed(result, {
+        "schema", "status", "project_id", "workflow_id", "receipt_sha256",
+        "source_commit", "kit_commit", "file_count", "source_bytes",
+        "workspace_path", "source_ref", "source_ref_commit", "kit_ref",
+        "kit_ref_commit", "python_cache_tag",
+    }, "delivery-source-inspection-v1")
+    if (result["status"] != "admitted" or result["project_id"] != project_id
+            or result["workflow_id"] != receipt["workflow_id"]
+            or result["receipt_sha256"] != installation["receipt_sha256"]
+            or result["source_commit"] != receipt["source_commit"]
+            or result["kit_commit"] != receipt["kit_commit"]
+            or result["workspace_path"] != str(workspace)
+            or result["source_ref"] != binding["source_ref"]
+            or result["kit_ref"] != binding["kit_ref"]
+            or type(result["file_count"]) is not int
+            or not 0 <= result["file_count"] <= MAX_SOURCE_RECEIPT_FILES
+            or type(result["source_bytes"]) is not int
+            or not 0 <= result["source_bytes"] <= 32 * 1024 * 1024):
+        raise ValueError("delivery source admission binding differs")
+    return result
+
+
+def confirm_source_binding(installation):
+    binding_path = (Path.home() / ".kent/project-memory-bindings"
+                    / f'{installation["project_id"]}.json')
+    binding_raw = record_bytes(None, binding_path, private=True,
+                               maximum=MAX_NATIVE_OUTPUT)
+    if hashlib.sha256(binding_raw).hexdigest() != installation["binding_sha256"]:
+        raise ValueError("native installation binding changed during admission")
+    receipt_raw = record_bytes(
+        None, Path(installation["binding"]["receipt_path"]), private=True,
+        maximum=MAX_RECEIPT_BYTES)
+    if hashlib.sha256(receipt_raw).hexdigest() != installation["receipt_sha256"]:
+        raise ValueError("source receipt changed during admission")
+    profile_raw = record_bytes(
+        None, Path(installation["primary_root"]) / ".kent/workflow-profile.toml",
+        private=False, maximum=MAX_NATIVE_OUTPUT)
+    if hashlib.sha256(profile_raw).hexdigest() != installation["profile_sha256"]:
+        raise ValueError("primary profile changed during admission")
+
+
+def preflight_source_admission(interface, request):
+    workspace = git_root(request.get("workspace_path"))
+    standalone = interface == "mcp" and "standalone_binding" in request
+    if standalone and "task_locator" in request:
+        raise ValueError("standalone binding conflicts with Task locator")
+    if interface == "workflow" and request.get("operation") == "resolve-janitor":
+        bootstrap_closed(request, {
+            "schema", "operation", "workspace_path", "native_context",
+        }, "r2-workflow-request-v1")
+        context = request["native_context"]
+        if (not isinstance(context, dict) or set(context) not in (
+                {"task_id", "node_id"},
+                {"task_id", "node_id", "transition_branch_key"})
+                or os.environ.get("KENT_TASK_ID") or os.environ.get("KENT_SESSION_ID")):
+            raise ValueError("Janitor source resolution requires native Script identity")
+        for value in context.values():
+            bootstrap_key(value)
+    if standalone:
+        if os.environ.get("KENT_TASK_ID"):
+            raise ValueError("standalone binding conflicts with native task")
+        project_id = native_project_id(workspace)
+        primary = native_primary(project_id, workspace)
+        installation = installation_records(project_id, primary)
+        if installation["mode"] != "r2":
+            raise ValueError("standalone R2 source binding unavailable")
+        inspection = run_source_inspector(installation, project_id, primary, workspace)
+        confirm_source_binding(installation)
+        return {
+            **installation, "mode": "r2", "interface": interface,
+            "standalone": True, "workspace": str(workspace), "task_id": None,
+            "inspection": inspection,
+            "standalone_binding_sha256": hashlib.sha256(json.dumps(
+                request["standalone_binding"], ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest(),
+        }
+
+    project_id = native_project_id(workspace)
+    task, script, session_id = native_task_context(request, workspace, project_id)
+    if task is None:
+        primary = native_primary(project_id, workspace)
+        installation = installation_records(project_id, primary)
+        if installation["mode"] == "legacy":
+            return {
+                **installation, "interface": interface, "standalone": False,
+                "workspace": str(workspace), "task_id": None,
+                "primary_workspace_id": None,
+            }
+        raise ValueError("native Task ownership required for R2 admission")
+
+    summary = task["summary"]
+    source = task.get("source_workspace")
+    if not isinstance(source, dict) or source.get("is_primary") is not True:
+        raise ValueError("native primary workspace unresolved")
+    primary = git_root(source.get("root_path"))
+    workspace_id = source.get("workspace_id")
+    bootstrap_key(workspace_id)
+    if (task.get("project", {}).get("default_workspace_id") != workspace_id
+            or str(workspace) != (task.get("worktree_path") or str(primary))):
+        raise ValueError("native task workspace differs")
+    installation = installation_records(project_id, primary, workspace_id)
+    task_id = summary["id"]
+    if installation["mode"] == "legacy":
+        return {
+            **installation, "interface": interface, "standalone": False,
+            "workspace": str(workspace), "task_id": task_id,
+            "primary_workspace_id": workspace_id,
+        }
+    if task_id in installation["receipt"]["project_memory"]["legacy_task_ids"]:
+        task_key = bootstrap_key(summary.get("short_id"))
+        memory_root = Path(installation["config"]["root"])
+        legacy_task_path = (memory_root / installation["config"]["project_key"]
+                            / "tasks" / task_key)
+        if os.path.lexists(legacy_task_path):
+            raise ValueError("legacy Task conflicts with R2 identity")
+        return {
+            **installation, "mode": "legacy", "interface": interface,
+            "standalone": False, "workspace": str(workspace), "task_id": task_id,
+            "primary_workspace_id": workspace_id,
+        }
+    inspection = run_source_inspector(installation, project_id, primary, workspace)
+    confirm_source_binding(installation)
+    return {
+        **installation, "mode": "r2", "interface": interface, "standalone": False,
+        "workspace": str(workspace), "task_id": task_id,
+        "primary_workspace_id": workspace_id, "session_id": session_id,
+        "inspection": inspection,
+    }
+
+
+def receipt_file(installation, relative_path):
+    kit_root = Path(installation["kit_root"])
+    entries = [item for item in installation["receipt"]["files"]
+               if isinstance(item, dict) and item.get("root") == str(kit_root)
+               and item.get("relative_path") == relative_path]
+    if len(entries) != 1:
+        raise ValueError("qualified Kit runtime source is absent")
+    item = entries[0]
+    bootstrap_closed(item, {"root", "relative_path", "sha256", "byte_size", "mode"})
+    if (not isinstance(item["sha256"], str) or not SHA256_PATTERN.fullmatch(item["sha256"])
+            or type(item["byte_size"]) is not int
+            or not 0 <= item["byte_size"] <= MAX_SOURCE_FILE_BYTES
+            or type(item["mode"]) is not int or not 0 <= item["mode"] <= 0o777
+            or item["mode"] & 0o022):
+        raise ValueError("invalid qualified Kit runtime metadata")
+    path = kit_root / relative_path
+    raw = record_bytes(None, path, private=False, maximum=MAX_SOURCE_FILE_BYTES)
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or len(raw) != item["byte_size"]
+            or hashlib.sha256(raw).hexdigest() != item["sha256"]
+            or stat.S_IMODE(info.st_mode) != item["mode"]):
+        raise ValueError("qualified Kit runtime source changed")
+    return raw, {"path": str(path), "sha256": item["sha256"],
+                 "byte_size": item["byte_size"], "mode": item["mode"]}
+
+
+def qualified_kit_janitor(installation):
+    if not isinstance(installation, dict) or installation.get("mode") != "r2":
+        raise ValueError("qualified Kit Janitor requires R2 source admission")
+    profile_raw, _ = receipt_file(installation, ".kent/workflow-profile.toml")
+    profile = tomllib.loads(profile_raw.decode("utf-8"))
+    commands = profile.get("commands")
+    if not isinstance(commands, dict):
+        raise ValueError("qualified Kit Janitor commands are unavailable")
+    janitor = commands.get("janitor")
+    runtime = commands.get("runtime_contracts")
+    if (janitor != ".kent/scripts/workflow-task-janitor"
+            or runtime != ".kent/scripts/workflow_runtime_contracts.py"):
+        raise ValueError("qualified Kit Janitor profile differs")
+    _, janitor_descriptor = receipt_file(installation, janitor)
+    _, runtime_descriptor = receipt_file(installation, runtime)
+    if not janitor_descriptor["mode"] & 0o100:
+        raise ValueError("qualified Kit Janitor is not executable")
+    return {
+        "schema": "r2-janitor-source-binding-v1",
+        "mode": "r2",
+        "janitor": janitor_descriptor,
+        "runtime_siblings": [runtime_descriptor],
+    }
+
+
+def assert_preadmission(project_id, workspace, primary, task_id, workspace_id):
+    expected = PREADMISSION
+    if (not isinstance(expected, dict) or expected.get("mode") != "r2"
+            or expected.get("standalone") is not False
+            or expected.get("project_id") != project_id
+            or expected.get("workspace") != str(workspace)
+            or expected.get("primary_root") != str(primary)
+            or expected.get("task_id") != task_id
+            or expected.get("primary_workspace_id") != workspace_id):
+        raise ValueError("native source pre-admission identity changed")
+
+
+def admitted_native_store(core, primary, project_id, primary_workspace_id, summary, *,
+                          initialize=False, source_refs=None):
+    expected = PREADMISSION
+    if (not isinstance(expected, dict) or expected.get("mode") != "r2"
+            or expected.get("standalone") is not False):
+        raise ValueError("native source pre-admission required")
+    assert_preadmission(project_id, Path(expected["workspace"]), primary,
+                        summary["id"], primary_workspace_id)
+    profile_path = primary / ".kent/workflow-profile.toml"
+    binding_path = Path.home() / ".kent/project-memory-bindings" / f"{project_id}.json"
+    if not os.path.lexists(binding_path):
+        raise ValueError("native R2 installation binding unavailable")
+    binding_raw = record_bytes(core, binding_path, maximum=MAX_NATIVE_OUTPUT)
+    binding = core._json(binding_raw)
+    core._closed(binding, INSTALLATION_BINDING_FIELDS, "r2-installation-binding-v2")
+    if hashlib.sha256(binding_raw).hexdigest() != expected.get("binding_sha256"):
+        raise ValueError("native installation binding changed after source admission")
+    if (binding["project_id"] != project_id or binding["primary_root"] != str(primary)
+            or binding["primary_workspace_id"] != primary_workspace_id):
+        raise ValueError("installed project binding differs")
+    if (binding["receipt_sha256"] != expected.get("receipt_sha256")
+            or binding["profile_sha256"] != expected.get("profile_sha256")
+            or binding["kit_root"] != expected.get("kit_root")):
+        raise ValueError("native source binding differs from admission")
+    profile_raw = record_bytes(core, profile_path, private=False)
+    if len(profile_raw) > core.MAX_BYTES or core._digest(profile_raw) != binding["profile_sha256"]:
+        raise ValueError("qualified primary profile differs")
+    config = tomllib.loads(profile_raw.decode()).get("project_memory")
+    if (not isinstance(config, dict) or set(config) != {"root", "project_key", "project_uid", "mode"}
+            or config["mode"] != "r2"):
+        raise ValueError("installed R2 configuration incomplete")
+    receipt_raw = record_bytes(core, Path(binding["receipt_path"]),
+                               maximum=MAX_RECEIPT_BYTES)
+    if core._digest(receipt_raw) != binding["receipt_sha256"]:
+        raise ValueError("source receipt differs")
+    receipt = core._json(receipt_raw)
+    core._closed(receipt, {"schema", "project_id", "workflow_id", "source_commit", "kit_commit",
+                           "runtime_roots", "files", "policy", "project_memory"},
+                 "delivery-runtime-publication-v1")
+    if receipt["project_id"] != project_id:
+        raise ValueError("foreign source receipt")
+    core._key(receipt["workflow_id"])
+    if receipt["policy"] != "delivery_reliability_v1":
+        raise ValueError("unsupported source policy")
+    for key in ("source_commit", "kit_commit"):
+        if not isinstance(receipt[key], str) or not re.fullmatch(r"[0-9a-f]{40}", receipt[key]):
+            raise ValueError("invalid published commit")
+    roots = receipt["runtime_roots"]
+    if (not isinstance(roots, list) or not roots or len(roots) > 256
+            or any(not isinstance(root, str) or not Path(root).is_absolute()
+                   or ".." in Path(root).parts for root in roots)
+            or len(set(roots)) != len(roots)):
+        raise ValueError("invalid runtime roots")
+    memory = receipt["project_memory"]
+    if not isinstance(memory, dict) or set(memory) != {
+            "root", "project_key", "project_uid", "legacy_task_ids"}:
+        raise ValueError("invalid cutover memory declaration")
+    if any(memory[key] != config[key] for key in ("root", "project_key", "project_uid")):
+        raise ValueError("cutover configuration differs")
+    legacy = memory["legacy_task_ids"]
+    if (not isinstance(legacy, list) or len(legacy) > 256
+            or any(not isinstance(item, str) for item in legacy) or len(set(legacy)) != len(legacy)):
+        raise ValueError("invalid legacy task inventory")
+    for task_id in legacy:
+        core._key(task_id)
+    files = receipt["files"]
+    if not isinstance(files, list) or len(files) > MAX_SOURCE_RECEIPT_FILES:
+        raise ValueError("invalid source receipt file inventory")
+    seen = set()
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {
+                "root", "relative_path", "sha256", "byte_size", "mode"}:
+            raise ValueError("invalid source receipt entry")
+        relative = item["relative_path"]
+        if (not isinstance(relative, str) or not relative or Path(relative).is_absolute()
+                or any(part in ("", ".", "..") for part in relative.split("/"))
+                or item["root"] not in roots):
+            raise ValueError("source receipt path escapes runtime root")
+        core._token(item["sha256"])
+        if (type(item["byte_size"]) is not int or not 0 <= item["byte_size"] <= core.MAX_BYTES
+                or type(item["mode"]) is not int or not 0 <= item["mode"] <= 0o777
+                or item["mode"] & 0o022):
+            raise ValueError("invalid qualified source metadata")
+        identity = (item["root"], relative)
+        if identity in seen:
+            raise ValueError("duplicate qualified source")
+        seen.add(identity)
+    expected = [item for item in files if isinstance(item, dict)
+                and item.get("relative_path") == ".kent/workflow-profile.toml"
+                and item.get("sha256") == binding["profile_sha256"]
+                and item.get("byte_size") == len(profile_raw)]
+    if not expected:
+        raise ValueError("profile not included in qualified source receipt")
+    store = core.ProjectMemory(Path(config["root"]), config["project_key"], config["project_uid"])
+    store._project()
+    task_key = core._key(summary["short_id"])
+    if summary["id"] in legacy:
+        if os.path.lexists(store.path / "tasks" / task_key):
+            raise ValueError("legacy task conflicts with R2 binding")
+        return None, None, None
+    references = [{"namespace": "kent", "project_id": project_id, "task_id": summary["id"]}]
+    if source_refs is not None:
+        core._references(source_refs, {"project_uid", "task_uid", "sha256"}, digest_field=True)
+        for reference in source_refs:
+            if reference["project_uid"] != store.project_uid:
+                raise ValueError("intake source belongs to another project")
+            source_key = "intake-" + reference["task_uid"]
+            source_task = store._task(source_key)
+            if source_task["task_uid"] != reference["task_uid"] or source_task["external_refs"]:
+                raise ValueError("source is not standalone intake")
+            with store._directory(f"tasks/{source_key}") as fd:
+                source_raw = core._read(fd, "task.json")
+                core._read(fd, "intake.json")
+            if core._digest(source_raw) != reference["sha256"]:
+                raise ValueError("intake source digest differs")
+    try:
+        task = store._task(task_key)
+    except (core.MissingMemory, FileNotFoundError):
+        if not initialize:
+            raise
+        task = store.initialize_task(task_key, None, references, source_refs=source_refs)
+    if task["external_refs"] != references:
+        raise ValueError("native external task binding differs")
+    if source_refs is not None and task.get("source_refs") != source_refs:
+        raise ValueError("native intake source binding differs")
+    with store._directory(f"tasks/{task_key}") as fd:
+        digest = core._digest(core._read(fd, "task.json"))
+    return store, task_key, {"path": str(store.path / f"tasks/{task_key}/task.json"), "sha256": digest}
+
+
+def current_session(task, session_id):
+    return any(isinstance(item, dict) and item.get("session_id") == session_id
+               for key in ("current_nodes", "live_sessions")
+               for item in (task.get(key) if isinstance(task.get(key), list) else []))
+
+
+def resolve_native(core, request, *, initialize=False):
+    workspace = git_root(request["workspace_path"])
+    project_id = native_read(["project", str(workspace)], workspace).decode().strip()
+    core._key(project_id)
+    task_id = os.environ.get("KENT_TASK_ID")
+    session_id = os.environ.get("KENT_SESSION_ID")
+    script = request.get("native_context")
+    if script is not None:
+        if (not isinstance(script, dict) or set(script) not in (
+                {"task_id", "node_id"}, {"task_id", "node_id", "transition_branch_key"})
+                or task_id or session_id or initialize):
+            raise ValueError("invalid native script context")
+        for value in script.values():
+            core._key(value)
+        task_id = script["task_id"]
+    if not task_id and session_id:
+        core._key(session_id)
+        expected = PREADMISSION
+        if (isinstance(expected, dict) and expected.get("mode") == "r2"
+                and expected.get("project_id") == project_id
+                and expected.get("workspace") == str(workspace)
+                and expected.get("session_id") == session_id):
+            task_id = expected.get("task_id")
+        if not task_id:
+            raise ValueError("native Session locator differs from source pre-admission")
+    if not task_id:
+        raise ValueError("native Task ownership required after source admission")
+    task_id = core._key(task_id)
+    if script is None:
+        session_id = core._key(session_id)
+    task = core._json(native_read(
+        ["task", "show", task_id, "--project", project_id, "--json"], workspace))
+    summary = task.get("summary")
+    if (not isinstance(summary, dict) or summary.get("id") != task_id
+            or summary.get("project_id") != project_id):
+        raise ValueError("native task identity mismatch")
+    source = task.get("source_workspace")
+    if not isinstance(source, dict) or source.get("is_primary") is not True:
+        raise ValueError("native primary workspace unresolved")
+    primary = git_root(source.get("root_path"))
+    if (task.get("project", {}).get("default_workspace_id") != source.get("workspace_id")
+            or str(workspace) != (task.get("worktree_path") or str(primary))):
+        raise ValueError("native task workspace mismatch")
+    if script is not None:
+        scripts = task.get("current_scripts")
+        if not isinstance(scripts, list) or not any(
+                isinstance(item, dict) and isinstance(item.get("current_node"), dict)
+                and item["current_node"].get("node_id") == script["node_id"]
+                and item["current_node"].get("transition_branch_key") == script.get("transition_branch_key")
+                and not item["current_node"].get("session_id")
+                for item in scripts):
+            raise ValueError("current native script ownership unresolved")
+    elif not current_session(task, session_id):
+        raise ValueError("current native session ownership unresolved")
+    assert_preadmission(project_id, workspace, primary, task_id, source["workspace_id"])
+    return admitted_native_store(core, primary, project_id, source["workspace_id"], summary,
+                                 initialize=initialize, source_refs=request.get("source_refs"))
+
+
+def require_acceptance_script(core, request):
+    context = request.get("native_context")
+    if not isinstance(context, dict):
+        raise ValueError("acceptance requires graph-owned Script")
+    workspace = git_root(request["workspace_path"])
+    project = native_read(["project", str(workspace)], workspace).decode().strip()
+    task = core._json(native_read(
+        ["task", "show", context["task_id"], "--project", project, "--json"], workspace))
+    workflow = core._key(task["summary"]["workflow_id"])
+    graph = core._json(native_read(
+        ["workflow", "graph", "inspect", workflow, "--json"], workspace))
+    if graph.get("workflow_id") != workflow:
+        raise ValueError("acceptance graph identity differs")
+    profile = tomllib.loads(record_bytes(
+        core, workspace / ".kent/workflow-profile.toml", private=False).decode())
+    command = profile.get("commands", {}).get("plan_contract_accept")
+    if not isinstance(command, str) or not command:
+        raise ValueError("acceptance command unavailable")
+    nodes = [node for node in graph["graph"]["nodes"]
+             if node.get("id") == context["node_id"]]
+    if (len(nodes) != 1 or nodes[0].get("kind") != "script"
+            or nodes[0].get("script_path") != command):
+        raise ValueError("current graph node does not own acceptance")
+
+
+def workflow_dispatch(core, request, body=None):
+    operations = {
+        "resolve-task": set(), "initialize-task": set(),
+        "read": {"document_key"},
+        "publish": {"document_key", "expected_revision", "content", "operation_id", "provenance"},
+        "check-plan": {"coder_selection"},
+        "accepted-head": set(),
+        "resolve-plan": {"plan_path"},
+        "prepare-report-only": {"provenance"},
+        "accept-plan": {"expected_revision", "expected_accepted", "metadata"},
+        "artifact-write": {"sha256", "byte_size"},
+        "artifact-read": {"sha256"},
+    }
+    operation = request.get("operation")
+    if not isinstance(operation, str) or operation not in operations:
+        raise ValueError("unsupported workflow memory operation")
+    fields = {"schema", "operation", "workspace_path"} | operations[operation]
+    if "task_locator" in request:
+        fields.add("task_locator")
+    if "native_context" in request:
+        fields.add("native_context")
+    if operation == "initialize-task" and "source_refs" in request:
+        fields.add("source_refs")
+    core._closed(request, fields,
+                 "r2-workflow-request-v1")
+    store, task, locator = resolve_native(
+        core, request, initialize=operation == "initialize-task")
+    if store is None:
+        if operation not in ("resolve-task", "initialize-task"):
+            raise ValueError("R2 document operation unavailable for legacy task")
+        return {"mode": "legacy", "binding_ref": None}
+    if operation in ("artifact-write", "artifact-read"):
+        digest = request["sha256"]
+        core._token(digest)
+        if operation == "artifact-write":
+            size = request["byte_size"]
+            if (type(size) is not int or not 0 <= size <= core.MAX_BYTES
+                    or not isinstance(body, bytes) or len(body) != size
+                    or core._digest(body) != digest):
+                raise ValueError("artifact body differs")
+            revision = store.put_attachment(task, body)
+            path = revision.path
+            output = b""
+        else:
+            output = store.read_attachment(task, digest)
+            size = len(output)
+            path = store.path / f"tasks/{task}/artifacts/attachments/objects/{digest}"
+        return ({"schema": "r2-artifact-response-v1", "operation": operation,
+                 "object_sha256": digest, "byte_size": size, "object_path": str(path)}, output)
+    if operation == "accepted-head":
+        return {"accepted_snapshot": store.accepted_head(task)}
+    if operation == "resolve-plan":
+        current = store.read(f"tasks/{task}/plan")
+        supplied = (current if request["plan_path"] == "not-applicable"
+                    else store.plan_revision(task, request["plan_path"]))
+        return {"supplied_revision": supplied.token, "working_revision": current.token,
+                "working_path": str(current.path), "working_sha256": current.sha256}
+    if operation == "prepare-report-only":
+        require_acceptance_script(core, request)
+        revision = store.publish(
+            f"tasks/{task}/plan", None, "not-applicable\n",
+            operation_id="report-only-contract", provenance=request["provenance"])
+        return {"token": revision.token, "path": str(revision.path), "sha256": revision.sha256}
+    if operation == "check-plan":
+        result = store.check_plan(task, coder_selection=request["coder_selection"])
+        accepted = result["accepted"]
+        result["cache_ref"] = {
+            "schema": "r2-plan-contract-cache-v1", "task_short_id": task,
+            "project_uid": accepted["project_uid"], "task_uid": accepted["task_uid"],
+            "task_binding_sha256": accepted["task_binding_sha256"],
+            "accepted_snapshot_path": result["accepted_path"],
+            "accepted_snapshot_sha256": result["accepted_snapshot"],
+        }
+        return result
+    if operation == "accept-plan":
+        require_acceptance_script(core, request)
+        revision = store.accept_plan(task, request["expected_revision"],
+                                    request["expected_accepted"], request["metadata"])
+        return {"token": revision.token, "path": str(revision.path), "sha256": revision.sha256}
+    if operation in ("read", "publish"):
+        document = request["document_key"]
+        if (not isinstance(document, str) or not (
+                document.startswith("knowledge/") or document.startswith(f"tasks/{task}/"))):
+            raise ValueError("document outside current task")
+        if operation == "read":
+            revision = store.read(document)
+        else:
+            core._key(request["operation_id"])
+            revision = store.publish(document, request["expected_revision"], request["content"],
+                                     operation_id=request["operation_id"],
+                                     provenance=request["provenance"])
+        result = asdict(revision)
+        result["path"] = str(result["path"])
+        return result
+    return {"mode": "r2", "binding_ref": locator, "task_key": task,
+            "project_path": str(store.path), "project_uid": store.project_uid,
+            "task_uid": store._task(task)["task_uid"]}
+
+
+FIELDS = {
+    "resolve-mcp": set(),
+    "new-invocation": {"binding_ref"},
+    "begin-invocation": {"binding_ref", "invocation_id", "request_sha256", "permitted_metadata"},
+    "read-invocation": {"binding_ref", "invocation_id"},
+    "finish-invocation": {"binding_ref", "invocation_id", "owner_token", "exit_code",
+                          "error_code", "object_sha256"},
+    "read-cache": {"binding_ref", "cache_key"},
+    "publish-cache": {"binding_ref", "cache_key", "object_sha256", "invocation_id", "owner_token"},
+    "put-artifact": {"binding_ref", "invocation_id", "owner_token", "kind", "sha256", "byte_size"},
+}
+
+
+def schema_metadata(metadata):
+    return (metadata.get("operation") == "list" and metadata.get("tool") == "list-schema"
+            and metadata.get("output_mode") == "json" and metadata.get("safe_mode") is False
+            and metadata.get("save_raw") is False)
+
+
+def public_invocation(store, task, invocation, state):
+    result = {"state": state["state"]}
+    if "started" in state:
+        result["permitted_metadata"] = state["started"]["permitted_metadata"]
+        result["receipt_path"] = str(store.path / store._invocation(task, invocation) / "started.json")
+    if state["state"] == "started":
+        result["owner_token"] = state["owner_token"]
+    if state["state"] == "finished":
+        finished = state["finished"]
+        result.update({key: finished[key] for key in ("exit_code", "error_code", "object_sha256")})
+        result["receipt_path"] = str(store.path / store._invocation(task, invocation) / "finished.json")
+        if finished["object_sha256"] is not None:
+            result["object_path"] = str(store._artifact(task, finished["object_sha256"]).path)
+    return result
+
+
+def dispatch(core, request, body=None):
+    operation = request.get("operation")
+    if not isinstance(operation, str) or operation not in FIELDS:
+        raise ValueError("unsupported memory operation")
+    fields = {"schema", "operation", "workspace_path"} | FIELDS[operation]
+    if "task_locator" in request:
+        fields.add("task_locator")
+    if "standalone_binding" in request:
+        fields.add("standalone_binding")
+    core._closed(request, fields, "r2-mcp-request-v1")
+    store, task, locator = (resolve_standalone(core, request) if "standalone_binding" in request
+                            else resolve_native(core, request))
+    if operation == "resolve-mcp":
+        return {"mode": "r2" if store is not None else "legacy", "binding_ref": locator}
+    if store is None:
+        raise ValueError("R2 operation unavailable for legacy task")
+    if request["binding_ref"] != locator:
+        raise ValueError("binding reference differs")
+    if operation == "new-invocation":
+        return store.new_invocation(task)
+    if operation == "read-cache":
+        return store.read_cache(task, request["cache_key"])
+    invocation = request["invocation_id"]
+    if operation == "put-artifact":
+        if (not isinstance(body, bytes) or len(body) > core.MAX_BYTES
+                or type(request["byte_size"]) is not int or request["byte_size"] != len(body)
+                or request["sha256"] != core._digest(body)):
+            raise ValueError("artifact body differs")
+        core._token(request["owner_token"])
+        relative = store._invocation(task, invocation)
+        with store._directory(relative) as fd, core._lock(fd):
+            started = store._active_owner(fd, task, invocation, request["owner_token"])
+            metadata = started["permitted_metadata"]
+            if request["kind"] == "raw":
+                if metadata.get("save_raw") is not True:
+                    raise ValueError("raw artifact disabled")
+            elif request["kind"] == "schema":
+                if not schema_metadata(metadata):
+                    raise ValueError("schema artifact not permitted")
+                core._json(body)
+            else:
+                raise ValueError("unsupported artifact kind")
+            artifact = store.put_artifact(task, body)
+        return {"object_sha256": artifact.sha256, "object_path": str(artifact.path)}
+    if operation == "begin-invocation":
+        if not request["permitted_metadata"]:
+            raise ValueError("MCP metadata required")
+        state = store.begin_invocation(task, invocation, request["request_sha256"],
+                                       permitted_metadata=request["permitted_metadata"])
+    elif operation == "read-invocation":
+        state = store.read_invocation(task, invocation)
+    elif operation == "publish-cache":
+        state = store.read_invocation(task, invocation)
+        if (state["state"] != "unknown"
+                or not schema_metadata(state["started"]["permitted_metadata"])):
+            raise ValueError("cache publication requires schema invocation")
+        artifact = store._artifact(task, request["object_sha256"])
+        with store._directory(f"tasks/{task}/artifacts/mcp/objects") as fd:
+            raw = core._read(fd, artifact.sha256)
+        if core._digest(raw) != artifact.sha256:
+            raise ValueError("cache object changed")
+        core._json(raw)
+        return store.publish_cache(task, request["cache_key"], request["object_sha256"],
+                                   invocation, request["owner_token"])
+    else:
+        store.finish_invocation(task, invocation, request["owner_token"],
+                                exit_code=request["exit_code"], error_code=request["error_code"],
+                                object_sha256=request["object_sha256"])
+        state = store.read_invocation(task, invocation)
+    return public_invocation(store, task, invocation, state)
+
+
+def legacy_response(interface, request):
+    if interface == "workflow":
+        operation = request.get("operation")
+        if operation not in ("resolve-task", "initialize-task", "resolve-janitor"):
+            raise ValueError("R2 document operation unavailable for legacy task")
+        fields = {"schema", "operation", "workspace_path"}
+        if "task_locator" in request:
+            fields.add("task_locator")
+        if "native_context" in request:
+            fields.add("native_context")
+        bootstrap_closed(request, fields, "r2-workflow-request-v1")
+        return {"mode": "legacy", "binding_ref": None}
+    if interface == "mcp" and request.get("operation") == "resolve-mcp":
+        fields = {"schema", "operation", "workspace_path"}
+        if "task_locator" in request:
+            fields.add("task_locator")
+        bootstrap_closed(request, fields,
+                         "r2-mcp-request-v1")
+        return {"mode": "legacy", "binding_ref": None}
+    raise ValueError("R2 operation unavailable for legacy task")
+
+
+def main() -> int:
+    global PREADMISSION
+    try:
+        if sys.argv[1:] not in (["mcp"], ["workflow"]):
+            raise ValueError("unsupported adapter interface")
+        interface = sys.argv[1]
+        raw = sys.stdin.buffer.readline(65537)
+        if len(raw) > 65536:
+            raise ValueError("request too large")
+        request = bootstrap_json(raw)
+        if not isinstance(request, dict):
+            raise ValueError("request must be an object")
+        expected_schema = f"r2-{interface}-request-v1"
+        if request.get("schema") != expected_schema:
+            raise ValueError("invalid adapter request schema")
+        PREADMISSION = preflight_source_admission(interface, request)
+        if PREADMISSION.get("mode") == "legacy":
+            if sys.stdin.buffer.read(1):
+                raise ValueError("unexpected request suffix")
+            result = legacy_response(interface, request)
+            print(json.dumps({"schema": f"r2-{interface}-response-v1",
+                              "result": result}, sort_keys=True))
+            return 0
+        if interface == "workflow" and request.get("operation") == "resolve-janitor":
+            if sys.stdin.buffer.read(1):
+                raise ValueError("unexpected request suffix")
+            result = qualified_kit_janitor(PREADMISSION)
+            print(json.dumps({"schema": f"r2-{interface}-response-v1",
+                              "result": result}, sort_keys=True))
+            return 0
+        kit_root = canonical_root(PREADMISSION["kit_root"])
+        core = load_core(kit_root, PREADMISSION["receipt"])
+        body = None
+        if request.get("operation") in ("put-artifact", "artifact-write"):
+            body = sys.stdin.buffer.read(core.MAX_BYTES + 1)
+            if len(body) > core.MAX_BYTES or sys.stdin.buffer.read(1):
+                raise ValueError("artifact body exceeds limit or has a suffix")
+        elif sys.stdin.buffer.read(1):
+            raise ValueError("unexpected request suffix")
+        result = (dispatch(core, request, body) if interface == "mcp"
+                  else workflow_dispatch(core, request, body))
+        if interface == "workflow" and request["operation"] in ("artifact-write", "artifact-read"):
+            header, content = result
+            sys.stdout.buffer.write(json.dumps(header, sort_keys=True).encode("utf-8") + b"\n")
+            sys.stdout.buffer.write(content)
+            return 0
+        print(json.dumps({"schema": f"r2-{interface}-response-v1",
+                          "result": result}, sort_keys=True))
+        return 0
+    except (ValueError, TypeError, KeyError, OSError, subprocess.SubprocessError):
+        print("project-memory: invalid-memory-request", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

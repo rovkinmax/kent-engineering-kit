@@ -36,8 +36,8 @@ Unchanged or unreachable surfaces need only scoped non-impact evidence, not
 universal requalification. Optional additive inputs may be compatible; removing
 a transition still emitted by a retained Session is not.
 
-Approval does not itself prove compatibility. Do not answer, replace or
-invalidate pending approvals as a side effect. Execution-target metadata needs
+Approval is not compatibility. Never answer, replace or invalidate pending
+approvals as a side effect. Execution-target metadata needs
 separate impact assessment: prove what remains pinned for existing execution
 and what future Sessions/worktrees resolve, rather than assume isolation.
 
@@ -53,7 +53,10 @@ isolated-version/migration approach; no automatic reset, resume or migration.
 Any later forward restore must be compatible with task state at restore time,
 not merely reproduce an old graph.
 
-This policy does not expand any client, driver or plan schema. The generic
-client's rejection of task-referenced or linked semantic updates, terminal-only
-canonical reconciliation and stricter retirement gates remain implementation
-limitations, not claims that never-started tasks are running.
+`canonical-workflow-reconcile-plan-v2` admits one task-backed/linked Workflow
+with digest-confirmed compatibility. Preserve identities, links and defaults;
+Only `implement_replan` may be added. No migration or cross-project
+atomicity. Other paths, v1 and retirement gates stay unchanged. Publication
+does not authorize activation.
+
+V2 gates: [runbook](../docs/KENT-UPGRADE-RUNBOOK.md#delivery-reliability-adoption).

@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Use project memory without a Kent installation or native Task."""
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+source = Path(__file__).resolve().parents[1] / "workflowkit" / "project_memory.py"
+spec = importlib.util.spec_from_file_location("r2_project_memory", source)
+if spec is None or spec.loader is None:
+    raise RuntimeError("project memory core is unavailable")
+memory = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = memory
+spec.loader.exec_module(memory)
+
+OPERATIONS = {
+    "initialize-project": set(),
+    "initialize-task": {"task_key", "task_uid", "external_refs"},
+    "initialize-intake": {"invocation_id", "intent"},
+    "read": {"document_key"},
+    "publish": {"document_key", "expected_revision", "content", "operation_id"},
+    "accept-plan": {"task_key", "expected_revision", "expected_accepted", "metadata"},
+    "check-plan": {"task_key"},
+    "artifact-write": {"task_key", "sha256", "byte_size"},
+    "artifact-read": {"task_key", "sha256"},
+    "accepted-head": {"task_key"},
+    "new-invocation": {"task_key"},
+    "begin-invocation": {"task_key", "invocation_id", "request_sha256"},
+    "finish-invocation": {"task_key", "invocation_id", "owner_token", "exit_code",
+                          "error_code", "object_sha256"},
+    "read-invocation": {"task_key", "invocation_id"},
+    "read-cache": {"task_key", "cache_key"},
+    "publish-cache": {"task_key", "cache_key", "object_sha256", "invocation_id", "owner_token"},
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--project-uid", required=True)
+    args = parser.parse_args()
+    try:
+        raw = sys.stdin.buffer.read(memory.MAX_BYTES + 65537)
+        if len(raw) > memory.MAX_BYTES + 65536:
+            raise memory.MemoryError("request exceeds size limit")
+        try:
+            request = memory._json(raw)
+        except memory.MemoryError as whole_request_error:
+            header, separator, body = raw.partition(b"\n")
+            if not separator:
+                raise whole_request_error
+            request = memory._json(header)
+            if request.get("operation") != "artifact-write":
+                raise whole_request_error
+        operation = request.get("operation")
+        if not isinstance(operation, str) or operation not in OPERATIONS:
+            raise memory.MemoryError("unsupported operation")
+        body = b""
+        if operation == "artifact-write":
+            header, separator, body = raw.partition(b"\n")
+            if not separator or len(header) > 65536:
+                raise memory.MemoryError("artifact write requires a bounded framed header")
+            request = memory._json(header)
+        elif operation == "artifact-read":
+            _, separator, suffix = raw.partition(b"\n")
+            if separator and suffix.strip():
+                raise memory.MemoryError("artifact read does not accept a request body")
+        elif len(raw) > memory.MAX_BYTES:
+            raise memory.MemoryError("request exceeds size limit")
+        allowed = {"schema", "operation"} | OPERATIONS[operation]
+        if operation == "initialize-task" and "source_refs" in request:
+            allowed.add("source_refs")
+        if operation == "publish" and "provenance" in request:
+            allowed.add("provenance")
+        if operation == "begin-invocation" and "permitted_metadata" in request:
+            allowed.add("permitted_metadata")
+        if operation == "check-plan" and "coder_selection" in request:
+            allowed.add("coder_selection")
+        memory._closed(request, allowed, "r2-request-v1")
+        store = memory.ProjectMemory(args.root, args.project, args.project_uid)
+        if operation == "initialize-project":
+            store = memory.ProjectMemory.initialize(args.root, args.project, args.project_uid)
+            result = {"project_path": str(store.path), "project_uid": store.project_uid}
+        elif operation == "initialize-task":
+            result = store.initialize_task(
+                request["task_key"], request["task_uid"], request["external_refs"],
+                source_refs=request.get("source_refs"),
+            )
+        elif operation == "initialize-intake":
+            result = store.initialize_intake(request["invocation_id"], request["intent"])
+        elif operation == "artifact-write":
+            size = request["byte_size"]
+            digest = request["sha256"]
+            memory._token(digest)
+            if type(size) is not int or not 0 <= size <= memory.MAX_BYTES or size != len(body):
+                raise memory.MemoryError("artifact body size differs")
+            if memory._digest(body) != digest:
+                raise memory.MemoryError("artifact body digest differs")
+            artifact = store.put_attachment(request["task_key"], body)
+            result = {"object_sha256": artifact.sha256, "byte_size": len(body),
+                      "object_path": str(artifact.path)}
+            response = {"schema": "r2-artifact-response-v1",
+                        "operation": operation, **result}
+            sys.stdout.buffer.write(
+                json.dumps(response, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
+            )
+            return 0
+        elif operation == "artifact-read":
+            digest = request["sha256"]
+            memory._token(digest)
+            content = store.read_attachment(request["task_key"], digest)
+            relative = f"tasks/{request['task_key']}/artifacts/attachments/objects/{digest}"
+            response = {"schema": "r2-artifact-response-v1", "operation": operation,
+                        "object_sha256": digest, "byte_size": len(content),
+                        "object_path": str(store.path / relative)}
+            sys.stdout.buffer.write(
+                json.dumps(response, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
+            )
+            sys.stdout.buffer.write(content)
+            return 0
+        elif operation == "read":
+            result = asdict(store.read(request["document_key"]))
+        elif operation == "publish":
+            memory._key(request["operation_id"])
+            result = asdict(store.publish(
+                request["document_key"], request["expected_revision"], request["content"],
+                operation_id=request["operation_id"],
+                provenance=request.get("provenance"),
+            ))
+        elif operation == "accept-plan":
+            result = asdict(store.accept_plan(
+                request["task_key"], request["expected_revision"],
+                request["expected_accepted"], request["metadata"],
+            ))
+        elif operation == "accepted-head":
+            result = {"accepted_snapshot": store.accepted_head(request["task_key"])}
+        elif operation == "check-plan":
+            result = store.check_plan(request["task_key"],
+                                      coder_selection=request.get("coder_selection"))
+        elif operation == "new-invocation":
+            result = store.new_invocation(request["task_key"])
+        elif operation == "begin-invocation":
+            result = store.begin_invocation(
+                request["task_key"], request["invocation_id"], request["request_sha256"],
+                permitted_metadata=request.get("permitted_metadata"),
+            )
+        elif operation == "read-cache":
+            result = store.read_cache(request["task_key"], request["cache_key"])
+        elif operation == "publish-cache":
+            result = store.publish_cache(
+                request["task_key"], request["cache_key"], request["object_sha256"],
+                request["invocation_id"], request["owner_token"],
+            )
+        elif operation == "finish-invocation":
+            result = store.finish_invocation(
+                request["task_key"], request["invocation_id"], request["owner_token"],
+                exit_code=request["exit_code"], error_code=request["error_code"],
+                object_sha256=request["object_sha256"],
+            )
+        else:
+            result = store.read_invocation(request["task_key"], request["invocation_id"])
+        if isinstance(result.get("path"), Path):
+            result["path"] = str(result["path"])
+        print(json.dumps({"schema": "r2-result-v1", "result": result},
+                         ensure_ascii=False, sort_keys=True))
+        return 0
+    except memory.Conflict as error:
+        print(f"project-memory: conflict: {error}", file=sys.stderr)
+        return 3
+    except (memory.MemoryError, OSError, TypeError, KeyError) as error:
+        print(f"project-memory: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

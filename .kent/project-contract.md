@@ -21,19 +21,19 @@ gap and use available evidence. Ask only for real decisions or external acts.
 ## Project interfaces
 
 `.kent/workflow-profile.toml` maps work kinds, procedures and commands.
-`.kent/workflows/kit_development.py` keeps Kit Engineering Delivery v5 as the
-default source graph and spec
-`.kent/workflows/kit-engineering-delivery-v5.spec.json`. It also generates the
-source-only complexity-selected v6 candidate at
-`.kent/workflows/kit-engineering-delivery-v6.spec.json`; the checked-in
-`.kent/workflow-profile.toml` remains opted out. Preserve v1 through v5 and the
-task-backed Workflow unchanged. Any live v6 rollout requires a separately
-approved new Workflow UUID and fresh qualification; source generation does not
-authorize activation. General workflow update eligibility follows
+`.kent/workflows/kit_development.py` preserves the historical v5 source spec
+and complexity-selected v6 candidate. The delivery reliability v1 builder writes
+`.kent/workflows/kit-engineering-delivery.current.spec.json` from the selected
+profile; it adds only `implement_replan` to retained Plan Revalidation.
+Historical snapshots are not rewritten for adoption. The current graph has
+21 nodes, 53 transition groups and 54 edges with coder selection disabled;
+complexity selection has 21 nodes, 55 groups and 56 edges.
+An approved same-UUID update still requires exact compatibility evidence;
+source generation does not authorize activation. General eligibility follows
 [Execution-history and compatibility policy](../contracts/workflow-contract.md#execution-history-and-compatibility-policy);
 source edits do not mutate live workflows or authorize broader driver admission.
-The default v5 flow has 21 nodes, 52 transition groups and 53 edges. The
-current-profile v6 candidate has 21 nodes, 54 transition groups and 55 edges.
+Historical v5 has 21 nodes, 52 transition groups and 53 edges; historical v6
+has 21 nodes, 54 transition groups and 55 edges.
 Both preserve continuous writer sessions and task branch identity. Plan's
 callable read-only leaf and the separate Plan Review node provide the two
 preview reviews. Only `plan_review_accept` adds the human approval
@@ -80,7 +80,13 @@ profile's compile verifier returns only
 `{"transition":"blocked"}` on stdout, with logs on stderr.
 Runtime checkpoints/evidence belong under ignored `.kent/runtime/`; verifier
 outputs and private temporary directories use ignored `build/kent-workflow/`.
-Normal `.todo` plans remain tracked.
+Legacy `.todo` plans remain tracked. R2 tasks use the profile's external
+project-memory binding and immutable plan revisions. Publish progress through
+the helper with an exact expected revision; do not edit revision files, create
+a `.todo` fallback, or migrate old Tasks implicitly. The external accepted
+snapshot owns acceptance; the local runtime cache is only a validated locator.
+Knowledge is context, not scope authority. Resolve mode and original decision
+references as described in the Kit skill's `references/durable-context.md`.
 
 ## Source verification ownership and identity
 

@@ -34,6 +34,48 @@ BRANCH_IDENTITY = load_script_module()
 
 
 class BranchIdentityTest(unittest.TestCase):
+    def test_r2_branch_uses_external_selection_without_recreating_cache(self):
+        import types
+        self.configure("task", coder_selection=True)
+        with (self.root / ".kent/workflow-profile.toml").open("a") as profile:
+            profile.write('\n[project_memory]\nmode = "r2"\n')
+        choice = {"schema": "coder-selection-v1", "task_short_id": "TASK-1",
+                  "complexity": "simple", "rationale": "Bounded change"}
+        digest = "a" * 64
+        handoff = {"plan_path": "/external/old/content.md", "accepted_plan_sha256": digest}
+        context = {"_kent": {"task_id": "task-native", "node_id": "branch-node"}}
+        status = {"comparison": "unchanged"}
+        calls = []
+
+        def memory_call(root, payload, operation, **fields):
+            calls.append((operation, payload, fields))
+            return {
+                "resolve-task": {"mode": "r2"},
+                "resolve-plan": {"working_path": "/external/current/content.md"},
+                "check-plan": status,
+            }[operation]
+
+        contract = types.SimpleNamespace(
+            memory_call=memory_call,
+            memory_snapshot_projection=lambda *args: {
+                "normalized_sha256": digest, "coder_selection": choice})
+        with mock.patch.object(importlib.util, "module_from_spec", return_value=contract), \
+                mock.patch.object(importlib.machinery.SourceFileLoader, "exec_module"), \
+                mock.patch.object(BRANCH_IDENTITY, "plan_coder_selection",
+                                  return_value=choice) as read_choice:
+            self.assertEqual(BRANCH_IDENTITY.coder_selection_snapshot(
+                self.root, handoff, short_id="TASK-1", native_payload=context),
+                ("implementation-simple", "xhigh"))
+            read_choice.assert_called_with(
+                Path("/external/current/content.md"), short_id="TASK-1")
+            self.assertTrue(all(payload == context for _, payload, _ in calls))
+            self.assertEqual(calls[-1][2], {"coder_selection": choice})
+            status["comparison"] = "changed"
+            with self.assertRaisesRegex(ValueError, "selection changed"):
+                BRANCH_IDENTITY.coder_selection_snapshot(
+                    self.root, handoff, short_id="TASK-1", native_payload=context)
+        self.assertFalse((self.root / ".kent/runtime/TASK-1/plan-contract.json").exists())
+
     def test_handoff_preserves_exact_delivery_context(self) -> None:
         from workflowkit import runtime
 

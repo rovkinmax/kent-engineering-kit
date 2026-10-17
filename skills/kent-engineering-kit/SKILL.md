@@ -13,6 +13,12 @@ the relevant section of
 [Task supervision operations](references/task-supervision-operations.md).
 The role prompt owns authority; the reference supplies native mechanics.
 
+For R2 task documents, missing accepted-plan caches, or recovery of earlier
+decisions, read [Durable context and recovery](references/durable-context.md).
+Resolve task-fixed legacy/R2 mode before choosing paths. Decision summaries
+and packet locators aid discovery; they do not replace original authority or
+fresh effect evidence.
+
 ## Boundaries
 
 The Kit is platform-neutral. Shared workflow owns lifecycle, approvals,

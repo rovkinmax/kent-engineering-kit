@@ -204,7 +204,26 @@ def snapshot_from_receipt(request, root, plan_contract):
     raw = text(data["snapshot_utf8"], "retained snapshot").encode()
     if len(raw) > 1024 * 1024 or digest(raw) != sha(request["snapshot_sha256"]):
         raise ValueError("retained raw snapshot digest differs")
-    snapshot = closed(parse(raw), SNAPSHOT_KEYS, "accepted snapshot")
+    snapshot = parse(raw)
+    if isinstance(snapshot, dict) and snapshot.get("schema") == "r2-plan-contract-cache-v1":
+        closed(snapshot, plan_contract.R2_CACHE_FIELDS, "accepted plan locator")
+        status = plan_contract.memory_call(root, {}, "check-plan", coder_selection=None)
+        plan_contract.validate_memory_cache(snapshot, status, request["task_short_id"])
+        accepted = status["accepted"]
+        selection = accepted.get("coder_selection")
+        if selection is not None:
+            selection = plan_contract.plan_coder_selection(
+                Path(status["working_path"]), request["task_short_id"])
+            status = plan_contract.memory_call(root, {}, "check-plan", coder_selection=selection)
+            plan_contract.validate_memory_cache(snapshot, status, request["task_short_id"])
+        if status["comparison"] != "unchanged":
+            raise ValueError("external working plan differs from accepted contract")
+        profile_path = safe_path(root, ".kent/workflow-profile.toml")
+        profile = tomllib.loads(read_file(profile_path, private=False)[0].decode())
+        if accepted["work_kind"] not in profile["work_kinds"]:
+            raise ValueError("external accepted work kind is not configured")
+        return raw
+    snapshot = closed(snapshot, SNAPSHOT_KEYS, "accepted snapshot")
     if (type(snapshot["schema_version"]) is not int or snapshot["schema_version"] != 1
             or snapshot["task_short_id"] != request["task_short_id"]):
         raise ValueError("snapshot schema/task differs")
@@ -238,13 +257,11 @@ def event_projection(event, root, ledger):
 
 
 def records_at(path, task, ledger, janitor):
-    raw, _ = read_file(path, limit=8 * 1024 * 1024)
-    records = janitor._ledger_records(raw)
-    previous = ""
-    for index, record in enumerate(records, 1):
-        previous = ledger.validate_entry(
-            record, task=task, sequence=index, previous_hash=previous,
-        )
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        records = ledger.load_evidence_view(descriptor, task=task)["records"]
+    finally:
+        os.close(descriptor)
     if not records:
         raise ValueError("existing ordinary task evidence is required")
     if any(record.get("record_kind") == "terminal_evidence_seal_v1" for record in records[:-1]):
@@ -328,6 +345,7 @@ def runtime_inventory(root, task, janitor, ledger, runtime):
                 raise ValueError("CI report reference count exceeds limit")
     allowed = {
         "plan-contract.json", "evidence-ledger.jsonl",
+        "evidence-recovery.json", "evidence-continuation.jsonl",
         "fix-checkpoint.json", "smoke-checkpoint.json",
     } | references
     if set(names) - allowed:
@@ -374,6 +392,20 @@ def invoke_ledger(root, task, action, payload, environment):
     if result.returncode != 0:
         raise ValueError(f"ledger {action} failed: {result.stderr.decode(errors='replace')[:2000]}")
     return parse(result.stdout)
+
+
+def retain_terminal(root, task, ledger, janitor, runtime, records):
+    """Retention follows the final seal; retries never append or unseal."""
+    if not janitor._retention_declared(root) and not any(
+        record.get("record_kind") == runtime.EVIDENCE_BOUNDARY_KIND for record in records
+    ):
+        return {}
+    preview = ledger.retain_evidence(root, task=task)
+    result = ledger.retain_evidence(root, task=task, confirm=preview["confirm"])
+    return {
+        "retained_bundle_path": result["bundle_path"],
+        "retained_bundle_sha256": result["receipt"]["bundle_sha256"],
+    }
 
 
 def assert_final_record(records, prepared):
@@ -489,9 +521,15 @@ def prepare(request):
     if prepared is None:
         if records[-1].get("record_kind") == runtime.TERMINAL_SEAL_SCHEMA:
             raise ValueError("an existing seal requires its preparation receipt")
-        source_raw, source_identity = read_file(source)
-        if source_raw != raw:
-            raise ValueError("source snapshot differs from verified retained bytes")
+        if (not os.path.lexists(source)
+                and parse(raw).get("schema") == "r2-plan-contract-cache-v1"):
+            # The external accepted head was verified by snapshot_from_receipt.
+            # Its disposable local locator need not be recreated for retirement.
+            source_identity = None
+        else:
+            source_raw, source_identity = read_file(source)
+            if source_raw != raw:
+                raise ValueError("source snapshot differs from verified retained bytes")
         prepared = {
             "schema_version": 1, "request": request, "git_head": head,
             "event": projection,
@@ -525,12 +563,14 @@ def prepare(request):
             task,
             seal_request,
         )
+        retained = retain_terminal(root, task, ledger, janitor, runtime, records)
         if prepared["state"] == "prepared":
             prepared.update(state="completed", cleanup_report=report)
             write_private(receipt_path, canonical(prepared), replace=True)
         return {
             "cleanup_report": report,
             "receipt_path": str(receipt_path.relative_to(root)),
+            **retained,
         }
     if prepared["state"] == "completed":
         raise ValueError("completed preparation lost its terminal evidence seal")
@@ -555,9 +595,10 @@ def prepare(request):
     line = runtime.terminal_marker_line(marker)
     if sealed["terminal_marker"] != line:
         raise ValueError("seal output does not match actual terminal ledger")
+    retained = retain_terminal(root, task, ledger, janitor, runtime, records)
     prepared.update(state="completed", cleanup_report=report)
     write_private(receipt_path, canonical(prepared), replace=True)
-    return {"cleanup_report": report, "receipt_path": str(receipt_path.relative_to(root))}
+    return {"cleanup_report": report, "receipt_path": str(receipt_path.relative_to(root)), **retained}
 
 
 def main():

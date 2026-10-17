@@ -60,3 +60,12 @@ procedures.
 
 Return canonical PR, branch, strategy, and cleanup evidence required by the
 workflow node.
+
+For a project opted into delivery reliability v1, use the configured
+checkpoint helper to reconstruct producer output from its exact source locator
+and pack the transition against its effective contract. Do not retype hashes,
+nested JSON, or producer-owned fields from a transcript. Submit the resulting
+file through the supported Task completion interface. An unknown completion
+outcome requires native readback before retry. Packet recovery restores
+transport bytes; it does not prove a fresh external result or authorize an
+effect. Legacy tasks retain their declared transport contract.

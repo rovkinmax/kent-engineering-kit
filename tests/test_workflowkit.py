@@ -456,6 +456,39 @@ def schema4_with_managed_adapter(contents: str) -> str:
 
 
 class WorkflowKitTest(unittest.TestCase):
+    def test_source_admission_gate_binds_exact_typed_inputs(self) -> None:
+        from workflowkit.delivery import (
+            SOURCE_ADMISSION_BEGIN, SOURCE_ADMISSION_END, source_admission_gate,
+        )
+        admission = {
+            "schema": "delivery-source-admission-v1",
+            "receipt_ref": {"path": "/private/receipt.json", "sha256": "a" * 64},
+            "installation_binding_sha256": "b" * 64,
+            "primary_workspace_id": "workspace-native",
+            "primary_root": "/project", "kit_root": "/kit",
+            "source_ref": "refs/remotes/origin/main", "kit_ref": "refs/remotes/origin/main",
+            "ci_helper": "/home/.kent/bin/kent-prepare-github-ci",
+            "helper_bindings": [{"link": "/home/.kent/bin/kent-project-memory",
+                                 "target": "/kit/.kent/scripts/workflow-project-memory"}],
+        }
+        arguments = dict(project_id="project-native", workflow_id="workflow-native",
+                         project_root="/project")
+        gate = source_admission_gate(admission, **arguments)
+        self.assertEqual(gate, source_admission_gate(dict(reversed(list(admission.items()))),
+                                                   **arguments))
+        lines = gate.splitlines()
+        self.assertEqual(lines[0], SOURCE_ADMISSION_BEGIN)
+        self.assertEqual(lines[-1], SOURCE_ADMISSION_END)
+        canonical = json.dumps(admission, sort_keys=True, ensure_ascii=False,
+                               separators=(",", ":")).encode()
+        self.assertEqual(json.loads(lines[1]), {
+            "receipt_sha256": "a" * 64,
+            "source_admission_sha256": hashlib.sha256(canonical).hexdigest()})
+        altered = {**admission, "installation_binding_sha256": "c" * 64}
+        self.assertNotEqual(gate, source_admission_gate(altered, **arguments))
+        self.assertIn("--receipt-sha256 " + "a" * 64, gate)
+        self.assertIn("task-fixed legacy mode before R2", gate)
+
     def test_prior_slice_interface_mismatch_red_then_bounded_repair(self) -> None:
         class BaselineScreens(ABC):
             @abstractmethod
@@ -1726,6 +1759,56 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             path.write_text("# Test release artifact\n")
         return ProjectProfile.load(root)
 
+    def project_memory_profile_contents(
+        self,
+        root: Path,
+        *,
+        schema: int = 3,
+    ) -> str:
+        if schema == 3:
+            contents = EXAMPLE_PROFILE.read_text().replace(
+                "[commands]\n",
+                (
+                    "[commands]\n"
+                    'project_memory = ".kent/scripts/workflow-project-memory"\n'
+                    'project_memory_core = '
+                    '".kent/scripts/workflow_project_memory.py"\n'
+                ),
+            )
+        else:
+            contents = schema4_profile_contents()
+            contents = contents.replace(
+                'kit_managed_commands = ["dispatch"]',
+                (
+                    'kit_managed_commands = ["dispatch", "project_memory", '
+                    '"project_memory_core"]'
+                ),
+            ).replace(
+                'dispatch = ".kent/scripts/workflow-verification-dispatch"\n',
+                (
+                    'dispatch = ".kent/scripts/workflow-verification-dispatch"\n'
+                    'project_memory = '
+                    '".kent/scripts/workflow-project-memory"\n'
+                    'project_memory_core = '
+                    '".kent/scripts/workflow_project_memory.py"\n'
+                ),
+            ).replace(
+                'dispatch = "1.0.0"\n',
+                (
+                    'dispatch = "1.0.0"\n'
+                    'project_memory = "1.0.0"\n'
+                    'project_memory_core = "1.0.0"\n'
+                ),
+            )
+        return (
+            contents
+            + "\n[project_memory]\n"
+            + f'root = "{root}"\n'
+            + 'project_key = "appsome"\n'
+            + 'project_uid = "project-a"\n'
+            + 'mode = "r2"\n'
+        )
+
     def create_schema4_sync_project(
         self,
         transform=lambda value: value,
@@ -2904,6 +2987,21 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                 self.assertIn(f"Choose `{edge.target}_replan`", edge.prompt)
                 self.assertIn("plan-contract.json", edge.prompt)
                 self.assertIn("before production edits", edge.prompt)
+
+    def test_r2_revalidation_does_not_require_disposable_cache(self) -> None:
+        from workflowkit.delivery import plan_revalidation_prompt, owner_replan_prompt
+        profile = ProjectProfile.load(REPO_ROOT)
+        self.assertEqual(profile.delivery_reliability_policy(), "v1")
+        prompts = [owner_replan_prompt(profile)]
+        prompts.extend(plan_revalidation_prompt(profile, from_review=value)
+                       for value in (False, True))
+        for prompt in prompts:
+            with self.subTest(prompt=prompt[:70]):
+                self.assertIn("task-fixed storage mode", prompt)
+                self.assertIn("external accepted snapshot", prompt)
+                self.assertIn("disposable cache, not required evidence", prompt)
+                self.assertIn("Do not recreate it", prompt)
+                self.assertIn("For fixed legacy tasks", prompt)
 
     def test_replan_profile_matrix_and_parameter_closure(self) -> None:
         source_ci = self.schema4_runtime_v2_contents().replace(
@@ -4172,15 +4270,38 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
     def test_install_adopts_byte_identical_managed_agent_file(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        kent_root = Path(temporary.name)
-        source = REPO_ROOT / "agents" / "compliance_reviewer.md"
+        root = Path(temporary.name)
+        kit = root / "kit"
+        (kit / "scripts").mkdir(parents=True)
+        (kit / "agents").mkdir()
+        generated = kit / ".kent" / "scripts"
+        generated.mkdir(parents=True)
+        installer = kit / "scripts" / "install"
+        source = kit / "agents" / "compliance_reviewer.md"
+        shutil.copyfile(REPO_ROOT / "scripts" / "install", installer)
+        installer.chmod(0o755)
+        shutil.copyfile(
+            REPO_ROOT / "agents" / "compliance_reviewer.md",
+            source,
+        )
+        adapter = generated / "workflow-project-memory"
+        shutil.copyfile(
+            REPO_ROOT / "templates" / "project" / "workflow-project-memory",
+            adapter,
+        )
+        adapter.chmod(0o755)
+        shutil.copyfile(
+            REPO_ROOT / "workflowkit" / "project_memory.py",
+            generated / "workflow_project_memory.py",
+        )
+        kent_root = root / "kent"
         target = kent_root / "agents" / source.name
         target.parent.mkdir(parents=True)
         target.write_bytes(source.read_bytes())
 
         environment = dict(os.environ)
         environment["KENT_PERSISTENCE_ROOT"] = str(kent_root)
-        script = REPO_ROOT / "scripts" / "install"
+        script = installer
         first = subprocess.run(
             [str(script)],
             env=environment,
@@ -5517,6 +5638,163 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             {node.key for node in build_delivery_workflow(profile, 1).nodes},
         )
 
+    def test_optional_project_memory_profile_is_closed_and_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            memory_root = root.parent / f"{root.name}-external-memory"
+            legacy = ProjectProfile.from_toml(
+                root,
+                EXAMPLE_PROFILE.read_text(),
+                check_files=False,
+            )
+            profile = ProjectProfile.from_toml(
+                root,
+                self.project_memory_profile_contents(memory_root),
+                check_files=False,
+            )
+
+            self.assertIsNone(legacy.project_memory)
+            self.assertEqual(legacy.delivery_reliability_policy(), "")
+            self.assertEqual(profile.project_memory.root, str(memory_root))
+            self.assertEqual(profile.project_memory.project_key, "appsome")
+            self.assertEqual(profile.project_memory.project_uid, "project-a")
+            self.assertEqual(profile.project_memory.mode, "r2")
+            self.assertFalse(memory_root.exists())
+
+            contents = self.project_memory_profile_contents(memory_root).replace(
+                "[policies]\n",
+                '[policies]\ndelivery_reliability = "v1"\n',
+            )
+            enabled = ProjectProfile.from_toml(
+                root,
+                contents,
+                check_files=False,
+            )
+            self.assertEqual(enabled.delivery_reliability_policy(), "v1")
+
+    def test_project_memory_profile_rejects_incomplete_or_unsafe_bindings(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            memory_root = root.parent / f"{root.name}-memory"
+            valid = self.project_memory_profile_contents(memory_root)
+            invalid = (
+                (valid.replace('mode = "r2"\n', ""), "exactly"),
+                (
+                    valid.replace(
+                        f'root = "{memory_root}"',
+                        'root = "memory"',
+                    ),
+                    "absolute",
+                ),
+                (
+                    valid.replace(
+                        f'root = "{memory_root}"',
+                        f'root = "{root}/../R2"',
+                    ),
+                    "normalized absolute",
+                ),
+                (
+                    self.project_memory_profile_contents(
+                        root / "inside-memory"
+                    ),
+                    "outside the project checkout",
+                ),
+                (
+                    valid.replace(
+                        'project_key = "appsome"',
+                        'project_key = "../escape"',
+                    ),
+                    "project_key",
+                ),
+                (
+                    valid.replace(
+                        'project_uid = "project-a"',
+                        'project_uid = ".."',
+                    ),
+                    "project_uid",
+                ),
+                (valid.replace('mode = "r2"', 'mode = "legacy"'), "mode"),
+                (
+                    valid.replace(
+                        'mode = "r2"\n',
+                        'mode = "r2"\nunknown = "rejected"\n',
+                    ),
+                    "exactly",
+                ),
+            )
+            for contents, message in invalid:
+                with self.subTest(contents=contents[-80:]):
+                    with self.assertRaisesRegex(SpecError, message):
+                        ProjectProfile.from_toml(
+                            root,
+                            contents,
+                            check_files=False,
+                        )
+
+            unsupported_policy = valid.replace(
+                "[policies]\n",
+                '[policies]\ndelivery_reliability = "v2"\n',
+            )
+            with self.assertRaisesRegex(
+                SpecError,
+                "delivery_reliability",
+            ):
+                ProjectProfile.from_toml(
+                    root,
+                    unsupported_policy,
+                    check_files=False,
+                )
+
+    def test_schema_four_project_memory_requires_versioned_sibling_closure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            contents = self.project_memory_profile_contents(
+                root.parent / f"{root.name}-external-memory",
+                schema=4,
+            )
+            profile = ProjectProfile.from_toml(
+                root,
+                contents,
+                check_files=False,
+            )
+            self.assertEqual(
+                profile.command_versions["project_memory"],
+                "1.0.0",
+            )
+            self.assertEqual(
+                profile.command_versions["project_memory_core"],
+                "1.0.0",
+            )
+            self.assertEqual(
+                Path(profile.command("project_memory")).parent,
+                Path(profile.command("project_memory_core")).parent,
+            )
+
+            missing_core = contents.replace(
+                'project_memory_core = ".kent/scripts/workflow_project_memory.py"\n',
+                "",
+            )
+            with self.assertRaisesRegex(SpecError, "project_memory_core"):
+                ProjectProfile.from_toml(
+                    root,
+                    missing_core,
+                    check_files=False,
+                )
+            wrong_version = contents.replace(
+                'project_memory_core = "1.0.0"',
+                'project_memory_core = "2.0.0"',
+            )
+            with self.assertRaisesRegex(SpecError, "project_memory_core"):
+                ProjectProfile.from_toml(
+                    root,
+                    wrong_version,
+                    check_files=False,
+                )
+
     def test_schema_four_runtime_v2_requires_prepare_ci_producer_adoption(
         self,
     ) -> None:
@@ -6339,6 +6617,166 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
 
         with self.assertRaisesRegex(SpecError, "must not contain symlinks"):
             ProjectProfile.load(root)
+
+    def test_sync_project_memory_materializes_schema_three_source_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / ".kent").mkdir()
+            memory_root = root.parent / f"{root.name}-R2"
+            profile = self.project_memory_profile_contents(memory_root)
+            (root / ".kent/workflow-profile.toml").write_text(profile)
+            create_work_kind_procedures(root)
+
+            result = self.run_sync_project_adapters(root)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            adapter = root / ".kent/scripts/workflow-project-memory"
+            core = root / ".kent/scripts/workflow_project_memory.py"
+            self.assertEqual(
+                adapter.read_bytes(),
+                (REPO_ROOT / "templates/project/workflow-project-memory").read_bytes(),
+            )
+            self.assertEqual(
+                core.read_bytes(),
+                (REPO_ROOT / "workflowkit/project_memory.py").read_bytes(),
+            )
+            self.assertTrue(adapter.stat().st_mode & 0o111)
+            self.assertTrue(core.stat().st_mode & 0o111)
+            self.assertFalse(memory_root.exists())
+            synchronized = {
+                item["command"]
+                for item in json.loads(result.stdout)["commands"]
+            }
+            self.assertTrue(
+                {"project_memory", "project_memory_core"} <= synchronized
+            )
+
+    def test_schema_three_project_memory_pair_preflights_before_writing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / ".kent").mkdir()
+            (root / ".kent/scripts").mkdir()
+            memory_root = root.parent / f"{root.name}-R2"
+            profile = self.project_memory_profile_contents(memory_root)
+            (root / ".kent/workflow-profile.toml").write_text(profile)
+            create_work_kind_procedures(root)
+            foreign_core = root / "foreign-core.py"
+            foreign_core.write_text("# foreign target\n")
+            core_target = root / ".kent/scripts/workflow_project_memory.py"
+            core_target.symlink_to(foreign_core)
+
+            result = self.run_sync_project_adapters(root)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("symlink", result.stderr)
+            self.assertFalse(
+                (root / ".kent/scripts/workflow-project-memory").exists()
+            )
+            self.assertEqual(core_target.resolve(), foreign_core)
+            self.assertFalse(memory_root.exists())
+
+    def test_sync_project_memory_materializes_schema_four_versioned_pair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            profile_contents = self.project_memory_profile_contents(
+                root.parent / f"{root.name}-R2",
+                schema=4,
+            )
+            project, profile = self.create_schema4_sync_project(
+                lambda _: profile_contents,
+            )
+
+            result = self.run_sync_project_adapters(project)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                profile.command_versions,
+                {
+                    "dispatch": "1.0.0",
+                    "project_memory": "1.0.0",
+                    "project_memory_core": "1.0.0",
+                },
+            )
+            for relative, source in (
+                (
+                    ".kent/scripts/workflow-project-memory",
+                    REPO_ROOT / "templates/project/workflow-project-memory",
+                ),
+                (
+                    ".kent/scripts/workflow_project_memory.py",
+                    REPO_ROOT / "workflowkit/project_memory.py",
+                ),
+            ):
+                target = project / relative
+                self.assertEqual(target.read_bytes(), source.read_bytes())
+                self.assertTrue(target.stat().st_mode & 0o111)
+            self.assertFalse(
+                (root.parent / f"{root.name}-R2/appsome").exists()
+            )
+
+    def test_installer_links_the_qualified_project_memory_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            kit = root / "kit"
+            (kit / "scripts").mkdir(parents=True)
+            generated = kit / ".kent/scripts"
+            generated.mkdir(parents=True)
+            installer = kit / "scripts/install"
+            shutil.copyfile(REPO_ROOT / "scripts/install", installer)
+            adapter = generated / "workflow-project-memory"
+            core = generated / "workflow_project_memory.py"
+            adapter.write_text("#!/usr/bin/env python3\n")
+            adapter.chmod(0o755)
+            core.write_text("# qualified sibling core\n")
+
+            persistence = root / "kent"
+            result = subprocess.run(
+                ["bash", str(installer)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "HOME": str(root / "home"),
+                    "KENT_PERSISTENCE_ROOT": str(persistence),
+                },
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            link = persistence / "bin/kent-project-memory"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.readlink(link), str(adapter))
+
+            incomplete = root / "incomplete"
+            (incomplete / "scripts").mkdir(parents=True)
+            incomplete_generated = incomplete / ".kent/scripts"
+            incomplete_generated.mkdir(parents=True)
+            incomplete_installer = incomplete / "scripts/install"
+            shutil.copyfile(REPO_ROOT / "scripts/install", incomplete_installer)
+            invalid_adapter = incomplete_generated / "workflow-project-memory"
+            invalid_adapter.write_text("#!/usr/bin/env python3\n")
+            invalid_adapter.chmod(0o755)
+            blocked_root = root / "blocked-kent"
+            blocked = subprocess.run(
+                ["bash", str(incomplete_installer)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "HOME": str(root / "home"),
+                    "KENT_PERSISTENCE_ROOT": str(blocked_root),
+                },
+                check=False,
+            )
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("sibling", blocked.stderr)
+            self.assertFalse(blocked_root.exists())
 
     def test_sync_project_adapters_installs_and_updates_declared_adapter(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -7436,6 +7874,104 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                 workflow_selector="11111111-1111-4111-8111-111111111111",
             )
         self.assertEqual(commands, [])
+
+    def test_apply_delegates_explicit_typed_compatibility_plan_without_legacy_effects(self) -> None:
+        import workflowkit.kent as kent_module
+
+        plan_type = getattr(kent_module, "CanonicalWorkflowCompatibilityPlan", None)
+        self.assertIsNotNone(plan_type)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            plan_path = root / "compatibility-plan.json"
+            workflow_id = "11111111-1111-4111-8111-111111111111"
+            digest = "a" * 64
+            compatibility_plan = plan_type(
+                path=plan_path,
+                expected_sha256=digest,
+                confirmation_sha256=digest,
+            )
+            spec = WorkflowSpec(
+                name="Current delivery",
+                description="Current compatible delivery.",
+                execution_target="default-branch",
+                nodes=(
+                    NodeSpec("backlog", "start", "Backlog"),
+                    NodeSpec("done", "terminal", "Done"),
+                ),
+                edges=(),
+            )
+            loaded = type(
+                "LoadedCompatibilityPlan",
+                (),
+                {
+                    "schema": "canonical-workflow-reconcile-plan-v2",
+                    "sha256": digest,
+                    "value": {
+                        "schema": "canonical-workflow-reconcile-plan-v2",
+                        "project_root": str(root),
+                        "kent": {"path": sys.executable},
+                        "workflows": [{"workflow_id": workflow_id}],
+                    },
+                },
+            )()
+            # Verifier TMPDIR may be inside another Git worktree; this fixture
+            # explicitly models its own project, not the ancestor repository.
+            client = KentClient(root, binary=sys.executable, project_workspace=root)
+            client.inspect = lambda *args, **kwargs: self.fail(
+                "compatibility delegation must not enter legacy KentClient apply"
+            )
+            client.run_json = lambda *args, **kwargs: self.fail(
+                "compatibility delegation must not create, link, or default"
+            )
+            with (
+                mock.patch(
+                    "workflowkit.operations.load_plan",
+                    return_value=loaded,
+                ) as load_plan_mock,
+                mock.patch(
+                    "workflowkit.operations.reconcile_canonical_workflows",
+                    side_effect=[
+                        {"phase": "prepared"},
+                        {"phase": "complete"},
+                    ],
+                ) as reconcile_mock,
+            ):
+                result = client.apply(
+                    spec,
+                    workflow_selector=workflow_id,
+                    compatibility_plan=compatibility_plan,
+                )
+            self.assertEqual(result["phase"], "complete")
+            load_plan_mock.assert_called_once()
+            self.assertEqual(
+                [call.kwargs["mode"] for call in reconcile_mock.call_args_list],
+                ["prepare", "apply"],
+            )
+            self.assertTrue(
+                all(
+                    call.kwargs["expected_workflow_id"] == workflow_id
+                    and call.kwargs["expected_spec"] is spec
+                    for call in reconcile_mock.call_args_list
+                )
+            )
+
+    def test_generate_workflow_exposes_exact_hash_compatibility_confirmation(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "generate-workflow"),
+                "--help",
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--compatibility-plan", result.stdout)
+        self.assertIn("--compatibility-plan-sha256", result.stdout)
+        self.assertIn("--confirm-compatibility-plan", result.stdout)
 
     def test_graph_apply_retries_only_confirmation_required_outcome(self) -> None:
         temporary = tempfile.TemporaryDirectory()

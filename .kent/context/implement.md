@@ -11,6 +11,8 @@ Conditional:
 - only source/tests/contracts touched by the approved slice;
 - authoritative templates when generated copies are involved;
 - merge/replay evidence when a finding depends on target-only changes.
+- R2 documents or missing decision/cache references: the installed Kit skill's
+  `references/durable-context.md` and the task's resolved external locators.
 
 Do not preload delivery, Smoke, consumer/device procedures or unrelated
 backlog. Preserve continuous-writer context and append slice evidence.

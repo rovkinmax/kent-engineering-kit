@@ -5,6 +5,12 @@ plan-contract input before editing. Work only in the selected managed root
 and approved file set. Preserve existing unrelated changes and the immutable
 task `fixed_point`; do not mirror Kent lifecycle in project metadata.
 
+Use the task-fixed storage mode returned by the project-memory adapter. For R2,
+read the external accepted plan and publish verified progress with its exact
+working revision token. Do not edit immutable content or replace a missing
+local cache with a new plan. Keep legacy task paths unchanged. A stale token
+requires reading and reconciling the current document, not overwriting it.
+
 On the first accepted entry and after material plan revalidation, preserve
 discoverable references to the original human decision, approved preview
 ScopeHash and both same-hash PASS receipts in existing Task evidence outside

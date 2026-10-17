@@ -11,6 +11,12 @@ Conditional:
 - PR feedback: only affected scope and review findings;
 - source refresh: README self-development preflight;
 - cleanup: current ownership, process, path and Git/Kent registration proofs.
+- delivery reliability v1: exact producer packet locators and the effective
+  transition contract; use checkpoint packing instead of retyping payloads;
+- damaged evidence: `contracts/evidence-recovery.md` and the exact recovery
+  request, without loading an opaque damaged suffix as decision evidence;
+- R2 acceptance: external accepted-state locators and the installed Kit skill's
+  `references/durable-context.md`.
 
 Do not preload implementation recipes, disabled CI/Smoke, consumer rollout or
 installation instructions. Before each Agent transition, append the required

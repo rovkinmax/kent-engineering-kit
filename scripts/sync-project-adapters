@@ -110,7 +110,16 @@ COMMAND_TEMPLATES = {
         REPO_ROOT / "templates" / "project" / "workflow-verify-report",
         "2.0.0",
     ),
+    "project_memory": CommandTemplate(
+        REPO_ROOT / "templates" / "project" / "workflow-project-memory",
+        "1.0.0",
+    ),
+    "project_memory_core": CommandTemplate(
+        REPO_ROOT / "workflowkit" / "project_memory.py",
+        "1.0.0",
+    ),
 }
+PROJECT_MEMORY_COMMAND_KEYS = ("project_memory", "project_memory_core")
 V2_COMMANDS = {
     "runtime_contracts",
     "verify",
@@ -298,6 +307,27 @@ def validate_schema4_command_versions(profile: ProjectProfile) -> None:
             )
 
 
+def plan_project_memory_sources(
+    profile: ProjectProfile,
+    project_root: Path,
+    *,
+    update: bool,
+) -> dict[str, PlannedSynchronization]:
+    if not any(profile.command(key) for key in PROJECT_MEMORY_COMMAND_KEYS):
+        return {}
+    plans: dict[str, PlannedSynchronization] = {}
+    for key in PROJECT_MEMORY_COMMAND_KEYS:
+        configured_path = profile.command(key)
+        template = COMMAND_TEMPLATES[key]
+        plans[key] = plan_synchronization(
+            template.source,
+            project_target(project_root, configured_path),
+            key=key,
+            update=update,
+        )
+    return plans
+
+
 def synchronize_schema3(
     profile: ProjectProfile,
     project_root: Path,
@@ -305,6 +335,11 @@ def synchronize_schema3(
     update: bool,
 ) -> dict[str, list[dict[str, str]]]:
     results = {"adapters": [], "commands": []}
+    project_memory_plans = plan_project_memory_sources(
+        profile,
+        project_root,
+        update=update,
+    )
     managed_adapter_keys = set(profile.kit_managed_adapters)
     for key, configured_path in sorted(profile.adapters.items()):
         if not configured_path:
@@ -344,6 +379,17 @@ def synchronize_schema3(
         if not configured_path:
             continue
         target = project_target(project_root, configured_path)
+        if key in project_memory_plans:
+            plan = project_memory_plans[key]
+            apply_synchronization(plan)
+            results["commands"].append(
+                {
+                    "command": key,
+                    "status": plan.status,
+                    "target": str(plan.target),
+                }
+            )
+            continue
         template = COMMAND_TEMPLATES.get(key)
         if template is None or key in V2_COMMANDS:
             continue

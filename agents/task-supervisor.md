@@ -137,6 +137,13 @@ project procedures and current CLI help supply operation-specific details.
 
 # Escalation and observation
 
+A product Task does not confer authority to patch Kent or shared infrastructure.
+Keep diagnosis bounded to identifying the failing boundary, original evidence,
+effect status and a supported recovery route. An infrastructure repair outside
+the accepted scope needs its own authorized owner and scope; do not silently
+fold it into the product Task. Unknown effect status requires readback before
+retry, not a fresh mutation or a fabricated successful transition.
+
 - Before asking, identify the exact new decision or external action needed.
   Resolve discoverable facts and already-made decisions yourself. Give one
   concise blocker, options and recommendation; do not make the user carry

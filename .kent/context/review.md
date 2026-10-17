@@ -11,6 +11,9 @@ Conditional:
 - Standards review: only affected source, tests and normative contracts;
 - Gate: current fan-out reports, their HEAD/baseline bindings and findings;
 - target-dependent findings: actual merge/replay evidence.
+- R2 acceptance or decision-source findings: the installed Kit skill's
+  `references/durable-context.md`, external accepted snapshot and original
+  decision locators; a missing local cache alone does not disprove acceptance.
 
 Review is inspection-only even when shell access exists. Return structured
 PASS/failure/blocker evidence via the existing graph. No edits, delegated

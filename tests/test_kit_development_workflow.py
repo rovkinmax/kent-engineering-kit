@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
@@ -62,6 +63,42 @@ def load_tests(loader, tests, pattern):
 
 
 class KitDevelopmentWorkflowTest(unittest.TestCase):
+    def test_current_source_snapshot_is_explicitly_unactivated(self) -> None:
+        source = json.loads(kit.rendered_current_spec())
+        ingress = [edge for edge in source["edges"]
+                   if edge["source"] == "backlog" and edge["target"] == "plan"]
+        self.assertEqual(len(ingress), 1)
+        self.assertIn("UNACTIVATED SOURCE CANDIDATE", ingress[0]["prompt"])
+        self.assertNotIn("KENT_SOURCE_ADMISSION_V1_BEGIN", json.dumps(source))
+        self.assertNotIn("receipt_sha256", json.dumps(source))
+
+    def test_published_current_builder_rejects_raw_admission_before_render(self) -> None:
+        with mock.patch.object(kit, "build_current_workflow") as render:
+            with self.assertRaisesRegex(SpecError, "VerifiedSourceAdmission"):
+                kit.build_published_current_workflow(kit.profile_at(ROOT), {"approved": True})
+            render.assert_not_called()
+
+    def test_published_current_builder_uses_genuine_verified_admission(self) -> None:
+        from tests.test_canonical_workflow_lifecycle import create_verified_source_fixture
+
+        fixture, admitted = create_verified_source_fixture(
+            self, "project-135413f9-2454-4d04-969e-3831b1527f18",
+            "4e7cea43-54f5-4662-8d5d-c8db3d816c74",
+        )
+        # Admission uses real disposable source/native interfaces. Rendering
+        # uses the Kit profile; this is not installed-project qualification.
+        profile = replace(kit.profile_at(ROOT), project_root=fixture.project)
+        with mock.patch.object(kit, "ROOT", fixture.kit):
+            rendered = kit.build_published_current_workflow(profile, admitted)
+            ingress = [edge for edge in rendered.edges
+                       if edge.source == "backlog" and edge.target == "plan"]
+            self.assertEqual(len(ingress), 1)
+            self.assertTrue(ingress[0].prompt.startswith(admitted.gate + "\n\n"))
+            self.assertNotIn("UNACTIVATED SOURCE CANDIDATE", ingress[0].prompt)
+            with self.assertRaisesRegex(SpecError, "different Kit deployment"):
+                kit.build_published_current_workflow(
+                    replace(profile, project_root=fixture.kit), admitted)
+
     def fixture_git_environment(self) -> dict[str, str]:
         environment = {
             key: value for key, value in os.environ.items()
@@ -436,7 +473,8 @@ assert edges["plan_review_accept"]["requires_approval"] is True
             "feature", "bugfix", "refactor", "migration", "dependency", "test",
         })
         self.assertEqual(set(profile.commands), {
-            *kit.SCHEMA3_COPIES, *kit.PROJECT_COPIES, "compile_verify", "prepare_cleanup",
+            *kit.SCHEMA3_COPIES, *kit.PROJECT_COPIES, *kit.MEMORY_COPIES,
+            "compile_verify", "prepare_cleanup",
         })
         self.assertEqual(set(profile.context_manifests), {
             "plan", "implement", "review", "delivery", "smoke",
@@ -450,7 +488,7 @@ assert edges["plan_review_accept"]["requires_approval"] is True
 
     def test_exact_graph_and_approval_delta(self) -> None:
         profile = kit.profile_at(ROOT)
-        base = build_delivery_workflow(profile, 5)
+        base = build_delivery_workflow(kit._historical_profile(profile), 5)
         spec = kit.build_workflow(profile)
         spec.validate()  # Includes context source and parameter topology.
         self.assertEqual(spec.name, "Kit Engineering Delivery v5")
@@ -670,7 +708,7 @@ assert edges["plan_review_accept"]["requires_approval"] is True
             snapshot.parent.mkdir(parents=True)
             # Preserve real command-closure validation: main's temporary
             # source root contains the checkout-local authoritative templates.
-            for relative in (kit.SCHEMA3_COPIES | kit.PROJECT_COPIES).values():
+            for relative in kit.generated_copies(kit.profile_at(ROOT)).values():
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT / relative, target)
@@ -1411,6 +1449,120 @@ class VerifierEnvironmentFixtureTest(unittest.TestCase):
 
 
 class CleanupPreparationTest(unittest.TestCase):
+    def test_r2_retention_uses_real_adapter_and_preserves_external_acceptance(self):
+        from tests.test_delivery_source_admission import (
+            DeliverySourceAdmissionTests,
+            accept_r2_plan,
+            branch_r2_plan,
+            install_r2_lifecycle_sources,
+            run_r2_cleanup,
+        )
+
+        owner = DeliverySourceAdmissionTests(
+            "test_published_r2_acceptance_reaches_real_branch_selection_without_cache",
+        )
+        owner.setUp()
+        self.addCleanup(owner.doCleanups)
+        install_r2_lifecycle_sources(owner, coder_selection="complexity")
+        accepted = accept_r2_plan(owner)
+        branch = branch_r2_plan(owner, accepted)
+        self.assertEqual(branch["transition"], "branch_identity_ready", branch)
+        self.assertEqual(
+            accepted["accepted_snapshot"]["authority_refs"],
+            ["question_answer(fixture-session/approved-plan)"],
+        )
+
+        result, _ = run_r2_cleanup(owner, accepted, branch_result=branch)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        completed = json.loads(result.stdout)
+        self.assertIn("TERMINAL_EVIDENCE_V1", completed["cleanup_report"])
+        self.assertIn("retained_bundle_path", completed)
+        self.assertFalse(accepted["cache_path"].exists())
+        archive = (
+            owner.project
+            / f"build/kent-workflow/OSM-130/plan-contract-"
+            f"{hashlib.sha256(accepted['cache_raw']).hexdigest()}.json"
+        )
+        self.assertEqual(archive.read_bytes(), accepted["cache_raw"])
+        self.assertEqual(
+            accepted["accepted_path"].read_bytes(), accepted["accepted_raw"],
+        )
+        self.assertFalse((owner.project / ".todo").exists())
+
+        retained_bytes = accepted["accepted_path"].read_bytes()
+        shutil.rmtree(owner.project)
+        self.assertEqual(accepted["accepted_path"].read_bytes(), retained_bytes)
+
+    def test_r2_cleanup_accepts_absent_local_cache_and_keeps_report_only_snapshot(self):
+        from tests.test_delivery_source_admission import (
+            DeliverySourceAdmissionTests,
+            accept_r2_plan,
+            install_r2_lifecycle_sources,
+            run_r2_cleanup,
+        )
+
+        owner = DeliverySourceAdmissionTests(
+            "test_published_r2_acceptance_reaches_real_branch_selection_without_cache",
+        )
+        owner.setUp()
+        self.addCleanup(owner.doCleanups)
+        install_r2_lifecycle_sources(owner, coder_selection="disabled")
+        accepted = accept_r2_plan(owner, report_only=True)
+        self.assertEqual(
+            accepted["accepted_snapshot"]["plan_kind"], "report_only",
+        )
+        result, _ = run_r2_cleanup(owner, accepted, remove_cache=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(accepted["cache_path"].exists())
+        self.assertEqual(
+            accepted["accepted_path"].read_bytes(), accepted["accepted_raw"],
+        )
+        shutil.rmtree(owner.project)
+        self.assertEqual(accepted["accepted_path"].read_bytes(), accepted["accepted_raw"])
+
+    def test_r2_cleanup_rejects_symlinked_local_cache(self):
+        from tests.test_delivery_source_admission import (
+            DeliverySourceAdmissionTests,
+            accept_r2_plan,
+            install_r2_lifecycle_sources,
+            run_r2_cleanup,
+        )
+
+        owner = DeliverySourceAdmissionTests(
+            "test_published_r2_acceptance_reaches_real_branch_selection_without_cache",
+        )
+        owner.setUp()
+        self.addCleanup(owner.doCleanups)
+        install_r2_lifecycle_sources(owner, coder_selection="disabled")
+        accepted = accept_r2_plan(owner, report_only=True)
+        result, _ = run_r2_cleanup(owner, accepted, symlink_cache=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlink is not admitted", result.stderr)
+        self.assertTrue(accepted["cache_path"].is_symlink())
+        self.assertEqual(
+            accepted["accepted_path"].read_bytes(), accepted["accepted_raw"],
+        )
+        self.assertFalse(
+            (owner.project / "build/kent-workflow/OSM-130/cleanup-preparation.json").exists(),
+        )
+
+    def test_legacy_cleanup_rejects_absent_local_snapshot(self):
+        root = self.fixture()
+        request = self.request(root)
+        snapshot = root / ".kent/runtime/TASK-1/plan-contract.json"
+        snapshot.unlink()
+
+        result = self.prepare(root, request)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No such file", result.stderr)
+        self.assertFalse(
+            (root / "build/kent-workflow/TASK-1/cleanup-preparation.json").exists(),
+        )
+
     def fixture(
         self,
         *,
@@ -1421,6 +1573,13 @@ class CleanupPreparationTest(unittest.TestCase):
         self.addCleanup(fixture_owner.doCleanups)
         root = fixture_owner.fixture()
         kit.bootstrap(root)
+        # These retained cleanup scenarios exercise the legacy snapshot protocol.
+        # Native R2 admission is qualified separately with published source fixtures.
+        profile_path = root / ".kent/workflow-profile.toml"
+        profile_path.write_text(re.sub(
+            r"(?ms)^\[project_memory\]\n.*?(?=^\[|\Z)", "",
+            profile_path.read_text(),
+        ).replace('delivery_reliability = "v1"\n', ""))
         if not prepare_cleanup:
             profile_path = root / ".kent/workflow-profile.toml"
             profile_contents = profile_path.read_text()

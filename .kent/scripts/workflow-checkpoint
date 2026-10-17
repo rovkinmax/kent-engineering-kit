@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ import stat
 import subprocess
 import sys
 import time
+import tomllib
 
 
 TASK_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -32,6 +35,12 @@ def parse_args() -> argparse.Namespace:
         subparser.add_argument("--stage", required=True, choices=STAGES)
         subparser.add_argument("--task", required=True)
         subparser.add_argument("--workspace", type=Path, default=Path.cwd())
+    packing = subparsers.add_parser(
+        "pack-delivery",
+        help="Pack exact producer-owned strings into native completion JSON; never submit it.",
+    )
+    packing.add_argument("--task", required=True)
+    packing.add_argument("--workspace", type=Path, default=Path.cwd())
     return parser.parse_args()
 
 
@@ -144,13 +153,185 @@ def require_ignored(root: Path, path: Path) -> None:
 
 
 def decode_payload(raw: str) -> dict[str, object]:
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate checkpoint JSON key")
+            result[key] = value
+        return result
+
+    def constant(value):
+        raise ValueError(f"invalid checkpoint JSON constant: {value}")
+
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
     except json.JSONDecodeError as error:
         raise ValueError(f"checkpoint input is not valid JSON: {error}") from error
     if not isinstance(payload, dict):
         raise ValueError("checkpoint input must be one JSON object")
     return payload
+
+
+def delivery_module():
+    """Use the existing installed first-party CLI/module source seam.
+
+    Source receipts/installation qualify this closure; legacy checkpoint calls
+    never resolve or depend on the installed Kit.
+    """
+    tool = Path.home() / ".kent" / "bin" / "kent-prepare-github-ci"
+    if not tool.is_symlink():
+        raise ValueError("qualified first-party Kit CLI symlink is unavailable")
+    script = tool.resolve(strict=True)
+    root = script.parent.parent
+    source = root / "workflowkit" / "delivery.py"
+    if script.name != "prepare-github-ci" or script.parent.name != "scripts":
+        raise ValueError("first-party Kit CLI source layout mismatch")
+    for path in (script, root / "workflowkit", source):
+        metadata = path.lstat()
+        if path.is_symlink() or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+            raise ValueError("unsafe first-party Kit source")
+    sys.path.insert(0, str(root))
+    from workflowkit import delivery
+    if Path(delivery.__file__).resolve() != source:
+        raise ValueError("unexpected first-party delivery module")
+    return delivery
+
+
+def current_delivery_identity(root: Path, task: str) -> dict:
+    source = Path(__file__).with_name("workflow-evidence-ledger")
+    metadata = source.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o022:
+        raise ValueError("unsafe native identity observer")
+    loader = importlib.machinery.SourceFileLoader("checkpoint_native_identity", str(source))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ValueError("native identity observer is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module.native_current_identity(root, task)
+
+
+def delivery_native_read(root: Path, arguments: list[str], *, structured=True):
+    """Bounded read-only native observation; never execute caller argv."""
+    with subprocess.Popen(
+        ["kent", *arguments], cwd=root, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    ) as process:
+        deadline = time.monotonic() + 15
+        raw = bytearray()
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError("native delivery readback timed out")
+                readable, _, _ = select.select([process.stdout], [], [], remaining)
+                if not readable:
+                    continue
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                if len(raw) > MAX_JSON_INPUT_BYTES:
+                    raise ValueError("native delivery readback exceeds byte limit")
+            code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+            if code != 0:
+                raise ValueError("native delivery readback failed")
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            raise
+    text = raw.decode("utf-8")
+    return decode_payload(text) if structured else text.strip()
+
+
+def delivery_reliability_enabled(root: Path) -> bool:
+    """Read only the qualified checkout policy, without loading installed Kit."""
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptors = [root_fd]
+    try:
+        kent_fd = open_child_directory(root_fd, ".kent", create=False)
+        descriptors.append(kent_fd)
+        descriptor = os.open(
+            "workflow-profile.toml", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=kent_fd,
+        )
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                    or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022
+                    or metadata.st_size > MAX_JSON_INPUT_BYTES):
+                raise ValueError("unsafe delivery policy profile")
+            raw = stream.read(MAX_JSON_INPUT_BYTES + 1)
+            after = os.fstat(stream.fileno())
+            if (len(raw) > MAX_JSON_INPUT_BYTES
+                    or (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+                    != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                raise ValueError("delivery policy profile changed during read")
+    finally:
+        close_descriptors(*descriptors)
+    profile = tomllib.loads(raw.decode("utf-8"))
+    policies = profile.get("policies", {})
+    if not isinstance(policies, dict):
+        raise ValueError("invalid delivery policy table")
+    policy = policies.get("delivery_reliability")
+    if policy not in (None, "v1"):
+        raise ValueError("unsupported delivery reliability policy")
+    return policy == "v1"
+
+
+def emit_producer_result(root: Path, payload: dict, result, producer_kind: str) -> bytes:
+    """Shared Script adapter; return bytes, never print or complete a Task.
+
+    Supply original serialized bytes (or text) when legacy wire formatting must
+    remain byte-identical. Dict results retain the existing ensure_ascii=False
+    json.dumps encoding. Only opted-in policy resolves installed Kit/native
+    identity, using the actual injected _kent context, not Agent environment.
+    """
+    raw = (result if isinstance(result, bytes) else result.encode("utf-8")
+           if isinstance(result, str) else
+           json.dumps(result, ensure_ascii=False).encode("utf-8"))
+    if not delivery_reliability_enabled(root):
+        return raw
+    if not isinstance(payload, dict):
+        raise ValueError("producer workflow input must be an object")
+    module = delivery_module()
+    output = module.packet_decode(raw)
+    inputs = {key: value for key, value in payload.items()
+              if isinstance(value, str)}
+    _, emitted = module.capture_script_producer(
+        root, task=None, native_context=payload.get("_kent"),
+        producer_kind=producer_kind, inputs=inputs, result=output,
+        native_read=delivery_native_read,
+    )
+    return emitted
+
+
+def pack_delivery_command(root: Path, task: str) -> int:
+    if not TASK_KEY.fullmatch(task):
+        raise ValueError("invalid task key")
+    request = read_json_input("pack-delivery")
+    module = delivery_module()
+    identity = current_delivery_identity(root, task)
+    detail = delivery_native_read(root, [
+        "task", "show", identity["task_id"], "--project", identity["project_id"], "--json",
+    ])
+    workflow = detail.get("summary", {}).get("workflow_id")
+    if not isinstance(workflow, str) or not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        workflow,
+    ):
+        raise ValueError("native Task Workflow identity is unavailable")
+    graph = delivery_native_read(root, ["workflow", "graph", "inspect", workflow, "--json"])
+    _, raw = module.pack_delivery(
+        root, request, identity=identity, task_detail=detail, graph=graph,
+    )
+    # These bytes already exist as emitted-<sha256>.json. The owner alone may
+    # submit that immutable artifact once; unknown completion needs readback.
+    sys.stdout.buffer.write(raw)
+    sys.stdout.buffer.flush()
+    return 0
 
 
 def read_json_input(label: str) -> dict[str, object]:
@@ -298,6 +479,8 @@ def write_checkpoint(
 def main() -> int:
     args = parse_args()
     root = repository_root(args.workspace)
+    if args.command == "pack-delivery":
+        return pack_delivery_command(root, args.task)
     path = checkpoint_path(root, args.task, args.stage)
 
     if args.command == "write":

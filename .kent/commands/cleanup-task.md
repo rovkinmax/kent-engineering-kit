@@ -34,6 +34,20 @@ root and branch, not the Cleanup session's new primary cwd.
 
 ## Terminal preparation before leave
 
+For R2 tasks, the local plan-contract cache contains only a validated external
+snapshot locator. Retain those exact cache bytes through the existing request
+below; validate the referenced accepted state through the project-memory
+adapter. Do not copy the external document history into runtime or remove R2
+storage when retiring the worktree. Missing cache bytes do not authorize
+recreating acceptance or repeating human approval.
+
+For delivery reliability v1, use the validated logical evidence view, including
+an admitted one-splice recovery when present. Follow
+`contracts/evidence-recovery.md`; never repair ledger bytes manually, treat an
+opaque suffix as evidence, or reseal a successful terminal result. Retention
+must preserve the exact packet and recovery dependencies needed after worktree
+retirement. Unknown files or unsettled effects remain blockers.
+
 Confirm terminal authority and quiescence first. Preserve and actually read
 back the retention data in the Task record outside this future-deleted root.
 The local archive is not durable after Janitor and cannot replace that record.

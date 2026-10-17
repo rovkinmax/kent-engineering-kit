@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -50,6 +52,781 @@ DEFAULT_KENT_PATHS = (
     "/opt/homebrew/bin/kent",
     "/usr/local/bin/kent",
 )
+
+R2_CACHE_FIELDS = {
+    "schema", "task_short_id", "project_uid", "task_uid", "task_binding_sha256",
+    "accepted_snapshot_path", "accepted_snapshot_sha256",
+}
+
+
+def validate_memory_cache(cache: object, status: dict[str, object], task: str) -> None:
+    """Validate a locator against the identity-checked external accepted head."""
+    if (not isinstance(cache, dict) or set(cache) != R2_CACHE_FIELDS
+            or cache.get("schema") != "r2-plan-contract-cache-v1"
+            or cache.get("task_short_id") != task
+            or cache != status.get("cache_ref")):
+        raise ValueError("R2 accepted plan locator differs from current accepted head")
+
+
+def memory_snapshot_projection(status: dict[str, object], task: str) -> dict[str, object]:
+    snapshot = status["accepted"]
+    if not isinstance(snapshot, dict):
+        raise ValueError("accepted memory snapshot is unavailable")
+    digest = require_sha256(snapshot.get("normalized_sha256"), "accepted plan digest")
+    result = {
+        "schema_version": 1, "task_short_id": task,
+        "plan_path": ("not-applicable" if snapshot.get("plan_kind") == "report_only"
+                      else require_string(status, "working_path")),
+        "work_kind": require_string(snapshot, "work_kind"),
+        "normalized_sha256": digest,
+        "normalized_plan": require_string(snapshot, "normalized_plan"),
+    }
+    if snapshot.get("coder_selection") is not None:
+        result["coder_selection"] = validate_coder_selection(snapshot["coder_selection"], task)
+        result["coder_selection_sha256"] = digest
+    return result
+
+
+def require_open_plan_acceptance(root: Path, task: str) -> None:
+    preparation = root / "build/kent-workflow" / task / "cleanup-preparation.json"
+    sentinel = root / ".kent/runtime" / (
+        ".evidence-terminal-" + hashlib.sha256(task.encode("utf-8")).hexdigest())
+    if os.path.lexists(preparation) or os.path.lexists(sentinel):
+        raise ValueError("terminal preparation owns the plan cache; acceptance is closed")
+    ledger = root / ".kent/runtime" / task / "evidence-ledger.jsonl"
+    if os.path.lexists(ledger):
+        records, _ = inspection_evidence_view(root, ledger, task=task)
+        if any(record.get("record_kind") == "terminal_evidence_seal_v1" for record in records):
+            raise ValueError("sealed evidence closes plan acceptance")
+
+
+def memory_call(
+    root: Path, payload: dict[str, object], operation: str, **fields: object,
+) -> dict[str, object]:
+    helper = Path(__file__).with_name("workflow-project-memory")
+    if helper.is_symlink() or not helper.is_file():
+        raise ValueError("qualified project memory adapter is unavailable")
+    request = {
+        "schema": "r2-workflow-request-v1", "operation": operation,
+        "workspace_path": str(root), **fields,
+    }
+    if "_kent" in payload:
+        request["native_context"] = payload["_kent"]
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(
+            [sys.executable, str(helper), "workflow"],
+            input=json.dumps(request).encode(), stdout=output,
+            # Source inspection has its own 120s bound plus native readbacks.
+            stderr=subprocess.DEVNULL, timeout=600, check=False,
+        )
+        output.seek(0)
+        raw = output.read(16 * 1024 * 1024 + 1)
+    if result.returncode or len(raw) > 16 * 1024 * 1024:
+        raise ValueError("project memory operation failed")
+    response = json.loads(raw, object_pairs_hook=json_object_without_duplicate_keys)
+    if (not isinstance(response, dict)
+            or set(response) != {"schema", "result"}
+            or response["schema"] != "r2-workflow-response-v1"
+            or not isinstance(response["result"], dict)):
+        raise ValueError("invalid project memory response")
+    return response["result"]
+
+
+INSPECTION_REQUEST_SCHEMA = "workflow-context-inspection-request-v1"
+INSPECTION_RESPONSE_SCHEMA = "workflow-context-inspection-v1"
+INSPECTION_REQUEST_FIELDS = {
+    "schema", "workspace_path", "task_short_id", "plan_path", "evidence_refs",
+}
+MAX_INSPECTION_REFERENCES = 64
+MAX_INSPECTION_FILE_BYTES = 8 * 1024 * 1024
+MAX_INSPECTION_EVIDENCE_BYTES = 32 * 1024 * 1024
+MAX_INSPECTION_NARRATIVE_BYTES = 64 * 1024
+INSPECTION_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_])(task_comment|session_message|question_answer)"
+    r"\(([A-Za-z0-9][A-Za-z0-9._:/,+-]{0,511})\)"
+)
+
+
+def inspection_json(raw: bytes, label: str) -> object:
+    try:
+        return json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=json_object_without_duplicate_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"{label} contains invalid JSON constant {value}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError(f"{label} is not valid bounded UTF-8 JSON") from error
+
+
+def inspection_read_file(
+    path: Path,
+    *,
+    root: Path | None,
+    max_bytes: int,
+) -> bytes:
+    """Read one stable regular file through no-follow directory descriptors."""
+    absolute = Path(os.path.abspath(path))
+    anchor = root if root is not None else Path("/")
+    try:
+        relative = absolute.relative_to(anchor)
+    except ValueError as error:
+        raise ValueError("inspection source escapes its admitted root") from error
+    parts = relative.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("inspection source path is invalid")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
+    try:
+        parent_fd = os.open(anchor, flags)
+        descriptors.append(parent_fd)
+        for component in parts[:-1]:
+            parent_fd = os.open(component, flags, dir_fd=parent_fd)
+            descriptors.append(parent_fd)
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        file_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(parts[-1], file_flags, dir_fd=parent_fd)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > max_bytes
+        ):
+            os.close(descriptor)
+            raise ValueError("inspection source is not a bounded regular file")
+        chunks: list[bytes] = []
+        total = 0
+        with os.fdopen(descriptor, "rb") as stream:
+            while True:
+                chunk = stream.read(min(65536, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("inspection source exceeds its byte limit")
+            after = os.fstat(stream.fileno())
+        linked = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        stable_fields = (
+            "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns",
+        )
+        if (
+            any(getattr(metadata, field) != getattr(after, field) for field in stable_fields)
+            or (after.st_dev, after.st_ino) != (linked.st_dev, linked.st_ino)
+            or total != after.st_size
+        ):
+            raise ValueError("inspection source changed while being read")
+        return b"".join(chunks)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def inspection_workspace_path(root: Path, value: object, label: str) -> Path:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ValueError(f"{label} must be a non-empty path")
+    configured = Path(value)
+    if ".." in configured.parts:
+        raise ValueError(f"{label} must not traverse parent directories")
+    candidate = configured if configured.is_absolute() else root / configured
+    absolute = Path(os.path.abspath(candidate))
+    if not absolute.is_relative_to(root):
+        raise ValueError(f"{label} escapes workspace_path")
+    return absolute
+
+
+def inspection_normalized_plan(raw: bytes) -> str:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("working plan is not valid UTF-8") from error
+    lines = [
+        CHECKBOX.sub(r"\1 \2", line).rstrip()
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines) + "\n"
+
+
+def inspection_project_memory_mode(root: Path) -> str:
+    profile = root / ".kent" / "workflow-profile.toml"
+    try:
+        raw = inspection_read_file(
+            profile, root=root, max_bytes=MAX_INSPECTION_FILE_BYTES,
+        )
+    except FileNotFoundError:
+        return "legacy"
+    except (OSError, ValueError):
+        return "unknown"
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return "unknown"
+    memory = data.get("project_memory")
+    if memory is None:
+        return "legacy"
+    if not isinstance(memory, dict):
+        return "unknown"
+    mode = memory.get("mode")
+    return mode if mode in {"r2", "legacy"} else "unknown"
+
+
+def inspection_runtime_module():
+    support = Path(__file__).with_name("workflow_runtime_contracts.py")
+    try:
+        metadata = support.lstat()
+    except OSError as error:
+        raise ValueError("validated evidence reader is unavailable") from error
+    if not stat.S_ISREG(metadata.st_mode) or support.is_symlink():
+        raise ValueError("validated evidence reader is unsafe")
+    spec = importlib.util.spec_from_file_location(
+        "workflow_plan_inspection_runtime_contracts", support,
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("validated evidence reader cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def inspection_evidence_view(
+    root: Path,
+    path: Path,
+    *,
+    task: str,
+) -> tuple[list[dict[str, object]], str]:
+    raw = inspection_read_file(
+        path, root=root, max_bytes=MAX_INSPECTION_FILE_BYTES,
+    )
+    manifest_path = path.with_name("evidence-recovery.json")
+    continuation_path = path.with_name("evidence-continuation.jsonl")
+    manifest = None
+    continuation = None
+    try:
+        manifest_raw = inspection_read_file(
+            manifest_path, root=root, max_bytes=1024 * 1024,
+        )
+    except FileNotFoundError:
+        manifest_raw = None
+    if manifest_raw is not None:
+        manifest = inspection_json(manifest_raw, "evidence recovery manifest")
+    try:
+        continuation = inspection_read_file(
+            continuation_path, root=root,
+            max_bytes=MAX_INSPECTION_FILE_BYTES,
+        )
+    except FileNotFoundError:
+        continuation = None
+    runtime = inspection_runtime_module()
+    view = runtime.validate_evidence_view(
+        raw, task_short_id=task, manifest=manifest,
+        continuation=continuation,
+    )
+    return view["records"], view["status"]
+
+
+def inspection_record_locator(path: Path, record: dict[str, object]) -> str:
+    event_hash = record.get("event_hash")
+    sequence = record.get("sequence")
+    if not isinstance(event_hash, str) or not isinstance(sequence, int):
+        raise ValueError("validated evidence record has no source identity")
+    return f"{path}#sequence={sequence}&event_hash={event_hash}"
+
+
+def inspection_add_narrative(
+    text: object,
+    *,
+    record_locator: str,
+    field: str,
+    candidates: list[dict[str, object]],
+    unresolved: list[dict[str, str]],
+) -> None:
+    if not isinstance(text, str) or not text.strip():
+        return
+    if len(text.encode("utf-8")) > MAX_INSPECTION_NARRATIVE_BYTES:
+        unresolved.append({
+            "locator": f"{record_locator}&field={field}",
+            "reason": "narrative exceeds inspection bound; retrieve original record",
+        })
+        return
+    matches = list(INSPECTION_REFERENCE.finditer(text))
+    remainder = text
+    for match in reversed(matches):
+        remainder = remainder[:match.start()] + remainder[match.end():]
+    for match in matches:
+        candidates.append({
+            "kind": match.group(1),
+            "reference": match.group(0),
+            "source_locator": f"{record_locator}&field={field}",
+            "verification": "unverified_candidate",
+        })
+    if remainder.strip(" \t\r\n.,;:—-()[]"):
+        unresolved.append({
+            "locator": f"{record_locator}&field={field}",
+            "reason": "unparsed narrative; retrieve and verify the original record",
+        })
+
+
+def inspection_add_records(
+    records: list[dict[str, object]],
+    *,
+    path: Path,
+    candidates: list[dict[str, object]],
+    evidence_locators: list[dict[str, object]],
+    unresolved: list[dict[str, str]],
+) -> None:
+    for record in records:
+        locator = inspection_record_locator(path, record)
+        for field in ("summary", "decisions", "checks"):
+            value = record.get(field)
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    inspection_add_narrative(
+                        item, record_locator=locator,
+                        field=f"{field}[{index}]", candidates=candidates,
+                        unresolved=unresolved,
+                    )
+            else:
+                inspection_add_narrative(
+                    value, record_locator=locator, field=field,
+                    candidates=candidates, unresolved=unresolved,
+                )
+        artifacts = record.get("artifacts")
+        if isinstance(artifacts, list):
+            for index, artifact in enumerate(artifacts):
+                if isinstance(artifact, str) and artifact.strip():
+                    artifact_locator = {
+                        "path": artifact,
+                        "source_locator": f"{locator}&field=artifacts[{index}]",
+                    }
+                    evidence_locators.append(artifact_locator)
+                    inspection_add_narrative(
+                        artifact, record_locator=locator,
+                        field=f"artifacts[{index}]", candidates=candidates,
+                        unresolved=unresolved,
+                    )
+
+
+def acceptance_references(root: Path, task: str, texts: tuple[str, ...]) -> list[str]:
+    """Preserve locators; the existing review gate still owns source verification."""
+    references = list(dict.fromkeys(
+        match.group(0) for text in texts for match in INSPECTION_REFERENCE.finditer(text)))
+    if references:
+        return references
+    ledger = root / ".kent/runtime" / task / "evidence-ledger.jsonl"
+    if not os.path.lexists(ledger):
+        return []
+    records, _ = inspection_evidence_view(root, ledger, task=task)
+    candidates, locators, unresolved = [], [], []
+    inspection_add_records(
+        records, path=ledger, candidates=candidates,
+        evidence_locators=locators, unresolved=unresolved)
+    references = list(dict.fromkeys(item["reference"] for item in candidates))
+    if len(references) > MAX_INSPECTION_REFERENCES:
+        raise ValueError("decision references exceed acceptance bound")
+    return references
+
+
+def inspection_add_plan_authority_refs(
+    refs: object,
+    *,
+    source_locator: str,
+    candidates: list[dict[str, object]],
+    unresolved: list[dict[str, str]],
+) -> None:
+    if not isinstance(refs, list):
+        unresolved.append({
+            "locator": source_locator,
+            "reason": "accepted plan authority references are unavailable",
+        })
+        return
+    for index, ref in enumerate(refs):
+        inspection_add_narrative(
+            ref, record_locator=source_locator,
+            field=f"authority_refs[{index}]", candidates=candidates,
+            unresolved=unresolved,
+        )
+
+
+def inspection_checkpoint_locators(
+    root: Path,
+    task: str,
+    *,
+    unresolved: list[dict[str, str]],
+) -> list[dict[str, object]]:
+    result = []
+    for stage in ("fix", "smoke"):
+        path = root / ".kent" / "runtime" / task / f"{stage}-checkpoint.json"
+        locator: dict[str, object] = {
+            "stage": stage, "path": str(path), "present": False,
+            "valid": None, "sha256": None,
+        }
+        try:
+            raw = inspection_read_file(
+                path, root=root, max_bytes=1024 * 1024,
+            )
+        except FileNotFoundError:
+            result.append(locator)
+            continue
+        except (OSError, ValueError) as error:
+            locator["present"] = True
+            locator["valid"] = False
+            unresolved.append({
+                "locator": str(path),
+                "reason": f"checkpoint source is unreadable or unsafe ({type(error).__name__})",
+            })
+            result.append(locator)
+            continue
+        locator["present"] = True
+        locator["sha256"] = hashlib.sha256(raw).hexdigest()
+        try:
+            checkpoint = inspection_json(raw, f"{stage} checkpoint")
+            valid = (
+                isinstance(checkpoint, dict)
+                and checkpoint.get("schema_version") == 1
+                and checkpoint.get("task_short_id") == task
+                and checkpoint.get("stage") == stage
+                and checkpoint.get("workspace_path") == str(root)
+                and isinstance(checkpoint.get("completed"), list)
+                and isinstance(checkpoint.get("remaining"), list)
+                and isinstance(checkpoint.get("mutation_ledger"), list)
+                and isinstance(checkpoint.get("next_action"), str)
+                and bool(checkpoint["next_action"].strip())
+                and isinstance(checkpoint.get("updated_at"), str)
+            )
+        except (OSError, ValueError, TypeError):
+            valid = False
+        locator["valid"] = valid
+        if not valid:
+            unresolved.append({
+                "locator": str(path),
+                "reason": "checkpoint identity or schema is invalid",
+            })
+        result.append(locator)
+    return result
+
+
+def inspection_legacy_plan(
+    root: Path,
+    task: str,
+    plan_path: str,
+    *,
+    unresolved: list[dict[str, str]],
+) -> tuple[dict[str, object] | None, dict[str, object] | None, str]:
+    if plan_path == "not-applicable":
+        return None, {"plan_path": "not-applicable"}, "not-applicable"
+    try:
+        path = inspection_workspace_path(root, plan_path, "plan_path")
+        raw = inspection_read_file(
+            path, root=root, max_bytes=MAX_INSPECTION_FILE_BYTES,
+        )
+        normalized = inspection_normalized_plan(raw)
+        working = {
+            "plan_path": str(path),
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            "normalized_sha256": hashlib.sha256(
+                normalized.encode("utf-8")
+            ).hexdigest(),
+        }
+    except (OSError, ValueError) as error:
+        unresolved.append({
+            "locator": plan_path,
+            "reason": f"working plan is missing or unavailable ({type(error).__name__})",
+        })
+        return None, None, "unknown"
+
+    snapshot_path = root / ".kent" / "runtime" / task / "plan-contract.json"
+    try:
+        ensure_safe_directory(snapshot_path.parent, root, create=False)
+        snapshot_raw = inspection_read_file(
+            snapshot_path, root=root, max_bytes=MAX_INSPECTION_FILE_BYTES,
+        )
+        snapshot = inspection_json(snapshot_raw, "accepted plan snapshot")
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("schema_version") != 1
+            or snapshot.get("task_short_id") != task
+            or not isinstance(snapshot.get("normalized_plan"), str)
+            or not isinstance(snapshot.get("normalized_sha256"), str)
+            or hashlib.sha256(
+                snapshot["normalized_plan"].encode("utf-8")
+            ).hexdigest() != snapshot["normalized_sha256"]
+        ):
+            raise ValueError("accepted plan snapshot identity or digest is invalid")
+        if coder_selection_policy(root) == "complexity":
+            selection = validate_coder_selection(snapshot.get("coder_selection"), task)
+            if snapshot.get("coder_selection_sha256") != snapshot["normalized_sha256"]:
+                raise ValueError("accepted coder selection is not digest-bound")
+            if plan_coder_selection(path, task) != selection:
+                raise ValueError("current coder selection differs from accepted choice")
+        accepted = {
+            "plan_path": snapshot.get("plan_path"),
+            "normalized_sha256": snapshot["normalized_sha256"],
+            "snapshot_path": str(snapshot_path),
+            "snapshot_sha256": hashlib.sha256(snapshot_raw).hexdigest(),
+        }
+        comparison = (
+            "unchanged"
+            if accepted["normalized_sha256"] == working["normalized_sha256"]
+            else "changed"
+        )
+        return accepted, working, comparison
+    except FileNotFoundError:
+        unresolved.append({
+            "locator": str(snapshot_path),
+            "reason": "legacy accepted plan snapshot is missing; scope is not inferred",
+        })
+    except (OSError, ValueError) as error:
+        unresolved.append({
+            "locator": str(snapshot_path),
+            "reason": f"accepted plan snapshot is invalid or unavailable ({type(error).__name__})",
+        })
+    return None, working, "unknown"
+
+
+def inspection_r2_plan(
+    root: Path,
+    payload: dict[str, object],
+    *,
+    plan_path: str,
+    candidates: list[dict[str, object]],
+    unresolved: list[dict[str, str]],
+) -> tuple[dict[str, object] | None, dict[str, object] | None, str]:
+    native_payload = (
+        {"_kent": payload["_kent"]} if "_kent" in payload else {}
+    )
+    try:
+        resolved = memory_call(root, native_payload, "resolve-plan", plan_path=plan_path)
+        if (
+            not isinstance(resolved.get("supplied_revision"), str)
+            or not isinstance(resolved.get("working_revision"), str)
+            or not isinstance(resolved.get("working_path"), str)
+            or not isinstance(resolved.get("working_sha256"), str)
+        ):
+            raise ValueError("R2 plan resolver returned an incomplete identity")
+        checked = memory_call(root, native_payload, "check-plan", coder_selection=None)
+        accepted_source = checked.get("accepted")
+        if isinstance(accepted_source, dict) and accepted_source.get("coder_selection") is not None:
+            selection = plan_coder_selection(
+                Path(require_string(checked, "working_path")),
+                require_string(payload, "task_short_id"),
+            )
+            checked = memory_call(root, native_payload, "check-plan", coder_selection=selection)
+            accepted_source = checked.get("accepted")
+        if (
+            not isinstance(accepted_source, dict)
+            or checked.get("comparison") not in {"unchanged", "changed"}
+            or not isinstance(checked.get("accepted_snapshot"), str)
+            or not isinstance(checked.get("accepted_path"), str)
+        ):
+            raise ValueError("R2 accepted plan inspection is incomplete")
+        accepted = {
+            "revision": accepted_source.get("revision_token"),
+            "normalized_sha256": accepted_source.get("normalized_sha256"),
+            "snapshot_path": checked["accepted_path"],
+            "snapshot_sha256": checked["accepted_snapshot"],
+        }
+        working = {
+            "supplied_revision": resolved["supplied_revision"],
+            "revision": resolved["working_revision"],
+            "plan_path": resolved["working_path"],
+            "raw_sha256": resolved["working_sha256"],
+        }
+        inspection_add_plan_authority_refs(
+            accepted_source.get("authority_refs"),
+            source_locator=checked["accepted_path"],
+            candidates=candidates, unresolved=unresolved,
+        )
+        return accepted, working, checked["comparison"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        unresolved.append({
+            "locator": plan_path,
+            "reason": f"R2 plan inspection is incomplete ({type(error).__name__})",
+        })
+        return None, None, "unknown"
+
+
+def inspect_workflow_context(
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Read plan/evidence locators without making an authority determination."""
+    native_context = payload.get("_kent")
+    request = {key: value for key, value in payload.items() if key != "_kent"}
+    if set(request) != INSPECTION_REQUEST_FIELDS:
+        raise ValueError(
+            "inspection request must contain exactly "
+            f"{sorted(INSPECTION_REQUEST_FIELDS)}"
+        )
+    if request.get("schema") != INSPECTION_REQUEST_SCHEMA:
+        raise ValueError(f"inspection schema must be {INSPECTION_REQUEST_SCHEMA!r}")
+    workspace = request.get("workspace_path")
+    if not isinstance(workspace, str) or not workspace.strip():
+        raise ValueError("workspace_path must be a non-empty string")
+    root = repository_root(workspace)
+    if workspace != str(root):
+        raise ValueError("workspace_path must be the canonical repository root")
+    task = request.get("task_short_id")
+    if not isinstance(task, str) or not TASK_KEY.fullmatch(task):
+        raise ValueError("task_short_id is invalid")
+    configured_plan = request.get("plan_path")
+    if not isinstance(configured_plan, str) or not configured_plan.strip():
+        raise ValueError("plan_path must be a non-empty string")
+    evidence_refs = request.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or len(evidence_refs) > MAX_INSPECTION_REFERENCES:
+        raise ValueError(
+            f"evidence_refs must contain at most {MAX_INSPECTION_REFERENCES} items"
+        )
+    validated_refs: list[tuple[str, str]] = []
+    seen_refs = set()
+    for index, ref in enumerate(evidence_refs):
+        if not isinstance(ref, dict) or set(ref) != {"path", "sha256"}:
+            raise ValueError(f"evidence_refs[{index}] must contain path and sha256")
+        path = ref["path"]
+        digest = require_sha256(ref["sha256"], f"evidence_refs[{index}].sha256")
+        if not isinstance(path, str) or not path.strip() or "\x00" in path:
+            raise ValueError(f"evidence_refs[{index}].path must be non-empty")
+        if path in seen_refs:
+            raise ValueError("evidence_refs paths must be unique")
+        seen_refs.add(path)
+        validated_refs.append((path, digest))
+
+    candidates: list[dict[str, object]] = []
+    evidence_locators: list[dict[str, object]] = []
+    unresolved: list[dict[str, str]] = []
+    profile_mode = inspection_project_memory_mode(root)
+    helper = Path(__file__).with_name("workflow-project-memory")
+    adapter_available = helper.is_file() and not helper.is_symlink()
+    use_r2 = False
+    if adapter_available:
+        try:
+            mode_result = memory_call(
+                root, {"_kent": native_context} if native_context is not None else {},
+                "resolve-task",
+            )
+            mode = mode_result.get("mode")
+            if mode not in {"legacy", "r2"}:
+                raise ValueError("R2 task resolver returned an unknown mode")
+            use_r2 = mode == "r2"
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            unresolved.append({
+                "locator": "native-task-context",
+                "reason": f"task mode could not be verified ({type(error).__name__})",
+            })
+    elif profile_mode == "r2":
+        unresolved.append({
+            "locator": "native-task-context",
+            "reason": "R2 task mode cannot be verified without its native context",
+        })
+    elif profile_mode == "unknown":
+        unresolved.append({
+            "locator": ".kent/workflow-profile.toml",
+            "reason": "project memory mode is invalid or unreadable",
+        })
+
+    accepted: dict[str, object] | None
+    working: dict[str, object] | None
+    comparison: str
+    if use_r2:
+        accepted, working, comparison = inspection_r2_plan(
+            root,
+            {**request, **({"_kent": native_context} if native_context is not None else {})},
+            plan_path=configured_plan, candidates=candidates,
+            unresolved=unresolved,
+        )
+    elif profile_mode == "r2" and not adapter_available:
+        accepted, working, comparison = None, None, "unknown"
+        unresolved.append({
+            "locator": ".kent/scripts/workflow-project-memory",
+            "reason": "qualified R2 plan reader is unavailable",
+        })
+    else:
+        accepted, working, comparison = inspection_legacy_plan(
+            root, task, configured_plan, unresolved=unresolved,
+        )
+
+    checkpoints = inspection_checkpoint_locators(
+        root, task, unresolved=unresolved,
+    )
+    runtime_dir = root / ".kent" / "runtime" / task
+    ledger_path_value = runtime_dir / "evidence-ledger.jsonl"
+    ledger_seen = False
+    ledger_status = "missing"
+    try:
+        records, ledger_status = inspection_evidence_view(
+            root, ledger_path_value, task=task,
+        )
+        ledger_seen = True
+        inspection_add_records(
+            records, path=ledger_path_value, candidates=candidates,
+            evidence_locators=evidence_locators, unresolved=unresolved,
+        )
+        evidence_locators.append({
+            "path": str(ledger_path_value), "status": ledger_status,
+        })
+        if ledger_status == "recovered_with_gap":
+            unresolved.append({
+                "locator": str(runtime_dir / "evidence-recovery.json"),
+                "reason": "validated evidence view preserves a damaged opaque suffix",
+            })
+    except FileNotFoundError:
+        unresolved.append({
+            "locator": str(ledger_path_value),
+            "reason": "evidence ledger is missing",
+        })
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        unresolved.append({
+            "locator": str(ledger_path_value),
+            "reason": f"evidence ledger is malformed or unavailable ({type(error).__name__})",
+        })
+
+    total_ref_bytes = 0
+    for path_value, expected_digest in validated_refs:
+        try:
+            path = inspection_workspace_path(root, path_value, "evidence reference")
+            raw = inspection_read_file(
+                path, root=root, max_bytes=MAX_INSPECTION_FILE_BYTES,
+            )
+            total_ref_bytes += len(raw)
+            if total_ref_bytes > MAX_INSPECTION_EVIDENCE_BYTES:
+                raise ValueError("aggregate evidence references exceed inspection limit")
+            actual_digest = hashlib.sha256(raw).hexdigest()
+            if actual_digest != expected_digest:
+                raise ValueError("evidence reference digest does not match")
+            locator = {"path": str(path), "sha256": actual_digest, "status": "digest-verified"}
+            evidence_locators.append(locator)
+            if path.name == "evidence-ledger.jsonl" and path != ledger_path_value:
+                records, status = inspection_evidence_view(root, path, task=task)
+                inspection_add_records(
+                    records, path=path, candidates=candidates,
+                    evidence_locators=evidence_locators, unresolved=unresolved,
+                )
+                locator["status"] = status
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            unresolved.append({
+                "locator": path_value,
+                "reason": f"evidence reference is missing, unsafe, or mismatched ({type(error).__name__})",
+            })
+
+    response = {
+        "schema": INSPECTION_RESPONSE_SCHEMA,
+        "task_short_id": task,
+        "workspace_path": str(root),
+        "accepted_plan_identity": accepted,
+        "working_plan_identity": working,
+        "plan_comparison": comparison,
+        "evidence_status": ledger_status if ledger_seen else "unavailable",
+        "evidence_locators": evidence_locators,
+        "checkpoint_locators": checkpoints,
+        "decision_candidates": candidates,
+        "unresolved": unresolved,
+        "discovery_complete": not unresolved,
+        "authority_verification_required": True,
+    }
+    return response
 
 
 def supplied_delivery_context(payload: dict[str, object]) -> str | None:
@@ -473,6 +1250,11 @@ def write_snapshot(
     if coder_selection is not None:
         payload["coder_selection"] = coder_selection
         payload["coder_selection_sha256"] = digest
+    write_snapshot_payload(path, root=root, payload=payload)
+
+
+def write_snapshot_payload(path: Path, *, root: Path, payload: dict[str, object]) -> None:
+    ensure_safe_directory(path.parent, root, create=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -597,10 +1379,12 @@ def complete_accept_revalidation(
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def main() -> int:
-    payload = json.load(sys.stdin)
+def execute(payload: dict[str, object]) -> int:
     if not isinstance(payload, dict):
         raise ValueError("workflow input must be one JSON object")
+    if os.environ.get("KENT_PLAN_CONTRACT_MODE") == "inspect":
+        print(json.dumps(inspect_workflow_context(payload), ensure_ascii=False))
+        return 0
     delivery_context = supplied_delivery_context(payload)
 
     workspace = repository_root(require_string(payload, "workspace_path"))
@@ -610,6 +1394,23 @@ def main() -> int:
         raise ValueError("KENT_PLAN_CONTRACT_MODE must be accept or check")
     task = require_string(payload, "task_short_id")
     snapshot_path = runtime_file(workspace, task)
+    memory_mode = False
+    memory_accepted = None
+    memory_head = None
+    if inspection_project_memory_mode(workspace) == "r2":
+        admission = memory_call(workspace, payload, "resolve-task")
+        if admission.get("mode") not in {"legacy", "r2"}:
+            raise ValueError("invalid task memory mode")
+        memory_mode = admission["mode"] == "r2"
+    if memory_mode:
+        memory_head = memory_call(workspace, payload, "accepted-head")["accepted_snapshot"]
+        if memory_head is not None:
+            status = memory_call(workspace, payload, "check-plan", coder_selection=None)
+            if snapshot_path.exists() or snapshot_path.is_symlink():
+                cache = inspection_json(inspection_read_file(
+                    snapshot_path, root=workspace, max_bytes=65536), "plan locator")
+                validate_memory_cache(cache, status, task)
+            memory_accepted = memory_snapshot_projection(status, task)
 
     if mode == "accept":
         review_context = require_string(payload, "review_context")
@@ -619,11 +1420,13 @@ def main() -> int:
         route_context = require_string(payload, "plan_route_context")
     else:
         route = require_environment("KENT_PLAN_CONTRACT_ROUTE")
-        accepted = load_snapshot(
+        accepted = memory_accepted if memory_mode else load_snapshot(
             snapshot_path,
             task=task,
             require_coder_selection=selection_policy == "complexity",
         )
+        if accepted is None:
+            raise ValueError("external accepted plan is missing")
         configured_plan = accepted.get("plan_path")
         work_kind = accepted.get("work_kind")
         if not isinstance(configured_plan, str) or not configured_plan:
@@ -639,7 +1442,23 @@ def main() -> int:
     if route not in ROUTES:
         raise ValueError(f"unsupported plan_route: {route!r}")
 
-    plan, portable_plan_path = plan_file(workspace, configured_plan)
+    memory_revision = None
+    report_only = configured_plan == "not-applicable"
+    if memory_mode:
+        if mode == "accept" and report_only and memory_head is None:
+            require_open_plan_acceptance(workspace, task)
+            memory_call(workspace, payload, "prepare-report-only", provenance=[])
+        resolved = memory_call(workspace, payload, "resolve-plan", plan_path=configured_plan)
+        plan = Path(require_string(resolved, "working_path"))
+        if not report_only:
+            configured_plan = str(plan)
+        portable_plan_path = configured_plan
+        memory_revision = require_string(resolved, "working_revision")
+        raw = inspection_read_file(plan, root=None, max_bytes=MAX_INSPECTION_FILE_BYTES)
+        if hashlib.sha256(raw).hexdigest() != resolved["working_sha256"]:
+            raise ValueError("working memory plan bytes changed")
+    else:
+        plan, portable_plan_path = plan_file(workspace, configured_plan)
     normalized = normalized_plan(plan)
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
@@ -651,8 +1470,9 @@ def main() -> int:
                 "accepted_plan_sha256",
             )
             prior_digest: str | None = None
-            if snapshot_path.exists() or snapshot_path.is_symlink():
-                prior_snapshot = load_snapshot(
+            if memory_accepted is not None or (
+                    not memory_mode and (snapshot_path.exists() or snapshot_path.is_symlink())):
+                prior_snapshot = memory_accepted if memory_mode else load_snapshot(
                     snapshot_path,
                     task=task,
                     require_coder_selection=True,
@@ -743,16 +1563,42 @@ def main() -> int:
                         accepted_plan_sha256=prior_digest or NOT_APPLICABLE,
                     )
                     return 0
-        write_snapshot(
-            snapshot_path,
-            root=workspace,
-            task=task,
-            plan_path=portable_plan_path,
-            work_kind=work_kind,
-            normalized=normalized,
-            digest=digest,
-            coder_selection=selection,
-        )
+        if memory_mode:
+            require_open_plan_acceptance(workspace, task)
+            references = acceptance_references(workspace, task, (review_context, normalized))
+            if not references:
+                complete_accept_revalidation(
+                    workspace=workspace, plan_path=configured_plan, work_kind=work_kind,
+                    review_context=review_context, route=route, route_context=route_context,
+                    task=task, delivery_context=delivery_context,
+                    reason="Original decision/review locators are missing; recover existing sources without repeating consent.",
+                    accepted_plan_sha256=(
+                        memory_accepted["normalized_sha256"] if memory_accepted else NOT_APPLICABLE),
+                )
+                return 0
+            accepted_revision = memory_call(
+                workspace, payload, "accept-plan", expected_revision=memory_revision,
+                expected_accepted=memory_head,
+                metadata={"work_kind": work_kind, "authority_refs": references,
+                          "coder_selection": selection,
+                          "plan_kind": "report_only" if report_only else "markdown"})
+            status = memory_call(workspace, payload, "check-plan", coder_selection=selection)
+            if (status["accepted_snapshot"] != accepted_revision["token"]
+                    or status["comparison"] != "unchanged"):
+                raise ValueError("accepted memory plan changed before cache publication")
+            require_open_plan_acceptance(workspace, task)
+            write_snapshot_payload(snapshot_path, root=workspace, payload=status["cache_ref"])
+        else:
+            write_snapshot(
+                snapshot_path,
+                root=workspace,
+                task=task,
+                plan_path=portable_plan_path,
+                work_kind=work_kind,
+                normalized=normalized,
+                digest=digest,
+                coder_selection=selection,
+            )
         complete_route(
             route,
             transition=f"plan_contract_{route}",
@@ -774,7 +1620,8 @@ def main() -> int:
         )
         return 0
 
-    ensure_safe_directory(snapshot_path.parent, workspace, create=False)
+    if not memory_mode:
+        ensure_safe_directory(snapshot_path.parent, workspace, create=False)
     accepted_digest = accepted.get("normalized_sha256")
     accepted_path = accepted.get("plan_path")
     selection_error: str | None = None
@@ -886,6 +1733,37 @@ def main() -> int:
         changed_payload["delivery_context"] = delivery_context
     print(json.dumps(changed_payload, ensure_ascii=False))
     return 0
+
+
+def main() -> int:
+    payload = json.load(sys.stdin)
+    if not isinstance(payload, dict):
+        raise ValueError("workflow input must be one JSON object")
+    if os.environ.get("KENT_PLAN_CONTRACT_MODE") == "inspect":
+        return execute(payload)
+    root = Path.cwd().resolve()
+    profile_path = root / ".kent/workflow-profile.toml"
+    profile = tomllib.loads(profile_path.read_text()) if profile_path.is_file() else {}
+    if profile.get("policies", {}).get("delivery_reliability") is None:
+        return execute(payload)
+    source = Path(__file__).with_name("workflow-checkpoint")
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("qualified producer adapter is unavailable")
+    loader = importlib.machinery.SourceFileLoader("plan_producer_adapter", str(source))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ValueError("producer adapter cannot be loaded")
+    adapter = importlib.util.module_from_spec(spec)
+    loader.exec_module(adapter)
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output:
+        with contextlib.redirect_stdout(output):
+            code = execute(payload)
+        output.seek(0)
+        raw = output.read(1024 * 1024 + 1).encode("utf-8")
+    if len(raw) > 1024 * 1024:
+        raise ValueError("plan producer result exceeds limit")
+    sys.stdout.buffer.write(adapter.emit_producer_result(root, payload, raw, "plan-contract"))
+    return code
 
 
 if __name__ == "__main__":

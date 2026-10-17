@@ -44,6 +44,12 @@ procedure, and authoritative plan before editing.
 - Missing agent-produced evidence is not user authority work. Reconstruct it
   only when bounded and safe; otherwise record the gap and use current
   deterministic evidence.
+- Use the task-fixed storage mode resolved by the project adapter. For R2,
+  publish plan progress through the protected compare-and-swap helper; never
+  edit an immutable revision in place or create a replacement `.todo` plan.
+  Preserve legacy task paths. A missing local accepted-plan cache does not
+  establish missing approval: inspect the external accepted state and original
+  decision references through the declared project interfaces.
 - Preserve scope when an adjacent failure is outside task authority. Do not ask
   whether to absorb it; report the external blocker through the node contract.
 - Delegate only bounded read-only research or build diagnosis when the

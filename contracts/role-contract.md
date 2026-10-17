@@ -114,6 +114,30 @@ mutations prohibited by a role.
 
 ## Execution Continuation
 
+Roles preserve the difference between human-required outcomes and
+agent-selected means. An earlier suggestion becomes a requirement only when
+an applicable original decision adopts it. Recover accessible decision sources
+before asking again; missing agent notes do not establish missing consent.
+
+Delivery reliability v1 uses producer-owned packets for exact transition
+transport. Roles select the intended transition and supply only its declared
+agent-owned values; the configured checkpoint helper reconstructs and packs
+producer-owned fields. Reconstruction proves bytes and bindings, not a fresh
+check result or external effect. Receivers retain their existing validation and
+freshness duties. Unknown completion outcomes require native readback before
+retry.
+
+Storage mode is fixed per task by the project adapter. R2 task documents use
+immutable revisions and compare-and-swap publication; local plan caches are
+locators, not approval authority. Legacy tasks keep their declared paths.
+Neither missing cache bytes nor unavailable R2 admission permits an implicit
+`.todo` fallback for new-mode work.
+
+Product Task scope does not include repairing Kent or shared infrastructure.
+Diagnose the boundary and preserve evidence and effect status. Repairs outside
+the accepted scope need a separately authorized owner; role or shell capability
+does not supply that authority.
+
 Delivery roles consume completed results and distinguish success, failure,
 truncation and a genuine pending observer handle. An identical successful
 read needs changed state, a missing fact or required fresh safety evidence.

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -12,12 +15,20 @@ import time
 import unittest
 from unittest import mock
 
+from workflowkit.delivery import owner_replan_instruction
+from workflowkit.model import SpecError
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CHILD = ROOT / ".kent/scripts/workflow-compile-verify"
 WRAPPER = ROOT / ".kent/scripts/workflow-verify-report"
 RUNTIME = ROOT / ".kent/scripts/workflow_runtime_contracts.py"
 IDENTITY = ROOT / ".kent/scripts/kit-verification-identity.py"
+BUILDER = ROOT / ".kent/workflows/kit_development.py"
+kit_spec = importlib.util.spec_from_file_location("kit_delivery_slice", BUILDER)
+assert kit_spec is not None and kit_spec.loader is not None
+kit = importlib.util.module_from_spec(kit_spec)
+kit_spec.loader.exec_module(kit)
 
 
 class IdentityFixtureTest(unittest.TestCase):
@@ -559,3 +570,280 @@ class DeliveryBaselineFixtureTest(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
         self.assertIn("focused production-shaped wrapper/helper checks", readme)
         self.assertIn("source/environment identity references", readme)
+
+
+class CurrentKitGraphTest(unittest.TestCase):
+    def profile(self, *, current: bool = False, complexity: bool = False):
+        profile = kit.profile_at(ROOT, check_files=False)
+        policies = {
+            key: value for key, value in profile.policies.items()
+            if key != "delivery_reliability"
+        }
+        policies["coder_selection"] = "complexity" if complexity else "disabled"
+        if current:
+            policies["delivery_reliability"] = "v1"
+        return replace(
+            profile, policies=policies,
+            commands=dict(
+                kit.CURRENT_COMMAND_TARGETS if current else kit.COMMAND_TARGETS
+            ),
+        )
+
+    def test_current_requires_opt_in_complete_commands_and_continuous_writer(self):
+        legacy = self.profile()
+        current = self.profile(current=True)
+        for invalid in (
+            legacy,
+            replace(current, commands=kit.COMMAND_TARGETS),
+            replace(current, policies={**current.policies, "delivery_reliability": "v2"}),
+            replace(current, policies={**current.policies, "writer_sessions": "fresh_per_slice"}),
+        ):
+            with self.subTest(policies=invalid.policies), self.assertRaises(SpecError):
+                kit.build_current_workflow(invalid)
+
+    def test_current_preserves_selected_baseline_and_existing_edge_contracts(self):
+        for complexity in (False, True):
+            with self.subTest(complexity=complexity):
+                legacy = self.profile(complexity=complexity)
+                current = self.profile(current=True, complexity=complexity)
+                baseline = (
+                    kit.build_complexity_candidate_workflow(legacy)
+                    if complexity else kit.build_workflow(legacy)
+                )
+                graph = kit.build_current_workflow(current)
+                graph.validate()
+                self.assertEqual(graph.name, baseline.name)
+                self.assertEqual(graph.execution_target, baseline.execution_target)
+                self.assertEqual(graph.nodes, baseline.nodes)
+                before = {edge.key: edge for edge in baseline.edges}
+                after = {edge.key: edge for edge in graph.edges}
+                self.assertEqual(after.keys() - before.keys(), {"implement_replan"})
+                self.assertFalse(before.keys() - after.keys())
+                for key, edge in before.items():
+                    self.assertEqual(replace(after[key], prompt=edge.prompt), edge, key)
+                route = after["implement_replan"]
+                self.assertEqual(
+                    (route.source, route.transition, route.target, route.context,
+                     route.context_source, route.requires_approval),
+                    ("implement", "implement_replan", "plan_revalidation", "continue_session",
+                     "node:plan", False),
+                )
+                self.assertEqual(route.parameters, after["fix_replan"].parameters)
+                self.assertEqual(route.prompt, after["fix_replan"].prompt)
+                self.assertIn("replan", after["plan_contract_continue_implement"].prompt)
+                self.assertEqual(
+                    (len(graph.nodes),
+                     len({(edge.source, edge.transition) for edge in graph.edges}),
+                     len(graph.edges)),
+                    (21, 55, 56) if complexity else (21, 53, 54),
+                )
+                self.assertEqual(
+                    [edge.key for edge in graph.edges if edge.requires_approval],
+                    [edge.key for edge in baseline.edges if edge.requires_approval],
+                )
+                self.assertTrue(after["plan_review_accept"].requires_approval)
+
+    def test_historical_builders_ignore_only_current_opt_in(self):
+        legacy = self.profile()
+        current = self.profile(current=True)
+        original_policies = dict(current.policies)
+        original_commands = dict(current.commands)
+        for build, shape in (
+            (kit.build_workflow, (21, 52, 53)),
+            (kit.build_complexity_candidate_workflow, (21, 54, 55)),
+        ):
+            graph = build(current)
+            self.assertEqual(graph, build(legacy))
+            self.assertEqual(
+                (len(graph.nodes),
+                 len({(edge.source, edge.transition) for edge in graph.edges}),
+                 len(graph.edges)), shape,
+            )
+            self.assertNotIn("implement_replan", {edge.key for edge in graph.edges})
+        self.assertEqual(current.policies, original_policies)
+        self.assertEqual(current.commands, original_commands)
+
+    def test_r2_replanning_reads_external_authority_without_cache_repair(self):
+        legacy = owner_replan_instruction(self.profile())
+        current = owner_replan_instruction(self.profile(current=True))
+        self.assertNotIn("workflow-project-memory", legacy)
+        for required in (
+            "resolve-task", "check-plan", "resolve-plan", "exact native",
+            "current working head", "original\napproval/review locators",
+            "missing local plan-contract cache does\nnot mean missing approval",
+            "must not recreate the cache", "helper-resolved legacy",
+            "schema_version=1",
+        ):
+            self.assertIn(required, current)
+        self.assertIn("plan_change_report", current)
+        self.assertIn("grants no expanded source", current)
+
+
+class CurrentKitBootstrapTest(unittest.TestCase):
+    def fixture(self, *, current: bool = True) -> Path:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        for directory in (".kent/context", ".kent/commands", "workflowkit"):
+            shutil.copytree(
+                ROOT / directory, root / directory,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+        (root / ".kent/workflows").mkdir()
+        shutil.copy2(BUILDER, root / ".kent/workflows/kit_development.py")
+        (root / ".kent/scripts").mkdir()
+        for command in ("workflow-compile-verify", "workflow-prepare-cleanup"):
+            shutil.copy2(ROOT / ".kent/scripts" / command,
+                         root / ".kent/scripts" / command)
+        for source in (kit.SCHEMA3_COPIES | kit.PROJECT_COPIES | kit.MEMORY_COPIES).values():
+            target = root / source
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / source, target)
+        (root / "scripts").mkdir()
+        shutil.copy2(ROOT / "scripts/sync-project-adapters",
+                     root / "scripts/sync-project-adapters")
+        profile = (ROOT / ".kent/workflow-profile.toml").read_text()
+        profile = re.sub(r"(?ms)^\[project_memory\]\n.*?(?=^\[|\Z)", "", profile)
+        profile = re.sub(
+            r"(?m)^(?:delivery_reliability|project_memory|project_memory_core)\s*=.*\n",
+            "", profile,
+        )
+        if current:
+            profile = profile.replace(
+                "[policies]\n", '[policies]\ndelivery_reliability = "v1"\n',
+            ).replace(
+                "[commands]\n",
+                "[commands]\n" + "".join(
+                    f'{key} = "{kit.CURRENT_COMMAND_TARGETS[key]}"\n'
+                    for key in kit.MEMORY_COPIES
+                ),
+            )
+        (root / ".kent/workflow-profile.toml").write_text(profile)
+        return root
+
+    def run_builder(self, root: Path, *arguments: str):
+        return subprocess.run(
+            [sys.executable, "-B", str(root / ".kent/workflows/kit_development.py"),
+             *arguments],
+            cwd=root, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True, text=True, check=False,
+        )
+
+    def snapshot(self, root: Path):
+        return {
+            str(path.relative_to(root)): (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+            for path in root.rglob("*") if path.is_file() and not path.is_symlink()
+        }
+
+    def test_explicit_materialization_supports_legacy_and_current_closures(self):
+        for current in (False, True):
+            with self.subTest(current=current):
+                root = self.fixture(current=current)
+                self.assertFalse((root / kit.CURRENT_COMMAND_TARGETS["project_memory"]).exists())
+                kit.bootstrap(root)
+                kit.verify_command_closure(root)
+                before = self.snapshot(root)
+                kit.bootstrap(root)
+                self.assertEqual(self.snapshot(root), before)
+                for key, source in kit.MEMORY_COPIES.items():
+                    target = root / kit.CURRENT_COMMAND_TARGETS[key]
+                    self.assertEqual(target.exists(), current)
+                    if current:
+                        self.assertFalse(target.is_symlink())
+                        self.assertEqual(target.read_bytes(), (ROOT / source).read_bytes())
+                        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+
+    def test_memory_drift_blocks_before_any_generated_write(self):
+        root = self.fixture()
+        target = root / kit.CURRENT_COMMAND_TARGETS["project_memory_core"]
+        target.write_text("foreign modified helper\n")
+        before = self.snapshot(root)
+        with self.assertRaises((SpecError, ValueError)):
+            kit.bootstrap(root)
+        self.assertEqual(self.snapshot(root), before)
+        self.assertFalse((root / kit.CURRENT_COMMAND_TARGETS["project_memory"]).exists())
+
+    def test_half_pair_and_redirected_pair_fail_before_writes(self):
+        for mutation in ("missing", "redirected"):
+            with self.subTest(mutation=mutation):
+                root = self.fixture()
+                profile_path = root / ".kent/workflow-profile.toml"
+                profile = profile_path.read_text()
+                if mutation == "missing":
+                    profile = re.sub(r"(?m)^project_memory_core\s*=.*\n", "", profile)
+                else:
+                    profile = profile.replace(
+                        kit.CURRENT_COMMAND_TARGETS["project_memory_core"],
+                        ".kent/scripts/other_memory.py",
+                    )
+                profile_path.write_text(profile)
+                before = self.snapshot(root)
+                with self.assertRaises((SpecError, ValueError)):
+                    kit.bootstrap(root)
+                self.assertEqual(self.snapshot(root), before)
+
+    def test_v1_without_memory_pair_blocks_before_any_generated_write(self):
+        root = self.fixture()
+        profile_path = root / ".kent/workflow-profile.toml"
+        profile_path.write_text(re.sub(
+            r"(?m)^(?:project_memory|project_memory_core)\s*=.*\n",
+            "", profile_path.read_text(),
+        ))
+        before = self.snapshot(root)
+        with self.assertRaises(SpecError):
+            kit.bootstrap(root)
+        self.assertEqual(self.snapshot(root), before)
+
+    def test_memory_symlink_blocks_without_touching_its_target(self):
+        root = self.fixture()
+        foreign = root / "foreign.py"
+        foreign.write_text("foreign content\n")
+        target = root / kit.CURRENT_COMMAND_TARGETS["project_memory_core"]
+        target.symlink_to(foreign)
+        before = self.snapshot(root)
+        with self.assertRaises((SpecError, ValueError)):
+            kit.bootstrap(root)
+        self.assertEqual(self.snapshot(root), before)
+        self.assertTrue(target.is_symlink())
+
+    def test_current_cli_materialization_parity_and_stale_failure_are_source_only(self):
+        root = self.fixture()
+        result = self.run_builder(root, "--bootstrap", "--write-current-spec")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        current = root / kit.CURRENT_SPEC_PATH
+        graph = json.loads(current.read_text())
+        self.assertEqual(graph["name"], "Kit Engineering Delivery v5")
+        self.assertIn("implement_replan", {edge["key"] for edge in graph["edges"]})
+        self.assertFalse((root / kit.SPEC_PATH).exists())
+        self.assertFalse((root / kit.CANDIDATE_SPEC_PATH).exists())
+        before = self.snapshot(root)
+        result = self.run_builder(root, "--check-current")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, self.snapshot(root))
+        current.write_text("{}\n")
+        before = self.snapshot(root)
+        result = self.run_builder(root, "--check-current")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("current Kit workflow spec is stale", result.stderr)
+        self.assertEqual(before, self.snapshot(root))
+
+    def test_check_current_rejects_bootstrap_before_any_write(self):
+        root = self.fixture()
+        before = self.snapshot(root)
+        result = self.run_builder(root, "--check-current", "--bootstrap")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot be combined with --bootstrap", result.stderr)
+        self.assertEqual(before, self.snapshot(root))
+
+    def test_current_spec_symlink_is_never_read_or_overwritten(self):
+        root = self.fixture()
+        kit.bootstrap(root)
+        foreign = root / "foreign.json"
+        foreign.write_text("{}\n")
+        (root / kit.CURRENT_SPEC_PATH).symlink_to(foreign)
+        before = self.snapshot(root)
+        for flag in ("--write-current-spec", "--check-current"):
+            result = self.run_builder(root, flag)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must not contain symlinks", result.stderr)
+            self.assertEqual(before, self.snapshot(root))

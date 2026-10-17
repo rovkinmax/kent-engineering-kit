@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""Offline, read-only admission of an explicitly pinned delivery publication.
+
+This command authenticates neither human consent nor native task identity. Its
+caller must obtain project/root/ref/receipt bindings from the approved graph or
+trusted native adapter, never from the candidate task checkout. No fetching,
+provisioning, imports of candidate code, Git writes, or runtime effects occur.
+"""
+from __future__ import annotations
+
+import sys
+
+sys.dont_write_bytecode = True
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import marshal
+import os
+from pathlib import Path
+import re
+import selectors
+import shutil
+import stat
+import subprocess
+import time
+import tomllib
+
+MAX_REQUEST = 1024 * 1024
+MAX_FILE = 8 * 1024 * 1024
+MAX_TOTAL = 32 * 1024 * 1024
+MAX_FILES = 256
+MAX_SOURCE_RECEIPT_FILES = 512
+MAX_TREE = 20000
+KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
+OID = re.compile(r"[0-9a-f]{40}\Z")
+DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+PROJECT_PREFIXES = (".kent/scripts/", ".kent/commands/", ".kent/context/",
+                    ".kent/skills/", ".kent/workflows/")
+KIT_PREFIXES = ("scripts/", "workflowkit/", "templates/", "agents/", "global/",
+                "prompts/", "skills/", "adapters/", "contracts/")
+PROJECT_FILES = {"AGENTS.md", ".gitignore", ".kent/workflow-profile.toml",
+                 ".kent/project-contract.md"}
+KIT_REQUIRED = {"scripts/inspect-delivery-source", "scripts/prepare-github-ci",
+                *(f"workflowkit/{name}.py" for name in (
+                    "__init__", "ci_contract", "delivery", "runtime", "profile",
+                    "model", "release", "revision", "kent", "graph", "project_memory"))}
+
+
+class SourceAdmissionError(ValueError):
+    """A fixed diagnostic without candidate data or private source excerpts."""
+
+
+def require(condition, message):
+    if not condition:
+        raise SourceAdmissionError(message)
+
+
+def closed(value, keys):
+    require(isinstance(value, dict) and set(value) == set(keys), "invalid object fields")
+
+
+def key(value):
+    require(isinstance(value, str) and KEY.fullmatch(value), "invalid identity")
+    return value
+
+
+def relative(value):
+    require(isinstance(value, str) and value and not value.startswith("/")
+            and all(part not in ("", ".", "..") for part in value.split("/"))
+            and "\\" not in value and "\x00" not in value, "unsafe relative path")
+    return value
+
+
+def canonical(value):
+    require(isinstance(value, (str, os.PathLike)), "invalid absolute path")
+    path = Path(value)
+    require(path.is_absolute() and str(path) == str(path.resolve())
+            and ".." not in path.parts and (not isinstance(value, str) or value == str(path)),
+            "noncanonical absolute path")
+    return path
+
+
+def infrastructure(path, kit=False):
+    # These are the executable/configuration/instruction surfaces, not product
+    # files, mutable ledgers, retained evidence, build products, or tests.
+    if "__pycache__" in Path(path).parts:
+        return False
+    return (path in PROJECT_FILES or path.startswith(PROJECT_PREFIXES)
+            or (kit and path.startswith(KIT_PREFIXES)))
+
+
+def read_file(path, maximum=MAX_FILE, *, private=False):
+    """No-follow descriptor walk, regular owner file, stable bytes and binding."""
+    path = canonical(path)
+    descriptors = [os.open("/", os.O_RDONLY | os.O_DIRECTORY)]
+    bindings = []
+    try:
+        for component in path.parent.parts[1:]:
+            parent = descriptors[-1]
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=parent)
+            descriptors.append(child)
+            bindings.append((parent, component, child))
+        parent_info = os.fstat(descriptors[-1])
+        require(parent_info.st_uid == os.getuid()
+                and not parent_info.st_mode & (0o7077 if private else 0o7022),
+                "unsafe source directory")
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=descriptors[-1])
+        descriptors.append(descriptor)
+        before = os.fstat(descriptor)
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+                and before.st_uid == os.getuid()
+                and not before.st_mode & (0o7077 if private else 0o7022)
+                and before.st_size <= maximum, "unsafe source file")
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, maximum + 1 - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            require(size <= maximum, "source file exceeds limit")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        def identity(info):
+            return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
+                    info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        require(identity(before) == identity(after) and size == before.st_size,
+                "source changed during read")
+        named = os.stat(path.name, dir_fd=descriptors[-2], follow_symlinks=False)
+        require(identity(named) == identity(after), "source binding changed")
+        for parent, component, child in bindings:
+            named = os.stat(component, dir_fd=parent, follow_symlinks=False)
+            opened = os.fstat(child)
+            require((named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino),
+                    "directory binding changed")
+        return b"".join(chunks), stat.S_IMODE(before.st_mode)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def parse_json(raw):
+    def pairs(items):
+        result = {}
+        for name, value in items:
+            require(name not in result, "duplicate JSON key")
+            result[name] = value
+        return result
+
+    def invalid_constant(_):
+        raise ValueError("nonfinite JSON number")
+
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs,
+                          parse_constant=invalid_constant)
+    except (UnicodeError, RecursionError, json.JSONDecodeError) as error:
+        raise ValueError("invalid receipt JSON") from error
+
+
+def git(root, *arguments, maximum=MAX_TOTAL):
+    executable = shutil.which("git")
+    require(executable is not None, "Git unavailable")
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1",
+                       GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", LC_ALL="C")
+    # Bounded readback, no inherited Git routing/config, no pager or hook.
+    process = subprocess.Popen(
+        [executable, "--no-optional-locks", "-c", "core.fsmonitor=false",
+         "-c", "core.hooksPath=/dev/null", "-C", str(root), *arguments],
+        env=environment, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 30
+    chunks = []
+    size = 0
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "Git source readback timed out")
+            for event, _ in selector.select(remaining):
+                chunk = os.read(event.fileobj.fileno(), min(65536, maximum + 1 - size))
+                if not chunk:
+                    selector.unregister(event.fileobj)
+                    continue
+                size += len(chunk)
+                require(size <= maximum, "Git source readback exceeds limit")
+                chunks.append(chunk)
+        process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        require(process.returncode == 0, "Git source readback failed")
+        return b"".join(chunks)
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        process.stdout.close()
+
+
+def repository(root):
+    root = canonical(root)
+    require(git(root, "rev-parse", "--show-toplevel").decode().strip() == str(root),
+            "source must be repository root")
+    common = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip()
+    return root, canonical(common)
+
+
+def publication(root, commit, ref):
+    require(isinstance(commit, str) and OID.fullmatch(commit), "full published commit required")
+    require(isinstance(ref, str) and ref.startswith(("refs/remotes/", "refs/tags/"))
+            and not ref.endswith("/HEAD"), "full publication ref required")
+    git(root, "check-ref-format", ref)
+    tip = git(root, "rev-parse", "--verify", ref + "^{commit}").decode().strip()
+    require(OID.fullmatch(tip), "publication ref missing")
+    git(root, "merge-base", "--is-ancestor", commit, tip)
+    git(root, "merge-base", "--is-ancestor", commit, "HEAD")
+    return tip
+
+
+def tree(root, commit):
+    result = {}
+    raw = git(root, "ls-tree", "-rz", "--full-tree", commit)
+    for entry in raw.split(b"\x00"):
+        if not entry:
+            continue
+        metadata, name = entry.split(b"\t", 1)
+        mode, kind, oid = metadata.decode("ascii").split()
+        path = relative(name.decode("utf-8"))
+        result[path] = (mode, kind, oid)
+        require(len(result) <= MAX_TREE, "source tree exceeds limit")
+    return result
+
+
+def live_inventory(root, *, kit=False):
+    """Include ignored source additions, but never walk mutable evidence/build."""
+    found = set()
+    candidates = set(PROJECT_FILES)
+    prefixes = PROJECT_PREFIXES + (KIT_PREFIXES if kit else ())
+    for prefix in prefixes:
+        start = root / prefix.rstrip("/")
+        if not os.path.lexists(start):
+            continue
+        require(not start.is_symlink() and start.is_dir(), "unsafe infrastructure directory")
+        for directory, children, files in os.walk(start, followlinks=False):
+            # Current-interpreter caches are checked against compiled admitted
+            # source below, not admitted by their timestamp/size header alone.
+            children[:] = [name for name in children if name != "__pycache__"]
+            for name in children:
+                require(not (Path(directory) / name).is_symlink(), "source directory symlink")
+            for name in files:
+                candidates.add((Path(directory) / name).relative_to(root).as_posix())
+                require(len(candidates) <= MAX_TREE, "source inventory exceeds limit")
+    for path in candidates:
+        if infrastructure(path, kit) and os.path.lexists(root / path):
+            found.add(path)
+    return found
+
+
+def verify_python_cache(source, raw):
+    if source.suffix != ".py":
+        return
+    for optimize in (0, 1, 2):
+        cache = Path(importlib.util.cache_from_source(
+            str(source), optimization="" if optimize == 0 else str(optimize)))
+        if not os.path.lexists(cache):
+            continue
+        cached, _ = read_file(cache)
+        require(len(cached) >= 16 and cached[:4] == importlib.util.MAGIC_NUMBER
+                and int.from_bytes(cached[4:8], "little") in (0, 1, 3),
+                "unsupported Python cache header")
+        # Do not deserialize or execute candidate bytecode. The compiler sees
+        # only the source bytes already bound to the published receipt.
+        filename = str(source)
+        code = compile(raw, filename, "exec", dont_inherit=True, optimize=optimize)
+        # Match importlib's retained code/filename references while marshaling;
+        # CPython's reference flags otherwise depend on temporary refcounts.
+        references = (filename, code)
+        expected = marshal.dumps(references[1])
+        require(cached[16:] == expected, "Python cache differs from qualified source")
+
+
+def verify_copy(root, expected, published_tree, *, kit=False):
+    require(live_inventory(root, kit=kit) == set(expected), "infrastructure inventory differs")
+    head_tree = tree(root, "HEAD")
+    require({name: item for name, item in head_tree.items() if infrastructure(name, kit)}
+            == {name: published_tree[name] for name in expected},
+            "committed infrastructure differs")
+    index = {}
+    for entry in git(root, "ls-files", "--stage", "-z").split(b"\x00"):
+        if not entry:
+            continue
+        metadata, name = entry.split(b"\t", 1)
+        path = name.decode("utf-8")
+        if infrastructure(path, kit):
+            mode, oid, stage = metadata.decode("ascii").split()
+            require(stage == "0", "unmerged infrastructure index")
+            index[path] = (mode, "blob", oid)
+    require(index == {name: published_tree[name] for name in expected},
+            "infrastructure index differs")
+    for name, item in expected.items():
+        raw, mode = read_file(root / name)
+        # Git records executable identity, not group/other read permissions.
+        # A task checked out under umask 077 validly has 0700 rather than 0755.
+        require(len(raw) == item["byte_size"] and bool(mode & 0o100) == bool(item["mode"] & 0o100)
+                and hashlib.sha256(raw).hexdigest() == item["sha256"],
+                "infrastructure bytes or mode differ")
+        verify_python_cache(root / name, raw)
+
+
+def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
+                   project_root, kit_root, primary_root, workspace_path,
+                   source_ref, kit_ref, ci_helper, helper_bindings=None):
+    """Return a bounded admission result or raise ValueError/OSError.
+
+    Bindings are trusted inputs. helper_bindings optionally maps additional
+    installed helper paths to exact absolute targets already present in receipt.
+    Both publication refs are explicit local remote-tracking/tag refs; they are
+    read, never refreshed. A local ref is cooperative provenance, not server
+    authentication or proof that the current human approved this invocation.
+    This entry admits current R2/v1 infrastructure, not intentionally different
+    legacy task checkouts. Select task-fixed legacy mode before using it. The
+    Python cache check covers this interpreter's cache tag; runtime callers must
+    use that same interpreter and a trusted import environment. It is not a
+    security sandbox or a reservation against changes after return.
+    """
+    require(isinstance(receipt_sha256, str) and DIGEST.fullmatch(receipt_sha256),
+            "exact receipt digest required")
+    key(project_id)
+    key(workflow_id)
+    raw, _ = read_file(receipt_path, MAX_REQUEST, private=True)
+    require(hashlib.sha256(raw).hexdigest() == receipt_sha256, "source receipt digest differs")
+    receipt = parse_json(raw)
+    closed(receipt, ("schema", "project_id", "workflow_id", "source_commit", "kit_commit",
+                     "runtime_roots", "files", "policy", "project_memory"))
+    require(receipt["schema"] == "delivery-runtime-publication-v1"
+            and receipt["project_id"] == project_id and receipt["workflow_id"] == workflow_id
+            and receipt["policy"] == "delivery_reliability_v1", "source receipt binding differs")
+    memory = receipt["project_memory"]
+    closed(memory, ("root", "project_key", "project_uid", "legacy_task_ids"))
+    canonical(memory["root"])
+    key(memory["project_key"])
+    key(memory["project_uid"])
+    legacy = memory["legacy_task_ids"]
+    require(isinstance(legacy, list) and len(legacy) <= 256, "invalid legacy inventory")
+    for identity in legacy:
+        key(identity)
+    require(len(set(legacy)) == len(legacy), "duplicate legacy identity")
+    project_root, project_common = repository(project_root)
+    kit_root, kit_common = repository(kit_root)
+    primary_root, primary_common = repository(primary_root)
+    workspace_path, workspace_common = repository(workspace_path)
+    require(primary_common == project_common == workspace_common, "foreign project repository")
+    project_tip = publication(project_root, receipt["source_commit"], source_ref)
+    kit_tip = publication(kit_root, receipt["kit_commit"], kit_ref)
+    for root in (primary_root, workspace_path):
+        git(root, "merge-base", "--is-ancestor", receipt["source_commit"], "HEAD")
+    # Primary is an activation source, not an unfinished product worktree.
+    for root in set((primary_root, kit_root)):
+        require(not git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                        "--ignore-submodules=none"), "primary source is dirty")
+    roots = receipt["runtime_roots"]
+    require(isinstance(roots, list) and 0 < len(roots) <= MAX_FILES, "invalid runtime roots")
+    require(all(isinstance(root, str) for root in roots)
+            and len(set(roots)) == len(roots), "duplicate runtime root")
+    admitted_roots = {}
+    for value in roots:
+        root, common = repository(value)
+        require(common in (project_common, kit_common), "foreign runtime repository")
+        # If Kit is itself the project, both commits must describe the same tree
+        # for the shared root; checked below through the two closure projections.
+        commit = receipt["kit_commit"] if root == kit_root or common != project_common else receipt["source_commit"]
+        git(root, "merge-base", "--is-ancestor", commit, "HEAD")
+        admitted_roots[str(root)] = (root, commit, tree(root, commit))
+    require(str(project_root) in admitted_roots and str(kit_root) in admitted_roots,
+            "runtime roots omit project or Kit")
+    heads = {root: git(root, "rev-parse", "--verify", "HEAD").decode().strip()
+             for root in set((primary_root, workspace_path, project_root, kit_root,
+                              *(item[0] for item in admitted_roots.values())))}
+    files = receipt["files"]
+    require(isinstance(files, list) and 0 < len(files) <= MAX_SOURCE_RECEIPT_FILES,
+            "invalid source inventory")
+    inventory = {}
+    total = 0
+    for item in files:
+        closed(item, ("root", "relative_path", "sha256", "byte_size", "mode"))
+        require(isinstance(item["root"], str) and item["root"] in admitted_roots,
+                "source root not admitted")
+        name = relative(item["relative_path"])
+        require(not name.startswith((".kent/runtime/", ".kent/retained-evidence/", "build/")),
+                "mutable evidence is not source")
+        require(isinstance(item["sha256"], str) and DIGEST.fullmatch(item["sha256"])
+                and type(item["byte_size"]) is int and 0 <= item["byte_size"] <= MAX_FILE
+                and type(item["mode"]) is int and 0 <= item["mode"] <= 0o777
+                and not item["mode"] & 0o022, "invalid source metadata")
+        identity = (item["root"], name)
+        require(identity not in inventory, "duplicate source entry")
+        inventory[identity] = item
+        root, commit, source_tree = admitted_roots[item["root"]]
+        source = source_tree.get(name)
+        require(source is not None and source[0] in ("100644", "100755") and source[1] == "blob",
+                "source is not published regular blob")
+        blob = git(root, "cat-file", "blob", source[2], maximum=MAX_FILE)
+        total += len(blob)
+        require(total <= MAX_TOTAL, "source inspection exceeds limit")
+        require(len(blob) == item["byte_size"] and hashlib.sha256(blob).hexdigest() == item["sha256"]
+                and bool(item["mode"] & 0o100) == (source[0] == "100755"),
+                "receipt does not match published source")
+        actual, mode = read_file(root / name)
+        require(actual == blob and mode == item["mode"], "runtime source differs")
+    project_tree = tree(project_root, receipt["source_commit"])
+    kit_tree = tree(kit_root, receipt["kit_commit"])
+    projections = []
+    for root, source_tree, is_kit in ((project_root, project_tree, False), (kit_root, kit_tree, True)):
+        required = {name for name in source_tree if infrastructure(name, is_kit)}
+        if is_kit:
+            require(KIT_REQUIRED <= required, "published Kit helper/module closure incomplete")
+        else:
+            require({"AGENTS.md", ".kent/workflow-profile.toml", ".kent/project-contract.md"} <= required,
+                    "published project contract incomplete")
+        expected = {}
+        for name in required:
+            item = inventory.get((str(root), name))
+            require(item is not None, "receipt omits infrastructure source")
+            expected[name] = item
+        projections.append((root, expected, source_tree, is_kit))
+    # When Kit is the project, project copies also carry the complete Kit closure.
+    project_expected = dict(projections[0][1])
+    project_is_kit = project_common == kit_common
+    if project_is_kit:
+        require({name: item for name, item in project_tree.items() if infrastructure(name, True)}
+                == {name: item for name, item in kit_tree.items() if infrastructure(name, True)},
+                "shared project/Kit infrastructure publication differs")
+        project_expected.update(projections[1][1])
+    for root in set((project_root, primary_root, workspace_path)):
+        verify_copy(root, project_expected, project_tree, kit=project_is_kit)
+    verify_copy(kit_root, projections[1][1], kit_tree, kit=True)
+    profile_raw, _ = read_file(primary_root / ".kent/workflow-profile.toml")
+    profile = tomllib.loads(profile_raw.decode("utf-8"))
+    require(profile.get("policies", {}).get("delivery_reliability") == "v1",
+            "delivery policy not enabled")
+    memory_config = profile.get("project_memory")
+    closed(memory_config, ("root", "project_key", "project_uid", "mode"))
+    require(memory_config["mode"] == "r2"
+            and all(memory_config[name] == memory[name] for name in ("root", "project_key", "project_uid")),
+            "cutover memory configuration differs")
+    for command in profile.get("commands", {}).values():
+        require(isinstance(command, str), "invalid profile command")
+        relative(command)
+        require(command in project_expected, "profile helper outside source closure")
+    helpers = {str(ci_helper): str(kit_root / "scripts/prepare-github-ci")}
+    if helper_bindings is not None:
+        require(isinstance(helper_bindings, dict) and len(helper_bindings) <= 64,
+                "invalid installed helper inventory")
+        require(str(ci_helper) not in helper_bindings, "duplicate CI helper binding")
+        helpers.update(helper_bindings)
+    def check_helpers():
+        for helper, target_value in helpers.items():
+            path = Path(helper)
+            require(path.is_absolute() and ".." not in path.parts, "helper must be absolute")
+            parent = canonical(path.parent)
+            parent_info = parent.stat()
+            link_info = path.lstat()
+            require(parent_info.st_uid == os.getuid() and not parent_info.st_mode & 0o7022
+                    and link_info.st_uid == os.getuid() and link_info.st_nlink == 1
+                    and not link_info.st_mode & 0o7000
+                    and (stat.S_ISLNK(link_info.st_mode) or stat.S_ISREG(link_info.st_mode)),
+                    "unsafe installed helper binding")
+            target = canonical(target_value)
+            require(path.resolve(strict=True) == target, "installed helper target differs")
+            matching = [item for (root, name), item in inventory.items() if Path(root) / name == target]
+            require(len(matching) == 1 and matching[0]["mode"] & 0o100,
+                    "helper target not qualified executable")
+    check_helpers()
+    # Recheck cooperative freshness after all reads; cannot reserve subsequent
+    # execution or defend against an attacker changing and restoring bytes.
+    require(read_file(receipt_path, MAX_REQUEST, private=True)[0] == raw, "receipt changed")
+    require(publication(project_root, receipt["source_commit"], source_ref) == project_tip
+            and publication(kit_root, receipt["kit_commit"], kit_ref) == kit_tip, "publication ref changed")
+    for root, head in heads.items():
+        require(git(root, "rev-parse", "--verify", "HEAD").decode().strip() == head,
+                "source HEAD changed")
+    for root in set((project_root, primary_root, workspace_path)):
+        verify_copy(root, project_expected, project_tree, kit=project_is_kit)
+    verify_copy(kit_root, projections[1][1], kit_tree, kit=True)
+    for (root, name), item in inventory.items():
+        current, mode = read_file(Path(root) / name)
+        require(hashlib.sha256(current).hexdigest() == item["sha256"] and mode == item["mode"],
+                "runtime source changed")
+        verify_python_cache(Path(root) / name, current)
+    for root in set((primary_root, kit_root)):
+        require(not git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                        "--ignore-submodules=none"), "primary source changed")
+    check_helpers()
+    return {"schema": "delivery-source-inspection-v1", "status": "admitted",
+            "project_id": project_id, "workflow_id": workflow_id,
+            "receipt_sha256": receipt_sha256, "source_commit": receipt["source_commit"],
+            "kit_commit": receipt["kit_commit"], "file_count": len(files),
+            "source_bytes": total, "workspace_path": str(workspace_path),
+            "source_ref": source_ref, "source_ref_commit": project_tip,
+            "kit_ref": kit_ref, "kit_ref_commit": kit_tip,
+            "python_cache_tag": sys.implementation.cache_tag}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("receipt", "receipt-sha256", "project-id", "workflow-id", "project-root",
+                 "kit-root", "primary-root", "workspace", "source-ref", "kit-ref", "ci-helper"):
+        parser.add_argument("--" + name, required=True)
+    parser.add_argument("--installed-helper", action="append", nargs=2, default=[],
+                        metavar=("LINK", "QUALIFIED_TARGET"),
+                        help="additional installed helper binding (repeatable)")
+    arguments = vars(parser.parse_args())
+    arguments["receipt_path"] = arguments.pop("receipt")
+    arguments["workspace_path"] = arguments.pop("workspace")
+    try:
+        helper_pairs = arguments.pop("installed_helper")
+        require(len(helper_pairs) <= 64 and len({pair[0] for pair in helper_pairs}) == len(helper_pairs),
+                "duplicate or excessive helper binding")
+        arguments["helper_bindings"] = dict(helper_pairs)
+        require(Path(__file__).resolve() == canonical(arguments["kit_root"]) / "scripts/inspect-delivery-source",
+                "inspector must execute from qualified external Kit root")
+        print(json.dumps(inspect_source(**arguments), sort_keys=True))
+        return 0
+    except (ValueError, OSError, TypeError, subprocess.SubprocessError) as error:
+        # Fixed diagnostic only: never expose private receipt/source bytes.
+        print(json.dumps({"schema": "delivery-source-inspection-v1", "status": "blocked",
+                          "reason": str(error).replace(" ", "_") if isinstance(error, SourceAdmissionError)
+                          else "source_admission_failed"}))
+        print("Delivery source admission failed; verify explicit publication bindings.", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
