@@ -390,18 +390,68 @@ def run_r2_cleanup(
 
 
 class DeliverySourceAdmissionTests(unittest.TestCase):
+    def native_worktree_status(self, *, name=None, root=None, effective=None,
+                               recorded_root=None, observed_root=None,
+                               problems=None, omit_observed_root=False):
+        root = root or str(self.project)
+        effective = effective or root
+        primary_status = {"recorded_root": str(self.project)}
+        if not omit_observed_root:
+            primary_status["observed_root"] = str(self.project)
+        status = {
+            "target": {
+                "workspace_id": "workspace-test",
+                "workspace_name": "Fixture",
+                "workspace_root": str(self.project),
+                "workspace_availability": "available",
+                "worktree": None,
+                "cwd_relpath": ".",
+                "effective_workdir": effective,
+            },
+            "worktree": primary_status,
+            "problems": [] if problems is None else problems,
+        }
+        if name is not None:
+            status["target"]["worktree"] = {
+                "id": "worktree-test", "name": name,
+                "root": root, "availability": "available",
+            }
+            status["worktree"] = {
+                "recorded_root": recorded_root or root,
+                "display_name": name,
+                "recorded_branch_ref": "refs/heads/not-an-authority",
+            }
+            if not omit_observed_root:
+                status["worktree"]["observed_root"] = observed_root or root
+        return status
+
     def native_session_lookup(self, records, *, include_next_offset=False,
-                              bad_scope_at=None, bad_next_offset_at=None):
+                              bad_scope_at=None, bad_next_offset_at=None,
+                              status=None, task_errors=()):
         import runpy
         adapter = runpy.run_path(str(ADAPTER_TEMPLATE))
         lookup = adapter["native_task_for_session"]
         project_id = "project-test"
-        inventory = [{"task_id": item["summary"]["id"]} for item in records]
+        inventory = [{
+            "task_id": item["summary"]["id"],
+            "short_id": item["summary"].get("short_id"),
+        } for item in records]
         by_id = {item["summary"]["id"]: item for item in records}
         list_pages = []
         task_reads = []
+        status_reads = []
+        self.native_task_reads = task_reads
+        self.native_status_reads = status_reads
+        task_errors = set(task_errors)
+        status = status if status is not None else self.native_worktree_status()
 
         def native_json(arguments, _workspace):
+            if arguments[:2] == ["worktree", "status"]:
+                status_reads.append(arguments)
+                if arguments != [
+                        "worktree", "status", "--session", "session-native", "--json"]:
+                    raise AssertionError(f"unexpected native worktree status query: {arguments!r}")
+                return status
             if arguments[:2] == ["task", "list"]:
                 limit = int(arguments[arguments.index("--limit") + 1])
                 offset = int(arguments[arguments.index("--offset") + 1])
@@ -421,11 +471,13 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
             if arguments[:2] == ["task", "show"]:
                 task_id = arguments[2]
                 task_reads.append(task_id)
+                if task_id in task_errors:
+                    raise ValueError("selected native task read failed")
                 return by_id[task_id]
             raise AssertionError(f"unexpected native read: {arguments!r}")
 
         with mock.patch.dict(lookup.__globals__, {"native_json": native_json}):
-            result = lookup(Path("/workspace"), project_id, "session-native")
+            result = lookup(self.project, project_id, "session-native")
         return result, list_pages, task_reads
 
     def test_task_locator_is_only_a_hint_verified_against_current_session(self):
@@ -510,6 +562,151 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "page offset differs"):
             self.native_session_lookup(records(101), include_next_offset=True,
                                         bad_next_offset_at=0)
+
+    def test_native_worktree_hint_reads_only_unique_current_task_detail(self):
+        records = [
+            {"summary": {"id": "task-current", "project_id": "project-test",
+                         "short_id": "OSM-130"},
+             "worktree_path": str(self.project),
+             "current_nodes": [{"session_id": "session-native"}]},
+            {"summary": {"id": "task-unrelated", "project_id": "project-test",
+                         "short_id": "OSM-102"},
+             "worktree_path": None,
+             "current_nodes": []},
+        ]
+        result, pages, task_reads = self.native_session_lookup(
+            records, status=self.native_worktree_status(name="OSM-130"))
+        self.assertEqual(result["summary"]["id"], "task-current")
+        self.assertEqual(pages, [(0, 100), (2, 100)])
+        self.assertEqual(task_reads, ["task-current"])
+        self.assertEqual(self.native_status_reads, [
+            ["worktree", "status", "--session", "session-native", "--json"]])
+
+    def test_native_worktree_hint_rejects_wrong_root_duplicate_short_id_and_stale_session(self):
+        record = {
+            "summary": {"id": "task-current", "project_id": "project-test",
+                        "short_id": "OSM-130"},
+            "worktree_path": str(self.kit),
+            "current_nodes": [{"session_id": "session-native"}],
+        }
+        with self.assertRaisesRegex(ValueError, "worktree differs"):
+            self.native_session_lookup(
+                [record], status=self.native_worktree_status(name="OSM-130"))
+
+        duplicate = [
+            {**record, "summary": {**record["summary"], "id": "task-one"}},
+            {**record, "summary": {**record["summary"], "id": "task-two"}},
+        ]
+        with self.assertRaisesRegex(ValueError, "ambiguous native worktree Task hint"):
+            self.native_session_lookup(
+                duplicate, status=self.native_worktree_status(name="OSM-130"))
+
+        stale = {
+            **record,
+            "worktree_path": str(self.project),
+            "current_nodes": [{"session_id": "session-stale"}],
+        }
+        with self.assertRaisesRegex(ValueError, "Session ownership differs"):
+            self.native_session_lookup(
+                [stale], status=self.native_worktree_status(name="OSM-130"))
+
+    def test_native_worktree_hint_propagates_selected_read_errors_and_status_conflicts(self):
+        record = {
+            "summary": {"id": "task-current", "project_id": "project-test",
+                        "short_id": "OSM-130"},
+            "worktree_path": str(self.project),
+            "current_nodes": [{"session_id": "session-native"}],
+        }
+        with self.assertRaisesRegex(ValueError, "selected native task read failed"):
+            self.native_session_lookup(
+                [record], status=self.native_worktree_status(name="OSM-130"),
+                task_errors={"task-current"})
+        self.assertEqual(self.native_task_reads, ["task-current"])
+
+        conflicting = self.native_worktree_status(
+            name="OSM-130", effective=str(self.kit))
+        with self.assertRaisesRegex(ValueError, "native worktree status conflicts"):
+            self.native_session_lookup([record], status=conflicting)
+
+        malformed = {"target": {"worktree": None}, "worktree": None}
+        with self.assertRaisesRegex(ValueError, "native worktree status incomplete"):
+            self.native_session_lookup([record], status=malformed)
+
+        problem_status = self.native_worktree_status(
+            problems=[{"kind": "git_binding_missing", "root": str(self.project)}])
+        with self.assertRaisesRegex(ValueError, "native worktree status incomplete"):
+            self.native_session_lookup([record], status=problem_status)
+
+    def test_native_primary_and_nonmatching_worktree_hints_keep_bounded_scan(self):
+        records = [
+            {"summary": {"id": "task-current", "project_id": "project-test",
+                         "short_id": "OSM-130"},
+             "current_nodes": [{"session_id": "session-native"}]},
+            {"summary": {"id": "task-other", "project_id": "project-test",
+                         "short_id": "OSM-102"},
+             "current_nodes": []},
+        ]
+        primary, _, primary_reads = self.native_session_lookup(
+            records, status=self.native_worktree_status())
+        self.assertEqual(primary["summary"]["id"], "task-current")
+        self.assertEqual(primary_reads, ["task-current", "task-other"])
+
+        primary_without_observed_root, _, primary_without_observed_reads = (
+            self.native_session_lookup(
+                records, status=self.native_worktree_status(omit_observed_root=True)))
+        self.assertEqual(primary_without_observed_root["summary"]["id"], "task-current")
+        self.assertEqual(primary_without_observed_reads, ["task-current", "task-other"])
+
+        nonmatching, _, nonmatching_reads = self.native_session_lookup(
+            records, status=self.native_worktree_status(name="OSM-999"))
+        self.assertEqual(nonmatching["summary"]["id"], "task-current")
+        self.assertEqual(nonmatching_reads, ["task-current", "task-other"])
+
+        wrong_root, _, wrong_root_reads = self.native_session_lookup(
+            records,
+            status=self.native_worktree_status(
+                name="OSM-130", root=str(self.kit), effective=str(self.kit)))
+        self.assertEqual(wrong_root["summary"]["id"], "task-current")
+        self.assertEqual(wrong_root_reads, ["task-current", "task-other"])
+
+    def test_native_session_lookup_does_not_trust_environment_worktree_name(self):
+        records = [
+            {"summary": {"id": "task-current", "project_id": "project-test",
+                         "short_id": "OSM-130"},
+             "current_nodes": [{"session_id": "session-native"}]},
+            {"summary": {"id": "task-other", "project_id": "project-test",
+                         "short_id": "OSM-102"},
+             "current_nodes": []},
+        ]
+        with mock.patch.dict(os.environ, {"KENT_WORKTREE_NAME": "OSM-130"}, clear=True):
+            result, _, task_reads = self.native_session_lookup(
+                records, status=self.native_worktree_status())
+        self.assertEqual(result["summary"]["id"], "task-current")
+        self.assertEqual(task_reads, ["task-current", "task-other"])
+
+    def test_native_explicit_task_id_path_does_not_use_worktree_hint(self):
+        import runpy
+        adapter = runpy.run_path(str(ADAPTER_TEMPLATE))
+        resolve = adapter["native_task_context"]
+        task = {
+            "summary": {"id": "task-explicit", "project_id": "project-test"},
+            "current_nodes": [{"session_id": "session-native"}],
+        }
+        read = mock.Mock(return_value=task)
+        scan = mock.Mock(side_effect=AssertionError("explicit Task ID must not scan"))
+        with mock.patch.dict(
+                os.environ,
+                {"KENT_TASK_ID": "task-explicit", "KENT_SESSION_ID": "session-native",
+                 "KENT_WORKTREE_NAME": "forged-short-id"},
+                clear=True), \
+                mock.patch.dict(resolve.__globals__, {
+                    "native_json": read, "native_task_for_session": scan}):
+            result = resolve({}, self.project, "project-test")
+        self.assertEqual(result[0], task)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(read.call_args.args[0], [
+            "task", "show", "task-explicit", "--project", "project-test", "--json"])
+        scan.assert_not_called()
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -767,17 +964,21 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
 
     def write_fake_kent(self, task):
         task_json = json.dumps(task, separators=(",", ":"))
+        worktree_status_json = json.dumps(self.native_worktree_status())
         task_id = task["summary"]["id"]
         self.native_bin.write_text(
             f"#!{sys.executable}\n"
             "import json, sys\n"
             f"task = json.loads({task_json!r})\n"
+            f"worktree_status = json.loads({worktree_status_json!r})\n"
             "args = sys.argv[1:]\n"
             f"project = {str(self.project)!r}\n"
             "if len(args) == 2 and args[0] == 'project' and args[1] in (project,):\n"
             "    print('project-test')\n"
             "elif args == ['project', 'list']:\n"
             "    print('project-test\\tFixture\\t' + project)\n"
+            "elif args == ['worktree', 'status', '--session', 'session-native', '--json']:\n"
+            "    print(json.dumps(worktree_status))\n"
             "elif (len(args) == 6 and args[:2] == ['task', 'show'] and "
             "args[2] in (task['summary']['id'], task['summary']['short_id']) "
             "and args[3] == '--project' and "

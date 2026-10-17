@@ -382,7 +382,7 @@ def native_project_id(workspace):
     return bootstrap_key(native_read(["project", str(workspace)], workspace).decode().strip())
 
 
-def native_primary(project_id, workspace):
+def native_primary(project_id, workspace, *, require_git=True):
     rows = native_read(["project", "list"], workspace).decode("utf-8").splitlines()
     if len(rows) > 256:
         raise ValueError("native project inventory incomplete")
@@ -390,7 +390,11 @@ def native_primary(project_id, workspace):
                if row.split("\t", 1)[0] == project_id]
     if len(matches) != 1 or len(matches[0]) != 3:
         raise ValueError("native primary workspace unresolved")
-    primary = git_root(str(Path(matches[0][2]).expanduser()))
+    primary_path = Path(matches[0][2]).expanduser()
+    if not primary_path.is_absolute():
+        primary_path = workspace / primary_path
+    primary_value = str(primary_path)
+    primary = git_root(primary_value) if require_git else canonical_root(primary_value)
     if native_project_id(primary) != project_id:
         raise ValueError("native primary project mismatch")
     return primary
@@ -402,8 +406,56 @@ def native_current_session(task, session_id):
                for item in (task.get(field) if isinstance(task.get(field), list) else []))
 
 
+def native_worktree_task_hint(workspace, session_id):
+    status = native_json([
+        "worktree", "status", "--session", session_id, "--json",
+    ], workspace)
+    if status.get("problems") != []:
+        raise ValueError("native worktree status incomplete")
+    target = status.get("target")
+    if (not isinstance(target, dict) or "worktree" not in target
+            or "worktree" not in status
+            or target.get("workspace_availability") != "available"):
+        raise ValueError("native worktree status incomplete")
+    bootstrap_key(target.get("workspace_id"))
+    canonical_root(target.get("workspace_root"))
+    effective_workdir = canonical_root(target.get("effective_workdir"))
+    target_worktree = target["worktree"]
+    reported_worktree = status["worktree"]
+    if target_worktree is None:
+        if not isinstance(reported_worktree, dict):
+            raise ValueError("native worktree status incomplete")
+        recorded_root = canonical_root(reported_worktree.get("recorded_root"))
+        observed_value = reported_worktree.get("observed_root")
+        observed_root = (canonical_root(observed_value)
+                         if observed_value is not None else recorded_root)
+        workspace_root = canonical_root(target.get("workspace_root"))
+        if (recorded_root != observed_root or recorded_root != workspace_root
+                or effective_workdir != recorded_root):
+            raise ValueError("native worktree status conflicts")
+        return None
+    if not isinstance(target_worktree, dict) or not isinstance(reported_worktree, dict):
+        raise ValueError("native worktree status incomplete")
+    bootstrap_key(target_worktree.get("id"))
+    worktree_name = bootstrap_key(target_worktree.get("name"))
+    worktree_root = canonical_root(target_worktree.get("root"))
+    if (target_worktree.get("availability") != "available"
+            or reported_worktree.get("display_name") != worktree_name):
+        raise ValueError("native worktree status conflicts")
+    recorded_root = canonical_root(reported_worktree.get("recorded_root"))
+    observed_root = canonical_root(reported_worktree.get("observed_root"))
+    if recorded_root != worktree_root or observed_root != worktree_root:
+        raise ValueError("native worktree status conflicts")
+    if effective_workdir != worktree_root:
+        raise ValueError("native worktree status conflicts")
+    if worktree_root != workspace:
+        return None
+    return worktree_name
+
+
 def native_task_for_session(workspace, project_id, session_id):
-    task_ids = []
+    worktree_hint = native_worktree_task_hint(workspace, session_id)
+    task_items = []
     seen = set()
     offset = 0
     while True:
@@ -415,7 +467,7 @@ def native_task_for_session(workspace, project_id, session_id):
         tasks = inventory.get("tasks")
         if (not isinstance(scope, dict) or scope.get("project_id") != project_id
                 or not isinstance(tasks, list) or len(tasks) > NATIVE_TASK_PAGE_LIMIT
-                or len(task_ids) + len(tasks) > MAX_NATIVE_TASKS):
+                or len(task_items) + len(tasks) > MAX_NATIVE_TASKS):
             raise ValueError("native task inventory incomplete")
         page_ids = []
         for item in tasks:
@@ -425,8 +477,11 @@ def native_task_for_session(workspace, project_id, session_id):
             if task_id in seen:
                 raise ValueError("duplicate native task")
             seen.add(task_id)
-            page_ids.append(task_id)
-        task_ids.extend(page_ids)
+            page_ids.append({
+                "task_id": task_id,
+                "short_id": item.get("short_id"),
+            })
+        task_items.extend(page_ids)
 
         next_offset = inventory.get("next_offset")
         expected_offset = offset + len(page_ids)
@@ -443,8 +498,35 @@ def native_task_for_session(workspace, project_id, session_id):
         # that the bounded inventory is complete.
         offset = expected_offset
 
+    if worktree_hint is not None:
+        candidates = []
+        for item in task_items:
+            short_id = item["short_id"]
+            if not isinstance(short_id, str):
+                raise ValueError("native task summary incomplete")
+            bootstrap_key(short_id)
+            if short_id == worktree_hint:
+                candidates.append(item["task_id"])
+        if len(candidates) > 1:
+            raise ValueError("ambiguous native worktree Task hint")
+        if len(candidates) == 1:
+            task_id = candidates[0]
+            detail = native_json(
+                ["task", "show", task_id, "--project", project_id, "--json"], workspace)
+            summary = detail.get("summary")
+            if (not isinstance(summary, dict) or summary.get("id") != task_id
+                    or summary.get("project_id") != project_id
+                    or summary.get("short_id") != worktree_hint):
+                raise ValueError("native task identity differs")
+            if detail.get("worktree_path") != str(workspace):
+                raise ValueError("native Task worktree differs")
+            if not native_current_session(detail, session_id):
+                raise ValueError("native Session ownership differs")
+            return detail
+
     matches = []
-    for task_id in task_ids:
+    for item in task_items:
+        task_id = item["task_id"]
         detail = native_json(
             ["task", "show", task_id, "--project", project_id, "--json"], workspace)
         summary = detail.get("summary")
@@ -615,7 +697,6 @@ def confirm_source_binding(installation):
 
 
 def preflight_source_admission(interface, request):
-    workspace = git_root(request.get("workspace_path"))
     standalone = interface == "mcp" and "standalone_binding" in request
     if standalone and "task_locator" in request:
         raise ValueError("standalone binding conflicts with Task locator")
@@ -631,6 +712,24 @@ def preflight_source_admission(interface, request):
             raise ValueError("Janitor source resolution requires native Script identity")
         for value in context.values():
             bootstrap_key(value)
+    requested_workspace = canonical_root(request.get("workspace_path"))
+    # Preserve unadopted primary callers before requiring a Task/session lookup.
+    # The fixed primary profile and installation binding must prove legacy mode;
+    # any R2 configuration or binding continues through the strict path below.
+    if (not standalone and not os.environ.get("KENT_TASK_ID")
+            and request.get("task_locator") is None
+            and request.get("native_context") is None):
+        project_id = native_project_id(requested_workspace)
+        primary = native_primary(project_id, requested_workspace, require_git=False)
+        installation = installation_records(project_id, primary)
+        if installation["mode"] == "legacy" and requested_workspace == primary:
+            return {
+                **installation, "interface": interface, "standalone": False,
+                "workspace": str(requested_workspace), "task_id": None,
+                "primary_workspace_id": None,
+            }
+
+    workspace = git_root(str(requested_workspace))
     if standalone:
         if os.environ.get("KENT_TASK_ID"):
             raise ValueError("standalone binding conflicts with native task")

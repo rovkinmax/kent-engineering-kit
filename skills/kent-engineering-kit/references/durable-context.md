@@ -34,7 +34,17 @@ only that original source can establish what its author decided.
 ## Discover before asking or continuing
 
 Before continuing after a context change, inspect the task-fixed mode, accepted
-and working plan, evidence, checkpoints, and referenced artifacts. Use the
+and working plan, evidence, checkpoints, and referenced artifacts.
+
+A retained legacy checkout may predate the inspection and packet commands.
+Check its own profile and helper capabilities before invoking them. If the
+checkout has not opted into `delivery_reliability_v1`, use its existing plan,
+ledger, checkpoint and original decision references directly. Do not require
+`inspect` or `pack-delivery`, migrate storage, or request approval again merely
+because those commands are unavailable. This preserves the legacy protocol;
+it does not permit reconstructing hashes or treating missing evidence as consent.
+
+For a qualified delivery-reliability checkout, use the
 read-only `workflow-plan-contract` inspect mode by setting
 `KENT_PLAN_CONTRACT_MODE=inspect`. Its request is a closed object:
 
