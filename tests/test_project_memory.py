@@ -436,27 +436,76 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
                 "current_node": {"node_id": "node-accept", "transition_branch_key": None},
             }],
         }
+        self.extra_native_tasks = []
+        self.invalid_utf8_task_ids = set()
+        self.native_worktree_status = None
+        self.native_project_list_root = str(project)
+        self.native_task_show_log = base / "native-task-show.log"
+        self.native_command_log = base / "native-command.log"
 
         def write_fake_kent():
             binary = self.bin / "kent"
-            task_json = json.dumps(self.native_task, separators=(",", ":"))
+            tasks_json = json.dumps(
+                [self.native_task, *self.extra_native_tasks], separators=(",", ":"))
+            invalid_task_ids = json.dumps(sorted(self.invalid_utf8_task_ids))
+            native_project_list_root = self.native_project_list_root
+            native_worktree_status = self.native_worktree_status
+            if native_worktree_status is None:
+                native_worktree_status = {
+                    "target": {
+                        "workspace_id": "workspace-test",
+                        "workspace_name": "Fixture",
+                        "workspace_root": str(project),
+                        "workspace_availability": "available",
+                        "worktree": None,
+                        "cwd_relpath": ".",
+                        "effective_workdir": str(project),
+                    },
+                    "worktree": {
+                        "recorded_root": str(project),
+                        "observed_root": str(project),
+                    },
+                    "problems": [],
+                }
+            worktree_status_json = json.dumps(native_worktree_status)
             binary.write_text(
                 f"#!{sys.executable}\n"
                 "import json, sys\n"
                 "args = sys.argv[1:]\n"
                 f"project = {str(project)!r}\n"
-                f"task = json.loads({task_json!r})\n"
+                f"native_project_list_root = {native_project_list_root!r}\n"
+                f"tasks = json.loads({tasks_json!r})\n"
+                "tasks_by_id = {item['summary']['id']: item for item in tasks}\n"
+                f"invalid_task_ids = set(json.loads({invalid_task_ids!r}))\n"
+                f"worktree_status = json.loads({worktree_status_json!r})\n"
+                f"task_show_log = {str(self.native_task_show_log)!r}\n"
+                f"native_command_log = {str(self.native_command_log)!r}\n"
                 f"workflow = {workflow_id!r}\n"
+                "with open(native_command_log, 'a', encoding='utf-8') as output:\n"
+                "    output.write(json.dumps(args) + '\\n')\n"
                 "if len(args) == 2 and args[0] == 'project' and args[1] == project:\n"
                 "    print('project-test')\n"
                 "elif args == ['project', 'list']:\n"
-                "    print('project-test\\tFixture\\t' + project)\n"
-                "elif args == ['task', 'show', task['summary']['id'], '--project', "
-                "'project-test', '--json']:\n"
-                "    print(json.dumps(task))\n"
+                "    print('project-test\\tFixture\\t' + native_project_list_root)\n"
+                "elif args == ['worktree', 'status', '--session', 'session-native', '--json']:\n"
+                "    print(json.dumps(worktree_status))\n"
+                "elif (len(args) == 6 and args[:2] == ['task', 'show']\n"
+                "      and args[3:] == ['--project', 'project-test', '--json']):\n"
+                "    task_id = args[2]\n"
+                "    with open(task_show_log, 'a', encoding='utf-8') as log:\n"
+                "        log.write(task_id + '\\n')\n"
+                "    if task_id in invalid_task_ids:\n"
+                "        sys.stdout.buffer.write(b'\\xff')\n"
+                "        sys.exit(0)\n"
+                "    if task_id not in tasks_by_id:\n"
+                "        sys.exit(2)\n"
+                "    print(json.dumps(tasks_by_id[task_id]))\n"
                 "elif args[:6] == ['task', 'list', '--project', 'project-test', '--limit', "
                 "'100'] and len(args) == 9 and args[6] == '--offset' and args[8] == '--json':\n"
-                "    rows = [{'task_id': task['summary']['id']}] if args[7] == '0' else []\n"
+                "    inventory = [{'task_id': item['summary']['id'], "
+                "'short_id': item['summary']['short_id']} for item in tasks]\n"
+                "    offset = int(args[7])\n"
+                "    rows = inventory[offset:offset + 100]\n"
                 "    print(json.dumps({'scope': {'project_id': 'project-test'}, "
                 "'tasks': rows}))\n"
                 "elif args == ['workflow', 'graph', 'inspect', workflow, '--json']:\n"
@@ -609,6 +658,70 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
         result = self.adapter_call(installed, source, None, "resolve-mcp",
                                    native_environment={**environment, "KENT_SESSION_ID": "foreign"})
         self.assertEqual(result.returncode, 2)
+
+    def test_unadopted_primary_session_skips_task_discovery_and_r2_evidence_blocks(self) -> None:
+        base = Path(self.temp.name).resolve()
+        workspace = base / "unadopted-primary"
+        (workspace / ".kent/scripts").mkdir(parents=True)
+        profile = workspace / ".kent/workflow-profile.toml"
+        profile.write_text('[policies]\ndelivery_reliability = "v1"\n')
+        adapter = workspace / ".kent/scripts/workflow-project-memory"
+        shutil.copyfile(
+            Path(__file__).resolve().parents[1]
+            / "templates/project/workflow-project-memory", adapter)
+        adapter.chmod(0o755)
+
+        home = base / "unadopted-home"
+        (home / ".kent/project-memory-bindings").mkdir(parents=True, mode=0o700)
+        binary_dir = base / "unadopted-bin"
+        binary_dir.mkdir(mode=0o700)
+        unexpected_queries = base / "unadopted-native-query.log"
+        fake_kent = binary_dir / "kent"
+        fake_kent.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "args = sys.argv[1:]\n"
+            f"workspace = {str(workspace)!r}\n"
+            f"unexpected_queries = {str(unexpected_queries)!r}\n"
+            "if args == ['project', workspace]:\n"
+            "    print('project-unadopted')\n"
+            "elif args == ['project', 'list']:\n"
+            "    print('project-unadopted\\tUnadopted\\t./')\n"
+            "elif args[:2] in (['task', 'list'], ['worktree', 'status']):\n"
+            "    with open(unexpected_queries, 'a', encoding='utf-8') as output:\n"
+            "        output.write(' '.join(args) + '\\n')\n"
+            "    raise SystemExit(3)\n"
+            "else:\n"
+            "    raise SystemExit(2)\n")
+        fake_kent.chmod(0o700)
+        request = {
+            "schema": "r2-mcp-request-v1", "operation": "resolve-mcp",
+            "workspace_path": str(workspace),
+        }
+        environment = {
+            "HOME": str(home),
+            "PATH": str(binary_dir) + os.pathsep + os.environ.get("PATH", ""),
+            "KENT_SESSION_ID": "session-without-task",
+        }
+
+        def invoke():
+            return subprocess.run(
+                [sys.executable, str(adapter), "mcp"],
+                input=json.dumps(request), text=True, capture_output=True,
+                timeout=30, env=environment, cwd=base)
+
+        legacy = invoke()
+        self.assertEqual(legacy.returncode, 0, legacy.stderr)
+        self.assertEqual(json.loads(legacy.stdout)["result"]["mode"], "legacy")
+        self.assertFalse(unexpected_queries.exists())
+
+        profile.write_text(
+            '[policies]\ndelivery_reliability = "v1"\n'
+            '[project_memory]\nmode = "r2"\n')
+        blocked = invoke()
+        self.assertEqual(blocked.returncode, 2)
+        self.assertEqual(blocked.stdout, "")
+        self.assertFalse(unexpected_queries.exists())
 
     def test_native_adapter_script_context_is_verified_without_session_impersonation(self) -> None:
         installed, source, environment = self.native_adapter_fixture(script=True)
@@ -975,6 +1088,60 @@ print('{{"tools":[],"ok":true}}')
         self.assertEqual(
             self.store.read_invocation("OSM-131", native_invocation)["state"], "finished")
         self.assertEqual(counter.read_text().splitlines(), ["call", "call", "call"])
+
+    def test_real_mcp_session_only_wrapper_avoids_unrelated_corrupt_task_detail(self) -> None:
+        installed, source, _, _ = self.adapter_fixture(seed_standalone=False)
+        self.native_task["worktree_path"] = str(source)
+        self.extra_native_tasks = [{
+            "summary": {"id": "task-unrelated", "project_id": "project-test",
+                        "short_id": "OSM-102", "workflow_id": "workflow-native"},
+            "worktree_path": None, "live_sessions": [], "current_nodes": [],
+        }]
+        self.invalid_utf8_task_ids = {"task-unrelated"}
+        self.native_worktree_status = {
+            "target": {
+                "workspace_id": "workspace-test",
+                "workspace_name": "Fixture",
+                "workspace_root": str(source),
+                "workspace_availability": "available",
+                "worktree": {
+                    "id": "worktree-native", "name": "OSM-130",
+                    "root": str(source), "availability": "available",
+                },
+                "cwd_relpath": ".",
+                "effective_workdir": str(source),
+            },
+            "worktree": {
+                "recorded_root": str(source),
+                "observed_root": str(source),
+                "display_name": "OSM-130",
+                "recorded_branch_ref": "refs/heads/task-OSM-130",
+            },
+            "problems": [],
+        }
+        self.native_project_list_root = "./"
+        self._write_adapter_fake_kent()
+        self.store.initialize_task(
+            "OSM-130", "native-wrapper-uid",
+            [{"namespace": "kent", "project_id": "project-test",
+              "task_id": "task-native"}])
+
+        result = self.adapter_call(
+            installed, source, None, "resolve-mcp",
+            native_environment={
+                "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
+                "KENT_SESSION_ID": "session-native",
+            })
+
+        calls = [json.loads(line) for line in self.native_command_log.read_text().splitlines()]
+        self.assertEqual(result.returncode, 0, f"{result.stderr}; native calls={calls!r}")
+        self.assertEqual(json.loads(result.stdout)["result"]["mode"], "r2")
+        self.assertEqual(
+            [call for call in calls if call[:2] == ["worktree", "status"]],
+            [["worktree", "status", "--session", "session-native", "--json"]])
+        self.assertEqual(
+            self.native_task_show_log.read_text().splitlines(),
+            ["task-native", "task-native"])
 
     def test_concurrent_real_mcp_wrappers_share_invocation_and_replay_exact_artifact(self) -> None:
         installed, source, binding, binding_path = self.adapter_fixture()
