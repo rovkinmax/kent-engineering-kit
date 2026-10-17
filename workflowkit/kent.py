@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
@@ -15,6 +15,15 @@ from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
 
 class KentCommandError(RuntimeError):
     """Raised when the Kent CLI rejects a generator operation."""
+
+
+@dataclass(frozen=True)
+class CanonicalWorkflowCompatibilityPlan:
+    """Exact-hash authorization to delegate an existing Workflow update."""
+
+    path: Path
+    expected_sha256: str
+    confirmation_sha256: str
 
 
 class KentClient:
@@ -40,8 +49,86 @@ class KentClient:
         minimum_version: tuple[int, int, int] = (2, 6, 1),
         set_default: bool = False,
         workflow_selector: str | None = None,
+        compatibility_plan: CanonicalWorkflowCompatibilityPlan | None = None,
     ) -> dict[str, Any]:
         spec.validate()
+        if compatibility_plan is not None:
+            if set_default:
+                raise SpecError(
+                    "a compatibility-plan update cannot create or change a project default"
+                )
+            workflow_id = canonical_workflow_selector(workflow_selector)
+            if workflow_id is None or workflow_selector != workflow_id:
+                raise SpecError(
+                    "a compatibility-plan update requires an explicit Workflow UUID"
+                )
+            if compatibility_plan.confirmation_sha256 != compatibility_plan.expected_sha256:
+                raise SpecError(
+                    "compatibility confirmation must exactly match the expected plan digest"
+                )
+            from shutil import which
+            from .operations import (
+                OperationError,
+                load_plan,
+                reconcile_canonical_workflows,
+            )
+
+            binary_path = Path(self.binary).expanduser()
+            if not binary_path.is_absolute():
+                resolved_binary = which(self.binary)
+                if resolved_binary is None:
+                    raise SpecError("configured Kent executable cannot be resolved")
+                binary_path = Path(resolved_binary)
+            expected_binary = binary_path.resolve()
+            try:
+                plan = load_plan(
+                    compatibility_plan.path,
+                    schema="canonical-workflow-reconcile-plan-v2",
+                    expected_sha256=compatibility_plan.expected_sha256,
+                    mutation=True,
+                    confirm=compatibility_plan.confirmation_sha256,
+                )
+            except (OperationError, OSError) as error:
+                raise SpecError(f"compatibility plan is invalid: {error}") from error
+            value = plan.value
+            if (
+                Path(value.get("project_root", "")).expanduser().resolve()
+                != self.project_workspace
+                or Path(value.get("kent", {}).get("path", "")).expanduser().resolve()
+                != expected_binary
+                or len(value.get("workflows", [])) != 1
+                or canonical_workflow_selector(
+                    value["workflows"][0].get("workflow_id")
+                ) != workflow_id
+            ):
+                raise SpecError(
+                    "compatibility plan project, Kent executable, or Workflow UUID differs"
+                )
+            try:
+                prepared = reconcile_canonical_workflows(
+                    plan,
+                    mode="prepare",
+                    kent=str(expected_binary),
+                    expected_workflow_id=workflow_id,
+                    expected_spec=spec,
+                )
+            except (OperationError, OSError) as error:
+                raise SpecError(f"compatibility plan could not be prepared: {error}") from error
+            if prepared.get("phase") != "prepared":
+                raise SpecError(
+                    "compatibility plan did not reach its prepared state"
+                )
+            try:
+                return reconcile_canonical_workflows(
+                    plan,
+                    mode="apply",
+                    confirm=compatibility_plan.confirmation_sha256,
+                    kent=str(expected_binary),
+                    expected_workflow_id=workflow_id,
+                    expected_spec=spec,
+                )
+            except (OperationError, OSError) as error:
+                raise SpecError(f"compatibility plan could not be applied: {error}") from error
         self.require_version(*minimum_version)
         self.preflight_scripts(spec)
 

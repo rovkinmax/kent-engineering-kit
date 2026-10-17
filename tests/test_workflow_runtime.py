@@ -729,6 +729,26 @@ class WorkflowPlanContractTest(GitRepositoryTest):
 
 
 class WorkflowVerificationDispatchTest(GitRepositoryTest):
+    def test_dispatch_uses_opted_in_exact_producer_emitter(self) -> None:
+        root = self.create_repository()
+        kent = root / ".kent"
+        scripts = kent / "scripts"
+        scripts.mkdir(parents=True)
+        (kent / "workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v1"\n')
+        adapter = scripts / "workflow-checkpoint"
+        adapter.write_text(
+            "import json\n"
+            "def emit_producer_result(root, payload, result, producer_kind):\n"
+            "    assert producer_kind == 'verification-dispatch'\n"
+            "    assert payload['review_context'] == 'verification evidence'\n"
+            "    output = json.loads(result)\n"
+            "    output['commentary'] += '\\nEXACT_CAPTURE_TEST'\n"
+            "    return json.dumps(output).encode()\n")
+        result = self.invoke(root, workspace_path=str(root), delivery_context=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["commentary"].endswith("EXACT_CAPTURE_TEST"))
+
     def invoke(
         self,
         root: Path,
@@ -1227,6 +1247,491 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
 
 
 class WorkflowEvidenceLedgerTest(GitRepositoryTest):
+    def native_fixture(self, root, source, owner):
+        return {
+            "task_short_id": "TASK-4", "workspace": str(root.resolve()),
+            "source_workspace": str(source.resolve()), "owner": owner,
+            "source_native_identity": {
+                "project_id": "native-project", "workspace_id": "native-primary",
+                "task_id": "native-task",
+            },
+        }
+
+    def test_recovery_crash_exact_retry_and_native_proof_gate(self):
+        root, scripts, directory, original = self.recovered_fixture()
+        (directory / "evidence-recovery.json").unlink()
+        (directory / "evidence-continuation.jsonl").unlink()
+        source = self.create_repository().resolve()
+        ledger = load_template_module(scripts / "workflow-evidence-ledger", "recovery_operation")
+        owner = {"session_id": "s", "run_id": "r", "step_id": "t"}
+        identity = self.native_fixture(root, source, owner)
+        environment = {"KENT_" + key.upper(): value for key, value in owner.items()}
+        with mock.patch.dict(os.environ, environment):
+            with self.assertRaisesRegex(ValueError, "canonical Kent"):
+                ledger.recovery_preview(root, task="TASK-4")
+            preview = ledger.recovery_preview(root, task="TASK-4", _native_lookup=lambda *_: identity)
+            self.assertEqual(set(path.name for path in directory.iterdir()), {"evidence-ledger.jsonl"})
+
+            def crash(phase):
+                if phase == "after_continuation_fsync":
+                    raise RuntimeError("simulated process death")
+
+            with self.assertRaisesRegex(RuntimeError, "simulated"):
+                ledger.recover_evidence(
+                    root, task="TASK-4", request=preview["request"],
+                    confirm=preview["request_sha256"], _native_lookup=lambda *_: identity,
+                    _phase_hook=crash,
+                )
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")
+        retry_owner = {"session_id": "s", "run_id": "retry-run", "step_id": "retry-step"}
+        identity = self.native_fixture(root, source, retry_owner)
+        with mock.patch.dict(os.environ, {"KENT_" + key.upper(): value for key, value in retry_owner.items()}):
+            result = ledger.recover_evidence(
+                root, task="TASK-4", request=preview["request"],
+                confirm=preview["request_sha256"], _native_lookup=lambda *_: identity,
+            )
+            self.assertTrue(result["reused"])
+            self.assertEqual(result["retry_owner"], retry_owner)
+            self.assertEqual(ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")[-1]["run_id"], owner["run_id"])
+            self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+            self.assertEqual(
+                result,
+                ledger.recover_evidence(
+                    root, task="TASK-4", request=preview["request"],
+                    confirm=preview["request_sha256"], _native_lookup=lambda *_: identity,
+                ),
+            )
+
+    def test_healthy_and_recovered_retention_crash_retry_and_readback(self):
+        import workflowkit.runtime as runtime
+        from workflowkit.delivery import capture_producer
+
+        for recovered in (False, True):
+            with self.subTest(recovered=recovered):
+                root, scripts, directory, original = self.recovered_fixture()
+                if not recovered:
+                    (directory / "evidence-ledger.jsonl").write_bytes(original.splitlines(keepends=True)[0])
+                    for name in runtime.EVIDENCE_RECOVERY_FILES:
+                        (directory / name).unlink()
+                ledger = load_template_module(scripts / "workflow-evidence-ledger", "retention_operation")
+                source = self.create_repository().resolve()
+                owner = {"session_id": "s", "run_id": "retention-run", "step_id": "t"}
+                identity = self.native_fixture(root, source, owner)
+                shutil.copyfile(CHECKPOINT, scripts / "workflow-checkpoint")
+                home = self.create_repository().resolve()
+                tools = home / ".kent/bin"
+                tools.mkdir(parents=True)
+                (tools / "kent-prepare-github-ci").symlink_to(REPO_ROOT / "scripts/prepare-github-ci")
+                packet_identity = {
+                    "task_id": "native-task", "task_short_id": "TASK-4",
+                    "project_id": "native-project", "workspace_path": str(root), **owner,
+                }
+                packet_locator, _ = capture_producer(
+                    root, identity=packet_identity, producer_kind="retention-fixture",
+                    inputs={}, result={"commentary": "Original exact report"})
+                report = root / "redaction.json"
+                report.write_bytes(b'{"status":"passed"}')
+                report_hash = hashlib.sha256(report.read_bytes()).hexdigest()
+                payload = {
+                    "node_key": "cleanup", "evidence_type": "cleanup",
+                    "summary": "real final event\nKENT_PACKET_SOURCE_V1 " + packet_locator,
+                    "artifacts": ["redaction.json"],
+                    "checks": [], "decisions": [],
+                    "context": {"manifest_path": ".kent/context/implement.md", "files_read": []},
+                }
+                seal_request = {
+                    "schema": runtime.TERMINAL_SEAL_REQUEST_SCHEMA,
+                    "operation_report_digests": [],
+                    "redaction": {"status": "passed", "report_sha256": report_hash},
+                    "retention_class": "cleanup_report_only",
+                }
+                with mock.patch.dict(os.environ, {
+                        **{"KENT_" + key.upper(): value for key, value in owner.items()},
+                        "HOME": str(home)}):
+                    with mock.patch.object(ledger, "read_json_input", return_value=payload):
+                        ledger.append_entry(root, directory / "evidence-ledger.jsonl", task="TASK-4")
+                    with mock.patch.object(ledger, "read_json_input", return_value=seal_request):
+                        ledger.seal_terminal(root, task="TASK-4")
+                    lookup = lambda *_: identity
+                    with self.assertRaises(FileNotFoundError):
+                        ledger.retain_evidence(root, task="TASK-4", _native_lookup=lookup)
+                    plan = root / ".todo/task/plan.md"
+                    plan.parent.mkdir(parents=True)
+                    plan.write_text("retained historical reference\n")
+                    preview = ledger.retain_evidence(root, task="TASK-4", _native_lookup=lookup)
+                    self.assertFalse((source / ".kent/retained-evidence").exists())
+                    receipt = preview["receipt"]
+                    self.assertEqual(receipt["recovery_request_sha256"] is not None, recovered)
+                    paths = {item["logical_path"] for item in receipt["files"]}
+                    self.assertIn(packet_locator, paths)
+                    self.assertEqual(
+                        f".kent/runtime/TASK-4/evidence-recovery.json" in paths, recovered,
+                    )
+
+                    def crash(phase):
+                        if phase == "before_retention_publish":
+                            raise RuntimeError("retention publication interrupted")
+
+                    with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                        ledger.retain_evidence(
+                            root, task="TASK-4", confirm=preview["confirm"],
+                            _native_lookup=lookup, _phase_hook=crash,
+                        )
+                    result = ledger.retain_evidence(
+                        root, task="TASK-4", confirm=preview["confirm"],
+                        _native_lookup=lookup,
+                    )
+                    self.assertTrue(result["published"])
+                    bundle = Path(result["bundle_path"])
+                    self.assertEqual(bundle.stat().st_mode & 0o777, 0o700)
+                    for path in bundle.iterdir():
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    retry = ledger.retain_evidence(
+                        root, task="TASK-4", confirm=preview["confirm"],
+                        _native_lookup=lookup,
+                    )
+                    self.assertTrue(retry["reused"])
+                    self.assertEqual(result["receipt"], retry["receipt"])
+                    self.assertEqual(ledger.verify_retention_bundle(identity, "TASK-4", receipt, runtime), str(bundle))
+                    marker = runtime.validate_terminal_chain(
+                        ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4"),
+                        task_short_id="TASK-4",
+                    )
+                    packet_directory = root / packet_locator
+                    packet_directory.parent.rename(packet_directory.parent.with_name("retired-packets"))
+                    found = ledger.find_retained_evidence(root, task="TASK-4", marker=marker, _native_lookup=lookup)
+                    self.assertEqual(found["receipt"], receipt)
+                    packet_directory.parent.with_name("retired-packets").rename(packet_directory.parent)
+                    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        ledger.verify_retained_sources(root, descriptor, found)
+                    finally:
+                        os.close(descriptor)
+                    (bundle / "000").write_bytes(b"tampered")
+                    with self.assertRaisesRegex(ValueError, "digest|limit"):
+                        ledger.retain_evidence(
+                            root, task="TASK-4", confirm=preview["confirm"],
+                            _native_lookup=lookup,
+                        )
+                    self.assertTrue(directory.exists())
+                    if recovered:
+                        self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+
+    def test_retained_healthy_and_recovered_janitor_retirement_and_crash_resume(self):
+        import workflowkit.runtime as runtime
+
+        for recovered in (False, True):
+            for managed in (False, True):
+                with self.subTest(recovered=recovered, managed=managed):
+                    root, scripts, directory, original = self.recovered_fixture()
+                    if not recovered:
+                        (directory / "evidence-ledger.jsonl").write_bytes(original.splitlines(keepends=True)[0])
+                        for name in runtime.EVIDENCE_RECOVERY_FILES:
+                            (directory / name).unlink()
+                        (root / ".kent/workflow-profile.toml").write_text('[policies]\ndelivery_reliability = "v1"\n')
+                    source = self.create_repository().resolve()
+                    owner, detail, native_file, environment = self.install_native_fixture(root, source)
+                    plan = root / ".todo/task/plan.md"
+                    plan.parent.mkdir(parents=True)
+                    plan.write_text("retained plan\n")
+                    report = root / "redaction.json"
+                    report.write_bytes(b'{"status":"passed"}')
+                    ledger = load_template_module(scripts / "workflow-evidence-ledger", "janitor_retained_ledger")
+                    janitor = load_template_module(scripts / "workflow-task-janitor", "janitor_retained_operation")
+                    payload = {
+                        "node_key": "cleanup", "evidence_type": "cleanup", "summary": "real final event",
+                        "artifacts": ["redaction.json"], "checks": [], "decisions": [],
+                        "context": {"manifest_path": ".kent/context/implement.md", "files_read": []},
+                    }
+                    seal_request = {
+                        "schema": runtime.TERMINAL_SEAL_REQUEST_SCHEMA,
+                        "operation_report_digests": [],
+                        "redaction": {"status": "passed", "report_sha256": hashlib.sha256(report.read_bytes()).hexdigest()},
+                        "retention_class": "cleanup_report_only",
+                    }
+                    with mock.patch.dict(os.environ, environment, clear=True):
+                        with mock.patch.object(ledger, "read_json_input", return_value=payload):
+                            ledger.append_entry(root, directory / "evidence-ledger.jsonl", task="TASK-4")
+                        with mock.patch.object(ledger, "read_json_input", return_value=seal_request):
+                            sealed = ledger.seal_terminal(root, task="TASK-4")
+                        operation = janitor._prepare_v2_managed_runtime_state if managed else janitor._remove_v2_runtime_state
+                        absent = operation(root, "TASK-4", cleanup_report=sealed["terminal_marker"])
+                        self.assertFalse(absent[0], absent)
+                        self.assertTrue(directory.exists(), "missing retention must block before rename")
+                        preview = ledger.retain_evidence(root, task="TASK-4")
+                        retained = ledger.retain_evidence(root, task="TASK-4", confirm=preview["confirm"])
+                        archive = Path(retained["bundle_path"])
+                        before = {path.name: path.read_bytes() for path in archive.iterdir()}
+                        failed = False
+                        def crash(phase):
+                            nonlocal failed
+                            boundary = "after_tombstone_rename" if managed else "after_opaque_unlink_fsync"
+                            if phase == boundary and not failed:
+                                failed = True
+                                raise OSError("retirement interrupted")
+                        first = operation(root, "TASK-4", cleanup_report=sealed["terminal_marker"], _phase_hook=crash)
+                        if recovered or managed:
+                            self.assertFalse(first[0], first)
+                        final = operation(root, "TASK-4", cleanup_report=sealed["terminal_marker"])
+                        self.assertTrue(final[0], final)
+                        self.assertEqual({path.name: path.read_bytes() for path in archive.iterdir()}, before)
+                        marker = runtime.validate_cleanup_report(sealed["terminal_marker"])
+                        tombstone = directory.parent / (".evidence-cleanup-" + runtime.canonical_sha256(marker))
+                        if managed:
+                            self.assertTrue(tombstone.is_dir())
+                            if recovered:
+                                self.assertEqual((tombstone / "evidence-ledger.jsonl").read_bytes(), original)
+                        else:
+                            self.assertFalse(tombstone.exists())
+                        self.assertFalse(directory.exists())
+
+    def install_native_fixture(self, root, source):
+        owner = {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "run_id": "22222222-2222-4222-8222-222222222222",
+            "step_id": "33333333-3333-4333-8333-333333333333",
+        }
+        detail = {
+            "summary": {"id": "native-task", "project_id": "native-project", "short_id": "TASK-4"},
+            "project": {},
+            "source_workspace": {
+                "root_path": str(source.resolve()), "workspace_id": "native-primary", "is_primary": True,
+            },
+            "worktree_path": str(root.resolve()),
+            "current_nodes": [{"node_id": "cleanup", "session_id": owner["session_id"]}],
+            # A retained-current Session need not be in the optional live list.
+            "retained_session_count": 1000,
+        }
+        native_file = root / "native-fixture.json"
+        native_file.write_text(json.dumps(detail))
+        executable = root / "fake-native/kent"
+        executable.parent.mkdir()
+        executable.write_text(
+            "#!" + sys.executable + "\n"
+            "import json,os,sys\n"
+            "a=sys.argv[1:]\n"
+            "if a[0]=='project': print('native-project')\n"
+            "elif a[:2]==['task','show']: print(open(os.environ['NATIVE_FIXTURE']).read())\n"
+            "else: raise SystemExit('irrelevant native inventory must not be queried')\n"
+        )
+        executable.chmod(0o755)
+        environment = {**os.environ, **{"KENT_" + key.upper(): value for key, value in owner.items()}}
+        environment.pop("KENT_TASK_ID", None)
+        environment.update(PATH=str(executable.parent) + os.pathsep + os.environ["PATH"], NATIVE_FIXTURE=str(native_file))
+        return owner, detail, native_file, environment
+
+    def test_native_proof_port_current_retained_script_foreign_and_missing_fields(self):
+        root, scripts, directory, original = self.recovered_fixture()
+        source = self.create_repository().resolve()
+        owner, detail, native_file, environment = self.install_native_fixture(root, source)
+        ledger = load_template_module(scripts / "workflow-evidence-ledger", "native_owner_port")
+        with mock.patch.dict(os.environ, environment, clear=True):
+            result = ledger._native_context(root, "TASK-4")
+            self.assertEqual(result["owner"], owner)
+            self.assertEqual(result["source_workspace"], str(source))
+            self.assertEqual(ledger.native_current_identity(root, "TASK-4"), {
+                "task_id": "native-task", "task_short_id": "TASK-4",
+                "project_id": "native-project", "workspace_path": str(root), **owner,
+            })
+            # A fresh active Session can be proven by live_sessions even when
+            # current_nodes is not included in this native projection.
+            fresh = dict(detail)
+            fresh.pop("current_nodes")
+            fresh["live_sessions"] = [{"session_id": owner["session_id"]}]
+            native_file.write_text(json.dumps(fresh))
+            self.assertEqual(ledger._native_context(root, "TASK-4")["owner"], owner)
+            for changed in (
+                {**detail, "current_nodes": [], "live_sessions": []},
+                {**detail, "current_nodes": [{"node_id": "cleanup"}], "current_scripts": [{"path": "script"}]},
+                {**detail, "current_nodes": [{"node_id": "cleanup", "session_id": "foreign"}]},
+                {**detail, "worktree_path": str(source)},
+                {**detail, "summary": {**detail["summary"], "short_id": "OTHER-1"}},
+                {**detail, "source_workspace": {**detail["source_workspace"], "is_primary": False}},
+            ):
+                with self.subTest(changed=changed):
+                    native_file.write_text(json.dumps(changed))
+                    with self.assertRaises(ValueError):
+                        ledger._native_context(root, "TASK-4")
+            native_file.write_text(json.dumps(detail))
+            for key in ("KENT_SESSION_ID", "KENT_RUN_ID", "KENT_STEP_ID"):
+                with mock.patch.dict(os.environ, {key: ""}), self.assertRaisesRegex(ValueError, "UUID"):
+                    ledger._native_context(root, "TASK-4")
+                with mock.patch.dict(os.environ, {key: "made-up"}), self.assertRaisesRegex(ValueError, "UUID"):
+                    ledger._native_context(root, "TASK-4")
+        self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+
+    def test_public_recovery_native_cli_staged_crash_and_fresh_run_retry(self):
+        import workflowkit.runtime as runtime
+
+        root, scripts, directory, original = self.recovered_fixture()
+        for name in runtime.EVIDENCE_RECOVERY_FILES:
+            (directory / name).unlink()
+        source = self.create_repository().resolve()
+        owner, detail, native_file, environment = self.install_native_fixture(root, source)
+        command = [str(scripts / "workflow-evidence-ledger")]
+        arguments = ["--task", "TASK-4", "--workspace", str(root)]
+        preview = subprocess.run(
+            [*command, "recovery-preview", *arguments], capture_output=True, text=True, env=environment,
+        )
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        preview = json.loads(preview.stdout)
+        self.assertEqual(preview["request"]["owner_provenance"], runtime.OWNER_PROVENANCE)
+        duplicate = json.dumps(preview["request"])[:-1] + ',"owner":' + json.dumps(owner) + "}"
+        invalid = subprocess.run(
+            [*command, "recover", *arguments, "--confirm", preview["request_sha256"]],
+            input=duplicate, capture_output=True, text=True, env=environment,
+        )
+        self.assertEqual(invalid.returncode, 1)
+        self.assertIn("duplicate JSON", invalid.stderr)
+        self.assertEqual(set(path.name for path in directory.iterdir()), {"evidence-ledger.jsonl"})
+        ledger = load_template_module(scripts / "workflow-evidence-ledger", "staged_recovery")
+        with mock.patch.dict(os.environ, environment, clear=True):
+            def crash(phase):
+                if phase == "after_manifest_staging_fsync":
+                    raise RuntimeError("staged crash")
+            with self.assertRaisesRegex(RuntimeError, "staged crash"):
+                ledger.recover_evidence(
+                    root, task="TASK-4", request=preview["request"],
+                    confirm=preview["request_sha256"], _phase_hook=crash,
+                )
+        temporary = root / "build/kent-workflow/TASK-4" / ("recovery-" + preview["request_sha256"] + ".tmp")
+        self.assertTrue(temporary.is_file())
+        environment["KENT_RUN_ID"] = "44444444-4444-4444-8444-444444444444"
+        environment["KENT_STEP_ID"] = "55555555-5555-4555-8555-555555555555"
+        recovered = subprocess.run(
+            [*command, "recover", *arguments, "--confirm", preview["request_sha256"]],
+            input=json.dumps(preview["request"]), capture_output=True, text=True, env=environment,
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(json.loads(recovered.stdout)["retry_owner"]["run_id"], environment["KENT_RUN_ID"])
+        self.assertFalse(temporary.exists())
+        self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+        self.assertEqual(set(path.name for path in directory.iterdir()), {
+            "evidence-ledger.jsonl", *runtime.EVIDENCE_RECOVERY_FILES,
+        })
+
+    def recovered_fixture(self):
+        import workflowkit.runtime as runtime
+        root = self.create_repository()
+        scripts = self.install_v2_runtime_commands(root)
+        (root / ".gitignore").write_text("/.kent/runtime/\n/build/kent-workflow/\n")
+        context = root / ".kent/context"
+        context.mkdir()
+        (context / "implement.md").write_text("manifest\n")
+        self.run_git(root, "add", ".")
+        self.run_git(root, "commit", "-q", "-m", "context")
+        self.append(root, summary="seed", files_read=[])
+        directory = root / ".kent/runtime/TASK-4"
+        base = directory / "evidence-ledger.jsonl"
+        original = base.read_bytes() + b'{"artifacts":["/untrusted/secret"],"broken":'
+        base.write_bytes(original)
+        owner = {"session_id": "test-session", "run_id": "recovery-run", "step_id": "recovery-step"}
+        request = runtime.build_evidence_recovery_request(
+            original, task_short_id="TASK-4", owner=owner,
+        )
+        digest = runtime.canonical_sha256(request)
+        prefix = json.loads(original.splitlines()[0])
+        boundary = {
+            "schema_version": 1, "sequence": 2, "task_short_id": "TASK-4",
+            "previous_hash": prefix["event_hash"], **owner,
+            "record_kind": runtime.EVIDENCE_BOUNDARY_KIND,
+            "recovery_request_sha256": digest,
+        }
+        boundary["event_hash"] = runtime._event_hash(boundary)
+        manifest = {
+            "schema": runtime.EVIDENCE_RECOVERY_SCHEMA, "request": request,
+            "request_sha256": digest, "boundary_event_hash": boundary["event_hash"],
+        }
+        for name, raw in (
+            ("evidence-recovery.json", runtime.canonical_bytes(manifest)),
+            ("evidence-continuation.jsonl", runtime.canonical_bytes(boundary) + b"\n"),
+        ):
+            path = directory / name
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        return root.resolve(), scripts, directory, original
+
+    def test_inspection_uses_recovered_view_without_opaque_suffix_disclosure(self):
+        root, scripts, directory, original = self.recovered_fixture()
+        target = scripts / "workflow-plan-contract"
+        shutil.copyfile(PLAN_CONTRACT, target)
+        module = load_template_module(target, "recovered_context_inspection")
+        result = module.inspect_workflow_context({
+            "schema": "workflow-context-inspection-request-v1",
+            "workspace_path": str(root), "task_short_id": "TASK-4",
+            "plan_path": "not-applicable", "evidence_refs": [],
+        })
+        serialized = json.dumps(result)
+        self.assertNotIn("/untrusted/secret", serialized)
+        self.assertEqual(result["evidence_status"], "recovered_with_gap")
+        self.assertFalse(result["discovery_complete"])
+        self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+        self.assertFalse((directory / "plan-contract.json").exists())
+
+    def test_recovered_read_append_dedup_and_seal_use_continuation(self):
+        root, scripts, directory, original = self.recovered_fixture()
+        ledger = load_template_module(scripts / "workflow-evidence-ledger", "recovered_ledger")
+        records = ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")
+        self.assertEqual(len(records), 2)
+        payload = {
+            "node_key": "cleanup", "evidence_type": "cleanup", "summary": "real final event",
+            "artifacts": [], "checks": [], "decisions": [],
+            "context": {"manifest_path": ".kent/context/implement.md", "files_read": []},
+        }
+        seal_request = {
+            "schema": "terminal-evidence-seal-request-v1",
+            "operation_report_digests": [],
+            "redaction": {"status": "passed", "report_sha256": "a" * 64},
+            "retention_class": "cleanup_report_only",
+        }
+        with mock.patch.object(ledger, "read_json_input", return_value=seal_request):
+            with self.assertRaisesRegex(ValueError, "ordinary"):
+                ledger.seal_terminal(root, task="TASK-4")
+        with mock.patch.dict(os.environ, {
+            "KENT_SESSION_ID": "test-session", "KENT_RUN_ID": "recovery-run",
+            "KENT_STEP_ID": "real-final-step",
+        }), mock.patch.object(ledger, "read_json_input", return_value=payload):
+            event, duplicate = ledger.append_entry(root, directory / "evidence-ledger.jsonl", task="TASK-4")
+            self.assertFalse(duplicate, "boundary must not suppress the genuine same-Run event")
+            self.assertEqual(event["sequence"], 3)
+            _, duplicate = ledger.append_entry(root, directory / "evidence-ledger.jsonl", task="TASK-4")
+            self.assertTrue(duplicate)
+        with mock.patch.object(ledger, "read_json_input", return_value=seal_request):
+            sealed = ledger.seal_terminal(root, task="TASK-4")
+            self.assertEqual(sealed, ledger.seal_terminal(root, task="TASK-4"))
+        records = ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")
+        self.assertEqual(len(records), 4)
+        sealed_bytes = (directory / "evidence-continuation.jsonl").read_bytes()
+        with mock.patch.object(ledger, "read_json_input", return_value=payload):
+            with self.assertRaisesRegex(ValueError, "sealed"):
+                ledger.append_entry(root, directory / "evidence-ledger.jsonl", task="TASK-4")
+        self.assertEqual((directory / "evidence-continuation.jsonl").read_bytes(), sealed_bytes)
+        self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+        janitor = load_template_module(scripts / "workflow-task-janitor", "recovered_janitor")
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            self.assertEqual(janitor._read_ledger_records(descriptor, task="TASK-4"), records)
+        finally:
+            os.close(descriptor)
+        cleanup = load_template_module(REPO_ROOT / ".kent/scripts/workflow-prepare-cleanup", "recovered_cleanup")
+        self.assertEqual(cleanup.records_at(directory / "evidence-ledger.jsonl", "TASK-4", ledger, janitor), records)
+
+    def test_incomplete_recovery_publication_blocks_read_append_and_janitor(self):
+        root, scripts, directory, original = self.recovered_fixture()
+        (directory / "evidence-recovery.json").unlink()
+        ledger = load_template_module(scripts / "workflow-evidence-ledger", "incomplete_ledger")
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")
+        self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+        janitor = load_template_module(scripts / "workflow-task-janitor", "incomplete_janitor")
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                janitor._read_ledger_records(descriptor, task="TASK-4")
+        finally:
+            os.close(descriptor)
+
     def install_v2_runtime_commands(self, root: Path) -> Path:
         scripts = root / ".kent" / "scripts"
         scripts.mkdir(parents=True)
@@ -4575,6 +5080,33 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
 
 
 class GitHubCiWatchTest(GitRepositoryTest):
+    def test_ci_and_pr_emitters_preserve_original_input_for_capture(self):
+        root = self.create_repository().resolve()
+        scripts = root / ".kent/scripts"
+        scripts.mkdir()
+        (root / ".kent/workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v1"\n')
+        (scripts / "workflow-checkpoint").write_text(
+            "import json\n"
+            "def emit_producer_result(root, payload, raw, kind):\n"
+            "    assert payload['delivery_context'] == ' exact incoming '\n"
+            "    value = json.loads(raw)\n"
+            "    value['commentary'] = kind + ':captured'\n"
+            "    return json.dumps(value).encode()\n")
+        for source, kind in ((CI_WATCH, "wait-ci"), (PR_WATCH, "wait-pr")):
+            target = scripts / source.name
+            shutil.copyfile(source, target)
+            module = load_template_module(target, kind.replace("-", "_") + "_capture")
+            output = io.BytesIO()
+            stream = types.SimpleNamespace(buffer=output)
+            with mock.patch.object(module.Path, "cwd", return_value=root), \
+                    mock.patch.object(module.sys, "stdout", stream):
+                module._emit("failed", {"ci_report": " exact output "},
+                             producer_payload={"delivery_context": " exact incoming "})
+            value = json.loads(output.getvalue())
+            self.assertEqual(value["ci_report"], " exact output ")
+            self.assertEqual(value["commentary"], kind + ":captured")
+
     def expected_contract(
         self,
         *,
@@ -9618,6 +10150,8 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     self.assertEqual(ledger.read_bytes(), raw)
 
     def test_ci_ledger_record_limit_is_inclusive_and_bounded(self):
+        from workflowkit import runtime
+
         for count in (8192, 8193):
             with self.subTest(count=count):
                 def records(rows):
@@ -9625,8 +10159,28 @@ class WorkflowJanitorTest(GitRepositoryTest):
                         "schema_version": 1, "task_short_id": "TASK-1",
                         "artifacts": rows[0]["artifacts"],
                     }
-                    rows[:] = [dict(prototype) for _ in range(count - 1)]
+                    rows[:] = [dict(prototype) for _ in range(min(count, 8192) - 1)]
                 fixture = self.make_ci_terminal_state(count=1, mutate_records=records)
+                if count == 8193:
+                    # The shared producer now rejects oversized chains itself.
+                    # Construct an independently hostile postimage to retain
+                    # Janitor's own admission-limit coverage.
+                    root, janitor, _, active, _, names = fixture
+                    path = active / "evidence-ledger.jsonl"
+                    rows = [json.loads(line) for line in path.read_bytes().splitlines()]
+                    rows.insert(-1, dict(rows[-2]))
+                    previous = ""
+                    for index, row in enumerate(rows, 1):
+                        row.pop("event_hash", None)
+                        row.update(sequence=index, previous_hash=previous)
+                        row["event_hash"] = runtime.canonical_sha256(row)
+                        previous = row["event_hash"]
+                    path.write_bytes(b"".join(runtime.canonical_bytes(row) + b"\n" for row in rows))
+                    marker = runtime.validate_terminal_chain(rows, task_short_id="TASK-1")
+                    fixture = (
+                        root, janitor, runtime.terminal_marker_line(marker), active,
+                        active.parent / (".evidence-cleanup-" + runtime.canonical_sha256(marker)), names,
+                    )
                 result = self.ci_cleanup(fixture)
                 self.assertEqual(result[0], count == 8192, result)
                 if count == 8193:

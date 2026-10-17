@@ -63,3 +63,10 @@ explicit authoritative source. Agent-authored comments and unsupported claims
 that "the user clarified" are not product authority. Report missing provenance
 as blocked rather than accepting the narrowed scope or turning it into writer
 work.
+
+Distinguish required outcomes from agent-selected implementation choices.
+Do not report departure from an earlier suggestion as a requirement violation
+unless the governing authority adopted that choice. A requirement attributed
+to a prior Session needs its original decision source, not an agent summary.
+Missing agent bookkeeping calls for source recovery; it does not create a new
+product requirement or justify asking the user to repeat an accessible decision.

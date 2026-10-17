@@ -42,6 +42,11 @@ and exact verification findings before editing.
   forbids repair in the frozen worktree, do not edit tracked or staged files.
 - Preserve scope when an adjacent failure is outside task authority. Do not ask
   whether to absorb it; report the blocker through the node contract.
+- Resolve the task-fixed storage mode through the project adapter before
+  reading or updating its plan. R2 revisions are immutable: publish authorized
+  progress through compare-and-swap and retain the external accepted-plan
+  reference. Missing local cache bytes do not mean approval is absent.
+  Preserve legacy task storage; never create a `.todo` fallback for an R2 task.
 - Dispose invalid, duplicate, baseline-only, or deferred findings explicitly
   and continue with the rest of the bundle when they do not block it.
 - Do not duplicate workflow-owned Standards, Specification, Compliance, or

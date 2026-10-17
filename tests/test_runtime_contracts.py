@@ -55,6 +55,246 @@ ZERO_SHA256 = "0" * 64
 ZERO_SHA1 = "0" * 40
 
 
+class EvidenceRecoveryViewTest(unittest.TestCase):
+    def record(self, sequence=1, previous="", **extra):
+        value = {
+            "schema_version": 1, "sequence": sequence,
+            "task_short_id": "TASK-4", "previous_hash": previous,
+            "session_id": "session", "run_id": "run", "step_id": "step",
+            **extra,
+        }
+        return {**value, "event_hash": runtime_module._event_hash(value)}
+
+    def line(self, record):
+        return runtime_module.canonical_bytes(record) + b"\n"
+
+    def fixture(self):
+        prefix = self.line(self.record())
+        original = prefix + b'{"damaged":'
+        owner = {"session_id": "new-session", "run_id": "new-run", "step_id": "new-step"}
+        request = runtime_module.build_evidence_recovery_request(
+            original, task_short_id="TASK-4", owner=owner,
+        )
+        digest = runtime_module.canonical_sha256(request)
+        boundary = self.record(
+            2, self.record()["event_hash"], **owner,
+            record_kind="evidence_recovery_boundary_v1",
+            recovery_request_sha256=digest,
+        )
+        manifest = {
+            "schema": "evidence-recovery-v1", "request": request,
+            "request_sha256": digest, "boundary_event_hash": boundary["event_hash"],
+        }
+        return original, manifest, boundary
+
+    def test_healthy_view_and_legacy_unterminated_line(self):
+        record = self.record()
+        view = runtime_module.validate_evidence_view(
+            self.line(record).rstrip(b"\n"), task_short_id="TASK-4",
+        )
+        self.assertEqual(view["records"], [record])
+        self.assertEqual(view["status"], "healthy")
+
+    def test_recovered_view_omits_opaque_suffix_and_keeps_gap(self):
+        original, manifest, boundary = self.fixture()
+        following = self.record(3, boundary["event_hash"], run_id="new-run")
+        view = runtime_module.validate_evidence_view(
+            original, task_short_id="TASK-4", manifest=manifest,
+            continuation=self.line(boundary) + self.line(following),
+        )
+        self.assertEqual(view["status"], "recovered_with_gap")
+        self.assertEqual(view["records"], [self.record(), boundary, following])
+        self.assertEqual(view["recovery_request_sha256"], manifest["request_sha256"])
+
+    def test_incomplete_or_changed_publication_and_second_corruption_rejected(self):
+        original, manifest, boundary = self.fixture()
+        for base, metadata, tail in (
+            (original, None, self.line(boundary)),
+            (original, manifest, None),
+            (original + b"x", manifest, self.line(boundary)),
+            (original, manifest, self.line(boundary) + b"bad"),
+            (original, manifest, self.line(boundary) + self.line(boundary)),
+        ):
+            with self.subTest(metadata=metadata, tail=tail):
+                with self.assertRaises(RuntimeContractError):
+                    runtime_module.validate_evidence_view(
+                        base, task_short_id="TASK-4", manifest=metadata,
+                        continuation=tail,
+                    )
+
+    def test_unknown_beginning_healthy_chain_and_unknown_owner_rejected(self):
+        for original, owner in (
+            (b"broken", {"session_id": "s", "run_id": "r", "step_id": "t"}),
+            (self.line(self.record()), {"session_id": "s", "run_id": "r", "step_id": "t"}),
+            (self.line(self.record()) + b"bad", {
+                "session_id": "s", "run_id": "unknown", "step_id": "t",
+            }),
+        ):
+            with self.assertRaises(RuntimeContractError):
+                runtime_module.build_evidence_recovery_request(
+                    original, task_short_id="TASK-4", owner=owner,
+                )
+
+    def test_boundary_must_match_request_owner_and_cannot_be_final_ordinary(self):
+        original, manifest, boundary = self.fixture()
+        boundary["run_id"] = "forged"
+        unsigned = {k: v for k, v in boundary.items() if k != "event_hash"}
+        boundary["event_hash"] = runtime_module._event_hash(unsigned)
+        manifest["boundary_event_hash"] = boundary["event_hash"]
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.validate_evidence_view(
+                original, task_short_id="TASK-4", manifest=manifest,
+                continuation=self.line(boundary),
+            )
+
+    def test_boundary_is_not_final_ordinary_and_seals_cannot_be_recovered(self):
+        original, manifest, boundary = self.fixture()
+        request = {
+            "schema": runtime_module.TERMINAL_SEAL_REQUEST_SCHEMA,
+            "operation_report_digests": [],
+            "redaction": {"status": "passed", "report_sha256": ZERO_SHA256},
+            "retention_class": "cleanup_report_only",
+        }
+        seal = runtime_module.build_terminal_seal_record(
+            request, sequence=3, task_short_id="TASK-4",
+            previous_hash=boundary["event_hash"],
+        )
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.validate_evidence_view(
+                original, task_short_id="TASK-4", manifest=manifest,
+                continuation=self.line(boundary) + self.line(seal),
+            )
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.validate_terminal_chain(
+                [self.record(), boundary, seal], task_short_id="TASK-4",
+            )
+        ordinary = self.record(3, boundary["event_hash"])
+        seal = runtime_module.build_terminal_seal_record(
+            request, sequence=4, task_short_id="TASK-4",
+            previous_hash=ordinary["event_hash"],
+        )
+        view = runtime_module.validate_evidence_view(
+            original, task_short_id="TASK-4", manifest=manifest,
+            continuation=self.line(boundary) + self.line(ordinary) + self.line(seal),
+        )
+        runtime_module.validate_terminal_chain(view["records"], task_short_id="TASK-4")
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.build_evidence_recovery_request(
+                self.line(self.record()) + self.line(
+                    runtime_module.build_terminal_seal_record(
+                        request, sequence=2, task_short_id="TASK-4",
+                        previous_hash=self.record()["event_hash"],
+                    )
+                ) + b"broken",
+                task_short_id="TASK-4", owner=manifest["request"]["owner"],
+            )
+
+    def test_duplicate_json_keys_are_damaged_not_valid_prefix(self):
+        record = self.record()
+        raw = self.line(record).rstrip(b"\n")
+        duplicate = raw[:-1] + b',"run_id":"run"}\n'
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.validate_evidence_view(duplicate, task_short_id="TASK-4")
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.build_evidence_recovery_request(
+                duplicate + b"broken", task_short_id="TASK-4",
+                owner={"session_id": "s", "run_id": "r", "step_id": "t"},
+            )
+
+    def test_closed_request_and_manifest_and_no_synthetic_boundary_claims(self):
+        original, manifest, boundary = self.fixture()
+        for mutate in (
+            lambda m, b: m.update(extra=True),
+            lambda m, b: m["request"].update(extra=True),
+            lambda m, b: m["request"].update(prefix_count=True),
+            lambda m, b: b.update(checks=["claimed PASS"]),
+        ):
+            original, manifest, boundary = self.fixture()
+            mutate(manifest, boundary)
+            with self.assertRaises(RuntimeContractError):
+                runtime_module.validate_evidence_view(
+                    original, task_short_id="TASK-4", manifest=manifest,
+                    continuation=self.line(boundary),
+                )
+
+    def test_byte_and_record_limits_are_not_truncated(self):
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.validate_evidence_view(
+                b"x" * (runtime_module.MAX_EVIDENCE_BYTES + 1), task_short_id="TASK-4",
+            )
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.validate_evidence_view(
+                b"\n" * (runtime_module.MAX_EVIDENCE_RECORDS + 1), task_short_id="TASK-4",
+            )
+        # Corrupt bytes are opaque, not logical records or authority.
+        original = self.line(self.record()) + b"damaged\n" * 10000
+        request = runtime_module.build_evidence_recovery_request(
+            original, task_short_id="TASK-4",
+            owner={"session_id": "s", "run_id": "r", "step_id": "t"},
+        )
+        self.assertEqual(request["prefix_count"], 1)
+        self.assertEqual(request["suffix_byte_size"], len(b"damaged\n") * 10000)
+
+    def test_owner_provenance_is_descriptive_closed_and_hash_bound(self):
+        original, manifest, boundary = self.fixture()
+        expected = dict(runtime_module.OWNER_PROVENANCE)
+        self.assertEqual(manifest["request"]["owner_provenance"], expected)
+        for changed in (
+            {**expected, "independently_verified_current_run": True},
+            {**expected, "independently_verified_current_run": 0},
+            {**expected, "extra": "authority"},
+            {**expected, "run_step_binding": "native-readback"},
+        ):
+            with self.assertRaises(RuntimeContractError):
+                runtime_module.validate_owner_provenance(changed)
+            original, manifest, boundary = self.fixture()
+            manifest["request"]["owner_provenance"] = changed
+            with self.assertRaises(RuntimeContractError):
+                runtime_module.validate_evidence_view(
+                    original, task_short_id="TASK-4", manifest=manifest,
+                    continuation=self.line(boundary),
+                )
+
+    def test_recovery_reserves_room_for_boundary_final_ordinary_and_seal(self):
+        records = []
+        previous = ""
+        for sequence in range(1, runtime_module.MAX_EVIDENCE_RECORDS - 1):
+            record = self.record(sequence, previous)
+            records.append(self.line(record))
+            previous = record["event_hash"]
+        with self.assertRaisesRegex(RuntimeContractError, "capacity"):
+            runtime_module.build_evidence_recovery_request(
+                b"".join(records) + b"broken", task_short_id="TASK-4",
+                owner={"session_id": "s", "run_id": "r", "step_id": "t"},
+            )
+
+    def test_retention_receipt_closed_inventory_and_binding(self):
+        unsigned = {
+            "schema": "evidence-retention-v1", "task_short_id": "TASK-4",
+            "source_workspace": "/source",
+            "source_native_identity": {"project_id": "project", "workspace_id": "workspace", "task_id": "task"},
+            "terminal_event_hash": ZERO_SHA256, "recovery_request_sha256": None,
+            "owner_provenance": dict(runtime_module.OWNER_PROVENANCE),
+            "files": [{
+                "logical_path": ".kent/runtime/TASK-4/evidence-ledger.jsonl",
+                "byte_size": 1, "sha256": ZERO_SHA256,
+            }],
+        }
+        receipt = {**unsigned, "bundle_sha256": runtime_module.canonical_sha256(unsigned)}
+        self.assertEqual(runtime_module.validate_evidence_retention_receipt(receipt), receipt)
+        for change in (
+            {"bundle_sha256": "a" * 64},
+            {"files": unsigned["files"] * 2},
+            {"files": [{**unsigned["files"][0], "logical_path": "../secret"}]},
+            {"files": [{**unsigned["files"][0], "byte_size": True}]},
+            {"files": [{**unsigned["files"][0], "byte_size": 256 * 1024 * 1024 + 1}]},
+            {"extra": True},
+            {"source_workspace": "relative"},
+        ):
+            with self.subTest(change=change), self.assertRaises(RuntimeContractError):
+                runtime_module.validate_evidence_retention_receipt({**receipt, **change})
+
+
 def expected_checks() -> dict[str, object]:
     return {
         "schema": "github-ci-expected-checks-v1",

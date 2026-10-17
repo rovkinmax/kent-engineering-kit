@@ -13,13 +13,16 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import sqlite3
+import tomllib
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from .release import canonical_bytes as release_canonical_bytes
 from .release import ReleaseSpec
@@ -183,7 +186,8 @@ class LoadedPlan:
     raw: bytes
     sha256: str
 
-def load_plan(path: Path, *, schema: str, expected_sha256: str, mutation: bool=False, confirm: str | None=None) -> \
+def load_plan(path: Path, *, schema: str | Sequence[str], expected_sha256: str, mutation: bool=False,
+        confirm: str | None=None) -> \
         LoadedPlan:
     path = Path(path).expanduser()
     if path.is_symlink():
@@ -198,8 +202,11 @@ def load_plan(path: Path, *, schema: str, expected_sha256: str, mutation: bool=F
                 in ()).throw(PlanValidationError(f'invalid JSON constant {token}')))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PlanValidationError(f'plan is not valid JSON: {error}') from error
-    if not isinstance(value, dict) or value.get('schema') != schema:
-        raise PlanValidationError(f'expected schema {schema!r}')
+    schemas = (schema,) if isinstance(schema, str) else tuple(schema)
+    if not isinstance(value, dict) or value.get('schema') not in schemas:
+        if isinstance(schema, str):
+            raise PlanValidationError(f'expected schema {schema!r}')
+        raise PlanValidationError(f'expected schema in {schemas!r}')
     if canonical_bytes(value) != raw:
         raise PlanValidationError('plan bytes are not canonical JSON')
     if mutation and confirm != expected:
@@ -2332,6 +2339,1609 @@ def _validate_canonical_plan(plan: LoadedPlan) -> dict[str, Any]:
     return {'state_dir': state_dir, 'project_root': project_root, 'kent': kent_path, 'kent_sha256': kent_sha, 'd9': d9,
             'workflows': workflows}
 
+
+CANONICAL_V2_SCHEMA = 'canonical-workflow-reconcile-plan-v2'
+CANONICAL_V2_SNAPSHOT_SCHEMA = 'canonical-workflow-compatibility-snapshot-v1'
+CANONICAL_V2_REVIEW_SCHEMA = 'canonical-workflow-compatibility-review-v1'
+CANONICAL_V2_MAX_PLAN = 1024 * 1024
+CANONICAL_V2_MAX_REFERENCE = 1024 * 1024
+SOURCE_ADMISSION_SCHEMA = 'delivery-source-admission-v1'
+SOURCE_RECEIPT_SCHEMA = 'delivery-runtime-publication-v1'
+SOURCE_BINDING_SCHEMA = 'r2-installation-binding-v2'
+SOURCE_INSPECTION_SCHEMA = 'delivery-source-inspection-v1'
+SOURCE_RECEIPT_FILE_LIMIT = 512
+SOURCE_RECEIPT_BYTES_LIMIT = 1024 * 1024
+SOURCE_FILE_BYTES_LIMIT = 8 * 1024 * 1024
+SOURCE_TOTAL_BYTES_LIMIT = 32 * 1024 * 1024
+SOURCE_INSPECTOR_TIMEOUT = 120
+
+_VERIFIED_SOURCE_ADMISSION_TOKEN = object()
+
+
+@dataclass(frozen=True, init=False)
+class VerifiedSourceAdmission:
+    """Bound result of native, installation and published-source admission.
+
+    The mapping properties decode fresh values from private canonical bytes.
+    Mutating a returned dictionary cannot change the gate, digests or identity.
+    Instances are created only by :func:`admit_source_admission`.
+    """
+
+    project_id: str
+    workflow_id: str
+    project_root: str
+    primary_workspace_id: str
+    primary_root: str
+    kit_root: str
+    source_admission_sha256: str
+    receipt_sha256: str
+    gate: str
+    _value_raw: bytes
+    _inspection_raw: bytes
+    _receipt_files_raw: bytes
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        workflow_id: str,
+        project_root: str,
+        primary_workspace_id: str,
+        primary_root: str,
+        kit_root: str,
+        source_admission_sha256: str,
+        receipt_sha256: str,
+        gate: str,
+        value_raw: bytes,
+        inspection_raw: bytes,
+        receipt_files_raw: bytes,
+        _token: object,
+    ) -> None:
+        if _token is not _VERIFIED_SOURCE_ADMISSION_TOKEN:
+            raise TypeError("VerifiedSourceAdmission is created by source admission")
+        for name, value in (
+            ("project_id", project_id),
+            ("workflow_id", workflow_id),
+            ("project_root", project_root),
+            ("primary_workspace_id", primary_workspace_id),
+            ("primary_root", primary_root),
+            ("kit_root", kit_root),
+            ("source_admission_sha256", source_admission_sha256),
+            ("receipt_sha256", receipt_sha256),
+            ("gate", gate),
+        ):
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_value_raw", bytes(value_raw))
+        object.__setattr__(self, "_inspection_raw", bytes(inspection_raw))
+        object.__setattr__(self, "_receipt_files_raw", bytes(receipt_files_raw))
+
+    @property
+    def value(self) -> dict[str, Any]:
+        return json.loads(self._value_raw.decode("utf-8"))
+
+    @property
+    def inspection(self) -> dict[str, Any]:
+        return json.loads(self._inspection_raw.decode("utf-8"))
+
+    @property
+    def receipt_files(self) -> list[dict[str, Any]]:
+        """Return a fresh copy of the verified publication file inventory."""
+        return json.loads(self._receipt_files_raw.decode("utf-8"))
+
+
+def _no_symlink_path(path: Path, label: str) -> Path:
+    path = _absolute_path(str(path), label)
+    if path.is_symlink():
+        raise PlanValidationError(f'{label} is a symlink')
+    try:
+        physical = path.resolve(strict=True)
+    except OSError as error:
+        raise PlanValidationError(f'{label} is absent or inaccessible') from error
+    current = Path('/')
+    for part in physical.parts[1:]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as error:
+            raise PlanValidationError(f'{label} is absent or inaccessible') from error
+        if stat.S_ISLNK(info.st_mode):
+            raise PlanValidationError(f'{label} contains a symlink')
+    return path
+
+
+def _read_reference(value: Any, label: str, *, limit: int = CANONICAL_V2_MAX_REFERENCE) -> tuple[Path, bytes]:
+    ref = _closed(value, {'path', 'sha256'}, label)
+    path = _no_symlink_path(
+        _absolute_path(_required(ref, 'path', label), f'{label}.path'),
+        f'{label}.path',
+    )
+    expected = _sha256(_required(ref, 'sha256', label), f'{label}.sha256')
+    physical = path.resolve(strict=True)
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    try:
+        descriptor = os.open(physical, flags)
+    except OSError as error:
+        raise PlanValidationError(f'{label} cannot be opened safely') from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise PlanValidationError(f'{label} is not a bounded regular file')
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(MANIFEST_READ_CHUNK, limit + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise PlanValidationError(f'{label} exceeds the size bound')
+            digest.update(chunk)
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _manifest_fingerprint(before) != _manifest_fingerprint(after):
+            raise PlanValidationError(f'{label} changed while being read')
+        raw = b''.join(chunks)
+    except OSError as error:
+        raise PlanValidationError(f'{label} could not be read safely') from error
+    finally:
+        os.close(descriptor)
+    if digest.hexdigest() != expected:
+        raise PlanValidationError(f'{label} digest drifted')
+    return path, raw
+
+
+def _source_canonical_path(value: Any, label: str) -> Path:
+    raw = _string(value, label)
+    path = Path(raw)
+    if not path.is_absolute() or '..' in path.parts or str(path) != raw:
+        raise PlanValidationError(f'{label} must be a canonical absolute path')
+    return path
+
+
+def _source_canonical_root(value: Any, label: str) -> Path:
+    path = _source_canonical_path(value, label)
+    try:
+        physical = path.resolve(strict=True)
+    except OSError as error:
+        raise PlanValidationError(f'{label} is absent or inaccessible') from error
+    if physical != path or not path.is_dir():
+        raise PlanValidationError(f'{label} is not a canonical directory')
+    current = Path('/')
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except OSError as error:
+            raise PlanValidationError(f'{label} is absent or inaccessible') from error
+        if stat.S_ISLNK(info.st_mode):
+            raise PlanValidationError(f'{label} contains a symlink')
+    return path
+
+
+def _read_source_record(
+    value: Any,
+    *,
+    label: str,
+    maximum: int,
+    private: bool,
+) -> tuple[Path, bytes, int]:
+    """Descriptor-relative no-follow read for a private admission record."""
+    path = _source_canonical_path(str(value) if isinstance(value, Path) else value, label)
+    descriptors: list[int] = []
+    bindings: list[tuple[int, str, int]] = []
+    try:
+        flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+        root_fd = os.open('/', flags)
+        descriptors.append(root_fd)
+        for component in path.parent.parts[1:]:
+            parent = descriptors[-1]
+            child = os.open(
+                component,
+                flags | getattr(os, 'O_NOFOLLOW', 0),
+                dir_fd=parent,
+            )
+            info = os.fstat(child)
+            if not stat.S_ISDIR(info.st_mode):
+                raise PlanValidationError(f'{label} has an unsafe directory')
+            descriptors.append(child)
+            bindings.append((parent, component, child))
+        parent_fd = descriptors[-1]
+        parent_info = os.fstat(parent_fd)
+        if private and (
+            parent_info.st_uid != os.getuid()
+            or parent_info.st_mode & 0o7077
+        ):
+            raise PlanValidationError(f'{label} parent directory is not private')
+        file_flags = (
+            os.O_RDONLY
+            | getattr(os, 'O_NOFOLLOW', 0)
+            | getattr(os, 'O_NONBLOCK', 0)
+            | getattr(os, 'O_CLOEXEC', 0)
+        )
+        descriptor = os.open(path.name, file_flags, dir_fd=parent_fd)
+        descriptors.append(descriptor)
+        before = os.fstat(descriptor)
+        forbidden = 0o7077 if private else 0o7022
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > maximum
+            or before.st_mode & forbidden
+            or (private and before.st_uid != os.getuid())
+        ):
+            raise PlanValidationError(f'{label} is not a safe bounded regular file')
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, min(MANIFEST_READ_CHUNK, maximum + 1 - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > maximum:
+                raise PlanValidationError(f'{label} exceeds its byte limit')
+            digest.update(chunk)
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        fingerprint = lambda info: (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_uid,
+            info.st_nlink,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+        if fingerprint(before) != fingerprint(after) or size != before.st_size:
+            raise PlanValidationError(f'{label} changed while being read')
+        linked = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if fingerprint(linked) != fingerprint(after):
+            raise PlanValidationError(f'{label} file binding changed')
+        for parent, component, child in bindings:
+            linked = os.stat(component, dir_fd=parent, follow_symlinks=False)
+            opened = os.fstat(child)
+            if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+                raise PlanValidationError(f'{label} directory binding changed')
+        return path, b''.join(chunks), stat.S_IMODE(before.st_mode)
+    except PlanValidationError:
+        raise
+    except OSError as error:
+        raise PlanValidationError(f'{label} cannot be read safely') from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _source_json(raw: bytes, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            raw.decode('utf-8'),
+            object_pairs_hook=_duplicate_free,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                PlanValidationError(f'{label} contains a non-finite JSON number')
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise PlanValidationError(f'{label} is not valid JSON') from error
+    if not isinstance(value, dict):
+        raise PlanValidationError(f'{label} must be an object')
+    return value
+
+
+def _v2_source_admission(value: Any, label: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    item = _closed(value, {
+        'schema', 'receipt_ref', 'installation_binding_sha256', 'primary_workspace_id',
+        'primary_root', 'kit_root', 'source_ref', 'kit_ref', 'ci_helper', 'helper_bindings',
+    }, label)
+    if item.get('schema') != SOURCE_ADMISSION_SCHEMA:
+        raise PlanValidationError(f'{label}.schema is unsupported')
+    receipt_ref = _closed(
+        _required(item, 'receipt_ref', label),
+        {'path', 'sha256'},
+        f'{label}.receipt_ref',
+    )
+    receipt_path = _source_canonical_path(
+        _required(receipt_ref, 'path', f'{label}.receipt_ref'),
+        f'{label}.receipt_ref.path',
+    )
+    receipt_sha256 = _sha256(
+        _required(receipt_ref, 'sha256', f'{label}.receipt_ref'),
+        f'{label}.receipt_ref.sha256',
+    )
+    binding_sha256 = _sha256(
+        _required(item, 'installation_binding_sha256', label),
+        f'{label}.installation_binding_sha256',
+    )
+    workspace_id = _string(
+        _required(item, 'primary_workspace_id', label),
+        f'{label}.primary_workspace_id',
+    )
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,255}', workspace_id):
+        raise PlanValidationError(f'{label}.primary_workspace_id is invalid')
+    primary_root = _source_canonical_path(
+        _required(item, 'primary_root', label),
+        f'{label}.primary_root',
+    )
+    kit_root = _source_canonical_path(
+        _required(item, 'kit_root', label),
+        f'{label}.kit_root',
+    )
+    source_ref = _string(_required(item, 'source_ref', label), f'{label}.source_ref')
+    kit_ref = _string(_required(item, 'kit_ref', label), f'{label}.kit_ref')
+    for ref, ref_label in ((source_ref, 'source_ref'), (kit_ref, 'kit_ref')):
+        if not ref.startswith(('refs/remotes/', 'refs/tags/')) or ref.endswith('/HEAD'):
+            raise PlanValidationError(f'{label}.{ref_label} is not a full publication ref')
+    ci_helper = _source_canonical_path(
+        _required(item, 'ci_helper', label),
+        f'{label}.ci_helper',
+    )
+    raw_helpers = _required(item, 'helper_bindings', label)
+    if not isinstance(raw_helpers, list) or len(raw_helpers) > 64:
+        raise PlanValidationError(f'{label}.helper_bindings exceeds its bound')
+    helper_bindings: list[dict[str, str]] = []
+    for index, raw_helper in enumerate(raw_helpers):
+        helper_label = f'{label}.helper_bindings[{index}]'
+        helper = _closed(raw_helper, {'link', 'target'}, helper_label)
+        link = _source_canonical_path(
+            _required(helper, 'link', helper_label),
+            f'{helper_label}.link',
+        )
+        target = _source_canonical_path(
+            _required(helper, 'target', helper_label),
+            f'{helper_label}.target',
+        )
+        helper_bindings.append({'link': str(link), 'target': str(target)})
+    _unique([row['link'] for row in helper_bindings], f'{label}.helper_bindings')
+    return {
+        'schema': SOURCE_ADMISSION_SCHEMA,
+        'receipt_ref': {'path': str(receipt_path), 'sha256': receipt_sha256},
+        'installation_binding_sha256': binding_sha256,
+        'primary_workspace_id': workspace_id,
+        'primary_root': str(primary_root),
+        'kit_root': str(kit_root),
+        'source_ref': source_ref,
+        'kit_ref': kit_ref,
+        'ci_helper': str(ci_helper),
+        'helper_bindings': helper_bindings,
+    }
+
+
+def _source_native_identity(
+    *,
+    project_id: str,
+    project_root: Path,
+    primary_root: Path,
+    kent_path: Path,
+) -> str:
+    projects = [row for row in _project_rows(kent_path, project_root) if row['id'] == project_id]
+    if len(projects) != 1 or Path(projects[0]['path']) != primary_root:
+        raise PlanValidationError('native project identity/root differs from source admission')
+    code, output, _ = _run(
+        [str(kent_path), 'project', str(primary_root)],
+        cwd=project_root,
+    )
+    if code != 0 or output.decode('utf-8', errors='replace').strip() != project_id:
+        raise PlanValidationError('native project readback differs from source admission')
+    pages = _kent_pages(kent_path, ['task', 'list', '--project', project_id], cwd=project_root)
+    rows = _page_rows(pages, ('items', 'tasks'))
+    task_ids = [_row_id(row, 'id', 'task_id') for row in rows]
+    _unique(task_ids, 'native source-admission Task inventory')
+    workspace_ids: set[str] = set()
+    for task_id in task_ids:
+        detail = _kent_json(
+            kent_path,
+            ['task', 'show', task_id, '--project', project_id, '--json'],
+            cwd=project_root,
+        )
+        if _row_id(detail, 'id', 'task_id') != task_id:
+            raise PlanValidationError('native Task identity changed during source admission')
+        summary = detail.get('summary') if isinstance(detail.get('summary'), dict) else {}
+        if summary.get('project_id') not in (None, project_id):
+            raise PlanValidationError('native Task project differs during source admission')
+        source = detail.get('source_workspace')
+        if not isinstance(source, dict) or source.get('is_primary') is not True:
+            continue
+        source_root = _source_canonical_root(
+            _required(source, 'root_path', f'Task {task_id}.source_workspace'),
+            f'Task {task_id}.source_workspace.root_path',
+        )
+        workspace_id = _string(
+            _required(source, 'workspace_id', f'Task {task_id}.source_workspace'),
+            f'Task {task_id}.source_workspace.workspace_id',
+        )
+        project = detail.get('project')
+        if (
+            source_root != primary_root
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,255}', workspace_id)
+            or not isinstance(project, dict)
+            or project.get('default_workspace_id') != workspace_id
+        ):
+            raise PlanValidationError('native primary workspace identity is inconsistent')
+        workspace_ids.add(workspace_id)
+    if len(workspace_ids) != 1:
+        raise PlanValidationError('native primary workspace identity is unavailable or ambiguous')
+    return next(iter(workspace_ids))
+
+
+def _source_binding(
+    value: Mapping[str, Any],
+    *,
+    project_id: str,
+    project_root: Path,
+    kent_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any], bytes, bytes, bytes, str]:
+    primary_root = _source_canonical_root(value['primary_root'], 'source_admission.primary_root')
+    kit_root = _source_canonical_root(value['kit_root'], 'source_admission.kit_root')
+    if primary_root != project_root:
+        raise PlanValidationError('source primary root differs from the plan project root')
+    native_workspace_id = _source_native_identity(
+        project_id=project_id,
+        project_root=project_root,
+        primary_root=primary_root,
+        kent_path=kent_path,
+    )
+    if native_workspace_id != value['primary_workspace_id']:
+        raise PlanValidationError('source primary workspace ID differs from native readback')
+    binding_path = Path.home() / '.kent' / 'project-memory-bindings' / f'{project_id}.json'
+    _, binding_raw, _ = _read_source_record(
+        binding_path,
+        label='native installation binding',
+        maximum=SOURCE_RECEIPT_BYTES_LIMIT,
+        private=True,
+    )
+    if sha256_bytes(binding_raw) != value['installation_binding_sha256']:
+        raise PlanValidationError('native installation binding digest differs')
+    binding = _source_json(binding_raw, 'native installation binding')
+    binding = _closed(binding, {
+        'schema', 'project_id', 'primary_root', 'primary_workspace_id', 'profile_sha256',
+        'receipt_path', 'receipt_sha256', 'kit_root', 'source_ref', 'kit_ref',
+        'ci_helper', 'helper_bindings',
+    }, 'native installation binding')
+    if binding.get('schema') != SOURCE_BINDING_SCHEMA:
+        raise PlanValidationError('native installation binding schema is unsupported')
+    if binding.get('project_id') != project_id:
+        raise PlanValidationError('native installation binding project differs')
+    binding_profile = _sha256(
+        _required(binding, 'profile_sha256', 'native installation binding'),
+        'native installation binding.profile_sha256',
+    )
+    binding_helpers = _required(binding, 'helper_bindings', 'native installation binding')
+    if not isinstance(binding_helpers, list) or len(binding_helpers) > 64:
+        raise PlanValidationError('native installation helper inventory is invalid')
+    normalized_binding_helpers: list[dict[str, str]] = []
+    for index, raw_helper in enumerate(binding_helpers):
+        helper_label = f'native installation binding.helper_bindings[{index}]'
+        helper = _closed(raw_helper, {'link', 'target'}, helper_label)
+        normalized_binding_helpers.append({
+            'link': str(_source_canonical_path(
+                _required(helper, 'link', helper_label), f'{helper_label}.link',
+            )),
+            'target': str(_source_canonical_path(
+                _required(helper, 'target', helper_label), f'{helper_label}.target',
+            )),
+        })
+    _unique([row['link'] for row in normalized_binding_helpers], 'native installation helper bindings')
+    expected_binding = {
+        'project_id': project_id,
+        'primary_root': str(primary_root),
+        'primary_workspace_id': native_workspace_id,
+        'receipt_path': value['receipt_ref']['path'],
+        'receipt_sha256': value['receipt_ref']['sha256'],
+        'kit_root': str(kit_root),
+        'source_ref': value['source_ref'],
+        'kit_ref': value['kit_ref'],
+        'ci_helper': value['ci_helper'],
+    }
+    if any(binding.get(key) != expected for key, expected in expected_binding.items()):
+        raise PlanValidationError('native installation binding differs from source admission')
+    sort_helpers = lambda rows: sorted(rows, key=lambda row: (row['link'], row['target']))
+    if sort_helpers(normalized_binding_helpers) != sort_helpers(value['helper_bindings']):
+        raise PlanValidationError('native installed helper bindings differ from source admission')
+    expected_adapter = {
+        'link': str(Path.home() / '.kent' / 'bin' / 'kent-project-memory'),
+        'target': str(kit_root / '.kent/scripts/workflow-project-memory'),
+    }
+    if (
+        expected_adapter not in normalized_binding_helpers
+        or value['ci_helper'] != str(Path.home() / '.kent' / 'bin' / 'kent-prepare-github-ci')
+    ):
+        raise PlanValidationError('native Kit helper bindings are incomplete')
+    profile_path = primary_root / '.kent/workflow-profile.toml'
+    _, profile_raw, _ = _read_source_record(
+        profile_path,
+        label='installed project profile',
+        maximum=SOURCE_RECEIPT_BYTES_LIMIT,
+        private=False,
+    )
+    if sha256_bytes(profile_raw) != binding_profile:
+        raise PlanValidationError('installed project profile differs from its binding')
+    try:
+        profile = tomllib.loads(profile_raw.decode('utf-8'))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise PlanValidationError('installed project profile is invalid') from error
+    project_memory = profile.get('project_memory')
+    if not isinstance(project_memory, dict) or project_memory.get('mode') != 'r2':
+        raise PlanValidationError('installed project is not configured for R2 source admission')
+    receipt_path, receipt_raw, _ = _read_source_record(
+        value['receipt_ref']['path'],
+        label='source publication receipt',
+        maximum=SOURCE_RECEIPT_BYTES_LIMIT,
+        private=True,
+    )
+    if sha256_bytes(receipt_raw) != value['receipt_ref']['sha256']:
+        raise PlanValidationError('source publication receipt digest differs')
+    receipt = _source_json(receipt_raw, 'source publication receipt')
+    receipt = _closed(receipt, {
+        'schema', 'project_id', 'workflow_id', 'source_commit', 'kit_commit',
+        'runtime_roots', 'files', 'policy', 'project_memory',
+    }, 'source publication receipt')
+    if (
+        receipt.get('schema') != SOURCE_RECEIPT_SCHEMA
+        or receipt.get('project_id') != project_id
+        or receipt.get('policy') != 'delivery_reliability_v1'
+    ):
+        raise PlanValidationError('source publication receipt identity differs')
+    bootstrap_workflow_id = _uuid(receipt.get('workflow_id'), 'source receipt workflow_id')
+    for name in ('source_commit', 'kit_commit'):
+        _sha1(receipt.get(name), f'source publication receipt.{name}')
+    roots = receipt.get('runtime_roots')
+    if not isinstance(roots, list) or not roots or len(roots) > MAX_LIST:
+        raise PlanValidationError('source publication runtime roots are invalid')
+    normalized_roots = [_source_canonical_root(root, 'source publication runtime root') for root in roots]
+    _unique([str(root) for root in normalized_roots], 'source publication runtime roots')
+    if primary_root not in normalized_roots or kit_root not in normalized_roots:
+        raise PlanValidationError('source publication roots differ from installation binding')
+    files = receipt.get('files')
+    if (
+        not isinstance(files, list)
+        or not files
+        or len(files) > SOURCE_RECEIPT_FILE_LIMIT
+    ):
+        raise PlanValidationError('source publication file inventory is invalid')
+    memory = receipt.get('project_memory')
+    if not isinstance(memory, dict) or set(memory) != {
+        'root', 'project_key', 'project_uid', 'legacy_task_ids',
+    }:
+        raise PlanValidationError('source publication project-memory declaration is invalid')
+    for name in ('root', 'project_key', 'project_uid'):
+        if project_memory.get(name) != memory.get(name):
+            raise PlanValidationError('source publication project-memory binding differs')
+    return binding, receipt, binding_raw, receipt_raw, profile_raw, bootstrap_workflow_id
+
+
+def admit_source_admission(
+    admission: Any,
+    *,
+    project_id: str,
+    workflow_id: str,
+    project_root: str | Path,
+    kent_path: str | Path,
+) -> VerifiedSourceAdmission:
+    """Verify native project identity, private install binding and pinned sources."""
+    parsed = _v2_source_admission(admission, 'source_admission')
+    if parsed is None:
+        raise PlanValidationError('source admission is required')
+    project_id = _native_project_id(project_id, 'source admission project_id')
+    workflow_id = _uuid(workflow_id, 'source admission workflow_id')
+    root = _source_canonical_root(str(project_root), 'source admission project_root')
+    kent = _kent_path(str(kent_path), 'source admission kent')
+    _verify_executable(kent, sha256_bytes(kent.read_bytes()))
+    binding, receipt, binding_raw, receipt_raw, profile_raw, receipt_workflow_id = _source_binding(
+        parsed,
+        project_id=project_id,
+        project_root=root,
+        kent_path=kent,
+    )
+    if receipt_workflow_id != workflow_id:
+        raise PlanValidationError('source publication receipt Workflow differs')
+    if parsed['receipt_ref']['path'] != binding['receipt_path']:
+        raise PlanValidationError('source publication receipt path differs from native binding')
+    kit_root = Path(parsed['kit_root'])
+    receipt_files = receipt['files']
+    inspector_entries = [
+        row for row in receipt_files
+        if isinstance(row, dict)
+        and row.get('root') == str(kit_root)
+        and row.get('relative_path') == 'scripts/inspect-delivery-source'
+    ]
+    if len(inspector_entries) != 1:
+        raise PlanValidationError('source publication receipt lacks a unique qualified inspector')
+    inspector_entry = _closed(
+        inspector_entries[0],
+        {'root', 'relative_path', 'sha256', 'byte_size', 'mode'},
+        'source inspector receipt entry',
+    )
+    inspector_digest = _sha256(
+        _required(inspector_entry, 'sha256', 'source inspector receipt entry'),
+        'source inspector receipt entry.sha256',
+    )
+    inspector_size = _required(inspector_entry, 'byte_size', 'source inspector receipt entry')
+    inspector_mode = _required(inspector_entry, 'mode', 'source inspector receipt entry')
+    if (
+        not isinstance(inspector_size, int)
+        or isinstance(inspector_size, bool)
+        or not 0 <= inspector_size <= SOURCE_FILE_BYTES_LIMIT
+        or not isinstance(inspector_mode, int)
+        or isinstance(inspector_mode, bool)
+        or not 0 <= inspector_mode <= 0o777
+        or inspector_mode & 0o022
+    ):
+        raise PlanValidationError('source inspector receipt metadata is invalid')
+    inspector_path = kit_root / 'scripts/inspect-delivery-source'
+    _, inspector_raw, actual_mode = _read_source_record(
+        inspector_path,
+        label='qualified source inspector',
+        maximum=SOURCE_FILE_BYTES_LIMIT,
+        private=False,
+    )
+    if (
+        len(inspector_raw) != inspector_size
+        or sha256_bytes(inspector_raw) != inspector_digest
+        or bool(actual_mode & 0o100) != bool(inspector_mode & 0o100)
+    ):
+        raise PlanValidationError('installed source inspector differs from receipt')
+    from .delivery import source_admission_gate
+
+    gate = source_admission_gate(
+        parsed,
+        project_id=project_id,
+        workflow_id=workflow_id,
+        project_root=str(root),
+    )
+    helper_args: list[str] = []
+    for helper in sorted(parsed['helper_bindings'], key=lambda row: row['link']):
+        helper_args.extend(('--installed-helper', helper['link'], helper['target']))
+    command = [
+        sys.executable,
+        '-I',
+        '-S',
+        '-c',
+        (
+            "import sys\n"
+            "filename = sys.argv.pop(1)\n"
+            "sys.argv[0] = filename\n"
+            "source = sys.stdin.buffer.read(8388609)\n"
+            "if len(source) > 8388608:\n"
+            "    raise SystemExit(2)\n"
+            "namespace = {'__file__': filename, '__name__': '__main__'}\n"
+            "exec(compile(source, filename, 'exec'), namespace)\n"
+        ),
+        str(inspector_path),
+        '--receipt', parsed['receipt_ref']['path'],
+        '--receipt-sha256', parsed['receipt_ref']['sha256'],
+        '--project-id', project_id,
+        '--workflow-id', workflow_id,
+        '--project-root', str(root),
+        '--kit-root', parsed['kit_root'],
+        '--primary-root', parsed['primary_root'],
+        '--workspace', str(root),
+        '--source-ref', parsed['source_ref'],
+        '--kit-ref', parsed['kit_ref'],
+        '--ci-helper', parsed['ci_helper'],
+        *helper_args,
+    ]
+    if sum(len(value.encode('utf-8')) + 1 for value in command) > 128 * 1024:
+        raise PlanValidationError('source inspector argument set exceeds its bound')
+    try:
+        with tempfile.TemporaryFile() as inspector_input, \
+                tempfile.TemporaryFile() as stdout_file, \
+                tempfile.TemporaryFile() as stderr_file:
+            inspector_input.write(inspector_raw)
+            inspector_input.seek(0)
+            process = subprocess.Popen(
+                command,
+                cwd=str(root),
+                env=_safe_env(),
+                stdin=inspector_input,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                close_fds=True,
+            )
+            try:
+                return_code = process.wait(timeout=SOURCE_INSPECTOR_TIMEOUT)
+            except subprocess.TimeoutExpired as error:
+                process.kill()
+                process.wait(timeout=2)
+                raise PlanValidationError('source inspection timed out') from error
+            stdout_file.seek(0)
+            output = stdout_file.read(MAX_OUTPUT + 1)
+            stderr_file.seek(0)
+            stderr = stderr_file.read(MAX_OUTPUT + 1)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise PlanValidationError('source inspector could not be executed safely') from error
+    if return_code != 0 or len(output) > MAX_OUTPUT or len(stderr) > MAX_OUTPUT:
+        raise PlanValidationError('published source inspection was not admitted')
+    inspection = _source_json(output, 'source inspector result')
+    inspection = _closed(inspection, {
+        'schema', 'status', 'project_id', 'workflow_id', 'receipt_sha256',
+        'source_commit', 'kit_commit', 'file_count', 'source_bytes', 'workspace_path',
+        'source_ref', 'source_ref_commit', 'kit_ref', 'kit_ref_commit', 'python_cache_tag',
+    }, 'source inspector result')
+    file_count = inspection.get('file_count')
+    source_bytes = inspection.get('source_bytes')
+    if (
+        inspection.get('schema') != SOURCE_INSPECTION_SCHEMA
+        or inspection.get('status') != 'admitted'
+        or inspection.get('project_id') != project_id
+        or inspection.get('workflow_id') != workflow_id
+        or inspection.get('receipt_sha256') != parsed['receipt_ref']['sha256']
+        or inspection.get('source_commit') != receipt.get('source_commit')
+        or inspection.get('kit_commit') != receipt.get('kit_commit')
+        or inspection.get('workspace_path') != str(root)
+        or inspection.get('source_ref') != parsed['source_ref']
+        or inspection.get('kit_ref') != parsed['kit_ref']
+        or not isinstance(file_count, int)
+        or isinstance(file_count, bool)
+        or file_count != len(receipt_files)
+        or not 1 <= file_count <= SOURCE_RECEIPT_FILE_LIMIT
+        or not isinstance(source_bytes, int)
+        or isinstance(source_bytes, bool)
+        or not 0 <= source_bytes <= SOURCE_TOTAL_BYTES_LIMIT
+        or not re.fullmatch(r'[0-9a-f]{40}', str(inspection.get('source_ref_commit', '')))
+        or not re.fullmatch(r'[0-9a-f]{40}', str(inspection.get('kit_ref_commit', '')))
+        or inspection.get('python_cache_tag') != sys.implementation.cache_tag
+    ):
+        raise PlanValidationError('source inspector result differs from bound admission')
+    _, binding_after, _ = _read_source_record(
+        Path.home() / '.kent' / 'project-memory-bindings' / f'{project_id}.json',
+        label='native installation binding',
+        maximum=SOURCE_RECEIPT_BYTES_LIMIT,
+        private=True,
+    )
+    _, receipt_after, _ = _read_source_record(
+        parsed['receipt_ref']['path'],
+        label='source publication receipt',
+        maximum=SOURCE_RECEIPT_BYTES_LIMIT,
+        private=True,
+    )
+    _, profile_after, _ = _read_source_record(
+        Path(parsed['primary_root']) / '.kent/workflow-profile.toml',
+        label='installed project profile',
+        maximum=SOURCE_RECEIPT_BYTES_LIMIT,
+        private=False,
+    )
+    if (
+        binding_after != binding_raw
+        or receipt_after != receipt_raw
+        or profile_after != profile_raw
+    ):
+        raise PlanValidationError('source admission inputs changed during inspection')
+    value_raw = canonical_bytes(parsed)
+    inspection_raw = canonical_bytes(inspection)
+    return VerifiedSourceAdmission(
+        project_id=project_id,
+        workflow_id=workflow_id,
+        project_root=str(root),
+        primary_workspace_id=parsed['primary_workspace_id'],
+        primary_root=parsed['primary_root'],
+        kit_root=parsed['kit_root'],
+        source_admission_sha256=sha256_bytes(value_raw),
+        receipt_sha256=parsed['receipt_ref']['sha256'],
+        gate=gate,
+        value_raw=value_raw,
+        inspection_raw=inspection_raw,
+        receipt_files_raw=canonical_bytes(receipt_files),
+        _token=_VERIFIED_SOURCE_ADMISSION_TOKEN,
+    )
+
+
+def _v2_ref_list(
+    value: Any,
+    label: str,
+    *,
+    verify_files: bool = True,
+) -> list[dict[str, Any]]:
+    refs = []
+    for index, raw in enumerate(_bounded_list(value, label)):
+        ref_label = f'{label}[{index}]'
+        ref = _closed(raw, {'path', 'sha256'}, ref_label)
+        path = _absolute_path(_required(ref, 'path', ref_label), f'{ref_label}.path')
+        expected = _sha256(_required(ref, 'sha256', ref_label), f'{ref_label}.sha256')
+        if verify_files:
+            path, contents = _read_reference(raw, ref_label)
+            expected = sha256_bytes(contents)
+        refs.append({'path': str(path), 'sha256': expected})
+    refs.sort(key=lambda row: row['path'])
+    _unique([row['path'] for row in refs], label)
+    return refs
+
+
+def _v2_snapshot(value: Any, label: str, *, verify_files: bool = True) -> dict[str, Any]:
+    raw = _closed(value, {
+        'schema', 'workflow_id', 'project_id', 'expected_version', 'execution_target',
+        'execution_root', 'tasks', 'sessions', 'live_executions',
+    }, label)
+    if raw.get('schema') != CANONICAL_V2_SNAPSHOT_SCHEMA:
+        raise PlanValidationError(f'{label}.schema is unsupported')
+    workflow_id = _uuid(_required(raw, 'workflow_id', label), f'{label}.workflow_id')
+    project_id = _native_project_id(_required(raw, 'project_id', label), f'{label}.project_id')
+    version = _required(raw, 'expected_version', label)
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        raise PlanValidationError(f'{label}.expected_version is invalid')
+    target = _plan_execution_target(_required(raw, 'execution_target', label), f'{label}.execution_target')
+    root = _absolute_path(_required(raw, 'execution_root', label), f'{label}.execution_root')
+    tasks = []
+    for index, raw_task in enumerate(_bounded_list(_required(raw, 'tasks', label), f'{label}.tasks')):
+        task_label = f'{label}.tasks[{index}]'
+        task = _closed(raw_task, {
+            'id', 'status', 'native_state', 'terminal', 'current_nodes', 'pending_decisions',
+            'history_classification', 'history_refs',
+        }, task_label)
+        status = _string(_required(task, 'status', task_label), f'{task_label}.status')
+        native_state = task.get('native_state')
+        if native_state is not None:
+            native_state = _string(native_state, f'{task_label}.native_state')
+        terminal = _required(task, 'terminal', task_label)
+        if not isinstance(terminal, bool):
+            raise PlanValidationError(f'{task_label}.terminal is invalid')
+        current_nodes = [
+            _string(row, f'{task_label}.current_nodes[{node_index}]')
+            for node_index, row in enumerate(_bounded_list(
+                _required(task, 'current_nodes', task_label), f'{task_label}.current_nodes',
+            ))
+        ]
+        current_nodes.sort()
+        pending = []
+        for decision_index, raw_decision in enumerate(_bounded_list(
+            _required(task, 'pending_decisions', task_label), f'{task_label}.pending_decisions',
+        )):
+            decision_label = f'{task_label}.pending_decisions[{decision_index}]'
+            decision = _closed(raw_decision, {'id', 'payload_sha256'}, decision_label)
+            pending.append({
+                'id': _string(_required(decision, 'id', decision_label), f'{decision_label}.id'),
+                'payload_sha256': _sha256(
+                    _required(decision, 'payload_sha256', decision_label),
+                    f'{decision_label}.payload_sha256',
+                ),
+            })
+        pending.sort(key=lambda row: row['id'])
+        _unique([row['id'] for row in pending], f'{task_label}.pending_decisions')
+        history = _string(
+            _required(task, 'history_classification', task_label),
+            f'{task_label}.history_classification',
+        )
+        refs = _v2_ref_list(
+            _required(task, 'history_refs', task_label),
+            f'{task_label}.history_refs',
+            verify_files=verify_files,
+        )
+        tasks.append({
+            'id': _string(_required(task, 'id', task_label), f'{task_label}.id'),
+            'status': status,
+            'native_state': native_state,
+            'terminal': terminal,
+            'current_nodes': current_nodes,
+            'pending_decisions': pending,
+            'history_classification': history,
+            'history_refs': refs,
+        })
+    tasks.sort(key=lambda row: row['id'])
+    _unique([row['id'] for row in tasks], f'{label}.tasks')
+    sessions = []
+    for index, raw_session in enumerate(_bounded_list(_required(raw, 'sessions', label), f'{label}.sessions')):
+        session_label = f'{label}.sessions[{index}]'
+        session = _closed(raw_session, {
+            'id', 'task_id', 'status', 'retained', 'live_owner', 'contract_fingerprint', 'source_refs',
+        }, session_label)
+        owner = session.get('live_owner')
+        if owner is not None:
+            owner = _string(owner, f'{session_label}.live_owner')
+        retained = _required(session, 'retained', session_label)
+        if not isinstance(retained, bool):
+            raise PlanValidationError(f'{session_label}.retained is invalid')
+        refs = _v2_ref_list(
+            _required(session, 'source_refs', session_label),
+            f'{session_label}.source_refs',
+            verify_files=verify_files,
+        )
+        fingerprint = _sha256(
+            _required(session, 'contract_fingerprint', session_label),
+            f'{session_label}.contract_fingerprint',
+        )
+        session_id = _string(_required(session, 'id', session_label), f'{session_label}.id')
+        if fingerprint != canonical_sha256({'session_id': session_id, 'source_refs': refs}):
+            raise PlanValidationError(f'{session_label}.contract_fingerprint does not bind its sources')
+        sessions.append({
+            'id': session_id,
+            'task_id': _string(_required(session, 'task_id', session_label), f'{session_label}.task_id'),
+            'status': _string(_required(session, 'status', session_label), f'{session_label}.status'),
+            'retained': retained,
+            'live_owner': owner,
+            'contract_fingerprint': fingerprint,
+            'source_refs': refs,
+        })
+    sessions.sort(key=lambda row: row['id'])
+    _unique([row['id'] for row in sessions], f'{label}.sessions')
+    task_ids = {task['id'] for task in tasks}
+    if any(session['task_id'] not in task_ids for session in sessions):
+        raise PlanValidationError(f'{label}.sessions contains an unknown Task')
+    executions = []
+    for index, raw_execution in enumerate(_bounded_list(
+        _required(raw, 'live_executions', label), f'{label}.live_executions',
+    )):
+        execution_label = f'{label}.live_executions[{index}]'
+        execution = _closed(raw_execution, {'id', 'state'}, execution_label)
+        executions.append({
+            'id': _string(_required(execution, 'id', execution_label), f'{execution_label}.id'),
+            'state': _string(_required(execution, 'state', execution_label), f'{execution_label}.state'),
+        })
+    executions.sort(key=lambda row: row['id'])
+    _unique([row['id'] for row in executions], f'{label}.live_executions')
+    return {
+        'schema': CANONICAL_V2_SNAPSHOT_SCHEMA,
+        'workflow_id': workflow_id,
+        'project_id': project_id,
+        'expected_version': version,
+        'execution_target': target,
+        'execution_root': str(root),
+        'tasks': tasks,
+        'sessions': sessions,
+        'live_executions': executions,
+    }
+
+
+def _v2_graph_compatibility(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    runtime_refs: Sequence[Mapping[str, Any]],
+) -> None:
+    if set(source) != {'version', 'nodes', 'edges', 'node_groups', 'transition_groups'}:
+        raise PlanValidationError('v2 source graph fields are unsupported')
+    if canonical_sha256(source) == canonical_sha256(target):
+        return
+    if set(target) != set(source) or target.get('version') != source.get('version', 0) + 1:
+        raise PlanValidationError('v2 target graph revision/fields are invalid')
+    for key in ('nodes', 'edges', 'node_groups', 'transition_groups'):
+        _bounded_list(source.get(key), f'source_graph.{key}')
+        _bounded_list(target.get(key), f'target_graph.{key}')
+    for name in ('nodes', 'edges', 'node_groups', 'transition_groups'):
+        old_rows, new_rows = source[name], target[name]
+        old_ids = [row.get('id') for row in old_rows if isinstance(row, dict)]
+        new_ids = [row.get('id') for row in new_rows if isinstance(row, dict)]
+        if len(old_ids) != len(old_rows) or len(new_ids) != len(new_rows):
+            raise PlanValidationError(f'v2 {name} entries must be objects')
+        if len(old_ids) != len(set(old_ids)) or len(new_ids) != len(set(new_ids)):
+            raise PlanValidationError(f'v2 {name} identities are duplicated')
+        old_by_id = {row['id']: row for row in old_rows}
+        new_by_id = {row['id']: row for row in new_rows}
+        added = set(new_by_id) - set(old_by_id)
+        removed = set(old_by_id) - set(new_by_id)
+        if removed:
+            raise PlanValidationError(f'v2 target removes existing {name}')
+        if name in {'nodes', 'node_groups'} and added:
+            raise PlanValidationError(f'v2 target adds unsupported {name}')
+        if name == 'transition_groups' and len(added) > 1:
+            raise PlanValidationError('v2 target adds more than one transition group')
+        if name == 'edges' and len(added) > 1:
+            raise PlanValidationError('v2 target adds more than one edge')
+        for identity in set(old_by_id) & set(new_by_id):
+            before = dict(old_by_id[identity])
+            after = dict(new_by_id[identity])
+            if name == 'nodes' and before != after:
+                before_script = before.pop('script_path', None)
+                after_script = after.pop('script_path', None)
+                qualified_paths = {
+                    ref['path']
+                    for ref in runtime_refs
+                    if isinstance(ref.get('path'), str)
+                    and isinstance(ref.get('mode'), int)
+                    and not isinstance(ref.get('mode'), bool)
+                    and ref['mode'] & 0o111
+                }
+                if (
+                    before != after
+                    or old_by_id[identity].get('kind') != 'script'
+                    or new_by_id[identity].get('kind') != 'script'
+                    or not isinstance(before_script, str)
+                    or not before_script
+                    or old_by_id[identity].get('script_path') == new_by_id[identity].get('script_path')
+                    or not isinstance(after_script, str)
+                    or not Path(after_script).is_absolute()
+                    or after_script not in qualified_paths
+                ):
+                    raise PlanValidationError(
+                        f'v2 target changes protected {name} semantics'
+                    )
+                continue
+            for key in ('prompt_template', 'prompt'):
+                before.pop(key, None)
+                after.pop(key, None)
+            if before != after:
+                raise PlanValidationError(f'v2 target changes protected {name} semantics')
+    if not any(
+        canonical_sha256(source[name]) != canonical_sha256(target[name])
+        for name in ('nodes', 'edges', 'node_groups', 'transition_groups')
+    ):
+        raise PlanValidationError('v2 graph revision contains no reviewed semantic delta')
+    nodes = {row.get('id'): row for row in target['nodes']}
+    keys = {row.get('key'): row for row in target['nodes']}
+    new_groups = [row for row in target['transition_groups'] if row['id'] not in {
+        item['id'] for item in source['transition_groups']
+    }]
+    new_edges = [row for row in target['edges'] if row['id'] not in {
+        item['id'] for item in source['edges']
+    }]
+    if not new_groups and not new_edges:
+        return
+    if len(new_groups) != 1 or len(new_edges) != 1:
+        raise PlanValidationError('v2 structural change must add exactly implement_replan')
+    group, edge = new_groups[0], new_edges[0]
+    if (
+        group.get('source_node_id') != keys.get('implement', {}).get('id')
+        or group.get('transition_id') != 'implement_replan'
+        or edge.get('key') != 'implement_replan'
+        or edge.get('transition_group_id') != group.get('id')
+        or edge.get('target_node_id') != keys.get('plan_revalidation', {}).get('id')
+        or edge.get('requires_approval') is not False
+        or edge.get('context_mode') != 'continue_session'
+        or edge.get('context_source') != {'kind': 'selected_node', 'node_key': 'plan'}
+        or keys.get('plan') is None
+        or edge.get('parameters') not in (None, [])
+        or edge.get('assignee_selection') != 'configured'
+        or edge.get('thinking_selection') != 'configured'
+        or not isinstance(edge.get('prompt_template'), str)
+        or not edge['prompt_template'].strip()
+    ):
+        raise PlanValidationError('v2 additive route is not the approved implement_replan edge')
+    if nodes.get(edge.get('target_node_id'), {}).get('key') != 'plan_revalidation':
+        raise PlanValidationError('v2 implement_replan target identity is invalid')
+
+
+def _v2_ingress_edge(graph: Mapping[str, Any], label: str) -> dict[str, Any]:
+    nodes = {
+        row.get('id', row.get('node_id')): row
+        for row in graph.get('nodes', [])
+        if isinstance(row, dict)
+    }
+    groups = {
+        row.get('id', row.get('transition_group_id')): row
+        for row in graph.get('transition_groups', [])
+        if isinstance(row, dict)
+    }
+    candidates = []
+    for edge in graph.get('edges', []):
+        if not isinstance(edge, dict):
+            continue
+        group = groups.get(edge.get('transition_group_id'))
+        if not isinstance(group, dict):
+            continue
+        source = nodes.get(group.get('source_node_id'))
+        target = nodes.get(edge.get('target_node_id'))
+        if (
+            isinstance(source, dict)
+            and isinstance(target, dict)
+            and source.get('key') == 'backlog'
+            and target.get('key') == 'plan'
+        ):
+            candidates.append(edge)
+    if len(candidates) != 1:
+        raise PlanValidationError(f'{label} must contain one unique Backlog-to-Plan ingress')
+    return candidates[0]
+
+
+def _v2_source_gate_check(
+    source_graph: Mapping[str, Any],
+    target_graph: Mapping[str, Any],
+    admission: Mapping[str, Any],
+    *,
+    project_id: str,
+    workflow_id: str,
+    project_root: Path,
+) -> None:
+    from .delivery import SOURCE_ADMISSION_BEGIN, SOURCE_ADMISSION_END, source_admission_gate
+
+    source_ingress = _v2_ingress_edge(source_graph, 'source graph')
+    target_ingress = _v2_ingress_edge(target_graph, 'target graph')
+    source_prompt = source_ingress.get('prompt_template', source_ingress.get('prompt'))
+    target_prompt = target_ingress.get('prompt_template', target_ingress.get('prompt'))
+    if not isinstance(source_prompt, str) or not isinstance(target_prompt, str):
+        raise PlanValidationError('source gate ingress prompt is absent')
+    old_starts = source_prompt.count(SOURCE_ADMISSION_BEGIN)
+    old_ends = source_prompt.count(SOURCE_ADMISSION_END)
+    if old_starts == 0 and old_ends == 0:
+        inherited_prompt = source_prompt
+    elif old_starts == 1 and old_ends == 1 and source_prompt.startswith(SOURCE_ADMISSION_BEGIN):
+        end = source_prompt.find(SOURCE_ADMISSION_END)
+        after = end + len(SOURCE_ADMISSION_END)
+        if end < 0 or not source_prompt[after:].startswith('\n\n'):
+            raise PlanValidationError('existing source admission frame is malformed')
+        inherited_prompt = source_prompt[after + 2:]
+    else:
+        raise PlanValidationError('source graph source admission frame is duplicated or malformed')
+    source_edges = {
+        row.get('id'): row
+        for row in source_graph.get('edges', [])
+        if isinstance(row, dict)
+    }
+    for edge in target_graph.get('edges', []):
+        if not isinstance(edge, dict) or edge.get('id') == target_ingress.get('id'):
+            continue
+        source_edge = source_edges.get(edge.get('id'))
+        if source_edge is None:
+            continue
+        prompt_before = source_edge.get('prompt_template', source_edge.get('prompt'))
+        prompt_after = edge.get('prompt_template', edge.get('prompt'))
+        if (
+            prompt_after != prompt_before
+            or (isinstance(prompt_after, str) and (
+                SOURCE_ADMISSION_BEGIN in prompt_after
+                or SOURCE_ADMISSION_END in prompt_after
+            ))
+        ):
+            raise PlanValidationError('source admission cannot alter another Workflow prompt')
+    gate = source_admission_gate(
+        dict(admission),
+        project_id=project_id,
+        workflow_id=workflow_id,
+        project_root=str(project_root),
+    )
+    expected_prompt = f'{gate}\n\n{inherited_prompt}'
+    if target_prompt != expected_prompt:
+        raise PlanValidationError('target ingress does not contain the exact bound source admission gate')
+    starts = sum(
+        prompt.count(SOURCE_ADMISSION_BEGIN)
+        for edge in target_graph.get('edges', [])
+        if isinstance(edge, dict)
+        for prompt in [edge.get('prompt_template', edge.get('prompt', ''))]
+        if isinstance(prompt, str)
+    )
+    ends = sum(
+        prompt.count(SOURCE_ADMISSION_END)
+        for edge in target_graph.get('edges', [])
+        if isinstance(edge, dict)
+        for prompt in [edge.get('prompt_template', edge.get('prompt', ''))]
+        if isinstance(prompt, str)
+    )
+    if starts != 1 or ends != 1:
+        raise PlanValidationError('target graph must contain exactly one source admission frame')
+
+
+def _v2_runtime_refs(value: Any, *, verify_sources: bool = True) -> list[dict[str, Any]]:
+    refs = []
+    for index, raw in enumerate(_bounded_list(value, 'runtime_refs')):
+        label = f'runtime_refs[{index}]'
+        ref = _closed(raw, {
+            'path', 'sha256', 'root', 'relative_path', 'mode', 'byte_size', 'published_commit',
+        }, label)
+        root = _absolute_path(_required(ref, 'root', label), f'{label}.root')
+        relative = Path(_string(_required(ref, 'relative_path', label), f'{label}.relative_path'))
+        if relative.is_absolute() or '..' in relative.parts or not relative.parts:
+            raise PlanValidationError(f'{label}.relative_path is invalid')
+        path = _absolute_path(_required(ref, 'path', label), f'{label}.path')
+        if path != root / relative:
+            raise PlanValidationError(f'{label}.path does not match its root-relative binding')
+        mode = _required(ref, 'mode', label)
+        size = _required(ref, 'byte_size', label)
+        if not isinstance(mode, int) or isinstance(mode, bool) or mode < 0:
+            raise PlanValidationError(f'{label}.mode is invalid')
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0 or size > CANONICAL_V2_MAX_REFERENCE:
+            raise PlanValidationError(f'{label}.byte_size is invalid')
+        commit = _sha1(_required(ref, 'published_commit', label), f'{label}.published_commit')
+        expected_digest = _sha256(_required(ref, 'sha256', label), f'{label}.sha256')
+        if verify_sources:
+            path, raw_bytes = _read_reference(
+                {'path': str(path), 'sha256': expected_digest},
+                label,
+            )
+            info = path.stat(follow_symlinks=False)
+            if (
+                stat.S_IMODE(info.st_mode) != mode
+                or info.st_size != size
+                or not (mode & 0o111)
+            ):
+                raise PlanValidationError(f'{label} mode/size is not qualified')
+            if not root.is_dir() or root.is_symlink():
+                raise PlanValidationError(f'{label}.root is unsafe')
+            top = _git(root, 'rev-parse', '--show-toplevel').strip()
+            head = _git(root, 'rev-parse', 'HEAD').strip()
+            dirty = _git(root, 'status', '--porcelain=v1', '--untracked-files=all')
+            if Path(top).resolve() != root.resolve() or head != commit or dirty:
+                raise PlanValidationError(f'{label} is not at its clean published revision')
+        refs.append({
+            'path': str(path),
+            'sha256': expected_digest,
+            'root': str(root),
+            'relative_path': relative.as_posix(),
+            'mode': mode,
+            'byte_size': size,
+            'published_commit': commit,
+        })
+    refs.sort(key=lambda row: row['path'])
+    _unique([row['path'] for row in refs], 'runtime_refs')
+    if not refs:
+        raise PlanValidationError('v2 plan requires at least one qualified runtime reference')
+    return refs
+
+
+def _v2_review(
+    value: Any,
+    *,
+    workflow_id: str,
+    project_id: str,
+    source_graph_sha256: str,
+    source_metadata_sha256: str,
+    target_graph_sha256: str,
+    target_metadata_sha256: str,
+    snapshot: Mapping[str, Any],
+    runtime_refs: Sequence[Mapping[str, Any]],
+    source_admission_sha256: str | None,
+    required_paths: set[str],
+) -> None:
+    path, raw = _read_reference(value, 'compatibility_review_ref')
+    try:
+        review = json.loads(raw.decode('utf-8'), object_pairs_hook=_duplicate_free)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PlanValidationError('compatibility review is not valid JSON') from error
+    if canonical_bytes(review) != raw:
+        raise PlanValidationError('compatibility review is not canonical JSON')
+    review = _closed(review, {
+        'schema', 'workflow_id', 'project_id', 'source_graph_sha256', 'source_metadata_sha256',
+        'target_graph_sha256', 'target_metadata_sha256', 'compatibility_snapshot_sha256',
+        'runtime_refs_sha256', 'source_admission_sha256', 'outcome', 'reviewer_session_id', 'dispositions',
+    }, 'compatibility review')
+    expected = {
+        'schema': CANONICAL_V2_REVIEW_SCHEMA,
+        'workflow_id': workflow_id,
+        'project_id': project_id,
+        'source_graph_sha256': source_graph_sha256,
+        'source_metadata_sha256': source_metadata_sha256,
+        'target_graph_sha256': target_graph_sha256,
+        'target_metadata_sha256': target_metadata_sha256,
+        'compatibility_snapshot_sha256': canonical_sha256(snapshot),
+        'runtime_refs_sha256': canonical_sha256(list(runtime_refs)),
+        'source_admission_sha256': source_admission_sha256,
+        'outcome': 'PASS',
+    }
+    if any(review.get(key) != expected_value for key, expected_value in expected.items()):
+        raise PlanValidationError('compatibility review does not bind the exact v2 plan inputs')
+    _uuid(_required(review, 'reviewer_session_id', 'compatibility review'), 'reviewer_session_id')
+    dispositions: dict[str, str] = {}
+    for index, raw_disposition in enumerate(_bounded_list(
+        _required(review, 'dispositions', 'compatibility review'), 'compatibility review.dispositions',
+    )):
+        label = f'compatibility review.dispositions[{index}]'
+        disposition = _closed(raw_disposition, {'path', 'disposition', 'evidence'}, label)
+        path_key = _string(_required(disposition, 'path', label), f'{label}.path')
+        outcome = _string(_required(disposition, 'disposition', label), f'{label}.disposition')
+        if outcome not in {'compatible', 'non-impact'} or path_key in dispositions:
+            raise PlanValidationError('compatibility review disposition is unsupported or duplicated')
+        if not _v2_ref_list(_required(disposition, 'evidence', label), f'{label}.evidence'):
+            raise PlanValidationError('compatibility disposition requires evidence references')
+        dispositions[path_key] = outcome
+    if not required_paths.issubset(dispositions):
+        raise PlanValidationError('compatibility review omits a changed semantic path')
+
+
+def _validate_canonical_v2_plan(
+    plan: LoadedPlan,
+    *,
+    verify_evidence: bool = True,
+) -> dict[str, Any]:
+    if len(plan.raw) > CANONICAL_V2_MAX_PLAN:
+        raise PlanValidationError('v2 plan exceeds the bounded size')
+    data = _closed(
+        plan.value,
+        {'schema', 'state_dir', 'project_root', 'kent', 'workflows'},
+        'canonical v2 plan',
+    )
+    if data.get('schema') != CANONICAL_V2_SCHEMA:
+        raise PlanValidationError('canonical v2 schema is unsupported')
+    state_dir = _absolute_path(_required(data, 'state_dir', 'canonical v2 plan'), 'state_dir')
+    project_root = _no_symlink_path(
+        _absolute_path(_required(data, 'project_root', 'canonical v2 plan'), 'project_root'),
+        'project_root',
+    )
+    kent = _closed(_required(data, 'kent', 'canonical v2 plan'), {'path', 'sha256'}, 'kent')
+    kent_path = _kent_path(_required(kent, 'path', 'kent'), 'kent.path')
+    kent_sha = _sha256(_required(kent, 'sha256', 'kent'), 'kent.sha256')
+    _verify_executable(kent_path, kent_sha)
+    raw_workflows = _bounded_list(_required(data, 'workflows', 'canonical v2 plan'), 'workflows')
+    if len(raw_workflows) != 1:
+        raise PlanValidationError('canonical v2 plan must bind exactly one existing Workflow')
+    workflows = []
+    for index, raw in enumerate(raw_workflows):
+        label = f'workflows[{index}]'
+        _reject_raw_protocol_fields(raw, label)
+        item = dict(_closed(raw, {
+            'workflow_id', 'project_id', 'intent', 'expected_version', 'source_graph_sha256',
+            'source_metadata_sha256', 'target_graph', 'target_metadata', 'links', 'default',
+            'anchors', 'compatibility_snapshot', 'runtime_refs', 'compatibility_review_ref',
+            'source_admission',
+        }, label))
+        item['workflow_id'] = _uuid(_required(item, 'workflow_id', label), f'{label}.workflow_id')
+        item['project_id'] = _native_project_id(_required(item, 'project_id', label), f'{label}.project_id')
+        intent = _string(_required(item, 'intent', label), f'{label}.intent')
+        if intent not in {'graph-only', 'metadata-only', 'graph-and-metadata'}:
+            raise PlanValidationError('canonical v2 intent is unsupported')
+        item['intent'] = intent
+        item['source_admission'] = _v2_source_admission(
+            _required(item, 'source_admission', label),
+            f'{label}.source_admission',
+        )
+        version = _required(item, 'expected_version', label)
+        if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            raise PlanValidationError('canonical v2 expected_version is invalid')
+        item['expected_version'] = version
+        item['source_graph_sha256'] = _sha256(
+            _required(item, 'source_graph_sha256', label), f'{label}.source_graph_sha256',
+        )
+        item['source_metadata_sha256'] = _sha256(
+            _required(item, 'source_metadata_sha256', label), f'{label}.source_metadata_sha256',
+        )
+        item['compatibility_snapshot'] = _v2_snapshot(
+            _required(item, 'compatibility_snapshot', label), f'{label}.compatibility_snapshot',
+            verify_files=verify_evidence,
+        )
+        snapshot = item['compatibility_snapshot']
+        if (
+            snapshot['workflow_id'] != item['workflow_id']
+            or snapshot['project_id'] != item['project_id']
+            or snapshot['expected_version'] != version
+            or Path(snapshot['execution_root']).resolve() != project_root.resolve()
+        ):
+            raise PlanValidationError('v2 compatibility snapshot identity/root drifted')
+        if (
+            item['source_admission'] is not None
+            and item['source_admission']['primary_root'] != str(project_root)
+        ):
+            raise PlanValidationError('v2 source admission primary root differs from project root')
+        links = []
+        for link_index, raw_link in enumerate(_bounded_list(
+            _required(item, 'links', label), f'{label}.links',
+        )):
+            link_label = f'{label}.links[{link_index}]'
+            link = _closed(raw_link, {'project_id', 'workflow_id', 'is_default'}, link_label)
+            parsed_link = {
+                'project_id': _native_project_id(
+                    _required(link, 'project_id', link_label), f'{link_label}.project_id',
+                ),
+                'workflow_id': _uuid(
+                    _required(link, 'workflow_id', link_label), f'{link_label}.workflow_id',
+                ),
+                'is_default': _required(link, 'is_default', link_label),
+            }
+            if (
+                parsed_link['project_id'] != item['project_id']
+                or parsed_link['workflow_id'] != item['workflow_id']
+                or not isinstance(parsed_link['is_default'], bool)
+            ):
+                raise PlanValidationError('v2 link identity/default is invalid')
+            links.append(parsed_link)
+        links.sort(key=lambda row: (row['project_id'], row['workflow_id']))
+        if len(links) != 1 or links[0]['is_default'] != (_required(item, 'default', label) is not None):
+            raise PlanValidationError('v2 plan must preserve one explicit existing project link')
+        item['links'] = links
+        default_value = item['default']
+        item['default'] = _uuid(default_value, f'{label}.default') if default_value is not None else None
+        if item['default'] != (item['workflow_id'] if links[0]['is_default'] else None):
+            raise PlanValidationError('v2 default does not match its existing project link')
+        anchors = []
+        for anchor_index, raw_anchor in enumerate(_bounded_list(
+            _required(item, 'anchors', label), f'{label}.anchors',
+        )):
+            anchor_label = f'{label}.anchors[{anchor_index}]'
+            anchor = _closed(raw_anchor, {'id', 'kind'}, anchor_label)
+            anchors.append({
+                'id': _string(_required(anchor, 'id', anchor_label), f'{anchor_label}.id'),
+                'kind': _string(_required(anchor, 'kind', anchor_label), f'{anchor_label}.kind'),
+            })
+        anchors.sort(key=lambda row: row['id'])
+        _unique([row['id'] for row in anchors], f'{label}.anchors')
+        item['anchors'] = anchors
+        if intent in {'graph-only', 'graph-and-metadata'}:
+            target_graph = dict(_closed(
+                _required(item, 'target_graph', label),
+                {'version', 'nodes', 'edges', 'node_groups', 'transition_groups'},
+                f'{label}.target_graph',
+            ))
+            if target_graph.get('version') != version + 1:
+                raise PlanValidationError('v2 target graph must advance exactly one version')
+            item['target_graph'] = target_graph
+        elif 'target_graph' in item:
+            raise PlanValidationError('v2 metadata-only plan cannot carry a graph')
+        if intent in {'metadata-only', 'graph-and-metadata'}:
+            metadata = _closed(
+                _required(item, 'target_metadata', label),
+                {'name', 'description', 'execution_target'},
+                f'{label}.target_metadata',
+            )
+            item['target_metadata'] = {
+                'name': _string(_required(metadata, 'name', label), f'{label}.target_metadata.name'),
+                'description': _string(
+                    _required(metadata, 'description', label),
+                    f'{label}.target_metadata.description',
+                    nonempty=False,
+                ),
+                'execution_target': _plan_execution_target(
+                    _required(metadata, 'execution_target', label),
+                    f'{label}.target_metadata.execution_target',
+                ),
+            }
+        elif 'target_metadata' in item:
+            raise PlanValidationError('v2 graph-only plan cannot carry metadata')
+        item['runtime_refs'] = _v2_runtime_refs(
+            _required(item, 'runtime_refs', label),
+            verify_sources=verify_evidence,
+        )
+        item['compatibility_review_ref'] = _closed(
+            _required(item, 'compatibility_review_ref', label),
+            {'path', 'sha256'},
+            f'{label}.compatibility_review_ref',
+        )
+        if item['source_admission'] is None and intent != 'metadata-only':
+            raise PlanValidationError('v2 graph-changing intent requires source_admission')
+        workflows.append(item)
+    item = workflows[0]
+    return {
+        'state_dir': state_dir,
+        'project_root': project_root,
+        'kent': kent_path,
+        'kent_sha256': kent_sha,
+        'workflows': workflows,
+    }
+
+
+def _v2_required_review_paths(
+    source_graph: Mapping[str, Any],
+    target_graph: Mapping[str, Any],
+    source_metadata: Mapping[str, Any],
+    target_metadata: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+) -> set[str]:
+    paths = {f"task:{task['id']}" for task in snapshot['tasks']}
+    paths.update(f"session:{session['id']}" for session in snapshot['sessions'])
+    if canonical_sha256(source_graph) != canonical_sha256(target_graph):
+        for name in ('nodes', 'edges', 'node_groups', 'transition_groups'):
+            before = {row['id']: row for row in source_graph[name]}
+            after = {row['id']: row for row in target_graph[name]}
+            additions = set(after) - set(before)
+            if name == 'edges' and any(after[identity].get('key') == 'implement_replan' for identity in additions):
+                paths.add('graph.added_edge:implement_replan')
+            for identity in set(before) & set(after):
+                if (
+                    name == 'nodes'
+                    and before[identity].get('script_path') != after[identity].get('script_path')
+                ):
+                    paths.add(f'graph.nodes:{identity}.script_path')
+                for prompt_key in ('prompt_template', 'prompt'):
+                    if before[identity].get(prompt_key) != after[identity].get(prompt_key):
+                        paths.add(f'graph.{name}:{identity}.{prompt_key}')
+    for key in set(source_metadata) | set(target_metadata):
+        if source_metadata.get(key) != target_metadata.get(key):
+            paths.add(f'metadata.{key}')
+    return paths
+
+
+def _validate_canonical_v2_target(
+    parsed: Mapping[str, Any],
+    item: Mapping[str, Any],
+    source: Mapping[str, Any],
+    expected_workflow_id: str | None = None,
+    expected_spec: Any = None,
+    *,
+    verify_evidence: bool = True,
+) -> dict[str, Any]:
+    if expected_workflow_id is not None and _uuid(
+        expected_workflow_id, 'expected_workflow_id',
+    ) != item['workflow_id']:
+        raise PlanValidationError('compatibility plan Workflow UUID differs from the selector')
+    if source['workflow_id'] != item['workflow_id'] or source['project_id'] != item['project_id']:
+        raise EffectBlocked('v2 source Workflow/project identity drifted')
+    if source['version'] != item['expected_version']:
+        raise EffectBlocked('v2 source Workflow revision drifted')
+    if canonical_sha256(source['graph']) != item['source_graph_sha256']:
+        raise EffectBlocked('v2 source graph digest drifted')
+    if canonical_sha256(source['metadata']) != item['source_metadata_sha256']:
+        raise EffectBlocked('v2 source metadata digest drifted')
+    if (
+        canonical_sha256(source['links']) != canonical_sha256(item['links'])
+        or source['default'] != item['default']
+    ):
+        raise EffectBlocked('v2 linked ownership/default state drifted')
+    graph = item.get('target_graph', source['graph'])
+    metadata = item.get('target_metadata', source['metadata'])
+    _v2_graph_compatibility(source['graph'], graph, item['runtime_refs'])
+    source_admission = item['source_admission']
+    if source_admission is None:
+        if (
+            canonical_sha256(source['graph']) != canonical_sha256(graph)
+            or metadata['execution_target'] != source['metadata']['execution_target']
+        ):
+            raise PlanValidationError(
+                'source_admission null is limited to metadata-only name/description changes'
+            )
+    else:
+        if (
+            metadata['execution_target'] != source['metadata']['execution_target']
+            and item['intent'] != 'graph-and-metadata'
+        ):
+            raise PlanValidationError(
+                'execution-target changes require graph-and-metadata with source admission'
+            )
+        _v2_source_gate_check(
+            source['graph'],
+            graph,
+            source_admission,
+            project_id=item['project_id'],
+            workflow_id=item['workflow_id'],
+            project_root=parsed['project_root'],
+        )
+    source_semantics = {
+        key: source['graph'][key] for key in ('nodes', 'edges', 'node_groups', 'transition_groups')
+    }
+    target_semantics = {
+        key: graph[key] for key in ('nodes', 'edges', 'node_groups', 'transition_groups')
+    }
+    if (
+        canonical_sha256(source_semantics) == canonical_sha256(target_semantics)
+        and canonical_sha256(source['metadata']) == canonical_sha256(metadata)
+    ):
+        raise PlanValidationError('v2 plan has no reviewed semantic change')
+    for node in graph['nodes']:
+        if not isinstance(node, dict) or node.get('kind') != 'script':
+            continue
+        script_path = node.get('script_path')
+        if not isinstance(script_path, str) or not script_path:
+            raise PlanValidationError('v2 script node is missing its qualified path')
+        candidate = Path(script_path)
+        if not candidate.is_absolute():
+            candidate = parsed['project_root'] / candidate
+        candidate = candidate.resolve()
+        if not any(
+            Path(ref['path']).resolve() == candidate
+            or (
+                Path(ref['root']).resolve() == parsed['project_root'].resolve()
+                and (parsed['project_root'] / ref['relative_path']).resolve() == candidate
+            )
+            for ref in item['runtime_refs']
+        ):
+            raise PlanValidationError('v2 script node has no matching runtime qualification')
+    kinds = {
+        node.get('id', node.get('node_id')): node.get('kind')
+        for node in graph['nodes'] if isinstance(node, dict)
+    }
+    if any(kinds.get(anchor['id']) != anchor['kind'] for anchor in item['anchors']):
+        raise PlanValidationError('v2 target graph does not preserve its reviewed anchors')
+    if verify_evidence:
+        _v2_review(
+            item['compatibility_review_ref'],
+            workflow_id=item['workflow_id'],
+            project_id=item['project_id'],
+            source_graph_sha256=item['source_graph_sha256'],
+            source_metadata_sha256=item['source_metadata_sha256'],
+            target_graph_sha256=canonical_sha256(graph),
+            target_metadata_sha256=canonical_sha256(metadata),
+            snapshot=item['compatibility_snapshot'],
+            runtime_refs=item['runtime_refs'],
+            source_admission_sha256=(
+                canonical_sha256(source_admission)
+                if source_admission is not None else None
+            ),
+            required_paths=_v2_required_review_paths(
+                source['graph'], graph, source['metadata'], metadata, item['compatibility_snapshot'],
+            ),
+        )
+    if expected_spec is not None:
+        from .graph import graph_matches_spec
+
+        if (
+            expected_spec.name != metadata['name']
+            or expected_spec.description != metadata['description']
+            or expected_spec.execution_target != metadata['execution_target']
+            or not graph_matches_spec(expected_spec, {
+                'workflow_id': item['workflow_id'],
+                'expected_version': graph['version'],
+                'graph': {key: graph[key] for key in ('nodes', 'edges', 'node_groups', 'transition_groups')},
+            })
+        ):
+            raise PlanValidationError('v2 target does not match the explicit WorkflowSpec')
+    return {'graph': graph, 'metadata': metadata}
+
+
 def _canonical_metadata(value: Mapping[str, Any]) -> dict[str, str]:
     if not isinstance(value, dict):
         raise EffectBlocked('Workflow summary is malformed')
@@ -2358,7 +3968,12 @@ def _canonical_graph(value: Mapping[str, Any], version: int) -> dict[str, Any]:
         graph[key] = rows
     return graph
 
-def _canonical_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, Any]:
+def _canonical_read(
+    parsed: Mapping[str, Any],
+    item: Mapping[str, Any],
+    *,
+    include_raw_task_details: bool = False,
+) -> dict[str, Any]:
     kent = parsed['kent']
     root = parsed['project_root']
     wid = item['workflow_id']
@@ -2384,10 +3999,13 @@ def _canonical_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> dict[
     task_rows = _page_rows(task_pages, ('items', 'tasks'))
     tasks = sorted((_task_state(row) for row in task_rows), key=lambda row: row['id'])
     details: list[dict[str, Any]] = []
+    raw_details: list[dict[str, Any]] = []
     anchor_ids: set[str] = set()
     for task in tasks:
         detail = _kent_json(kent, ['task', 'show', task['id'], '--project', project_id, '--json'], cwd=root)
         details.append(_task_state(detail, task['id']))
+        if include_raw_task_details:
+            raw_details.append(detail)
         rows = detail.get('terminal_anchors', detail.get('current_nodes', []))
         if not isinstance(rows, list):
             raise EffectBlocked('canonical terminal anchor readback is malformed')
@@ -2402,9 +4020,15 @@ def _canonical_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> dict[
             anchor['id'])
     if any((not isinstance(anchor['kind'], str) for anchor in anchors)):
         raise EffectBlocked('canonical terminal anchor is absent from the graph')
-    return {'workflow_id': wid, 'project_id': project_id, 'version': listed_version, 'metadata':
+    result = {'workflow_id': wid, 'project_id': project_id, 'version': listed_version, 'metadata':
             _canonical_metadata(inspect), 'graph': graph, 'tasks': tasks, 'task_details': details, 'terminal_anchors':
             anchors, 'links': links, 'default': default, 'valid': True}
+    if include_raw_task_details:
+        result['raw_task_details'] = sorted(
+            raw_details,
+            key=lambda row: _row_id(row, 'id', 'task_id'),
+        )
+    return result
 
 def _canonical_gate(item: Mapping[str, Any], snapshot: Mapping[str, Any], expected_version: int) -> None:
     if snapshot.get('workflow_id') != item['workflow_id']:
@@ -2495,6 +4119,428 @@ def _canonical_assert_expected(parsed: Mapping[str, Any], item: Mapping[str, Any
         raise EffectBlocked(f"canonical complete snapshot drifted for {item['workflow_id']}")
     return live
 
+def _canonical_v2_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, Any]:
+    live = _canonical_read(parsed, item, include_raw_task_details=True)
+    list_facts = [
+        {key: task[key] for key in ('id', 'status', 'terminal')}
+        for task in live['tasks']
+    ]
+    detail_facts = [
+        {key: task[key] for key in ('id', 'status', 'terminal')}
+        for task in live['task_details']
+    ]
+    if canonical_sha256(list_facts) != canonical_sha256(detail_facts):
+        raise EffectBlocked('native Task list/detail inventories disagree')
+    kent = parsed['kent']
+    root = parsed['project_root']
+    raw_details = {
+        _row_id(row, 'id', 'task_id'): row for row in live.pop('raw_task_details')
+    }
+    all_links: list[dict[str, Any]] = []
+    for project in _project_rows(kent, root):
+        project_id = _native_project_id(project['id'], 'native project identity')
+        pages = _kent_pages(kent, ['workflow', 'list', '--project', project_id], cwd=root)
+        links, _, _ = _workflow_link_state(
+            _page_rows(pages, ('items', 'workflows')),
+            project_id,
+            item['workflow_id'],
+        )
+        all_links.extend(links)
+    if canonical_sha256(all_links) != canonical_sha256(item['links']):
+        raise EffectBlocked('v2 Workflow linked-project ownership changed')
+    expected_sessions = {session['id']: session for session in item['compatibility_snapshot']['sessions']}
+    task_history = {task['id']: task for task in item['compatibility_snapshot']['tasks']}
+    tasks: list[dict[str, Any]] = []
+    sessions: list[dict[str, Any]] = []
+    live_executions: list[dict[str, str]] = []
+    for task in live['tasks']:
+        detail = raw_details[task['id']]
+        normalized = _task_state(detail, task['id'])
+        base_detail = next(row for row in live['task_details'] if row['id'] == task['id'])
+        if canonical_sha256(normalized) != canonical_sha256(base_detail):
+            raise EffectBlocked('Task changed during v2 native inventory readback')
+        summary = detail.get('summary') if isinstance(detail.get('summary'), dict) else {}
+        status_value = detail.get('status', summary.get('status'))
+        native_state = status_value.get('native_state') if isinstance(status_value, dict) else None
+        current_nodes = detail.get('current_nodes', summary.get('current_nodes', []))
+        if not isinstance(current_nodes, list):
+            raise EffectBlocked('v2 Task current-node inventory is malformed')
+        normalized_nodes = []
+        for row in current_nodes:
+            node_id = row if isinstance(row, str) else (
+                row.get('node_id', row.get('id')) if isinstance(row, dict) else None
+            )
+            if not isinstance(node_id, str) or not node_id:
+                raise EffectBlocked('v2 Task current-node identity is malformed')
+            normalized_nodes.append(node_id)
+        if not normalized_nodes and not normalized['terminal']:
+            current = detail.get('current_node', summary.get('current_node'))
+            if isinstance(current, str) and current:
+                normalized_nodes.append(current)
+        pending_rows = detail.get('pending_approvals', summary.get('pending_approvals', []))
+        if not isinstance(pending_rows, list) or len(pending_rows) > MAX_LIST:
+            raise EffectBlocked('v2 pending approval inventory is malformed')
+        pending = []
+        for row in pending_rows:
+            if not isinstance(row, dict):
+                raise EffectBlocked('v2 pending approval record is malformed')
+            pending.append({'id': _row_id(row, 'id', 'approval_id'), 'payload_sha256': canonical_sha256(row)})
+        pending.sort(key=lambda row: row['id'])
+        planned_task = task_history.get(task['id'])
+        tasks.append({
+            'id': task['id'],
+            'status': normalized['status'],
+            'native_state': native_state,
+            'terminal': normalized['terminal'],
+            'current_nodes': normalized_nodes,
+            'pending_decisions': pending,
+            'history_classification': (
+                planned_task['history_classification'] if planned_task is not None else 'unreviewed'
+            ),
+            'history_refs': planned_task['history_refs'] if planned_task is not None else [],
+        })
+        live_rows = detail.get('live_sessions', [])
+        if not isinstance(live_rows, list) or len(live_rows) > MAX_LIST:
+            raise EffectBlocked('v2 live Session inventory is malformed')
+        live_ids: set[str] = set()
+        for row in live_rows:
+            if isinstance(row, str):
+                live_ids.add(row)
+            elif isinstance(row, dict):
+                live_ids.add(_row_id(row, 'id', 'session_id'))
+            else:
+                raise EffectBlocked('v2 live Session identity is malformed')
+        pages = _kent_pages(kent, ['task', 'sessions', task['id'], '--project', item['project_id']], cwd=root)
+        task_sessions = []
+        for row in _page_rows(pages, ('items', 'sessions')):
+            native = _session_cli_state(row, task['id'], live_ids)
+            planned = expected_sessions.get(native['id'])
+            if planned is not None and planned['task_id'] != task['id']:
+                raise EffectBlocked('v2 Session Task association drifted')
+            task_sessions.append({
+                **native,
+                'contract_fingerprint': (
+                    planned['contract_fingerprint'] if planned is not None else 'unreviewed'
+                ),
+                'source_refs': planned['source_refs'] if planned is not None else [],
+            })
+        retained_count = detail.get('retained_session_count')
+        if retained_count is not None and retained_count != len(task_sessions):
+            raise EffectBlocked('v2 retained Session pagination is incomplete')
+        sessions.extend(task_sessions)
+        executions = detail.get('live_executions', [])
+        if not isinstance(executions, list) or len(executions) > MAX_LIST:
+            raise EffectBlocked('v2 live execution inventory is malformed')
+        for row in executions:
+            if not isinstance(row, dict):
+                raise EffectBlocked('v2 live execution record is malformed')
+            live_executions.append({
+                'id': _row_id(row, 'id', 'execution_id'),
+                'state': _status_name(row.get('state', row.get('status'))),
+            })
+    tasks.sort(key=lambda row: row['id'])
+    sessions.sort(key=lambda row: row['id'])
+    live_executions.sort(key=lambda row: row['id'])
+    if (
+        len({row['id'] for row in sessions}) != len(sessions)
+        or len({row['id'] for row in live_executions}) != len(live_executions)
+    ):
+        raise EffectBlocked('v2 native Session/execution identities are duplicated')
+    live['compatibility_snapshot'] = {
+        'schema': CANONICAL_V2_SNAPSHOT_SCHEMA,
+        'workflow_id': live['workflow_id'],
+        'project_id': live['project_id'],
+        'expected_version': item['compatibility_snapshot']['expected_version'],
+        'execution_target': item['compatibility_snapshot']['execution_target'],
+        'execution_root': str(root),
+        'tasks': tasks,
+        'sessions': sessions,
+        'live_executions': live_executions,
+    }
+    return live
+
+def _canonical_v2_owned(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value[key] for key in (
+        'workflow_id', 'project_id', 'version', 'metadata', 'graph', 'links', 'default', 'valid',
+    )}
+
+def _canonical_v2_assert_owned(parsed: Mapping[str, Any], item: Mapping[str, Any],
+        expected: Mapping[str, Any]) -> dict[str, Any]:
+    live = _canonical_v2_read(parsed, item)
+    if canonical_sha256(_canonical_v2_owned(live)) != canonical_sha256(_canonical_v2_owned(expected)):
+        raise EffectBlocked(f"v2 effect-owned Workflow postimage drifted for {item['workflow_id']}")
+    return live
+
+def _canonical_v2_gate(item: Mapping[str, Any], snapshot: Mapping[str, Any], expected_version: int,
+        *, compare_inventory: bool=True) -> None:
+    if (snapshot.get('workflow_id') != item['workflow_id'] or snapshot.get('project_id') != item['project_id'] or
+            snapshot.get('version') != expected_version or snapshot.get('valid') is not True):
+        raise EffectBlocked('v2 Workflow identity/revision/validation drifted')
+    if canonical_sha256(snapshot.get('links')) != canonical_sha256(item['links']) or snapshot.get('default') != \
+            item['default']:
+        raise EffectBlocked('v2 existing project link/default ownership drifted')
+    graph = snapshot.get('graph')
+    if not isinstance(graph, dict):
+        raise EffectBlocked('v2 Workflow graph readback is malformed')
+    node_kinds = {node.get('id', node.get('node_id')): node.get('kind') for node in graph['nodes']
+            if isinstance(node, dict)}
+    if any(node_kinds.get(anchor['id']) != anchor['kind'] for anchor in item['anchors']):
+        raise EffectBlocked('v2 Workflow lost a reviewed anchor')
+    if compare_inventory and canonical_sha256(snapshot.get('compatibility_snapshot')) != canonical_sha256(
+            item['compatibility_snapshot']):
+        raise EffectBlocked('v2 Task/Session/approval inventory drifted')
+
+def _canonical_v2_plan_check(parsed: Mapping[str, Any], item: Mapping[str, Any], preimage: Mapping[str, Any],
+        *, expected_workflow_id: str | None, expected_spec: Any,
+        verify_evidence: bool=True) -> None:
+    snapshot = item['compatibility_snapshot']
+    if verify_evidence:
+        try:
+            for task in snapshot['tasks']:
+                refs = _v2_ref_list(task['history_refs'], f"task {task['id']} history")
+                if canonical_sha256(refs) != canonical_sha256(task['history_refs']):
+                    raise EffectBlocked('v2 Task history evidence changed')
+            for session in snapshot['sessions']:
+                refs = _v2_ref_list(session['source_refs'], f"Session {session['id']} evidence")
+                if canonical_sha256(refs) != canonical_sha256(session['source_refs']):
+                    raise EffectBlocked('v2 Session source evidence changed')
+        except PlanValidationError as error:
+            raise EffectBlocked(f'v2 history evidence drifted: {error}') from error
+    _validate_canonical_v2_target(
+        parsed,
+        item,
+        preimage,
+        expected_workflow_id,
+        expected_spec,
+        verify_evidence=verify_evidence,
+    )
+    if verify_evidence:
+        try:
+            current_refs = _v2_runtime_refs(item['runtime_refs'])
+        except PlanValidationError as error:
+            raise EffectBlocked(f'v2 runtime qualification drifted: {error}') from error
+        if canonical_sha256(current_refs) != canonical_sha256(item['runtime_refs']):
+            raise EffectBlocked('v2 runtime qualification drifted')
+
+
+def _admit_v2_source(
+    parsed: Mapping[str, Any],
+    item: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    admission = item['source_admission']
+    if admission is None:
+        return None
+    try:
+        verified = admit_source_admission(
+            admission,
+            project_id=item['project_id'],
+            workflow_id=item['workflow_id'],
+            project_root=parsed['project_root'],
+            kent_path=parsed['kent'],
+        )
+    except (OperationError, OSError, subprocess.SubprocessError) as error:
+        raise EffectBlocked(f'v2 source admission failed: {error}') from error
+    expected_admission_sha = canonical_sha256(admission)
+    expected_gate = None
+    from .delivery import source_admission_gate
+
+    expected_gate = source_admission_gate(
+        admission,
+        project_id=item['project_id'],
+        workflow_id=item['workflow_id'],
+        project_root=str(parsed['project_root']),
+    )
+    if (
+        not isinstance(verified, VerifiedSourceAdmission)
+        or verified.project_id != item['project_id']
+        or verified.workflow_id != item['workflow_id']
+        or verified.project_root != str(parsed['project_root'])
+        or verified.primary_root != admission['primary_root']
+        or verified.primary_workspace_id != admission['primary_workspace_id']
+        or verified.kit_root != admission['kit_root']
+        or verified.value != admission
+        or verified.source_admission_sha256 != expected_admission_sha
+        or verified.receipt_sha256 != admission['receipt_ref']['sha256']
+        or verified.gate != expected_gate
+    ):
+        raise EffectBlocked('v2 source admission result does not bind the exact plan inputs')
+    inspection = verified.inspection
+    if (
+        inspection.get('project_id') != item['project_id']
+        or inspection.get('workflow_id') != item['workflow_id']
+        or inspection.get('workspace_path') != str(parsed['project_root'])
+        or inspection.get('status') != 'admitted'
+    ):
+        raise EffectBlocked('v2 source inspection result identity differs')
+    return {
+        'source_admission_sha256': verified.source_admission_sha256,
+        'receipt_sha256': verified.receipt_sha256,
+        'inspection_sha256': canonical_sha256(inspection),
+        'inspection': inspection,
+    }
+
+
+def _journal_source_admission(
+    state: Mapping[str, Any],
+    result: dict[str, Any] | None,
+    *,
+    effect_key: str | None = None,
+) -> dict[str, Any]:
+    inventory = dict(state.get('inventory') or {})
+    if effect_key is None:
+        inventory['source_admission_prepared'] = result
+    else:
+        records = dict(inventory.get('source_admissions') or {})
+        records[effect_key] = result
+        inventory['source_admissions'] = records
+    return {**state, 'inventory': inventory}
+
+def _canonical_v2_progress(
+    parsed: Mapping[str, Any],
+    item: Mapping[str, Any],
+    prepared: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        stage for stage in _canonical_progress(parsed, item, prepared)
+        if canonical_sha256(_canonical_v2_owned(stage['before']))
+        != canonical_sha256(_canonical_v2_owned(stage['after']))
+    ]
+
+def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: bool | str,
+        kent: str | Path | None, expected_workflow_id: str | None, expected_spec: Any) -> dict[str, Any]:
+    try:
+        parsed = _validate_canonical_v2_plan(
+            plan,
+            verify_evidence=mode == 'prepare',
+        )
+    except PlanValidationError as error:
+        if any(token in str(error) for token in (
+            'runtime_refs', 'compatibility_review_ref', 'history_refs', 'source_refs', 'evidence[',
+        )):
+            raise EffectBlocked(f'v2 compatibility evidence drifted: {error}') from error
+        raise
+    if kent is not None and str(kent) != str(parsed['kent']):
+        raise PlanValidationError('runtime --kent differs from v2 plan executable')
+    if mode == 'rollback':
+        raise PlanValidationError('v2 rollback is unsupported; apply a freshly reviewed reverse plan')
+    if mode not in {'prepare', 'apply'}:
+        raise PlanValidationError('canonical v2 mode is unsupported')
+    if mode == 'apply' and confirm != plan.sha256:
+        raise PlanValidationError('canonical v2 mutation requires exact plan confirmation')
+    item = parsed['workflows'][0]
+    if 'target_graph' in item:
+        item['graph'] = item['target_graph']
+    if 'target_metadata' in item:
+        item['metadata'] = item['target_metadata']
+    with OperationJournal(parsed['state_dir'], 'canonical-workflow-reconcile', plan) as journal:
+        if mode == 'prepare':
+            if journal.state is not None:
+                raise JournalError('canonical v2 prepare refuses an existing journal')
+            live = _canonical_v2_read(parsed, item)
+            _canonical_v2_gate(item, live, item['expected_version'])
+            _canonical_v2_plan_check(
+                parsed, item, live, expected_workflow_id=expected_workflow_id, expected_spec=expected_spec,
+            )
+            admission_result = _admit_v2_source(parsed, item)
+            progress = _canonical_v2_progress(parsed, item, live)
+            final = progress[-1]['after'] if progress else live
+            journal.persist({
+                'phase': 'prepared',
+                'preimage': [live],
+                'inventory': {
+                    'targets': {item['workflow_id']: {
+                        'owned_preimage_sha256': canonical_sha256(_canonical_v2_owned(live)),
+                        'owned_target_sha256': canonical_sha256(_canonical_v2_owned(final)),
+                        'compatibility_snapshot_sha256': canonical_sha256(item['compatibility_snapshot']),
+                    }},
+                    'source_admission_prepared': admission_result,
+                },
+                'members': [{'workflow_id': item['workflow_id'], 'status': 'prepared'}],
+                'effects': {},
+            })
+            return _canonical_report(plan, 'prepared', journal)
+        state = journal.require_phase({'prepared', 'in_progress', 'complete'})
+        preimages = state.get('preimage', [])
+        members = state.get('members', [])
+        if len(preimages) != 1 or len(members) != 1 or members[0].get('workflow_id') != item['workflow_id']:
+            raise JournalError('canonical v2 journal member inventory drifted')
+        preimage = preimages[0]
+        progress = _canonical_v2_progress(parsed, item, preimage)
+        status = members[0].get('status')
+        if status not in {'prepared', *(stage['status'] for stage in progress), 'verified'}:
+            raise JournalError('canonical v2 member progress is invalid')
+        if state['phase'] == 'complete':
+            expected = progress[-1]['after'] if progress else preimage
+            _canonical_v2_assert_owned(parsed, item, expected)
+            return {**_canonical_report(plan, 'complete', journal), 'resumed': True}
+        journal.persist({**state, 'phase': 'in_progress'})
+        for stage_index, stage in enumerate(progress):
+            status = journal.state['members'][0]['status']
+            if status in {stage['status'], 'verified'}:
+                continue
+            effect_key = f"apply:{item['workflow_id']}:{stage['name']}"
+            existing_effect = (journal.state.get('effects') or {}).get(effect_key)
+            pending_settlement = isinstance(existing_effect, dict) and existing_effect.get('status') in {
+                'attempted', 'unresolved', 'ambiguous', 'verified',
+            }
+            live = _canonical_v2_read(parsed, item)
+            live_owned_sha = canonical_sha256(_canonical_v2_owned(live))
+            before_sha = canonical_sha256(_canonical_v2_owned(stage['before']))
+            after_sha = canonical_sha256(_canonical_v2_owned(stage['after']))
+            if pending_settlement:
+                allowed_owned = {after_sha} if existing_effect.get('status') == 'verified' else {
+                    before_sha, after_sha,
+                }
+                if live_owned_sha not in allowed_owned:
+                    raise EffectBlocked('v2 unresolved effect has an unknown Workflow postimage')
+                _canonical_v2_gate(item, live, live['version'], compare_inventory=False)
+            else:
+                _canonical_v2_gate(item, live, stage['before']['version'])
+            if not pending_settlement and live_owned_sha != before_sha:
+                raise EffectBlocked('v2 effect-owned state drifted before the next stage')
+            if not pending_settlement:
+                _canonical_v2_plan_check(
+                    parsed,
+                    item,
+                    preimage,
+                    expected_workflow_id=expected_workflow_id,
+                    expected_spec=expected_spec,
+                )
+                admission_result = _admit_v2_source(parsed, item)
+                journal.persist(_journal_source_admission(
+                    journal.state or {},
+                    admission_result,
+                    effect_key=effect_key,
+                ))
+            current = lambda: canonical_sha256(_canonical_v2_owned(_canonical_v2_read(parsed, item)))
+            settled = _settle_or_run(
+                journal, effect_key=effect_key, command=stage['command'], cwd=parsed['project_root'],
+                preimage_sha256=canonical_sha256(_canonical_v2_owned(stage['before'])),
+                postimage_sha256=canonical_sha256(_canonical_v2_owned(stage['after'])),
+                current_sha256=current, stdin_bytes=stage['stdin'],
+            )
+            if settled == 'preimage':
+                return {**_canonical_report(plan, 'in_progress', journal), 'settled': 'preimage'}
+            after = _canonical_v2_assert_owned(parsed, item, stage['after'])
+            journal.persist({**journal.state, 'members': [{
+                'workflow_id': item['workflow_id'], 'status': stage['status'],
+            }]})
+            if (
+                canonical_sha256(after['compatibility_snapshot'])
+                != canonical_sha256(item['compatibility_snapshot'])
+                and stage_index < len(progress) - 1
+            ):
+                return {**_canonical_report(plan, 'in_progress', journal), 'settled': settled}
+        live = _canonical_v2_read(parsed, item)
+        expected = progress[-1]['after'] if progress else preimage
+        _canonical_v2_gate(item, live, expected['version'], compare_inventory=False)
+        if canonical_sha256(_canonical_v2_owned(live)) != canonical_sha256(_canonical_v2_owned(expected)):
+            raise EffectBlocked('v2 final effect-owned Workflow state drifted')
+        journal.persist({**journal.state, 'phase': 'complete', 'members': [{
+            'workflow_id': item['workflow_id'], 'status': 'verified',
+        }]})
+        return _canonical_report(plan, 'complete', journal)
+
 def _canonical_restore_progress(parsed: Mapping[str, Any], item: Mapping[str, Any], prepared: Mapping[str, Any], start:
         Mapping[str, Any]) -> list[dict[str, Any]]:
     stages: list[dict[str, Any]] = []
@@ -2516,7 +4562,18 @@ def _canonical_report(plan: LoadedPlan, phase: str, journal: OperationJournal) -
             _effect_attempts(journal.state or {})}
 
 def reconcile_canonical_workflows(plan: LoadedPlan, *, mode: str, confirm: bool | str=False, kent: str | Path |
-        None=None) -> dict[str, Any]:
+        None=None, expected_workflow_id: str | None=None, expected_spec: Any=None) -> dict[str, Any]:
+    if plan.schema == CANONICAL_V2_SCHEMA or plan.value.get('schema') == CANONICAL_V2_SCHEMA:
+        return _reconcile_canonical_workflows_v2(
+            plan,
+            mode=mode,
+            confirm=confirm,
+            kent=kent,
+            expected_workflow_id=expected_workflow_id,
+            expected_spec=expected_spec,
+        )
+    if expected_workflow_id is not None or expected_spec is not None:
+        raise PlanValidationError('expected Workflow/spec binding is supported only for canonical v2')
     parsed = _validate_canonical_plan(plan)
     if kent is not None and str(kent) != str(parsed['kent']):
         raise PlanValidationError('runtime --kent differs from plan executable')

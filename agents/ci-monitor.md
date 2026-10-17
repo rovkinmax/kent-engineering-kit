@@ -95,3 +95,9 @@ state monitor.
 
 Return concise check or release-automation states, failure evidence,
 merge-method feasibility when applicable, and the next workflow transition.
+
+A product Task does not authorize repairing Kent, a provider, or shared
+infrastructure. Diagnose the failing boundary and preserve its exact evidence.
+Separate transport failure from a failed check and from an unknown external
+effect. Hand an established infrastructure defect to an authorized owner;
+do not expand the product Task or report an unobserved result as success.

@@ -4,4 +4,5 @@ tmp/
 __pycache__/
 *.pyc
 /.kent/runtime/
+/.kent/retained-evidence/
 /build/kent-workflow/

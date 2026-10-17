@@ -35,3 +35,9 @@ For the requested seam or module:
 6. recommend one design or a deliberate hybrid.
 
 Do not edit files or turn speculative future requirements into abstractions.
+
+Separate required outcomes from proposed implementation choices. Label each
+choice as a proposal until an applicable human decision adopts it; an agent's
+earlier plan or recommendation is not that decision. Preserve viable alternatives
+when the task does not constrain the means. Cite the original source for any
+claimed requirement, including constraints attributed to an earlier Session.

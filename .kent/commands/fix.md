@@ -5,6 +5,12 @@ scope. The retained continuous writer resolves compatible root-cause groups
 before re-verification; do not create a new planning cycle for each symptom.
 Reproduce hard bugs deterministically before production edits.
 
+Resolve the task-fixed storage mode before plan access. R2 plan updates use
+the protected helper and exact revision compare-and-swap; immutable revision
+files are not editable working copies. Inspect external accepted state when
+the local locator cache is missing. Preserve legacy task paths and never
+create a `.todo` fallback for new-mode work.
+
 Classify against immutable `fixed_point` and authoritative task scope, not
 only the last changed-files list. Target-only commits are integration inputs;
 use actual merge/replay evidence before claiming a task regression. Repair

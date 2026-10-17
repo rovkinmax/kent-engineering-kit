@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib.machinery
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 from typing import Any
-
-sys.dont_write_bytecode = True
 
 sys.dont_write_bytecode = True
 
@@ -118,7 +118,22 @@ def main() -> int:
         }
     if delivery_context is not None:
         output["delivery_context"] = delivery_context
-    print(json.dumps(output, ensure_ascii=False))
+    encoded = (json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8")
+    profile_path = Path(execution_root) / ".kent/workflow-profile.toml"
+    profile = tomllib.loads(profile_path.read_text()) if profile_path.is_file() else {}
+    if profile.get("policies", {}).get("delivery_reliability") is not None:
+        source = Path(__file__).with_name("workflow-checkpoint")
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("qualified producer adapter is unavailable")
+        loader = importlib.machinery.SourceFileLoader("dispatch_producer_adapter", str(source))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            raise ValueError("producer adapter cannot be loaded")
+        adapter = importlib.util.module_from_spec(spec)
+        loader.exec_module(adapter)
+        encoded = adapter.emit_producer_result(
+            Path(execution_root), payload, encoded, "verification-dispatch")
+    sys.stdout.buffer.write(encoded)
     return 0
 
 

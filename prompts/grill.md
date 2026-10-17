@@ -10,6 +10,12 @@ understanding.
 - Ask exactly one decision question at a time.
 - With every question, include concrete options and a recommended answer.
 - Resolve prerequisite decisions before dependent ones.
+- Separate the user's required outcome from implementation options proposed by
+  agents. Do not turn an earlier suggestion into a mandatory requirement without
+  its original acceptance source.
+- Recover applicable decisions from original messages or Question answers
+  before asking again. A missing summary is not a missing decision; conflicting
+  or inaccessible sources remain an explicit uncertainty.
 - Record durable terminology or architecture decisions through the project's
   declared domain documentation when appropriate.
 - Do not implement the result until the user confirms that the decision tree is

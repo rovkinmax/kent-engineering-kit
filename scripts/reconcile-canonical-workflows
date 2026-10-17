@@ -31,7 +31,10 @@ def main() -> int:
     try:
         plan = load_plan(
             args.plan,
-            schema="canonical-workflow-reconcile-plan-v1",
+            schema=(
+                "canonical-workflow-reconcile-plan-v1",
+                "canonical-workflow-reconcile-plan-v2",
+            ),
             expected_sha256=args.expect_plan_sha256,
             mutation=args.mode in {"apply", "rollback"},
             confirm=args.confirm,

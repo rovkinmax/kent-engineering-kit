@@ -46,6 +46,85 @@ def source_validation_copy_ignore(directory, names):
 
 
 class CiContractTest(unittest.TestCase):
+    def test_prepare_cli_capture_receives_original_input_before_unwrap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            scripts = root / ".kent/scripts"
+            scripts.mkdir(parents=True)
+            (root / ".kent/workflow-profile.toml").write_text(
+                '[policies]\ndelivery_reliability = "v1"\n')
+            (scripts / "workflow-checkpoint").write_text(
+                "import json\n"
+                "def emit_producer_result(root, payload, result, producer_kind):\n"
+                "    assert producer_kind == 'prepare-ci'\n"
+                "    assert 'pr_url' not in payload\n"
+                "    assert payload['delivery_context'].startswith(' {')\n"
+                "    output = json.loads(result)\n"
+                "    output['commentary'] = 'capture-observed'\n"
+                "    return json.dumps(output).encode()\n")
+            context = ' {"schema":"workflow-delivery-context-v1","phase":"post_pr",' \
+                      '"pr_url":"https://github.com/owner/repository/pull/17",' \
+                      '"branch_name":"feature/TASK-17","merge_strategy":"rebase",' \
+                      '"pr_feedback_cursor":"uninitialized"} '
+            result = subprocess.run(
+                [sys.executable, "-B", str(ROOT / "scripts/prepare-github-ci")],
+                cwd=root, input=json.dumps({
+                    "workspace_path": str(root), "task_short_id": "TASK-17",
+                    "delivery_context": context}), text=True, capture_output=True,
+                env={**os.environ, "KENT_GH_BIN": "/nonexistent-gh"}, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["commentary"], "capture-observed")
+
+    def test_ci_archive_uses_recovered_logical_view_and_ignores_suffix_refs(self):
+        from tests.test_workflow_runtime import WorkflowEvidenceLedgerTest, load_template_module
+        from tests.test_runtime_contracts import dynamic_contract
+
+        fixture = WorkflowEvidenceLedgerTest()
+        self.addCleanup(fixture.doCleanups)
+        root, scripts, directory, original = fixture.recovered_fixture()
+        ledger = load_template_module(scripts / "workflow-evidence-ledger", "ci_recovered_view")
+        contract = dynamic_contract()
+        report = runtime.build_dynamic_ci_report(
+            contract=contract, attempts=[{
+                "sequence": 1, "head_oid": contract["head_oid"], "base_oid": contract["base_oid"],
+                "retry": None, "checks": [], "check_count": 0,
+                "checks_sha256": runtime.canonical_sha256([]), "reason": "no_checks",
+                "watcher_exit_code": 0, "error": None,
+            }],
+        )
+        payload = {
+            "node_key": "ci_prepare", "evidence_type": "ci_report",
+            "summary": "actual recovered report", "artifacts": [], "checks": [], "decisions": [],
+            "context": {"manifest_path": ".kent/context/implement.md", "files_read": []},
+        }
+        with mock.patch.dict(os.environ, {"KENT_RUN_ID": "actual-ci-archive-run"}), mock.patch.object(
+            ledger, "read_json_input", side_effect=lambda _: payload,
+        ):
+            # A fresh append happens through the real template module below;
+            # the CI producer's source-only template shares the pure validator.
+            payload["artifacts"] = [f".kent/runtime/TASK-4/ci-report-{runtime.canonical_sha256(report)}.json"]
+            ledger.append_entry(root, directory / "evidence-ledger.jsonl", task="TASK-4")
+        with mock.patch.object(ci_contract.subprocess, "run", wraps=subprocess.run) as effects:
+            artifact = ci_contract.archive_ci_report(root, "TASK-4", report)
+        self.assertEqual(artifact, payload["artifacts"][0])
+        self.assertFalse(any("append" in call.args[0] for call in effects.call_args_list))
+        self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+        (root / ".kent/context/delivery.md").write_text("actual CI manifest\n")
+        second_report = json.loads(json.dumps(report))
+        second_report["contract"]["pull_number"] += 1
+        with mock.patch.dict(os.environ, {"KENT_RUN_ID": "second-ci-archive-run"}):
+            second_artifact = ci_contract.archive_ci_report(root, "TASK-4", second_report)
+        records = ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")
+        self.assertIn(second_artifact, records[-1]["artifacts"])
+        self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+        before = {path.name: path.read_bytes() for path in directory.iterdir()}
+        (directory / "evidence-continuation.jsonl").write_bytes(b"broken")
+        third_report = json.loads(json.dumps(second_report))
+        third_report["contract"]["pull_number"] += 1
+        with self.assertRaises(ValueError):
+            ci_contract.archive_ci_report(root, "TASK-4", third_report)
+        self.assertEqual(set(path.name for path in directory.iterdir()), set(before))
+
     def test_delivery_context_unwraps_before_identity_and_failure_routing(self) -> None:
         context = {
             "schema": "workflow-delivery-context-v1",
@@ -144,6 +223,10 @@ class CiContractTest(unittest.TestCase):
                 prepare_ci_payload(payload)
 
     def test_prepare_ci_cli_routes_context_identity_after_unwrap(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        workspace = Path(temporary.name).resolve()
+        # Exercise legacy routing independently of the Kit's opted-in profile.
         context = {
             "schema": "workflow-delivery-context-v1",
             "phase": "post_pr",
@@ -155,10 +238,11 @@ class CiContractTest(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "-B", str(ROOT / "scripts/prepare-github-ci")],
             input=json.dumps({
-                "workspace_path": str(ROOT),
+                "workspace_path": str(workspace),
                 "task_short_id": "TASK-17",
                 "delivery_context": json.dumps(context),
             }),
+            cwd=workspace,
             text=True,
             capture_output=True,
             timeout=10,
@@ -275,8 +359,12 @@ class CiContractTest(unittest.TestCase):
             self.assertEqual(result.stderr, "")
 
     def test_preparation_failure_retry_does_not_fabricate_a_ci_report(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        workspace = Path(temporary.name).resolve()
+        # Retry remains a legacy CLI scenario, without native delivery capture.
         payload = {
-            "workspace_path": str(ROOT),
+            "workspace_path": str(workspace),
             "pr_url": "https://github.com/owner/repository/pull/1",
             "branch_name": "TASK-1", "merge_strategy": "rebase",
             "task_short_id": "TASK-1",
@@ -284,7 +372,8 @@ class CiContractTest(unittest.TestCase):
         for _ in range(2):
             result = subprocess.run(
                 [sys.executable, "-B", str(ROOT / "scripts/prepare-github-ci")],
-                input=json.dumps(payload), text=True, capture_output=True, timeout=10,
+                input=json.dumps(payload), cwd=workspace,
+                text=True, capture_output=True, timeout=10,
                 env={**os.environ, "KENT_GH_BIN": "/nonexistent-gh"},
             )
             self.assertEqual(result.returncode, 0, result.stderr)

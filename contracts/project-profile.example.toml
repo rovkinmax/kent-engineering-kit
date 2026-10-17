@@ -23,6 +23,9 @@ smoke = "conditional"
 writer_sessions = "fresh_per_slice"
 pr_merge_strategy = "auto"
 branch_identity = "task"
+# Set delivery_reliability = "v1" only for an explicit opt-in; absence keeps
+# the existing behavior.
+# delivery_reliability = "v1"
 
 [capabilities]
 managed_worktrees = true
@@ -47,6 +50,19 @@ wait_pr = ".kent/scripts/workflow-wait-github-pr"
 github_observation = ".kent/scripts/workflow_github_observation.py"
 janitor = ".kent/scripts/workflow-task-janitor"
 smoke = ""
+# R2 project memory is synchronized as this exact paired source closure.
+# project_memory = ".kent/scripts/workflow-project-memory"
+# project_memory_core = ".kent/scripts/workflow_project_memory.py"
+# Schema 4 profiles additionally list both command keys in
+# kit_managed_commands and pin each new command at version "1.0.0".
+
+# Optional independent R2 storage binding. This absolute normalized root is
+# outside the checkout; loading a profile does not create or initialize it.
+# [project_memory]
+# root = "/absolute/path/to/R2"
+# project_key = "example"
+# project_uid = "independent-project-identity"
+# mode = "r2"
 
 [context_manifests]
 plan = ".kent/context/plan.md"

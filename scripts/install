@@ -21,6 +21,15 @@ fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 kent_root="${KENT_PERSISTENCE_ROOT:-$HOME/.kent}"
+project_memory_adapter="$repo_root/.kent/scripts/workflow-project-memory"
+project_memory_core="$repo_root/.kent/scripts/workflow_project_memory.py"
+
+if [[ -L "$project_memory_adapter" || ! -f "$project_memory_adapter" || \
+      ! -x "$project_memory_adapter" || -L "$project_memory_core" || \
+      ! -f "$project_memory_core" || ! -r "$project_memory_core" ]]; then
+  echo "install: qualified project-memory adapter and sibling core are required" >&2
+  exit 1
+fi
 
 link_item() {
   local source="$1"
@@ -74,6 +83,9 @@ link_item \
 link_item \
   "$repo_root/scripts/resolve-github-merge-strategy" \
   "$kent_root/bin/kent-resolve-github-merge-strategy"
+link_item \
+  "$project_memory_adapter" \
+  "$kent_root/bin/kent-project-memory"
 link_item \
   "$repo_root/adapters/mcp/kent-mcp-call" \
   "$kent_root/bin/kent-mcp-call"

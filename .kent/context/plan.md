@@ -11,6 +11,8 @@ Conditional:
 - graph changes: relevant generator and workflow contracts;
 - generated commands: their authoritative template/runtime sources;
 - source selection: README self-development preflight.
+- R2 storage or prior-decision recovery: the installed Kit skill's
+  `references/durable-context.md`; resolve task mode before document paths.
 
 Do not preload implementation, delivery, disabled Smoke, consumer adapters,
 global configuration or the full maintainer documentation tree.

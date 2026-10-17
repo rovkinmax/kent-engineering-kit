@@ -17,7 +17,11 @@ from workflowkit import (
     build_delivery_workflow,
     build_smoke_lab_workflow,
 )
-from workflowkit.kent import KentCommandError, spec_as_json
+from workflowkit.kent import (
+    CanonicalWorkflowCompatibilityPlan,
+    KentCommandError,
+    spec_as_json,
+)
 from workflowkit.model import SpecError
 from workflowkit.naming import snapshot_filename
 
@@ -66,6 +70,21 @@ def parse_args() -> argparse.Namespace:
             "display name differs from the generated name."
         ),
     )
+    parser.add_argument(
+        "--compatibility-plan",
+        type=Path,
+        help="Delegate an existing UUID-bound semantic update to the canonical v2 effect owner.",
+    )
+    parser.add_argument(
+        "--compatibility-plan-sha256",
+        default="",
+        help="Expected exact SHA-256 of the canonical v2 compatibility plan.",
+    )
+    parser.add_argument(
+        "--confirm-compatibility-plan",
+        default="",
+        help="Repeat the exact compatibility-plan SHA-256 to authorize its application.",
+    )
     return parser.parse_args()
 
 
@@ -73,6 +92,23 @@ def main() -> int:
     args = parse_args()
     if args.set_default and not args.apply:
         raise SpecError("--set-default requires --apply")
+    compatibility_values = (
+        args.compatibility_plan,
+        args.compatibility_plan_sha256,
+        args.confirm_compatibility_plan,
+    )
+    if any(compatibility_values) and not all(compatibility_values):
+        raise SpecError(
+            "compatibility-plan application requires --compatibility-plan, "
+            "--compatibility-plan-sha256, and --confirm-compatibility-plan"
+        )
+    if args.compatibility_plan is not None:
+        if not args.apply:
+            raise SpecError("--compatibility-plan requires --apply")
+        if not args.workflow_id.strip():
+            raise SpecError("--compatibility-plan requires an explicit --workflow-id UUID")
+        if args.set_default:
+            raise SpecError("--compatibility-plan cannot set a project default")
     if args.kind == "smoke-lab":
         if args.version is not None:
             raise SpecError("--version is not used with smoke-lab")
@@ -96,12 +132,25 @@ def main() -> int:
         return 0
 
     client = KentClient(profile.project_root)
+    compatibility_plan = (
+        CanonicalWorkflowCompatibilityPlan(
+            path=args.compatibility_plan,
+            expected_sha256=args.compatibility_plan_sha256,
+            confirmation_sha256=args.confirm_compatibility_plan,
+        )
+        if args.compatibility_plan is not None
+        else None
+    )
     definition = client.apply(
         spec,
         minimum_version=profile.minimum_version_tuple(),
         set_default=args.set_default,
         workflow_selector=args.workflow_id.strip() or None,
+        compatibility_plan=compatibility_plan,
     )
+    if compatibility_plan is not None:
+        print(json.dumps(definition, indent=2, ensure_ascii=False))
+        return 0
     snapshot_name = snapshot_filename(
         definition["workflow"]["name"],
         disambiguate=bool(args.label.strip()),

@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -9,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from typing import Optional
 from urllib.parse import urlparse
@@ -258,7 +262,40 @@ def coder_selection_snapshot(
     handoff: dict[str, str],
     *,
     short_id: str,
+    native_payload: dict[str, object] | None = None,
 ) -> tuple[str, str]:
+    profile = tomllib.loads((root / ".kent/workflow-profile.toml").read_text())
+    if profile.get("project_memory", {}).get("mode") == "r2":
+        source = Path(__file__).with_name("workflow-plan-contract")
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("qualified plan contract adapter unavailable")
+        loader = importlib.machinery.SourceFileLoader("branch_memory_contract", str(source))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            raise ValueError("plan contract adapter cannot be loaded")
+        contract = importlib.util.module_from_spec(spec)
+        loader.exec_module(contract)
+        context = native_payload or {}
+        admission = contract.memory_call(root, context, "resolve-task")
+        if admission.get("mode") == "r2":
+            resolved = contract.memory_call(
+                root, context, "resolve-plan", plan_path=handoff["plan_path"])
+            choice = plan_coder_selection(Path(resolved["working_path"]), short_id=short_id)
+            status = contract.memory_call(root, context, "check-plan", coder_selection=choice)
+            accepted = contract.memory_snapshot_projection(status, short_id)
+            cache_path = root / ".kent/runtime" / short_id / "plan-contract.json"
+            if os.path.lexists(cache_path):
+                cache = contract.inspection_json(contract.inspection_read_file(
+                    cache_path, root=root, max_bytes=65536), "plan locator")
+                contract.validate_memory_cache(cache, status, short_id)
+            if (status["comparison"] != "unchanged"
+                    or accepted["normalized_sha256"] != handoff["accepted_plan_sha256"]
+                    or accepted.get("coder_selection") != choice):
+                raise ValueError("external accepted coder selection changed")
+            role, effort = CODER_SELECTION_TARGETS[choice["complexity"]]
+            return role, effort
+        if admission.get("mode") != "legacy":
+            raise ValueError("invalid task memory mode")
     runtime = root / ".kent" / "runtime"
     task_directory = runtime / short_id
     for directory in (root / ".kent", runtime, task_directory):
@@ -756,6 +793,7 @@ def apply_branch_identity(
                 root,
                 handoff,
                 short_id=short_id,
+                native_payload=incoming,
             )
         except ValueError as error:
             return revalidate_before_writer(handoff, str(error))
@@ -838,8 +876,7 @@ def apply_branch_identity(
     )
 
 
-def main() -> int:
-    incoming = workflow_input()
+def execute(incoming: dict[str, object]) -> int:
     handoff = handoff_values(incoming)
     try:
         return apply_branch_identity(incoming, handoff)
@@ -855,6 +892,35 @@ def main() -> int:
             f"ошибки: {error}. После устранения причины повторите Script.",
             handoff,
         )
+
+
+def main() -> int:
+    incoming = workflow_input()
+    root = Path.cwd().resolve()
+    profile_path = root / ".kent/workflow-profile.toml"
+    profile = tomllib.loads(profile_path.read_text()) if profile_path.is_file() else {}
+    if profile.get("policies", {}).get("delivery_reliability") is None:
+        return execute(incoming)
+    source = Path(__file__).with_name("workflow-checkpoint")
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("qualified producer adapter is unavailable")
+    loader = importlib.machinery.SourceFileLoader("branch_producer_adapter", str(source))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ValueError("producer adapter cannot be loaded")
+    adapter = importlib.util.module_from_spec(spec)
+    loader.exec_module(adapter)
+    # Preserve the existing result producer, including blocked/revalidation
+    # routes. Only validated final JSON reaches native completion stdout.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output:
+        with contextlib.redirect_stdout(output):
+            code = execute(incoming)
+        output.seek(0)
+        raw = output.read(1024 * 1024 + 1).encode("utf-8")
+    if len(raw) > 1024 * 1024:
+        raise ValueError("branch producer result exceeds limit")
+    sys.stdout.buffer.write(adapter.emit_producer_result(root, incoming, raw, "branch-identity"))
+    return code
 
 
 if __name__ == "__main__":

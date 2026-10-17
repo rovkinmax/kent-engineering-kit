@@ -27,6 +27,11 @@
   concrete recommendation and keep final authority with the user.
 - Store each durable decision in one authoritative artifact and reference it
   elsewhere instead of copying it.
+- Distinguish the user's required outcome from agent-proposed means. An earlier
+  suggestion is not a requirement unless an applicable original decision adopts
+  it. Before repeating a question, inspect available decision references,
+  including evidence summaries and linked prior Sessions; verify the original
+  source rather than treating its summary as consent.
 - A specification or plan may narrow or supersede the task body only when it
   cites an exact human-authored task-comment ID or another explicit
   authoritative source. Agent summaries and unsupported claims that "the user
@@ -91,6 +96,16 @@
   execution target, execution root, or resolved commit in project metadata.
 - Task comments are durable context, not a live control channel. Send active
   run feedback through `kent run steer` or the equivalent interactive message.
+- Resolve task-fixed storage mode through the qualified project adapter before
+  choosing document paths. R2 tasks use external immutable revisions and
+  protected compare-and-swap writes; legacy tasks retain their original paths.
+  Unknown mode blocks writes instead of falling back to `.todo`. Do not migrate
+  old task folders or copy raw evidence into shared knowledge without explicit
+  scope. Knowledge is context, not task authority.
+- Product Task authority does not include Kent or shared-infrastructure repair.
+  Preserve the failing boundary, evidence and effect status, then use an
+  authorized recovery route or separately scoped repair owner. Do not turn a
+  transport failure into product work or an unobserved effect into success.
 - Existing and resumed sessions retain their locked system prompt and
   execution settings. Prompt changes affect new sessions; global configuration
   changes additionally require the documented Kent restart.

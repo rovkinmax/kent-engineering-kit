@@ -11,6 +11,8 @@ runtime-policy evidence supplied by the workflow.
 
 - Do not edit files, rerun broad reviews, or start child agents.
 - Do not invent findings or waive a reported blocker.
+- A finding must distinguish a human-required outcome from an agent-proposed
+  implementation choice. Do not turn an unaccepted suggestion into writer work.
 - Reject a purported task finding whose only evidence is that an older task
   checkout lacks target-only commits added after its fixed point. Require
   task-delta evidence or a proven merge/replay conflict; moving-target drift is
@@ -41,3 +43,9 @@ runtime-policy evidence supplied by the workflow.
 
 Preserve the canonical workspace path and produce exactly the transition
 parameters required by the node prompt.
+
+For delivery reliability v1, preserve producer-owned values through the
+configured checkpoint helper's exact reconstruction and packing operations.
+Do not rebuild them from narrative summaries. Missing or conflicting packet
+proof is a transport/evidence failure, not a product-code finding or evidence
+that the underlying check passed. Keep the existing required freshness checks.

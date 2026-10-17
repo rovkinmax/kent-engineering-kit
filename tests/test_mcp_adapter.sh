@@ -12,7 +12,9 @@ home="$tmp/home"
 fake_bin="$tmp/bin"
 main="$tmp/Example"
 worktree="$tmp/TASK-1"
-mkdir -p "$home/.kent" "$home/.mcporter" "$fake_bin" "$main"
+r2_worktree="$tmp/TASK-R2"
+memory_bin="$home/.kent/bin"
+mkdir -p "$memory_bin" "$home/.mcporter" "$fake_bin" "$main"
 
 git -C "$main" init -q
 git -C "$main" config user.name "Kent Test"
@@ -21,6 +23,7 @@ echo tracked >"$main/tracked"
 git -C "$main" add tracked
 git -C "$main" commit -qm "Initial"
 git -C "$main" worktree add -qb task "$worktree"
+git -C "$main" worktree add --detach "$r2_worktree" HEAD
 
 cat >"$main/.mcp.json" <<'JSON'
 {
@@ -54,6 +57,9 @@ cat >"$fake_bin/mcporter" <<'SH'
 set -euo pipefail
 : "${MCPORTER_ARGS_LOG:?}"
 printf '%s\n' "$@" >"$MCPORTER_ARGS_LOG"
+if [[ -n "${MCPORTER_CALL_COUNT_FILE:-}" ]]; then
+  printf 'call\n' >>"$MCPORTER_CALL_COUNT_FILE"
+fi
 if [[ -n "${MCPORTER_STDERR_FILE:-}" ]]; then
   cat "$MCPORTER_STDERR_FILE" >&2
 fi
@@ -66,6 +72,331 @@ exit "${MCPORTER_EXIT_CODE:-0}"
 SH
 chmod +x "$fake_bin/mcporter"
 
+cat >"$memory_bin/kent-project-memory" <<'PY'
+#!/usr/bin/env python3
+"""Faithful local fixture for the narrow r2-mcp-request-v1 wire protocol."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import sys
+import uuid
+
+MAX_BODY = 8 * 1024 * 1024
+MAX_HEADER = 64 * 1024
+home = Path(os.environ["HOME"])
+control = home / ".kent"
+expected_binding = json.loads((control / "test-binding.json").read_text())
+state = Path(expected_binding["project_path"])
+task_root = state / "tasks" / expected_binding["task_key"]
+object_root = task_root / "artifacts" / "mcp" / "objects"
+call_root = task_root / "artifacts" / "mcp" / "calls"
+cache_root = task_root / "artifacts" / "mcp" / "cache"
+trace = control / "mcp-protocol.jsonl"
+
+
+def fail(message, code=2):
+    print(f"fake_memory:{message}", file=sys.stderr)
+    raise SystemExit(code)
+
+if sys.argv[1:] != ["mcp"]:
+    fail("invalid_adapter_command")
+
+
+def write_atomic(path, raw):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp-" + secrets.token_hex(6))
+    temporary.write_bytes(raw)
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def response(result):
+    print(json.dumps({"schema": "r2-mcp-response-v1", "result": result},
+                     sort_keys=True, separators=(",", ":")))
+
+
+line = sys.stdin.buffer.readline(MAX_HEADER + 1)
+if len(line) > MAX_HEADER or not line.endswith(b"\n"):
+    fail("invalid_header")
+try:
+    request = json.loads(line)
+except (UnicodeError, ValueError):
+    fail("invalid_json")
+if (not isinstance(request, dict)
+        or request.get("schema") != "r2-mcp-request-v1"
+        or not isinstance(request.get("operation"), str)):
+    fail("invalid_request")
+
+operation = request["operation"]
+body = b""
+if operation == "put-artifact":
+    body = sys.stdin.buffer.read(MAX_BODY + 1)
+    if len(body) > MAX_BODY:
+        fail("artifact_too_large")
+elif sys.stdin.buffer.read(1):
+    fail("unexpected_body")
+
+logged = dict(request)
+logged.pop("owner_token", None)
+with trace.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(logged, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def verify_workspace():
+    workspace = request.get("workspace_path")
+    if not isinstance(workspace, str) or not Path(workspace).is_absolute():
+        fail("invalid_workspace")
+    return Path(workspace)
+
+
+def verify_binding():
+    verify_workspace()
+    if request.get("binding_ref") != {
+            "path": str(task_root / "task.json"),
+            "sha256": expected_binding["task_binding_sha256"]}:
+        fail("binding_ref_mismatch")
+    supplied = request.get("standalone_binding")
+    if supplied is not None and supplied != expected_binding:
+        fail("standalone_binding_mismatch")
+
+
+def checked_metadata(value):
+    expected = {"operation", "server", "tool", "config_sha256",
+                "output_mode", "safe_mode", "save_raw"}
+    if not isinstance(value, dict) or set(value) != expected:
+        fail("invalid_permitted_metadata")
+    if value["operation"] not in ("list", "call"):
+        fail("invalid_permitted_metadata")
+    for name in ("server", "tool", "output_mode"):
+        item = value[name]
+        if (not isinstance(item, str) or len(item) > 128
+                or (item and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", item))):
+            fail("invalid_permitted_metadata")
+    if not re.fullmatch(r"[0-9a-f]{64}", value["config_sha256"]):
+        fail("invalid_permitted_metadata")
+    if type(value["safe_mode"]) is not bool or type(value["save_raw"]) is not bool:
+        fail("invalid_permitted_metadata")
+
+
+def invocation_paths(invocation_id):
+    if (not isinstance(invocation_id, str)
+            or str(uuid.UUID(invocation_id)) != invocation_id):
+        fail("invalid_invocation_id")
+    directory = call_root / invocation_id
+    return directory / "started.json", directory / "finished.json"
+
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+
+
+def verify_owner(started, owner_token):
+    if (not isinstance(owner_token, str)
+            or started is None
+            or not secrets.compare_digest(
+                started["owner_sha256"],
+                hashlib.sha256(owner_token.encode()).hexdigest())):
+        fail("invocation_owner_mismatch", 3)
+
+
+mode = (control / "mcp-mode").read_text().strip()
+if operation == "resolve-mcp":
+    verify_workspace()
+    if mode == "legacy":
+        response({"mode": "legacy"})
+    elif mode == "r2":
+        supplied = request.get("standalone_binding")
+        if supplied != expected_binding or os.environ.get("KENT_TASK_ID", ""):
+            fail("standalone_binding_required")
+        response({
+            "mode": "r2",
+            "binding_ref": {
+                "path": str(task_root / "task.json"),
+                "sha256": expected_binding["task_binding_sha256"],
+            },
+        })
+    else:
+        fail("unknown_mode")
+elif operation == "new-invocation":
+    verify_binding()
+    invocation_id = str(uuid.uuid4())
+    started, finished = invocation_paths(invocation_id)
+    response({"invocation_id": invocation_id,
+              "started_path": str(started), "finished_path": str(finished)})
+elif operation == "begin-invocation":
+    verify_binding()
+    invocation_id = request.get("invocation_id")
+    started_path, finished_path = invocation_paths(invocation_id)
+    request_sha = request.get("request_sha256")
+    metadata = request.get("permitted_metadata")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(request_sha)):
+        fail("invalid_request_sha256")
+    checked_metadata(metadata)
+    started = load_json(started_path)
+    finished = load_json(finished_path)
+    if started is not None:
+        if (started["request_sha256"] != request_sha
+                or started["permitted_metadata"] != metadata):
+            fail("invocation_request_conflict", 3)
+        response({"state": "finished" if finished is not None else "unknown",
+                  "receipt_path": str(finished_path if finished is not None else started_path)})
+    elif (control / "force-unknown-id").exists() and (
+            (control / "force-unknown-id").read_text().strip() == invocation_id):
+        owner_token = secrets.token_hex(32)
+        write_atomic(started_path, json.dumps({
+            "request_sha256": request_sha,
+            "permitted_metadata": metadata,
+            "owner_sha256": hashlib.sha256(owner_token.encode()).hexdigest(),
+            "object_sha256": None,
+        }, sort_keys=True).encode())
+        response({"state": "unknown", "receipt_path": str(started_path)})
+    else:
+        owner_token = secrets.token_hex(32)
+        write_atomic(started_path, json.dumps({
+            "request_sha256": request_sha,
+            "permitted_metadata": metadata,
+            "owner_sha256": hashlib.sha256(owner_token.encode()).hexdigest(),
+            "object_sha256": None,
+        }, sort_keys=True).encode())
+        response({"state": "started", "owner_token": owner_token,
+                  "receipt_path": str(started_path)})
+elif operation == "put-artifact":
+    verify_binding()
+    invocation_id = request.get("invocation_id")
+    started_path, _ = invocation_paths(invocation_id)
+    started = load_json(started_path)
+    verify_owner(started, request.get("owner_token"))
+    kind = request.get("kind")
+    digest = request.get("sha256")
+    size = request.get("byte_size")
+    if (kind not in ("raw", "schema") or type(size) is not int or size != len(body)
+            or hashlib.sha256(body).hexdigest() != digest):
+        fail("artifact_digest_mismatch")
+    object_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    object_path = object_root / digest
+    if object_path.exists():
+        if object_path.read_bytes() != body:
+            fail("artifact_conflict", 3)
+    else:
+        write_atomic(object_path, body)
+    started["object_sha256"] = digest
+    write_atomic(started_path, json.dumps(started, sort_keys=True).encode())
+    response({"object_sha256": digest, "object_path": str(object_path)})
+elif operation == "finish-invocation":
+    verify_binding()
+    invocation_id = request.get("invocation_id")
+    started_path, finished_path = invocation_paths(invocation_id)
+    started = load_json(started_path)
+    verify_owner(started, request.get("owner_token"))
+    object_sha = request.get("object_sha256")
+    if object_sha is not None and not (object_root / object_sha).is_file():
+        fail("artifact_missing")
+    finished = {
+        "exit_code": request.get("exit_code"),
+        "error_code": request.get("error_code"),
+        "object_sha256": object_sha,
+        "permitted_metadata": started["permitted_metadata"],
+    }
+    write_atomic(finished_path, json.dumps(finished, sort_keys=True).encode())
+    response({"state": "finished", "receipt_path": str(finished_path)})
+elif operation == "read-invocation":
+    verify_binding()
+    invocation_id = request.get("invocation_id")
+    started_path, finished_path = invocation_paths(invocation_id)
+    started = load_json(started_path)
+    finished = load_json(finished_path)
+    if started is None:
+        result = {"state": "not-started"}
+    elif finished is None:
+        result = {"state": "unknown",
+                  "permitted_metadata": started["permitted_metadata"]}
+    else:
+        result = {"state": "finished", **finished,
+                  "receipt_path": str(finished_path)}
+        if finished["object_sha256"] is not None:
+            result["object_path"] = str(object_root / finished["object_sha256"])
+    response(result)
+elif operation == "read-cache":
+    verify_binding()
+    cache_key = request.get("cache_key")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(cache_key)):
+        fail("invalid_cache_key")
+    cache = load_json(cache_root / f"{cache_key}.json")
+    if cache is None:
+        response({"state": "miss"})
+    else:
+        path = object_root / cache["object_sha256"]
+        response({"state": "hit", "object_sha256": cache["object_sha256"],
+                  "object_path": str(path)})
+elif operation == "publish-cache":
+    verify_binding()
+    invocation_id = request.get("invocation_id")
+    started_path, _ = invocation_paths(invocation_id)
+    started = load_json(started_path)
+    verify_owner(started, request.get("owner_token"))
+    cache_key = request.get("cache_key")
+    object_sha = request.get("object_sha256")
+    if (not re.fullmatch(r"[0-9a-f]{64}", str(cache_key))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(object_sha))
+            or not (object_root / object_sha).is_file()):
+        fail("invalid_cache_publication")
+    cache = cache_root / f"{cache_key}.json"
+    write_atomic(cache, json.dumps({"object_sha256": object_sha},
+                                   sort_keys=True).encode())
+    response({"state": "published"})
+else:
+    fail("unsupported_operation")
+PY
+chmod +x "$memory_bin/kent-project-memory"
+echo legacy >"$home/.kent/mcp-mode"
+r2_project_path="$tmp/R2/kent-engineering-kit"
+standalone_binding="$(
+  jq -cn \
+    --arg project_path "$r2_project_path" \
+    --arg project_uid "project-11111111-1111-4111-8111-111111111111" \
+    --arg task_key "intake-22222222-2222-4222-8222-222222222222" \
+    --arg task_uid "task-33333333-3333-4333-8333-333333333333" \
+    --arg task_binding_sha256 "$(printf 'b%.0s' {1..64})" \
+    '{project_path:$project_path,project_uid:$project_uid,task_key:$task_key,
+      task_uid:$task_uid,task_binding_sha256:$task_binding_sha256}'
+)"
+printf '%s\n' "$standalone_binding" >"$home/.kent/test-binding.json"
+call_count_file="$tmp/mcporter-calls"
+: >"$call_count_file"
+: >"$home/.kent/mcp-protocol.jsonl"
+
+r2_memory_request() {
+  HOME="$home" KENT_TASK_ID= "$memory_bin/kent-project-memory" mcp
+}
+
+new_r2_invocation() {
+  local resolve_request resolved binding_ref allocation_request
+  resolve_request="$(
+    jq -cn --arg workspace "$r2_worktree" \
+      --argjson standalone "$standalone_binding" \
+      '{schema:"r2-mcp-request-v1",operation:"resolve-mcp",
+        workspace_path:$workspace,standalone_binding:$standalone}'
+  )"
+  resolved="$(printf '%s\n' "$resolve_request" | r2_memory_request)"
+  binding_ref="$(jq -ce '.result.binding_ref | select(type == "object")' \
+    <<<"$resolved")"
+  allocation_request="$(
+    jq -cn --arg workspace "$r2_worktree" \
+      --argjson binding_ref "$binding_ref" \
+      --argjson standalone "$standalone_binding" \
+      '{schema:"r2-mcp-request-v1",operation:"new-invocation",
+        workspace_path:$workspace,binding_ref:$binding_ref,
+        standalone_binding:$standalone}'
+  )"
+  printf '%s\n' "$allocation_request" | r2_memory_request
+}
+
 run_adapter() {
   local log="$1"
   shift
@@ -77,6 +408,24 @@ run_adapter() {
       MCPORTER_FIXTURE_FILE="${MCPORTER_FIXTURE_FILE:-}" \
       MCPORTER_STDERR_FILE="${MCPORTER_STDERR_FILE:-}" \
       MCPORTER_EXIT_CODE="${MCPORTER_EXIT_CODE:-0}" \
+      MCPORTER_CALL_COUNT_FILE="${MCPORTER_CALL_COUNT_FILE:-}" \
+      "$@"
+  )
+}
+
+run_r2_adapter() {
+  local log="$1"
+  shift
+  (
+    cd "$r2_worktree"
+    HOME="$home" \
+      PATH="$fake_bin:$PATH" \
+      MCPORTER_ARGS_LOG="$log" \
+      MCPORTER_FIXTURE_FILE="${MCPORTER_FIXTURE_FILE:-}" \
+      MCPORTER_STDERR_FILE="${MCPORTER_STDERR_FILE:-}" \
+      MCPORTER_EXIT_CODE="${MCPORTER_EXIT_CODE:-0}" \
+      MCPORTER_CALL_COUNT_FILE="$call_count_file" \
+      KENT_TASK_ID= \
       "$@"
   )
 }
@@ -1017,5 +1366,263 @@ if mobile_checkpoint_gate \
   echo "checkpoint gate promoted a positive assertion with uncovered error condition" >&2
   exit 1
 fi
+
+echo r2 >"$home/.kent/mcp-mode"
+test ! -e "$r2_worktree/.todo"
+test ! -e "$r2_worktree/build/mcp-cache"
+r2_trace_start="$(wc -l <"$home/.kent/mcp-protocol.jsonl" | tr -d '[:space:]')"
+r2_calls_start="$(wc -l <"$call_count_file" | tr -d '[:space:]')"
+
+if run_r2_adapter "$args_log" "$call_adapter" example.inspect \
+  --allow-mutate --standalone-binding "$standalone_binding" --quiet \
+  >"$tmp/r2-no-invocation.out" 2>"$tmp/r2-no-invocation.err"; then
+  echo "R2 MCP call without a preknown invocation ID unexpectedly succeeded" >&2
+  exit 1
+fi
+if ! grep -E 'invocation-id|mcp_' "$tmp/r2-no-invocation.err" >/dev/null; then
+  echo "R2 call without invocation ID failed for an unexpected reason:" >&2
+  sed -n '1,12p' "$tmp/r2-no-invocation.err" >&2
+  exit 1
+fi
+test ! -s "$tmp/r2-no-invocation.out"
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" = "$r2_calls_start"
+no_token_requests="$tmp/r2-no-token-requests.jsonl"
+sed -n "$((r2_trace_start + 1)),$ p" "$home/.kent/mcp-protocol.jsonl" \
+  >"$no_token_requests"
+jq -se 'length == 1 and .[0].operation == "resolve-mcp"' \
+  "$no_token_requests" >/dev/null
+
+list_trace_start="$(wc -l <"$home/.kent/mcp-protocol.jsonl" | tr -d '[:space:]')"
+if run_r2_adapter "$args_log" "$list_adapter" example --schema \
+  --standalone-binding "$standalone_binding" \
+  >"$tmp/r2-list-no-invocation.out" 2>"$tmp/r2-list-no-invocation.err"; then
+  echo "R2 MCP list without a preknown invocation ID unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -F 'mcp_invocation_id_required' "$tmp/r2-list-no-invocation.err" >/dev/null
+test ! -s "$tmp/r2-list-no-invocation.out"
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" = "$r2_calls_start"
+list_no_token_requests="$tmp/r2-list-no-token-requests.jsonl"
+sed -n "$((list_trace_start + 1)),$ p" "$home/.kent/mcp-protocol.jsonl" \
+  >"$list_no_token_requests"
+jq -se 'length == 1 and .[0].operation == "resolve-mcp"' \
+  "$list_no_token_requests" >/dev/null
+
+cat >"$tmp/r2-response.json" <<'JSON'
+{"result":"response-private"}
+JSON
+quiet_invocation="$(new_r2_invocation)"
+quiet_id="$(jq -er '.result.invocation_id' <<<"$quiet_invocation")"
+quiet_started="$(jq -er '.result.started_path' <<<"$quiet_invocation")"
+quiet_finished="$(jq -er '.result.finished_path' <<<"$quiet_invocation")"
+test ! -e "$quiet_started"
+test ! -e "$quiet_finished"
+MCPORTER_FIXTURE_FILE="$tmp/r2-response.json" \
+KENT_MCP_ARTIFACT_ROOT="$tmp/outside-artifacts" \
+  run_r2_adapter "$args_log" "$call_adapter" example.inspect \
+    credential=credential-private --allow-mutate --quiet \
+    --standalone-binding "$standalone_binding" \
+    --invocation-id "$quiet_id" >"$tmp/r2-quiet.out"
+test ! -s "$tmp/r2-quiet.out"
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$((r2_calls_start + 1))"
+test -f "$quiet_started"
+test -f "$quiet_finished"
+jq -e '
+  .permitted_metadata.operation == "call" and
+  .permitted_metadata.server == "example" and
+  .permitted_metadata.tool == "inspect" and
+  .permitted_metadata.output_mode == "text" and
+  .permitted_metadata.safe_mode == true and
+  .permitted_metadata.save_raw == false
+' "$quiet_finished" >/dev/null
+test ! -e "$tmp/outside-artifacts"
+test ! -e "$r2_worktree/.todo"
+test ! -e "$r2_worktree/build/mcp-cache"
+if grep -Fq -- "--invocation-id" "$args_log" ||
+  grep -Fq -- "--standalone-binding" "$args_log"; then
+  echo "R2 adapter options leaked through to mcporter" >&2
+  exit 1
+fi
+if grep -R -E 'credential-private|response-private' \
+  "$r2_project_path/tasks" "$home/.kent/mcp-protocol.jsonl"; then
+  echo "suppressed MCP input/output leaked into R2 metadata or helper logs" >&2
+  exit 1
+fi
+
+if run_r2_adapter "$args_log" "$call_adapter" example.inspect \
+  credential=credential-private --allow-mutate --quiet \
+  --standalone-binding "$standalone_binding" \
+  --invocation-id "$quiet_id" >"$tmp/r2-duplicate.out" \
+  2>"$tmp/r2-duplicate.err"; then
+  echo "finished R2 invocation replay unexpectedly succeeded" >&2
+  exit 1
+fi
+test ! -s "$tmp/r2-duplicate.out"
+grep -E 'finished.*read-invocation|read-invocation.*finished' \
+  "$tmp/r2-duplicate.err" >/dev/null
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$((r2_calls_start + 1))"
+
+if run_r2_adapter "$args_log" "$call_adapter" example.inspect \
+  credential=changed-private --allow-mutate --quiet \
+  --standalone-binding "$standalone_binding" \
+  --invocation-id "$quiet_id" >"$tmp/r2-conflict.out" \
+  2>"$tmp/r2-conflict.err"; then
+  echo "R2 invocation token with a changed request unexpectedly succeeded" >&2
+  exit 1
+fi
+test ! -s "$tmp/r2-conflict.out"
+grep -Ei 'conflict|request differs' "$tmp/r2-conflict.err" >/dev/null
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$((r2_calls_start + 1))"
+
+unknown_invocation="$(new_r2_invocation)"
+unknown_id="$(jq -er '.result.invocation_id' <<<"$unknown_invocation")"
+printf '%s\n' "$unknown_id" >"$home/.kent/force-unknown-id"
+if run_r2_adapter "$args_log" "$call_adapter" example.inspect \
+  --allow-mutate --quiet --standalone-binding "$standalone_binding" \
+  --invocation-id "$unknown_id" >"$tmp/r2-unknown.out" \
+  2>"$tmp/r2-unknown.err"; then
+  echo "unresolved started R2 invocation unexpectedly replayed" >&2
+  exit 1
+fi
+test ! -s "$tmp/r2-unknown.out"
+grep -E 'unknown.*read-invocation|read-invocation.*unknown' \
+  "$tmp/r2-unknown.err" >/dev/null
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$((r2_calls_start + 1))"
+rm "$home/.kent/force-unknown-id"
+
+raw_invocation="$(new_r2_invocation)"
+raw_id="$(jq -er '.result.invocation_id' <<<"$raw_invocation")"
+raw_started="$(jq -er '.result.started_path' <<<"$raw_invocation")"
+if run_r2_adapter "$args_log" "$call_adapter" example.inspect \
+  --allow-mutate --raw-dir "$tmp/outside-raw" \
+  --standalone-binding "$standalone_binding" \
+  --invocation-id "$raw_id" >"$tmp/r2-raw-dir.out" \
+  2>"$tmp/r2-raw-dir.err"; then
+  echo "R2 MCP call accepted an escaping --raw-dir" >&2
+  exit 1
+fi
+test ! -e "$tmp/outside-raw"
+test ! -e "$raw_started"
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$((r2_calls_start + 1))"
+
+saved_invocation="$(new_r2_invocation)"
+saved_id="$(jq -er '.result.invocation_id' <<<"$saved_invocation")"
+saved_finished="$(jq -er '.result.finished_path' <<<"$saved_invocation")"
+MCPORTER_FIXTURE_FILE="$tmp/r2-response.json" \
+KENT_MCP_ARTIFACT_ROOT="$tmp/outside-artifacts" \
+  run_r2_adapter "$args_log" "$call_adapter" example.inspect \
+    --allow-mutate --save-raw \
+    --standalone-binding "$standalone_binding" \
+    --invocation-id "$saved_id" >"$tmp/r2-save-raw.out"
+cmp -s "$tmp/r2-response.json" "$tmp/r2-save-raw.out"
+saved_sha="$(shasum -a 256 "$tmp/r2-response.json" | awk '{print $1}')"
+saved_object="$r2_project_path/tasks/intake-22222222-2222-4222-8222-222222222222/artifacts/mcp/objects/$saved_sha"
+test -s "$saved_object"
+cmp -s "$tmp/r2-response.json" "$saved_object"
+jq -e --arg digest "$saved_sha" '.object_sha256 == $digest' \
+  "$saved_finished" >/dev/null
+jq -e '
+  .permitted_metadata.safe_mode == false and
+  .permitted_metadata.save_raw == true
+' "$saved_finished" >/dev/null
+test ! -e "$tmp/outside-artifacts"
+test ! -e "$r2_worktree/.todo"
+
+same_request_one="$(new_r2_invocation)"
+same_request_two="$(new_r2_invocation)"
+same_id_one="$(jq -er '.result.invocation_id' <<<"$same_request_one")"
+same_id_two="$(jq -er '.result.invocation_id' <<<"$same_request_two")"
+same_finished_one="$(jq -er '.result.finished_path' <<<"$same_request_one")"
+same_finished_two="$(jq -er '.result.finished_path' <<<"$same_request_two")"
+MCPORTER_FIXTURE_FILE="$tmp/r2-response.json" \
+  run_r2_adapter "$args_log" "$call_adapter" example.inspect stable=yes \
+    --allow-mutate --quiet --standalone-binding "$standalone_binding" \
+    --invocation-id "$same_id_one" >"$tmp/r2-same-one.out"
+MCPORTER_FIXTURE_FILE="$tmp/r2-response.json" \
+  run_r2_adapter "$args_log" "$call_adapter" example.inspect stable=yes \
+    --allow-mutate --quiet --standalone-binding "$standalone_binding" \
+    --invocation-id "$same_id_two" >"$tmp/r2-same-two.out"
+test "$same_id_one" != "$same_id_two"
+test -f "$same_finished_one"
+test -f "$same_finished_two"
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$((r2_calls_start + 4))"
+
+cat >"$tmp/r2-schema.json" <<'JSON'
+{"tools":[{"name":"inspect"}]}
+JSON
+schema_invocation="$(new_r2_invocation)"
+schema_id="$(jq -er '.result.invocation_id' <<<"$schema_invocation")"
+schema_finished="$(jq -er '.result.finished_path' <<<"$schema_invocation")"
+schema_calls_before="$(wc -l <"$call_count_file" | tr -d '[:space:]')"
+MCPORTER_FIXTURE_FILE="$tmp/r2-schema.json" \
+  run_r2_adapter "$args_log" "$list_adapter" example --schema \
+    --standalone-binding "$standalone_binding" --invocation-id "$schema_id" \
+    >"$tmp/r2-schema-first.out"
+cmp -s "$tmp/r2-schema.json" "$tmp/r2-schema-first.out"
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$((schema_calls_before + 1))"
+jq -e '.object_sha256 != null' "$schema_finished" >/dev/null
+jq -e '
+  .permitted_metadata.operation == "list" and
+  .permitted_metadata.server == "example" and
+  .permitted_metadata.tool == "list-schema" and
+  .permitted_metadata.output_mode == "json" and
+  .permitted_metadata.safe_mode == false and
+  .permitted_metadata.save_raw == false
+' "$schema_finished" >/dev/null
+test ! -e "$r2_worktree/build/mcp-cache"
+
+cached_schema_invocation="$(new_r2_invocation)"
+cached_schema_id="$(jq -er '.result.invocation_id' \
+  <<<"$cached_schema_invocation")"
+cached_schema_finished="$(jq -er '.result.finished_path' \
+  <<<"$cached_schema_invocation")"
+MCPORTER_FIXTURE_FILE="$tmp/another-schema.json" \
+  run_r2_adapter "$args_log" "$list_adapter" example --schema \
+    --standalone-binding "$standalone_binding" \
+    --invocation-id "$cached_schema_id" \
+    >"$tmp/r2-schema-cache-hit.out"
+cmp -s "$tmp/r2-schema.json" "$tmp/r2-schema-cache-hit.out"
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$((schema_calls_before + 1))"
+jq -e '.object_sha256 != null' "$cached_schema_finished" >/dev/null
+test ! -e "$r2_worktree/.todo"
+test ! -e "$r2_worktree/build/mcp-cache"
+
+r2_requests="$tmp/r2-requests.jsonl"
+sed -n "$((r2_trace_start + 1)),$ p" "$home/.kent/mcp-protocol.jsonl" \
+  >"$r2_requests"
+jq -se --arg workspace "$r2_worktree" '
+  all(.[]; .workspace_path == $workspace) and
+  all(.[]; (.credential // "") == "" and (.arguments // "") == "") and
+  all(.[]; has("owner_token") | not)
+' "$r2_requests" >/dev/null
+for invocation_id in "$quiet_id" "$saved_id" "$schema_id" "$cached_schema_id"; do
+  if ! jq -se --arg id "$invocation_id" '
+    [.[] | select(.invocation_id == $id) | .operation] as $ops |
+    ($ops[0] == "begin-invocation") and
+    ("finish-invocation" as $finish | ($ops | index($finish)) != null)
+  ' "$r2_requests" >/dev/null; then
+    echo "missing begin/finish invocation sequence for $invocation_id:" >&2
+    jq -cs --arg id "$invocation_id" \
+      '[.[] | select(.invocation_id == $id) | .operation]' "$r2_requests" >&2
+    exit 1
+  fi
+done
+jq -se --arg id "$cached_schema_id" '
+  to_entries as $entries |
+  ($entries | map(select(.value.invocation_id == $id and
+    .value.operation == "begin-invocation")) | .[0].key) as $begin |
+  ($entries | map(select(.value.invocation_id == $id and
+    .value.operation == "finish-invocation")) | .[0].key) as $finish |
+  any($entries[]; .key > $begin and .key < $finish and
+    .value.operation == "read-cache")
+' "$r2_requests" >/dev/null
 
 echo "MCP adapter tests passed"
