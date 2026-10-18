@@ -14,9 +14,7 @@ sys.dont_write_bytecode = True
 
 import argparse
 import hashlib
-import importlib.util
 import json
-import marshal
 import os
 from pathlib import Path
 import re
@@ -80,6 +78,12 @@ def canonical(value):
             and ".." not in path.parts and (not isinstance(value, str) or value == str(path)),
             "noncanonical absolute path")
     return path
+
+
+def local_identity(path):
+    info = path.lstat()
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def infrastructure(path, kit=False):
@@ -246,8 +250,7 @@ def live_inventory(root, *, kit=False):
             continue
         require(not start.is_symlink() and start.is_dir(), "unsafe infrastructure directory")
         for directory, children, files in os.walk(start, followlinks=False):
-            # Current-interpreter caches are checked against compiled admitted
-            # source below, not admitted by their timestamp/size header alone.
+            # Owner-controlled derived caches are outside source admission.
             children[:] = [name for name in children if name != "__pycache__"]
             for name in children:
                 require(not (Path(directory) / name).is_symlink(), "source directory symlink")
@@ -260,31 +263,10 @@ def live_inventory(root, *, kit=False):
     return found
 
 
-def verify_python_cache(source, raw):
-    if source.suffix != ".py":
-        return
-    for optimize in (0, 1, 2):
-        cache = Path(importlib.util.cache_from_source(
-            str(source), optimization="" if optimize == 0 else str(optimize)))
-        if not os.path.lexists(cache):
-            continue
-        cached, _ = read_file(cache)
-        require(len(cached) >= 16 and cached[:4] == importlib.util.MAGIC_NUMBER
-                and int.from_bytes(cached[4:8], "little") in (0, 1, 3),
-                "unsupported Python cache header")
-        # Do not deserialize or execute candidate bytecode. The compiler sees
-        # only the source bytes already bound to the published receipt.
-        filename = str(source)
-        code = compile(raw, filename, "exec", dont_inherit=True, optimize=optimize)
-        # Match importlib's retained code/filename references while marshaling;
-        # CPython's reference flags otherwise depend on temporary refcounts.
-        references = (filename, code)
-        expected = marshal.dumps(references[1])
-        require(cached[16:] == expected, "Python cache differs from qualified source")
-
-
-def verify_copy(root, expected, published_tree, *, kit=False):
-    require(live_inventory(root, kit=kit) == set(expected), "infrastructure inventory differs")
+def verify_copy(root, expected, published_tree, *, kit=False, local_inputs=None):
+    local_inputs = local_inputs or {}
+    require(live_inventory(root, kit=kit) == set(expected) | set(local_inputs),
+            "infrastructure inventory differs")
     head_tree = tree(root, "HEAD")
     require({name: item for name, item in head_tree.items() if infrastructure(name, kit)}
             == {name: published_tree[name] for name in expected},
@@ -308,7 +290,11 @@ def verify_copy(root, expected, published_tree, *, kit=False):
         require(len(raw) == item["byte_size"] and bool(mode & 0o100) == bool(item["mode"] & 0o100)
                 and hashlib.sha256(raw).hexdigest() == item["sha256"],
                 "infrastructure bytes or mode differ")
-        verify_python_cache(root / name, raw)
+    for name, item in local_inputs.items():
+        raw, mode = read_file(root / name)
+        require(len(raw) == item["byte_size"] and mode == item["mode"]
+                and hashlib.sha256(raw).hexdigest() == item["sha256"],
+                "local instruction bytes or mode differ")
 
 
 def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
@@ -322,10 +308,13 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
     read, never refreshed. A local ref is cooperative provenance, not server
     authentication or proof that the current human approved this invocation.
     This entry admits current R2/v1 infrastructure, not intentionally different
-    legacy task checkouts. Select task-fixed legacy mode before using it. The
-    Python cache check covers this interpreter's cache tag; runtime callers must
-    use that same interpreter and a trusted import environment. It is not a
-    security sandbox or a reservation against changes after return.
+    legacy task checkouts. Select task-fixed legacy mode before using it.
+    Admission binds published source and explicit private instructions, not
+    every byte the interpreter may execute. The local interpreter, import
+    environment and owner-controlled derived caches are trusted: tampered or
+    stale timestamp caches can execute despite admission. python_cache_tag is
+    interpreter metadata, not cache attestation. This is not a security sandbox
+    or a reservation against changes after return.
     """
     require(isinstance(receipt_sha256, str) and DIGEST.fullmatch(receipt_sha256),
             "exact receipt digest required")
@@ -334,9 +323,11 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
     raw, _ = read_file(receipt_path, MAX_REQUEST, private=True)
     require(hashlib.sha256(raw).hexdigest() == receipt_sha256, "source receipt digest differs")
     receipt = parse_json(raw)
-    closed(receipt, ("schema", "project_id", "workflow_id", "source_commit", "kit_commit",
-                     "runtime_roots", "files", "policy", "project_memory"))
-    require(receipt["schema"] == "delivery-runtime-publication-v1"
+    fields = {"schema", "project_id", "workflow_id", "source_commit", "kit_commit",
+              "runtime_roots", "files", "policy", "project_memory"}
+    v2 = isinstance(receipt, dict) and receipt.get("schema") == "delivery-runtime-publication-v2"
+    closed(receipt, fields | ({"local_inputs"} if v2 else set()))
+    require(receipt["schema"] in ("delivery-runtime-publication-v1", "delivery-runtime-publication-v2")
             and receipt["project_id"] == project_id and receipt["workflow_id"] == workflow_id
             and receipt["policy"] == "delivery_reliability_v1", "source receipt binding differs")
     memory = receipt["project_memory"]
@@ -381,8 +372,12 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
              for root in set((primary_root, workspace_path, project_root, kit_root,
                               *(item[0] for item in admitted_roots.values())))}
     files = receipt["files"]
+    local_inputs = receipt["local_inputs"] if v2 else []
     require(isinstance(files, list) and 0 < len(files) <= MAX_SOURCE_RECEIPT_FILES,
             "invalid source inventory")
+    require(isinstance(local_inputs, list)
+            and len(files) + len(local_inputs) <= MAX_SOURCE_RECEIPT_FILES,
+            "invalid local instruction inventory")
     inventory = {}
     total = 0
     for item in files:
@@ -411,6 +406,41 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
                 "receipt does not match published source")
         actual, mode = read_file(root / name)
         require(actual == blob and mode == item["mode"], "runtime source differs")
+    locals_by_root = {}
+    local_identities = {}
+    identities = set(inventory)
+    for item in local_inputs:
+        closed(item, ("kind", "root", "relative_path", "sha256", "byte_size", "mode"))
+        require(item["kind"] == "local-instruction", "unsupported local input kind")
+        require(isinstance(item["root"], str)
+                and item["root"] in admitted_roots
+                and item["root"] in {str(primary_root), str(kit_root)},
+                "local instruction root is not primary")
+        name = relative(item["relative_path"])
+        require(name.startswith(".kent/skills/") and name.endswith(".md")
+                and not any(c in name for c in "*?[]"),
+                "invalid local instruction path")
+        require(isinstance(item["sha256"], str) and DIGEST.fullmatch(item["sha256"])
+                and type(item["byte_size"]) is int and 0 <= item["byte_size"] <= MAX_FILE
+                and type(item["mode"]) is int and 0 <= item["mode"] <= 0o777
+                and not item["mode"] & 0o133, "invalid local instruction metadata")
+        identity = (item["root"], name)
+        require(not any(root == identity[0] and (
+            other == name or other.startswith(name + "/") or name.startswith(other + "/"))
+            for root, other in identities), "overlapping local instruction")
+        identities.add(identity)
+        root, _, source_tree = admitted_roots[item["root"]]
+        require(name not in source_tree, "local instruction is published")
+        before = local_identity(root / name)
+        current, mode = read_file(root / name)
+        require(before == local_identity(root / name), "local instruction changed")
+        local_identities[root / name] = before
+        require(len(current) == item["byte_size"] and mode == item["mode"]
+                and hashlib.sha256(current).hexdigest() == item["sha256"],
+                "local instruction bytes or mode differ")
+        total += len(current)
+        require(total <= MAX_TOTAL, "source inspection exceeds limit")
+        locals_by_root.setdefault(root, {})[name] = item
     project_tree = tree(project_root, receipt["source_commit"])
     kit_tree = tree(kit_root, receipt["kit_commit"])
     projections = []
@@ -436,8 +466,10 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
                 "shared project/Kit infrastructure publication differs")
         project_expected.update(projections[1][1])
     for root in set((project_root, primary_root, workspace_path)):
-        verify_copy(root, project_expected, project_tree, kit=project_is_kit)
-    verify_copy(kit_root, projections[1][1], kit_tree, kit=True)
+        verify_copy(root, project_expected, project_tree, kit=project_is_kit,
+                    local_inputs=locals_by_root.get(root))
+    verify_copy(kit_root, projections[1][1], kit_tree, kit=True,
+                local_inputs=locals_by_root.get(kit_root))
     profile_raw, _ = read_file(primary_root / ".kent/workflow-profile.toml")
     profile = tomllib.loads(profile_raw.decode("utf-8"))
     require(profile.get("policies", {}).get("delivery_reliability") == "v1",
@@ -484,21 +516,24 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
         require(git(root, "rev-parse", "--verify", "HEAD").decode().strip() == head,
                 "source HEAD changed")
     for root in set((project_root, primary_root, workspace_path)):
-        verify_copy(root, project_expected, project_tree, kit=project_is_kit)
-    verify_copy(kit_root, projections[1][1], kit_tree, kit=True)
+        verify_copy(root, project_expected, project_tree, kit=project_is_kit,
+                    local_inputs=locals_by_root.get(root))
+    verify_copy(kit_root, projections[1][1], kit_tree, kit=True,
+                local_inputs=locals_by_root.get(kit_root))
     for (root, name), item in inventory.items():
         current, mode = read_file(Path(root) / name)
         require(hashlib.sha256(current).hexdigest() == item["sha256"] and mode == item["mode"],
                 "runtime source changed")
-        verify_python_cache(Path(root) / name, current)
     for root in set((primary_root, kit_root)):
         require(not git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
                         "--ignore-submodules=none"), "primary source changed")
+    for path, identity in local_identities.items():
+        require(local_identity(path) == identity, "local instruction identity changed")
     check_helpers()
     return {"schema": "delivery-source-inspection-v1", "status": "admitted",
             "project_id": project_id, "workflow_id": workflow_id,
             "receipt_sha256": receipt_sha256, "source_commit": receipt["source_commit"],
-            "kit_commit": receipt["kit_commit"], "file_count": len(files),
+            "kit_commit": receipt["kit_commit"], "file_count": len(files) + len(local_inputs),
             "source_bytes": total, "workspace_path": str(workspace_path),
             "source_ref": source_ref, "source_ref_commit": project_tip,
             "kit_ref": kit_ref, "kit_ref_commit": kit_tip,

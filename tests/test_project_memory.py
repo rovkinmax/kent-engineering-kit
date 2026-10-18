@@ -20,6 +20,81 @@ from workflowkit.project_memory import MAX_BYTES, Conflict, MemoryError, Project
 
 
 class ProjectMemoryTests(unittest.TestCase):
+    def test_publication_inventory_v1_v2_closed_and_combined_limits(self):
+        adapter = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-project-memory"))
+        validate = adapter["publication_inventory"]
+        entry = {"root": "/primary", "relative_path": "AGENTS.md",
+                 "sha256": "a" * 64, "byte_size": 1, "mode": 0o644}
+        receipt = {key: None for key in adapter["PUBLICATION_RECEIPT_FIELDS"]}
+        receipt.update(schema="delivery-runtime-publication-v1",
+                       runtime_roots=["/primary", "/kit"], files=[entry])
+        self.assertEqual(validate(receipt, "/primary", "/kit"), 1)
+        local = entry | {"kind": "local-instruction",
+                         "relative_path": ".kent/skills/private/instruction.md", "mode": 0o600}
+        receipt.update(schema="delivery-runtime-publication-v2", local_inputs=[local])
+        self.assertEqual(validate(receipt, "/primary", "/kit"), 2)
+        self.assertEqual(validate(receipt | {"local_inputs": [
+            local | {"relative_path": ".kent/skills/instruction.md"}]}, "/primary", "/kit"), 2)
+        full = [entry | {"relative_path": f"file-{i}"} for i in range(511)]
+        self.assertEqual(validate(receipt | {"files": full}, "/primary", "/kit"), 512)
+        with self.assertRaises(ValueError):
+            validate(receipt | {"files": full + [entry]}, "/primary", "/kit")
+        for change in ({"kind": "module"}, {"mode": 0o700}, {"mode": 0o622},
+                       {"relative_path": ".kent/skills/../instruction.md"},
+                       {"relative_path": ".kent/skills/private/*.md"},
+                       {"root": "/task"}, {"byte_size": True},
+                       {"extra": True}, {"sha256": "invalid"}):
+            with self.subTest(change=change):
+                with self.assertRaises(ValueError):
+                    validate(receipt | {"local_inputs": [local | change]}, "/primary", "/kit")
+        with self.assertRaises(ValueError):
+            validate(receipt | {"local_inputs": [local, local]}, "/primary", "/kit")
+        with self.assertRaises(ValueError):
+            validate(receipt | {"files": [entry] * 512}, "/primary", "/kit")
+        with self.assertRaises(ValueError):
+            validate(receipt | {"schema": "delivery-runtime-publication-v1"}, "/primary", "/kit")
+        with self.assertRaises(ValueError):
+            validate(receipt | {"files": [entry | {"byte_size": 8 * 1024 * 1024,
+                      "relative_path": f"file-{i}"} for i in range(4)]}, "/primary", "/kit")
+
+    def test_native_adapter_v2_private_instruction_both_validators(self):
+        installed, source, environment = self.native_adapter_fixture()
+        ignore = source / ".gitignore"
+        ignore.write_text(ignore.read_text() + "\n.kent/skills/private/\n")
+        subprocess.run(["git", "-C", str(source), "add", ".gitignore"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(source), "commit", "-qm", "ignore private fixture"],
+                       check=True, capture_output=True)
+        commit = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"],
+                                         text=True).strip()
+        subprocess.run(["git", "-C", str(source), "update-ref", "refs/remotes/origin/main", commit],
+                       check=True, capture_output=True)
+        self.receipt["source_commit"] = commit
+        item = next(row for row in self.receipt["files"]
+                    if row["root"] == str(source) and row["relative_path"] == ".gitignore")
+        raw = ignore.read_bytes()
+        item.update(sha256=hashlib.sha256(raw).hexdigest(), byte_size=len(raw))
+        path = source / ".kent/skills/private/instruction.md"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"private fixture instruction\n")
+        path.chmod(0o600)
+        self.receipt.update(schema="delivery-runtime-publication-v2", local_inputs=[{
+            "kind": "local-instruction", "root": str(source),
+            "relative_path": path.relative_to(source).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "byte_size": path.stat().st_size, "mode": 0o600,
+        }])
+        self.pin_adapter_receipt()
+        self.write_adapter_binding()
+        result = self.adapter_call(installed, source, None, "initialize-task",
+                                   native_environment=environment, interface="workflow")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        path.write_bytes(b"changed private fixture\n")
+        result = self.adapter_call(installed, source, None, "initialize-task",
+                                   native_environment=environment, interface="workflow")
+        self.assertNotEqual(result.returncode, 0)
+
     def test_report_only_preparation_requires_gate_before_writing_and_retries_exactly(self):
         import workflowkit.project_memory as core
         adapter = runpy.run_path(str(Path(__file__).resolve().parents[1] /
