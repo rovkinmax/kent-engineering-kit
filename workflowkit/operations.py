@@ -372,14 +372,15 @@ cwd = sys.argv[5]
 env_encoded = sys.argv[6]
 env = json.loads(base64.b64decode(env_encoded).decode())
 limit = int(sys.argv[7])
+input_limit = int(sys.argv[12])
 expected_length = int(sys.argv[8])
 expected_sha256 = sys.argv[9]
 fd_decimal_limit = int(sys.argv[10])
-if expected_length < 0 or expected_length > limit:
+if input_limit not in (262144, 1048576) or expected_length < 0 or expected_length > input_limit:
     raise SystemExit(126)
 if len(expected_sha256) != 64 or any(character not in "0123456789abcdef" for character in expected_sha256):
     raise SystemExit(126)
-stdin_bytes = sys.stdin.buffer.read(limit + 1)
+stdin_bytes = sys.stdin.buffer.read(input_limit + 1)
 if len(stdin_bytes) != expected_length or hashlib.sha256(stdin_bytes).hexdigest() != expected_sha256:
     raise SystemExit(126)
 stdin_view = memoryview(stdin_bytes)
@@ -500,9 +501,10 @@ def _encoded_json(value: Any) -> str:
     return base64.b64encode(canonical_bytes(value)).decode('ascii')
 
 def _guardian_argv(lock_fd: int | str, report_fd: int | str, control_fd: int | str, command_encoded: str, cwd: Path,
-        env_encoded: str, stdin_length: int, stdin_sha256: str) -> list[str]:
+        env_encoded: str, stdin_length: int, stdin_sha256: str, stdin_limit: int=MAX_OUTPUT) -> list[str]:
     return [sys.executable, '-c', _GUARDIAN, str(lock_fd), str(report_fd), str(control_fd), command_encoded, str(cwd),
-            env_encoded, str(MAX_OUTPUT), str(stdin_length), stdin_sha256, str(EXEC_FD_DECIMAL_RESERVE), _CHILD_GATE]
+            env_encoded, str(MAX_OUTPUT), str(stdin_length), stdin_sha256, str(EXEC_FD_DECIMAL_RESERVE), _CHILD_GATE,
+            str(stdin_limit)]
 
 def _child_gate_argv(release_fd: int | str, command_encoded: str, cwd: Path, env_encoded: str) -> list[str]:
     return [sys.executable, '-c', _CHILD_GATE, str(release_fd), command_encoded, str(cwd), env_encoded]
@@ -524,7 +526,7 @@ def _validate_exec_vector(argv: Sequence[str], env: Mapping[str, str], label: st
         raise PlanValidationError(f'{label} exceeds the aggregate process-exec limit')
 
 def _validate_effect_exec_vectors(command: Sequence[str], cwd: Path, env: Mapping[str, str], stdin_length: int,
-        stdin_sha256: str, lock_fd: int) -> tuple[str, str]:
+        stdin_sha256: str, lock_fd: int, stdin_limit: int=MAX_OUTPUT) -> tuple[str, str]:
     lock_arg = str(lock_fd)
     if len(lock_arg) > EXEC_FD_DECIMAL_RESERVE:
         raise PlanValidationError('operation lock descriptor exceeds the process-exec reserve')
@@ -533,7 +535,7 @@ def _validate_effect_exec_vectors(command: Sequence[str], cwd: Path, env: Mappin
     env_encoded = _encoded_json(env)
     reserved_fd = '9' * EXEC_FD_DECIMAL_RESERVE
     guardian_argv = _guardian_argv(lock_arg, reserved_fd, reserved_fd, command_encoded, cwd, env_encoded,
-            stdin_length, stdin_sha256)
+            stdin_length, stdin_sha256, stdin_limit)
     child_gate_argv = _child_gate_argv(reserved_fd, command_encoded, cwd, env_encoded)
     _validate_exec_vector(guardian_argv, env, 'effect guardian')
     _validate_exec_vector(child_gate_argv, env, 'effect child gate')
@@ -680,7 +682,7 @@ class EffectResult:
     settlement: str | None = None
 
 def _effect_inputs(command: Sequence[str], cwd: Path, extra_env: Mapping[str, str] | None, stdin_bytes: bytes | None,
-        preimage_sha256: str | None, postimage_sha256: str | None) -> tuple[list[str], Path, dict[str, str], bytes,
+        preimage_sha256: str | None, postimage_sha256: str | None, *, stdin_limit: int=MAX_OUTPUT) -> tuple[list[str], Path, dict[str, str], bytes,
         dict[str, Any]]:
     argv = _argv(list(command), 'effect command')
     executable = Path(argv[0])
@@ -691,7 +693,9 @@ def _effect_inputs(command: Sequence[str], cwd: Path, extra_env: Mapping[str, st
     if not root.is_dir() or root.is_symlink():
         raise PlanValidationError('effect cwd must be a regular directory')
     stdin = stdin_bytes if stdin_bytes is not None else b''
-    if len(stdin) > MAX_OUTPUT:
+    if type(stdin_limit) is not int or stdin_limit not in (MAX_OUTPUT, 1024 * 1024):
+        raise PlanValidationError('effect stdin bound is invalid')
+    if len(stdin) > stdin_limit:
         raise PlanValidationError('effect stdin is too large')
     for name, value in (('preimage_sha256', preimage_sha256), ('postimage_sha256', postimage_sha256)):
         if value is not None:
@@ -757,18 +761,18 @@ def _terminate_owned(process: subprocess.Popen[bytes]) -> None:
 def run_effect(journal: OperationJournal, *, effect_key: str, command: Sequence[str], cwd: Path, timeout: float=30.0,
         preimage_sha256: str | None=None, postimage_sha256: str | None=None, extra_env: Mapping[str, str] | None=None,
         stdin_bytes: bytes | None=None, current_sha256: Callable[[], str] | None=None,
-        pre_release_check: Callable[[], Any] | None=None) -> EffectResult:
+        pre_release_check: Callable[[], Any] | None=None, stdin_limit: int=MAX_OUTPUT) -> EffectResult:
     if timeout <= 0 or timeout > 300:
         raise PlanValidationError('effect timeout must be between 0 and 300 seconds')
     if not callable(current_sha256):
         raise PlanValidationError('effect requires an exact current-state readback')
     command, cwd, env, stdin_bytes, identity = _effect_inputs(command, cwd, extra_env, stdin_bytes, preimage_sha256,
-            postimage_sha256)
+            postimage_sha256, stdin_limit=stdin_limit)
     lock_fd = journal._lock_fd
     if lock_fd is None:
         raise JournalError('effect requires the held operation lock')
     command_encoded, env_encoded = _validate_effect_exec_vectors(command, cwd, env, len(stdin_bytes),
-            identity['stdin_sha256'], lock_fd)
+            identity['stdin_sha256'], lock_fd, stdin_limit)
     state = journal.state or {}
     effects = dict(state.get('effects') or {})
     previous = effects.get(effect_key)
@@ -796,7 +800,7 @@ def run_effect(journal: OperationJournal, *, effect_key: str, command: Sequence[
         deadline = time.monotonic() + timeout
         guardian_argv = _guardian_argv(_descriptor_arg(lock_fd), _descriptor_arg(write_fd),
                 _descriptor_arg(control_read), command_encoded, cwd, env_encoded, len(stdin_bytes),
-                identity['stdin_sha256'])
+                identity['stdin_sha256'], stdin_limit)
         guardian = subprocess.Popen(guardian_argv, cwd=str(cwd), env=env, stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(lock_fd, write_fd, control_read),
                 start_new_session=True, close_fds=True)
@@ -906,10 +910,11 @@ def _settle_effect(journal: OperationJournal, effect_key: str, current: str, pre
 
 def recover_effect(journal: OperationJournal, *, effect_key: str, command: Sequence[str], cwd: Path, preimage_sha256:
         str | None, postimage_sha256: str | None, current_sha256: Callable[[], str], extra_env: Mapping[str, str] |
-        None=None, stdin_bytes: bytes | None=None) -> str:
+        None=None, stdin_bytes: bytes | None=None, stdin_limit: int=MAX_OUTPUT) -> str:
     if not callable(current_sha256):
         raise PlanValidationError('effect recovery requires an exact readback')
-    _, _, _, _, identity = _effect_inputs(command, cwd, extra_env, stdin_bytes, preimage_sha256, postimage_sha256)
+    _, _, _, _, identity = _effect_inputs(command, cwd, extra_env, stdin_bytes, preimage_sha256, postimage_sha256,
+            stdin_limit=stdin_limit)
     recovery_phases = {'prepared', 'in_progress', 'activation_committed'}
     if journal.operation == RELEASE_LIVE_PORTFOLIO_OPERATION:
         recovery_phases.update({'retirement_in_progress', 'd9_complete', 'canonical_in_progress'})
@@ -929,7 +934,7 @@ def recover_effect(journal: OperationJournal, *, effect_key: str, command: Seque
 def _settle_or_run(journal: OperationJournal, *, effect_key: str, command: Sequence[str], cwd: Path, preimage_sha256:
         str, postimage_sha256: str, current_sha256: Callable[[], str], extra_env: Mapping[str, str] | None=None,
         stdin_bytes: bytes | None=None, timeout: float=30.0,
-        pre_release_check: Callable[[], Any] | None=None) -> str:
+        pre_release_check: Callable[[], Any] | None=None, stdin_limit: int=MAX_OUTPUT) -> str:
     entry = (journal.state.get('effects') or {}).get(effect_key)
     if isinstance(entry, dict) and entry.get('status') == 'verified':
         if current_sha256() != postimage_sha256:
@@ -938,10 +943,11 @@ def _settle_or_run(journal: OperationJournal, *, effect_key: str, command: Seque
     if isinstance(entry, dict) and entry.get('status') in {'attempted', 'unresolved', 'ambiguous'}:
         return recover_effect(journal, effect_key=effect_key, command=command, cwd=cwd, preimage_sha256=preimage_sha256,
                 postimage_sha256=postimage_sha256, current_sha256=current_sha256, extra_env=extra_env,
-                stdin_bytes=stdin_bytes)
+                stdin_bytes=stdin_bytes, stdin_limit=stdin_limit)
     return run_effect(journal, effect_key=effect_key, command=command, cwd=cwd, timeout=timeout,
             preimage_sha256=preimage_sha256, postimage_sha256=postimage_sha256, current_sha256=current_sha256,
-            extra_env=extra_env, stdin_bytes=stdin_bytes, pre_release_check=pre_release_check).settlement or ''
+            extra_env=extra_env, stdin_bytes=stdin_bytes, pre_release_check=pre_release_check,
+            stdin_limit=stdin_limit).settlement or ''
 
 def _run(
     command: Sequence[str],
@@ -6354,6 +6360,15 @@ def _require_native_execution_bindings(parsed: Mapping[str, Any], item: Mapping[
     ):
         raise EffectBlocked('native prepare, dispatch and completion require reviewed native-components-v2 bindings')
 
+def _canonical_v2_stdin_limit(parsed: Mapping[str, Any], item: Mapping[str, Any], stage: Mapping[str, Any]) -> int:
+    if (
+        stage['name'] == 'graph'
+        and isinstance(parsed.get('native_evidence'), Mapping)
+        and item['compatibility_snapshot']['native_components']['schema'] == NATIVE_COMPONENTS_V2_SCHEMA
+    ):
+        return 1024 * 1024
+    return MAX_OUTPUT
+
 
 def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: bool | str,
         kent: str | Path | None, expected_workflow_id: str | None, expected_spec: Any) -> dict[str, Any]:
@@ -6395,6 +6410,16 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
             admission_result = _admit_v2_source(parsed, item)
             progress = _canonical_v2_progress(parsed, item, live)
             final = progress[-1]['after'] if progress else live
+            for stage in progress:
+                stdin_limit = _canonical_v2_stdin_limit(parsed, item, stage)
+                argv, cwd, env, payload, identity = _effect_inputs(
+                    stage['command'], parsed['project_root'], None, stage['stdin'],
+                    canonical_sha256(_canonical_v2_owned(stage['before'])),
+                    canonical_sha256(_canonical_v2_owned(stage['after'])), stdin_limit=stdin_limit,
+                )
+                _validate_effect_exec_vectors(
+                    argv, cwd, env, len(payload), identity['stdin_sha256'], journal._lock_fd, stdin_limit,
+                )
             journal.persist({
                 'phase': 'prepared',
                 'preimage': [live],
@@ -6461,6 +6486,7 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                     journal, effect_key=effect_key, command=stage['command'], cwd=parsed['project_root'],
                     preimage_sha256=before_sha, postimage_sha256=after_sha,
                     current_sha256=current, stdin_bytes=stage['stdin'],
+                    stdin_limit=_canonical_v2_stdin_limit(parsed, item, stage),
                 )
                 if settled == 'preimage':
                     return {**_canonical_report(plan, 'in_progress', journal), 'settled': 'preimage'}
@@ -6532,6 +6558,7 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                 postimage_sha256=canonical_sha256(_canonical_v2_owned(stage['after'])),
                 current_sha256=current, stdin_bytes=stage['stdin'],
                 pre_release_check=process_pre_release,
+                stdin_limit=_canonical_v2_stdin_limit(parsed, item, stage),
             )
             if settled == 'preimage':
                 return {**_canonical_report(plan, 'in_progress', journal), 'settled': 'preimage'}
