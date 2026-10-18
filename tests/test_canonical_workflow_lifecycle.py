@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 import stat
 import subprocess
@@ -273,6 +274,7 @@ def canonical_v2_plan(
         {"id": "node-terminal", "key": "terminal", "kind": "terminal"},
         {"id": "node-implement", "key": "implement", "kind": "agent"},
         {"id": "node-plan", "key": "plan", "kind": "agent"},
+        {"id": "node-fix", "key": "fix", "kind": "agent"},
         {
             "id": "node-plan-revalidation",
             "key": "plan_revalidation",
@@ -304,6 +306,17 @@ def canonical_v2_plan(
             "context_mode": "continue_session",
             "context_source": {"kind": "selected_node", "node_key": "backlog"},
             "prompt_template": "Begin plan revalidation.",
+        })
+    if not any(edge.get("key") == "fix_replan" for edge in workflow["graph"]["edges"]):
+        workflow["graph"]["transition_groups"].append({
+            "id": "group-fix-replan", "source_node_id": "node-fix",
+            "transition_id": "fix_replan",
+        })
+        workflow["graph"]["edges"].append({
+            "id": "edge-fix-replan", "key": "fix_replan",
+            "transition_group_id": "group-fix-replan",
+            "target_node_id": "node-plan-revalidation",
+            "parameters": [], "prompt_template": "Revalidate after a fix.",
         })
     detail = workflow["details"]["TASK-1"]
     detail["live_sessions"] = []
@@ -342,6 +355,7 @@ def canonical_v2_plan(
             "context_mode": "continue_session",
             "context_source": {"kind": "selected_node", "node_key": "plan"},
             "prompt_template": "Revalidate the approved plan.",
+            "parameters": [],
         })
     source_admission = (
         synthetic_source_admission(Path(fixture["root"]))
@@ -633,6 +647,7 @@ def make_native_persistence(
     production_shape: bool = False,
     with_approvals: bool = False,
     unknown_backlog: bool = False,
+    with_questions: bool = False,
 ) -> tuple[Path, Path, Path, sqlite3.Connection, list[dict], list[dict], dict]:
     """Create a disposable, WAL-backed persistence DB matching native reader queries."""
     root = Path(fixture["root"])
@@ -675,7 +690,7 @@ def make_native_persistence(
                     "native_state": "waiting_ask",
                     "attention_types": ["question"],
                 }
-                if index == 0
+                if index == 0 or (with_questions and index in (4, 5))
                 else {"kind": "doing", "native_state": "waiting"}
             )
             node_id = "node-terminal" if terminal else "node-backlog"
@@ -695,7 +710,7 @@ def make_native_persistence(
             current_node = {"node_id": node_id}
             if with_approvals and index < 4:
                 current_node["transition_branch_key"] = "backlog_plan"
-            elif index == 0 and rows and not unknown_backlog:
+            elif (index == 0 or (with_questions and index in (4, 5))) and rows and not unknown_backlog:
                 current_node["session_id"] = rows[0]["session_id"]
             details[task_id] = {
                 "id": task_id,
@@ -747,7 +762,21 @@ def make_native_persistence(
             project_id TEXT NOT NULL,
             workflow_id BLOB NOT NULL,
             project_workflow_link_id TEXT NOT NULL,
-            workflow_revision_seen INTEGER NOT NULL
+            workflow_revision_seen INTEGER NOT NULL,
+            source_workspace_id TEXT,
+            managed_worktree_id TEXT,
+            execution_target_mode TEXT,
+            execution_target_requested_ref TEXT,
+            execution_target_resolved_ref TEXT,
+            execution_target_commit_oid TEXT,
+            execution_target_provenance TEXT,
+            updated_at_unix_ms INTEGER
+        );
+        CREATE TABLE worktrees (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            canonical_root_path TEXT NOT NULL,
+            creation_base_commit_oid TEXT
         );
         CREATE TABLE task_current_nodes (
             task_id TEXT NOT NULL,
@@ -835,7 +864,8 @@ def make_native_persistence(
         task_id = task["task_id"]
         detail = workflow["details"][task_id]
         connection.execute(
-            "INSERT INTO task_records VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO task_records (id,project_id,workflow_id,project_workflow_link_id,"
+            "workflow_revision_seen) VALUES (?, ?, ?, ?, ?)",
             (task_id, PROJECT_ID, wid_bytes, "link-1", workflow["version"]),
         )
         current = detail["current_nodes"][0]
@@ -929,7 +959,8 @@ def make_native_persistence(
                             }],
                         },
                     }
-                    if task_id == "TASK-1" and not with_approvals and not unknown_backlog
+                    if (task_id == "TASK-1" and not with_approvals and not unknown_backlog)
+                    or (with_questions and task_id in ("TASK-5", "TASK-6"))
                     else {
                         "seq": 1,
                         "kind": "message",
@@ -994,12 +1025,9 @@ def native_observer_patches(
     def run(command, **kwargs):
         if len(command) > 1 and command[1] == "question":
             if (
-                command[2:] != [
-                    "--session",
-                    context["question_session_id"],
-                    "--project",
-                    PROJECT_ID,
-                ]
+                len(command) != 6 or command[2] != "--session"
+                or command[3] not in context.get("question_session_ids", [context["question_session_id"]])
+                or list(command[4:]) != ["--project", PROJECT_ID]
             ):
                 return 1, b"", b"unexpected question query"
             return 0, question_output, b""
@@ -1035,6 +1063,8 @@ def native_canonical_v2_plan(
     unknown_backlog: bool = False,
     intent: str = "graph-only",
     synchronize_effects: bool = False,
+    with_questions: bool = False,
+    with_bindings: bool = False,
 ) -> tuple[operations.LoadedPlan, dict, dict]:
     if synchronize_effects:
         # Install before canonical_v2_plan binds the executable digest. Only
@@ -1058,13 +1088,21 @@ def native_canonical_v2_plan(
 '''
         if source.count(marker) != 1:
             raise AssertionError("fake Kent save hook is not unique")
-        kent.write_text(source.replace(marker, replacement, 1))
+        source = source.replace(marker, replacement, 1)
+        metadata_marker = '    state["last_update_argv"] = args'
+        if source.count(metadata_marker) != 1:
+            raise AssertionError("fake Kent metadata hook is not unique")
+        # Native workflow update saves metadata through SaveWorkflowGraph,
+        # which increments the same Workflow revision as graph apply.
+        source = source.replace(metadata_marker, '    workflow["version"] += 1\n' + metadata_marker, 1)
+        kent.write_text(source)
     plan, value = canonical_v2_plan(fixture, intent=intent)
     home, database, sessions_root, connection, sessions, _, question_input = make_native_persistence(
         fixture,
         production_shape=production_shape,
         with_approvals=with_approvals,
         unknown_backlog=unknown_backlog,
+        with_questions=with_questions,
     )
     testcase.addCleanup(connection.close)
     descriptor = {
@@ -1095,6 +1133,37 @@ def native_canonical_v2_plan(
             "SESSION-1",
         ),
     }
+    if with_questions:
+        context["question_session_ids"] = [
+            row["id"] for row in sessions if row["task_id"] in ("TASK-5", "TASK-6")
+        ]
+    if with_bindings:
+        connection.executemany(
+            "INSERT INTO workspaces VALUES (?, ?, ?)",
+            [
+                ("workspace-task", PROJECT_ID, str(Path(fixture["root"]) / "historical/task-source")),
+                ("workspace-session", PROJECT_ID, str(Path(fixture["root"]) / "historical/session-source")),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO worktrees VALUES (?, ?, ?, ?)",
+            [
+                ("worktree-task", "workspace-task", str(Path(fixture["root"]) / "historical/task-tree"), "c" * 40),
+                ("worktree-session", "workspace-session", str(Path(fixture["root"]) / "historical/session-tree"), "d" * 40),
+            ],
+        )
+        connection.execute(
+            "UPDATE task_records SET source_workspace_id='workspace-task',"
+            "managed_worktree_id='worktree-task',execution_target_mode='custom_ref',"
+            "execution_target_requested_ref='ref:published',execution_target_resolved_ref='refs/heads/published',"
+            "execution_target_commit_oid=?,execution_target_provenance='explicit' WHERE id IN ('TASK-1','TASK-30')",
+            ("e" * 40,),
+        )
+        connection.execute(
+            "UPDATE sessions SET workspace_id='workspace-session',worktree_id='worktree-session' WHERE id=?",
+            (sessions[0]["id"],),
+        )
+        connection.commit()
     with native_observer_patches(context):
         observed = operations._canonical_v2_read(parsed, parsed["workflows"][0])
 
@@ -1286,6 +1355,31 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             )["sha256"],
             "0" * 64,
         )
+
+    def test_future_task_checkout_at_published_pin_passes_actual_source_inspector(self) -> None:
+        fixture, admitted = create_verified_source_fixture(self, PROJECT_ID, workflow_id(0))
+        checkout = fixture.base / "future-task-checkout"
+        future_pin = fixture.receipt["source_commit"]
+        fixture.git(fixture.project, "worktree", "add", "-q", "--detach", str(checkout), future_pin)
+        self.assertEqual(fixture.git(checkout, "rev-parse", "HEAD").strip(), future_pin)
+        result = subprocess.run(
+            [
+                sys.executable, str(fixture.kit / "scripts/inspect-delivery-source"),
+                "--receipt", str(fixture.receipt_path), "--receipt-sha256", fixture.digest,
+                "--project-id", PROJECT_ID, "--workflow-id", workflow_id(0),
+                "--project-root", str(fixture.project), "--kit-root", str(fixture.kit),
+                "--primary-root", str(fixture.project), "--workspace", str(checkout),
+                "--source-ref", admitted.value["source_ref"], "--kit-ref", admitted.value["kit_ref"],
+                "--ci-helper", str(fixture.ci_helper),
+                "--installed-helper", str(fixture.adapter_link), str(fixture.adapter_target),
+            ],
+            cwd=checkout, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        inspection = json.loads(result.stdout)
+        self.assertEqual(inspection["status"], "admitted")
+        self.assertEqual(inspection["source_commit"], future_pin)
+        self.assertEqual(inspection["workspace_path"], str(checkout))
 
     def test_v2_private_source_admission_uses_real_cli_and_combined_count(self):
         fixture, admitted = create_verified_source_fixture(
@@ -2579,6 +2673,222 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 for ref in session["source_refs"]
             ))
 
+    def test_native_workflow_policy_change_preserves_task_bindings(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, observed = native_canonical_v2_plan(
+                fixture, self, production_shape=True, with_approvals=True,
+                intent="graph-and-metadata", synchronize_effects=True,
+                with_questions=True, with_bindings=True,
+            )
+            value = plan.value
+            value["workflows"][0]["target_metadata"]["execution_target"] = "ref:" + "a" * 40
+            review = json.loads(context["review_path"].read_text())
+            review["target_metadata_sha256"] = canonical_sha256(value["workflows"][0]["target_metadata"])
+            review["dispositions"].append({
+                "path": "metadata.execution_target", "disposition": "compatible",
+                "evidence": review["dispositions"][0]["evidence"],
+            })
+            raw = canonical_bytes(review)
+            context["review_path"].write_bytes(raw)
+            value["workflows"][0]["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+            plan = write_canonical_v2_plan(fixture, value)
+            frozen_tables = (
+                "task_records", "sessions", "worktrees", "workspaces",
+                "task_pending_approvals", "task_pending_approval_branches",
+            )
+            frozen = [
+                context["connection"].execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+                for table in frozen_tables
+            ]
+            with native_observer_patches(context):
+                reconcile_canonical_workflows(plan, mode="prepare")
+                self.assertEqual(
+                    reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)["phase"],
+                    "complete",
+                )
+                parsed = operations._validate_canonical_v2_plan(plan)
+                current = operations._canonical_v2_read(parsed, parsed["workflows"][0])
+            before = observed["compatibility_snapshot"]["native_components"]
+            after = current["compatibility_snapshot"]["native_components"]
+            self.assertEqual(before, after)
+            self.assertEqual(len(after["questions"]), 2)
+            self.assertEqual(len(after["approvals"]), 4)
+            for table, rows in zip(frozen_tables, frozen):
+                self.assertEqual(
+                    context["connection"].execute(f"SELECT * FROM {table} ORDER BY 1").fetchall(), rows)
+            self.assertEqual(len(graph_apply_rows(fixture)), 1)
+            self.assertEqual(sum(row[:2] == ["workflow", "update"] for row in read_log(fixture)), 1)
+
+    def test_native_execution_binding_drift_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self, synchronize_effects=True)
+            with native_observer_patches(context):
+                reconcile_canonical_workflows(plan, mode="prepare")
+                context["connection"].execute(
+                    "UPDATE task_records SET execution_target_commit_oid=?", ("b" * 40,))
+                context["connection"].commit()
+                with self.assertRaises(EffectBlocked):
+                    reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_binding_digest_protects_every_execution_field_and_referenced_root(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, observed = native_canonical_v2_plan(
+                fixture, self, production_shape=True, with_bindings=True,
+            )
+            connection = context["connection"]
+            parsed = operations._validate_canonical_v2_plan(plan)
+            item = parsed["workflows"][0]
+            baseline = observed["compatibility_snapshot"]["native_components"]
+            self.assertEqual(baseline["schema"], "kent-native-components-v2")
+            changes = [
+                ("task_records", "TASK-1", field, value)
+                for field, value in (
+                    ("source_workspace_id", "workspace-session"),
+                    ("managed_worktree_id", "worktree-session"),
+                    ("execution_target_mode", "default_branch"),
+                    ("execution_target_requested_ref", "different-ref"),
+                    ("execution_target_resolved_ref", "refs/heads/different"),
+                    ("execution_target_commit_oid", "f" * 40),
+                    ("execution_target_provenance", "workflow_default"),
+                )
+            ] + [
+                ("task_records", "TASK-30", "execution_target_commit_oid", "f" * 40),
+                ("task_records", "TASK-13", "execution_target_mode", "default_branch"),
+                ("worktrees", "worktree-task", "canonical_root_path", str(Path(temporary) / "different-tree")),
+                ("worktrees", "worktree-task", "creation_base_commit_oid", "f" * 40),
+                ("worktrees", "worktree-task", "workspace_id", "workspace-session"),
+                ("worktrees", "worktree-session", "canonical_root_path", str(Path(temporary) / "different-retained")),
+                ("workspaces", "workspace-task", "canonical_root_path", str(Path(temporary) / "different-source")),
+                ("workspaces", "workspace-session", "canonical_root_path", str(Path(temporary) / "different-retained-source")),
+            ]
+            with native_observer_patches(context):
+                for table, identity, field, value in changes:
+                    with self.subTest(table=table, identity=identity, field=field):
+                        old = connection.execute(f"SELECT {field} FROM {table} WHERE id=?", (identity,)).fetchone()[0]
+                        connection.execute(f"UPDATE {table} SET {field}=? WHERE id=?", (value, identity))
+                        connection.commit()
+                        try:
+                            current = operations._canonical_v2_read(parsed, item)
+                            actual = current["compatibility_snapshot"]["native_components"]
+                            self.assertNotEqual(
+                                actual["task_execution_bindings_sha256"], baseline["task_execution_bindings_sha256"])
+                            with self.assertRaisesRegex(EffectBlocked, "inventory drifted"):
+                                operations._canonical_v2_gate(item, current, item["expected_version"])
+                        finally:
+                            connection.execute(f"UPDATE {table} SET {field}=? WHERE id=?", (old, identity))
+                            connection.commit()
+                connection.execute("UPDATE task_records SET updated_at_unix_ms=999")
+                connection.commit()
+                actual = operations._canonical_v2_read(parsed, item)["compatibility_snapshot"]["native_components"]
+                self.assertEqual(actual, baseline)
+                for table, identity, field, value in (
+                    ("task_records", "TASK-1", "source_workspace_id", "absent"),
+                    ("task_records", "TASK-1", "managed_worktree_id", "absent"),
+                    ("worktrees", "worktree-session", "workspace_id", "absent"),
+                    ("workspaces", "workspace-task", "project_id", "foreign-project"),
+                    ("workspaces", "workspace-session", "project_id", "foreign-project"),
+                ):
+                    with self.subTest(missing_or_foreign=(table, identity, field)):
+                        old = connection.execute(f"SELECT {field} FROM {table} WHERE id=?", (identity,)).fetchone()[0]
+                        connection.execute(f"UPDATE {table} SET {field}=? WHERE id=?", (value, identity))
+                        connection.commit()
+                        try:
+                            with self.assertRaises(EffectBlocked):
+                                operations._canonical_v2_read(parsed, item)
+                        finally:
+                            connection.execute(f"UPDATE {table} SET {field}=? WHERE id=?", (old, identity))
+                            connection.commit()
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_component_versions_are_closed_and_preserve_original_shape(self) -> None:
+        v1 = {
+            "schema": "kent-native-components-v1", "approvals": [], "questions": [], "sessions": [],
+            "terminal_inventory_sha256": "a" * 64,
+        }
+        v2 = {**v1, "schema": "kent-native-components-v2", "task_execution_bindings_sha256": "b" * 64}
+        for value in (v1, v2):
+            self.assertEqual(operations._native_components(value, "components"), value)
+        for value in (
+            {**v1, "task_execution_bindings_sha256": "b" * 64},
+            {key: value for key, value in v2.items() if key != "task_execution_bindings_sha256"},
+            {**v2, "task_execution_bindings_sha256": True},
+            {**v2, "task_execution_bindings_sha256": "invalid"},
+            {**v2, "extra": None},
+        ):
+            with self.subTest(value=value), self.assertRaises(PlanValidationError):
+                operations._native_components(value, "components")
+
+    def test_legacy_native_evidence_is_recovery_only_and_never_upgraded_from_live_state(self) -> None:
+        for outcome in ("new-dispatch", "preimage", "postimage", "final", "complete"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+                fixture = make_d9_fixture(Path(temporary))
+                plan, context, observed = native_canonical_v2_plan(
+                    fixture, self, intent="graph-and-metadata" if outcome == "complete" else "graph-only")
+                value = plan.value
+                item = value["workflows"][0]
+                components = item["compatibility_snapshot"]["native_components"]
+                components["schema"] = "kent-native-components-v1"
+                components.pop("task_execution_bindings_sha256")
+                observed["compatibility_snapshot"]["native_components"] = dict(components)
+                review = json.loads(context["review_path"].read_text())
+                review["compatibility_snapshot_sha256"] = canonical_sha256(item["compatibility_snapshot"])
+                raw = canonical_bytes(review)
+                context["review_path"].write_bytes(raw)
+                item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+                plan = write_canonical_v2_plan(fixture, value)
+                state_dir = Path(value["state_dir"])
+                with self.assertRaisesRegex(EffectBlocked, "require reviewed native-components-v2"):
+                    reconcile_canonical_workflows(plan, mode="prepare")
+                self.assertFalse(state_dir.exists(), "rejected v1 prepare must not create journal/lock directory")
+                before_state = read_state(fixture)
+                # A legacy journal is a historical fixture, never a new prepare
+                # performed through the v2-only admission gate.
+                with OperationJournal(state_dir, "canonical-workflow-reconcile", plan) as journal:
+                    journal.persist({
+                        "phase": "prepared", "preimage": [observed],
+                        "inventory": {}, "members": [{"workflow_id": workflow_id(0), "status": "prepared"}],
+                        "effects": {},
+                    })
+                with native_observer_patches(context):
+                    if outcome != "new-dispatch":
+                        install_v2_unresolved_graph_postimage(fixture, plan)
+                    if outcome == "preimage":
+                        write_state(fixture, before_state)
+                    if outcome in ("final", "complete"):
+                        if outcome == "complete":
+                            state = read_state(fixture)
+                            state["workflows"][workflow_id(0)]["metadata"] = item["target_metadata"]
+                            write_state(fixture, state)
+                        with OperationJournal(state_dir, "canonical-workflow-reconcile", plan) as journal:
+                            journal.persist({
+                                **journal.state, "phase": "complete" if outcome == "complete" else "in_progress",
+                                "members": [{"workflow_id": workflow_id(0),
+                                             "status": "verified" if outcome == "complete" else "graph_verified"}],
+                            })
+                    with mock.patch.object(
+                        operations, "_canonical_v2_read", side_effect=AssertionError("legacy native reader used"),
+                    ), mock.patch.object(
+                        operations, "_canonical_v2_plan_check", side_effect=AssertionError("legacy evidence refreshed"),
+                    ):
+                        if outcome in ("new-dispatch", "final"):
+                            with self.assertRaisesRegex(EffectBlocked, "require reviewed native-components-v2"):
+                                reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+                        else:
+                            report = reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+                            if outcome == "complete":
+                                self.assertTrue(report["resumed"])
+                                self.assertEqual(report["phase"], "complete")
+                            else:
+                                self.assertEqual(report["settled"], outcome)
+                                with self.assertRaisesRegex(EffectBlocked, "require reviewed native-components-v2"):
+                                    reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+                self.assertEqual(graph_apply_rows(fixture), [])
+                self.assertEqual(item["compatibility_snapshot"]["native_components"], components)
+
     def test_native_frozen_approvals_survive_real_graph_and_metadata_effects(self) -> None:
         for intent in ("graph-only", "graph-and-metadata"):
             with self.subTest(intent=intent), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
@@ -2613,13 +2923,14 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     self.assertEqual(
                         connection.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall(), rows)
                 workflow = read_state(fixture)["workflows"][workflow_id(0)]
-                self.assertEqual(workflow["version"], 17)
+                expected_version = 18 if intent == "graph-and-metadata" else 17
+                self.assertEqual(workflow["version"], expected_version)
                 self.assertNotEqual(
                     json.loads(before[1][0][3])["prompt_template"],
                     next(edge for edge in workflow["graph"]["edges"]
                          if edge["key"] == "backlog_plan")["prompt_template"],
                 )
-                self.assertEqual(connection.execute("SELECT version FROM workflows").fetchone(), (17,))
+                self.assertEqual(connection.execute("SELECT version FROM workflows").fetchone(), (expected_version,))
                 self.assertEqual(len(graph_apply_rows(fixture)), 1)
                 self.assertEqual(
                     sum(row[:2] == ["workflow", "update"] for row in read_log(fixture)),
@@ -2709,12 +3020,13 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 self.assertEqual(graph_apply_rows(fixture), [])
 
     def test_native_drift_after_graph_blocks_metadata_and_completion(self) -> None:
-        for change in ("approval", "unknown-graph"):
+        for change in ("approval", "unknown-graph", "binding", "null-backlog", "retained-root"):
             with self.subTest(change=change), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
                 fixture = make_d9_fixture(Path(temporary))
                 plan, context, _ = native_canonical_v2_plan(
                     fixture, self, production_shape=True, with_approvals=True,
                     intent="graph-and-metadata", synchronize_effects=True,
+                    with_bindings=True,
                 )
                 settle = operations._settle_or_run
 
@@ -2726,10 +3038,21 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                             "UPDATE task_pending_approvals SET materialized_values_json="
                             "' ' || materialized_values_json")
                         context["connection"].commit()
-                    else:
+                    elif change == "unknown-graph":
                         state = read_state(fixture)
                         state["workflows"][workflow_id(0)]["graph"]["edges"][0]["prompt_template"] = "unknown"
                         write_state(fixture, state)
+                    elif change == "retained-root":
+                        context["connection"].execute(
+                            "UPDATE worktrees SET canonical_root_path=? WHERE id='worktree-session'",
+                            (str(Path(temporary) / "changed-retained-root"),))
+                        context["connection"].commit()
+                    else:
+                        task = "TASK-1" if change == "binding" else "TASK-13"
+                        context["connection"].execute(
+                            "UPDATE task_records SET execution_target_commit_oid=? WHERE id=?",
+                            ("f" * 40, task))
+                        context["connection"].commit()
                     return result
 
                 with native_observer_patches(context):
@@ -3309,12 +3632,9 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                         prompt_template=expected
                     ),
                 )),
-                "ingress-suffix-changed": changed(lambda graph: graph["edges"][0].update(
-                    prompt_template=graph["edges"][0]["prompt_template"].replace(
-                        "\n\nBegin plan revalidation.",
-                        "\n\nUnreviewed prompt change.",
-                    )
-                )),
+                "hidden-extra-marker": changed(lambda graph: graph["edges"][1].update(prompt=expected)),
+                "node-extra-marker": changed(lambda graph: graph["nodes"][0].update(prompt=expected)),
+                "group-extra-marker": changed(lambda graph: graph["transition_groups"][0].update(prompt=expected)),
             }
             for name, graph in cases.items():
                 with self.subTest(name=name), self.assertRaises(PlanValidationError):
@@ -3326,6 +3646,143 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                         workflow_id=workflow_id(0),
                         project_root=Path(fixture["root"]),
                     )
+            for graph in (
+                changed(lambda graph: graph["edges"][0].update(
+                    prompt_template=expected + "\n\nNew reviewed ingress body.")),
+                changed(lambda graph: graph["edges"][1].update(
+                    prompt_template="New reviewed non-ingress body.")),
+            ):
+                gate(
+                    source_graph, graph, item["source_admission"],
+                    project_id=PROJECT_ID, workflow_id=workflow_id(0), project_root=Path(fixture["root"]),
+                )
+
+    def test_composed_builder_parameters_and_prompt_reviews_are_exact(self) -> None:
+        from workflowkit.graph import plan_workflow_graph
+        from workflowkit.delivery import source_admission_gate
+
+        root = Path(__file__).resolve().parents[1]
+        builder = runpy.run_path(str(root / ".kent/workflows/kit_development.py"))
+        profile = builder["profile_at"](root, check_files=False)
+        legacy = replace(
+            profile, commands=builder["COMMAND_TARGETS"],
+            policies={key: value for key, value in profile.policies.items() if key != "delivery_reliability"},
+        )
+        for complexity in (False, True):
+            with self.subTest(complexity=complexity), tempfile.TemporaryDirectory() as temporary:
+                legacy_profile = replace(
+                    legacy, policies={**legacy.policies, "coder_selection": "complexity" if complexity else "disabled"},
+                )
+                current_profile = replace(
+                    profile, policies={**profile.policies, "coder_selection": "complexity" if complexity else "disabled"},
+                )
+                baseline = builder["build_complexity_candidate_workflow" if complexity else "build_workflow"](
+                    legacy_profile)
+                spec = builder["build_current_workflow"](current_profile)
+                empty = {"workflow_id": workflow_id(0), "expected_version": 16,
+                         "graph": {key: [] for key in ("nodes", "edges", "node_groups", "transition_groups")}}
+                source_graph = plan_workflow_graph(baseline, empty, metadata_changed=False).document["graph"]
+                target = plan_workflow_graph(
+                    spec, {**empty, "graph": source_graph}, metadata_changed=False).document["graph"]
+                source_graph["version"] = 16
+                target["version"] = 17
+                fixture = make_d9_fixture(Path(temporary))
+                plan, value = canonical_v2_plan(fixture)
+                item = value["workflows"][0]
+                runtime = item["runtime_refs"][0]
+                for graph in (source_graph, target):
+                    for node in graph["nodes"]:
+                        if node["kind"] == "script":
+                            node["script_path"] = runtime["path"]
+                ingress = operations._v2_ingress_edge(target, "builder target")
+                ingress["prompt_template"] = source_admission_gate(
+                    item["source_admission"], project_id=PROJECT_ID, workflow_id=workflow_id(0),
+                    project_root=str(fixture["root"]),
+                ) + "\n\n" + ingress["prompt_template"]
+                parameters = next(edge for edge in target["edges"] if edge["key"] == "implement_replan")[
+                    "parameters"]
+                self.assertEqual(len(parameters), 7 if complexity else 6)
+                operations._v2_graph_compatibility(source_graph, target, item["runtime_refs"])
+                operations._v2_source_gate_check(
+                    source_graph, target, item["source_admission"], project_id=PROJECT_ID,
+                    workflow_id=workflow_id(0), project_root=Path(fixture["root"]),
+                )
+                mutations = [
+                    parameters[:-1], list(reversed(parameters)), [{"key": "arbitrary"}],
+                    [{**parameters[0], "key": "renamed"}, *parameters[1:]],
+                    [{**parameters[0], "type": "changed"}, *parameters[1:]],
+                    [{**parameters[0], "default": None}, *parameters[1:]],
+                ]
+                for mutation in mutations:
+                    bad = json.loads(json.dumps(target))
+                    next(edge for edge in bad["edges"] if edge["key"] == "implement_replan")[
+                        "parameters"] = mutation
+                    with self.assertRaisesRegex(PlanValidationError, "additive route"):
+                        operations._v2_graph_compatibility(source_graph, bad, item["runtime_refs"])
+                typed_source = json.loads(json.dumps(source_graph))
+                typed_target = json.loads(json.dumps(target))
+                for graph in (typed_source, typed_target):
+                    next(edge for edge in graph["edges"] if edge["key"] == "fix_replan")[
+                        "parameters"][0]["default"] = True
+                next(edge for edge in typed_target["edges"] if edge["key"] == "implement_replan")[
+                    "parameters"][0]["default"] = 1
+                with self.assertRaisesRegex(PlanValidationError, "additive route"):
+                    operations._v2_graph_compatibility(typed_source, typed_target, item["runtime_refs"])
+                for duplicate in (False, True):
+                    bad_source = json.loads(json.dumps(source_graph))
+                    fix = next(edge for edge in bad_source["edges"] if edge["key"] == "fix_replan")
+                    if duplicate:
+                        bad_source["edges"].append({**fix, "id": "duplicate-fix"})
+                        bad_target = json.loads(json.dumps(target))
+                        bad_target["edges"].append({**fix, "id": "duplicate-fix"})
+                    else:
+                        bad_source["edges"].remove(fix)
+                        bad_target = json.loads(json.dumps(target))
+                        bad_target["edges"] = [edge for edge in bad_target["edges"] if edge["id"] != fix["id"]]
+                    with self.assertRaisesRegex(PlanValidationError, "additive route"):
+                        operations._v2_graph_compatibility(bad_source, bad_target, item["runtime_refs"])
+
+                source = {
+                    **read_state(fixture)["workflows"][workflow_id(0)],
+                    "workflow_id": workflow_id(0), "project_id": PROJECT_ID,
+                    "version": 16, "graph": source_graph, "links": item["links"], "default": item["default"],
+                }
+                source["metadata"] = {key: source["metadata"][key]
+                                      for key in ("name", "description", "execution_target")}
+                item.update(expected_version=16, source_graph_sha256=canonical_sha256(source_graph),
+                            source_metadata_sha256=canonical_sha256(source["metadata"]), target_graph=target,
+                            anchors=[])
+                review_path = Path(item["compatibility_review_ref"]["path"])
+                review = json.loads(review_path.read_text())
+                review.update(source_graph_sha256=item["source_graph_sha256"],
+                              source_metadata_sha256=item["source_metadata_sha256"],
+                              target_graph_sha256=canonical_sha256(target),
+                              target_metadata_sha256=canonical_sha256(source["metadata"]))
+                required = operations._v2_required_review_paths(
+                    source_graph, target, source["metadata"], source["metadata"], item["compatibility_snapshot"])
+                evidence = review["dispositions"][0]["evidence"]
+                review["dispositions"] = [
+                    {"path": path, "disposition": "compatible", "evidence": evidence} for path in required
+                ]
+
+                def write_review():
+                    raw = canonical_bytes(review)
+                    review_path.write_bytes(raw)
+                    item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+
+                write_review()
+                operations._validate_canonical_v2_target(
+                    {"project_root": Path(fixture["root"])}, item, source, None, None)
+                prompt_paths = [path for path in required if path.endswith(".prompt_template")]
+                self.assertGreater(len(prompt_paths), 1)
+                for path in prompt_paths:
+                    accepted = review["dispositions"]
+                    review["dispositions"] = [row for row in accepted if row["path"] != path]
+                    write_review()
+                    with self.assertRaisesRegex(PlanValidationError, "changed semantic path"):
+                        operations._validate_canonical_v2_target(
+                            {"project_root": Path(fixture["root"])}, item, source, None, None)
+                    review["dispositions"] = accepted
 
     def test_v2_script_paths_allow_only_exact_qualified_script_replacements(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

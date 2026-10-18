@@ -2389,6 +2389,7 @@ CANONICAL_V2_MAX_PLAN = 1024 * 1024
 CANONICAL_V2_MAX_REFERENCE = 1024 * 1024
 NATIVE_EVIDENCE_SCHEMA = 'kent-native-evidence-v1'
 NATIVE_COMPONENTS_SCHEMA = 'kent-native-components-v1'
+NATIVE_COMPONENTS_V2_SCHEMA = 'kent-native-components-v2'
 NATIVE_MAX_TASKS = 4096
 NATIVE_MAX_TERMINAL_IDENTITIES = 4096
 NATIVE_MAX_EVENT_FILE_BYTES = 256 * 1024 * 1024
@@ -3272,10 +3273,11 @@ def _v2_ref_list(
 
 
 def _native_components(value: Any, label: str) -> dict[str, Any]:
+    v2 = isinstance(value, dict) and value.get('schema') == NATIVE_COMPONENTS_V2_SCHEMA
     raw = _closed(value, {
         'schema', 'approvals', 'questions', 'sessions', 'terminal_inventory_sha256',
-    }, label)
-    if raw.get('schema') != NATIVE_COMPONENTS_SCHEMA:
+    } | ({'task_execution_bindings_sha256'} if v2 else set()), label)
+    if raw.get('schema') not in (NATIVE_COMPONENTS_SCHEMA, NATIVE_COMPONENTS_V2_SCHEMA):
         raise PlanValidationError(f'{label}.schema is unsupported')
     approvals = []
     for index, row_value in enumerate(_bounded_list(_required(raw, 'approvals', label), f'{label}.approvals')):
@@ -3347,8 +3349,8 @@ def _native_components(value: Any, label: str) -> dict[str, Any]:
         raise PlanValidationError(f'{label}.sessions exceeds the detailed Session bound')
     sessions.sort(key=lambda row: (row['task_id'], row['session_id']))
     _unique([row['session_id'] for row in sessions], f'{label}.sessions')
-    return {
-        'schema': NATIVE_COMPONENTS_SCHEMA,
+    result = {
+        'schema': raw['schema'],
         'approvals': approvals,
         'questions': questions,
         'sessions': sessions,
@@ -3357,6 +3359,12 @@ def _native_components(value: Any, label: str) -> dict[str, Any]:
             f'{label}.terminal_inventory_sha256',
         ),
     }
+    if v2:
+        result['task_execution_bindings_sha256'] = _sha256(
+            _required(raw, 'task_execution_bindings_sha256', label),
+            f'{label}.task_execution_bindings_sha256',
+        )
+    return result
 
 
 def _v2_native_descriptor(value: Any, label: str) -> dict[str, Any]:
@@ -3995,6 +4003,70 @@ def _native_question_matches_cli(
         raise EffectBlocked('native pending Question output differs from its persisted input')
 
 
+def _native_execution_bindings(
+    connection: sqlite3.Connection,
+    project_id: str,
+    tasks: Sequence[Mapping[str, Any]],
+    sessions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Observe only persisted bindings, without requalifying historical roots."""
+    task_keys = (
+        'id', 'source_workspace_id', 'managed_worktree_id', 'execution_target_mode',
+        'execution_target_requested_ref', 'execution_target_resolved_ref',
+        'execution_target_commit_oid', 'execution_target_provenance',
+    )
+    task_bindings = sorted(
+        [{key: row[key] for key in task_keys} for row in tasks], key=lambda row: row['id'],
+    )
+
+    def references(rows: Sequence[Mapping[str, Any]], key: str) -> set[str]:
+        values = set()
+        for row in rows:
+            value = row[key]
+            if value is not None:
+                if not isinstance(value, str) or not value:
+                    raise EffectBlocked('native execution binding identity is invalid')
+                values.add(value)
+        return values
+
+    worktree_ids = references(tasks, 'managed_worktree_id') | references(sessions, 'worktree_id')
+    workspace_ids = references(tasks, 'source_workspace_id') | references(sessions, 'workspace_id')
+    if len(worktree_ids) > NATIVE_MAX_TERMINAL_IDENTITIES:
+        raise EffectBlocked('native execution worktrees exceed the identity bound')
+    worktrees = _native_rows_by_ids(
+        connection,
+        'SELECT id,workspace_id,canonical_root_path,creation_base_commit_oid FROM worktrees WHERE id IN',
+        sorted(worktree_ids),
+    )
+    if len(worktrees) != len(worktree_ids) or {row['id'] for row in worktrees} != worktree_ids:
+        raise EffectBlocked('native execution worktree join is missing or duplicated')
+    workspace_ids |= references(worktrees, 'workspace_id')
+    if any(row['workspace_id'] is None for row in worktrees):
+        raise EffectBlocked('native execution worktree has no workspace')
+    if len(workspace_ids) > NATIVE_MAX_TERMINAL_IDENTITIES:
+        raise EffectBlocked('native execution workspaces exceed the identity bound')
+    workspaces = _native_rows_by_ids(
+        connection,
+        'SELECT id,project_id,canonical_root_path FROM workspaces WHERE id IN',
+        sorted(workspace_ids),
+    )
+    if (
+        len(workspaces) != len(workspace_ids)
+        or {row['id'] for row in workspaces} != workspace_ids
+        or any(row['project_id'] != project_id for row in workspaces)
+    ):
+        raise EffectBlocked('native execution workspace join is missing, duplicated or foreign')
+    for row in [*worktrees, *workspaces]:
+        root = row['canonical_root_path']
+        if not isinstance(root, str) or not Path(root).is_absolute() or os.path.normpath(root) != root:
+            raise EffectBlocked('native execution canonical root is invalid')
+    return {
+        'tasks': task_bindings,
+        'worktrees': sorted(worktrees, key=lambda row: row['id']),
+        'workspaces': sorted(workspaces, key=lambda row: row['id']),
+    }
+
+
 def _native_approval_payload(
     approval: Mapping[str, Any],
     branches: Sequence[Mapping[str, Any]],
@@ -4218,7 +4290,9 @@ def _native_observe(
 
         task_rows = _native_rows(
             connection,
-            'SELECT id,project_id,workflow_id,project_workflow_link_id,workflow_revision_seen '
+            'SELECT id,project_id,workflow_id,project_workflow_link_id,workflow_revision_seen,'
+            'source_workspace_id,managed_worktree_id,execution_target_mode,execution_target_requested_ref,'
+            'execution_target_resolved_ref,execution_target_commit_oid,execution_target_provenance '
             'FROM task_records WHERE project_id=? AND workflow_id=? ORDER BY id',
             (item['project_id'], workflow_bytes),
         )
@@ -4451,7 +4525,12 @@ def _native_observe(
         session_facts_by_id = {row['id']: row for row in cli_sessions}
         aggregate_bytes = [0]
         selected_bytes = [0]
-        db_component_bytes = [0]
+        execution_bindings = _native_execution_bindings(
+            connection, item['project_id'], task_rows, detailed_rows,
+        )
+        db_component_bytes = [len(canonical_bytes(execution_bindings))]
+        if db_component_bytes[0] > NATIVE_MAX_DB_COMPONENT_BYTES:
+            raise EffectBlocked('native execution bindings exceed the component byte bound')
         for row in sorted(detailed_rows, key=lambda value: (value['task_id'], value['id'])):
             try:
                 _uuid(row['id'], 'native Session identity')
@@ -4576,11 +4655,12 @@ def _native_observe(
             row['task_id'], row['session_id'], row['call_id'], row['event_sequence'],
         ))
         components = {
-            'schema': NATIVE_COMPONENTS_SCHEMA,
+            'schema': NATIVE_COMPONENTS_V2_SCHEMA,
             'approvals': approval_components,
             'questions': question_components,
             'sessions': session_components,
             'terminal_inventory_sha256': terminal_inventory_sha256,
+            'task_execution_bindings_sha256': canonical_sha256(execution_bindings),
         }
         detailed_cli_sessions = [
             dict(row) for row in cli_sessions if row['task_id'] in detailed_task_ids
@@ -4885,6 +4965,7 @@ def _v2_graph_compatibility(
     if len(new_groups) != 1 or len(new_edges) != 1:
         raise PlanValidationError('v2 structural change must add exactly implement_replan')
     group, edge = new_groups[0], new_edges[0]
+    fix_edges = [row for row in source['edges'] if row.get('key') == 'fix_replan']
     if (
         group.get('source_node_id') != keys.get('implement', {}).get('id')
         or group.get('transition_id') != 'implement_replan'
@@ -4895,7 +4976,8 @@ def _v2_graph_compatibility(
         or edge.get('context_mode') != 'continue_session'
         or edge.get('context_source') != {'kind': 'selected_node', 'node_key': 'plan'}
         or keys.get('plan') is None
-        or edge.get('parameters') not in (None, [])
+        or len(fix_edges) != 1
+        or canonical_sha256(edge.get('parameters')) != canonical_sha256(fix_edges[0].get('parameters'))
         or edge.get('assignee_selection') != 'configured'
         or edge.get('thinking_selection') != 'configured'
         or not isinstance(edge.get('prompt_template'), str)
@@ -4949,66 +5031,33 @@ def _v2_source_gate_check(
 ) -> None:
     from .delivery import SOURCE_ADMISSION_BEGIN, SOURCE_ADMISSION_END, source_admission_gate
 
-    source_ingress = _v2_ingress_edge(source_graph, 'source graph')
+    _v2_ingress_edge(source_graph, 'source graph')
     target_ingress = _v2_ingress_edge(target_graph, 'target graph')
-    source_prompt = source_ingress.get('prompt_template', source_ingress.get('prompt'))
     target_prompt = target_ingress.get('prompt_template', target_ingress.get('prompt'))
-    if not isinstance(source_prompt, str) or not isinstance(target_prompt, str):
+    if not isinstance(target_prompt, str):
         raise PlanValidationError('source gate ingress prompt is absent')
-    old_starts = source_prompt.count(SOURCE_ADMISSION_BEGIN)
-    old_ends = source_prompt.count(SOURCE_ADMISSION_END)
-    if old_starts == 0 and old_ends == 0:
-        inherited_prompt = source_prompt
-    elif old_starts == 1 and old_ends == 1 and source_prompt.startswith(SOURCE_ADMISSION_BEGIN):
-        end = source_prompt.find(SOURCE_ADMISSION_END)
-        after = end + len(SOURCE_ADMISSION_END)
-        if end < 0 or not source_prompt[after:].startswith('\n\n'):
-            raise PlanValidationError('existing source admission frame is malformed')
-        inherited_prompt = source_prompt[after + 2:]
-    else:
-        raise PlanValidationError('source graph source admission frame is duplicated or malformed')
-    source_edges = {
-        row.get('id'): row
-        for row in source_graph.get('edges', [])
-        if isinstance(row, dict)
-    }
-    for edge in target_graph.get('edges', []):
-        if not isinstance(edge, dict) or edge.get('id') == target_ingress.get('id'):
-            continue
-        source_edge = source_edges.get(edge.get('id'))
-        if source_edge is None:
-            continue
-        prompt_before = source_edge.get('prompt_template', source_edge.get('prompt'))
-        prompt_after = edge.get('prompt_template', edge.get('prompt'))
-        if (
-            prompt_after != prompt_before
-            or (isinstance(prompt_after, str) and (
-                SOURCE_ADMISSION_BEGIN in prompt_after
-                or SOURCE_ADMISSION_END in prompt_after
-            ))
-        ):
-            raise PlanValidationError('source admission cannot alter another Workflow prompt')
     gate = source_admission_gate(
         dict(admission),
         project_id=project_id,
         workflow_id=workflow_id,
         project_root=str(project_root),
     )
-    expected_prompt = f'{gate}\n\n{inherited_prompt}'
-    if target_prompt != expected_prompt:
+    if not target_prompt.startswith(f'{gate}\n\n'):
         raise PlanValidationError('target ingress does not contain the exact bound source admission gate')
     starts = sum(
         prompt.count(SOURCE_ADMISSION_BEGIN)
-        for edge in target_graph.get('edges', [])
+        for collection in ('nodes', 'edges', 'node_groups', 'transition_groups')
+        for edge in target_graph.get(collection, [])
         if isinstance(edge, dict)
-        for prompt in [edge.get('prompt_template', edge.get('prompt', ''))]
+        for prompt in [edge.get('prompt_template'), edge.get('prompt')]
         if isinstance(prompt, str)
     )
     ends = sum(
         prompt.count(SOURCE_ADMISSION_END)
-        for edge in target_graph.get('edges', [])
+        for collection in ('nodes', 'edges', 'node_groups', 'transition_groups')
+        for edge in target_graph.get(collection, [])
         if isinstance(edge, dict)
-        for prompt in [edge.get('prompt_template', edge.get('prompt', ''))]
+        for prompt in [edge.get('prompt_template'), edge.get('prompt')]
         if isinstance(prompt, str)
     )
     if starts != 1 or ends != 1:
@@ -5775,11 +5824,16 @@ def _canonical_v2_unknown_approval_is_nonimpact(
 def _canonical_v2_inventory_matches(
     item: Mapping[str, Any],
     live_snapshot: Mapping[str, Any],
+    *,
+    expected_execution_target: str | None = None,
 ) -> bool:
     planned = item['compatibility_snapshot']
+    policy = planned['execution_target'] if expected_execution_target is None else expected_execution_target
+    if live_snapshot.get('execution_target') != policy:
+        return False
     if any(
         live_snapshot.get(key) != planned.get(key)
-        for key in ('schema', 'workflow_id', 'project_id', 'execution_target', 'execution_root')
+        for key in ('schema', 'workflow_id', 'project_id', 'execution_root')
     ):
         return False
     planned_tasks = {row['id']: row for row in planned['tasks']}
@@ -6129,13 +6183,20 @@ def _canonical_v2_assert_owned(parsed: Mapping[str, Any], item: Mapping[str, Any
         _canonical_v2_owned_read(parsed, item)
         if native_mode else _canonical_v2_read(parsed, item)
     )
-    _canonical_v2_gate(item, live, expected['version'], compare_inventory=False)
+    _canonical_v2_gate(
+        item, live, expected['version'], compare_inventory=False,
+        expected_execution_target=expected['metadata']['execution_target'],
+    )
     if canonical_sha256(_canonical_v2_owned(live)) != canonical_sha256(_canonical_v2_owned(expected)):
         raise EffectBlocked(f"v2 effect-owned Workflow postimage drifted for {item['workflow_id']}")
     return live
 
 def _canonical_v2_gate(item: Mapping[str, Any], snapshot: Mapping[str, Any], expected_version: int,
-        *, compare_inventory: bool=True) -> None:
+        *, compare_inventory: bool=True, expected_execution_target: str | None=None) -> None:
+    policy = (
+        item['compatibility_snapshot']['execution_target']
+        if expected_execution_target is None else expected_execution_target
+    )
     if (snapshot.get('workflow_id') != item['workflow_id'] or snapshot.get('project_id') != item['project_id'] or
             snapshot.get('version') != expected_version or snapshot.get('valid') is not True):
         raise EffectBlocked('v2 Workflow identity/revision/validation drifted')
@@ -6149,8 +6210,10 @@ def _canonical_v2_gate(item: Mapping[str, Any], snapshot: Mapping[str, Any], exp
             if isinstance(node, dict)}
     if any(node_kinds.get(anchor['id']) != anchor['kind'] for anchor in item['anchors']):
         raise EffectBlocked('v2 Workflow lost a reviewed anchor')
+    if snapshot.get('metadata', {}).get('execution_target') != policy:
+        raise EffectBlocked('v2 Workflow execution policy drifted from its owned stage')
     if compare_inventory and not _canonical_v2_inventory_matches(
-            item, snapshot.get('compatibility_snapshot', {})):
+            item, snapshot.get('compatibility_snapshot', {}), expected_execution_target=policy):
         raise EffectBlocked('v2 Task/Session/approval inventory drifted')
 
 def _canonical_v2_plan_check(parsed: Mapping[str, Any], item: Mapping[str, Any], preimage: Mapping[str, Any],
@@ -6264,11 +6327,33 @@ def _canonical_v2_progress(
     item: Mapping[str, Any],
     prepared: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    return [
+    stages = [
         stage for stage in _canonical_progress(parsed, item, prepared)
         if canonical_sha256(_canonical_v2_owned(stage['before']))
         != canonical_sha256(_canonical_v2_owned(stage['after']))
     ]
+    if (
+        isinstance(parsed.get('native_evidence'), Mapping)
+        and item['compatibility_snapshot']['native_components']['schema'] == NATIVE_COMPONENTS_V2_SCHEMA
+    ):
+        for stage in stages:
+            if stage['name'] == 'metadata':
+                # Native workflow update saves metadata through the graph
+                # store and increments its revision without rewriting Tasks.
+                # Legacy v1 journals retain their original effect identities.
+                version = stage['before']['version'] + 1
+                stage['after'] = {
+                    **stage['after'], 'version': version,
+                    'graph': {**stage['after']['graph'], 'version': version},
+                }
+    return stages
+
+def _require_native_execution_bindings(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> None:
+    if isinstance(parsed.get('native_evidence'), Mapping) and (
+        item['compatibility_snapshot']['native_components']['schema'] != NATIVE_COMPONENTS_V2_SCHEMA
+    ):
+        raise EffectBlocked('native prepare, dispatch and completion require reviewed native-components-v2 bindings')
+
 
 def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: bool | str,
         kent: str | Path | None, expected_workflow_id: str | None, expected_spec: Any) -> dict[str, Any]:
@@ -6296,6 +6381,8 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
         item['graph'] = item['target_graph']
     if 'target_metadata' in item:
         item['metadata'] = item['target_metadata']
+    if mode == 'prepare':
+        _require_native_execution_bindings(parsed, item)
     with OperationJournal(parsed['state_dir'], 'canonical-workflow-reconcile', plan) as journal:
         if mode == 'prepare':
             if journal.state is not None:
@@ -6360,7 +6447,11 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                 }
                 if live_owned_sha not in allowed_owned:
                     raise EffectBlocked('v2 unresolved effect has an unknown Workflow postimage')
-                _canonical_v2_gate(item, live, live['version'], compare_inventory=False)
+                owned = stage['before'] if live_owned_sha == before_sha else stage['after']
+                _canonical_v2_gate(
+                    item, live, owned['version'], compare_inventory=False,
+                    expected_execution_target=owned['metadata']['execution_target'],
+                )
                 current = lambda: canonical_sha256(_canonical_v2_owned(
                     _canonical_v2_owned_read(parsed, item)
                     if isinstance(parsed.get('native_evidence'), Mapping)
@@ -6383,14 +6474,21 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                         'settled': 'postimage',
                     }
                 if (
-                    not _canonical_v2_inventory_matches(item, after['compatibility_snapshot'])
+                    not _canonical_v2_inventory_matches(
+                        item, after['compatibility_snapshot'],
+                        expected_execution_target=stage['after']['metadata']['execution_target'],
+                    )
                     and stage_index < len(progress) - 1
                 ):
                     return {**_canonical_report(plan, 'in_progress', journal), 'settled': settled}
             else:
+                _require_native_execution_bindings(parsed, item)
                 live = _canonical_v2_read(parsed, item)
                 live_owned_sha = canonical_sha256(_canonical_v2_owned(live))
-                _canonical_v2_gate(item, live, stage['before']['version'])
+                _canonical_v2_gate(
+                    item, live, stage['before']['version'],
+                    expected_execution_target=stage['before']['metadata']['execution_target'],
+                )
                 if live_owned_sha != before_sha:
                     raise EffectBlocked('v2 effect-owned state drifted before the next stage')
                 _canonical_v2_plan_check(
@@ -6410,7 +6508,10 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                     # Re-read all mutable native evidence after static plan/source
                     # checks and immediately before recording the new effect.
                     fresh = _canonical_v2_read(parsed, item)
-                    _canonical_v2_gate(item, fresh, stage['before']['version'])
+                    _canonical_v2_gate(
+                        item, fresh, stage['before']['version'],
+                        expected_execution_target=stage['before']['metadata']['execution_target'],
+                    )
                     if canonical_sha256(_canonical_v2_owned(fresh)) != before_sha:
                         raise EffectBlocked('v2 effect-owned state drifted before native dispatch')
                 current = lambda: canonical_sha256(_canonical_v2_owned(
@@ -6442,6 +6543,7 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                 not isinstance(parsed.get('native_evidence'), Mapping)
                 and not _canonical_v2_inventory_matches(
                     item, after['compatibility_snapshot'],
+                    expected_execution_target=stage['after']['metadata']['execution_target'],
                 )
                 and stage_index < len(progress) - 1
             ):
@@ -6450,13 +6552,18 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                 not isinstance(parsed.get('native_evidence'), Mapping)
                 and not _canonical_v2_inventory_matches(
                     item, after['compatibility_snapshot'],
+                    expected_execution_target=stage['after']['metadata']['execution_target'],
                 )
                 and stage_index < len(progress) - 1
             ):
                 return {**_canonical_report(plan, 'in_progress', journal), 'settled': settled}
+        _require_native_execution_bindings(parsed, item)
         live = _canonical_v2_read(parsed, item)
         expected = progress[-1]['after'] if progress else preimage
-        _canonical_v2_gate(item, live, expected['version'])
+        _canonical_v2_gate(
+            item, live, expected['version'],
+            expected_execution_target=expected['metadata']['execution_target'],
+        )
         if canonical_sha256(_canonical_v2_owned(live)) != canonical_sha256(_canonical_v2_owned(expected)):
             raise EffectBlocked('v2 final effect-owned Workflow state drifted')
         journal.persist({**journal.state, 'phase': 'complete', 'members': [{
