@@ -1095,6 +1095,18 @@ def native_canonical_v2_plan(
         # Native workflow update saves metadata through SaveWorkflowGraph,
         # which increments the same Workflow revision as graph apply.
         source = source.replace(metadata_marker, '    workflow["version"] += 1\n' + metadata_marker, 1)
+        graph_marker = '        workflow["graph"] = document["graph"]'
+        if source.count(graph_marker) != 1:
+            raise AssertionError("fake Kent graph-save hook is not unique")
+        whitespace = (
+            "\t\n\v\f\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+            "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+        )
+        source = source.replace(graph_marker, graph_marker + f'''
+        for edge in workflow["graph"]["edges"]:
+            if isinstance(edge.get("prompt_template"), str):
+                edge["prompt_template"] = edge["prompt_template"].strip({whitespace!r})
+''', 1)
         kent.write_text(source)
     plan, value = canonical_v2_plan(fixture, intent=intent)
     home, database, sessions_root, connection, sessions, _, question_input = make_native_persistence(
@@ -2672,6 +2684,87 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 for session in plan.value["workflows"][0]["compatibility_snapshot"]["sessions"]
                 for ref in session["source_refs"]
             ))
+
+    def test_native_project_readers_resolve_absolute_tilde_and_query_relative_roots(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self)
+            parsed = operations._validate_canonical_v2_plan(plan)
+            item = parsed["workflows"][0]
+            baseline = read_state(fixture)
+            for reader in (operations._canonical_v2_read, operations._canonical_v2_owned_read):
+                for native_root in (str(Path(temporary)), "~/..", "."):
+                    with self.subTest(reader=reader.__name__, native_root=native_root):
+                        state = json.loads(json.dumps(baseline))
+                        state["project_root"] = native_root
+                        write_state(fixture, state)
+                        with native_observer_patches(context):
+                            result = reader(parsed, item)
+                        self.assertEqual(result["workflow_id"], item["workflow_id"])
+                for foreign in (str(Path(temporary) / "foreign"), "~/foreign", "foreign"):
+                    with self.subTest(reader=reader.__name__, foreign=foreign):
+                        state = json.loads(json.dumps(baseline))
+                        state["project_root"] = foreign
+                        write_state(fixture, state)
+                        with native_observer_patches(context), self.assertRaisesRegex(
+                            EffectBlocked, "identity/root drifted",
+                        ):
+                            reader(parsed, item)
+
+    def test_native_graph_save_matches_projected_prompt_bytes_exactly(self) -> None:
+        from workflowkit.graph import plan_workflow_graph
+        from workflowkit.model import EdgeSpec, NodeSpec, WorkflowSpec
+
+        spec = WorkflowSpec(
+            name="Native save fixture", description="Exact prompt bytes.", execution_target="head",
+            nodes=(NodeSpec("start", "start", "Start"), NodeSpec("end", "terminal", "End")),
+            edges=(EdgeSpec("finish", "start", "finish", "end", prompt=" \nKeep internal\n whitespace.\t\n"),),
+        )
+        projected = plan_workflow_graph(
+            spec,
+            {"workflow_id": workflow_id(0), "expected_version": 1,
+             "graph": {key: [] for key in ("nodes", "edges", "node_groups", "transition_groups")}},
+            metadata_changed=False,
+        )
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self, synchronize_effects=True)
+            value = plan.value
+            item = value["workflows"][0]
+            next(edge for edge in item["target_graph"]["edges"] if edge["key"] == "implement_replan")[
+                "prompt_template"] = projected.document["graph"]["edges"][0]["prompt_template"]
+            review = json.loads(context["review_path"].read_text())
+            review["target_graph_sha256"] = canonical_sha256(item["target_graph"])
+            raw = canonical_bytes(review)
+            context["review_path"].write_bytes(raw)
+            item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+            plan = write_canonical_v2_plan(fixture, value)
+            with native_observer_patches(context):
+                reconcile_canonical_workflows(plan, mode="prepare")
+                self.assertEqual(
+                    reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)["phase"], "complete")
+                parsed = operations._validate_canonical_v2_plan(plan)
+                actual = operations._canonical_v2_owned_read(parsed, parsed["workflows"][0])
+            self.assertEqual(actual["graph"], item["target_graph"])
+            self.assertEqual(len(graph_apply_rows(fixture)), 1)
+            expected = operations._canonical_v2_owned(actual)
+            for drift in ("prompt", "metadata", "version"):
+                with self.subTest(drift=drift):
+                    state = read_state(fixture)
+                    baseline = json.loads(json.dumps(state))
+                    workflow = state["workflows"][workflow_id(0)]
+                    if drift == "prompt":
+                        # Never strip the readback to hide an extra difference.
+                        workflow["graph"]["edges"][-1]["prompt_template"] += "\n"
+                    elif drift == "metadata":
+                        workflow["metadata"]["description"] += " drift"
+                    else:
+                        workflow["version"] += 1
+                    write_state(fixture, state)
+                    with native_observer_patches(context), self.assertRaises(EffectBlocked):
+                        operations._canonical_v2_assert_owned(parsed, parsed["workflows"][0], expected)
+                    write_state(fixture, baseline)
+            self.assertEqual(len(graph_apply_rows(fixture)), 1)
 
     def test_native_workflow_policy_change_preserves_task_bindings(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:

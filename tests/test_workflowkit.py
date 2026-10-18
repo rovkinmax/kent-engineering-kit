@@ -7619,6 +7619,61 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             client.apply(spec)
         self.assertEqual(commands, [])
 
+    def test_native_edge_prompt_projection_matches_go_whitespace_before_diff(self) -> None:
+        whitespace = (
+            "\t\n\v\f\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+            "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+        )
+        spec = WorkflowSpec(
+            name="Native whitespace", description="Projection fixture.", execution_target="head",
+            nodes=(NodeSpec("start", "start", "Start"), NodeSpec("end", "terminal", "End")),
+            edges=(EdgeSpec("finish", "start", "finish", "end",
+                            prompt=whitespace + "\x1c interior \n whitespace \x1f" + whitespace),),
+        )
+        inspected = {
+            "workflow_id": "11111111-1111-4111-8111-111111111111", "expected_version": 1,
+            "graph": {key: [] for key in ("nodes", "edges", "node_groups", "transition_groups")},
+        }
+        plan = plan_workflow_graph(spec, inspected, metadata_changed=False)
+        self.assertEqual(
+            plan.document["graph"]["edges"][0]["prompt_template"],
+            "\x1c interior \n whitespace \x1f",
+        )
+        second = plan_workflow_graph(spec, plan.document, metadata_changed=False)
+        self.assertFalse(second.graph_changed)
+
+    def test_shared_native_projection_is_narrow_nonmutating_and_idempotent(self) -> None:
+        from workflowkit.graph import native_graph_projection
+
+        graph = {
+            "version": 17, "description": " Keep metadata.\n",
+            "nodes": [{"id": "node-1", "prompt_template": " Keep node instructions.\n"}],
+            "transition_groups": [{"description": " Keep transition description.\n"}],
+            "edges": [
+                {"id": "edge-1", "prompt_template": "\nPrompt with\n internal \t whitespace.\n",
+                 "future": {"prompt_template": " Keep unknown data.\n"}},
+                {"id": "edge-2", "prompt_template": None},
+                {"id": "edge-3", "prompt": " Keep other field.\n"},
+                {"id": "edge-4", "prompt_template": " \t\n"},
+            ],
+        }
+        original = deepcopy(graph)
+        projected = native_graph_projection(graph)
+        self.assertEqual(graph, original)
+        expected = deepcopy(graph)
+        expected["edges"][0]["prompt_template"] = "Prompt with\n internal \t whitespace."
+        expected["edges"][3]["prompt_template"] = ""
+        self.assertEqual(projected, expected)
+        self.assertEqual(native_graph_projection(projected), projected)
+        projected["edges"][0]["future"]["prompt_template"] = "Changed copy only"
+        self.assertEqual(graph, original)
+        for character in "\x1c\x1d\x1e\x1f\u180e\u200b\ufeff":
+            text = character + " content\n " + character
+            self.assertEqual(
+                native_graph_projection({"edges": [{"prompt_template": text}]})["edges"][0]["prompt_template"],
+                text,
+            )
+
     def test_graph_projection_preserves_ids_order_and_unknown_fields(self) -> None:
         spec = WorkflowSpec(
             name="Minimal v1",

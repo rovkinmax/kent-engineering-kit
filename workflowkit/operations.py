@@ -5564,7 +5564,7 @@ def _canonical_read(
     project_id = item['project_id']
     project_rows = _project_rows(kent, root)
     projects = [row for row in project_rows if row['id'] == project_id]
-    if len(projects) != 1 or Path(projects[0]['path']).resolve() != root.resolve():
+    if len(projects) != 1 or (root / Path(projects[0]['path']).expanduser()).resolve() != root.resolve():
         raise EffectBlocked('canonical project identity/root drifted')
     pages = _kent_pages(kent, ['workflow', 'list', '--project', project_id], cwd=root)
     links, default, listed_version = _workflow_link_state(_page_rows(pages, ('items', 'workflows')), project_id, wid)
@@ -6140,7 +6140,7 @@ def _canonical_v2_owned_read(
         row for row in _project_rows(kent, root)
         if row['id'] == project_id
     ]
-    if len(projects) != 1 or Path(projects[0]['path']).resolve() != root.resolve():
+    if len(projects) != 1 or (root / Path(projects[0]['path']).expanduser()).resolve() != root.resolve():
         raise EffectBlocked('canonical project identity/root drifted during owned readback')
     pages = _kent_pages(kent, ['workflow', 'list', '--project', project_id], cwd=root)
     links, default, listed_version = _workflow_link_state(
