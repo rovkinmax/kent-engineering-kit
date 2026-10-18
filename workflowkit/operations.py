@@ -2771,7 +2771,16 @@ def _source_native_identity(
     kent_path: Path,
 ) -> str:
     projects = [row for row in _project_rows(kent_path, project_root) if row['id'] == project_id]
-    if len(projects) != 1 or Path(projects[0]['path']) != primary_root:
+    if len(projects) != 1:
+        raise PlanValidationError('native project identity/root differs from source admission')
+    try:
+        native_root = Path(projects[0]['path']).expanduser()
+        if not native_root.is_absolute():
+            native_root = project_root / native_root
+        native_root = native_root.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise PlanValidationError('native project identity/root differs from source admission') from error
+    if native_root != primary_root:
         raise PlanValidationError('native project identity/root differs from source admission')
     code, output, _ = _run(
         [str(kent_path), 'project', str(primary_root)],
@@ -2783,8 +2792,7 @@ def _source_native_identity(
     rows = _page_rows(pages, ('items', 'tasks'))
     task_ids = [_row_id(row, 'id', 'task_id') for row in rows]
     _unique(task_ids, 'native source-admission Task inventory')
-    workspace_ids: set[str] = set()
-    for task_id in task_ids:
+    for task_id in sorted(task_ids):
         detail = _kent_json(
             kent_path,
             ['task', 'show', task_id, '--project', project_id, '--json'],
@@ -2793,12 +2801,15 @@ def _source_native_identity(
         if _row_id(detail, 'id', 'task_id') != task_id:
             raise PlanValidationError('native Task identity changed during source admission')
         summary = detail.get('summary') if isinstance(detail.get('summary'), dict) else {}
-        if summary.get('project_id') not in (None, project_id):
+        if summary.get('project_id') != project_id:
             raise PlanValidationError('native Task project differs during source admission')
         source = detail.get('source_workspace')
-        if not isinstance(source, dict) or source.get('is_primary') is not True:
-            continue
-        source_root = _source_canonical_root(
+        if not isinstance(source, dict) or not isinstance(source.get('is_primary'), bool):
+            raise PlanValidationError('native Task primary workspace evidence is malformed')
+        project = detail.get('project')
+        if not isinstance(project, dict):
+            raise PlanValidationError('native primary workspace identity is inconsistent')
+        source_root_path = _source_canonical_path(
             _required(source, 'root_path', f'Task {task_id}.source_workspace'),
             f'Task {task_id}.source_workspace.root_path',
         )
@@ -2806,18 +2817,34 @@ def _source_native_identity(
             _required(source, 'workspace_id', f'Task {task_id}.source_workspace'),
             f'Task {task_id}.source_workspace.workspace_id',
         )
-        project = detail.get('project')
+        default_workspace_id = _string(
+            _required(project, 'default_workspace_id', f'Task {task_id}.project'),
+            f'Task {task_id}.project.default_workspace_id',
+        )
         if (
-            source_root != primary_root
-            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,255}', workspace_id)
-            or not isinstance(project, dict)
-            or project.get('default_workspace_id') != workspace_id
+            not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,255}', workspace_id)
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,255}', default_workspace_id)
         ):
             raise PlanValidationError('native primary workspace identity is inconsistent')
-        workspace_ids.add(workspace_id)
-    if len(workspace_ids) != 1:
-        raise PlanValidationError('native primary workspace identity is unavailable or ambiguous')
-    return next(iter(workspace_ids))
+        if source['is_primary'] is False:
+            try:
+                source_root = source_root_path.resolve(strict=False)
+            except (OSError, RuntimeError) as error:
+                raise PlanValidationError('native primary workspace identity is inconsistent') from error
+            if source_root == primary_root or workspace_id == default_workspace_id:
+                raise PlanValidationError('native primary workspace identity is inconsistent')
+            continue
+        source_root = _source_canonical_root(
+            str(source_root_path),
+            f'Task {task_id}.source_workspace.root_path',
+        )
+        if (
+            source_root != primary_root
+            or default_workspace_id != workspace_id
+        ):
+            raise PlanValidationError('native primary workspace identity is inconsistent')
+        return workspace_id
+    raise PlanValidationError('native primary workspace identity is unavailable or ambiguous')
 
 
 def _source_binding(

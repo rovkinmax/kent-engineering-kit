@@ -1260,7 +1260,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_source_admission_rejects_duplicate_native_task_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             with mock.patch.object(
                 operations,
                 "_project_rows",
@@ -1277,6 +1277,284 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 with self.assertRaisesRegex(
                     PlanValidationError,
                     "native source-admission Task inventory contains duplicate identities",
+                ):
+                    operations._source_native_identity(
+                        project_id=PROJECT_ID,
+                        project_root=root,
+                        primary_root=root,
+                        kent_path=root / "kent",
+                    )
+
+    def test_source_native_identity_normalizes_project_paths_and_stops_at_primary_task(self) -> None:
+        def task_detail(
+            task_id: str,
+            *,
+            root: Path,
+            workspace_id: str,
+            is_primary: bool,
+            default_workspace_id: str = "workspace-primary",
+        ) -> dict:
+            return {
+                "summary": {"id": task_id, "project_id": PROJECT_ID},
+                "source_workspace": {
+                    "root_path": str(root),
+                    "is_primary": is_primary,
+                    "workspace_id": workspace_id,
+                },
+                "project": {"default_workspace_id": default_workspace_id},
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve() / "home"
+            root = home / "primary"
+            secondary_root = home / "secondary"
+            root.mkdir(parents=True)
+            details = {
+                "task-00-secondary": task_detail(
+                    "task-00-secondary",
+                    root=secondary_root,
+                    workspace_id="workspace-secondary",
+                    is_primary=False,
+                ),
+                "task-01-primary": task_detail(
+                    "task-01-primary",
+                    root=root,
+                    workspace_id="workspace-primary",
+                    is_primary=True,
+                ),
+            }
+            task_rows = [
+                {"task_id": "task-55335-corrupt-later"},
+                {"task_id": "task-01-primary"},
+                {"task_id": "task-00-secondary"},
+            ]
+            for native_path in ("./", "~/primary", str(root)):
+                with self.subTest(native_path=native_path):
+                    detail_calls: list[str] = []
+
+                    def read_detail(
+                        _kent: Path,
+                        args: list[str],
+                        *,
+                        cwd: Path,
+                    ) -> dict:
+                        self.assertEqual(cwd, root)
+                        task_id = args[2]
+                        detail_calls.append(task_id)
+                        if task_id == "task-55335-corrupt-later":
+                            raise AssertionError("read unrelated malformed Task detail")
+                        return details[task_id]
+
+                    with mock.patch.dict(os.environ, {"HOME": str(home)}), \
+                            mock.patch.object(
+                                operations,
+                                "_project_rows",
+                                return_value=[{
+                                    "id": PROJECT_ID,
+                                    "name": "fixture",
+                                    "path": native_path,
+                                }],
+                            ), mock.patch.object(
+                                operations,
+                                "_run",
+                                return_value=(0, PROJECT_ID.encode(), b""),
+                            ), mock.patch.object(
+                                operations,
+                                "_kent_pages",
+                                return_value=[{"tasks": task_rows}],
+                            ), mock.patch.object(
+                                operations,
+                                "_kent_json",
+                                side_effect=read_detail,
+                            ):
+                        workspace_id = operations._source_native_identity(
+                            project_id=PROJECT_ID,
+                            project_root=root,
+                            primary_root=root,
+                            kent_path=root / "kent",
+                        )
+
+                    self.assertEqual(workspace_id, "workspace-primary")
+                    self.assertEqual(detail_calls, ["task-00-secondary", "task-01-primary"])
+
+    def test_source_native_identity_fails_closed_on_selected_task_read_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with mock.patch.object(
+                operations,
+                "_project_rows",
+                return_value=[{"id": PROJECT_ID, "name": "fixture", "path": str(root)}],
+            ), mock.patch.object(
+                operations,
+                "_run",
+                return_value=(0, PROJECT_ID.encode(), b""),
+            ), mock.patch.object(
+                operations,
+                "_kent_pages",
+                return_value=[{"tasks": [
+                    {"task_id": "task-00-selected"},
+                    {"task_id": "task-01-later"},
+                ]}],
+            ), mock.patch.object(
+                operations,
+                "_kent_json",
+                side_effect=operations.OperationError("selected native Task read failed"),
+            ) as read_detail:
+                with self.assertRaisesRegex(
+                    operations.OperationError,
+                    "selected native Task read failed",
+                ):
+                    operations._source_native_identity(
+                        project_id=PROJECT_ID,
+                        project_root=root,
+                        primary_root=root,
+                        kent_path=root / "kent",
+                    )
+
+            self.assertEqual(read_detail.call_count, 1)
+            self.assertEqual(read_detail.call_args.args[1][2], "task-00-selected")
+
+    def test_source_native_identity_rejects_inconsistent_primary_task_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary).resolve()
+            root = temporary_root / "primary"
+            other_root = temporary_root / "other"
+            root.mkdir()
+            other_root.mkdir()
+            primary_detail = {
+                "summary": {"id": "task-primary", "project_id": PROJECT_ID},
+                "source_workspace": {
+                    "root_path": str(root),
+                    "is_primary": True,
+                    "workspace_id": "workspace-primary",
+                },
+                "project": {"default_workspace_id": "workspace-primary"},
+            }
+            cases = (
+                (
+                    "source root",
+                    {
+                        **primary_detail,
+                        "source_workspace": {
+                            **primary_detail["source_workspace"],
+                            "root_path": str(other_root),
+                        },
+                    },
+                ),
+                (
+                    "default workspace",
+                    {
+                        **primary_detail,
+                        "project": {"default_workspace_id": "workspace-other"},
+                    },
+                ),
+                (
+                    "project identity",
+                    {
+                        **primary_detail,
+                        "summary": {"id": "task-primary", "project_id": "project-other"},
+                    },
+                ),
+                (
+                    "primary flag",
+                    {
+                        **primary_detail,
+                        "source_workspace": {
+                            **primary_detail["source_workspace"],
+                            "is_primary": "true",
+                        },
+                    },
+                ),
+                (
+                    "nonprimary source root",
+                    {
+                        **primary_detail,
+                        "source_workspace": {
+                            **primary_detail["source_workspace"],
+                            "root_path": str(root),
+                            "is_primary": False,
+                        },
+                    },
+                ),
+                (
+                    "nonprimary default workspace",
+                    {
+                        **primary_detail,
+                        "source_workspace": {
+                            **primary_detail["source_workspace"],
+                            "root_path": str(other_root),
+                            "is_primary": False,
+                            "workspace_id": "workspace-primary",
+                        },
+                    },
+                ),
+            )
+            for label, detail in cases:
+                with self.subTest(label=label), \
+                        mock.patch.object(
+                            operations,
+                            "_project_rows",
+                            return_value=[{
+                                "id": PROJECT_ID,
+                                "name": "fixture",
+                                "path": str(root),
+                            }],
+                        ), mock.patch.object(
+                            operations,
+                            "_run",
+                            return_value=(0, PROJECT_ID.encode(), b""),
+                        ), mock.patch.object(
+                            operations,
+                            "_kent_pages",
+                            return_value=[{"tasks": [{"task_id": "task-primary"}]}],
+                        ), mock.patch.object(
+                            operations,
+                            "_kent_json",
+                            return_value=detail,
+                        ):
+                    with self.assertRaises(PlanValidationError):
+                        operations._source_native_identity(
+                            project_id=PROJECT_ID,
+                            project_root=root,
+                            primary_root=root,
+                            kent_path=root / "kent",
+                        )
+
+    def test_source_native_identity_fails_when_no_primary_task_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary).resolve()
+            root = temporary_root / "primary"
+            secondary_root = temporary_root / "secondary"
+            root.mkdir()
+            detail = {
+                "summary": {"id": "task-secondary", "project_id": PROJECT_ID},
+                "source_workspace": {
+                    "root_path": str(secondary_root),
+                    "is_primary": False,
+                    "workspace_id": "workspace-secondary",
+                },
+                "project": {"default_workspace_id": "workspace-primary"},
+            }
+            with mock.patch.object(
+                operations,
+                "_project_rows",
+                return_value=[{"id": PROJECT_ID, "name": "fixture", "path": str(root)}],
+            ), mock.patch.object(
+                operations,
+                "_run",
+                return_value=(0, PROJECT_ID.encode(), b""),
+            ), mock.patch.object(
+                operations,
+                "_kent_pages",
+                return_value=[{"tasks": [{"task_id": "task-secondary"}]}],
+            ), mock.patch.object(
+                operations,
+                "_kent_json",
+                return_value=detail,
+            ):
+                with self.assertRaisesRegex(
+                    PlanValidationError,
+                    "native primary workspace identity is unavailable or ambiguous",
                 ):
                     operations._source_native_identity(
                         project_id=PROJECT_ID,
