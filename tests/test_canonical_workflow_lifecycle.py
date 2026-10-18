@@ -42,6 +42,72 @@ from tests.test_delivery_source_admission import DeliverySourceAdmissionTests
 PROJECT_ID = "project-" + RETIREMENT_PROJECT_ID
 
 
+class NativeGraphTransportTests(unittest.TestCase):
+    def test_large_packet_tamper_never_releases_child(self):
+        from tests.test_workflow_retirement import load_test_plan, PYTHON
+        transfer = operations._transfer_guardian_stdin
+        payload = b"x" * 427648
+        for delivered in (payload[:-1], b"y" + payload[1:]):
+            with self.subTest(length=len(delivered)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                marker = root / "released"
+                with OperationJournal(root / "state", "effect-test", load_test_plan(root)) as journal:
+                    journal.persist({"phase": "in_progress", "effects": {}})
+                    with mock.patch.object(operations, "_transfer_guardian_stdin",
+                        side_effect=lambda process, data, deadline, timeout:
+                            transfer(process, delivered, deadline, timeout)):
+                        with self.assertRaises(EffectBlocked):
+                            operations.run_effect(
+                                journal, effect_key="graph", command=[PYTHON, "-c",
+                                    "import sys; from pathlib import Path; Path(sys.argv[1]).touch()", str(marker)],
+                                cwd=root, stdin_bytes=payload, stdin_limit=1024 * 1024,
+                                preimage_sha256="a" * 64, postimage_sha256="b" * 64,
+                                current_sha256=lambda: "a" * 64)
+                    self.assertFalse(marker.exists())
+                    with mock.patch.object(operations.subprocess, "Popen", side_effect=AssertionError("replay")):
+                        self.assertEqual(operations.recover_effect(
+                            journal, effect_key="graph", command=[PYTHON, "-c",
+                                "import sys; from pathlib import Path; Path(sys.argv[1]).touch()", str(marker)],
+                            cwd=root, stdin_bytes=payload, stdin_limit=1024 * 1024,
+                            preimage_sha256="a" * 64, postimage_sha256="b" * 64,
+                            current_sha256=lambda: "a" * 64), "preimage")
+
+    def test_only_native_v2_graph_selects_larger_bound(self):
+        item = {"compatibility_snapshot": {"native_components": {"schema": operations.NATIVE_COMPONENTS_V2_SCHEMA}}}
+        self.assertEqual(operations._canonical_v2_stdin_limit(
+            {"native_evidence": {}}, item, {"name": "graph"}), 1024 * 1024)
+        for parsed, stage in (({}, "graph"), ({"native_evidence": {}}, "metadata")):
+            self.assertEqual(operations._canonical_v2_stdin_limit(parsed, item, {"name": stage}), operations.MAX_OUTPUT)
+        item["compatibility_snapshot"]["native_components"]["schema"] = "kent-native-components-v1"
+        self.assertEqual(operations._canonical_v2_stdin_limit(
+            {"native_evidence": {}}, item, {"name": "graph"}), operations.MAX_OUTPUT)
+
+    def test_large_graph_pipe_and_hard_bounds(self):
+        from tests.test_workflow_retirement import load_test_plan, PYTHON
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "packet"
+            for size in (427648, 1024 * 1024):
+                payload = (bytes(range(256)) * (size // 256 + 1))[:size]
+                with OperationJournal(root / str(size), "effect-test", load_test_plan(root)) as journal:
+                    journal.persist({"phase": "in_progress", "effects": {}})
+                    result = operations.run_effect(
+                        journal, effect_key="graph", command=[PYTHON, "-c",
+                            "import sys; from pathlib import Path; Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read()); sys.stdout.buffer.write(b'o'*400000); sys.stderr.buffer.write(b'e'*400000)",
+                            str(marker)], cwd=root, stdin_bytes=payload, stdin_limit=1024 * 1024,
+                        preimage_sha256="a" * 64, postimage_sha256="b" * 64,
+                        current_sha256=lambda: "b" * 64 if marker.exists() and marker.read_bytes() == payload else "a" * 64,
+                    )
+                    self.assertEqual(result.settlement, "postimage")
+                    self.assertEqual(marker.read_bytes(), payload)
+                    self.assertEqual(result.stdout_sha256, hashlib.sha256(b"o" * operations.MAX_OUTPUT).hexdigest())
+                    self.assertEqual(result.stderr_sha256, hashlib.sha256(b"e" * operations.MAX_OUTPUT).hexdigest())
+            for limit in (operations.MAX_OUTPUT, 1024 * 1024):
+                with self.assertRaises(PlanValidationError):
+                    operations._effect_inputs([PYTHON, "-c", "pass"], root, None,
+                        b"x" * (limit + 1), None, None, stdin_limit=limit)
+
+
 def create_verified_source_fixture(
     testcase: unittest.TestCase,
     project_id: str,
@@ -1335,6 +1401,43 @@ def install_effect(
 
 
 class CanonicalWorkflowLifecycleTest(unittest.TestCase):
+    def test_prepare_preflights_later_stage_before_persist_or_child(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self, intent="graph-and-metadata")
+            real_progress = operations._canonical_v2_progress
+            def invalid_later_stage(*args):
+                stages = real_progress(*args)
+                self.assertGreaterEqual(len(stages), 2)
+                stages[-1] = {**stages[-1], "command": ["/not-an-executable"]}
+                return stages
+            with native_observer_patches(context), mock.patch.object(
+                operations, "_canonical_v2_progress", side_effect=invalid_later_stage
+            ), mock.patch.object(OperationJournal, "persist") as persist:
+                with self.assertRaises(PlanValidationError):
+                    reconcile_canonical_workflows(plan, mode="prepare")
+                persist.assert_not_called()
+            self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_prepare_rejects_later_stage_exec_vector_before_persist(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_d9_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(fixture, self, intent="graph-and-metadata")
+            real_progress = operations._canonical_v2_progress
+            def invalid_vector(*args):
+                stages = real_progress(*args)
+                self.assertGreaterEqual(len(stages), 2)
+                stages[-1] = {**stages[-1], "command": [
+                    *stages[-1]["command"], "x" * operations.EXEC_ENTRY_LIMIT]}
+                return stages
+            with native_observer_patches(context), mock.patch.object(
+                operations, "_canonical_v2_progress", side_effect=invalid_vector
+            ), mock.patch.object(OperationJournal, "persist") as persist:
+                with self.assertRaisesRegex(PlanValidationError, "process-exec entry limit"):
+                    reconcile_canonical_workflows(plan, mode="prepare")
+                persist.assert_not_called()
+            self.assertEqual(graph_apply_rows(fixture), [])
+
     def setUp(self) -> None:
         self._source_admission_patch = mock.patch.object(
             operations,
