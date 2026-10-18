@@ -9,6 +9,27 @@ from typing import Any
 from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
 
 
+# unicode.White_Space as used by Go strings.TrimSpace; Python's default strip
+# additionally removes U+001C..U+001F, which native Kent preserves.
+_GO_WHITE_SPACE = (
+    "\t\n\v\f\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+def native_graph_projection(graph: dict[str, Any]) -> dict[str, Any]:
+    """Copy a built native graph with edge prompts as Kent will persist them.
+
+    Call before diffing, hashing or review. This is not readback normalization.
+    All other fields, collection order and non-string prompt values are retained.
+    """
+    projected = deepcopy(graph)
+    for edge in projected.get("edges", []):
+        if isinstance(edge, dict) and isinstance(edge.get("prompt_template"), str):
+            edge["prompt_template"] = edge["prompt_template"].strip(_GO_WHITE_SPACE)
+    return projected
+
+
 @dataclass(frozen=True)
 class WorkflowMutationPlan:
     document: dict[str, Any]
@@ -145,6 +166,7 @@ def plan_workflow_graph(
     desired_graph["nodes"] = desired_nodes
     desired_graph["transition_groups"] = desired_groups
     desired_graph["edges"] = desired_edges
+    desired_graph = native_graph_projection(desired_graph)
     document = deepcopy(inspected)
     document["workflow_id"] = workflow_id
     document["expected_version"] = expected_version

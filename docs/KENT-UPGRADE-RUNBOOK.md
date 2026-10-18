@@ -77,6 +77,22 @@ incompatible graphs.
 
 ## Delivery reliability adoption
 
+Native graph projection normalizes edge prompt templates using Kent's Go
+`strings.TrimSpace` semantics before review and hashing. Readback still requires
+exact equality; it never normalizes an unexpected postimage into success.
+
+If a historical operation dispatched successfully but its original expected
+postimage omitted that native normalization, preserve its plan, review, journal,
+effect identity and `ambiguous` result. Do not replay or rewrite it. Explicit
+human acceptance may instead bind a fresh full actual-state readback, the exact
+enumerated differences and native-source evidence in append-only rollout records.
+This accepts installed state; it does not mechanically settle the old operation.
+Fresh compatibility-reviewed forward plans use a separate state directory and
+the actual source state. Create graph changes only for real intended changes,
+such as refreshed source bindings, not to make historical bookkeeping appear
+complete. No downstream step may treat the preserved ambiguous journal as a
+completed operation.
+
 For composed adoption, validate the full published builder graph. The source
 admission frame and the semantic review of changed prompts are complementary;
 an exact frame does not approve the surrounding prompt changes.
