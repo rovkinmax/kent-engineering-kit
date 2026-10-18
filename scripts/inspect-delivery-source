@@ -481,6 +481,8 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
             "cutover memory configuration differs")
     for command in profile.get("commands", {}).values():
         require(isinstance(command, str), "invalid profile command")
+        if command == "":
+            continue
         relative(command)
         require(command in project_expected, "profile helper outside source closure")
     helpers = {str(ci_helper): str(kit_root / "scripts/prepare-github-ci")}

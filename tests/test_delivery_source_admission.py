@@ -1056,6 +1056,42 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
             self.assertEqual(self.git(root, "status", "--porcelain"), before[root])
             self.assertFalse(list(root.rglob("__pycache__")))
 
+    def test_profile_commands_cli_allow_only_exact_empty_or_qualified_paths(self):
+        profile = self.project / ".kent/workflow-profile.toml"
+        original = profile.read_text()
+        cases = (
+            ('""', 0, None),
+            ('".kent/scripts/workflow-checkpoint"', 0, None),
+            ("false", 2, "invalid_profile_command"),
+            ("0", 2, "invalid_profile_command"),
+            ("[]", 2, "invalid_profile_command"),
+            ('" "', 2, "profile_helper_outside_source_closure"),
+            ('"../escape"', 2, "unsafe_relative_path"),
+            ('"/absolute"', 2, "unsafe_relative_path"),
+            ('".kent/scripts/not-published"', 2, "profile_helper_outside_source_closure"),
+        )
+        for literal, returncode, reason in cases:
+            with self.subTest(command=literal):
+                profile.write_text(original.replace(
+                    'checkpoint = ".kent/scripts/workflow-checkpoint"', f"smoke = {literal}"))
+                self.commit(self.project)
+                self.receipt["source_commit"] = self.git(
+                    self.project, "rev-parse", "HEAD").strip()
+                self.git(self.project, "update-ref", "refs/remotes/origin/main",
+                         self.receipt["source_commit"])
+                entry = next(item for item in self.receipt["files"]
+                             if item["root"] == str(self.project)
+                             and item["relative_path"] == ".kent/workflow-profile.toml")
+                raw = profile.read_bytes()
+                entry.update(sha256=hashlib.sha256(raw).hexdigest(), byte_size=len(raw))
+                self.pin()
+                result = subprocess.run(self.cli(), capture_output=True, text=True, timeout=120)
+                self.assertEqual(result.returncode, returncode, result.stdout + result.stderr)
+                inspection = json.loads(result.stdout)
+                self.assertEqual(inspection["status"], "admitted" if returncode == 0 else "blocked")
+                if reason is not None:
+                    self.assertEqual(inspection["reason"], reason)
+
     def add_local_instruction(self):
         """Publish only an ignore rule; the instruction stays outside Git."""
         self.put(self.project, ".gitignore",
