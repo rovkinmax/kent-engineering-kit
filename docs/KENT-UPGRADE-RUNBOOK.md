@@ -77,6 +77,31 @@ incompatible graphs.
 
 ## Delivery reliability adoption
 
+For composed adoption, validate the full published builder graph. The source
+admission frame and the semantic review of changed prompts are complementary;
+an exact frame does not approve the surrounding prompt changes.
+
+Native captures now include `kent-native-components-v2` with
+`task_execution_bindings_sha256`: all Workflow Task target fields, source
+workspace and managed worktree identities, plus referenced workspace/worktree
+root mappings. Capture these in the same read-only native transaction, preserving
+nulls. Historical root directories need not exist. Do not substitute Git HEAD,
+timestamps or the Workflow policy for a Task's stored binding.
+
+When changing future execution policy, review unresolved Tasks explicitly.
+Existing null fields can inherit the new default on later resolution; this
+consequence needs approval and native semantic evidence. Keep resolved Task
+bindings unchanged. Compare Workflow policy against each confirmed journal
+stage's owned before/after metadata, without rewriting the original snapshot.
+
+New native prepare and dispatch require fresh v2 evidence and exact-hash review.
+An old v1 journal can still settle a known owned pre/post image without replay,
+even when full native evidence is unavailable. That settlement does not authorize
+another effect: subsequent dispatch or incomplete-operation final qualification
+requires v2. Already-complete journals retain owned-only readback. Do not fill
+missing baseline fields using current state; preserve old artifacts and obtain
+fresh reviewed plans for further effects.
+
 This package updates Kit source, adapters and selected Workflow contracts; it
 does not require an engine upgrade or authorize a Kent restart. Use the
 approved package preview for repositories, publication targets and rollout

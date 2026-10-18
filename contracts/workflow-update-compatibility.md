@@ -59,4 +59,4 @@ Only `implement_replan` may be added. No migration or cross-project
 atomicity. Other paths, v1 and retirement gates stay unchanged. Publication
 does not authorize activation.
 
-V2 gates: [runbook](../docs/KENT-UPGRADE-RUNBOOK.md#delivery-reliability-adoption).
+V2 recovery: [runbook](../docs/KENT-UPGRADE-RUNBOOK.md#delivery-reliability-adoption).
