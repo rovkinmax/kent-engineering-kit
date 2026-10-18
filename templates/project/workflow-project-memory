@@ -74,6 +74,57 @@ def bootstrap_closed(value, fields, schema=None):
         raise ValueError("invalid source-admission schema")
 
 
+def publication_inventory(receipt, primary, kit_root):
+    """Validate both receipt generations without admitting local code references."""
+    v2 = isinstance(receipt, dict) and receipt.get("schema") == "delivery-runtime-publication-v2"
+    bootstrap_closed(receipt, PUBLICATION_RECEIPT_FIELDS | ({"local_inputs"} if v2 else set()),
+                     "delivery-runtime-publication-v2" if v2 else "delivery-runtime-publication-v1")
+    files = receipt["files"]
+    local_inputs = receipt["local_inputs"] if v2 else []
+    if (not isinstance(files, list) or not isinstance(local_inputs, list)
+            or not files or len(files) + len(local_inputs) > MAX_SOURCE_RECEIPT_FILES):
+        raise ValueError("invalid source receipt file inventory")
+    roots = receipt["runtime_roots"]
+    if not isinstance(roots, list):
+        raise ValueError("invalid published runtime roots")
+    seen = set()
+    total = 0
+    for local, items in ((False, files), (True, local_inputs)):
+        for item in items:
+            bootstrap_closed(item, {"root", "relative_path", "sha256", "byte_size", "mode"}
+                             | ({"kind"} if local else set()))
+            name = item["relative_path"]
+            root = item["root"]
+            if (not isinstance(name, str) or not name or name.startswith("/")
+                    or "\\" in name or "\x00" in name
+                    or any(part in ("", ".", "..") for part in name.split("/"))
+                    or not isinstance(root, str) or root not in roots):
+                raise ValueError("invalid source receipt path")
+            if (not isinstance(item["sha256"], str) or not SHA256_PATTERN.fullmatch(item["sha256"])
+                    or type(item["byte_size"]) is not int
+                    or not 0 <= item["byte_size"] <= MAX_SOURCE_FILE_BYTES
+                    or type(item["mode"]) is not int or not 0 <= item["mode"] <= 0o777
+                    or item["mode"] & 0o022):
+                raise ValueError("invalid qualified source metadata")
+            if (root, name) in seen:
+                raise ValueError("duplicate qualified source")
+            if local:
+                if (item["kind"] != "local-instruction"
+                        or root not in {str(primary), str(kit_root)}
+                        or not name.startswith(".kent/skills/") or not name.endswith(".md")
+                        or any(c in name for c in "*?[]")
+                        or item["mode"] & 0o111
+                        or any(other_root == root and (
+                            other.startswith(name + "/") or name.startswith(other + "/"))
+                            for other_root, other in seen)):
+                    raise ValueError("invalid local instruction")
+            seen.add((root, name))
+            total += item["byte_size"]
+            if total > 32 * 1024 * 1024:
+                raise ValueError("source inspection exceeds limit")
+    return len(files) + len(local_inputs)
+
+
 def canonical_root(value):
     if (not isinstance(value, str) or not Path(value).is_absolute()
             or ".." in Path(value).parts or str(Path(value)) != value):
@@ -338,7 +389,7 @@ def installation_records(project_id, primary, primary_workspace_id=None):
     if hashlib.sha256(receipt_raw).hexdigest() != binding["receipt_sha256"]:
         raise ValueError("source receipt differs")
     receipt = bootstrap_json(receipt_raw)
-    bootstrap_closed(receipt, PUBLICATION_RECEIPT_FIELDS, "delivery-runtime-publication-v1")
+    publication_inventory(receipt, primary, kit_root)
     if (receipt["project_id"] != project_id
             or receipt["policy"] != "delivery_reliability_v1"):
         raise ValueError("source receipt binding differs")
@@ -365,9 +416,6 @@ def installation_records(project_id, primary, primary_workspace_id=None):
         raise ValueError("invalid legacy task inventory")
     for task_id in legacy:
         bootstrap_key(task_id)
-    if (not isinstance(receipt["files"], list)
-            or len(receipt["files"]) > MAX_SOURCE_RECEIPT_FILES):
-        raise ValueError("invalid source receipt file inventory")
     return {
         "mode": "r2", "project_id": project_id, "primary_root": str(primary),
         "primary_workspace_id": primary_workspace_id,
@@ -670,7 +718,7 @@ def run_source_inspector(installation, project_id, primary, workspace):
             or result["source_ref"] != binding["source_ref"]
             or result["kit_ref"] != binding["kit_ref"]
             or type(result["file_count"]) is not int
-            or not 0 <= result["file_count"] <= MAX_SOURCE_RECEIPT_FILES
+            or result["file_count"] != publication_inventory(receipt, primary, kit_root)
             or type(result["source_bytes"]) is not int
             or not 0 <= result["source_bytes"] <= 32 * 1024 * 1024):
         raise ValueError("delivery source admission binding differs")
@@ -901,9 +949,7 @@ def admitted_native_store(core, primary, project_id, primary_workspace_id, summa
     if core._digest(receipt_raw) != binding["receipt_sha256"]:
         raise ValueError("source receipt differs")
     receipt = core._json(receipt_raw)
-    core._closed(receipt, {"schema", "project_id", "workflow_id", "source_commit", "kit_commit",
-                           "runtime_roots", "files", "policy", "project_memory"},
-                 "delivery-runtime-publication-v1")
+    publication_inventory(receipt, Path(binding["primary_root"]), Path(binding["kit_root"]))
     if receipt["project_id"] != project_id:
         raise ValueError("foreign source receipt")
     core._key(receipt["workflow_id"])
@@ -931,27 +977,6 @@ def admitted_native_store(core, primary, project_id, primary_workspace_id, summa
     for task_id in legacy:
         core._key(task_id)
     files = receipt["files"]
-    if not isinstance(files, list) or len(files) > MAX_SOURCE_RECEIPT_FILES:
-        raise ValueError("invalid source receipt file inventory")
-    seen = set()
-    for item in files:
-        if not isinstance(item, dict) or set(item) != {
-                "root", "relative_path", "sha256", "byte_size", "mode"}:
-            raise ValueError("invalid source receipt entry")
-        relative = item["relative_path"]
-        if (not isinstance(relative, str) or not relative or Path(relative).is_absolute()
-                or any(part in ("", ".", "..") for part in relative.split("/"))
-                or item["root"] not in roots):
-            raise ValueError("source receipt path escapes runtime root")
-        core._token(item["sha256"])
-        if (type(item["byte_size"]) is not int or not 0 <= item["byte_size"] <= core.MAX_BYTES
-                or type(item["mode"]) is not int or not 0 <= item["mode"] <= 0o777
-                or item["mode"] & 0o022):
-            raise ValueError("invalid qualified source metadata")
-        identity = (item["root"], relative)
-        if identity in seen:
-            raise ValueError("duplicate qualified source")
-        seen.add(identity)
     expected = [item for item in files if isinstance(item, dict)
                 and item.get("relative_path") == ".kent/workflow-profile.toml"
                 and item.get("sha256") == binding["profile_sha256"]

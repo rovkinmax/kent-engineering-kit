@@ -116,6 +116,43 @@ Source inventory allows 512
 files, with 8 MiB per file and 32 MiB in total; Task and retention caps are
 separate and unchanged. Never trim infrastructure from a receipt to fit a cap.
 
+`delivery-runtime-publication-v1` retains its exact published-only inventory.
+For an explicitly approved private instruction, use the closed
+`delivery-runtime-publication-v2` receipt with required `local_inputs` (including
+an empty list when none apply). Each entry has exactly `kind`, `root`,
+`relative_path`, `sha256`, `byte_size`, and `mode`; the only kind is
+`local-instruction`. Bind one regular, owner-owned, non-executable Markdown file
+beneath `.kent/skills/` at an already declared project or Kit primary source
+root. Paths cannot contain globs, traversal, duplicates or overlaps. Published
+and indexed files, symlinks, hardlinks and unsafe modes are rejected. Both
+collections share the 512-file and 32-MiB limits; the inspection result counts
+and measures both. Inventory, index exclusion, local bytes, size, mode and
+identity are rechecked before admission. Locals cannot qualify inspectors,
+modules, profile commands or installed helpers, and are neither required nor
+inherited at an ordinary task checkout.
+
+Keep instruction contents and private receipts outside Git and public reports.
+Check the approved private postimage against its preserved original before
+recording its digest; an unexpected extra file is not permission to admit it.
+The unchanged `r2-installation-binding-v2` binds the entire v1 or v2 receipt
+digest. Preserve prior receipts, bindings and source preimages; publish and
+verify compatible consumers before separately authorized primary adoption and
+binding updates. This format change has no native graph, profile, configuration
+or restart effect.
+
+Source admission qualifies published source plus explicitly bound private
+instructions; it does not attest every byte the interpreter may execute. The
+local Python interpreter, import environment and owner-controlled derived caches
+are trusted. A tampered `.pyc`, or a stale timestamp cache with matching source
+size/time, can execute despite successful source admission. `python_cache_tag`
+remains interpreter metadata for existing consumers, not evidence of cache
+correctness. There is no sandbox or protection against later owner mutation.
+The inspector excludes `__pycache__` from source inventory and does not read,
+decode, rewrite, remove or regenerate caches. No cache maintenance is required
+or authorized by this source-boundary change. Diagnose any concrete stale-cache
+execution failure separately; stronger execution guarantees need separate
+approved scope.
+
 Final project builders consume `VerifiedSourceAdmission` from the trusted Kit
 operation caller. They do not import an inspector from a caller-selected Kit
 directory or accept a raw JSON mapping as proof. The Appsome source CLI can

@@ -2955,12 +2955,13 @@ def _source_binding(
     if sha256_bytes(receipt_raw) != value['receipt_ref']['sha256']:
         raise PlanValidationError('source publication receipt digest differs')
     receipt = _source_json(receipt_raw, 'source publication receipt')
+    v2 = receipt.get('schema') == 'delivery-runtime-publication-v2'
     receipt = _closed(receipt, {
         'schema', 'project_id', 'workflow_id', 'source_commit', 'kit_commit',
         'runtime_roots', 'files', 'policy', 'project_memory',
-    }, 'source publication receipt')
+    } | ({'local_inputs'} if v2 else set()), 'source publication receipt')
     if (
-        receipt.get('schema') != SOURCE_RECEIPT_SCHEMA
+        receipt.get('schema') not in (SOURCE_RECEIPT_SCHEMA, 'delivery-runtime-publication-v2')
         or receipt.get('project_id') != project_id
         or receipt.get('policy') != 'delivery_reliability_v1'
     ):
@@ -2982,6 +2983,46 @@ def _source_binding(
         or len(files) > SOURCE_RECEIPT_FILE_LIMIT
     ):
         raise PlanValidationError('source publication file inventory is invalid')
+    local_inputs = receipt['local_inputs'] if v2 else []
+    if (not isinstance(local_inputs, list)
+            or len(files) + len(local_inputs) > SOURCE_RECEIPT_FILE_LIMIT):
+        raise PlanValidationError('source publication local inventory is invalid')
+    seen: set[tuple[str, str]] = set()
+    total = 0
+    for local, items in ((False, files), (True, local_inputs)):
+        for item in items:
+            item = _closed(item, {'root', 'relative_path', 'sha256', 'byte_size', 'mode'}
+                           | ({'kind'} if local else set()), 'source publication entry')
+            name = item['relative_path']
+            source_root = item['root']
+            if (not isinstance(name, str) or not name or name.startswith('/')
+                    or '\\' in name or '\x00' in name
+                    or any(part in ('', '.', '..') for part in name.split('/'))
+                    or not isinstance(source_root, str) or source_root not in roots):
+                raise PlanValidationError('source publication path is invalid')
+            _sha256(item['sha256'], 'source publication entry.sha256')
+            if (type(item['byte_size']) is not int
+                    or not 0 <= item['byte_size'] <= SOURCE_FILE_BYTES_LIMIT
+                    or type(item['mode']) is not int or not 0 <= item['mode'] <= 0o777
+                    or item['mode'] & 0o022):
+                raise PlanValidationError('source publication metadata is invalid')
+            if (source_root, name) in seen:
+                raise PlanValidationError('duplicate source publication entry')
+            if local and (
+                item['kind'] != 'local-instruction'
+                or source_root not in {str(primary_root), str(kit_root)}
+                or not name.startswith('.kent/skills/') or not name.endswith('.md')
+                or any(c in name for c in '*?[]')
+                or item['mode'] & 0o111
+                or any(other_root == source_root and (
+                    other.startswith(name + '/') or name.startswith(other + '/'))
+                    for other_root, other in seen)
+            ):
+                raise PlanValidationError('source publication local instruction is invalid')
+            seen.add((source_root, name))
+            total += item['byte_size']
+            if total > SOURCE_TOTAL_BYTES_LIMIT:
+                raise PlanValidationError('source publication exceeds byte limit')
     memory = receipt.get('project_memory')
     if not isinstance(memory, dict) or set(memory) != {
         'root', 'project_key', 'project_uid', 'legacy_task_ids',
@@ -3156,7 +3197,7 @@ def admit_source_admission(
         or inspection.get('kit_ref') != parsed['kit_ref']
         or not isinstance(file_count, int)
         or isinstance(file_count, bool)
-        or file_count != len(receipt_files)
+        or file_count != len(receipt_files) + len(receipt.get('local_inputs', []))
         or not 1 <= file_count <= SOURCE_RECEIPT_FILE_LIMIT
         or not isinstance(source_bytes, int)
         or isinstance(source_bytes, bool)
@@ -3958,12 +3999,15 @@ def _native_approval_payload(
     approval: Mapping[str, Any],
     branches: Sequence[Mapping[str, Any]],
     task_nodes: Sequence[Mapping[str, Any]],
-    workflow_version: int,
     workflow_id: str,
     graph: Mapping[str, Any],
 ) -> dict[str, Any]:
-    if approval.get('workflow_version') != workflow_version:
-        raise EffectBlocked('native pending Approval workflow version differs')
+    # The version and prompt bytes belong to the frozen decision, not the
+    # current graph. Its exact raw fingerprint is checked against the reviewed
+    # snapshot; graph ownership/preimages are checked independently.
+    version = approval.get('workflow_version')
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        raise EffectBlocked('native pending Approval workflow version is invalid')
     task_id = approval.get('source_task_id')
     source_node = approval.get('source_node_id')
     source_branch = approval.get('source_transition_branch_key')
@@ -4024,13 +4068,21 @@ def _native_approval_payload(
             row for row in graph.get('nodes', [])
             if isinstance(row, Mapping) and row.get('id', row.get('node_id')) == target.get('node_id')
         ]
-        graph_edge_keys = set(graph_edges[0]) | {'workflow_id'} if len(graph_edges) == 1 else set()
-        extra_edge_keys = set(edge) - graph_edge_keys
+        prompt_keys = {'prompt', 'prompt_template'}
+        graph_edge_keys = (
+            (set(graph_edges[0]) | {'workflow_id'}) - prompt_keys
+            if len(graph_edges) == 1 else set()
+        )
+        extra_edge_keys = set(edge) - prompt_keys - graph_edge_keys
         edge_matches_graph = (
             len(graph_edges) == 1
             and graph_edge_keys.issubset(edge)
             and extra_edge_keys.issubset({'input_bindings', 'output_requirements'})
-            and all(edge.get(key) == value for key, value in graph_edges[0].items())
+            and all(
+                edge.get(key) == value
+                for key, value in graph_edges[0].items()
+                if key not in prompt_keys
+            )
             and all(edge[key] is None for key in extra_edge_keys)
         )
         if (
@@ -4282,7 +4334,6 @@ def _native_observe(
                 approval,
                 branches_by_approval.get(approval['id'], []),
                 nodes_by_task[task_id],
-                native_workflow['version'],
                 item['workflow_id'],
                 live['graph'],
             )

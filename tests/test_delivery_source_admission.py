@@ -1056,6 +1056,280 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
             self.assertEqual(self.git(root, "status", "--porcelain"), before[root])
             self.assertFalse(list(root.rglob("__pycache__")))
 
+    def add_local_instruction(self):
+        """Publish only an ignore rule; the instruction stays outside Git."""
+        self.put(self.project, ".gitignore",
+                 (self.project / ".gitignore").read_text() + ".kent/skills/private/\n")
+        self.commit(self.project)
+        self.receipt["source_commit"] = self.git(self.project, "rev-parse", "HEAD").strip()
+        self.git(self.project, "update-ref", "refs/remotes/origin/main",
+                 self.receipt["source_commit"])
+        entry = next(item for item in self.receipt["files"]
+                     if item["root"] == str(self.project) and item["relative_path"] == ".gitignore")
+        raw = (self.project / ".gitignore").read_bytes()
+        entry.update(sha256=hashlib.sha256(raw).hexdigest(), byte_size=len(raw))
+        name = ".kent/skills/private/instructions.md"
+        self.put(self.project, name, "PRIVATE_LOCAL_INSTRUCTION_SENTINEL\n", 0o600)
+        raw = (self.project / name).read_bytes()
+        self.receipt["schema"] = "delivery-runtime-publication-v2"
+        self.receipt["local_inputs"] = [{
+            "kind": "local-instruction", "root": str(self.project), "relative_path": name,
+            "sha256": hashlib.sha256(raw).hexdigest(), "byte_size": len(raw), "mode": 0o600,
+        }]
+        self.pin()
+        return self.project / name
+
+    def assert_local_cli_blocked(self):
+        result = subprocess.run(self.cli(), capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "blocked")
+        self.assertNotIn("PRIVATE_LOCAL_INSTRUCTION_SENTINEL", result.stdout + result.stderr)
+
+    def test_v2_local_instruction_real_cli_and_task_isolation(self):
+        path = self.add_local_instruction()
+        result = subprocess.run(self.cli(), capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        admitted = json.loads(result.stdout)
+        self.assertEqual(admitted["file_count"], len(self.receipt["files"]) + 1)
+        self.assertEqual(admitted["source_bytes"],
+                         sum(item["byte_size"] for item in self.receipt["files"])
+                         + path.stat().st_size)
+        self.assertEqual(self.git(self.project, "ls-files", "--", str(path)), "")
+        task = self.base / "task"
+        self.git(self.project, "worktree", "add", "-qb", "task", str(task))
+        self.assertFalse((task / path.relative_to(self.project)).exists())
+        command = self.cli()
+        command[command.index("--workspace") + 1] = str(task)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.put(task, str(path.relative_to(self.project)), "checkout must not inherit\n", 0o600)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.receipt["runtime_roots"].append(str(task))
+        self.receipt["local_inputs"][0]["root"] = str(task)
+        self.pin()
+        self.assert_local_cli_blocked()
+
+    def test_v2_local_instruction_closed_metadata_cli(self):
+        self.add_local_instruction()
+        original = dict(self.receipt["local_inputs"][0])
+        changes = [
+            {"kind": "helper"}, {"kind": "local-instruction", "extra": True},
+            {"root": str(self.base)}, {"root": str(self.kit)},
+            {"relative_path": ".kent/skills/private/../instructions.md"},
+            {"relative_path": ".kent/skills/private/*.md"},
+            {"relative_path": ".kent/scripts/private.md"},
+            {"relative_path": ".kent/skills/private/instructions.py"},
+            {"mode": 0o700}, {"mode": 0o620}, {"mode": True},
+            {"byte_size": True}, {"byte_size": original["byte_size"] + 1},
+            {"sha256": "0" * 64},
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                self.receipt["local_inputs"] = [original | change]
+                self.pin()
+                self.assert_local_cli_blocked()
+        self.receipt["local_inputs"] = [original, original]
+        self.pin()
+        self.assert_local_cli_blocked()
+        self.receipt["schema"] = "delivery-runtime-publication-v1"
+        self.pin()
+        self.assert_local_cli_blocked()
+
+    def test_v2_local_instruction_missing_changed_extra_and_unsafe_cli(self):
+        path = self.add_local_instruction()
+        raw = path.read_bytes()
+        path.unlink()
+        self.assert_local_cli_blocked()
+        path.write_bytes(raw + b"changed\n")
+        path.chmod(0o600)
+        self.assert_local_cli_blocked()
+        path.write_bytes(raw)
+        path.chmod(0o700)
+        self.assert_local_cli_blocked()
+        path.chmod(0o600)
+        extra = path.with_name("extra.md")
+        extra.write_text("unbound private instruction\n")
+        self.assert_local_cli_blocked()
+        extra.unlink()
+        path.unlink()
+        path.symlink_to(self.project / "AGENTS.md")
+        self.assert_local_cli_blocked()
+        path.unlink()
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        os.link(path, extra)
+        self.assert_local_cli_blocked()
+
+    def test_v2_local_instruction_indexed_published_and_overlap_cli(self):
+        path = self.add_local_instruction()
+        self.git(self.project, "add", "-f", str(path))
+        self.assert_local_cli_blocked()
+        self.commit(self.project)
+        self.receipt["source_commit"] = self.git(self.project, "rev-parse", "HEAD").strip()
+        self.git(self.project, "update-ref", "refs/remotes/origin/main",
+                 self.receipt["source_commit"])
+        self.pin()
+        self.assert_local_cli_blocked()
+        item = dict(self.receipt["local_inputs"][0])
+        item.pop("kind")
+        self.receipt["files"].append(item)
+        self.pin()
+        self.assert_local_cli_blocked()
+
+    def test_v2_local_instruction_never_qualifies_helper_cli(self):
+        path = self.add_local_instruction()
+        link = self.helper.with_name("private-helper")
+        link.symlink_to(path)
+        result = subprocess.run(self.cli("--installed-helper", str(link), str(path)),
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("helper_target_not_qualified_executable", result.stdout)
+
+    def test_v2_local_instruction_never_qualifies_profile_command_cli(self):
+        path = self.add_local_instruction()
+        profile = self.project / ".kent/workflow-profile.toml"
+        profile.write_text(profile.read_text().replace(
+            ".kent/scripts/workflow-checkpoint", path.relative_to(self.project).as_posix()))
+        self.commit(self.project)
+        self.receipt["source_commit"] = self.git(self.project, "rev-parse", "HEAD").strip()
+        self.git(self.project, "update-ref", "refs/remotes/origin/main",
+                 self.receipt["source_commit"])
+        entry = next(item for item in self.receipt["files"]
+                     if item["root"] == str(self.project)
+                     and item["relative_path"] == ".kent/workflow-profile.toml")
+        raw = profile.read_bytes()
+        entry.update(sha256=hashlib.sha256(raw).hexdigest(), byte_size=len(raw))
+        self.pin()
+        result = subprocess.run(self.cli(), capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("profile_helper_outside_source_closure", result.stdout)
+
+    def test_v2_empty_inventory_and_required_closed_collection_cli(self):
+        self.receipt.update(schema="delivery-runtime-publication-v2", local_inputs=[])
+        self.pin()
+        result = subprocess.run(self.cli(), capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["file_count"], len(self.receipt["files"]))
+        for invalid in (None, {}, "private.md"):
+            self.receipt["local_inputs"] = invalid
+            self.pin()
+            self.assert_local_cli_blocked()
+        del self.receipt["local_inputs"]
+        self.pin()
+        self.assert_local_cli_blocked()
+
+    def test_v2_local_instruction_nonowner_and_shared_limits(self):
+        path = self.add_local_instruction()
+        actual_fstat = self.module.os.fstat
+        def foreign_owner(fd):
+            info = actual_fstat(fd)
+            if (info.st_ino, info.st_dev) == (path.stat().st_ino, path.stat().st_dev):
+                fields = list(info)
+                fields[4] = os.getuid() + 1
+                return os.stat_result(fields)
+            return info
+        with mock.patch.object(self.module.os, "fstat", side_effect=foreign_owner):
+            with self.assertRaisesRegex(ValueError, "unsafe source file"):
+                self.inspect()
+        entry = dict(self.receipt["local_inputs"][0])
+        self.receipt["local_inputs"] = [entry] * 512
+        self.pin()
+        self.assert_local_cli_blocked()
+        # A lowered fixture cap isolates shared byte accounting without allocating
+        # 32 MiB or changing the production limit.
+        self.receipt["local_inputs"] = [entry]
+        self.pin()
+        published_bytes = sum(item["byte_size"] for item in self.receipt["files"])
+        with mock.patch.object(self.module, "MAX_TOTAL", published_bytes):
+            with self.assertRaisesRegex(ValueError, "source inspection exceeds limit"):
+                self.inspect()
+        with mock.patch.object(self.module, "MAX_SOURCE_RECEIPT_FILES", len(self.receipt["files"])):
+            with self.assertRaisesRegex(ValueError, "invalid local instruction inventory"):
+                self.inspect()
+
+    def test_v2_adapter_rejects_inconsistent_real_cli_count(self):
+        self.native_adapter_fixture()
+        self.add_local_instruction()
+        self.repin_native_sources()
+        admitted = self.adapter_call("workflow", "initialize-task")
+        self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+        inspector = self.kit / "scripts/inspect-delivery-source"
+        source = inspector.read_text()
+        changed = source.replace('"file_count": len(files) + len(local_inputs)',
+                                 '"file_count": len(files)')
+        self.assertNotEqual(source, changed)
+        inspector.write_text(changed)
+        self.repin_native_sources()
+        result = self.adapter_call("workflow", "initialize-task")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid-memory-request", result.stderr)
+
+    def test_v2_local_instruction_real_cli_detects_end_change(self):
+        path = self.add_local_instruction()
+        # The disposable Git shim mutates only at the final index readback;
+        # the pinned inspector itself executes unchanged through its real CLI.
+        actual_git = shutil.which("git")
+        shim = self.base / "git-shim"
+        shim.mkdir()
+        fired = self.base / "mutation-fired"
+        counter = self.base / "index-read-count"
+        self.put(shim, "git",
+                 f"#!{sys.executable}\n"
+                 "import pathlib, subprocess, sys\n"
+                 f"result = subprocess.run([{actual_git!r}, *sys.argv[1:]])\n"
+                 f"fired = pathlib.Path({str(fired)!r})\n"
+                 f"counter = pathlib.Path({str(counter)!r})\n"
+                 f"if {str(self.project)!r} in sys.argv and '--stage' in sys.argv:\n"
+                 "    count = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+                 "    counter.write_text(str(count))\n"
+                 "    if count == 2:\n"
+                 "        fired.touch()\n"
+                 f"        pathlib.Path({str(path)!r}).write_bytes(b'changed during inspection\\n')\n"
+                 "sys.exit(result.returncode)\n", 0o755)
+        result = subprocess.run(
+            self.cli(), capture_output=True, text=True, timeout=120,
+            env={**os.environ, "PATH": str(shim) + os.pathsep + os.environ.get("PATH", "")})
+        self.assertTrue(fired.exists(), result.stdout)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("local_instruction_bytes_or_mode_differ", result.stdout)
+
+    def test_v2_local_instruction_end_rechecks(self):
+        path = self.add_local_instruction()
+        original = self.module.verify_copy
+        for mutation in ("bytes", "mode", "index", "extra", "identity"):
+            with self.subTest(mutation=mutation):
+                raw = path.read_bytes()
+                extra = path.with_name("extra.md")
+                fired = False
+                def mutate(*args, **kwargs):
+                    nonlocal fired
+                    result = original(*args, **kwargs)
+                    if not fired:
+                        fired = True
+                        if mutation == "bytes":
+                            path.write_bytes(raw + b"changed\n")
+                        elif mutation == "mode":
+                            path.chmod(0o700)
+                        elif mutation == "index":
+                            self.git(self.project, "add", "-f", str(path))
+                        elif mutation == "extra":
+                            extra.write_text("unbound\n")
+                        else:
+                            replacement = path.with_name("replacement.md")
+                            replacement.write_bytes(raw)
+                            replacement.chmod(0o600)
+                            replacement.replace(path)
+                    return result
+                with mock.patch.object(self.module, "verify_copy", side_effect=mutate):
+                    with self.assertRaises(ValueError):
+                        self.inspect()
+                if mutation == "index":
+                    self.git(self.project, "rm", "--cached", "-f", str(path))
+                extra.unlink(missing_ok=True)
+                path.write_bytes(raw)
+                path.chmod(0o600)
+
     def test_cli_blocker_is_structured_and_does_not_expose_private_input(self):
         self.pin(b'{"PRIVATE_SENTINEL_DO_NOT_PRINT":')
         process = subprocess.run(self.cli(), capture_output=True, text=True)
@@ -1122,10 +1396,32 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
                 self.receipt["files"] = original
         self.pin()
 
-    def test_source_equivalent_import_cache_passes(self):
+    def assert_source_admission_preserves_fixture_state(self):
+        def snapshot():
+            result = {}
+            for root in (self.project, self.kit):
+                for path in (root, *root.rglob("*")):
+                    info = path.lstat()
+                    result[str(path)] = (
+                        info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                        info.st_mtime_ns, info.st_ctime_ns,
+                        path.read_bytes() if path.is_file() else None,
+                    )
+            return result
+        before = snapshot()
+        result = self.inspect()
+        self.assertEqual(result["status"], "admitted")
+        self.assertEqual(result["python_cache_tag"], sys.implementation.cache_tag)
+        process = subprocess.run(self.cli(), capture_output=True, text=True, timeout=120)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual(json.loads(process.stdout)["status"], "admitted")
+        self.assertEqual(snapshot(), before)
+
+    def test_source_admission_cli_preserves_normal_import_and_py_compile_caches(self):
         source = self.kit / "workflowkit/delivery.py"
         source.write_text('"""Cache fixture."""\n'
                           'VALUES = {"tuple": (1, 2), "unicode": "résumé"}\n'
+                          'FROZEN = {"alpha", "beta", "gamma"}\n'
                           'def outer(value):\n'
                           '    def inner(other):\n'
                           '        assert other is not None\n'
@@ -1141,6 +1437,15 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         item["sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
         item["byte_size"] = source.stat().st_size
         self.pin()
+        environment = dict(os.environ)
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        process = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); import workflowkit.delivery",
+             str(self.kit)], env=environment, capture_output=True, text=True, timeout=30)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertTrue(Path(importlib.util.cache_from_source(str(source))).is_file())
+        self.assert_source_admission_preserves_fixture_state()
         for invalidation in (py_compile.PycInvalidationMode.TIMESTAMP,
                              py_compile.PycInvalidationMode.CHECKED_HASH,
                              py_compile.PycInvalidationMode.UNCHECKED_HASH):
@@ -1148,9 +1453,9 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
                 py_compile.compile(str(source), doraise=True, optimize=optimize,
                                    invalidation_mode=invalidation)
             with self.subTest(invalidation=invalidation):
-                self.inspect()
+                self.assert_source_admission_preserves_fixture_state()
 
-    def test_timestamp_cache_can_execute_unqualified_code_even_under_dash_B(self):
+    def test_source_admission_trusts_owner_cache_even_when_import_executes_poison(self):
         source = self.kit / "workflowkit/delivery.py"
         cache = Path(py_compile.compile(str(source), doraise=True))
         # A valid timestamp/size header is not a binding of the executable body.
@@ -1163,8 +1468,9 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
             capture_output=True, text=True)
         self.assertNotEqual(process.returncode, 0)
         self.assertIn("unqualified-cache-executed", process.stderr)
-        with self.assertRaises(ValueError):
-            self.inspect()
+        # This excluded guarantee is deliberate: unchanged qualified source
+        # passes even though ordinary import can execute owner-controlled cache.
+        self.assert_source_admission_preserves_fixture_state()
 
     def test_staged_only_infrastructure_change_fails(self):
         task = self.base / "task"
