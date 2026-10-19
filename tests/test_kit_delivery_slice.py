@@ -567,9 +567,9 @@ class DeliveryBaselineFixtureTest(unittest.TestCase):
             ROOT / ".kent/context/delivery.md",
         ):
             self.assertIn(".kent/project-contract.md", path.read_text())
-        readme = (ROOT / "README.md").read_text()
-        self.assertIn("focused production-shaped wrapper/helper checks", readme)
-        self.assertIn("source/environment identity references", readme)
+        operations = (ROOT / "docs/OPERATIONS.md").read_text()
+        self.assertIn("focused production-shaped wrapper/helper checks", operations)
+        self.assertIn("source/environment identity references", operations)
 
 
 class CurrentKitGraphTest(unittest.TestCase):

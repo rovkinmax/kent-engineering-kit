@@ -1063,9 +1063,9 @@ assert edges["plan_review_accept"]["requires_approval"] is True
             "current published branch", "never checkout/fast-forward",
         ):
             self.assertIn(text, contract)
-        readme = (ROOT / "README.md").read_text()
-        self.assertIn("git fetch origin", readme)
-        self.assertIn("does not implicitly fetch", readme)
+        operations = (ROOT / "docs/OPERATIONS.md").read_text()
+        self.assertIn("git fetch origin", operations)
+        self.assertIn("does not implicitly fetch", operations)
         ship = (ROOT / ".kent/commands/ship-pr.md").read_text()
         self.assertIn("`rebase`", ship)
         self.assertIn("`canBeRebased`", ship)

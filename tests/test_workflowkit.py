@@ -2769,14 +2769,18 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         contract = " ".join(
             (REPO_ROOT / "contracts" / "role-contract.md").read_text().split()
         )
-        readme = " ".join((REPO_ROOT / "README.md").read_text().split())
+        operations = " ".join(
+            (REPO_ROOT / "docs/OPERATIONS.md").read_text().split()
+        )
         alternatives = (
             "if either (a) the previous run completed normally, or (b) the "
             "previous run was manually stopped by the user, canceled, or "
             "interrupted and a new explicit human decision naming that exact "
             "Session was made after that outcome."
         )
-        for name, text in (("grill", prompt), ("contract", contract), ("README", readme)):
+        for name, text in (
+            ("grill", prompt), ("contract", contract), ("operations", operations)
+        ):
             with self.subTest(source=name):
                 self.assertIn(alternatives, text)
                 self.assertNotIn("and its previous run completed normally", text)
@@ -2798,7 +2802,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         ):
             with self.subTest(requirement=requirement):
                 self.assertIn(requirement, contract)
-        self.assertIn("an ambiguous attempt is not retried", readme)
+        self.assertIn("an ambiguous attempt is not retried", operations)
 
     def test_current_model_policy_matches_grill_configuration(self) -> None:
         config = tomllib.loads((REPO_ROOT / "config" / "subagents.toml").read_text())
