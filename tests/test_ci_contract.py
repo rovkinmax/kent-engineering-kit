@@ -75,6 +75,10 @@ class CiContractTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["commentary"], "capture-observed")
 
+    @mock.patch.dict(os.environ, {
+        "KENT_SESSION_ID": "11111111-1111-4111-8111-111111111111",
+        "KENT_STEP_ID": "22222222-2222-4222-8222-222222222222",
+    })
     def test_ci_archive_uses_recovered_logical_view_and_ignores_suffix_refs(self):
         from tests.test_workflow_runtime import WorkflowEvidenceLedgerTest, load_template_module
         from tests.test_runtime_contracts import dynamic_contract
@@ -555,6 +559,10 @@ class CiContractTest(unittest.TestCase):
         self.assertEqual(json.loads(fresh["ci_contract"])["head_oid"], changed_head)
         archive_changed.assert_called_once()
 
+    @mock.patch.dict(os.environ, {
+        "KENT_SESSION_ID": "11111111-1111-4111-8111-111111111111",
+        "KENT_STEP_ID": "22222222-2222-4222-8222-222222222222",
+    })
     def test_archive_cli_requires_nested_v3_contract_identity(self) -> None:
         contract = {
             "schema": "github-ci-contract-v1",
@@ -1008,6 +1016,10 @@ jobs:
                         validator.call_args_list[0].args[0][0].workflow_path, path,
                     )
 
+    @mock.patch.dict(os.environ, {
+        "KENT_SESSION_ID": "11111111-1111-4111-8111-111111111111",
+        "KENT_STEP_ID": "22222222-2222-4222-8222-222222222222",
+    })
     def test_prepare_ci_payload_and_cli_bind_real_target_and_head_revisions(
         self,
     ) -> None:

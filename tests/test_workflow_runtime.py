@@ -59,6 +59,12 @@ VERIFICATION_DISPATCH = (
 APK_INSTALL = (
     REPO_ROOT / "templates" / "project" / "android-apk-install-preserve"
 )
+# Test-owned identities only: fixture writers must never depend on the Agent
+# environment running unittest (CI deliberately has no inherited Kent owner).
+EVIDENCE_FIXTURE_OWNER = {
+    "KENT_SESSION_ID": "11111111-1111-4111-8111-111111111111",
+    "KENT_STEP_ID": "22222222-2222-4222-8222-222222222222",
+}
 
 
 def load_template_module(path: Path, name: str):
@@ -2016,6 +2022,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
         self.assertFalse((directory / "plan-contract.json").exists())
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_recovered_read_append_dedup_and_seal_use_continuation(self):
         root, scripts, directory, original = self.recovered_fixture()
         ledger = load_template_module(scripts / "workflow-evidence-ledger", "recovered_ledger")
@@ -2220,6 +2227,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual(metrics["verification_loops"], 2)
         self.assertEqual(metrics["unknown_model_call_entries"], 2)
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_v2_seal_is_idempotent_and_janitor_retains_terminal_sentinel(self) -> None:
         root = self.create_repository()
         (root / ".kent" / "context").mkdir()
@@ -2568,6 +2576,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual(validate.returncode, 1)
         self.assertIn("invalid hash", validate.stderr)
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_append_rejects_runtime_replacement_after_admission(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -2621,6 +2630,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual(preserved, "preserve\n")
         self.assertEqual(replacement, "replacement\n")
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_append_rejects_lock_tombstone_conflict_without_task_creation(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -2655,6 +2665,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertFalse((root / ".kent" / "runtime" / "TASK-4").exists())
         self.assertEqual((tombstone / "outside.txt").read_text(), "preserve\n")
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_append_rejects_task_detach_and_replacement(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -2701,6 +2712,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         task.rmdir()
         detached.rename(task)
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_seal_waits_for_paused_writer_and_rereads_complete_chain(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -2823,6 +2835,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
                 task="TASK-4",
             )
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_append_rejects_terminal_sentinel_after_seal(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -3026,6 +3039,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual(len(records), 1)
         self.assertNotIn("terminal_evidence_seal_v1", data.decode())
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_append_task_creation_fsync_failure_preserves_empty_task(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -9818,6 +9832,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.run_git(root, "commit", "-q", "-m", "context")
         scripts = self.install_v2_runtime_commands(root)
         evidence = scripts / "workflow-evidence-ledger"
+        environment = {**os.environ, **EVIDENCE_FIXTURE_OWNER}
         append = subprocess.run(
             [str(evidence), "append", "--task", "TASK-1", "--workspace", str(root)],
             input=json.dumps(
@@ -9838,6 +9853,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env=environment,
         )
         self.assertEqual(append.returncode, 0, append.stderr)
         seal = subprocess.run(
@@ -9857,6 +9873,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env=environment,
         )
         self.assertEqual(seal.returncode, 0, seal.stderr)
         return scripts, json.loads(seal.stdout)["terminal_marker"]
@@ -9883,7 +9900,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             root = linked_root
         head = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
         scripts = self.install_v2_runtime_commands(root)
-        environment = dict(os.environ)
+        environment = {**os.environ, **EVIDENCE_FIXTURE_OWNER}
         environment.pop("KENT_RUN_ID", None)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         artifacts = []
@@ -11364,6 +11381,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         marker = ""
         if with_v2:
             evidence = scripts / "workflow-evidence-ledger"
+            environment = {**os.environ, **EVIDENCE_FIXTURE_OWNER}
             append = subprocess.run(
                 [
                     str(evidence),
@@ -11391,6 +11409,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                env=environment,
             )
             self.assertEqual(append.returncode, 0, append.stderr)
             seal = subprocess.run(
@@ -11417,6 +11436,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                env=environment,
             )
             self.assertEqual(seal.returncode, 0, seal.stderr)
             marker = json.loads(seal.stdout)["terminal_marker"]
@@ -13117,6 +13137,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertTrue(sentinel.exists())
         self.assertFalse(tombstone.exists())
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_v2_sentinel_create_phase_failure_preserves_state_and_blocks_append(
         self,
     ) -> None:
@@ -13187,6 +13208,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             check=False,
         )
         self.assertEqual(append.returncode, 1)
+        self.assertIn("sealed", append.stderr)
         self.assertFalse(task.exists())
         retry = janitor._remove_v2_runtime_state(
             root.resolve(),
