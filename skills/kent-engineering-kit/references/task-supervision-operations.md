@@ -30,6 +30,20 @@ well as sending the active owner a message.
   bounded assignment after verifying it is not Workflow-owned.
 - New helper: `kent run --agent` with an available qualified role.
 
+Kent 2.10 continuation of an already active Session steers that execution and
+observes its outcome; it does not start a second writer or refresh its locked
+instructions. Prefer explicit `kent run steer` for active-owner feedback.
+Continuation may warn about ignored execution overrides; thinking-level
+changes have their native semantics, not a new authority grant. Workflow-owned
+Sessions still use Task lifecycle operations only under the owning contract;
+active-session continuation does not authorize Task resume or route changes.
+
+For durable Session identity, `kent session-id` prints a bare UUID in 2.9
+and diagnostic Short ID/UUID/Log path lines in 2.10. Extract the UUID and verify
+native ownership; numeric short IDs are convenient CLI selectors, not durable
+artifact identities. New evidence uses inherited Session/Step UUIDs, never a
+fabricated Run. Native Session/Task readback does not authenticate current Step.
+
 Question answering may select the first pending object, not an exact ID.
 Re-read immediately before answering; this is not an atomic compare-and-set.
 Changed targeting or concurrent answers need reconciliation. Read back the

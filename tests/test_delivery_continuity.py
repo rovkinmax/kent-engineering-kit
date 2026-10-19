@@ -274,7 +274,6 @@ class DeliveryPackingCommandTests(unittest.TestCase):
         identity = {
             "task_id": "native-task", "task_short_id": "KIT-1", "project_id": "native-project",
             "workspace_path": str(root), "session_id": session,
-            "run_id": "22222222-2222-4222-8222-222222222222",
             "step_id": "33333333-3333-4333-8333-333333333333",
         }
         workflow_id = "44444444-4444-4444-8444-444444444444"
@@ -333,7 +332,7 @@ class DeliveryPackingCommandTests(unittest.TestCase):
         environment = {
             **os.environ, "HOME": str(home), "PATH": str(bin_path) + os.pathsep + os.environ["PATH"],
             "TEST_NATIVE_CALLS": str(command_log), "TEST_NATIVE_DATA": str(native),
-            **{"KENT_" + key.upper(): identity[key] for key in ("session_id", "run_id", "step_id")},
+            **{"KENT_" + key.upper(): identity[key] for key in ("session_id", "step_id")},
         }
         command = [
             sys.executable, str(scripts / "workflow-checkpoint"), "pack-delivery",
@@ -369,6 +368,57 @@ class DeliveryPackingCommandTests(unittest.TestCase):
 
 
 class ScriptProducerIdentityTests(unittest.TestCase):
+    def test_versioned_agent_archives_keep_legacy_bytes_and_reject_mixed_owners(self):
+        import hashlib
+        from workflowkit import delivery
+
+        native = self.observe()
+        common = {key: native[key] for key in
+                  ("task_id", "task_short_id", "project_id", "workspace_path")}
+        current = {
+            **common, "session_id": "11111111-1111-4111-8111-111111111111",
+            "step_id": "22222222-2222-4222-8222-222222222222",
+        }
+        for version in (1, 2):
+            with self.subTest(version=version):
+                stored_owner = ({**common, "session_id": "historical-session",
+                                 "run_id": "historical-run", "step_id": "historical-step"}
+                                if version == 1 else current)
+                base = {
+                    "schema": f"workflow-producer-source-v{version}", "identity": stored_owner,
+                    "producer_kind": "historical-fixture", "inputs": {},
+                    "result": {"transition": "failed", "commentary": "original bytes"}, "binding": {},
+                }
+                raw = delivery.packet_json(base)
+                locator = f"build/kent-workflow/KIT-1/packets/base-{hashlib.sha256(raw).hexdigest()}.json"
+                emitted = delivery._packet_emitted(base, locator)
+                emitted_path = str(Path(locator).with_name(
+                    "emitted-" + hashlib.sha256(emitted).hexdigest() + ".json"))
+                archive = {locator: raw, emitted_path: emitted}
+                result = reconstruct_producer(
+                    self.root, locator, identity=current, read_relative=archive.__getitem__)
+                self.assertEqual(result["identity"], stored_owner)
+                self.assertEqual(result["emitted"], emitted)
+                self.assertEqual(producer_reference_closure(
+                    self.root, locator, identity=current, read_relative=archive.__getitem__),
+                    sorted(archive))
+                for schema in ("workflow-producer-source-v3",
+                               f"workflow-producer-source-v{3 - version}"):
+                    wrong = {**base, "schema": schema}
+                    wrong_raw = delivery.packet_json(wrong)
+                    wrong_locator = f"build/kent-workflow/KIT-1/packets/base-{hashlib.sha256(wrong_raw).hexdigest()}.json"
+                    with self.assertRaisesRegex(ValueError, "schema|version"):
+                        reconstruct_producer(
+                            self.root, wrong_locator, identity=current,
+                            read_relative=lambda _: wrong_raw)
+        with self.assertRaises(ValueError):
+            capture_producer(self.root, identity={**current, "run_id": "stale"},
+                             producer_kind="agent", inputs={}, result={})
+        locator, _ = capture_producer(self.root, identity=current,
+                                      producer_kind="agent", inputs={}, result={})
+        self.assertEqual(json.loads((self.root / locator).read_bytes())["schema"],
+                         "workflow-producer-source-v2")
+
     def setUp(self):
         self.root = create_repository(self)
         self.context = {"task_id": "native-task", "node_id": "script-node"}
@@ -430,7 +480,8 @@ class ScriptProducerIdentityTests(unittest.TestCase):
         })
         agent = {key: identity[key] for key in
                  ("task_id", "task_short_id", "project_id", "workspace_path")}
-        agent.update(session_id="later-session", run_id="later-run", step_id="later-step")
+        agent.update(session_id="11111111-1111-4111-8111-111111111111",
+                     step_id="22222222-2222-4222-8222-222222222222")
         self.assertEqual(reconstruct_producer(
             self.root, locator, identity=agent,
         )["emitted"], emitted)
@@ -554,9 +605,10 @@ class ScriptProducerIdentityTests(unittest.TestCase):
             )
         agent = {key: identity[key] for key in
                  ("task_id", "task_short_id", "project_id", "workspace_path")}
-        agent.update(session_id="current-agent", run_id="run", step_id="step")
+        agent.update(session_id="11111111-1111-4111-8111-111111111111",
+                     step_id="22222222-2222-4222-8222-222222222222")
         detail = {**self.detail, "current_nodes": [{
-            "node_id": "agent-node", "session_id": "current-agent",
+            "node_id": "agent-node", "session_id": agent["session_id"],
         }]}
         graph = {
             "workflow_id": self.graph["workflow_id"], "expected_version": 3,
@@ -643,16 +695,41 @@ class ScriptProducerIdentityTests(unittest.TestCase):
         self.assertTrue(set(reads) <= set(paths))
 
     def test_nested_producer_closure_reconstructs_after_original_files_retire(self):
-        identity = self.observe()
+        script_identity = self.observe()
+        identity = {
+            **{key: script_identity[key] for key in
+               ("task_id", "task_short_id", "project_id", "workspace_path")},
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "step_id": "22222222-2222-4222-8222-222222222222",
+        }
         original, _ = capture_producer(
-            self.root, identity=identity, producer_kind="original-script",
+            self.root, identity=script_identity, producer_kind="original-script",
             inputs={}, result={"transition": "failed", "report": "exact historical failure"},
         )
-        packed, _ = capture_producer(
-            self.root, identity=identity, producer_kind="pack-delivery",
-            inputs={}, result={"transition": "failed", "report": "exact historical failure"},
-            binding={"producer_refs": json.dumps({"refs": [original]})},
-        )
+        detail = {**self.detail, "current_nodes": [{
+            "node_id": "agent-node", "session_id": identity["session_id"],
+        }]}
+        graph = {
+            "workflow_id": self.graph["workflow_id"], "expected_version": 3,
+            "graph": {
+                "nodes": [{"id": "agent-node", "kind": "agent"}],
+                "transition_groups": [{
+                    "id": "failed", "source_node_id": "agent-node", "transition_id": "failed",
+                }],
+                "edges": [{"id": "edge", "transition_group_id": "failed",
+                           "parameters": [{"key": "report"}]}],
+            },
+        }
+        packed, emitted = pack_delivery(self.root, {
+            "schema": "workflow-pack-delivery-v1", "transition": "failed", "values": {},
+            "producer_refs": [original], "delivery_mode": "preserve",
+            "transition_contract_ref": transition_contract_reference(identity, detail, graph, "failed"),
+        }, identity=identity, task_detail=detail, graph=graph)
+        self.assertEqual(json.loads(emitted)["report"], "exact historical failure")
+        self.assertEqual(json.loads((self.root / original).read_bytes())["schema"],
+                         "workflow-producer-source-v1")
+        self.assertEqual(json.loads((self.root / packed).read_bytes())["schema"],
+                         "workflow-producer-source-v2")
         paths = producer_reference_closure(self.root, packed, identity=identity)
         self.assertEqual(len(paths), 4)
         archive = {path: (self.root / path).read_bytes() for path in paths}
@@ -1133,10 +1210,12 @@ class DeliveryContinuityTest(unittest.TestCase):
         profile = runtime_v2_profile(ci=False)
         prompt = edge_map(profile)["gate_smoke_required"].prompt or ""
         for required in (
-            "kent task show {{.TaskShortId}} --json",
-            "`summary.id`",
-            "`summary.short_id`",
-            "`kent session-id`",
+            "`identity --task {{.TaskShortId}} --workspace <root>`",
+            "`task_id`",
+            "verified inherited current",
+            "requires neither Step nor retention/R2 admission",
+            "Never parse `kent session-id` output",
+            "preserve inherited `KENT_SESSION_ID`",
             "`KENT_TASK_ID`",
             "`KENT_SESSION_ID`",
             "`task_native_id`",
@@ -1160,11 +1239,15 @@ class DeliveryContinuityTest(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, prompt)
+        self.assertNotIn("obtain the current Session with `kent session-id`", prompt)
+        self.assertNotIn("kent task show {{.TaskShortId}} --json", prompt)
 
         contract = (REPO_ROOT / "contracts" / "mobile-smoke-contract.md").read_text()
         for required in (
-            "`summary.id`",
-            "`summary.short_id`",
+            "`task_id`",
+            "`task_short_id`",
+            "workflow-evidence-ledger identity",
+            "Never parse `kent session-id`",
             "`lease_owner_id`",
             "`lock_resource`",
             "`lock_token`",

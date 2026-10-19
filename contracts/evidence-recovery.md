@@ -14,19 +14,30 @@ membership cannot authorize an effect. Historical Session pagination is not a
 prerequisite when the complete current association already proves ownership.
 There is no `KENT_TASK_ID` assumption or all-project Task inventory.
 
-Session, Run and Step must be canonical UUIDs inherited from Kent. JSON cannot
-override them. Native Task/Session and execution/source workspace bindings are
-checked; Run/Step are **not independently authenticated**. Every recovery request
-and retention receipt hashes the closed classification:
+New writes require canonical Session and Step UUIDs inherited from Kent on
+both 2.9 and 2.10. Ignore stale `KENT_RUN_ID`; never manufacture a Run or use
+a numeric Session short ID as a durable owner. JSON cannot override ownership.
+Native Task/Session and execution/source workspace bindings are checked;
+the current Step is **not independently authenticated**. New recovery requests
+and retention receipts hash the closed classification:
 
 ```json
-{"schema":"kent-owner-provenance-v1","session_task_binding":"native-readback","run_step_binding":"inherited-kent-environment","independently_verified_current_run":false}
+{"schema":"kent-owner-provenance-v2","session_task_binding":"native-readback","step_binding":"inherited-kent-environment","independently_verified_current_step":false}
 ```
 
 This protects against accidental missing, stale or foreign ownership within
 the declared cooperative trust model. It does not prevent intentional
-same-user environment spoofing, authenticate a current Run, settle a prior
+same-user environment spoofing, authenticate a current Step, settle a prior
 effect, grant permission, replenish a budget or authenticate human authorship.
+
+Ordinary record `schema_version=2` carries Session/Step only. Version 1 keeps
+its original Session/Run/Step and hashes. Deduplication is Task-scoped by known
+Session/Step, excluding recovery boundaries and seals; unknown owners never
+match and ambiguous historical matches block. Mixed chains are supported.
+The outer artifact version selects the closed owner object (no nested schema
+field): `evidence-recovery-v2` uses `evidence_recovery_boundary_v2` and v2
+provenance; v1 retains its exact old owner and provenance. Unknown or
+inconsistent versions block. Terminal seal/marker remain v1.
 
 ## One splice
 
@@ -58,7 +69,7 @@ The continuation is exclusively created and fsynced first. The canonical
 manifest is staged as private
 `build/kent-workflow/TASK/recovery-HASH.tmp`, fsynced and read back, then renamed
 on the same filesystem into the fixed manifest path; both directories are
-fsynced. The manifest contains exactly `schema=evidence-recovery-v1`, `request`,
+fsynced. New manifests contain exactly `schema=evidence-recovery-v2`, `request`,
 `request_sha256`, and `boundary_event_hash`. A stage is a bounded temporary
 publication artifact, not a registry, packet or third Task runtime entry.
 
@@ -66,12 +77,15 @@ publication artifact, not a registry, packet or third Task runtime entry.
 
 An exact complete continuation without a manifest can finish publication.
 An exact published manifest can settle without replay or rewriting the marker,
-including from a fresh genuine Run still attached to the current Task Session.
+including from a fresh genuine Step still attached to the current Task Session.
 The result records the actual `retry_owner`; retain that exact result in the
 operation trace before final cleanup evidence. It is a settlement observation,
 not ordinary acceptance. A partially written or conflicting continuation or
 stage is preserved and blocks; it is never truncated or silently replaced.
 An exact staged manifest is consumed by rename on retry.
+Historical v1 retry requires the exact durable old continuation or manifest;
+a caller-only old request cannot initiate a fresh v1 effect. Never rewrite
+historical ownership, request digest, prefix bytes, receipt or seal on retry.
 
 ### Validated view and limits
 
@@ -115,7 +129,7 @@ Native source identity is exactly `{project_id,workspace_id,task_id}`.
 For primary-runtime cleanup the source can be the same primary checkout; it
 must not be a child of a retiring managed root.
 
-The receipt schema `evidence-retention-v1` has exactly:
+The new receipt schema `evidence-retention-v2` has exactly:
 `schema`, `task_short_id`, `source_workspace`, `source_native_identity`,
 `terminal_event_hash`, `recovery_request_sha256`, `owner_provenance`,
 `files[{logical_path,byte_size,sha256}]`, and `bundle_sha256`.
@@ -138,6 +152,20 @@ footer blocks retention. The resolver follows digest-bound producer references,
 not modification time or a latest-result index. Retained validation reads the
 same closure from receipt-bound archive files after the original packet paths
 are unavailable; it does not restore or fabricate those paths.
+
+New Agent bases use `workflow-producer-source-v2` and a Session/Step owner.
+Native Script bases keep `workflow-producer-source-v1` and their native
+invocation identity. Historical Agent v1 bases retain Session/Run/Step;
+readers validate the stored base by its own schema and compare Task/root
+binding, not the historical Run against the current owner. Packet footer,
+checkpoint and R2 document formats are unchanged.
+
+Retention selects an existing verified v1 receipt or exact `.preparing-HASH`
+publication before constructing a new v2 receipt. It preserves the original
+confirm/hash, including when preparation stopped before `receipt.json`.
+Selection validates the full live source/reference closure and every existing
+prepared file; conflicting, partial or foreign bytes block. A caller-only
+old hash cannot initiate a fresh v1 operation or create a duplicate bundle.
 
 Bundle directories are 0700 and files 0600, owner-bound and no-follow; unsafe
 hardlinks/symlink components are rejected. Source artifacts are streamed from

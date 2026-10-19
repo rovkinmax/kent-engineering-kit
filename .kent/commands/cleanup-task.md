@@ -98,11 +98,13 @@ Invoke the profile's `prepare_cleanup` command with one JSON object on stdin:
   authenticity; the caller owns the real readback, authority and redaction.
 - `final_event`: the existing ordinary ledger payload with `node_key=cleanup`,
   `evidence_type=cleanup_preparation`, `summary`, `artifacts`, `checks`,
-  `decisions` and `context`. Use real current unmodified `KENT_SESSION_ID`,
-  `KENT_RUN_ID`, and `KENT_STEP_ID`. Never generate, export, substitute or
+  `decisions` and `context`. Use real current unmodified `KENT_SESSION_ID`
+  and `KENT_STEP_ID` for new schema-2 evidence; ignore stale `KENT_RUN_ID`.
+  Never generate, export, substitute or
   replace identities to bypass deduplication. Non-empty identity strings
   are not native authentication; qualification must read back the actual
-  Kent Run/Session/Step records for the final event.
+  Kent Session/Task binding for the final event. Current Step is inherited,
+  not independently authenticated; historical v1 keeps its original owner.
 - `seal_request`: the existing `terminal-evidence-seal-request-v1` object
   containing actual `operation_report_digests`, passed `redaction` proof and
   `retention_class=cleanup_report_only`. Existing kinds are `approval`,
@@ -170,7 +172,8 @@ end with exactly the same marker as the validated ledger chain. The original
 frozen request must validate and exactly match the marker's operation-report
 digests, redaction proof and retention class; verify those digests against the
 actual retained operation reports and redaction evidence. Read back the final
-ordinary event's actual Kent Session/Run/Step records and confirm its
+ordinary event's versioned owner (Session/Step for v2; original
+Session/Run/Step for v1) and native Session/Task binding, and confirm its
 identities are unchanged. Local non-empty identity strings do not establish
 native provenance.
 

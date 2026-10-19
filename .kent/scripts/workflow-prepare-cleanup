@@ -397,7 +397,7 @@ def invoke_ledger(root, task, action, payload, environment):
 def retain_terminal(root, task, ledger, janitor, runtime, records):
     """Retention follows the final seal; retries never append or unseal."""
     if not janitor._retention_declared(root) and not any(
-        record.get("record_kind") == runtime.EVIDENCE_BOUNDARY_KIND for record in records
+        record.get("record_kind") in runtime.EVIDENCE_BOUNDARY_KINDS for record in records
     ):
         return {}
     preview = ledger.retain_evidence(root, task=task)
@@ -414,13 +414,17 @@ def assert_final_record(records, prepared):
     if len(ordinary) != baseline["sequence"] + 1:
         raise ValueError("final ordinary event was not appended exactly once")
     final = ordinary[-1]
+    version = final.get("schema_version")
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("final ordinary event has an unsupported identity version")
     if (final["previous_hash"] != baseline["event_hash"]
             or any(final.get(key) != value for key, value in prepared["event"].items())
             or final.get("workspace_path") != prepared["request"]["workspace_path"]
             or final.get("task_short_id") != prepared["request"]["task_short_id"]
             or final.get("git_head") != prepared["git_head"]
             or any(not final.get(key) or final[key] == "unknown"
-                   for key in ("run_id", "session_id", "step_id"))):
+                   for key in (("run_id", "session_id", "step_id") if version == 1 else ("session_id", "step_id")))
+            or (version == 2 and "run_id" in final)):
         raise ValueError("actual final ordinary event does not match preparation")
 
 
@@ -577,7 +581,7 @@ def prepare(request):
     baseline = prepared["baseline"]
     if (len(records) == baseline["sequence"]
             and records[-1]["event_hash"] == baseline["event_hash"]):
-        for identity in ("KENT_RUN_ID", "KENT_SESSION_ID", "KENT_STEP_ID"):
+        for identity in ("KENT_SESSION_ID", "KENT_STEP_ID"):
             if not os.environ.get(identity) or os.environ[identity] == "unknown":
                 raise ValueError("real current Kent event identities are required")
         invoke_ledger(root, task, "append", request["final_event"], environment)

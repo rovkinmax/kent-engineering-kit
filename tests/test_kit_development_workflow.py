@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 
 from workflowkit.delivery import build_delivery_workflow
@@ -558,6 +559,24 @@ assert edges["plan_review_accept"]["requires_approval"] is True
                 self.assertNotIn("workflow-evidence-ledger append", edge.prompt)
                 self.assertIn("unmodified", edge.prompt)
                 self.assertIn("KENT_RUN_ID", edge.prompt)
+
+    def test_current_identity_prompts_use_session_step_without_topology_change(self):
+        profile = kit.profile_at(ROOT)
+        current = kit.build_current_workflow(profile)
+        historical = kit.build_workflow(profile)
+        prompts = [edge.prompt or "" for edge in current.edges]
+        self.assertEqual(sum("Session/Step pair; on recovery" in prompt for prompt in prompts), 20)
+        self.assertFalse(any("KENT_RUN_ID" in prompt for prompt in prompts))
+        for edge in current.edges:
+            if edge.target == "cleanup":
+                self.assertIn("`KENT_SESSION_ID` and `KENT_STEP_ID`", edge.prompt)
+        self.assertEqual(current.nodes, historical.nodes)
+        # Reliability's existing implement_replan is the sole graph delta.
+        before = {edge.key: replace(edge, prompt=None) for edge in historical.edges}
+        after = {edge.key: replace(edge, prompt=None) for edge in current.edges}
+        self.assertEqual(set(after) - set(before), {"implement_replan"})
+        for key in before:
+            self.assertEqual(after[key], before[key], key)
 
     def test_v5_preserves_historical_v1_through_v5_snapshots(self) -> None:
         import hashlib
@@ -1609,8 +1628,9 @@ class CleanupPreparationTest(unittest.TestCase):
         if plan:
             (root / "plan.md").write_text("# Plan\n- [ ] Implement scoped change\n")
         self.environment = {
-            **os.environ, "KENT_SESSION_ID": "fixture-session",
-            "KENT_RUN_ID": "fixture-plan", "KENT_STEP_ID": "fixture-step",
+            **os.environ, "KENT_SESSION_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "fixture-session")),
+            "KENT_RUN_ID": "fixture-plan",
+            "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "fixture-plan")),
         }
         accepted = self.command(root, "workflow-plan-contract", {
             "workspace_path": str(root), "task_short_id": "TASK-1",
@@ -1683,7 +1703,8 @@ class CleanupPreparationTest(unittest.TestCase):
     def prepare(self, root, request, *, run_id="fixture-cleanup"):
         return self.command(
             root, "workflow-prepare-cleanup", request,
-            environment={**self.environment, "KENT_RUN_ID": run_id},
+            environment={**self.environment, "KENT_RUN_ID": run_id,
+                         "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, run_id))},
         )
 
     def add_ci_archive(
@@ -1742,7 +1763,7 @@ class CleanupPreparationTest(unittest.TestCase):
                 environment={
                     **self.environment,
                     "KENT_RUN_ID": "fixture-ci-archive",
-                    "KENT_STEP_ID": "fixture-ci-archive-step",
+                    "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "fixture-ci-archive")),
                 },
             )
             self.assertEqual(append.returncode, 0, append.stderr)
@@ -1789,6 +1810,7 @@ class CleanupPreparationTest(unittest.TestCase):
                         {
                             **self.environment,
                             "KENT_RUN_ID": "fixture-retry",
+                            "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "fixture-retry")),
                         },
                     ):
                         repeated = helper.prepare(request)
@@ -1810,7 +1832,7 @@ class CleanupPreparationTest(unittest.TestCase):
                 ]
                 original_ids = tuple(
                     retained_records[-2][key]
-                    for key in ("run_id", "session_id", "step_id")
+                    for key in ("session_id", "step_id")
                 )
                 actions = []
                 with mock.patch.object(
@@ -1839,7 +1861,7 @@ class CleanupPreparationTest(unittest.TestCase):
                 self.assertEqual(
                     tuple(
                         replayed_records[-2][key]
-                        for key in ("run_id", "session_id", "step_id")
+                        for key in ("session_id", "step_id")
                     ),
                     original_ids,
                 )
@@ -2007,7 +2029,7 @@ class CleanupPreparationTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, defect)
                 self.assertTrue(source.exists())
 
-    def test_final_event_run_dedup_cannot_suppress_unrelated_event(self) -> None:
+    def test_final_event_session_step_dedup_cannot_suppress_unrelated_event(self) -> None:
         root = self.fixture()
         request = self.request(root)
         before = (root / ".kent/runtime/TASK-1/evidence-ledger.jsonl").read_bytes()
@@ -2030,7 +2052,10 @@ class CleanupPreparationTest(unittest.TestCase):
                 raise ValueError("injected failure before seal")
             return invoke(root, task, action, payload, environment)
 
-        with mock.patch.dict(os.environ, {**self.environment, "KENT_RUN_ID": "fixture-cleanup"}):
+        with mock.patch.dict(os.environ, {
+            **self.environment, "KENT_RUN_ID": "stale-ignored",
+            "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "fixture-cleanup")),
+        }):
             with mock.patch.object(helper, "invoke_ledger", side_effect=fail_seal):
                 with self.assertRaisesRegex(ValueError, "injected"):
                     helper.prepare(request)
@@ -2046,7 +2071,8 @@ class CleanupPreparationTest(unittest.TestCase):
 
         with mock.patch.dict(
             os.environ,
-            {**self.environment, "KENT_RUN_ID": "fixture-new-run"},
+            {**self.environment, "KENT_RUN_ID": "stale-ignored",
+             "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "fixture-new-step"))},
         ):
             with mock.patch.object(
                 helper,
@@ -2059,6 +2085,64 @@ class CleanupPreparationTest(unittest.TestCase):
         after = ledger.read_text().splitlines()
         self.assertEqual(after[:2], before)
         self.assertEqual(len(after), 3)
+
+    def test_historical_cleanup_v1_final_event_reused_after_upgrade(self):
+        from workflowkit import runtime
+
+        for completed in (False, True):
+            with self.subTest(completed=completed):
+                root = self.fixture()
+                request = self.request(root)
+                helper = self.helper(root)
+                invoke = helper.invoke_ledger
+                path = root / ".kent/runtime/TASK-1/evidence-ledger.jsonl"
+
+                def historical_writer(root, task, action, payload, environment):
+                    if action == "seal" and not completed:
+                        raise ValueError("historical crash before seal")
+                    result = invoke(root, task, action, payload, environment)
+                    if action == "append":
+                        lines = path.read_bytes().splitlines(keepends=True)
+                        final = json.loads(lines[-1])
+                        final.update(schema_version=1, run_id="33333333-3333-4333-8333-333333333333")
+                        final["event_hash"] = runtime._event_hash(
+                            {key: value for key, value in final.items() if key != "event_hash"})
+                        path.write_bytes(b"".join(lines[:-1]) + runtime.canonical_bytes(final) + b"\n")
+                    return result
+
+                with mock.patch.dict(os.environ, {
+                    **self.environment,
+                    "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "historical-cleanup")),
+                }), mock.patch.object(helper, "invoke_ledger", side_effect=historical_writer):
+                    if completed:
+                        original_report = helper.prepare(request)["cleanup_report"]
+                    else:
+                        with self.assertRaisesRegex(ValueError, "historical crash"):
+                            helper.prepare(request)
+                original = path.read_bytes()
+                final = json.loads(original.splitlines()[-2 if completed else -1])
+                self.assertEqual(final["schema_version"], 1)
+                actions = []
+
+                def record(root, task, action, payload, environment):
+                    actions.append(action)
+                    return invoke(root, task, action, payload, environment)
+
+                environment = {**self.environment,
+                               "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "after-upgrade"))}
+                environment.pop("KENT_RUN_ID", None)
+                with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                    helper, "invoke_ledger", side_effect=record,
+                ):
+                    retry = helper.prepare(request)
+                self.assertNotIn("append", actions)
+                self.assertEqual(json.loads(path.read_bytes().splitlines()[-2]), final)
+                if completed:
+                    self.assertEqual(path.read_bytes(), original)
+                    self.assertEqual(retry["cleanup_report"], original_report)
+                else:
+                    self.assertTrue(path.read_bytes().startswith(original))
+                self.assertTrue(self.admission(root, retry["cleanup_report"])[0])
 
     def test_matching_archive_and_prepared_source_recover_without_overwrite(self) -> None:
         for boundary in ("archive", "receipt", "seal"):
@@ -2076,7 +2160,10 @@ class CleanupPreparationTest(unittest.TestCase):
                             or (boundary == "receipt" and path.name == "cleanup-preparation.json")):
                         raise ValueError("injected retained-write boundary")
 
-                with mock.patch.dict(os.environ, {**self.environment, "KENT_RUN_ID": "cleanup-start"}):
+                with mock.patch.dict(os.environ, {
+                    **self.environment, "KENT_RUN_ID": "stale-ignored",
+                    "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "cleanup-start")),
+                }):
                     with mock.patch.object(helper, "write_private", side_effect=fail_after_write):
                         with self.assertRaisesRegex(ValueError, "injected"):
                             helper.prepare(request)
@@ -2093,7 +2180,7 @@ class CleanupPreparationTest(unittest.TestCase):
                     ]
                     original_ids = tuple(
                         records_before[-2][key]
-                        for key in ("run_id", "session_id", "step_id")
+                        for key in ("session_id", "step_id")
                     )
                     actions = []
                     invoke = helper.invoke_ledger
@@ -2114,6 +2201,7 @@ class CleanupPreparationTest(unittest.TestCase):
                             {
                                 **self.environment,
                                 "KENT_RUN_ID": "cleanup-recovery",
+                                "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "cleanup-recovery")),
                             },
                         ):
                             retried = helper.prepare(request)
@@ -2127,7 +2215,7 @@ class CleanupPreparationTest(unittest.TestCase):
                     self.assertEqual(
                         tuple(
                             records_after[-2][key]
-                            for key in ("run_id", "session_id", "step_id")
+                            for key in ("session_id", "step_id")
                         ),
                         original_ids,
                     )
@@ -2258,7 +2346,7 @@ class CleanupPreparationTest(unittest.TestCase):
         cleanup_environment = {
             **self.environment,
             "KENT_RUN_ID": "fixture-no-helper-cleanup",
-            "KENT_STEP_ID": "fixture-no-helper-step",
+            "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "fixture-no-helper-step")),
         }
         final_event = {
             "node_key": "cleanup",
@@ -2332,7 +2420,7 @@ class CleanupPreparationTest(unittest.TestCase):
         final_record = records[-2]
         original_ids = {
             key: final_record[key]
-            for key in ("session_id", "run_id", "step_id")
+            for key in ("session_id", "step_id")
         }
         retained_source = {
             "task_short_id": task,
@@ -2457,7 +2545,7 @@ class CleanupPreparationTest(unittest.TestCase):
             final = current_records[-2]
             current_ids = {
                 key: final.get(key)
-                for key in ("session_id", "run_id", "step_id")
+                for key in ("session_id", "step_id")
             }
             if final.get("node_key") != "cleanup":
                 raise ValueError("original final ordinary event is not Cleanup")
@@ -2519,7 +2607,7 @@ class CleanupPreparationTest(unittest.TestCase):
         self.assertEqual(
             {
                 key: replayed_records[-2][key]
-                for key in ("session_id", "run_id", "step_id")
+                for key in ("session_id", "step_id")
             },
             original_ids,
         )

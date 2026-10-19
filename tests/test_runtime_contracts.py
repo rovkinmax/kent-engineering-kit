@@ -55,7 +55,83 @@ ZERO_SHA256 = "0" * 64
 ZERO_SHA1 = "0" * 40
 
 
+class RetainedScriptReaderTest(unittest.TestCase):
+    def test_closed_native_script_reader_never_projects_agent_owner(self):
+        context = {"task_id": "native-task", "node_id": "janitor", "transition_branch_key": "cleanup"}
+        detail = {
+            "summary": {"id": "native-task", "workflow_id": "workflow"},
+            "current_scripts": [{
+                "current_node": {"node_id": "janitor", "transition_branch_key": "cleanup"},
+                "path": "/workspace/.kent/scripts/janitor",
+            }],
+        }
+        graph = {"workflow_id": "workflow", "graph": {"nodes": [{
+            "id": "janitor", "kind": "script", "script_path": ".kent/scripts/janitor",
+        }]}}
+
+        def validate(native=context, observed=detail, selected=graph):
+            return runtime_module.validate_retained_script_reader(
+                native, detail=observed, graph=selected, workspace="/workspace",
+            )
+
+        self.assertEqual(validate(), {**context, "invocation_kind": "script"})
+        for native in (
+            {}, None, {**context, "session_id": "borrowed"}, {**context, "step_id": "fabricated"},
+            {**context, "cleanup_session_id": "borrowed"}, {**context, "task_id": "foreign"},
+            {**context, "node_id": "foreign"}, {**context, "transition_branch_key": "foreign"},
+        ):
+            with self.subTest(native=native), self.assertRaises(RuntimeContractError):
+                validate(native)
+        for observed in (
+            {}, {"summary": None}, {**detail, "current_scripts": None},
+            {**detail, "current_scripts": detail["current_scripts"] * 2},
+            {**detail, "current_scripts": [{
+                **detail["current_scripts"][0], "current_node": {
+                    **detail["current_scripts"][0]["current_node"], "session_id": "agent",
+                },
+            }]},
+        ):
+            with self.subTest(observed=observed), self.assertRaises(RuntimeContractError):
+                validate(observed=observed)
+        for selected in (
+            {}, {**graph, "workflow_id": "foreign"},
+            {"workflow_id": "workflow", "graph": {"nodes": []}},
+            {"workflow_id": "workflow", "graph": {"nodes": [{
+                "id": "janitor", "kind": "agent", "script_path": ".kent/scripts/janitor",
+            }]}},
+        ):
+            with self.subTest(graph=selected), self.assertRaises(RuntimeContractError):
+                validate(selected=selected)
+
+
 class EvidenceRecoveryViewTest(unittest.TestCase):
+    def test_v2_identity_and_mixed_chain(self):
+        legacy = self.record()
+        owner = {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "step_id": "22222222-2222-4222-8222-222222222222",
+        }
+        current = {
+            "schema_version": 2, "sequence": 2, "task_short_id": "TASK-4",
+            "previous_hash": legacy["event_hash"], **owner,
+        }
+        current["event_hash"] = runtime_module._event_hash(current)
+        raw = self.line(legacy) + self.line(current)
+        self.assertEqual(runtime_module.validate_evidence_view(
+            raw, task_short_id="TASK-4")["records"], [legacy, current])
+        request = runtime_module.build_evidence_recovery_request(
+            raw + b"broken", task_short_id="TASK-4", owner=owner)
+        self.assertEqual(request["owner"], owner)
+        self.assertEqual(request["owner_provenance"]["schema"], "kent-owner-provenance-v2")
+        self.assertFalse(request["owner_provenance"]["independently_verified_current_step"])
+        for version, extra in ((3, {}), (2, {"run_id": "stale"}), (2, {"step_id": "unknown"})):
+            invalid = {**current, "schema_version": version, **extra}
+            invalid["event_hash"] = runtime_module._event_hash(
+                {k: v for k, v in invalid.items() if k != "event_hash"})
+            with self.assertRaises(RuntimeContractError):
+                runtime_module.validate_evidence_view(
+                    self.line(legacy) + self.line(invalid), task_short_id="TASK-4")
+
     def record(self, sequence=1, previous="", **extra):
         value = {
             "schema_version": 1, "sequence": sequence,
@@ -237,7 +313,7 @@ class EvidenceRecoveryViewTest(unittest.TestCase):
 
     def test_owner_provenance_is_descriptive_closed_and_hash_bound(self):
         original, manifest, boundary = self.fixture()
-        expected = dict(runtime_module.OWNER_PROVENANCE)
+        expected = dict(runtime_module.LEGACY_OWNER_PROVENANCE)
         self.assertEqual(manifest["request"]["owner_provenance"], expected)
         for changed in (
             {**expected, "independently_verified_current_run": True},
@@ -274,7 +350,7 @@ class EvidenceRecoveryViewTest(unittest.TestCase):
             "source_workspace": "/source",
             "source_native_identity": {"project_id": "project", "workspace_id": "workspace", "task_id": "task"},
             "terminal_event_hash": ZERO_SHA256, "recovery_request_sha256": None,
-            "owner_provenance": dict(runtime_module.OWNER_PROVENANCE),
+            "owner_provenance": dict(runtime_module.LEGACY_OWNER_PROVENANCE),
             "files": [{
                 "logical_path": ".kent/runtime/TASK-4/evidence-ledger.jsonl",
                 "byte_size": 1, "sha256": ZERO_SHA256,

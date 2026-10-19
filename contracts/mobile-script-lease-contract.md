@@ -52,7 +52,17 @@ The Puber-owned wrapper obtains `task_id` from native Task readback, computes
 the stable context digest over its verified Task/project/workflow/node,
 operation/source identity, execution root, and resolved execution base, and
 passes its actual parent PID. It does not use inherited or fabricated
-Session/Run/Step identity. `entry_transition` is business routing context and is
+Agent Session/Step identity (or historical Session/Run/Step).
+Kent 2.10's removal of Agent Run does not change this native Script protocol.
+For terminal retained-evidence lookup, Janitor passes its actual native `_kent`
+Task/Node/transition-branch context to the ledger's read-only reader. The
+reader verifies current native `current_scripts`, the Workflow's Script node
+and path, and Task/project/execution/source workspace binding before validating
+the existing receipt, hashes and source closure. No Agent environment is
+required. `cleanup_session_id` identifies the preceding Agent and is never
+borrowed as Script identity. This seam grants no append, recover or
+retain-evidence writer capability and does not change historical proof formats.
+`entry_transition` is business routing context and is
 not part of the stable owner digest. The Kit adapter bounds and independently
 observes the supplied process PID; OS observations are cooperative identity,
 not native Kent authentication.

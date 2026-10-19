@@ -18,6 +18,7 @@ import threading
 import time
 import types
 import unittest
+import uuid
 from unittest import mock
 import xml.etree.ElementTree as ET
 
@@ -58,6 +59,12 @@ VERIFICATION_DISPATCH = (
 APK_INSTALL = (
     REPO_ROOT / "templates" / "project" / "android-apk-install-preserve"
 )
+# Test-owned identities only: fixture writers must never depend on the Agent
+# environment running unittest (CI deliberately has no inherited Kent owner).
+EVIDENCE_FIXTURE_OWNER = {
+    "KENT_SESSION_ID": "11111111-1111-4111-8111-111111111111",
+    "KENT_STEP_ID": "22222222-2222-4222-8222-222222222222",
+}
 
 
 def load_template_module(path: Path, name: str):
@@ -1247,6 +1254,186 @@ class AndroidApkInstallPreserveTest(GitRepositoryTest):
 
 
 class WorkflowEvidenceLedgerTest(GitRepositoryTest):
+    def test_historical_retention_selects_original_digest_before_new_receipt(self):
+        import workflowkit.runtime as runtime
+        for phase in ("after_retained_file_fsync", "before_retention_publish", "after_retention_publish"):
+            with self.subTest(phase=phase):
+                root, scripts, directory, original = self.recovered_fixture()
+                for name in runtime.EVIDENCE_RECOVERY_FILES:
+                    (directory / name).unlink()
+                (directory / "evidence-ledger.jsonl").write_bytes(original.splitlines(keepends=True)[0])
+                plan = root / ".todo/task/plan.md"
+                plan.parent.mkdir(parents=True)
+                plan.write_text("historical plan\n")
+                report = root / "redaction.json"
+                report.write_bytes(b'{"status":"passed"}')
+                ledger = load_template_module(scripts / "workflow-evidence-ledger", "historical_retention")
+                owner = {
+                    "session_id": "11111111-1111-4111-8111-111111111111",
+                    "step_id": "22222222-2222-4222-8222-222222222222",
+                }
+                source = self.create_repository().resolve()
+                identity = self.native_fixture(root, source, owner)
+                lookup = lambda *_: identity
+                environment = {"KENT_" + key.upper(): value for key, value in owner.items()}
+                with mock.patch.dict(os.environ, environment):
+                    ledger.append_entry(root, directory / "evidence-ledger.jsonl", task="TASK-4", _payload={
+                        "node_key": "cleanup", "evidence_type": "cleanup", "summary": "final",
+                        "artifacts": ["redaction.json"],
+                        "context": {"manifest_path": ".kent/context/implement.md", "files_read": []},
+                    })
+                    with mock.patch.object(ledger, "read_json_input", return_value={
+                        "schema": runtime.TERMINAL_SEAL_REQUEST_SCHEMA,
+                        "operation_report_digests": [],
+                        "redaction": {"status": "passed", "report_sha256": hashlib.sha256(report.read_bytes()).hexdigest()},
+                        "retention_class": "cleanup_report_only",
+                    }):
+                        ledger.seal_terminal(root, task="TASK-4")
+                    original_builder = ledger._retention_receipt
+
+                    def historical(*args, **kwargs):
+                        return original_builder(*args, **{**kwargs, "version": 1})
+
+                    with mock.patch.object(ledger, "_retention_receipt", side_effect=historical):
+                        old = ledger.retain_evidence(root, task="TASK-4", _native_lookup=lookup)
+                    # A caller-only old digest is not a historical operation.
+                    with self.assertRaisesRegex(ValueError, "confirmation"):
+                        ledger.retain_evidence(root, task="TASK-4", confirm=old["confirm"], _native_lookup=lookup)
+                    self.assertFalse((source / ".kent/retained-evidence").exists())
+
+                    def crash(observed):
+                        if observed == phase:
+                            raise RuntimeError("historical publication crash")
+
+                    with mock.patch.object(ledger, "_retention_receipt", side_effect=historical):
+                        with self.assertRaisesRegex(RuntimeError, "historical"):
+                            ledger.retain_evidence(root, task="TASK-4", confirm=old["confirm"],
+                                                   _native_lookup=lookup, _phase_hook=crash)
+                    selected = ledger.retain_evidence(root, task="TASK-4", _native_lookup=lookup)
+                    self.assertEqual(selected["receipt"], old["receipt"])
+                    self.assertEqual(selected["confirm"], old["confirm"])
+                    result = ledger.retain_evidence(root, task="TASK-4", confirm=old["confirm"], _native_lookup=lookup)
+                    self.assertEqual(result["receipt"]["schema"], "evidence-retention-v1")
+                    self.assertEqual(set(p.name for p in (source / ".kent/retained-evidence/TASK-4").iterdir()), {old["confirm"]})
+                    marker = runtime.validate_terminal_chain(
+                        ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4"), task_short_id="TASK-4")
+                    retained = ledger.find_retained_evidence(root, task="TASK-4", marker=marker, _native_lookup=lookup)
+                    task_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        ledger.verify_retained_sources(root, task_fd, retained)
+                    finally:
+                        os.close(task_fd)
+                    self.assertEqual(retained["receipt"], old["receipt"])
+                    report.write_bytes(b"changed source")
+                    with self.assertRaises(ValueError):
+                        ledger.retain_evidence(root, task="TASK-4", confirm=old["confirm"], _native_lookup=lookup)
+
+    def test_historical_v1_recovery_requires_durable_preparation(self):
+        import workflowkit.runtime as runtime
+        root, scripts, directory, original = self.recovered_fixture()
+        for name in runtime.EVIDENCE_RECOVERY_FILES:
+            (directory / name).unlink()
+        ledger = load_template_module(scripts / "workflow-evidence-ledger", "historical_recovery")
+        owner = {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "step_id": "22222222-2222-4222-8222-222222222222",
+        }
+        request = runtime.build_evidence_recovery_request(
+            original, task_short_id="TASK-4", owner={**owner, "run_id": "historical-run"})
+        manifest, continuation = ledger._recovery_documents(runtime, original, request)
+        identity = self.native_fixture(root, self.create_repository().resolve(), owner)
+        lookup = lambda *_: identity
+        environment = {"KENT_" + key.upper(): value for key, value in owner.items()}
+        with mock.patch.dict(os.environ, {**environment, "KENT_RUN_ID": "stale-ignored"}):
+            with self.assertRaisesRegex(ValueError, "fresh recovery"):
+                ledger.recover_evidence(root, task="TASK-4", request=request,
+                                        confirm=manifest["request_sha256"], _native_lookup=lookup)
+            self.assertFalse((directory / "evidence-continuation.jsonl").exists())
+            tail = directory / "evidence-continuation.jsonl"
+            tail.write_bytes(continuation)
+            tail.chmod(0o600)
+            result = ledger.recover_evidence(root, task="TASK-4", request=request,
+                                            confirm=manifest["request_sha256"], _native_lookup=lookup)
+            self.assertTrue(result["reused"])
+            self.assertEqual((directory / "evidence-recovery.json").read_bytes(), runtime.canonical_bytes(manifest))
+            payload = {
+                "node_key": "cleanup", "evidence_type": "cleanup", "summary": "new genuine event",
+                "context": {"manifest_path": ".kent/context/implement.md", "files_read": []},
+            }
+            event, reused = ledger.append_entry(
+                root, directory / "evidence-ledger.jsonl", task="TASK-4", _payload=payload)
+            self.assertFalse(reused)  # The same owner's recovery boundary is not an ordinary event.
+            self.assertEqual(event["schema_version"], 2)
+            self.assertEqual(event["sequence"], 3)
+            before = tail.read_bytes()
+            self.assertTrue(ledger.recover_evidence(
+                root, task="TASK-4", request=request, confirm=manifest["request_sha256"],
+                _native_lookup=lookup)["reused"])
+            self.assertEqual(tail.read_bytes(), before)
+            self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+            with self.assertRaisesRegex(ValueError, "already recovered"):
+                runtime.build_evidence_recovery_request(
+                    original.splitlines(keepends=True)[0] + before + b"broken",
+                    task_short_id="TASK-4", owner=owner)
+
+    def test_legacy_session_step_match_and_ambiguity_preserve_bytes(self):
+        root = self.create_repository().resolve()
+        (root / "AGENTS.md").write_text("rules\n")
+        owner = {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "step_id": "22222222-2222-4222-8222-222222222222",
+        }
+        ledger = load_template_module(EVIDENCE, "legacy_dedup_identity")
+        payload = {
+            "node_key": "implement", "evidence_type": "implementation", "summary": "fixture",
+            "context": {"manifest_path": "AGENTS.md", "files_read": []},
+        }
+        path = root / ".kent/runtime/TASK-4/evidence-ledger.jsonl"
+        with mock.patch.dict(os.environ, {"KENT_" + key.upper(): value for key, value in owner.items()}):
+            first, _ = ledger.append_entry(root, path, task="TASK-4", _payload=payload)
+            first.update(schema_version=1, run_id="historical-run")
+            first["event_hash"] = ledger.entry_hash({k: v for k, v in first.items() if k != "event_hash"})
+            path.write_bytes(ledger.canonical_bytes(first) + b"\n")
+            before = path.read_bytes()
+            self.assertEqual(ledger.append_entry(root, path, task="TASK-4", _payload=payload), (first, True))
+            self.assertEqual(path.read_bytes(), before)
+            second = {**first, "sequence": 2, "previous_hash": first["event_hash"], "run_id": "other-old-run"}
+            second["event_hash"] = ledger.entry_hash({k: v for k, v in second.items() if k != "event_hash"})
+            path.write_bytes(before + ledger.canonical_bytes(second) + b"\n")
+            before = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "ambiguous historical"):
+                ledger.append_entry(root, path, task="TASK-4", _payload=payload)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_v2_append_ignores_run_and_deduplicates_session_step(self):
+        root = self.create_repository().resolve()
+        (root / "AGENTS.md").write_text("rules\n")
+        payload = {
+            "node_key": "implement", "evidence_type": "implementation",
+            "summary": "Identity fixture", "context": {"manifest_path": "AGENTS.md", "files_read": []},
+        }
+        ledger = load_template_module(EVIDENCE, "v2_append_identity")
+        session = "11111111-1111-4111-8111-111111111111"
+        step = "22222222-2222-4222-8222-222222222222"
+        path = root / ".kent/runtime/TASK-4/evidence-ledger.jsonl"
+        with mock.patch.dict(os.environ, {"KENT_SESSION_ID": session, "KENT_STEP_ID": step}):
+            os.environ.pop("KENT_RUN_ID", None)
+            first, reused = ledger.append_entry(root, path, task="TASK-4", _payload=payload)
+            self.assertFalse(reused)
+            self.assertEqual(first["schema_version"], 2)
+            self.assertNotIn("run_id", first)
+            os.environ["KENT_RUN_ID"] = "stale-run"
+            self.assertEqual(ledger.append_entry(root, path, task="TASK-4", _payload=payload), (first, True))
+            os.environ["KENT_STEP_ID"] = "33333333-3333-4333-8333-333333333333"
+            second, reused = ledger.append_entry(root, path, task="TASK-4", _payload=payload)
+            self.assertFalse(reused)
+            self.assertEqual(second["sequence"], 2)
+            os.environ["KENT_STEP_ID"] = "unknown"
+            before = path.read_bytes()
+            with self.assertRaises(ValueError):
+                ledger.append_entry(root, path, task="TASK-4", _payload=payload)
+            self.assertEqual(path.read_bytes(), before)
+
     def native_fixture(self, root, source, owner):
         return {
             "task_short_id": "TASK-4", "workspace": str(root.resolve()),
@@ -1263,12 +1450,14 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         (directory / "evidence-continuation.jsonl").unlink()
         source = self.create_repository().resolve()
         ledger = load_template_module(scripts / "workflow-evidence-ledger", "recovery_operation")
-        owner = {"session_id": "s", "run_id": "r", "step_id": "t"}
+        owner = {"session_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "s")),
+                 "step_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "t"))}
         identity = self.native_fixture(root, source, owner)
         environment = {"KENT_" + key.upper(): value for key, value in owner.items()}
         with mock.patch.dict(os.environ, environment):
-            with self.assertRaisesRegex(ValueError, "canonical Kent"):
-                ledger.recovery_preview(root, task="TASK-4")
+            with mock.patch.dict(os.environ, {"KENT_STEP_ID": "unknown"}):
+                with self.assertRaisesRegex(ValueError, "canonical Kent"):
+                    ledger.recovery_preview(root, task="TASK-4")
             preview = ledger.recovery_preview(root, task="TASK-4", _native_lookup=lambda *_: identity)
             self.assertEqual(set(path.name for path in directory.iterdir()), {"evidence-ledger.jsonl"})
 
@@ -1284,7 +1473,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
                 )
             with self.assertRaisesRegex(ValueError, "incomplete"):
                 ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")
-        retry_owner = {"session_id": "s", "run_id": "retry-run", "step_id": "retry-step"}
+        retry_owner = {**owner, "step_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "retry-step"))}
         identity = self.native_fixture(root, source, retry_owner)
         with mock.patch.dict(os.environ, {"KENT_" + key.upper(): value for key, value in retry_owner.items()}):
             result = ledger.recover_evidence(
@@ -1293,7 +1482,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
             )
             self.assertTrue(result["reused"])
             self.assertEqual(result["retry_owner"], retry_owner)
-            self.assertEqual(ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")[-1]["run_id"], owner["run_id"])
+            self.assertEqual(ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")[-1]["step_id"], owner["step_id"])
             self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
             self.assertEqual(
                 result,
@@ -1316,7 +1505,8 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
                         (directory / name).unlink()
                 ledger = load_template_module(scripts / "workflow-evidence-ledger", "retention_operation")
                 source = self.create_repository().resolve()
-                owner = {"session_id": "s", "run_id": "retention-run", "step_id": "t"}
+                owner = {"session_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "s")),
+                         "step_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "t"))}
                 identity = self.native_fixture(root, source, owner)
                 shutil.copyfile(CHECKPOINT, scripts / "workflow-checkpoint")
                 home = self.create_repository().resolve()
@@ -1489,7 +1679,6 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
     def install_native_fixture(self, root, source):
         owner = {
             "session_id": "11111111-1111-4111-8111-111111111111",
-            "run_id": "22222222-2222-4222-8222-222222222222",
             "step_id": "33333333-3333-4333-8333-333333333333",
         }
         detail = {
@@ -1513,6 +1702,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
             "a=sys.argv[1:]\n"
             "if a[0]=='project': print('native-project')\n"
             "elif a[:2]==['task','show']: print(open(os.environ['NATIVE_FIXTURE']).read())\n"
+            "elif a[:3]==['workflow','graph','inspect']: print(open(os.environ['NATIVE_GRAPH']).read())\n"
             "else: raise SystemExit('irrelevant native inventory must not be queried')\n"
         )
         executable.chmod(0o755)
@@ -1520,6 +1710,169 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         environment.pop("KENT_TASK_ID", None)
         environment.update(PATH=str(executable.parent) + os.pathsep + os.environ["PATH"], NATIVE_FIXTURE=str(native_file))
         return owner, detail, native_file, environment
+
+    def test_public_identity_needs_only_inherited_session_and_native_binding(self):
+        root, scripts, directory, original = self.recovered_fixture()
+        source = self.create_repository().resolve()
+        owner, detail, native_file, environment = self.install_native_fixture(root, source)
+        for key in ("KENT_STEP_ID", "KENT_RUN_ID", "KENT_TASK_ID"):
+            environment.pop(key, None)
+        # Neither ignored runtime state nor R2/retention admission is needed.
+        (root / ".gitignore").write_text("")
+        (root / ".kent/workflow-profile.toml").write_text("not valid TOML")
+        command = [str(scripts / "workflow-evidence-ledger"), "identity",
+                   "--task", "TASK-4", "--workspace", str(root)]
+
+        def invoke(env=environment):
+            return subprocess.run(command, capture_output=True, text=True, env=env)
+
+        result = invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            "task_id": "native-task", "task_short_id": "TASK-4",
+            "project_id": "native-project", "workspace_path": str(root),
+            "session_id": owner["session_id"],
+        })
+        for value in ("", "123", "made-up", "22222222-2222-4222-8222-222222222222"):
+            result = invoke({**environment, "KENT_SESSION_ID": value})
+            self.assertEqual(result.returncode, 1, result.stdout)
+        for changed in (
+            {**detail, "current_nodes": [], "live_sessions": []},
+            {**detail, "worktree_path": str(source)},
+            {**detail, "summary": {**detail["summary"], "project_id": "foreign"}},
+        ):
+            native_file.write_text(json.dumps(changed))
+            self.assertEqual(invoke().returncode, 1)
+        self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+
+    def test_real_script_janitor_retained_reader_without_agent_environment(self):
+        """Synthetic native transport; identity and actual Janitor are not stubbed."""
+        import workflowkit.runtime as runtime
+        from workflowkit.delivery import capture_producer
+
+        for recovered, scenario in (
+            (False, "healthy"), (True, "recovered"), (True, "archive-resume"),
+            (True, "foreign-task"), (True, "foreign-node"), (True, "foreign-branch"),
+            (True, "missing-current"), (True, "ambiguous-current"), (True, "foreign-path"),
+            (True, "foreign-workspace"), (True, "foreign-source"),
+            (True, "bundle-tamper"), (True, "bundle-missing"),
+        ):
+            with self.subTest(scenario=scenario):
+                root, scripts, directory, original = self.recovered_fixture()
+                if not recovered:
+                    (directory / "evidence-ledger.jsonl").write_bytes(original.splitlines(keepends=True)[0])
+                    for name in runtime.EVIDENCE_RECOVERY_FILES:
+                        (directory / name).unlink()
+                    (root / ".kent/workflow-profile.toml").write_text('[policies]\ndelivery_reliability = "v1"\n')
+                source = self.create_repository().resolve()
+                owner, detail, native_file, environment = self.install_native_fixture(root, source)
+                plan = root / ".todo/task/plan.md"
+                plan.parent.mkdir(parents=True)
+                plan.write_text("retained plan\n")
+                report = root / "redaction.json"
+                report.write_bytes(b'{"status":"passed"}')
+                ledger = load_template_module(scripts / "workflow-evidence-ledger", "script_reader_ledger")
+                shutil.copyfile(CHECKPOINT, scripts / "workflow-checkpoint")
+                home = self.create_repository().resolve()
+                tools = home / ".kent/bin"
+                tools.mkdir(parents=True)
+                (tools / "kent-prepare-github-ci").symlink_to(REPO_ROOT / "scripts/prepare-github-ci")
+                environment["HOME"] = str(home)
+                packet_locator, _ = capture_producer(
+                    root, identity={
+                        "task_id": "native-task", "task_short_id": "TASK-4",
+                        "project_id": "native-project", "workspace_path": str(root), **owner,
+                    }, producer_kind="script-reader-fixture", inputs={}, result={"commentary": "Original exact report"},
+                )
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    ledger.append_entry(root, directory / "evidence-ledger.jsonl", task="TASK-4", _payload={
+                        "node_key": "cleanup", "evidence_type": "cleanup",
+                        "summary": "final\nKENT_PACKET_SOURCE_V1 " + packet_locator,
+                        "artifacts": ["redaction.json"],
+                        "context": {"manifest_path": ".kent/context/implement.md", "files_read": []},
+                    })
+                    with mock.patch.object(ledger, "read_json_input", return_value={
+                        "schema": runtime.TERMINAL_SEAL_REQUEST_SCHEMA,
+                        "operation_report_digests": [],
+                        "redaction": {"status": "passed", "report_sha256": hashlib.sha256(report.read_bytes()).hexdigest()},
+                        "retention_class": "cleanup_report_only",
+                    }):
+                        sealed = ledger.seal_terminal(root, task="TASK-4")
+                    preview = ledger.retain_evidence(root, task="TASK-4")
+                    retained = ledger.retain_evidence(root, task="TASK-4", confirm=preview["confirm"])
+                archive = Path(retained["bundle_path"])
+                native = {"task_id": "native-task", "node_id": "janitor", "transition_branch_key": "cleanup"}
+                workflow = "44444444-4444-4444-8444-444444444444"
+                detail["summary"]["workflow_id"] = workflow
+                detail["current_nodes"] = []
+                detail["current_scripts"] = [{
+                    "current_node": {"node_id": "janitor", "transition_branch_key": "cleanup"},
+                    "path": str(scripts / "workflow-task-janitor"),
+                }]
+                graph = root / "graph.json"
+                graph.write_text(json.dumps({"workflow_id": workflow, "graph": {"nodes": [{
+                    "id": "janitor", "kind": "script", "script_path": str(scripts / "workflow-task-janitor"),
+                }]}}))
+                environment["NATIVE_GRAPH"] = str(graph)
+                for key in ("KENT_SESSION_ID", "KENT_STEP_ID", "KENT_RUN_ID", "KENT_TASK_ID"):
+                    environment.pop(key, None)
+                if scenario == "foreign-task":
+                    native["task_id"] = "foreign"
+                elif scenario == "foreign-node":
+                    native["node_id"] = "foreign"
+                elif scenario == "foreign-branch":
+                    native["transition_branch_key"] = "foreign"
+                elif scenario == "missing-current":
+                    detail["current_scripts"] = []
+                elif scenario == "ambiguous-current":
+                    detail["current_scripts"] *= 2
+                elif scenario == "foreign-path":
+                    detail["current_scripts"][0]["path"] = "/foreign/script"
+                elif scenario == "foreign-workspace":
+                    detail["worktree_path"] = str(source)
+                elif scenario == "foreign-source":
+                    detail["source_workspace"]["workspace_id"] = "foreign"
+                elif scenario == "bundle-tamper":
+                    (archive / "000").write_bytes(b"tampered")
+                elif scenario == "bundle-missing":
+                    (archive / "000").unlink()
+                elif scenario == "archive-resume":
+                    marker = runtime.validate_cleanup_report(sealed["terminal_marker"])
+                    tombstone = directory.parent / (".evidence-cleanup-" + runtime.canonical_sha256(marker))
+                    directory.rename(tombstone)
+                    (tombstone / "evidence-ledger.jsonl").unlink()
+                    _, sentinel = ledger.runtime_state_names("TASK-4")
+                    (directory.parent / sentinel).touch(mode=0o600)
+                native_file.write_text(json.dumps(detail))
+                before = {path.name: path.read_bytes() for path in archive.iterdir()}
+                # Reproduce the old Agent-only admission defect without
+                # substituting the identity validator in the actual invocation.
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(ValueError, "UUID"):
+                        ledger._verified_context(root, "TASK-4")
+                    for writer in (ledger.recovery_preview, ledger.retain_evidence):
+                        with self.assertRaisesRegex(ValueError, "UUID"):
+                            writer(root, task="TASK-4")
+                payload = {
+                    "_kent": native, "workspace_path": str(root),
+                    "branch_name": self.run_git(root, "branch", "--show-current").stdout.strip(),
+                    "pr_url": "", "cleanup_mode": "no_pr",
+                    "cleanup_session_id": owner["session_id"],
+                    "cleanup_report": sealed["terminal_marker"], "task_short_id": "TASK-4",
+                }
+                result = subprocess.run(
+                    [str(scripts / "workflow-task-janitor")], input=json.dumps(payload),
+                    capture_output=True, text=True, env=environment,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = json.loads(result.stdout)
+                expected = "task_janitor_done" if scenario in {"healthy", "recovered", "archive-resume"} else "task_janitor_blocked"
+                self.assertEqual(output["transition"], expected, output)
+                self.assertEqual({path.name: path.read_bytes() for path in archive.iterdir()}, before)
+                if expected == "task_janitor_blocked":
+                    self.assertTrue(directory.exists())
+                else:
+                    self.assertFalse(directory.exists())
 
     def test_native_proof_port_current_retained_script_foreign_and_missing_fields(self):
         root, scripts, directory, original = self.recovered_fixture()
@@ -1554,7 +1907,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
                     with self.assertRaises(ValueError):
                         ledger._native_context(root, "TASK-4")
             native_file.write_text(json.dumps(detail))
-            for key in ("KENT_SESSION_ID", "KENT_RUN_ID", "KENT_STEP_ID"):
+            for key in ("KENT_SESSION_ID", "KENT_STEP_ID"):
                 with mock.patch.dict(os.environ, {key: ""}), self.assertRaisesRegex(ValueError, "UUID"):
                     ledger._native_context(root, "TASK-4")
                 with mock.patch.dict(os.environ, {key: "made-up"}), self.assertRaisesRegex(ValueError, "UUID"):
@@ -1604,7 +1957,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
             input=json.dumps(preview["request"]), capture_output=True, text=True, env=environment,
         )
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
-        self.assertEqual(json.loads(recovered.stdout)["retry_owner"]["run_id"], environment["KENT_RUN_ID"])
+        self.assertEqual(json.loads(recovered.stdout)["retry_owner"]["step_id"], environment["KENT_STEP_ID"])
         self.assertFalse(temporary.exists())
         self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
         self.assertEqual(set(path.name for path in directory.iterdir()), {
@@ -1635,12 +1988,12 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         boundary = {
             "schema_version": 1, "sequence": 2, "task_short_id": "TASK-4",
             "previous_hash": prefix["event_hash"], **owner,
-            "record_kind": runtime.EVIDENCE_BOUNDARY_KIND,
+            "record_kind": "evidence_recovery_boundary_v1",
             "recovery_request_sha256": digest,
         }
         boundary["event_hash"] = runtime._event_hash(boundary)
         manifest = {
-            "schema": runtime.EVIDENCE_RECOVERY_SCHEMA, "request": request,
+            "schema": "evidence-recovery-v1", "request": request,
             "request_sha256": digest, "boundary_event_hash": boundary["event_hash"],
         }
         for name, raw in (
@@ -1669,6 +2022,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
         self.assertFalse((directory / "plan-contract.json").exists())
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_recovered_read_append_dedup_and_seal_use_continuation(self):
         root, scripts, directory, original = self.recovered_fixture()
         ledger = load_template_module(scripts / "workflow-evidence-ledger", "recovered_ledger")
@@ -1689,8 +2043,9 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
             with self.assertRaisesRegex(ValueError, "ordinary"):
                 ledger.seal_terminal(root, task="TASK-4")
         with mock.patch.dict(os.environ, {
-            "KENT_SESSION_ID": "test-session", "KENT_RUN_ID": "recovery-run",
-            "KENT_STEP_ID": "real-final-step",
+            "KENT_SESSION_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "test-session")),
+            "KENT_RUN_ID": "stale-ignored-run",
+            "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "real-final-step")),
         }), mock.patch.object(ledger, "read_json_input", return_value=payload):
             event, duplicate = ledger.append_entry(root, directory / "evidence-ledger.jsonl", task="TASK-4")
             self.assertFalse(duplicate, "boundary must not suppress the genuine same-Run event")
@@ -1762,9 +2117,9 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         environment = os.environ.copy()
         environment.update(
             {
-                "KENT_SESSION_ID": "test-session",
+                "KENT_SESSION_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, "test-session")),
                 "KENT_RUN_ID": resolved_run_id,
-                "KENT_STEP_ID": f"{resolved_run_id}-step",
+                "KENT_STEP_ID": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{resolved_run_id}-step")),
             }
         )
         result = subprocess.run(
@@ -1872,6 +2227,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual(metrics["verification_loops"], 2)
         self.assertEqual(metrics["unknown_model_call_entries"], 2)
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_v2_seal_is_idempotent_and_janitor_retains_terminal_sentinel(self) -> None:
         root = self.create_repository()
         (root / ".kent" / "context").mkdir()
@@ -2075,7 +2431,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         )
 
 
-    def test_ledger_suppresses_duplicate_append_for_same_kent_run(self) -> None:
+    def test_ledger_suppresses_duplicate_append_for_same_session_step(self) -> None:
         root = self.create_repository()
         (root / ".kent" / "context").mkdir()
         (root / ".kent" / "context" / "implement.md").write_text("manifest\n")
@@ -2113,8 +2469,8 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         entries = [json.loads(line) for line in ledger.read_text().splitlines()]
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["summary"], "Original transition evidence.")
-        self.assertEqual(entries[0]["run_id"], "recovered-run")
-        self.assertEqual(entries[0]["step_id"], "recovered-run-step")
+        self.assertNotIn("run_id", entries[0])
+        self.assertEqual(entries[0]["step_id"], str(uuid.uuid5(uuid.NAMESPACE_URL, "recovered-run-step")))
 
     def test_ledger_append_without_json_fails_instead_of_waiting(self) -> None:
         root = self.create_repository()
@@ -2220,6 +2576,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual(validate.returncode, 1)
         self.assertIn("invalid hash", validate.stderr)
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_append_rejects_runtime_replacement_after_admission(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -2273,6 +2630,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual(preserved, "preserve\n")
         self.assertEqual(replacement, "replacement\n")
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_append_rejects_lock_tombstone_conflict_without_task_creation(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -2307,6 +2665,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertFalse((root / ".kent" / "runtime" / "TASK-4").exists())
         self.assertEqual((tombstone / "outside.txt").read_text(), "preserve\n")
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_append_rejects_task_detach_and_replacement(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -2353,6 +2712,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         task.rmdir()
         detached.rename(task)
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_seal_waits_for_paused_writer_and_rereads_complete_chain(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -2475,6 +2835,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
                 task="TASK-4",
             )
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_append_rejects_terminal_sentinel_after_seal(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -2678,6 +3039,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual(len(records), 1)
         self.assertNotIn("terminal_evidence_seal_v1", data.decode())
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_append_task_creation_fsync_failure_preserves_empty_task(self) -> None:
         root = self.create_repository()
         context = root / ".kent" / "context"
@@ -9470,6 +9832,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.run_git(root, "commit", "-q", "-m", "context")
         scripts = self.install_v2_runtime_commands(root)
         evidence = scripts / "workflow-evidence-ledger"
+        environment = {**os.environ, **EVIDENCE_FIXTURE_OWNER}
         append = subprocess.run(
             [str(evidence), "append", "--task", "TASK-1", "--workspace", str(root)],
             input=json.dumps(
@@ -9490,6 +9853,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env=environment,
         )
         self.assertEqual(append.returncode, 0, append.stderr)
         seal = subprocess.run(
@@ -9509,6 +9873,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env=environment,
         )
         self.assertEqual(seal.returncode, 0, seal.stderr)
         return scripts, json.loads(seal.stdout)["terminal_marker"]
@@ -9535,12 +9900,15 @@ class WorkflowJanitorTest(GitRepositoryTest):
             root = linked_root
         head = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
         scripts = self.install_v2_runtime_commands(root)
-        environment = dict(os.environ)
+        environment = {**os.environ, **EVIDENCE_FIXTURE_OWNER}
         environment.pop("KENT_RUN_ID", None)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         artifacts = []
         with mock.patch.dict(os.environ, environment, clear=True):
             for index in range(count):
+                # Each genuine CI event is a distinct Step, even without Run.
+                environment["KENT_STEP_ID"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"ci-event-{index}"))
+                os.environ["KENT_STEP_ID"] = environment["KENT_STEP_ID"]
                 if report_kind == "v3":
                     contract = {
                         "schema": "github-ci-contract-v1",
@@ -11013,6 +11381,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         marker = ""
         if with_v2:
             evidence = scripts / "workflow-evidence-ledger"
+            environment = {**os.environ, **EVIDENCE_FIXTURE_OWNER}
             append = subprocess.run(
                 [
                     str(evidence),
@@ -11040,6 +11409,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                env=environment,
             )
             self.assertEqual(append.returncode, 0, append.stderr)
             seal = subprocess.run(
@@ -11066,6 +11436,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                env=environment,
             )
             self.assertEqual(seal.returncode, 0, seal.stderr)
             marker = json.loads(seal.stdout)["terminal_marker"]
@@ -12766,6 +13137,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertTrue(sentinel.exists())
         self.assertFalse(tombstone.exists())
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_v2_sentinel_create_phase_failure_preserves_state_and_blocks_append(
         self,
     ) -> None:
@@ -12836,6 +13208,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             check=False,
         )
         self.assertEqual(append.returncode, 1)
+        self.assertIn("sealed", append.stderr)
         self.assertFalse(task.exists())
         retry = janitor._remove_v2_runtime_state(
             root.resolve(),

@@ -8,6 +8,7 @@ import platform
 import re
 import selectors
 import shutil
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -174,6 +175,8 @@ class MobileLeaseRegressionTest(unittest.TestCase):
             """#!/bin/sh
 case "$*" in
   "task show KEN-6 --json") cat "$KENT_TEST_TASK_JSON" ;;
+  "project "*) echo native-mobile-project ;;
+  "task show KEN-6 --project native-mobile-project --json") cat "$KENT_TEST_IDENTITY_JSON" ;;
   "session-id") cat "$KENT_TEST_SESSION_FILE" ;;
   *) exit 64 ;;
 esac
@@ -1158,35 +1161,53 @@ sys.exit(released.returncode)
         *,
         session_file: Path | None = None,
     ) -> dict[str, str]:
+        # These files seed inherited fixture identity, never CLI output.
+        inherited_session = (session_file or FIXTURES / "native-session.txt").read_text().strip()
+        workspace = self.temporary_root / "identity-workspace"
+        workspace.mkdir(exist_ok=True)
+        subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+        scripts = workspace / ".kent/scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        for source, name in (
+            (ROOT / "templates/project/workflow-evidence-ledger", "workflow-evidence-ledger"),
+            (ROOT / "workflowkit/runtime.py", "workflow_runtime_contracts.py"),
+        ):
+            shutil.copyfile(source, scripts / name)
+        fixture = workspace / "native-identity.json"
+        fixture.write_text(json.dumps({
+            "summary": {"id": NATIVE_TASK_ID, "short_id": "KEN-6", "project_id": "native-mobile-project"},
+            "project": {},
+            "source_workspace": {
+                "root_path": str(workspace.resolve()), "workspace_id": "native-mobile-primary", "is_primary": True,
+            },
+            "current_nodes": [{"node_id": "smoke", "session_id": SESSION_ONE},
+                              {"node_id": "smoke", "session_id": SESSION_TWO}],
+        }))
         environment = os.environ.copy()
         environment.update(
             {
                 "PATH": f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}",
                 **self.fake_kent_environment,
+                "KENT_SESSION_ID": inherited_session,
+                "KENT_TEST_IDENTITY_JSON": str(fixture),
             }
         )
         if session_file is not None:
             environment["KENT_TEST_SESSION_FILE"] = str(session_file)
-        task = subprocess.run(
-            ["kent", "task", "show", "KEN-6", "--json"],
+        identity = subprocess.run(
+            [sys.executable, str(scripts / "workflow-evidence-ledger"), "identity",
+             "--task", "KEN-6", "--workspace", str(workspace.resolve())],
             check=False,
             capture_output=True,
             text=True,
             env=environment,
         )
-        session = subprocess.run(
-            ["kent", "session-id"],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        if task.returncode != 0 or session.returncode != 0:
+        if identity.returncode != 0:
             raise ValueError("stubbed native identity readback failed")
-        summary = json.loads(task.stdout)["summary"]
-        native_task_id = summary["id"]
-        task_short_id = summary["short_id"]
-        session_id = session.stdout.strip()
+        observed = json.loads(identity.stdout)
+        native_task_id = observed["task_id"]
+        task_short_id = observed["task_short_id"]
+        session_id = observed["session_id"]
         if (
             native_task_id != NATIVE_TASK_ID
             or task_short_id != "KEN-6"
@@ -1879,6 +1900,21 @@ sys.exit(released.returncode)
         )
         self.assertEqual(summary["short_id"], "KEN-6")
         self.assertEqual(session.stdout.strip(), SESSION_ONE)
+
+    def test_public_identity_ignores_diagnostic_output_and_requires_inherited_uuid(self):
+        diagnostic = self.temporary_root / "session-diagnostic.txt"
+        diagnostic.write_text(f"Short ID: 123\nUUID: {SESSION_ONE}\nLog path: /fixture/events.jsonl\n")
+        # Deliberately poison diagnostic output; identity never invokes it.
+        self.fake_kent_environment["KENT_TEST_SESSION_FILE"] = str(diagnostic)
+        self.assertEqual(self.read_native_identity()["session_id"], SESSION_ONE)
+        for output in ("123\n", "UUID: 123\n",
+                       f"Short ID: 123\nUUID: {SESSION_ONE}\nLog path: /fixture\nUUID: {SESSION_TWO}\n"):
+            diagnostic.write_text(output)
+            with self.assertRaises(ValueError):
+                self.read_native_identity(session_file=diagnostic)
+        smoke = (ROOT / "contracts/mobile-smoke-contract.md").read_text()
+        self.assertIn("workflow-evidence-ledger identity", smoke)
+        self.assertIn("inherited canonical", smoke)
 
     def test_native_task_uuid_is_accepted_as_verified_identity_input(self) -> None:
         task = json.loads(

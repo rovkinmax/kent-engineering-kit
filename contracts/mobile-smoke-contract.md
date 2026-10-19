@@ -322,13 +322,16 @@ or another security control.
   not ask again. Reuse that authorization for the same account, environment,
   action, and task scope until it is revoked or the scope materially changes.
   Store only the authorization boundary, never credential values.
-- Resolve the current Task using the short ID rendered for the Smoke run:
-  inspect `summary.id` and `summary.short_id` from
-  `kent task show <task-short-id> --json`, and verify the returned short ID.
-  Resolve the current Session with `kent session-id`. `KENT_TASK_ID` and
-  `KENT_SESSION_ID` are adapter inputs, not assumed Kent exports: set them
-  explicitly from this readback. A label, sole lock occupancy, or Session ID
-  alone does not establish Task ownership.
+- Resolve the current Task/Session using the profile evidence command:
+  `workflow-evidence-ledger identity --task <task-short-id> --workspace <root>`.
+  It returns exactly `task_id`, `task_short_id`, `project_id`, `workspace_path`,
+  and `session_id`, using the inherited canonical `KENT_SESSION_ID` plus native
+  current Task/project/workspace binding. Missing, foreign or historical-only
+  Sessions block. Never parse `kent session-id` diagnostic output or invent,
+  export or replace a Session UUID. This read-only command needs neither Step
+  identity nor retention/R2 admission. Set adapter `KENT_TASK_ID` from the
+  verified short ID; preserve the inherited Session UUID. A label, sole lock
+  occupancy, or Session ID alone does not establish Task ownership.
 - Keep top-level checkpoint `task_short_id` authoritative. Store
   `task_native_id`, `task_short_id`, `lease_owner_id`, `lock_resource`, and
   `lock_token` together in its extensible stage data. A legacy checkpoint

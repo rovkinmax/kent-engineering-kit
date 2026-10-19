@@ -3619,6 +3619,304 @@ def _native_process_evidence(
     raise EffectBlocked(f'native process proof is unsupported on {system}')
 
 
+NATIVE_COMMENTS_CONTEXT_SCHEMA = 'kit-native-local-context-v1'
+NATIVE_COMMENTS_SCHEMA = 'kit-native-task-comments-v1'
+NATIVE_COMMENTS_MAX_COUNT = 4096
+NATIVE_COMMENTS_MAX_BYTES = 4 * 1024 * 1024
+NATIVE_COMMENTS_SNAPSHOT_SECONDS = 2.0
+NATIVE_COMMENT_FIELDS = (
+    'id', 'task_id', 'body', 'author_kind', 'author_id',
+    'created_at_unix_ms', 'updated_at_unix_ms',
+)
+
+
+def _native_listener_evidence(
+    pid: int, port: int, root: Path, *, system: str | None = None,
+    proc_root: Path = Path('/proc'),
+) -> dict[str, Any]:
+    """Prove socket ownership, not merely a PID reported by the health route."""
+    system = sys.platform if system is None else system
+    if system == 'darwin':
+        code, output, _ = _run([
+            '/usr/sbin/lsof', '-n', '-P', '-l', '-iTCP:' + str(port),
+            '-sTCP:LISTEN', '-FpuftnT',
+        ], cwd=root, timeout=5.0)
+        if code:
+            raise EffectBlocked('local native listener observation failed')
+        try:
+            rows = []
+            owner = uid = None
+            current: dict[str, Any] = {}
+            for line in output.decode('utf-8', errors='strict').splitlines():
+                if not line:
+                    continue
+                field, value = line[0], line[1:]
+                if field in {'p', 'f'} and current:
+                    rows.append(current)
+                    current = {}
+                if field == 'p':
+                    owner, uid = int(value), None
+                elif field == 'u':
+                    uid = int(value)
+                elif field == 'f':
+                    current = {'pid': owner, 'uid': uid, 'fd': value}
+                elif field in {'t', 'n'} or (field == 'T' and value.startswith('ST=')):
+                    current[field] = value
+            if current:
+                rows.append(current)
+            if (
+                len(rows) != 1 or rows[0].get('pid') != pid
+                or rows[0].get('uid') != os.geteuid()
+                or rows[0].get('n') != f'127.0.0.1:{port}'
+                or rows[0].get('t') != 'IPv4'
+                or rows[0].get('T') != 'ST=LISTEN'
+            ):
+                raise ValueError
+            return rows[0]
+        except (UnicodeError, ValueError) as error:
+            raise EffectBlocked('local native listener ownership is ambiguous') from error
+    if system == 'linux':
+        try:
+            process = proc_root / str(pid)
+            with (process / 'net' / 'tcp').open('rb') as stream:
+                raw = stream.read(MAX_OUTPUT + 1)
+            if len(raw) > MAX_OUTPUT:
+                raise ValueError
+            matches = []
+            for line in raw.decode('ascii').splitlines()[1:]:
+                fields = line.split()
+                if len(fields) < 10:
+                    raise ValueError
+                if fields[1] == f'0100007F:{port:04X}' and fields[3] == '0A':
+                    if int(fields[7]) != os.geteuid():
+                        raise ValueError
+                    matches.append(fields[9])
+            if len(matches) != 1:
+                raise ValueError
+            owners = []
+            for index, entry in enumerate((process / 'fd').iterdir()):
+                if index >= 4096:
+                    raise ValueError
+                if os.readlink(entry) == f'socket:[{matches[0]}]':
+                    owners.append(entry.name)
+            if not owners:
+                raise ValueError
+            return {'pid': pid, 'uid': os.geteuid(), 'inode': matches[0], 'fds': sorted(owners)}
+        except (OSError, UnicodeError, ValueError) as error:
+            raise EffectBlocked('local native listener ownership is unavailable') from error
+    raise EffectBlocked('local native listener observation is unsupported')
+
+
+def _native_comments_status(kent: Path, project_root: Path, environment: Mapping[str, str]) -> dict[str, Any]:
+    code, output, _ = _run([
+        str(kent), 'service', 'status', '--json',
+        '--persistence-root', environment['KENT_PERSISTENCE_ROOT'],
+    ], cwd=project_root, extra_env=environment, timeout=5.0)
+    if code:
+        raise EffectBlocked('local native service status failed')
+    try:
+        value = json.loads(output.decode('utf-8'), object_pairs_hook=_duplicate_free)
+        if not isinstance(value, dict):
+            raise ValueError
+        return value
+    except (UnicodeError, ValueError, OperationError) as error:
+        raise EffectBlocked('local native service status is invalid') from error
+
+
+def native_local_context(*, kent: str, project_root: str) -> dict[str, Any]:
+    """Discover a fixed local-only native CLI context; never read credentials."""
+    executable = _kent_path(kent)
+    workspace = _absolute_path(project_root, 'project_root')
+    _native_path_stat(workspace, 'native execution root', directory=True)
+    home = _safe_env().get('HOME', '')
+    if not Path(home).is_absolute():
+        raise EffectBlocked('local native context requires an absolute HOME')
+    root = Path(home) / '.kent'
+    database = root / 'db' / 'main.sqlite3'
+    _native_path_stat(root, 'native persistence root', directory=True)
+    before = _native_path_stat(database, 'native persistence database')
+    environment = {'KENT_SERVER_HOST': '127.0.0.1', 'KENT_PERSISTENCE_ROOT': str(root)}
+    digest = sha256_bytes(executable.read_bytes())
+    status = _native_comments_status(executable, workspace, environment)
+    endpoint = status.get('endpoint')
+    match = re.fullmatch(r'http://127\.0\.0\.1:([0-9]{1,5})', endpoint) if isinstance(endpoint, str) else None
+    if not match or not 1 <= int(match[1]) <= 65535:
+        raise EffectBlocked('native service endpoint is not an unambiguous loopback port')
+    port = int(match[1])
+    environment['KENT_SERVER_PORT'] = str(port)
+    pid = status.get('health_pid')
+    command = status.get('command')
+    if (
+        status.get('health_status') != 'ok'
+        or type(pid) is not int or pid <= 0
+        or not isinstance(command, list) or not command
+        or not all(isinstance(value, str) for value in command)
+        or not Path(command[0]).is_absolute()
+        or Path(command[0]).resolve() != executable.resolve()
+        or command[1:] != ['serve', '--persistence-root', str(root)]
+    ):
+        raise EffectBlocked('native service identity does not bind the local root')
+    process = _native_process_evidence(pid, executable, root, database)
+    listener = _native_listener_evidence(pid, port, root)
+    # Close discovery races before giving another caller a usable connection.
+    repeated = _native_comments_status(executable, workspace, environment)
+    after_process = _native_process_evidence(pid, executable, root, database)
+    after_listener = _native_listener_evidence(pid, port, root)
+    after = _native_path_stat(database, 'native persistence database')
+    if (
+        any(repeated.get(key) != status.get(key) for key in ('endpoint', 'health_pid', 'health_status', 'command'))
+        or process != after_process or listener != after_listener
+        or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        or digest != sha256_bytes(executable.read_bytes())
+    ):
+        raise EffectBlocked('local native context changed during discovery')
+    return {
+        'schema': NATIVE_COMMENTS_CONTEXT_SCHEMA, 'kent': str(executable),
+        'kent_sha256': digest, 'project_root': str(workspace),
+        'persistence_root': str(root), 'host': '127.0.0.1', 'port': port,
+        'process': process, 'listener': listener,
+        'database': {'device': before.st_dev, 'inode': before.st_ino},
+        'environment': environment,
+    }
+
+
+def validate_native_local_context(context: Any) -> dict[str, Any]:
+    fields = {
+        'schema', 'kent', 'kent_sha256', 'project_root', 'persistence_root',
+        'host', 'port', 'process', 'listener', 'database', 'environment',
+    }
+    value = _closed(context, fields, 'local native context')
+    if set(value) != fields or len(canonical_bytes(value)) > 16 * 1024:
+        raise EffectBlocked('local native context is incomplete or oversized')
+    fresh = native_local_context(kent=value['kent'], project_root=value['project_root'])
+    if canonical_bytes(fresh) != canonical_bytes(value):
+        raise EffectBlocked('local native context no longer matches the local service')
+    return fresh
+
+
+def _native_comments_columns(connection: sqlite3.Connection) -> None:
+    # Only consumed columns/types form this observer's storage compatibility gate.
+    tables = {
+        'task_records': {'id': 'TEXT', 'project_id': 'TEXT', 'workflow_id': 'BLOB',
+                         'source_workspace_id': 'TEXT', 'managed_worktree_id': 'TEXT'},
+        'workspaces': {'id': 'TEXT', 'project_id': 'TEXT', 'canonical_root_path': 'TEXT'},
+        'worktrees': {'id': 'TEXT', 'workspace_id': 'TEXT', 'canonical_root_path': 'TEXT'},
+        'projects': {'id': 'TEXT'},
+        'workflows': {'id': 'BLOB'},
+        'task_comments': {key: ('INTEGER' if key.endswith('_unix_ms') else 'TEXT') for key in NATIVE_COMMENT_FIELDS},
+    }
+    for table, required in tables.items():
+        columns = {row[1]: row[2].upper() for row in connection.execute(f'PRAGMA table_info("{table}")')}
+        if any(columns.get(key) != declared for key, declared in required.items()):
+            raise EffectBlocked('native comments required columns/types differ')
+
+
+def _native_prefixed_uuid(value: Any, prefix: str) -> str:
+    value = _string(value, prefix + ' identity')
+    if not value.startswith(prefix + '-') or _uuid(value[len(prefix) + 1:], prefix) != value[len(prefix) + 1:]:
+        raise EffectBlocked('native identity has an invalid format')
+    return value
+
+
+def read_native_task_comments(
+    context: Any, *, task_id: str, project_id: str, workflow_id: str,
+) -> dict[str, Any]:
+    """Read one bounded WAL-aware snapshot, returning all authority or none."""
+    task_id = _native_prefixed_uuid(task_id, 'task')
+    project_id = _native_project_id(project_id, 'project_id')
+    workflow_id = _uuid(workflow_id, 'workflow_id')
+    validated = validate_native_local_context(context)
+    database = Path(validated['persistence_root']) / 'db' / 'main.sqlite3'
+    before = _native_path_stat(database, 'native persistence database')
+    deadline = time.monotonic() + NATIVE_COMMENTS_SNAPSHOT_SECONDS
+    connection = None
+    try:
+        connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=0.25, isolation_level=None)
+        connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, NATIVE_COMMENTS_MAX_BYTES)
+        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        connection.execute('PRAGMA query_only=ON')
+        connection.execute('PRAGMA busy_timeout=250')
+        connection.execute('BEGIN')
+        if connection.execute('PRAGMA query_only').fetchone() != (1,):
+            raise EffectBlocked('native comments snapshot is not query-only')
+        if [row[2] for row in connection.execute('PRAGMA database_list') if row[1] == 'main'] != [str(database)]:
+            raise EffectBlocked('native comments database path differs')
+        _native_comments_columns(connection)
+        bindings = connection.execute(
+            'SELECT t.project_id,t.workflow_id,w.project_id,w.canonical_root_path,'
+            't.managed_worktree_id,wt.workspace_id,wt.canonical_root_path '
+            'FROM task_records t JOIN projects p ON p.id=t.project_id '
+            'JOIN workflows f ON f.id=t.workflow_id '
+            'JOIN workspaces w ON w.id=t.source_workspace_id '
+            'LEFT JOIN worktrees wt ON wt.id=t.managed_worktree_id WHERE t.id=? LIMIT 2',
+            (task_id,),
+        ).fetchall()
+        if len(bindings) != 1:
+            raise EffectBlocked('native Task binding is missing or ambiguous')
+        binding = bindings[0]
+        source_workspace = connection.execute(
+            'SELECT source_workspace_id FROM task_records WHERE id=? LIMIT 2', (task_id,),
+        ).fetchall()
+        expected_root = binding[6] if binding[4] is not None else binding[3]
+        if (
+            binding[0] != project_id or binding[1] != uuid.UUID(workflow_id).bytes
+            or binding[2] != project_id
+            or (binding[4] is not None and binding[5] != source_workspace[0][0])
+            or not isinstance(expected_root, str) or not Path(expected_root).is_absolute()
+            or Path(expected_root).resolve() != Path(validated['project_root']).resolve()
+        ):
+            raise EffectBlocked('native Task project/Workflow/execution root differs')
+        size = connection.execute(
+            'SELECT count(*),coalesce(sum(coalesce(length(CAST(id AS BLOB)),0)+'
+            'coalesce(length(CAST(task_id AS BLOB)),0)+coalesce(length(CAST(body AS BLOB)),0)+'
+            'coalesce(length(CAST(author_kind AS BLOB)),0)+coalesce(length(CAST(author_id AS BLOB)),0)),0),'
+            'coalesce(max(length(CAST(body AS BLOB))),0) FROM task_comments WHERE task_id=?',
+            (task_id,),
+        ).fetchone()
+        if size[0] > NATIVE_COMMENTS_MAX_COUNT or size[1] > NATIVE_COMMENTS_MAX_BYTES or size[2] > 262144:
+            raise EffectBlocked('native comments snapshot exceeds count/byte limits')
+        rows = connection.execute(
+            'SELECT ' + ','.join(NATIVE_COMMENT_FIELDS)
+            + ' FROM task_comments WHERE task_id=? ORDER BY created_at_unix_ms,id LIMIT ?',
+            (task_id, NATIVE_COMMENTS_MAX_COUNT + 1),
+        ).fetchall()
+        comments = []
+        seen = set()
+        for row in rows:
+            comment = dict(zip(NATIVE_COMMENT_FIELDS, row))
+            identity = _native_prefixed_uuid(comment['id'], 'comment')
+            if (
+                identity in seen or comment['task_id'] != task_id
+                or comment['author_kind'] not in {'user', 'agent'}
+                or not isinstance(comment['body'], str) or not comment['body'].strip()
+                or not isinstance(comment['author_id'], str)
+                or len(comment['author_id'].encode('utf-8')) > 4096
+                or any(type(comment[key]) is not int or not 0 <= comment[key] <= 2**63 - 1
+                       for key in ('created_at_unix_ms', 'updated_at_unix_ms'))
+                or comment['updated_at_unix_ms'] < comment['created_at_unix_ms']
+            ):
+                raise EffectBlocked('native comment identity/author/timestamp is invalid')
+            seen.add(identity)
+            comments.append(comment)
+        if len(rows) != size[0] or time.monotonic() > deadline:
+            raise EffectBlocked('native comments snapshot exceeded bounds')
+    except (sqlite3.Error, UnicodeError, TypeError, ValueError) as error:
+        # Do not leak database bodies, provider data, or SQL parameter payloads.
+        raise EffectBlocked('native comments snapshot is unavailable or incompatible') from error
+    finally:
+        if connection is not None:
+            connection.close()
+    after = _native_path_stat(database, 'native persistence database')
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise EffectBlocked('native comments database identity changed')
+    validate_native_local_context(validated)
+    return {
+        'schema': NATIVE_COMMENTS_SCHEMA, 'context': validated,
+        'task_id': task_id, 'project_id': project_id, 'workflow_id': workflow_id,
+        'comments': comments,
+    }
+
+
 def _native_process_binding(
     parsed: Mapping[str, Any],
     descriptor: Mapping[str, Any],

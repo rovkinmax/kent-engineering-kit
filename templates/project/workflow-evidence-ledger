@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         description="Append and validate task-local workflow evidence."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("append", "read", "validate", "summary", "recovery-preview", "recover", "retain-evidence"):
+    for command in ("identity", "append", "read", "validate", "summary", "recovery-preview", "recover", "retain-evidence"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--task", required=True)
         subparser.add_argument("--workspace", type=Path, default=Path.cwd())
@@ -296,8 +296,16 @@ def validate_entry(
 ) -> str:
     if not isinstance(entry, dict):
         raise ValueError("ledger line {} is not an object".format(sequence))
-    if entry.get("schema_version") != 1:
+    if type(entry.get("schema_version")) is not int or entry.get("schema_version") not in (1, 2):
         raise ValueError("ledger line {} has unsupported schema".format(sequence))
+    if entry["schema_version"] == 2:
+        current_owner({key: entry.get(key) for key in ("session_id", "step_id")})
+        if "run_id" in entry or entry.get("record_kind") in {
+            "terminal_evidence_seal_v1", "evidence_recovery_boundary_v1",
+        }:
+            raise ValueError("inconsistent evidence identity version")
+    elif entry.get("record_kind") == "evidence_recovery_boundary_v2":
+        raise ValueError("inconsistent recovery boundary version")
     if entry.get("sequence") != sequence:
         raise ValueError("ledger line {} has invalid sequence".format(sequence))
     if entry.get("task_short_id") != task:
@@ -405,12 +413,13 @@ def writable_ledger_name(task_fd: int, *, task: str, runtime=None) -> tuple[str,
     )
 
 
-def _native_context(root: Path, task: str) -> dict:
-    """Native Task/Session readback; Run/Step are inherited, not authenticated."""
+def _native_context(root: Path, task: str, *, session_only=False, native_kent=None) -> dict:
+    """Native Task/Session readback; Step is inherited, not authenticated."""
     uuid = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
-    owner = {key: os.environ.get("KENT_" + key.upper(), "") for key in ("session_id", "run_id", "step_id")}
-    if any(not uuid.fullmatch(value) for value in owner.values()):
-        raise ValueError("recovery requires inherited canonical Kent Session/Run/Step UUIDs")
+    keys = ("session_id",) if session_only else ("session_id", "step_id")
+    owner = {key: os.environ.get("KENT_" + key.upper(), "") for key in keys}
+    if native_kent is None and any(not uuid.fullmatch(value) for value in owner.values()):
+        raise ValueError("recovery requires inherited canonical Kent Session/Step UUIDs")
     executable = shutil.which("kent")
     if executable is None:
         raise ValueError("native Kent CLI readback is unavailable")
@@ -501,7 +510,7 @@ def _native_context(root: Path, task: str) -> dict:
         raise ValueError("native current execution observation is incomplete")
     if any(not isinstance(item, dict) for item in [*current, *live]):
         raise ValueError("invalid native current execution observation")
-    if not any(item.get("session_id") == owner["session_id"] for item in [*current, *live]):
+    if native_kent is None and not any(item.get("session_id") == owner["session_id"] for item in [*current, *live]):
         raise ValueError("historical-only or Script caller is not a current Task Session")
     # Recheck the exact resolved project at the independently reported source.
     source_root = Path(source["root_path"])
@@ -510,13 +519,25 @@ def _native_context(root: Path, task: str) -> dict:
         or read(["project", str(source_root)], structured=False) != project_id
     ):
         raise ValueError("native source project identity mismatch")
-    return {
+    result = {
         "task_short_id": task, "workspace": str(root),
         "source_workspace": str(source_root), "owner": owner,
         "source_native_identity": {
             "project_id": project_id, "workspace_id": source["workspace_id"], "task_id": summary["id"],
         },
     }
+    if native_kent is not None:
+        if source_root != root and source_root.is_relative_to(root):
+            raise ValueError("retention requires a native source workspace outside the retiring root")
+        workflow = summary.get("workflow_id")
+        if not isinstance(workflow, str) or not uuid.fullmatch(workflow):
+            raise ValueError("native Script Workflow is unresolved")
+        graph = read(["workflow", "graph", "inspect", workflow, "--json"])
+        result.pop("owner")
+        result["reader"] = _runtime_module().validate_retained_script_reader(
+            native_kent, detail=detail, graph=graph, workspace=str(root),
+        )
+    return result
 
 
 def _verified_context(root: Path, task: str, lookup=None) -> dict:
@@ -528,7 +549,7 @@ def _verified_context(root: Path, task: str, lookup=None) -> dict:
         raise ValueError("native identity readback is incomplete")
     if value["task_short_id"] != task or value["workspace"] != str(root):
         raise ValueError("native Task/workspace readback mismatch")
-    owner = runtime._evidence_owner(value["owner"])
+    owner = runtime._evidence_owner(value["owner"], version=2)
     if any(owner[key] != kent_identity("KENT_" + key.upper()) for key in owner):
         raise ValueError("native current owner differs from inherited execution identity")
     source = value["source_workspace"]
@@ -548,6 +569,18 @@ def native_current_identity(root: Path, task: str) -> dict:
         "project_id": identity["source_native_identity"]["project_id"],
         "workspace_path": str(root),
         **identity["owner"],
+    }
+
+
+def public_identity(root: Path, task: str) -> dict:
+    """Read-only Session projection; no Step, recovery or retention admission."""
+    identity = _native_context(root, task, session_only=True)
+    return {
+        "task_id": identity["source_native_identity"]["task_id"],
+        "task_short_id": task,
+        "project_id": identity["source_native_identity"]["project_id"],
+        "workspace_path": str(root),
+        "session_id": identity["owner"]["session_id"],
     }
 
 
@@ -637,16 +670,17 @@ def _recovery_documents(runtime, original, request):
         original[:request["prefix_byte_size"]], task_short_id=task,
     )["records"]
     digest = runtime.canonical_sha256(request)
+    version = 1 if "run_id" in request["owner"] else 2
     boundary = {
-        "schema_version": 1, "sequence": len(prefix) + 1, "task_short_id": task,
+        "schema_version": version, "sequence": len(prefix) + 1, "task_short_id": task,
         "previous_hash": prefix[-1]["event_hash"], **request["owner"],
-        "record_kind": runtime.EVIDENCE_BOUNDARY_KIND,
+        "record_kind": f"evidence_recovery_boundary_v{version}",
         "recovery_request_sha256": digest,
     }
     boundary["event_hash"] = runtime._event_hash(boundary)
     continuation = runtime.canonical_bytes(boundary) + b"\n"
     manifest = {
-        "schema": runtime.EVIDENCE_RECOVERY_SCHEMA, "request": request,
+        "schema": f"evidence-recovery-v{version}", "request": request,
         "request_sha256": digest, "boundary_event_hash": boundary["event_hash"],
     }
     runtime.validate_evidence_view(
@@ -714,7 +748,9 @@ def recover_evidence(
             prepared = _read_fixed(task_fd, runtime.EVIDENCE_RECOVERY_FILES[1], runtime.MAX_EVIDENCE_BYTES)
         except FileNotFoundError:
             prepared = None
-        if prepared is None and request["owner"] != identity["owner"]:
+        if prepared is None and (
+            "run_id" in request["owner"] or request["owner"] != identity["owner"]
+        ):
             raise ValueError("fresh recovery request requires the genuine current owner")
         if prepared is not None and prepared != continuation:
             raise ValueError("conflicting or damaged prepared evidence continuation")
@@ -757,7 +793,7 @@ def _producer_resolver(identity, *, read_relative=None):
             "task_id": identity["source_native_identity"]["task_id"],
             "task_short_id": task,
             "project_id": identity["source_native_identity"]["project_id"],
-            "workspace_path": str(root), **identity["owner"],
+            "workspace_path": str(root), **identity.get("owner", identity.get("reader", {})),
         }
         return delivery.producer_reference_closure(
             root, locator, identity=observed, read_relative=read_relative)
@@ -767,7 +803,7 @@ def _producer_resolver(identity, *, read_relative=None):
 def _retention_references(root, task, records, runtime, *, producer_resolver=None):
     """Resolve only the validated logical view, never the opaque suffix."""
     paths = {f".kent/runtime/{task}/evidence-ledger.jsonl"}
-    recovered = any(record.get("record_kind") == runtime.EVIDENCE_BOUNDARY_KIND for record in records)
+    recovered = any(record.get("record_kind") in runtime.EVIDENCE_BOUNDARY_KINDS for record in records)
     if recovered:
         paths.update(f".kent/runtime/{task}/{name}" for name in runtime.EVIDENCE_RECOVERY_FILES)
     for record in records:
@@ -890,7 +926,7 @@ def _metadata_identity(metadata):
     ))
 
 
-def _retention_receipt(root, task, task_fd, root_fd, identity, runtime):
+def _retention_receipt(root, task, task_fd, root_fd, identity, runtime, *, version=2):
     view = load_evidence_view(task_fd, task=task)
     records = view["records"]
     runtime.validate_terminal_chain(records, task_short_id=task)
@@ -929,12 +965,12 @@ def _retention_receipt(root, task, task_fd, root_fd, identity, runtime):
     if required_digests - digests:
         raise ValueError("terminal report digest has no required retained local artifact")
     unsigned = {
-        "schema": "evidence-retention-v1", "task_short_id": task,
+        "schema": f"evidence-retention-v{version}", "task_short_id": task,
         "source_workspace": identity["source_workspace"],
         "source_native_identity": identity["source_native_identity"],
         "terminal_event_hash": seal["event_hash"],
         "recovery_request_sha256": view["recovery_request_sha256"], "files": files,
-        "owner_provenance": dict(runtime.OWNER_PROVENANCE),
+        "owner_provenance": dict(runtime.LEGACY_OWNER_PROVENANCE if version == 1 else runtime.OWNER_PROVENANCE),
     }
     return runtime.validate_evidence_retention_receipt({
         **unsigned, "bundle_sha256": runtime.canonical_sha256(unsigned),
@@ -1057,10 +1093,15 @@ def revalidate_retention_observation(identity, task, receipt, observation):
             os.close(descriptor)
 
 
-def find_retained_evidence(root, *, task, marker, _native_lookup=None):
+def find_retained_evidence(root, *, task, marker, _native_lookup=None, native_kent=None):
     """Find the one immutable Task bundle by its native binding, never mtime."""
     runtime = _runtime_module()
-    identity = _verified_context(root, task, _native_lookup)
+    if native_kent is None:
+        identity = _verified_context(root, task, _native_lookup)
+    else:
+        # This seam is read-only. Writer entry points still require genuine
+        # inherited Agent Session/Step and never accept native Script context.
+        identity = _native_context(root, task, native_kent=native_kent)
     descriptors, parent = _retention_root(identity, task, create=False)
     try:
         names = os.listdir(parent)
@@ -1174,7 +1215,71 @@ def retain_evidence(root, *, task, confirm=None, _native_lookup=None, _phase_hoo
     descriptors, root_fd, _, _, task_fd = _open_runtime_fds(root, task, create_task=False, read_only=confirm is None)
     archive_descriptors = []
     try:
-        receipt = _retention_receipt(root, task, task_fd, root_fd, identity, runtime)
+        # Select durable history before creating a new v2 receipt. A caller's
+        # old digest alone never grants permission to initiate a v1 bundle.
+        try:
+            prior_descriptors, prior_parent = _retention_root(identity, task, create=False)
+        except FileNotFoundError:
+            prior_descriptors, prior_parent = [], None
+        version = 2
+        prior_name = None
+        try:
+            if prior_parent is not None:
+                names = os.listdir(prior_parent)
+                if len(names) > 1:
+                    raise ValueError("conflicting retained inventory for this terminal Task")
+                if names:
+                    prior_name = names[0]
+                    digest = prior_name.removeprefix(".preparing-")
+                    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                        raise ValueError("invalid retained inventory")
+                    prior = _private_directory(prior_parent, prior_name)
+                    prior_descriptors.append(prior)
+                    try:
+                        raw = _read_fixed(prior, "receipt.json", MAX_JSON_INPUT_BYTES)
+                    except FileNotFoundError:
+                        if not prior_name.startswith(".preparing-"):
+                            raise ValueError("completed retention is missing its receipt")
+                        raw = None
+                    if raw is not None:
+                        old = runtime.validate_evidence_retention_receipt(runtime.parse_canonical_json(
+                            raw, label="retention receipt", max_bytes=MAX_JSON_INPUT_BYTES))
+                        version = 1 if old["schema"] == "evidence-retention-v1" else 2
+                        receipt = _retention_receipt(root, task, task_fd, root_fd, identity, runtime, version=version)
+                        if old != receipt or digest != receipt["bundle_sha256"]:
+                            raise ValueError("retained receipt differs from full source/reference closure")
+                    else:
+                        # Interrupted old publication may precede receipt.json.
+                        # Only the existing exact prepared directory can select
+                        # the historical digest; validate all existing bytes.
+                        for candidate_version in (2, 1):
+                            receipt = _retention_receipt(
+                                root, task, task_fd, root_fd, identity, runtime, version=candidate_version)
+                            if receipt["bundle_sha256"] == digest:
+                                version = candidate_version
+                                break
+                        else:
+                            raise ValueError("prepared retention does not match source inventory")
+                    allowed = {f"{index:03d}": item for index, item in enumerate(receipt["files"])}
+                    for name in os.listdir(prior):
+                        if name == "receipt.json":
+                            continue
+                        if name not in allowed:
+                            raise ValueError("foreign entries in prepared retention bundle")
+                        item = allowed[name]
+                        target = _open_runtime_file(prior, name, create=False)
+                        try:
+                            if _file_digest(target, item["byte_size"]) != (item["byte_size"], item["sha256"]):
+                                raise ValueError("conflicting or incomplete prepared retained file digest")
+                        finally:
+                            os.close(target)
+                    if not prior_name.startswith(".preparing-"):
+                        verify_retention_bundle(identity, task, receipt, runtime)
+            if prior_name is None:
+                receipt = _retention_receipt(root, task, task_fd, root_fd, identity, runtime)
+        finally:
+            for descriptor in reversed(prior_descriptors):
+                os.close(descriptor)
         if confirm is None:
             return {"receipt": receipt, "confirm": receipt["bundle_sha256"], "published": False}
         if confirm != receipt["bundle_sha256"]:
@@ -1235,7 +1340,7 @@ def retain_evidence(root, *, task, confirm=None, _native_lookup=None, _phase_hoo
                     _phase_hook("after_retained_file_fsync")
             finally:
                 os.close(source)
-        if _retention_receipt(root, task, task_fd, root_fd, identity, runtime) != receipt:
+        if _retention_receipt(root, task, task_fd, root_fd, identity, runtime, version=version) != receipt:
             raise ValueError("source drift before retention publication")
         _publish_exact(prepared, "receipt.json", runtime.canonical_bytes(receipt))
         os.fsync(prepared)
@@ -1446,6 +1551,15 @@ def kent_identity(name: str) -> str:
     return os.environ.get(name, "").strip() or "unknown"
 
 
+def current_owner(owner=None):
+    if owner is None:
+        owner = {key: os.environ.get("KENT_" + key.upper(), "") for key in ("session_id", "step_id")}
+    uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+    if any(not isinstance(value, str) or not re.fullmatch(uuid, value) for value in owner.values()):
+        raise ValueError("owner requires canonical Kent Session/Step UUIDs")
+    return owner
+
+
 def append_entry(
     root: Path,
     path: Path,
@@ -1468,9 +1582,7 @@ def append_entry(
     decisions = require_string_list(raw.get("decisions", []), "decisions")
     metrics = context_metrics(root, raw.get("context"))
     git_head = run_git(root, "rev-parse", "HEAD").stdout.strip()
-    session_id = kent_identity("KENT_SESSION_ID")
-    run_id = kent_identity("KENT_RUN_ID")
-    step_id = kent_identity("KENT_STEP_ID")
+    owner = current_owner()
 
     descriptors, _, _, _, task_fd = _open_runtime_fds(
         root,
@@ -1504,13 +1616,20 @@ def append_entry(
                 "terminal_evidence_seal_v1"
             ):
                 raise ValueError("evidence ledger is sealed")
-            if run_id != "unknown":
-                for existing in reversed(entries):
-                    if existing.get("record_kind") != "evidence_recovery_boundary_v1" and existing.get("run_id") == run_id:
-                        return existing, True
+            matches = [
+                existing for existing in entries
+                if existing.get("record_kind") not in {
+                    "terminal_evidence_seal_v1", "evidence_recovery_boundary_v1",
+                    "evidence_recovery_boundary_v2",
+                } and all(existing.get(key) == value for key, value in owner.items())
+            ]
+            if len(matches) > 1:
+                raise ValueError("ambiguous historical Session/Step evidence identity")
+            if matches:
+                return matches[0], True
             previous_hash = entries[-1]["event_hash"] if entries else ""
             entry = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "sequence": len(entries) + 1,
                 "task_short_id": task,
                 "node_key": node_key,
@@ -1522,9 +1641,7 @@ def append_entry(
                 "context": metrics,
                 "workspace_path": str(root),
                 "git_head": git_head,
-                "session_id": session_id,
-                "run_id": run_id,
-                "step_id": step_id,
+                **owner,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "previous_hash": previous_hash,
             }
@@ -1756,7 +1873,7 @@ def seal_terminal(
             }
         if sentinel_present:
             raise ValueError("terminal sentinel has no valid terminal seal")
-        if last.get("record_kind") == runtime.EVIDENCE_BOUNDARY_KIND:
+        if last.get("record_kind") in runtime.EVIDENCE_BOUNDARY_KINDS:
             raise ValueError("terminal seal requires a genuine final ordinary event")
         seal = runtime.build_terminal_seal_record(
             request,
@@ -1811,6 +1928,9 @@ def main() -> int:
     args = parse_args()
     root = repository_root(args.workspace)
     path = ledger_path(root, args.task)
+    if args.command == "identity":
+        print(json.dumps(public_identity(root, args.task), ensure_ascii=False))
+        return 0
     require_ignored(root, path)
     if args.command == "append":
         entry, duplicate_suppressed = append_entry(root, path, task=args.task)
