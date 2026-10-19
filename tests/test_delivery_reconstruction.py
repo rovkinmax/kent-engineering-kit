@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest.mock import patch
 
 from workflowkit.delivery import (
@@ -127,7 +128,8 @@ class ProducerTransportTests(unittest.TestCase):
         self.identity = {
             "task_id": "native-task", "task_short_id": "KIT-1",
             "project_id": "native-project", "workspace_path": str(self.root),
-            "session_id": "session", "run_id": "run", "step_id": "step",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "step_id": "22222222-2222-4222-8222-222222222222",
         }
         self.outer = ' { "schema": "workflow-delivery-context-v1", "phase":"pre_pr" } \n'
         self.result = {
@@ -163,8 +165,7 @@ class ProducerTransportTests(unittest.TestCase):
 
     def test_exact_strings_and_historical_failure_survive_resume(self):
         locator, emitted = self.capture()
-        self.identity["step_id"] = "later-step"
-        self.identity["run_id"] = "later-run"
+        self.identity["step_id"] = "33333333-3333-4333-8333-333333333333"
         recovered = self.read(locator)
         self.assertEqual(recovered["emitted"], emitted)
         self.assertEqual(recovered["result"]["ci_report"], self.result["ci_report"])
@@ -242,7 +243,7 @@ class ProducerTransportTests(unittest.TestCase):
     def test_actual_process_death_during_immutable_publication_is_retryable(self):
         import workflowkit.delivery as delivery
         for boundary in ("before_link", "after_link"):
-            identity = {**self.identity, "step_id": boundary}
+            identity = {**self.identity, "step_id": str(uuid.uuid5(uuid.NAMESPACE_URL, boundary))}
             child = (
                 "import json, os, sys\n"
                 "from pathlib import Path\n"
@@ -322,7 +323,7 @@ class ProducerTransportTests(unittest.TestCase):
         return {
             "summary": {"id": "native-task", "project_id": "native-project",
                         "workflow_id": "workflow", "short_id": "KIT-1"},
-            "current_nodes": [{"node_id": "source", "session_id": "session"}],
+            "current_nodes": [{"node_id": "source", "session_id": self.identity["session_id"]}],
         }
 
     def request(self, locator):

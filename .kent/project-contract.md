@@ -141,12 +141,16 @@ or append after seal, including after leaving the source worktree.
 The configured `prepare_cleanup` opts Cleanup and its recovery into this
 single-owner contract. Do not append standalone evidence before the helper
 or merely to report a blocker; retain those observations in Task records.
-Use real current unmodified Kent Session/Run/Step identities; never generate,
+Use real current unmodified Kent Session/Step UUIDs for new schema-2 evidence;
+ignore stale Run environment values and preserve historical schema-1 identities.
+Never generate,
 export or replace them to defeat deduplication. Preserve and block on
 conflicting/fabricated evidence, without reconstructing or resealing history.
 This behavioral prohibition does not provide native identity authentication:
-qualification must independently verify the final event's actual Kent
-Run/Session/Step records before admitting it as evidence.
+qualification must verify the final event's Session/Task native binding.
+Current Step comes from the inherited Kent environment, not independently
+authenticated native readback; do not claim otherwise. Historical schema-1
+proof keeps its original Session/Run/Step contract and bytes.
 
 ## Source versus installed state
 

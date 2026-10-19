@@ -244,11 +244,16 @@ Kent session on the machine.
 
 ### Mobile resource-lock interface
 
-Before calling the adapter, a project procedure resolves the current Task's
-native ID and short ID from native Task JSON and obtains the current Session
-with `kent session-id`. Kent does not promise to export `KENT_TASK_ID`; the
-procedure sets `KENT_TASK_ID` to the verified Task short ID and
-`KENT_SESSION_ID` to the current Session. New leases use the Task short ID as
+Before calling the adapter, run the profile evidence command's read-only
+`identity --task <short-id> --workspace <root>` subcommand. Its closed JSON
+contains `task_id`, `task_short_id`, `project_id`, `workspace_path`, and
+`session_id`; it verifies the inherited canonical Session UUID against the
+current native Task/project/workspace. It does not require Step or R2/retention
+admission. Never parse diagnostic `kent session-id` output, invent or replace
+the inherited Session UUID, or treat a historical-only Session as current.
+Numeric short IDs are selectors, never durable Session/evidence owners.
+Kent does not promise to export `KENT_TASK_ID`; set it from the verified Task
+short ID and preserve the inherited `KENT_SESSION_ID`. New leases use the Task short ID as
 owner identity. A legacy native-ID owner may be retained only when native
 readback proves its short-ID mapping.
 

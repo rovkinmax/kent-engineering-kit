@@ -97,7 +97,10 @@ class CiContractTest(unittest.TestCase):
             "summary": "actual recovered report", "artifacts": [], "checks": [], "decisions": [],
             "context": {"manifest_path": ".kent/context/implement.md", "files_read": []},
         }
-        with mock.patch.dict(os.environ, {"KENT_RUN_ID": "actual-ci-archive-run"}), mock.patch.object(
+        with mock.patch.dict(os.environ, {
+            "KENT_RUN_ID": "stale-ignored",
+            "KENT_STEP_ID": "11111111-1111-4111-8111-111111111111",
+        }), mock.patch.object(
             ledger, "read_json_input", side_effect=lambda _: payload,
         ):
             # A fresh append happens through the real template module below;
@@ -112,7 +115,10 @@ class CiContractTest(unittest.TestCase):
         (root / ".kent/context/delivery.md").write_text("actual CI manifest\n")
         second_report = json.loads(json.dumps(report))
         second_report["contract"]["pull_number"] += 1
-        with mock.patch.dict(os.environ, {"KENT_RUN_ID": "second-ci-archive-run"}):
+        with mock.patch.dict(os.environ, {
+            "KENT_RUN_ID": "stale-ignored",
+            "KENT_STEP_ID": "22222222-2222-4222-8222-222222222222",
+        }):
             second_artifact = ci_contract.archive_ci_report(root, "TASK-4", second_report)
         records = ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")
         self.assertIn(second_artifact, records[-1]["artifacts"])

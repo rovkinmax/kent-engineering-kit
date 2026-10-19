@@ -276,6 +276,30 @@ MOBILE_LEASE_NEW = (
     "evidence; `status` must redact them."
 )
 
+# Project only the approved native-identity guidance back to the frozen KEN-6
+# clause before applying the existing historical projection. Keep its hashes.
+MOBILE_NATIVE_IDENTITY_OLD = (
+    "Before any resource operation, run `kent task show "
+    "{{.TaskShortId}} --json`, verify `summary.short_id` against the "
+    "rendered Task short ID, retain `summary.id` as the native ID, "
+    "and obtain the current Session with `kent session-id`. These "
+    "readbacks establish identity; do not assume Kent already "
+    "exported `KENT_TASK_ID` or `KENT_SESSION_ID`. Set `KENT_TASK_ID` "
+    "to the verified short ID and `KENT_SESSION_ID` to the current "
+    "Session for adapter calls. Keep top-level checkpoint "
+)
+MOBILE_NATIVE_IDENTITY_NEW = (
+    "Before any resource operation, run the profile evidence command "
+    "`identity --task {{.TaskShortId}} --workspace <root>`. Verify "
+    "`task_short_id` against the rendered Task, retain `task_id` as "
+    "the native ID and `session_id` as the verified inherited current "
+    "Session UUID. This read-only native binding requires neither Step "
+    "nor retention/R2 admission. Never parse `kent session-id` output "
+    "or invent/export/replace a Session UUID. Set adapter `KENT_TASK_ID` "
+    "to the verified short ID; preserve inherited `KENT_SESSION_ID`. "
+    "Keep top-level checkpoint "
+)
+
 PLAN_RECOVERY_NEW = """If recovery inputs identify prior work, inspect each supplied item
 independently:
 
@@ -781,7 +805,10 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                     )
                     reverse_prompt(
                         "gate_smoke_required",
-                        ((MOBILE_LEASE_NEW, MOBILE_LEASE_OLD),),
+                        (
+                            (MOBILE_NATIVE_IDENTITY_NEW, MOBILE_NATIVE_IDENTITY_OLD),
+                            (MOBILE_LEASE_NEW, MOBILE_LEASE_OLD),
+                        ),
                     )
                     reverse_prompt(
                         "start_plan",

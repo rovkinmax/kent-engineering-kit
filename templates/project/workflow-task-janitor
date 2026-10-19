@@ -55,6 +55,9 @@ MAX_CI_ARTIFACTS = 64
 MAX_CI_ARTIFACT_BYTES = 4 * 1024 * 1024
 MAX_LEDGER_BYTES = 8 * 1024 * 1024
 MAX_LEDGER_RECORDS = 8192
+# Actual native Script input, populated only by main. It is never synthesized
+# from cleanup_session_id (which identifies the preceding Agent, not us).
+_NATIVE_KENT = None
 RUNTIME_EVIDENCE_ENTRIES = frozenset({
     "evidence-ledger.jsonl",
     "fix-checkpoint.json",
@@ -947,12 +950,13 @@ class _EvidenceAdmission:
                     raise
                 archive_fallback = True
             requires_retention = archive_fallback or retention_declared or (
-                any(record.get("record_kind") == runtime.EVIDENCE_BOUNDARY_KIND for record in records)
+                any(record.get("record_kind") in runtime.EVIDENCE_BOUNDARY_KINDS for record in records)
             )
             if requires_retention:
                 self.retention_ledger = evidence_ledger()
                 self.retained = self.retention_ledger.find_retained_evidence(
                     workspace, task=task_short_id, marker=reported_marker,
+                    native_kent=_NATIVE_KENT,
                 )
                 if archive_fallback:
                     records = self.retained["view"]["records"]
@@ -2589,12 +2593,16 @@ def settle_local_branch(
 
 
 def main() -> int:
+    global _NATIVE_KENT
     try:
-        payload = json.load(sys.stdin)
+        payload = json.load(sys.stdin, object_pairs_hook=_unique_json_pairs)
     except json.JSONDecodeError as error:
         raise ValueError(f"stdin is not valid JSON: {error}") from error
     if not isinstance(payload, dict):
         raise ValueError("stdin must be one JSON object")
+    _NATIVE_KENT = payload.get("_kent")
+    if "_kent" in payload and not isinstance(_NATIVE_KENT, dict):
+        raise ValueError("_kent must be a native Script context object")
 
     workspace = Path(require_string(payload, "workspace_path")).expanduser().resolve()
     branch = require_string(payload, "branch_name", empty=True)

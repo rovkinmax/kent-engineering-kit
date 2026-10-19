@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Fixed local-only native context discovery and typed Task comments."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from workflowkit.operations import (
+    OperationError, _duplicate_free, native_local_context, read_native_task_comments,
+)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest='mode', required=True)
+    discover = subparsers.add_parser('context')
+    discover.add_argument('--kent', required=True)
+    discover.add_argument('--project-root', required=True)
+    comments = subparsers.add_parser('comments')
+    comments.add_argument('--context-json', required=True)
+    comments.add_argument('--task-id', required=True)
+    comments.add_argument('--project-id', required=True)
+    comments.add_argument('--workflow-id', required=True)
+    args = parser.parse_args()
+    try:
+        if args.mode == 'context':
+            result = native_local_context(kent=args.kent, project_root=args.project_root)
+        else:
+            if len(args.context_json.encode('utf-8')) > 16 * 1024:
+                raise OperationError('local native context exceeds 16 KiB')
+            context = json.loads(args.context_json, object_pairs_hook=_duplicate_free)
+            result = read_native_task_comments(
+                context, task_id=args.task_id, project_id=args.project_id, workflow_id=args.workflow_id,
+            )
+    except (OperationError, OSError, ValueError, TypeError, RecursionError):
+        print('read-native-task-comments: local observation blocked; no authority returned', file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(',', ':')))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -24,8 +24,9 @@ _PACKET_LOCATOR = re.compile(
 )
 _IDENTITY_KEYS = {
     "task_id", "task_short_id", "project_id", "workspace_path",
-    "session_id", "run_id", "step_id",
+    "session_id", "step_id",
 }
+_LEGACY_IDENTITY_KEYS = _IDENTITY_KEYS | {"run_id"}
 _SCRIPT_IDENTITY_KEYS = {
     "task_id", "task_short_id", "project_id", "workspace_path",
     "invocation_kind", "node_id", "transition_branch_key",
@@ -139,7 +140,7 @@ def _packet_strings(value: object, label: str) -> dict[str, str]:
 
 def _packet_identity(root: Path, identity: dict) -> dict:
     if not isinstance(identity, dict) or set(identity) not in (
-        _IDENTITY_KEYS, _SCRIPT_IDENTITY_KEYS,
+        _IDENTITY_KEYS, _LEGACY_IDENTITY_KEYS, _SCRIPT_IDENTITY_KEYS,
     ):
         raise ValueError("producer identity is incomplete")
     strings = dict(identity)
@@ -154,6 +155,9 @@ def _packet_identity(root: Path, identity: dict) -> dict:
         raise ValueError("producer workspace identity mismatch")
     if not _PACKET_KEY.fullmatch(identity["task_short_id"]):
         raise ValueError("invalid producer task key")
+    if set(identity) == _IDENTITY_KEYS:
+        from .runtime import _evidence_owner
+        _evidence_owner({key: identity[key] for key in ("session_id", "step_id")}, version=2)
     return dict(identity)
 
 
@@ -386,10 +390,15 @@ def capture_producer(
     immutable artifacts have passed durable publication/readback.
     """
     identity = _packet_identity(root, identity)
+    if set(identity) == _LEGACY_IDENTITY_KEYS:
+        raise ValueError("new Agent producer requires Session/Step identity, not Run")
     if not isinstance(producer_kind, str) or not _PACKET_KEY.fullmatch(producer_kind):
         raise ValueError("invalid producer kind")
     base = {
-        "schema": "workflow-producer-source-v1", "identity": identity,
+        "schema": (
+            "workflow-producer-source-v1" if set(identity) == _SCRIPT_IDENTITY_KEYS
+            else "workflow-producer-source-v2"
+        ), "identity": identity,
         "producer_kind": producer_kind,
         "inputs": _packet_strings(inputs, "producer inputs"),
         "result": _packet_strings(result, "producer result"),
@@ -449,9 +458,11 @@ def reconstruct_producer(root: Path, locator: str, *, identity: dict,
         base = packet_decode(raw)
         if set(base) != {"schema", "identity", "producer_kind", "inputs", "result", "binding"}:
             raise ValueError("invalid producer artifact fields")
-        if base["schema"] != "workflow-producer-source-v1":
+        if base["schema"] not in {"workflow-producer-source-v1", "workflow-producer-source-v2"}:
             raise ValueError("unsupported producer artifact schema")
         stored = _packet_identity(root, base["identity"])
+        if (base["schema"] == "workflow-producer-source-v2") != (set(stored) == _IDENTITY_KEYS):
+            raise ValueError("inconsistent producer identity version")
         for key in ("task_id", "task_short_id", "project_id", "workspace_path"):
             if stored[key] != identity[key]:
                 raise ValueError("foreign producer identity")
@@ -3390,6 +3401,11 @@ def cleanup_evidence_owner_instruction(profile: ProjectProfile) -> str:
     helper = profile.command("prepare_cleanup")
     if not helper:
         return ""
+    identity = (
+        "`KENT_SESSION_ID` and `KENT_STEP_ID`"
+        if profile.delivery_reliability_policy() == "v1" or profile.runtime_contracts_v2()
+        else "`KENT_SESSION_ID`, `KENT_RUN_ID` and `KENT_STEP_ID`"
+    )
     return f"""Terminal Cleanup evidence has one project-owned owner: `{helper}`.
 Invoke it in the original Task root using the project Cleanup procedure.
 {procedure_instruction(profile, "cleanup")}
@@ -3400,7 +3416,7 @@ keep its payload and archive protocol in the project procedure.
 Do not issue a standalone ledger append before the helper, after seal, or
 merely to report a blocker. Until valid terminal preparation is possible,
 keep preflight and blocker observations in retained Task records.
-Use real current, unmodified `KENT_SESSION_ID`, `KENT_RUN_ID` and `KENT_STEP_ID`.
+Use real current, unmodified {identity}.
 Never generate, export, substitute or replace identities to bypass deduplication.
 If conflicting or fabricated evidence or substituted identities are present,
 preserve the evidence and block. Do not accept that seal as valid, overwrite
@@ -3424,6 +3440,16 @@ def cleanup_without_preparation_instruction(
     runtime_support = (
         f"`{runtime}`" if runtime else "the configured runtime-contract support module"
     )
+    current = profile.delivery_reliability_policy() == "v1" or profile.runtime_contracts_v2()
+    identity = (
+        "`KENT_SESSION_ID` and `KENT_STEP_ID`" if current
+        else "`KENT_SESSION_ID`, `KENT_RUN_ID` and `KENT_STEP_ID`"
+    )
+    owner_proof = (
+        "verify the final event's native Session/Task binding and stored inherited Step;\n"
+        "native readback does not independently authenticate the current Step"
+        if current else "read back the final ordinary event's actual Kent Session/Run/Step records"
+    )
     return f"""Read `{manifest}` first and stay inside its required and
 conditionally triggered sources.
 
@@ -3442,7 +3468,7 @@ Validate the ledger chain with the existing
 identity, an identical original report marker and ledger marker, and an exact
 match between the frozen request and the marker's operation-report digests,
 redaction proof and retention class. Check those digests against the retained
-operation reports and read back the final ordinary event's actual Kent Session/Run/Step records;
+operation reports and {owner_proof};
 non-empty identity strings alone are not proof. Use
 only this existing read-only validation path. Reuse a valid prior success
 without another append or seal; do not fabricate a marker or reconstruct
@@ -3454,7 +3480,7 @@ ordinary event before transition using
 `{evidence_command} append --task {{{{.TaskShortId}}}} --workspace <workspace>`.
 Set `node_key=cleanup`, `evidence_type={evidence_type}`, and
 `context.manifest_path={manifest}`; use real unmodified current
-`KENT_SESSION_ID`, `KENT_RUN_ID` and `KENT_STEP_ID`. Include the exact files
+{identity}. Include the exact files
 read, actual checks, repeated questions and verification loops, and null for
 unavailable model/compaction counters. Then use the existing evidence
 command's `seal` operation:
@@ -3495,6 +3521,11 @@ conditionally triggered sources.
                 manifest,
                 evidence_type,
             )
+    identity_scope = (
+        "Session/Step pair"
+        if profile.delivery_reliability_policy() == "v1" or profile.runtime_contracts_v2()
+        else "Kent run"
+    )
     return f"""Read `{manifest}` first and stay inside its required and
 conditionally triggered sources.
 
@@ -3506,7 +3537,7 @@ Before transition, pipe one non-empty JSON object to
 order; do not repeat the manifest there. Record repeated questions and
 verification loops, use null for unavailable model/compaction counters, and
 exclude secrets or broad raw evidence. Append is idempotent for the current
-Kent run; on recovery, reuse the returned sequence/hash and continue."""
+{identity_scope}; on recovery, reuse the returned sequence/hash and continue."""
 
 
 def branch_identity_resolution_prompt(
@@ -3562,14 +3593,15 @@ def checkpoint_instruction(profile: ProjectProfile, stage: str) -> str:
             "runtime target, completed build/install/launch work, sanitized "
             "evidence paths, remaining scenarios, external-side-effect "
             "ledger, restoration state, and one next permitted action. "
-            "Before any resource operation, run `kent task show "
-            "{{.TaskShortId}} --json`, verify `summary.short_id` against the "
-            "rendered Task short ID, retain `summary.id` as the native ID, "
-            "and obtain the current Session with `kent session-id`. These "
-            "readbacks establish identity; do not assume Kent already "
-            "exported `KENT_TASK_ID` or `KENT_SESSION_ID`. Set `KENT_TASK_ID` "
-            "to the verified short ID and `KENT_SESSION_ID` to the current "
-            "Session for adapter calls. Keep top-level checkpoint "
+            "Before any resource operation, run the profile evidence command "
+            "`identity --task {{.TaskShortId}} --workspace <root>`. Verify "
+            "`task_short_id` against the rendered Task, retain `task_id` as "
+            "the native ID and `session_id` as the verified inherited current "
+            "Session UUID. This read-only native binding requires neither Step "
+            "nor retention/R2 admission. Never parse `kent session-id` output "
+            "or invent/export/replace a Session UUID. Set adapter `KENT_TASK_ID` "
+            "to the verified short ID; preserve inherited `KENT_SESSION_ID`. "
+            "Keep top-level checkpoint "
             "`task_short_id` authoritative and store `task_native_id`, "
             "`task_short_id`, `lease_owner_id`, `lock_resource`, and "
             "`lock_token` together in `stage_data`. Enrich missing fields in "

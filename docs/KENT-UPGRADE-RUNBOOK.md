@@ -4,7 +4,102 @@ Use this runbook when upgrading the Kent execution set or when Kent changes
 workflow persistence, graph authoring, runtime continuity, or Script completion
 contracts.
 
-## Approved baseline
+## Kent 2.9 to 2.10 preparation
+
+This section describes the reviewed compatibility boundary, not authorization
+to install or restart Kent. Source verification alone is not upgrade readiness.
+The earlier 2.6 baseline below remains historical guidance.
+
+The inspected upstream revisions are 2.9.0
+`8497311f451dee6a23039bc2c00311eadf387688` and 2.10.0
+`9c7e96c39e8029f8a04118a9603902b6c75e942c`.
+The exact tree comparison covers 894 changed files; source and test inspection
+is not execution of every changed path.
+
+### Compatibility gates
+
+- Kent 2.10 removes `KENT_RUN_ID`. Updated Kit writers use genuine Session and
+  Step UUIDs. Readers accept historical v1 and new v2 evidence without changing
+  historical bytes or hashes. GitHub Actions run IDs are unrelated.
+- Activate a qualified complete reader/writer bundle before engine upgrade.
+  New helpers write v2 even on Kent 2.9. Old readers cannot be left reachable
+  after this activation; file-copy order alone does not establish a safe
+  boundary. Inventory retained execution roots, project-local helper copies,
+  producer packets, Cleanup procedures and locked Session instructions.
+- Each affected retained execution must either finish naturally with its
+  existing bundle or receive a separately approved compatible deployment.
+  Preserve dirty files, pins, pending Questions/Approvals and task-fixed storage
+  modes. Do not force-stop Tasks or rewrite history to satisfy this gate.
+- Source publication, shared Kit installation and engine restart do not refresh
+  copied project helpers or retained Session instructions. Future execution
+  source pins also need explicit qualification.
+- `kent session-id` changes from a bare UUID to labeled Short ID, UUID and Log
+  path lines. Durable owners use the UUID, never the numeric selector.
+- Protocol 204 becomes 213; upgrade CLI/TUI, service and Desktop as a matching
+  set. Native Task/worktree CLI JSON projections inspected for this release
+  did not require a decoder change. The UI In Use indicator is not proof of
+  process quiescence or safe cleanup.
+
+### Backup and operator update boundary
+
+1. Record exact executable versions/hashes, configuration revision, active
+   Task/Session inventory, graph exports, retained roots and pending decisions.
+   Verify the consumer compatibility gates above before scheduling the update.
+2. Establish an explicitly approved consistent backup boundary. The operator,
+   not an agent hosted by the service, stops the service and relevant clients
+   when safe. Preserve resource-owner checkpoints and handle active Scripts
+   through their supported procedures. Do not copy a moving SQLite database
+   and Session tree and call the result a consistent snapshot.
+3. Back up the persistence metadata and Session artifacts together, including
+   applicable SQLite sidecars, plus the old executable set and configuration.
+   Preserve credentials through an operator-managed secure backup; never paste
+   secrets into evidence. Record manifest hashes and permissions, and verify
+   restoration in an isolated location before treating the backup as usable.
+   There is no assumed `kent backup` command.
+4. The operator installs the matching 2.10 execution set and restarts it.
+   Record the actual migration result and re-read native state before allowing
+   affected executions to proceed. Metadata migrations 99 and 100 add nullable
+   Session short IDs and connection consumption; existing Sessions are not
+   backfilled with short IDs. Requalify schema/executable-bound operation plans;
+   old hashes are not authorization for the changed installation.
+
+### Qualification after update
+
+Verify the preserved Task/current-node/pin and pending-decision inventory,
+locked Session configuration and connection identity. Test a fresh disposable
+Session and approved retained continuation, including Session/Step evidence,
+producer consumption, recovery/retention and Cleanup paths. Confirm that
+continuing an active ordinary Session steers and observes it; acknowledgement
+does not prove terminal success and does not grant Task lifecycle authority.
+
+Include multi-workspace model dispatch and post-compaction reopening:
+workspace metadata is now a required request-preparation dependency. A workspace
+catalog/reminder does not authorize changing execution root. Check interactive
+Question/Approval handling and keyboard input without answering real pending
+decisions as a test. Record which checks were actually executed and which
+remain source-only or fixture-based.
+
+Existing scalar connection configuration needs no migration. Connection sets
+use recent consumption for new allocation; retained connection identity remains
+significant. Optional nano naming is excluded from a mandatory upgrade:
+enabling it requires a provider/data/cost decision. Invalid nano configuration
+may block startup even when naming is disabled.
+
+### Recovery limits
+
+Migrations are forward-only. New workspace messages can be unreadable by 2.9
+even though the event-log header version is unchanged. Replacing only the
+binary is not a supported downgrade. Likewise, reverting only Kit helpers
+after the first v2 write leaves incompatible readers.
+
+An authorized restore must recover the consistent pre-upgrade metadata and
+Session artifacts with matching executables/configuration. First inventory and
+reconcile any post-upgrade external effects; restoring local state does not
+undo publication, Git or other external actions. Preserve post-upgrade evidence
+separately. Do not blindly replay an ambiguous effect or silently discard new
+execution history.
+
+## Historical approved baseline
 
 The approved baseline is **Kent 2.6.1**, released **August 13, 2026**. Kent
 2.6.0 was released **August 12, 2026**. Upgrade the CLI/TUI, background
