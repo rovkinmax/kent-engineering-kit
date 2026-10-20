@@ -5,6 +5,15 @@ thinking_level = "high"
 model_verbosity = "low"
 max_subagent_depth = 1
 
+# Supply nano.connection locally before merging this fragment.
+[nano]
+model = "gpt-6-luna"
+thinking_level = "low"
+model_verbosity = "low"
+
+[nano.features]
+session_naming = true
+
 [workflow]
 subagents = true
 concurrency = 4

@@ -85,6 +85,40 @@ Compatibility requirements belong to the selected project's profile and the
 [workflow contract](contracts/workflow-contract.md). Mobile and MCP integrations
 are optional, not prerequisites for every project.
 
+### Automatic session names
+
+The managed `config/subagents.toml` fragment configures Kent's nano model for
+session naming without changing the coding model. Before merging that fragment
+into `~/.kent/config.toml`, supply `nano.connection` using an existing connection
+from your own global configuration. The shared fragment intentionally omits
+this personal setting. The resulting global configuration should contain:
+
+```toml
+[nano]
+connection = "your-existing-connection"
+model = "gpt-6-luna"
+thinking_level = "low"
+model_verbosity = "low"
+
+[nano.features]
+session_naming = true
+```
+
+Roll out only after approving the configuration change: keep a private backup,
+merge these settings without replacing unrelated configuration, and restart Kent
+at a safe moment. Do not install a service just to restart a manually launched
+server. The installer does not rewrite your configuration.
+
+After restarting, verify that a new unnamed session gains a title after its first
+answer and associated tool work finish, and that a manually named session keeps
+its name. Naming makes additional model requests. Existing names are preserved;
+this is not a bulk rename of old sessions. See Kent's
+[nano reference](https://kent.sh/auxiliary-models/) for behavior and overrides.
+
+To roll back, restore only the prior `nano` settings from your backup, preserving
+unrelated changes, and restart again. If `nano` was previously absent, remove the
+added tables. Reverting the source PR alone does not change the installed config.
+
 ## Find your way around
 
 | Resource | What belongs there |
