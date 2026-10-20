@@ -2804,6 +2804,20 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                 self.assertIn(requirement, contract)
         self.assertIn("an ambiguous attempt is not retried", operations)
 
+    def test_session_naming_configuration(self) -> None:
+        config = tomllib.loads((REPO_ROOT / "config" / "subagents.toml").read_text())
+        self.assertEqual(
+            config["nano"],
+            {
+                "model": "gpt-6-luna",
+                "thinking_level": "low",
+                "model_verbosity": "low",
+                "features": {"session_naming": True},
+            },
+        )
+        self.assertNotIn("connection", config["nano"])
+        self.assertNotIn("nano", config["subagents"])
+
     def test_current_model_policy_matches_grill_configuration(self) -> None:
         config = tomllib.loads((REPO_ROOT / "config" / "subagents.toml").read_text())
         policy = (REPO_ROOT / "docs" / "MODEL-POLICY.md").read_text()
