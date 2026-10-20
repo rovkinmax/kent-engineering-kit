@@ -318,7 +318,6 @@ Sealed cleanup: [governed exception](sealed-recovery.md).
   discovery or planning.
 - `work_kind`: v1 continuation/verify guards restore it from the accepted
   snapshot; writers omit it there. Other declared carriers retain it.
-  Fix stays findings-driven.
 
 ## Fan-out constraints
 
