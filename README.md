@@ -47,8 +47,17 @@ kent --agent task-supervisor
 Prefer a guided conversation? Start with prompts for
 [mapping an uncertain project](prompts/wayfind.md),
 [comparing designs](prompts/design-alternatives.md),
-[diagnosing a problem](prompts/diagnose.md), or
-[reviewing a change](prompts/review-change.md).
+[diagnosing a problem](prompts/diagnose.md),
+[reviewing a change](prompts/review-change.md), or
+[migrating Tasks](prompts/migrate-tasks.md).
+
+Use `migrate-tasks` with predecessor Tasks as arguments to prepare a reviewed
+successor migration. It preserves decisions, source work, dependencies and
+resource ownership, checks continuation/recovery contracts, and ends
+migration-only observation at the agreed handoff. Creation, execution and
+cancellation need explicit effect approvals; transfer is not product acceptance.
+The existing installer discovers it alongside other prompts. A PR does not
+install it or change locked Sessions; installation is separately authorized.
 
 ### Give a project a delivery workflow
 

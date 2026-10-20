@@ -3885,6 +3885,35 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
 
         self.assertEqual(roles["verification_gate"], "default")
 
+    def test_current_recovery_uses_guard_owned_work_kind(self) -> None:
+        from workflowkit.delivery import (
+            work_kind_implement_instruction,
+            work_kind_recovery_instruction,
+        )
+
+        legacy = self.load_profile()
+        current = ProjectProfile.load(REPO_ROOT)
+        self.assertIn(
+            "Re-emit `work_kind` on\n`continue_implementation`",
+            work_kind_recovery_instruction(legacy),
+        )
+        for instruction in (
+            work_kind_implement_instruction(current),
+            work_kind_recovery_instruction(current),
+        ):
+            self.assertIn("accepted snapshot", instruction)
+            self.assertIn("Do not emit `work_kind`", instruction)
+        spec = build_delivery_workflow(current, 1)
+        edges = {edge.key: edge for edge in spec.edges}
+        for key in ("implement_continue", "implement_verify"):
+            self.assertNotIn(
+                "work_kind", {parameter.key for parameter in edges[key].parameters}
+            )
+        self.assertIn(
+            "work_kind",
+            {parameter.key for parameter in edges["implement_needs_user_action"].parameters},
+        )
+
     def test_delivery_continues_one_plan_step_until_verification(self) -> None:
         profile = self.load_profile()
         spec = build_delivery_workflow(profile, 1)
