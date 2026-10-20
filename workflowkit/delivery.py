@@ -3679,7 +3679,7 @@ separate delivery workflow."""
 
 
 def work_kind_implement_instruction(profile: ProjectProfile) -> str:
-    return f"""Selected work kind: `{{{{.Params.work_kind}}}}`.
+    instruction = f"""Selected work kind: `{{{{.Params.work_kind}}}}`.
 
 Use the matching Implement procedure from this profile catalog:
 
@@ -3690,9 +3690,26 @@ it does not, stop with `needs_user_action`; do not silently reclassify it. Load
 only the mapped Implement procedure. When that file combines planning and
 execution, skip its discovery, planning, audit-launch, and scope-confirmation
 stages: execute exactly one already-approved unchecked plan step."""
+    if profile.delivery_reliability_policy() == "v1":
+        instruction += "\n\n" + guard_owned_work_kind_instruction()
+    return instruction
+
+
+def guard_owned_work_kind_instruction() -> str:
+    return """Preserve the selected work kind without reclassifying it.
+Do not emit `work_kind` on `continue_implementation` or `verify`: their
+Plan Contract guard restores it from the accepted snapshot and carries it to
+the next writer. This supersedes any earlier recovery instruction requiring
+that undeclared output. Emit `work_kind` on `needs_user_action` and `replan`,
+where the transition declares it; preserve all other declared carriers."""
 
 
 def work_kind_recovery_instruction(profile: ProjectProfile) -> str:
+    if profile.delivery_reliability_policy() == "v1":
+        return """Preserve the selected `{{.Params.work_kind}}` routing key. Use its
+mapped Implement procedure from `.kent/workflow-profile.toml`.
+
+""" + guard_owned_work_kind_instruction()
     return """Preserve the selected `{{.Params.work_kind}}` routing key. Use its
 mapped Implement procedure from `.kent/workflow-profile.toml`; do not
 reclassify the task during recovery. Re-emit `work_kind` on

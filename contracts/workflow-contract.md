@@ -316,8 +316,9 @@ Sealed cleanup: [governed exception](sealed-recovery.md).
 - Plan uses only planning sections of a combined procedure. Implement uses the
   selected procedure for exactly one approved plan step and never repeats
   discovery or planning.
-- `work_kind` is required on Plan-to-Implement, Implement continuation, and
-  Implement recovery transitions. Fix remains findings-driven and generic.
+- `work_kind`: v1 continuation/verify guards restore it from the accepted
+  snapshot; writers omit it there. Other declared carriers retain it.
+  Fix stays findings-driven.
 
 ## Fan-out constraints
 
