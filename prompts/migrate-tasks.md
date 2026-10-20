@@ -21,9 +21,10 @@ For each predecessor record:
   do not recreate work completed elsewhere or infer native closure automatically.
 - Required outcome, exclusions, original human decision locators and unanswered
   decisions. Distinguish requirements from proposed implementation means.
-- Original baseline, current HEAD, index/worktree delta and untracked product
-  files; separate generated/cache/evidence files. A new branch does not carry
-  uncommitted work.
+- For Git-backed source transfers: original baseline, current HEAD,
+  index/worktree delta and untracked product files; separate generated/cache/
+  evidence files. A new branch does not carry uncommitted work. Otherwise,
+  record identities and versions of the applicable artifacts.
 - Accepted and working plans, completed work and concrete remaining acceptance.
 - Execution receipts and source/environment bindings, stale evidence and UNKNOWN
   effects. Historical success is not current-source admission.
@@ -37,6 +38,8 @@ For each predecessor record:
 Classify each original decision as applicable unchanged, requiring clarification,
 or unanswered; check branch/source/Task/environment/resource bindings. Historical
 approvals and accepted plans are not native successor acceptance.
+Mark genuinely inapplicable fields with a brief reason; unavailable or missing
+evidence remains unknown, not inapplicable.
 
 # Consolidate
 
@@ -62,13 +65,14 @@ Prepare a self-contained successor body with outcome, scope, progress,
 remaining work, original decisions, verification requirements and blockers.
 Write for a human reader: short Goal, Already done, Remaining work and
 Acceptance sections. Use concrete behavior and readable bullets; avoid UUID
-inventories and protocol dumps in the main narrative. Put exact source manifests,
-decision locators and transfer checks in a linked durable technical handoff,
-explicitly required before planning or mutation. Preserve material restrictions
+inventories and protocol dumps in the main narrative. Keep applicable manifests,
+decision locators and transfer checks in a durable technical section or, when
+their volume warrants it, a linked handoff. Require reading these details before
+planning or mutation. Preserve material restrictions
 in the readable body; links must not hide a contradictory authority boundary.
 Reference durable evidence; summaries never replace original consent.
-Identify exact commits/files to transfer and which historical work will not
-transfer. Distinguish deliberate loss from unknown recoverability.
+Identify exact artifacts to transfer (commits/files where applicable) and which
+historical work will not transfer. Distinguish deliberate loss from unknown recoverability.
 Use four dispositions: transfer, historical context, deliberately omit, unknown.
 Acceptable progress loss never includes silent loss of restrictions or effects.
 
@@ -80,7 +84,7 @@ No live Session does not prove resources are released. Do not rewrite owner IDs.
 
 # Preview and decision
 
-Present exact successor bodies, target pins, branch names, transfer boundaries,
+Present exact successor bodies, applicable target pins/branches, transfer boundaries,
 predecessor disposition, ownership handling, verification and rollback.
 Choose a compatible workflow before Task creation; do not assume Start can
 change a previously selected workflow. Leave unsupported successors prepared/
@@ -104,18 +108,27 @@ Task creation and launch are separate effects. Do not assume launch merely
 materializes an idle worktree: initial Plan may proceed automatically through
 acceptance to Implement. Authorize that scope or identify a supported pause
 for genuinely missing authority. Resolve the project's supported transfer route,
-task-fixed storage mode and single writer before mutation. Where the route
-uses Plan followed by Implement, Plan reads predecessor evidence without product
-edits and the accepted Implement writer owns transfer. Do not seed concurrently
+task-fixed storage mode and single writer before mutation. The project contract
+determines the authorized transfer stage and owner; the presence of Plan and
+Implement alone does not assign transfer to Implement. Do not seed concurrently
 with another writer, race Start with Interrupt or invent a prestart
 materialization helper. Preserve admitted infrastructure and initialize storage
 through the supported project-owned route and qualified adapter. Missing safe
 admission is a blocker, not permission to improvise a fallback.
 
+Before launching or continuing a successor into dependency-sensitive work,
+verify the required dependency links or equivalent supported blocking mechanism.
+If this cannot be established, keep that successor before the dependent stage;
+unrelated successors need not wait.
+
 Preserve predecessor roots/history. Create successors through supported tooling.
 Recheck relevant states and source preimages before effects. Maintain one
 predecessor-to-successor mapping; unknown create outcomes require lookup before
 retry. Revalidate changed bindings, not unrelated completed investigation.
+For any effect with an ambiguous outcome, establish its actual result before
+retrying or performing dependent actions. If reconciliation is unavailable,
+retain UNKNOWN and report the precise blocker; do not block independent work
+without a concrete dependency.
 Record real predecessor/successor IDs and original authority links.
 Verify transferred code and context before treating the successor as ready.
 Check that the admitted next route remains usable after the actual handoff;
@@ -131,7 +144,8 @@ because identity changed. Determine checks from actual bindings and next gates.
 # Completion
 
 Report per successor: prepared/not created, created, source transfer verified, instructions loaded,
-plan accepted, executable, or blocked. These are different states.
+plan accepted, executable, or blocked, marking inapplicable states explicitly.
+These are different states.
 Retain the exact rollback and predecessor cleanup obligations.
 Close each predecessor only when its required code/context transfer is verified,
 restrictions and dependency links are preserved, resource duties are settled
@@ -142,8 +156,10 @@ real dependency or an explicit human decision requires it. Never bypass
 node-owned resource settlement with terminal cancellation.
 
 At the agreed migration endpoint or a concrete blocker handoff, stop only
-migration-owned observers and verify they ended. Do not stop product Sessions
-or Tasks, and do not silently extend migration into ongoing product supervision.
+migration-owned observers and verify they ended. Observer cleanup does not
+authorize stopping product Sessions or Tasks; separately authorized predecessor
+cancellation follows the conditions above. Do not silently extend migration
+into ongoing product supervision.
 Report any retained resource or monitoring duties separately.
 Rollback stops further effects and preserves verified state; it does not
 implicitly authorize deleting Tasks, branches or history.
