@@ -165,28 +165,10 @@ you want to work on. Start an interactive specialist session with
 - **build-doctor** diagnoses build and test failures, with bounded fixes when authorized.
 - **task-supervisor** accompanies the Tasks and projects you select.
 
-See [role definitions](../agents/) for each role's limits and
-[the role contract](../contracts/role-contract.md) for shared responsibilities.
+See [role definitions](../agents/) and
+[effective configuration](../config/subagents.toml) for behavior and capabilities.
 Supervision runs within a live session; it does not provide an independent
 scheduler or observation after the session exits.
-
-### Cross-session critique and supervision
-
-Give grill the exact Session ID when asking it to critique ongoing work.
-Active feedback uses `kent run steer`; continuation has a stricter boundary.
-Grill may attempt one continuation of a verified idle, ordinary non-Workflow
-Session if either (a) the previous run completed normally, or (b) the previous
-run was manually stopped by the user, canceled, or interrupted and a new explicit
-human decision naming that exact Session was made after that outcome.
-Unknown outcomes or unverified fresh authority block continuation;
-an ambiguous attempt is not retried.
-
-The [grill prompt](../prompts/grill.md) and
-[Session communication contract](../contracts/role-contract.md#session-communication)
-own the complete rules. Task supervision has its own
-[role](../agents/task-supervisor.md) and
-[operating reference](../skills/kent-engineering-kit/references/task-supervision-operations.md).
-Do not use ordinary Session continuation to resume a Workflow-owned Session.
 
 ## Developing the Kit
 
@@ -196,7 +178,7 @@ The [self-development contract](../.kent/project-contract.md) and
 [project profile](../.kent/workflow-profile.toml) define the development process.
 Use a Kent-managed source worktree; preserve the installed primary checkout,
 its local `main`, symlinks, global configuration, and consumer pins.
-Follow the [Kit change process](../contracts/kit-change-governance.md) before edits.
+Follow [global governance](../global/AGENTS.md#authority-and-decisions) before edits.
 
 Before starting a Task from the default branch, explicitly refresh and inspect
 the source selection:
@@ -243,13 +225,8 @@ notes as current installation state.
 | Workflow lifecycle, profile policies, and execution targets | [Workflow contract](../contracts/workflow-contract.md) |
 | Changes to existing workflows | [Update compatibility](../contracts/workflow-update-compatibility.md) |
 | Accepted plans and revalidation | [Plan contract](../contracts/plan-contract.md) |
-| Runtime evidence and recovery | [Evidence recovery](../contracts/evidence-recovery.md), [sealed recovery](../contracts/sealed-recovery.md) |
+| Runtime evidence and recovery | [Evidence recovery](../contracts/evidence-recovery.md) |
 | PR checks and merge handling | [PR contract](../contracts/workflow-contract.md#pr) |
 | Worktree ownership and cleanup | [Worktree contract](../contracts/worktree-contract.md), [task-owned cleanup](../contracts/workflow-contract.md#task-owned-cleanup) |
 | Release source checks and publication | [Release contract](../contracts/workflow-contract.md#release-sourcepublication), [source bindings](../contracts/release-source-bindings.md) |
-| Retirement and portfolio operations | [Kit operational tooling](../skills/kent-engineering-kit/SKILL.md) |
-| Upgrade planning and recovery | [Upgrade runbook](KENT-UPGRADE-RUNBOOK.md) |
-| Model allocation and historical adoption records | [Model policy](MODEL-POLICY.md) |
-
-[The roadmap](ROADMAP.md) records planning and rollout history. It is not proof
-of the current installed or live state.
+| Model, tool and delegation settings | [Managed configuration](../config/subagents.toml) |

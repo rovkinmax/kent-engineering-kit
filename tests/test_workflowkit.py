@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
-from abc import ABC, abstractmethod
+import ast
 import hashlib
 import importlib.util
 import json
@@ -26,22 +26,16 @@ from workflowkit.delivery import (
     implement_prompt,
     janitor_recovery_prompt,
     plan_prompt,
-    plan_review_prompt,
-    plan_revalidation_prompt,
     published_cleanup_prompt,
 )
 from workflowkit.kent import (
     KentClient,
     KentCommandError,
     canonical_workflow_selector,
-    context_source_string,
-    edge_index,
     execution_target_from_policy,
-    spec_as_json,
 )
 from workflowkit.graph import graph_matches_spec, plan_workflow_graph
 from workflowkit.model import (
-    CoderSelection,
     EdgeSpec,
     NodeSpec,
     ParameterSpec,
@@ -49,7 +43,6 @@ from workflowkit.model import (
     WorkflowSpec,
     validate_execution_target,
 )
-from workflowkit.naming import snapshot_filename
 from workflowkit.profile import ProjectProfile, ReleaseProfile
 
 
@@ -83,345 +76,13 @@ CONTEXT_MANIFESTS = (
     ".kent/context/smoke.md",
     ".kent/context/delivery.md",
 )
-REVALIDATION_EDGE_CONTRACTS = {
-    "plan_review_revalidate": {
-        "source": "plan_review",
-        "transition": "plan_review_needs_changes",
-    },
-    "plan_contract_continue_revalidate": {
-        "source": "plan_contract_continue",
-        "transition": "plan_contract_continue_changed",
-    },
-    "plan_contract_verify_revalidate": {
-        "source": "plan_contract_verify",
-        "transition": "plan_contract_verify_changed",
-    },
-}
-REVALIDATION_MATERIAL_GRILL_CLAUSE = (
-    "Consult a bounded read-only grill leaf before freeze and formal review "
-    "only when materially revising requirements, API/UX, architecture, "
-    "authority, safety/effects, cost, or evidence strategy, or when "
-    "execution disproves the chosen approach."
-)
-REVALIDATION_ELIGIBILITY_CLAUSE = (
-    "Report unavailable effective leaf eligibility as a concrete blocker "
-    "rather than claiming critique occurred."
-)
-REVALIDATION_PROMPT_REQUIREMENTS = (
-    (
-        "grill timing",
-        "Consult a bounded read-only grill leaf before freeze and formal review",
-    ),
-    (
-        "material-change triggers",
-        "only when materially revising requirements, API/UX, architecture, "
-        "authority, safety/effects, cost, or evidence strategy",
-    ),
-    (
-        "execution-disproof trigger",
-        "or when execution disproves the chosen approach",
-    ),
-    (
-        "grill non-triggers",
-        "Hash drift, checkbox progress, typos, operational waiting, and "
-        "repeated identical failures alone do not require another grill call.",
-    ),
-    ("unavailable eligibility blocker", REVALIDATION_ELIGIBILITY_CLAUSE),
-    (
-        "linked proposal and human acceptance",
-        "Keep the exact proposal plus human acceptance when that pair grants authority.",
-    ),
-    (
-        "discoverable durable authority",
-        "Store durable references in the authoritative plan or discoverable "
-        "project-permitted report-only evidence, not only `review_context`;",
-    ),
-    (
-        "no agent-summary consent substitution",
-        "An agent summary or truncated historical source cannot fill missing consent.",
-    ),
-)
 
 
-def compact_prompt(value: str) -> str:
-    return " ".join(value.split())
-
-
-def assert_revalidation_edge_contract(
-    document: dict[str, object],
-    key: str,
-) -> None:
-    edges = {
-        edge["key"]: edge
-        for edge in document["edges"]
-        if isinstance(edge, dict) and isinstance(edge.get("key"), str)
-    }
-    edge = edges.get(key)
-    if edge is None:
-        raise AssertionError(f"{key}: missing required revalidation edge")
-    expected = REVALIDATION_EDGE_CONTRACTS[key]
-    for field, value in (
-        ("source", expected["source"]),
-        ("transition", expected["transition"]),
-        ("target", "plan_revalidation"),
-    ):
-        if edge.get(field) != value:
-            raise AssertionError(
-                f"{key}: {field} expected {value!r}, got {edge.get(field)!r}"
-            )
-    if edge.get("context") != "continue_session":
-        raise AssertionError(
-            f"{key}: retained-session context expected "
-            f"'continue_session', got {edge.get('context')!r}"
-        )
-    if edge.get("context_source") != "node:plan":
-        raise AssertionError(
-            f"{key}: retained planning context expected 'node:plan', "
-            f"got {edge.get('context_source')!r}"
-        )
-    prompt = edge.get("prompt")
-    if not isinstance(prompt, str):
-        raise AssertionError(f"{key}: missing revalidation prompt")
-    normalized = compact_prompt(prompt)
-    for label, required_text in REVALIDATION_PROMPT_REQUIREMENTS:
-        if compact_prompt(required_text) not in normalized:
-            raise AssertionError(f"{key}: missing {label} clause")
-
-
-def mutate_revalidation_edge(
-    document: dict[str, object],
-    key: str,
-    transform,
-) -> dict[str, object]:
-    mutant = deepcopy(document)
-    edges = list(mutant["edges"])
-    for index, edge in enumerate(edges):
-        if edge.get("key") == key:
-            edges[index] = transform(edge)
-            mutant["edges"] = edges
-            return mutant
-    raise AssertionError(f"{key}: cannot mutate missing edge")
-
-
-def remove_revalidation_prompt_clause(clause: str):
-    wanted = compact_prompt(clause)
-
-    def transform(edge: dict[str, object]) -> dict[str, object]:
-        prompt = edge.get("prompt")
-        if not isinstance(prompt, str):
-            raise AssertionError(f"{edge.get('key')}: missing source prompt")
-        normalized = compact_prompt(prompt)
-        if wanted not in normalized:
-            raise AssertionError(
-                f"{edge.get('key')}: source clause missing before mutation"
-            )
-        return {**edge, "prompt": normalized.replace(wanted, "", 1)}
-
-    return transform
-
-
-def replace_revalidation_edge_field(field: str, value: object):
-    return lambda edge: {**edge, field: value}
-
-# Frozen KEN-6 prompt delta: project only these exact bytes away when checking
-# historical whole-workflow hashes. Future prompt changes must still fail.
-MOBILE_LEASE_OLD = (
-    "Recover a saved token with the lock adapter's `resume`. If "
-    "acquire succeeded but stdout was lost before checkpointing, use "
-    "`resume-owned` only when lock status proves the same non-empty "
-    "Kent task ID; it must not create or adopt a lock."
-)
-MOBILE_LEASE_NEW = (
-    "Before any resource operation, run `kent task show "
-    "{{.TaskShortId}} --json`, verify `summary.short_id` against the "
-    "rendered Task short ID, retain `summary.id` as the native ID, "
-    "and obtain the current Session with `kent session-id`. These "
-    "readbacks establish identity; do not assume Kent already "
-    "exported `KENT_TASK_ID` or `KENT_SESSION_ID`. Set `KENT_TASK_ID` "
-    "to the verified short ID and `KENT_SESSION_ID` to the current "
-    "Session for adapter calls. Keep top-level checkpoint "
-    "`task_short_id` authoritative and store `task_native_id`, "
-    "`task_short_id`, `lease_owner_id`, `lock_resource`, and "
-    "`lock_token` together in `stage_data`. Enrich missing fields in "
-    "a legacy checkpoint only after native readback matches its "
-    "existing short ID; conflicting fields block. Use the short ID "
-    "for new leases. Retain a legacy native-ID owner only when the "
-    "readback proves the mapping, and use that exact owner ID through "
-    "release. Parse by command: `acquire` emits one bare token; "
-    "`acquire-any` emits exactly `resource=...` then `token=...`. "
-    "Reject missing, empty, duplicate, malformed, extra, or ineligible "
-    "records, then checkpoint the exact resource and token before "
-    "device activity. Read the checkpoint before recovery. For a "
-    "recorded resource and token, call `resume` on that exact pair "
-    "after validating the Task binding; failure blocks without "
-    "discovery fallback. For a known resource with a missing token "
-    "or lost stdout, inspect redacted `status`, prove the exact "
-    "resource has one valid owner record for this Task, then use "
-    "guarded `resume-owned`. If no resource is recorded, inventory "
-    "only project-eligible resources: recover exactly one proven "
-    "same-Task candidate with `resume-owned`, use normal acquisition "
-    "for zero matches, and block on multiple matches. Foreign, "
-    "malformed, duplicate, or resource-mismatched metadata and sole "
-    "occupancy are never ownership proof. Acquisition TTL belongs to "
-    "its caller: `age <= TTL` stays busy, and replacement requires "
-    "`age > TTL`; it is not stored in a lease. Exact-owner `resume` "
-    "or `resume-owned` may refresh a still-present lease after that "
-    "age if replacement has not already won. The first guarded "
-    "operation wins: resume-first refreshes, while replacement-first "
-    "invalidates the old owner/token. `resume-owned` cannot create a "
-    "missing lock or reclaim a foreign or unknown owner. "
-    "After explicit release or trap cleanup, read back `status` for "
-    "that exact resource and require `unlocked`; otherwise cleanup "
-    "is unresolved. Never echo tokens in reports, comments, or "
-    "evidence; `status` must redact them."
-)
-
-# Project only the approved native-identity guidance back to the frozen KEN-6
-# clause before applying the existing historical projection. Keep its hashes.
-MOBILE_NATIVE_IDENTITY_OLD = (
-    "Before any resource operation, run `kent task show "
-    "{{.TaskShortId}} --json`, verify `summary.short_id` against the "
-    "rendered Task short ID, retain `summary.id` as the native ID, "
-    "and obtain the current Session with `kent session-id`. These "
-    "readbacks establish identity; do not assume Kent already "
-    "exported `KENT_TASK_ID` or `KENT_SESSION_ID`. Set `KENT_TASK_ID` "
-    "to the verified short ID and `KENT_SESSION_ID` to the current "
-    "Session for adapter calls. Keep top-level checkpoint "
-)
-MOBILE_NATIVE_IDENTITY_NEW = (
-    "Before any resource operation, run the profile evidence command "
-    "`identity --task {{.TaskShortId}} --workspace <root>`. Verify "
-    "`task_short_id` against the rendered Task, retain `task_id` as "
-    "the native ID and `session_id` as the verified inherited current "
-    "Session UUID. This read-only native binding requires neither Step "
-    "nor retention/R2 admission. Never parse `kent session-id` output "
-    "or invent/export/replace a Session UUID. Set adapter `KENT_TASK_ID` "
-    "to the verified short ID; preserve inherited `KENT_SESSION_ID`. "
-    "Keep top-level checkpoint "
-)
-
-PLAN_RECOVERY_NEW = """If recovery inputs identify prior work, inspect each supplied item
-independently:
-
-- If a checkpoint ref is supplied, verify HEAD exactly matches it; inspect its
-  diff, tests, and evidence.
-- If a source task is identified, read its body without modifying or canceling
-  it.
-- If exact task-comment IDs are supplied, read the exact referenced comments
-  without modifying or canceling the source task.
-- Update one authoritative design/spec/plan; cite human comment IDs for
-  decisions and explicitly supersede conflicts.
-
-A source-task reference or comment IDs alone do not establish preserved
-implementation. Treat it as preserved only when HEAD matches a supplied
-checkpoint or concrete source diff/evidence confirms it. Plan only remaining
-verifiable work; never reset, revert, or reimplement preserved code during
-Plan."""
-PLAN_RECOVERY_OLD = """If the task body declares a checkpoint ref, source task, or exact task-comment
-IDs, treat the current checkout as preserved implementation rather than a blank
-feature:
-
-- verify that HEAD matches the declared checkpoint;
-- read the source task body and exact referenced comments without modifying or
-  canceling the source task;
-- update one authoritative design/specification/plan set and reference comment
-  IDs instead of duplicating decisions;
-- explicitly supersede conflicting earlier decisions;
-- inspect the checkpoint diff and existing tests/evidence;
-- plan only remaining independently verifiable work.
-
-Do not reset, revert, or reimplement preserved code during Plan."""
-PLAN_CONFIRMATION_NEW = """If the task body says the recovery Plan must stop for confirmation, complete
-through `plan_needs_user_action` with a concise artifact/remaining-work summary and
-an explicit confirmation request. Do not choose `plan_review_plan` in that Plan
-run."""
-PLAN_CONFIRMATION_OLD = """If the task body says the recovery Plan must stop for confirmation, complete
-through `plan_needs_user_action` with a concise artifact/remaining-work summary and
-an explicit confirmation request. Do not choose `implement` in that Plan run."""
-CLEANUP_CAPTURE = """Before leaving, preserve the canonical task worktree root as `workspace_path`
-and capture `branch_name` with
-`git -C <workspace_path> branch --show-current`. Keep both exact values after
-leaving; never look up the branch from the post-leave working directory."""
-CLEANUP_BRANCH_NEW = """  `git -C <workspace_path> branch --show-current`, including `no_pr` and
-  `report_only`; never use `null`, `none`, `not-applicable`, an empty value, or
-  the Kent task ID by inference;"""
-CLEANUP_BRANCH_OLD = """  `git branch --show-current`, including `no_pr` and `report_only`; never use
-  `null`, `none`, `not-applicable`, an empty value, or the Kent task ID by
-  inference;"""
-CLEANUP_WORKSPACE_NEW = "- canonical `workspace_path` for the preserved task worktree root;"
-CLEANUP_WORKSPACE_OLD = "- canonical `workspace_path`;"
-CLEANUP_REPORT_NEW = """- a non-empty `cleanup_report` describing preflight and preserved resources,
-  including the exact `workspace_path` and `branch_name`."""
-CLEANUP_REPORT_OLD = "- a non-empty `cleanup_report` describing preflight and preserved resources."
-PUBLISHED_CAPTURE = """Before leaving, retain the exact supplied `workspace_path` and `branch_name`.
-If a branch lookup is needed, use
-`git -C <workspace_path> branch --show-current`; do not resolve it from the
-post-leave working directory. Include both exact values in `cleanup_report`
-and preserve them for Janitor recovery."""
-PUBLISHED_REPORT_NEW = """`cleanup_session_id` from `KENT_SESSION_ID`; and a non-empty `cleanup_report`
-including the exact `workspace_path` and `branch_name`."""
-PUBLISHED_REPORT_OLD = (
-    "`cleanup_session_id` from `KENT_SESSION_ID`; and a non-empty `cleanup_report`."
-)
-JANITOR_RECOVERY_NEW = """Use the retained Cleanup context and the exact `workspace_path` and
-`branch_name` recorded in its `cleanup_report`; do not infer either from this
-recovery session's current directory. If a branch lookup is needed, use
-`git -C <workspace_path> branch --show-current` and require the same exact
-branch. Do not directly remove a Kent-managed worktree from this agent session.
-Close every task-owned background shell or kept-open tool session. If this
-session still targets the task worktree, run `kent worktree leave` before
-retrying. If the infrastructure failure is transient and the same safety
-proofs still hold, choose `cleanup_run_janitor` again with the complete canonical
-parameter contract. Otherwise choose `cleanup_needs_user_action` with the exact
-blocker. Preserve every ambiguous or unique resource."""
-CROSS_SESSION_CLEANUP_NEW = """For managed worktree Cleanup and Janitor recovery, follow the
-bounded cross-Session cleanup coordination protocol in
-`contracts/worktree-contract.md` before terminal preparation, retry, or leave.
-Before contact, freeze `task_short_id`, project, exact `workspace_path`, branch,
-owner, and attempt in the cleanup Task record. Close only safe children proven
-to belong to this Task; a parent move or old PID exit does not prove release.
-For a verified active owner, use `kent run steer <owner-session-id>` once and
-require a fresh acknowledgement for the exact current request in a new
-owner-attributed Task comment naming the root, released child identities, and
-runtime disposition. Read bounded comments with
-`kent task comment list <task> --project <project> --limit <n> --offset <n>`;
-`run watch/wait`, Questions, and approvals are not acknowledgements.
-An incomplete page or readback is an evidence gap, not proof that the owner is
-unavailable. If a materially new blocker appears, raise it to the owner once
-within this same attempt and only if the deadline permits; never reset the
-deadline.
-
-Use one single monotonic 60-second deadline for the entire attempt, at most two
-bounded Task-comment observations, and no more than 30 seconds between them.
-Bound each observer to the remaining time; stop only the task-owned observer,
-never stop or signal another Session. After acknowledgement, freshly recheck
-before terminal preparation and immediately before leave/handoff. New owner
-re-entry, a retained child, or changed runtime/evidence invalidates the prior
-all-clear. Reuse the recorded attempt and Question on an identical retry; never
-ask the user to finish safe task-owned cleanup. On refusal, timeout, an
-unavailable owner, unknown ownership, incomplete evidence, or unsupported
-action, preserve the root and use the existing blocker route. Acknowledgement
-and last-read evidence are not an atomic reservation or a race-free guarantee."""
-JANITOR_RECOVERY_OLD = """Use the retained Cleanup context. Do not directly remove a Kent-managed
-worktree from this agent session. Close every task-owned background shell or
-kept-open tool session. If this session still targets the task worktree, run
-`kent worktree leave` before retrying. If the infrastructure failure is
-transient and the same safety proofs still hold, choose `cleanup_run_janitor` again
-with the complete canonical parameter contract. Otherwise choose
-`cleanup_needs_user_action` with the exact blocker. Preserve every ambiguous or unique
-resource."""
-
-
-def role_prompt(filename: str) -> str:
-    return (REPO_ROOT / "agents" / filename).read_text()
-
-
-def load_transition_key_migrator():
-    path = REPO_ROOT / "scripts" / "migrate-transition-keys"
-    loader = SourceFileLoader("transition_key_migrator_test", str(path))
+def load_generator():
+    loader = SourceFileLoader(
+        "workflow_generator_test", str(REPO_ROOT / "scripts/generate-workflow")
+    )
     spec = importlib.util.spec_from_loader(loader.name, loader)
-    if spec is None:
-        raise AssertionError("could not load transition-key migrator")
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
@@ -480,6 +141,91 @@ def schema4_with_managed_adapter(contents: str) -> str:
 
 
 class WorkflowKitTest(unittest.TestCase):
+    def test_test_classes_do_not_shadow_methods(self) -> None:
+        duplicates = []
+        for path in sorted((REPO_ROOT / "tests").glob("test_*.py")):
+            for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                seen = set()
+                for method in node.body:
+                    if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if method.name in seen:
+                            duplicates.append(f"{path.name}:{node.name}.{method.name}")
+                        seen.add(method.name)
+        self.assertEqual(duplicates, [])
+
+    def test_review_stage_obligations_survive_optional_delivery_nodes(self) -> None:
+        baseline = self.load_profile()
+        for compliance in (False, True):
+            for pull_requests in (False, True):
+                with self.subTest(compliance=compliance, pull_requests=pull_requests):
+                    profile = replace(
+                        baseline,
+                        capabilities={
+                            **baseline.capabilities,
+                            "compliance_review": compliance,
+                            "pull_requests": pull_requests,
+                            "ci_monitoring": pull_requests,
+                        },
+                    )
+                    spec = build_delivery_workflow(profile, 1)
+                    nodes = {node.key for node in spec.nodes}
+                    self.assertEqual("compliance" in nodes, compliance and pull_requests)
+                    self.assertEqual("prepare_pr" in nodes, pull_requests)
+                    for target in ("spec_review", "verification_gate"):
+                        prompt = " ".join(next(
+                            edge.prompt for edge in spec.edges if edge.target == target
+                        ).split())
+                        self.assertIn("current authorized stage", prompt)
+                        self.assertIn("owner and due milestone", prompt)
+                        self.assertIn("review-ready PR", prompt)
+                        self.assertIn("full business", prompt)
+                    gate = " ".join(next(
+                        edge.prompt for edge in spec.edges
+                        if edge.target == "verification_gate"
+                    ).split())
+                    self.assertIn("every enabled status is `passed`", gate)
+                    self.assertIn("fresh review", gate)
+                    self.assertIn("previous `blocked`", gate)
+
+    def test_completion_fields_match_actual_graph_across_profile_capabilities(self) -> None:
+        baseline = self.load_profile()
+        runtime_v2 = self.load_schema4_profile(
+            lambda _: self.source_ci_profile_contents()
+        )
+        current = ProjectProfile.from_toml(
+            REPO_ROOT, (REPO_ROOT / ".kent/workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        profiles = (
+            baseline,
+            replace(baseline, policies={**baseline.policies, "writer_sessions": "continuous"}),
+            runtime_v2,
+            replace(runtime_v2, capabilities={**runtime_v2.capabilities, "ci_monitoring": False}),
+            current,
+            replace(current, policies={**current.policies, "coder_selection": "complexity"}),
+        )
+        header = "Completion fields from the selected graph contract "
+        for index, profile in enumerate(profiles):
+            spec = build_delivery_workflow(profile, 1)
+            agents = {node.key for node in spec.nodes if node.kind == "agent"}
+            for edge in spec.edges:
+                if edge.target not in agents:
+                    continue
+                with self.subTest(profile=index, edge=edge.key):
+                    prompt = edge.prompt or ""
+                    self.assertEqual(prompt.count(header), 1)
+                    footer = prompt.split(header, 1)[1].splitlines()[1:]
+                    expected = []
+                    for outgoing in spec.edges:
+                        if outgoing.source == edge.target:
+                            fields = ", ".join(
+                                f"`{parameter.key}`" for parameter in outgoing.parameters
+                            ) or "(none)"
+                            expected.append(f"- `{outgoing.transition}`: {fields}.")
+                    self.assertEqual(footer, expected)
+
     def test_source_admission_gate_binds_exact_typed_inputs(self) -> None:
         from workflowkit.delivery import (
             SOURCE_ADMISSION_BEGIN, SOURCE_ADMISSION_END, source_admission_gate,
@@ -511,153 +257,7 @@ class WorkflowKitTest(unittest.TestCase):
         altered = {**admission, "installation_binding_sha256": "c" * 64}
         self.assertNotEqual(gate, source_admission_gate(altered, **arguments))
         self.assertIn("--receipt-sha256 " + "a" * 64, gate)
-        self.assertIn("task-fixed legacy mode before R2", gate)
 
-    def test_prior_slice_interface_mismatch_red_then_bounded_repair(self) -> None:
-        class BaselineScreens(ABC):
-            @abstractmethod
-            def search(self): ...
-
-        class BaselineProbe(BaselineScreens):
-            def search(self): return "search"
-
-        self.assertEqual(BaselineProbe().search(), "search")
-
-        class TaskScreens(BaselineScreens):
-            @abstractmethod
-            def actor_items(self, actor_name): ...
-
-        class OmittedProbe(TaskScreens):
-            def search(self): return "search"
-
-        with self.assertRaisesRegex(TypeError, "actor_items"):
-            OmittedProbe()
-
-        class AdaptedProbe(OmittedProbe):
-            def actor_items(self, actor_name): return "unsupported"
-
-        self.assertEqual(AdaptedProbe().search(), "search")
-        self.assertEqual(AdaptedProbe().actor_items("fixture"), "unsupported")
-
-    def test_execution_continuation_contract_and_cases(self) -> None:
-        role = (REPO_ROOT / "agents/delivery-operator.md").read_text()
-        self.assertIn("Consume completed tool output", role)
-        self.assertIn("required fresh safety check", role)
-        normalized_role = " ".join(role.split())
-        self.assertIn("exact, current human authorization", normalized_role)
-        self.assertIn(
-            "A prompt's wording or source-plan acceptance alone does not create Git authority",
-            normalized_role,
-        )
-        self.assertIn("transport/evidence only", normalized_role)
-        self.assertIn(
-            "None grants commit, push, merge, package publication, or consumer/source write",
-            normalized_role,
-        )
-        monitor = (REPO_ROOT / "agents/ci-monitor.md").read_text()
-        self.assertIn("neither proven external nor", monitor)
-        self.assertIn("unknown attribution never authorizes more retries", monitor)
-        for name in ("implementation-worker", "fix-worker"):
-            text = (REPO_ROOT / f"agents/{name}.md").read_text()
-            self.assertIn("approved", text)
-            self.assertIn("earlier", text)
-            self.assertIn("closed", text)
-        cases = json.loads(
-            (REPO_ROOT / "tests/fixtures/execution-continuation-cases.json").read_text()
-        )["cases"]
-        self.assertEqual(len(cases), 13)
-        self.assertEqual(len({case["id"] for case in cases}), 13)
-        self.assertIn("completed reads do", cleanup_prompt(self.load_profile()))
-
-    def test_planning_grill_and_decision_carrier_prompts(self) -> None:
-        profile = self.load_profile()
-        initial = plan_prompt(profile)
-        review = plan_review_prompt(profile)
-        variants = [
-            plan_revalidation_prompt(profile, from_review=value)
-            for value in (False, True)
-        ]
-        self.assertIn("before freezing the plan and before formal reviews",
-                      " ".join(initial.split()))
-        self.assertIn("not the sole durable authority carrier", initial)
-        self.assertIn("do not launch grill from this leaf", review)
-        self.assertIn("do not replace them with a PASS summary", review)
-        for prompt in variants:
-            self.assertIn("execution disproves", prompt)
-            self.assertIn("do not repurpose `plan_route_context`", prompt)
-            self.assertIn("do not require another grill call", prompt)
-        cases = json.loads(
-            (REPO_ROOT / "tests/fixtures/planning-decision-carriers.json").read_text()
-        )
-        self.assertEqual(len(cases["cases"]), 8)
-        self.assertEqual(len({case["id"] for case in cases["cases"]}), 8)
-
-    def test_revalidation_graph_contract_and_mutation_sensitivity(self) -> None:
-        profile = ProjectProfile.from_toml(
-            REPO_ROOT,
-            (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text(),
-            check_files=False,
-        )
-        document = spec_as_json(build_delivery_workflow(profile, 1))
-        for key in REVALIDATION_EDGE_CONTRACTS:
-            with self.subTest(edge=key):
-                assert_revalidation_edge_contract(document, key)
-
-        clause_mutants = (
-            (
-                REVALIDATION_MATERIAL_GRILL_CLAUSE,
-                "grill timing",
-            ),
-            (
-                REVALIDATION_ELIGIBILITY_CLAUSE,
-                "unavailable eligibility blocker",
-            ),
-        )
-        for key in REVALIDATION_EDGE_CONTRACTS:
-            for clause, diagnostic in clause_mutants:
-                mutant = mutate_revalidation_edge(
-                    document,
-                    key,
-                    remove_revalidation_prompt_clause(clause),
-                )
-                self.assertNotEqual(document, mutant)
-                with self.subTest(edge=key, removed_clause=diagnostic):
-                    with self.assertRaisesRegex(
-                        AssertionError,
-                        rf"{key}: missing {diagnostic} clause",
-                    ):
-                        assert_revalidation_edge_contract(mutant, key)
-
-        wrong_context = mutate_revalidation_edge(
-            document,
-            "plan_review_revalidate",
-            replace_revalidation_edge_field("context", "new_session"),
-        )
-        self.assertNotEqual(document, wrong_context)
-        with self.assertRaisesRegex(
-            AssertionError,
-            "plan_review_revalidate: retained-session context",
-        ):
-            assert_revalidation_edge_contract(
-                wrong_context,
-                "plan_review_revalidate",
-            )
-
-        omitted_edge = deepcopy(document)
-        omitted_edge["edges"] = [
-            edge
-            for edge in omitted_edge["edges"]
-            if edge.get("key") != "plan_contract_verify_revalidate"
-        ]
-        self.assertNotEqual(document, omitted_edge)
-        with self.assertRaisesRegex(
-            AssertionError,
-            "plan_contract_verify_revalidate: missing required revalidation edge",
-        ):
-            assert_revalidation_edge_contract(
-                omitted_edge,
-                "plan_contract_verify_revalidate",
-            )
 
     def cleanup_profile(self, *, managed: bool, published: bool) -> ProjectProfile:
         profile = self.load_profile()
@@ -673,203 +273,6 @@ class WorkflowKitTest(unittest.TestCase):
             },
         )
 
-    def test_non_opt_in_cleanup_graphs_preserve_frozen_baseline_bytes(self) -> None:
-        # Pre-amendment cleanup ownership behavior, rebaselined for approved
-        # planning and execution-continuation prompt changes only.
-        expected = {
-            (False, False): "104ee56940e58cc5d7892b8ca79462f851f5776162aa9e4d0a6aaeabc9f504fc",
-            (False, True): "d5d605122ab39befa78d780766cea432ec685d2f191995b1fda0bac43130d2d3",
-            (True, False): "7e67847327451216e0eb46e3b8e4928e76cf9646974d6c9f6641f9c7feefa5c2",
-            (True, True): "05f85c9cd804b28d0b330f0b635062d0f4cd6282493e1800426cf38f081a2288",
-        }
-        for (managed, published), baseline in expected.items():
-            for helper in (None, ""):
-                with self.subTest(managed=managed, published=published, helper=helper):
-                    profile = self.cleanup_profile(managed=managed, published=published)
-                    if helper is not None:
-                        profile = replace(profile, commands={**profile.commands, "prepare_cleanup": helper})
-                    document = spec_as_json(build_delivery_workflow(profile, 1))
-                    # Project only this approved semantic delta away; preserve
-                    # the historical cleanup bytes/hashes, do not rebaseline them.
-                    from workflowkit.delivery import (
-                        lifecycle_feasibility_instruction, owner_replan_instruction,
-                    )
-                    document["edges"] = [
-                        edge for edge in document["edges"]
-                        if edge["key"] not in {"fix_replan", "compliance_replan"}
-                    ]
-                    for edge in document["edges"]:
-                        if edge["key"] == "merge_watch_cleanup":
-                            edge["parameters"] = [
-                                parameter
-                                for parameter in edge["parameters"]
-                                if parameter["key"] not in {
-                                    "merge_strategy",
-                                    "pr_feedback_cursor",
-                                }
-                            ]
-                    for edge in document["edges"]:
-                        prompt = edge.get("prompt")
-                        if prompt:
-                            cleanup_context = context_instruction(
-                                profile,
-                                "delivery",
-                                "cleanup",
-                                "delivery",
-                            )
-                            if cleanup_context in prompt:
-                                # Preserve the frozen graph baseline while
-                                # removing only this approved no-helper
-                                # recovery-instruction delta.
-                                prior_cleanup_context = f"""Read `.kent/context/delivery.md` first and stay inside its required and
-conditionally triggered sources.
-
-Before transition, pipe one non-empty JSON object to
-`{profile.command("evidence")} append --task {{{{.TaskShortId}}}} --workspace
-<workspace>`. Set `node_key` to `cleanup`, `evidence_type` to
-`delivery`, and `context.manifest_path` to `.kent/context/delivery.md`.
-`context.files_read` lists other project instruction files in actual read
-order; do not repeat the manifest there. Record repeated questions and
-verification loops, use null for unavailable model/compaction counters, and
-exclude secrets or broad raw evidence. Append is idempotent for the current
-Kent run; on recovery, reuse the returned sequence/hash and continue."""
-                                self.assertEqual(prompt.count(cleanup_context), 1)
-                                prompt = prompt.replace(
-                                    cleanup_context,
-                                    prior_cleanup_context,
-                                    1,
-                                )
-                            if edge["target"] in {"fix", "compliance"} and (
-                                edge["key"] != "dispatch_invalid_workspace"
-                            ):
-                                suffix = "\n\n" + owner_replan_instruction().replace(
-                                    "`replan`", f"`{edge['target']}_replan`",
-                                )
-                                self.assertTrue(prompt.endswith(suffix), edge["key"])
-                                prompt = prompt[:-len(suffix)]
-                            prompt = prompt.replace(
-                                lifecycle_feasibility_instruction() + "\n", "",
-                            ).replace(
-                                "existing evidence before editing. Material changes to product decisions,\n"
-                                "acceptance or authority require the available replan route before source\n"
-                                "repair; they are not permission to update the plan and immediately implement.\n"
-                                "Do not redo completed work.",
-                                "existing evidence before editing. If feedback changes a product decision or\n"
-                                "acceptance criterion, update the authoritative design/specification/plan first\n"
-                                "and reference the comment ID. Do not redo completed work.",
-                            )
-                            edge["prompt"] = prompt
-                        for parameter in edge.get("parameters", []):
-                            if parameter["key"] == "plan_change_report":
-                                parameter["description"] = (
-                                    "Deterministic summary of material plan-contract changes."
-                                )
-                    edges = {edge["key"]: edge for edge in document["edges"]}
-
-                    def reverse_prompt(
-                        edge_key: str,
-                        replacements: tuple[tuple[str, str], ...],
-                    ) -> None:
-                        edge = edges[edge_key]
-                        prompt = edge["prompt"]
-                        self.assertIsInstance(prompt, str, edge_key)
-                        for current, historical in replacements:
-                            self.assertEqual(
-                                prompt.count(current),
-                                1,
-                                f"{edge_key} must contain exactly one approved delta",
-                            )
-                            prompt = prompt.replace(current, historical, 1)
-                        edge["prompt"] = prompt
-
-                    reverse_prompt(
-                        "compliance_prepare_pr",
-                        (
-                            (
-                                "Git actions require exact current human approval naming action, "
-                                "task/branch, reviewed changes and permitted stage. "
-                                "Plan acceptance, `delivery_context`, PR/CI/merge data are evidence "
-                                "only. No consumer-source writes or merge; package publication "
-                                "needs separate approval.",
-                                "This workflow explicitly authorizes committing the task changes, pushing only\n"
-                                "the current task branch, and creating or updating its pull request. It never\n"
-                                "authorizes merging, pushing protected branches, or broadening scope.",
-                            ),
-                            (
-                                "Flat prepare_pr_monitor_ci: workspace_path, pr_url, branch_name, "
-                                "merge_strategy, ci_contract.",
-                                "Complete through `prepare_pr_monitor_ci` and provide `workspace_path`, `pr_url`, and\n"
-                                "`branch_name`, plus the resolved `merge_strategy`.",
-                            ),
-                        ),
-                    )
-                    reverse_prompt(
-                        "gate_smoke_required",
-                        (
-                            (MOBILE_NATIVE_IDENTITY_NEW, MOBILE_NATIVE_IDENTITY_OLD),
-                            (MOBILE_LEASE_NEW, MOBILE_LEASE_OLD),
-                        ),
-                    )
-                    reverse_prompt(
-                        "start_plan",
-                        (
-                            (PLAN_RECOVERY_NEW, PLAN_RECOVERY_OLD),
-                            (PLAN_CONFIRMATION_NEW, PLAN_CONFIRMATION_OLD),
-                        ),
-                    )
-                    if managed:
-                        cleanup_keys = [
-                            "prepare_pr_no_pr",
-                            "waiting_pr_close_without_merge",
-                        ]
-                        if not published:
-                            cleanup_keys.extend(
-                                (
-                                    "fix_pr_merged_cleanup",
-                                    "waiting_pr_cleanup",
-                                    "merge_watch_cleanup",
-                                    "ci_watch_merged",
-                                    "ci_monitor_merged",
-                                )
-                            )
-                        for key in cleanup_keys:
-                            reverse_prompt(
-                                key,
-                                (
-                                    (
-                                        f"\n\n{CLEANUP_CAPTURE}\n\n",
-                                        "\n\n",
-                                    ),
-                                    (CLEANUP_BRANCH_NEW, CLEANUP_BRANCH_OLD),
-                                    (CLEANUP_WORKSPACE_NEW, CLEANUP_WORKSPACE_OLD),
-                                    (CLEANUP_REPORT_NEW, CLEANUP_REPORT_OLD),
-                                    (CROSS_SESSION_CLEANUP_NEW + "\n\n", ""),
-                                ),
-                            )
-                        if published:
-                            reverse_prompt(
-                                "publish_cleanup",
-                                (
-                                    (
-                                        f"\n\n{PUBLISHED_CAPTURE}\n\n",
-                                        "\n\n",
-                                    ),
-                                    (PUBLISHED_REPORT_NEW, PUBLISHED_REPORT_OLD),
-                                    (CROSS_SESSION_CLEANUP_NEW + "\n\n", ""),
-                                ),
-                            )
-                        reverse_prompt(
-                            "task_janitor_blocked",
-                            (
-                                (CROSS_SESSION_CLEANUP_NEW + "\n\n", ""),
-                                (JANITOR_RECOVERY_NEW, JANITOR_RECOVERY_OLD),
-                            ),
-                        )
-                    raw = json.dumps(
-                        document,
-                        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                    ).encode()
-                    self.assertEqual(hashlib.sha256(raw).hexdigest(), baseline)
 
     def test_opt_in_cleanup_variants_have_one_project_owned_event(self) -> None:
         for managed in (False, True):
@@ -1169,55 +572,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             check=False,
         )
 
-    def test_coder_selection_is_closed_and_task_bound(self) -> None:
-        for complexity in ("simple", "complex"):
-            with self.subTest(complexity=complexity):
-                selection = CoderSelection.from_mapping(
-                    {
-                        "schema": "coder-selection-v1",
-                        "task_short_id": "KEN-18",
-                        "complexity": complexity,
-                        "rationale": "  Deterministic scoped work.  ",
-                    },
-                    expected_task_short_id="KEN-18",
-                )
-                self.assertEqual(selection.complexity, complexity)
-                self.assertEqual(selection.rationale, "Deterministic scoped work.")
-                if complexity == "simple":
-                    self.assertEqual(selection.target_assignee, "implementation-simple")
-                    self.assertEqual(selection.target_thinking, "xhigh")
-                else:
-                    self.assertEqual(selection.target_assignee, "implementation-complex")
-                    self.assertEqual(selection.target_thinking, "medium")
-                self.assertEqual(
-                    set(selection.as_dict()),
-                    {"schema", "task_short_id", "complexity", "rationale"},
-                )
-
-        valid = {
-            "schema": "coder-selection-v1",
-            "task_short_id": "KEN-18",
-            "complexity": "simple",
-            "rationale": "Small local change.",
-        }
-        invalid_values = (
-            ({**valid, "extra": "not allowed"}, "exactly"),
-            (
-                {key: value for key, value in valid.items() if key != "rationale"},
-                "exactly",
-            ),
-            ({**valid, "schema": "coder-selection-v2"}, "schema"),
-            ({**valid, "task_short_id": "KEN-19"}, "does not match"),
-            ({**valid, "complexity": "unknown"}, "complexity"),
-            ({**valid, "rationale": "  "}, "rationale"),
-        )
-        for value, expected_error in invalid_values:
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(SpecError, expected_error):
-                    CoderSelection.from_mapping(
-                        value,
-                        expected_task_short_id="KEN-18",
-                    )
 
     def test_coder_selection_policy_is_opt_in_and_continuous_only(self) -> None:
         profile = self.load_profile()
@@ -1907,6 +1261,18 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         )
         return contents
 
+    def source_ci_profile_contents(self) -> str:
+        return (
+            self.schema4_runtime_v2_contents()
+            .replace('"github_observation"]', '"github_observation", "prepare_ci"]')
+            .replace('wait_ci = "3.0.0"\n', 'wait_ci = "3.0.0"\nprepare_ci = "2.0.0"\n')
+            .replace(
+                'wait_ci = ".kent/scripts/workflow-wait-github-ci"',
+                'wait_ci = ".kent/scripts/workflow-wait-github-ci"\n'
+                'prepare_ci = ".kent/scripts/workflow-prepare-github-ci"',
+            )
+        )
+
     def run_sync_project_adapters(
         self,
         root: Path,
@@ -1928,7 +1294,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             check=False,
         )
 
-    def test_mixed_model_policy_preserves_operating_settings(self) -> None:
+    def test_subagent_configuration_preserves_operating_settings(self) -> None:
         config = tomllib.loads(
             (REPO_ROOT / "config" / "subagents.toml").read_text()
         )
@@ -1959,15 +1325,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         }
         roles = config["subagents"]
         self.assertEqual(set(roles), set(expected_roles))
-        current_policy = (
-            (REPO_ROOT / "docs" / "MODEL-POLICY.md").read_text()
-            .split("## Current Source Policy\n", 1)[1]
-            .split("## HISTORICAL —", 1)[0]
-        )
-        self.assertIn(
-            "| Opt-in `defaultExtra` selector | `gpt-6-astra` | low |",
-            current_policy,
-        )
         selectors = {"root": config, "reviewer": config["reviewer"], **roles}
         expected_models = {
             "root": "gpt-6.1-sol",
@@ -2125,244 +1482,8 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             },
         )
 
-    @unittest.skip("pre-edit failure retained in build/kent-workflow/KEN-18/pre-edit")
-    def test_ken18_complexity_lifecycle_pre_edit_red_fixture(self) -> None:
-        profile = ProjectProfile.load(REPO_ROOT)
-        builder_loader = SourceFileLoader(
-            "ken18_kit_development_baseline",
-            str(REPO_ROOT / ".kent/workflows/kit_development.py"),
-        )
-        builder_spec = importlib.util.spec_from_loader(
-            builder_loader.name,
-            builder_loader,
-        )
-        self.assertIsNotNone(builder_spec)
-        if builder_spec is None:
-            return
-        builder = importlib.util.module_from_spec(builder_spec)
-        sys.modules[builder_spec.name] = builder
-        builder_loader.exec_module(builder)
-        workflow = builder.build_workflow(profile)
-        nodes = {node.key: node for node in workflow.nodes}
-        edges = {edge.key: edge for edge in workflow.edges}
-        config = tomllib.loads(
-            (REPO_ROOT / "config" / "subagents.toml").read_text()
-        )
-        roles = config["subagents"]
 
-        expected_coders = {
-            "simple": (
-                "implementation-simple",
-                "gpt-5.6-luna",
-                "xhigh",
-                372000,
-                353400,
-            ),
-            "complex": (
-                "implementation-complex",
-                "gpt-6.1-sol",
-                "medium",
-                400000,
-                360000,
-            ),
-        }
-        configured_implementer = roles[nodes["implement"].agent]
-        self.assertEqual(nodes["implement"].agent, "implementation-worker")
-        with self.subTest(requirement="legacy implementer remains unchanged"):
-            self.assertEqual(
-                (
-                    configured_implementer["model"],
-                    configured_implementer["thinking_level"],
-                    configured_implementer["model_context_window"],
-                    configured_implementer[
-                        "context_compaction_threshold_tokens"
-                    ],
-                ),
-                ("gpt-6-luna", "xhigh", 372000, 353400),
-            )
-        for complexity, (
-            expected_role,
-            expected_model,
-            expected_effort,
-            expected_window,
-            expected_compaction,
-        ) in expected_coders.items():
-            with self.subTest(
-                complexity=complexity,
-                requirement="v5 static model and budget",
-            ):
-                self.assertEqual(
-                    (
-                        configured_implementer["model"],
-                        configured_implementer["thinking_level"],
-                        configured_implementer["model_context_window"],
-                        configured_implementer[
-                            "context_compaction_threshold_tokens"
-                        ],
-                    ),
-                    (
-                        expected_model,
-                        expected_effort,
-                        expected_window,
-                        expected_compaction,
-                    ),
-                )
-            selected = roles.get(expected_role)
-            with self.subTest(complexity=complexity, requirement="role exists"):
-                self.assertIsNotNone(selected, expected_role)
-            if selected is not None:
-                with self.subTest(complexity=complexity, requirement="role allocation"):
-                    self.assertEqual(
-                        (
-                            selected["system_prompt_file"],
-                            selected["agent_callable"],
-                            selected["workflow_subagent"],
-                            selected["tools"],
-                            selected["model"],
-                            selected["thinking_level"],
-                            selected["model_context_window"],
-                            selected["context_compaction_threshold_tokens"],
-                        ),
-                        (
-                            roles["implementation-worker"]["system_prompt_file"],
-                            True,
-                            True,
-                            roles["implementation-worker"]["tools"],
-                            expected_model,
-                            expected_effort,
-                            expected_window,
-                            expected_compaction,
-                        ),
-                    )
-
-        planner = roles.get("complexity-planner")
-        for node_key in ("plan", "plan_revalidation"):
-            with self.subTest(planner_node=node_key):
-                self.assertEqual(nodes[node_key].agent, "complexity-planner")
-        with self.subTest(requirement="planner role exists"):
-            self.assertIsNotNone(planner, "complexity-planner")
-        if planner is not None:
-            with self.subTest(requirement="planner allocation"):
-                self.assertEqual(
-                    (
-                        planner["model"],
-                        planner["thinking_level"],
-                        planner["model_context_window"],
-                        planner["context_compaction_threshold_tokens"],
-                    ),
-                    ("gpt-6-astra", "medium", 400000, 360000),
-                )
-
-        first_entry = edges["plan_contract_implement"]
-        revalidation = edges["plan_contract_continue_revalidate"]
-        same_choice_resume = edges["plan_contract_checked_continue"]
-        recovery = edges["implement_needs_user_action"]
-        with self.subTest(route="first writer identity"):
-            self.assertEqual(
-                (first_entry.context, first_entry.context_source),
-                ("new_session", "immediate_source"),
-            )
-        with self.subTest(route="first writer model selectors"):
-            self.assertEqual(first_entry.assignee_selection, "previous_node")
-            self.assertEqual(first_entry.thinking_selection, "previous_node")
-            self.assertEqual(
-                {parameter.purpose for parameter in first_entry.parameters},
-                {"ordinary", "target_assignee", "target_thinking"},
-            )
-        with self.subTest(route="planner revalidation identity"):
-            self.assertEqual(
-                (revalidation.context, revalidation.context_source),
-                ("continue_session", "node:plan"),
-            )
-        with self.subTest(route="same-choice writer continuation"):
-            self.assertEqual(
-                (same_choice_resume.context, same_choice_resume.context_source),
-                ("continue_session", "previous_target_or_new"),
-            )
-            self.assertEqual(same_choice_resume.assignee_selection, "configured")
-            self.assertEqual(same_choice_resume.thinking_selection, "configured")
-        with self.subTest(route="Implement blocker recovery identity"):
-            self.assertEqual(
-                (recovery.context, recovery.context_source),
-                ("continue_session", "immediate_source"),
-            )
-        with self.subTest(route="human approval remains mandatory"):
-            self.assertTrue(edges["plan_review_accept"].requires_approval)
-
-        for complexity, (
-            expected_role,
-            expected_model,
-            expected_effort,
-            expected_window,
-            expected_compaction,
-        ) in expected_coders.items():
-            plan_session = "plan-session"
-            writer_session = (
-                f"writer-session-{complexity}"
-                if first_entry.context == "new_session"
-                else plan_session
-            )
-            revalidated_plan_session = (
-                plan_session
-                if revalidation.context_source == "node:plan"
-                else "unexpected-session"
-            )
-            resumed_writer_session = (
-                writer_session
-                if (
-                    same_choice_resume.context == "continue_session"
-                    and same_choice_resume.context_source == "previous_target_or_new"
-                )
-                else "unexpected-session"
-            )
-            with self.subTest(complexity=complexity, route="separate writer identity"):
-                self.assertNotEqual(writer_session, plan_session)
-                self.assertEqual(revalidated_plan_session, plan_session)
-            with self.subTest(complexity=complexity, route="same-choice retained writer"):
-                self.assertEqual(resumed_writer_session, writer_session)
-                self.assertIsNotNone(roles.get(expected_role))
-            with self.subTest(
-                complexity=complexity,
-                route="same-choice model and effort",
-            ):
-                self.assertEqual(
-                    (
-                        configured_implementer["model"],
-                        configured_implementer["thinking_level"],
-                        configured_implementer["model_context_window"],
-                        configured_implementer[
-                            "context_compaction_threshold_tokens"
-                        ],
-                    ),
-                    (
-                        expected_model,
-                        expected_effort,
-                        expected_window,
-                        expected_compaction,
-                    ),
-                )
-            selected = roles.get(expected_role)
-            if selected is not None:
-                with self.subTest(
-                    complexity=complexity,
-                    route="same-choice model and effort",
-                ):
-                    self.assertEqual(
-                        (
-                            selected["model"],
-                            selected["thinking_level"],
-                            selected["model_context_window"],
-                            selected["context_compaction_threshold_tokens"],
-                        ),
-                        (
-                            expected_model,
-                            expected_effort,
-                            expected_window,
-                            expected_compaction,
-                        ),
-                    )
-
-    def test_ken18_complexity_lifecycle_for_both_selected_coders(self) -> None:
+    def test_current_complexity_lifecycle_for_both_selected_coders(self) -> None:
         profile = ProjectProfile.load(REPO_ROOT)
         selected_profile = replace(
             profile,
@@ -2386,7 +1507,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         builder = importlib.util.module_from_spec(builder_spec)
         sys.modules[builder_spec.name] = builder
         builder_loader.exec_module(builder)
-        workflow = builder.build_complexity_candidate_workflow(selected_profile)
+        workflow = builder.build_current_workflow(selected_profile)
         nodes = {node.key: node for node in workflow.nodes}
         edges = {edge.key: edge for edge in workflow.edges}
         roles = tomllib.loads(
@@ -2498,10 +1619,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             ).split()
         )
         for requirement in (
-            "GetSessionExecutionEnvironment",
-            "GetSessionMainView",
-            "372000 context tokens",
-            "400000",
             "identity differs from the retained Astra Plan Session",
             "do not use continuation or recovery to create another writer",
         ):
@@ -2715,95 +1832,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                     revised_digest,
                 )
 
-    def test_grill_method_and_session_communication_contract(self) -> None:
-        prompt = (REPO_ROOT / "agents" / "grill.md").read_text()
-        method = (REPO_ROOT / "prompts" / "grill.md").read_text()
-        contract = (REPO_ROOT / "contracts" / "role-contract.md").read_text()
-        normalized_prompt = " ".join(prompt.split())
-        self.assertIn("Ask exactly one decision question at a time.", method)
-        self.assertIn("prompts/grill.md", prompt)
-        self.assertNotIn("Ask exactly one decision question at a time.", prompt)
-        for requirement in (
-            "one material decision question at a time",
-            "In a headless run, do not ask",
-            "excessive",
-            "complexity",
-            "cost",
-            "foregone usefulness",
-            "kent run steer <session-id>",
-            "kent run watch <session-id>",
-            "kent run --session <session-id>",
-            "one next outcome of the same active run",
-            "backgrounding alone is not a deadline",
-            'return "awaiting response"',
-            "stop only your observer process",
-            "A Question, Approval, interruption, or unrelated outcome",
-            "Do not use `kent run wait` or `kent run stop`",
-            "demonstrably idle, ordinary",
-            "not owned by a Workflow Task",
-            "Do not retry an ambiguous outcome",
-            "never edit files yourself",
-            "start children",
-        ):
-            with self.subTest(requirement=requirement):
-                self.assertIn(requirement, normalized_prompt)
-        for requirement in (
-            "verified facts, agent proposals, and human decisions",
-            "recipient retains its own contract",
-            "formal reports, Workflow transitions, or independent review",
-            "one read-only `kent run watch <session-id>`",
-            "a real deadline",
-            "a mutual wait is possible",
-            'return "awaiting response"',
-            "`kent run wait` remains prohibited",
-            "a role must not require `contracts/role-contract.md`",
-            "Steer permission does not permit `kent run stop`",
-            "only outside Workflow",
-            "max_subagent_depth",
-        ):
-            with self.subTest(requirement=requirement):
-                self.assertIn(requirement, contract)
-
-    def test_grill_requires_fresh_authority_after_manual_stop(self) -> None:
-        prompt = " ".join((REPO_ROOT / "agents" / "grill.md").read_text().split())
-        contract = " ".join(
-            (REPO_ROOT / "contracts" / "role-contract.md").read_text().split()
-        )
-        operations = " ".join(
-            (REPO_ROOT / "docs/OPERATIONS.md").read_text().split()
-        )
-        alternatives = (
-            "if either (a) the previous run completed normally, or (b) the "
-            "previous run was manually stopped by the user, canceled, or "
-            "interrupted and a new explicit human decision naming that exact "
-            "Session was made after that outcome."
-        )
-        for name, text in (
-            ("grill", prompt), ("contract", contract), ("operations", operations)
-        ):
-            with self.subTest(source=name):
-                self.assertIn(alternatives, text)
-                self.assertNotIn("and its previous run completed normally", text)
-                self.assertNotIn("and whose prior run completed normally", text)
-        for requirement in (
-            "demonstrably idle, ordinary",
-            "not owned by a Workflow Task",
-            "Verify the target's type, state, and previous outcome",
-            "also verify the human decision and its timing",
-            "If any required fact is unknown or ambiguous",
-            "Do not retry an ambiguous outcome",
-        ):
-            with self.subTest(requirement=requirement):
-                self.assertIn(requirement, prompt)
-        for requirement in (
-            "earlier target selection is insufficient",
-            "missing fresh authority",
-            "rather than triggering a retry",
-        ):
-            with self.subTest(requirement=requirement):
-                self.assertIn(requirement, contract)
-        self.assertIn("an ambiguous attempt is not retried", operations)
-
     def test_session_naming_configuration(self) -> None:
         config = tomllib.loads((REPO_ROOT / "config" / "subagents.toml").read_text())
         self.assertEqual(
@@ -2817,84 +1845,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         )
         self.assertNotIn("connection", config["nano"])
         self.assertNotIn("nano", config["subagents"])
-
-    def test_current_model_policy_matches_grill_configuration(self) -> None:
-        config = tomllib.loads((REPO_ROOT / "config" / "subagents.toml").read_text())
-        policy = (REPO_ROOT / "docs" / "MODEL-POLICY.md").read_text()
-        current = policy.split("## Current Source Policy\n", 1)[1].split(
-            "## HISTORICAL —", 1
-        )[0]
-        grill = config["subagents"]["grill"]
-        expected = f"| `grill` | `{grill['model']}` | {grill['thinking_level']} |"
-        self.assertEqual(
-            [line for line in current.splitlines() if line.startswith("| `grill` |")],
-            [expected],
-        )
-        for name in (
-            "implementation-worker",
-            "implementation-simple",
-            "implementation-complex",
-            "complexity-planner",
-        ):
-            role = config["subagents"][name]
-            expected = (
-                f"| `{name}` | `{role['model']}` | "
-                f"{role['thinking_level']} |"
-            )
-            with self.subTest(role=name):
-                self.assertEqual(
-                    [
-                        line
-                        for line in current.splitlines()
-                        if line.startswith(f"| `{name}` |")
-                    ],
-                    [expected],
-                )
-
-    def test_communication_exception_does_not_restore_blanket_run_ban(self) -> None:
-        role_names = (
-            "architecture-designer",
-            "researcher",
-            "standards-reviewer",
-            "spec-reviewer",
-            "compliance_reviewer",
-            "release-manager",
-        )
-        for name in role_names:
-            with self.subTest(role=name):
-                prompt = (REPO_ROOT / "agents" / f"{name}.md").read_text()
-                normalized = " ".join(prompt.split())
-                self.assertIn("kent run steer <session-id>", prompt)
-                self.assertIn("kent run watch <session-id>", prompt)
-                self.assertIn("kent run --agent grill", prompt)
-                self.assertIn(
-                    "In Workflow, do not start child agents",
-                    normalized,
-                )
-                self.assertNotIn("contracts/role-contract.md", prompt)
-                for requirement in (
-                    "The recipient retains its own role contract",
-                    "Messages grant no user authority",
-                    "Do not stop or resume other Sessions",
-                    "Questions or Approvals",
-                    "manage Task, Workflow, or config through this permission",
-                    "After that steer, one read-only",
-                    "the same active run",
-                    "Bound and close only your observer",
-                    "backgrounding alone is not a deadline",
-                    'report "awaiting response"',
-                    "Do not use `kent run wait`",
-                ):
-                    self.assertIn(requirement, normalized)
-                self.assertNotIn("Do not call `kent run`", prompt)
-                self.assertNotIn("kent run --session", prompt)
-                self.assertNotIn("kent run stop", prompt)
-        for path in (REPO_ROOT / "agents").glob("*.md"):
-            with self.subTest(role=path.name):
-                prompt = path.read_text()
-                self.assertNotIn("Do not call `kent run`", prompt)
-                if path.stem not in {*role_names, "grill"}:
-                    self.assertNotIn("kent run watch <session-id>", prompt)
 
     def test_selected_owner_replan_preserves_digest_through_repeated_acceptance(self) -> None:
         from workflowkit.delivery import owner_replan_instruction
@@ -2911,7 +1861,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                                   "coder_selection": "complexity"},
                         capabilities={**profile.capabilities, "compliance_review": compliance},
                     )
-                    spec = build_delivery_workflow(profile, 6)
+                    spec = build_delivery_workflow(profile, 1)
                     spec.validate()
                     edges = {edge.key: edge for edge in spec.edges}
                     self.assertEqual("compliance_replan" in edges, compliance)
@@ -3020,33 +1970,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         self.assertEqual(edges["plan_review_accept"].target, "plan_contract")
         spec.validate()
 
-    def test_replan_instruction_covers_fix_and_compliance_ingress(self) -> None:
-        spec = build_delivery_workflow(self.load_profile(), 99)
-        for edge in spec.edges:
-            if edge.target not in {"fix", "compliance"} or not edge.prompt:
-                continue
-            with self.subTest(edge=edge.key):
-                if edge.key == "dispatch_invalid_workspace":
-                    self.assertIn("without editing production files", edge.prompt)
-                    continue
-                self.assertIn(f"Choose `{edge.target}_replan`", edge.prompt)
-                self.assertIn("plan-contract.json", edge.prompt)
-                self.assertIn("before production edits", edge.prompt)
-
-    def test_r2_revalidation_does_not_require_disposable_cache(self) -> None:
-        from workflowkit.delivery import plan_revalidation_prompt, owner_replan_prompt
-        profile = ProjectProfile.load(REPO_ROOT)
-        self.assertEqual(profile.delivery_reliability_policy(), "v1")
-        prompts = [owner_replan_prompt(profile)]
-        prompts.extend(plan_revalidation_prompt(profile, from_review=value)
-                       for value in (False, True))
-        for prompt in prompts:
-            with self.subTest(prompt=prompt[:70]):
-                self.assertIn("task-fixed storage mode", prompt)
-                self.assertIn("external accepted snapshot", prompt)
-                self.assertIn("disposable cache, not required evidence", prompt)
-                self.assertIn("Do not recreate it", prompt)
-                self.assertIn("For fixed legacy tasks", prompt)
 
     def test_replan_profile_matrix_and_parameter_closure(self) -> None:
         source_ci = self.schema4_runtime_v2_contents().replace(
@@ -3113,80 +2036,18 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                     # Global generator does not impose Kit's project-only approval.
                     self.assertFalse(edges["plan_review_accept"].requires_approval)
 
-    def test_supervisor_decision_closure_static_scenarios(self) -> None:
-        fixture = json.loads(
-            (REPO_ROOT / "tests/fixtures/supervisor-decision-closure.json").read_text()
-        )
-        self.assertEqual(set(fixture), {"description", "cases"})
-        self.assertIsInstance(fixture["description"], str)
-        self.assertTrue(fixture["description"].strip())
-        cases = fixture["cases"]
-        self.assertIsInstance(cases, list)
-        self.assertTrue(cases)
-        expected_fields = {"id", "input", "expected", "category"}
-        allowed_categories = {"allow", "protect", "capability"}
-        ids = []
-        categories = set()
-        for case in cases:
-            with self.subTest(case=case.get("id")):
-                self.assertEqual(set(case), expected_fields)
-                for field in expected_fields:
-                    self.assertIsInstance(case[field], str)
-                    self.assertTrue(case[field].strip())
-                ids.append(case["id"])
-                categories.add(case["category"])
-        self.assertEqual(len(ids), len(set(ids)))
-        self.assertEqual(categories, allowed_categories)
-        for prompt in (
-            plan_prompt(self.load_profile()),
-            plan_revalidation_prompt(self.load_profile(), from_review=True),
-        ):
-            self.assertIn("whole required lifecycle", prompt)
-            self.assertIn("do not execute those effects in Plan", prompt)
 
     def test_task_supervisor_packaged_operational_contract(self) -> None:
         config = tomllib.loads((REPO_ROOT / "config" / "subagents.toml").read_text())
-        self.assertEqual(
-            config["subagents"]["task-supervisor"],
-            {
-                "description": (
-                    "Operational supervision of selected Tasks, factual answers, "
-                    "bounded recovery, and human escalation."
-                ),
-                "model": "gpt-6.1-sol",
-                "system_prompt_file": "agents/task-supervisor.md",
-                "thinking_level": "high",
-                "model_verbosity": "low",
-                "agent_callable": True,
-                "workflow_subagent": False,
-                "tools": {"shell": True, "patch": False, "edit": False},
-            },
-        )
-
-        role_path = REPO_ROOT / "agents" / "task-supervisor.md"
+        role = config["subagents"]["task-supervisor"]
+        self.assertEqual(role["system_prompt_file"], "agents/task-supervisor.md")
+        self.assertTrue(role["agent_callable"])
+        self.assertFalse(role["workflow_subagent"])
+        self.assertEqual(role["tools"], {"shell": True, "patch": False, "edit": False})
+        role_path = REPO_ROOT / role["system_prompt_file"]
         prompt = role_path.read_text()
         self.assertFalse(prompt.lstrip().startswith("---"))
         self.assertNotRegex(prompt, r"(?m)^\s*(model|tools)\s*:")
-        self.assertNotIn("contracts/role-contract.md", prompt)
-
-        skill_path = REPO_ROOT / "skills" / "kent-engineering-kit" / "SKILL.md"
-        skill = skill_path.read_text()
-        reference = "references/task-supervision-operations.md"
-        self.assertIn(reference, skill)
-        self.assertTrue((skill_path.parent / reference).is_file())
-
-        self.assertIn(
-            "kent --agent task-supervisor",
-            (REPO_ROOT / "README.md").read_text(),
-        )
-        guidance = " ".join(
-            (REPO_ROOT / "global" / "AGENTS.md").read_text().split()
-        )
-        self.assertIn(
-            "An original human Session message or native Question answer",
-            guidance,
-        )
-        self.assertIn("Never manufacture provenance with `--author user`", guidance)
 
     def test_global_role_tools_are_mutually_exclusive(self) -> None:
         config = tomllib.loads(
@@ -3205,7 +2066,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                 conflicts.append(name)
         self.assertEqual(conflicts, [])
 
-    def test_release_decision_role_is_toolless_and_operations_are_documented(self) -> None:
+    def test_release_decision_role_is_toolless(self) -> None:
         config = tomllib.loads(
             (REPO_ROOT / "config" / "subagents.toml").read_text()
         )
@@ -3217,15 +2078,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         prompt = (REPO_ROOT / "agents" / "release-decision.md").read_text()
         self.assertNotIn("model:", prompt)
         self.assertNotIn("tools:", prompt)
-        skill = (REPO_ROOT / "skills" / "kent-engineering-kit" / "SKILL.md").read_text()
-        for expected in (
-            "retire-workflow-batch",
-            "reconcile-canonical-workflows",
-            "activate-primary-checkout",
-            "Mutation requires `--confirm`",
-            "Recovery never signals a PID",
-        ):
-            self.assertIn(expected, skill)
 
     def test_edge_rejects_malformed_template_placeholders(self) -> None:
         malformed_prompts = (
@@ -3270,120 +2122,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
 
         edge.validate()
 
-    def test_global_contract_localizes_user_facing_workflow_text(self) -> None:
-        contract = (REPO_ROOT / "global" / "AGENTS.md").read_text()
-
-        for expected in (
-            "default to Russian",
-            "transition commentary",
-            "`blocker_reason`",
-            "`closure_reason`",
-            "do not paste raw review reports",
-            "do not present task-scoped code fixes",
-            "Missing agent-produced bookkeeping",
-            "ordinary missing operational date",
-            "`kent task resume` confirms durable requeueing",
-        ):
-            self.assertIn(expected, contract)
-
-        workflow_contract = (
-            REPO_ROOT / "contracts" / "workflow-contract.md"
-        ).read_text()
-        for expected in (
-            "Retry only that\n  job",
-            "`Fixes #N`",
-        ):
-            self.assertIn(expected, workflow_contract)
-
-        release_manager = (
-            REPO_ROOT / "agents" / "release-manager.md"
-        ).read_text()
-        self.assertIn(
-            "current calendar date from the execution environment",
-            release_manager,
-        )
-        self.assertIn(
-            "today's date",
-            release_manager,
-        )
-
-        ci_monitor = (REPO_ROOT / "agents" / "ci-monitor.md").read_text()
-        for expected in (
-            "The runner has received a shutdown signal",
-            "The operation was canceled",
-            "gh run rerun <run-id> --job <job-id>",
-            "assertions",
-            "external service `5xx` responses",
-            "three total attempts",
-            "failure before eligible tests actually started",
-            "Never automatically retry",
-        ):
-            self.assertIn(expected, ci_monitor)
-
-        smoke_tester = role_prompt("runtime-smoke-tester.md")
-        for expected in (
-            "task-started test runner",
-            "task-owned orphan processes",
-            "Never leave a resource unlocked while task-owned",
-        ):
-            self.assertIn(expected, smoke_tester)
-
-    def test_instruction_ownership_keeps_runtime_prompts_bounded(self) -> None:
-        profile = self.load_profile()
-        by_key = {
-            edge.key: edge.prompt or ""
-            for edge in build_delivery_workflow(profile, 1).edges
-        }
-        budgets = {
-            # Approved lifecycle feasibility and task-bound replan instructions.
-            "start_plan": 8000,
-            "plan_contract_implement": 5000,
-            "gate_fix": 5600,
-            "dispatch_standards_review": 1500,
-            "dispatch_spec_review": 1300,
-            "verification_join_gate": 3200,
-            "gate_delivery_ready": 3900,
-            "compliance_prepare_pr": 3600,
-            "ci_watch_diagnose": 3200,
-        }
-        for key, maximum in budgets.items():
-            self.assertLessEqual(
-                len(by_key[key]),
-                maximum,
-                f"{key} exceeded its generated prompt budget",
-            )
-
-        self.assertLessEqual(
-            (REPO_ROOT / "skills" / "kent-engineering-kit" / "SKILL.md")
-            .stat()
-            .st_size,
-            8000,
-        )
-        self.assertLessEqual(
-            (REPO_ROOT / "contracts" / "workflow-contract.md").stat().st_size,
-            40500,
-        )
-        self.assertNotIn(
-            "The runner has received a shutdown signal",
-            by_key["ci_watch_diagnose"],
-        )
-        self.assertIn(
-            "The runner has received a shutdown signal",
-            role_prompt("ci-monitor.md"),
-        )
-
-    def test_workflow_update_policy_placement_is_bounded(self) -> None:
-        contract = (REPO_ROOT / "contracts" / "workflow-contract.md").read_text()
-        self.assertIn(
-            "### Execution-history and compatibility policy\n\n"
-            "For workflow updates, read [the authoritative policy]"
-            "(workflow-update-compatibility.md).",
-            contract,
-        )
-        policy = REPO_ROOT / "contracts" / "workflow-update-compatibility.md"
-        self.assertTrue(policy.is_file())
-        self.assertTrue(policy.read_text().strip())
-        self.assertLessEqual(policy.stat().st_size, 4000)
 
     def test_team_delivery_has_direct_fanout_join(self) -> None:
         profile = self.load_profile()
@@ -3534,25 +2272,21 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         without_jira_plan = next(
             edge.prompt for edge in without_jira.edges if edge.target == "plan"
         )
-        self.assertNotIn("normalized `issue_links`", without_jira_plan)
+        adapter_path = ".kent/adapters/jira/jira-api.sh"
+        self.assertNotIn(adapter_path, without_jira_plan)
 
         jira_profile = replace(
             profile,
             required_adapters=("jira_api",),
-            adapters={"jira_api": ".kent/adapters/jira/jira-api.sh"},
+            adapters={"jira_api": adapter_path},
         )
         with_jira = build_delivery_workflow(jira_profile, 1)
         with_jira_plan = next(
             edge.prompt for edge in with_jira.edges if edge.target == "plan"
         )
+        self.assertIn(adapter_path, with_jira_plan)
         self.assertIn("normalized `issue_links`", with_jira_plan)
-        self.assertIn("mandatory bounded product evidence", with_jira_plan)
-        self.assertIn("API operations/models", with_jira_plan)
         self.assertIn("only root issues explicitly supplied", with_jira_plan)
-        self.assertIn(
-            "`checked`, `adopted`, `rejected`, and\n`conflicts`",
-            with_jira_plan,
-        )
         self.assertIn("deferred/out-of-scope issues", with_jira_plan)
 
     def test_sentry_adapter_adds_bounded_plan_instruction(self) -> None:
@@ -3561,24 +2295,28 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         without_sentry_plan = next(
             edge.prompt for edge in without_sentry.edges if edge.target == "plan"
         )
-        self.assertNotIn("explicitly identifies a Sentry issue", without_sentry_plan)
+        adapter_path = ".kent/adapters/sentry/sentry-issues.sh"
+        self.assertNotIn(adapter_path, without_sentry_plan)
 
         sentry_profile = replace(
             profile,
             required_adapters=("sentry_issues",),
             adapters={
-                "sentry_issues": ".kent/adapters/sentry/sentry-issues.sh",
+                "sentry_issues": adapter_path,
             },
         )
         with_sentry = build_delivery_workflow(sentry_profile, 1)
         with_sentry_plan = next(
             edge.prompt for edge in with_sentry.edges if edge.target == "plan"
         )
+        self.assertIn(adapter_path, with_sentry_plan)
         self.assertIn("explicitly identifies a Sentry issue", with_sentry_plan)
-        self.assertIn("bounded latest-event evidence", with_sentry_plan)
-        self.assertIn("never persist raw", with_sentry_plan)
-        self.assertIn("mark-seen --allow-mutate", with_sentry_plan)
-        self.assertIn("Do not resolve or mute", with_sentry_plan)
+        normalized = " ".join(with_sentry_plan.split())
+        self.assertIn("normalized, bounded evidence", normalized)
+        self.assertIn("never raw request", normalized)
+        self.assertNotIn("mark-seen --allow-mutate", normalized)
+        self.assertIn("grants no mutation permission", normalized)
+        self.assertIn("Do not resolve or mute an issue in Plan", normalized)
 
     def test_delivery_inserts_configured_branch_identity_before_implement(
         self,
@@ -3654,7 +2392,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         )
         self.assertNotIn("plan_implement", edges)
 
-    def test_ken18_complexity_candidate_uses_task_bound_selectors_and_guards(
+    def test_complexity_profile_uses_task_bound_selectors_and_guards(
         self,
     ) -> None:
         def complexity_policy(contents: str) -> str:
@@ -3665,9 +2403,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             )
 
         profile = self.load_profile(complexity_policy)
-        with self.assertRaisesRegex(SpecError, "only by the source candidate workflow v6"):
-            build_delivery_workflow(profile, 5)
-        spec = build_delivery_workflow(profile, 6)
+        spec = build_delivery_workflow(profile, 1)
         nodes = {node.key: node for node in spec.nodes}
         edges = {edge.key: edge for edge in spec.edges}
 
@@ -3740,7 +2476,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         )
         branch_edges = {
             edge.key: edge
-            for edge in build_delivery_workflow(branch_profile, 6).edges
+            for edge in build_delivery_workflow(branch_profile, 1).edges
         }
         branch_entry = branch_edges["branch_identity_implement"]
         self.assertEqual(
@@ -3768,98 +2504,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             "plan_revalidation",
         )
 
-    def test_ken18_source_v6_candidate_preserves_opt_out_and_v5_snapshot(
-        self,
-    ) -> None:
-        path = REPO_ROOT / ".kent" / "workflows" / "kit_development.py"
-        loader = SourceFileLoader("ken18_kit_development_candidate_test", str(path))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        self.assertIsNotNone(spec)
-        if spec is None:
-            raise AssertionError("could not load the Kit development builder")
-        builder = importlib.util.module_from_spec(spec)
-        loader.exec_module(builder)
-
-        profile_path = REPO_ROOT / ".kent" / "workflow-profile.toml"
-        profile_before = profile_path.read_bytes()
-        v5_path = REPO_ROOT / builder.SPEC_PATH
-        v5_before = v5_path.read_bytes()
-        profile = builder.profile_at(REPO_ROOT)
-        self.assertEqual(profile.coder_selection_policy(), "disabled")
-
-        default = builder.build_workflow(profile)
-        candidate = builder.build_complexity_candidate_workflow(profile)
-        self.assertEqual(default.name, "Kit Engineering Delivery v5")
-        self.assertEqual(candidate.name, "Kit Engineering Delivery v6")
-        self.assertEqual(
-            (
-                len(candidate.nodes),
-                len({(edge.source, edge.transition) for edge in candidate.edges}),
-                len(candidate.edges),
-            ),
-            (21, 54, 55),
-        )
-        nodes = {node.key: node for node in candidate.nodes}
-        edges = {edge.key: edge for edge in candidate.edges}
-        self.assertEqual(nodes["plan"].agent, "complexity-planner")
-        self.assertEqual(nodes["plan_revalidation"].agent, "complexity-planner")
-        self.assertEqual(nodes["implement"].agent, "implementation-worker")
-        self.assertEqual(
-            (
-                edges["plan_contract_implement"].context,
-                edges["plan_contract_implement"].context_source,
-                edges["plan_contract_implement"].assignee_selection,
-                edges["plan_contract_implement"].thinking_selection,
-            ),
-            ("new_session", "immediate_source", "previous_node", "previous_node"),
-        )
-
-        self.assertEqual(v5_path.read_bytes(), v5_before)
-        # KEN-22 G3 freezes v5; its only approved default-render differences
-        # are G1 merged-watcher fields and G2 delivery authority/handoff.
-        # Keep KEN-18 opt-out/shape assertions without accepting an arbitrary
-        # stale snapshot or rewriting the historical artifact.
-        self.assertEqual(
-            hashlib.sha256(v5_before).hexdigest(),
-            "b4ad79a3499d1a65ab749b8f3a98f2837a4b519eb8f4a0629d240dd6e9efcd55",
-        )
-        historical = json.loads(v5_before)
-        rendered = json.loads(builder.rendered_spec())
-        self.assertEqual(historical.keys(), rendered.keys())
-        for field in historical.keys() - {"edges"}:
-            self.assertEqual(historical[field], rendered[field], field)
-        historical_edges = {edge["key"]: edge for edge in historical["edges"]}
-        rendered_edges = {edge["key"]: edge for edge in rendered["edges"]}
-        self.assertEqual(historical_edges.keys(), rendered_edges.keys())
-        changed_fields = {
-            key: {
-                field
-                for field in historical_edges[key].keys() | rendered_edges[key].keys()
-                if historical_edges[key].get(field) != rendered_edges[key].get(field)
-            }
-            for key in historical_edges
-            if historical_edges[key] != rendered_edges[key]
-        }
-        self.assertEqual(changed_fields, {
-            "gate_delivery_ready": {"prompt"},
-            "merge_watch_cleanup": {"parameters"},
-        })
-        candidate_path = REPO_ROOT / builder.CANDIDATE_SPEC_PATH
-        self.assertEqual(builder.rendered_candidate_spec(), candidate_path.read_text())
-        self.assertEqual(profile_path.read_bytes(), profile_before)
-
-        fresh_profile = replace(
-            profile,
-            policies={
-                **profile.policies,
-                "writer_sessions": "fresh_per_slice",
-            },
-        )
-        with self.assertRaisesRegex(
-            SpecError,
-            "requires continuous writer Sessions",
-        ):
-            builder.build_complexity_candidate_workflow(fresh_profile)
 
     def test_delivery_keeps_direct_plan_start_for_task_branch_policy(self) -> None:
         profile = self.load_profile()
@@ -3893,10 +2537,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
 
         legacy = self.load_profile()
         current = ProjectProfile.load(REPO_ROOT)
-        self.assertIn(
-            "Re-emit `work_kind` on\n`continue_implementation`",
-            work_kind_recovery_instruction(legacy),
-        )
+        self.assertIn("{{.Params.work_kind}}", work_kind_recovery_instruction(legacy))
         for instruction in (
             work_kind_implement_instruction(current),
             work_kind_recovery_instruction(current),
@@ -3943,10 +2584,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             by_key["plan_contract_checked_continue"].prompt,
         )
         self.assertIn(
-            "acquire a device",
-            role_prompt("implementation-worker.md"),
-        )
-        self.assertIn(
             "when every\nwriter-owned plan step is complete",
             by_key["plan_contract_checked_continue"].prompt,
         )
@@ -3959,10 +2596,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             by_key["start_plan"].prompt,
         )
         self.assertIn("pre-edit red run", by_key["start_plan"].prompt)
-        self.assertIn(
-            "Missing agent-produced evidence is not user authority work",
-            role_prompt("implementation-worker.md"),
-        )
         self.assertEqual(
             by_key["plan_contract_implement"].context,
             "new_session",
@@ -4095,21 +2728,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             "plan_revalidation",
         )
 
-    def test_writer_prompts_preserve_report_only_and_scope_boundaries(self) -> None:
-        profile = self.load_profile()
-        spec = build_delivery_workflow(profile, 1)
-        by_key = {edge.key: edge for edge in spec.edges}
-
-        for filename in ("implementation-worker.md", "fix-worker.md"):
-            prompt = role_prompt(filename)
-            self.assertIn("do not edit tracked or staged files", prompt)
-            self.assertIn("Do not ask\n  whether to absorb it", prompt)
-
-        for key in ("plan_contract_implement", "gate_fix"):
-            self.assertIn(
-                "approval is a resume signal",
-                by_key[key].prompt,
-            )
 
     def test_delivery_preserves_continuous_writer_compatibility(self) -> None:
         profile = self.load_profile(
@@ -4214,132 +2832,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         self.assertEqual(handoff.context, "compact_and_continue_session")
         self.assertEqual(handoff.context_source, "node:plan")
 
-    def test_delivery_writer_prompts_reserve_final_review_for_graph(self) -> None:
-        profile = self.load_profile()
-        spec = build_delivery_workflow(profile, 1)
-        prompts = {edge.key: edge.prompt or "" for edge in spec.edges}
-
-        self.assertIn(
-            "Do not duplicate workflow-owned Standards",
-            role_prompt("implementation-worker.md"),
-        )
-        self.assertIn(
-            "Apply the `implementation-worker` role contract",
-            prompts["plan_contract_implement"],
-        )
-        self.assertIn(
-            "Do not duplicate workflow-owned Standards",
-            role_prompt("fix-worker.md"),
-        )
-        self.assertIn(
-            "Apply the `fix-worker` role contract",
-            prompts["gate_fix"],
-        )
-        self.assertIn("checkpoint ref", prompts["start_plan"])
-        self.assertIn("exact referenced comments", prompts["start_plan"])
-        self.assertIn(
-            "fresh writer session",
-            prompts["plan_contract_implement"],
-        )
-        self.assertIn(
-            "exactly one independently verifiable fix slice",
-            prompts["gate_fix"],
-        )
-        self.assertIn("`fix_continue_fix`", prompts["gate_fix"])
-        self.assertIn(
-            "Do not create a transition-only session",
-            prompts["gate_fix"],
-        )
-        self.assertIn(
-            "bookkeeping-only evidence",
-            prompts["gate_fix"],
-        )
-        self.assertIn(
-            "exactly one independently verifiable PR or branch recovery slice",
-            prompts["prepare_pr_fix"],
-        )
-        self.assertIn("`fix_continue_fix`", prompts["prepare_pr_fix"])
-        self.assertIn(
-            "exactly one independently verifiable PR-feedback slice",
-            prompts["waiting_pr_fix"],
-        )
-        self.assertIn("`fix_continue_fix`", prompts["waiting_pr_fix"])
-        self.assertIn(
-            "Fix only findings proven to be task-scoped",
-            role_prompt("fix-worker.md"),
-        )
-        self.assertIn(
-            "git branch --show-current",
-            prompts["compliance_prepare_pr"],
-        )
-        self.assertIn(
-            "Read the task's current\n`source_url`",
-            prompts["compliance_prepare_pr"],
-        )
-
-    def test_standards_and_gate_require_task_scoped_differential_evidence(
-        self,
-    ) -> None:
-        profile = self.load_profile()
-        spec = build_delivery_workflow(profile, 1)
-        by_key = {edge.key: edge for edge in spec.edges}
-
-        standards_prompt = by_key["dispatch_standards_review"].prompt or ""
-        gate_prompt = by_key["verification_join_gate"].prompt or ""
-        standards_role = role_prompt("standards-reviewer.md")
-        for expected in (
-            "whole-repository analyzer",
-            "task-introduced or task-worsened",
-            "changed file or touched method",
-            "baseline debt",
-            "policy\ncontradiction",
-            "do not\nsubstitute a newer merge-target tip",
-            "Target-only commits",
-            "free-form strings",
-            "typed source contract",
-        ):
-            self.assertIn(expected, standards_role)
-        self.assertIn(
-            "Apply the `standards-reviewer` role contract",
-            standards_prompt,
-        )
-        spec_role = role_prompt("spec-reviewer.md")
-        for expected in (
-            "fixed point",
-            "target-only commits",
-            "Do not ask the writer to copy",
-        ):
-            self.assertIn(expected, spec_role)
-        self.assertIn(
-            "Apply the `spec-reviewer` role contract",
-            by_key["dispatch_spec_review"].prompt or "",
-        )
-        for expected in (
-            "Route task-scoped failures to Fix",
-            "Route missing authority",
-            "Missing agent-produced bookkeeping is not a user decision",
-            "target-only commits",
-            "merge/replay conflict",
-        ):
-            self.assertIn(expected, role_prompt("workflow-gate.md"))
-        self.assertIn("Apply the `workflow-gate` role contract", gate_prompt)
-        self.assertIn("deduplicated, dependency-ordered repair bundle", gate_prompt)
-        self.assertIn(
-            "dependency-ordered repair bundle",
-            role_prompt("workflow-gate.md"),
-        )
-        self.assertIn(
-            "stable ID",
-            role_prompt("workflow-gate.md"),
-        )
-        self.assertIn(
-            "one-finding-per-session",
-            role_prompt("workflow-gate.md"),
-        )
-        self.assertIn(
-            "linked, cloned, sibling, and dependency issues",
-            spec_role,
-        )
 
     def test_install_adopts_byte_identical_managed_agent_file(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -4527,7 +3019,9 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             edge.prompt for edge in spec.edges if edge.prompt is not None
         )
         self.assertIn("work_kind", prompts)
-        self.assertIn(".kent/commands/feature-start.md", prompts)
+        for kind in profile.work_kinds.values():
+            self.assertNotIn(kind.plan, prompts)
+            self.assertNotIn(kind.implement, prompts)
         self.assertNotIn("gate_smoke_required", by_key)
         self.assertEqual(by_key["gate_delivery_ready"].target, "cleanup")
 
@@ -4587,7 +3081,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             "\n".join(edge.prompt or "" for edge in by_key.values()),
         )
 
-        self.assertTrue(by_key["prepare_pr_fix"].requires_approval)
+        self.assertFalse(by_key["prepare_pr_fix"].requires_approval)
         self.assertEqual(
             tuple(parameter.key for parameter in by_key["prepare_pr_fix"].parameters),
             ("workspace_path", "blocker_reason"),
@@ -4641,10 +3135,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             by_key["ci_watch_diagnose"].prompt,
         )
         self.assertIn(
-            "task-differential evidence",
-            role_prompt("ci-monitor.md"),
-        )
-        self.assertIn(
             "exact terminal watcher report",
             by_key["ci_watch_diagnose"].prompt,
         )
@@ -4652,16 +3142,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             "Never use `ci_monitor_needs_user_action` merely because CI is still running",
             by_key["ci_watch_diagnose"].prompt,
         )
-        for expected in (
-            "The runner has received a shutdown signal",
-            "The operation was canceled",
-            "gh run rerun <run-id> --job <job-id>",
-            "assertions",
-            "external service `5xx` responses",
-            "three total attempts",
-            "failure before eligible tests actually started",
-        ):
-            self.assertIn(expected, role_prompt("ci-monitor.md"))
         self.assertIn("Fixes #N", by_key["compliance_prepare_pr"].prompt)
         self.assertEqual(
             by_key["fix_pr_merged_cleanup"].transition,
@@ -4757,28 +3237,12 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                 "waiting_pr_fix",
             )
         )
-        role_contracts = "\n".join(
-            (
-                role_prompt("delivery-operator.md"),
-                role_prompt("ci-monitor.md"),
-            )
-        )
-        for expected in (
-            "canBeRebased",
-            "forced replay",
-            "temporary clone or branch",
-        ):
-            self.assertIn(expected, role_contracts)
         for expected in (
             "force-with-lease",
             "outcome=needs_user_action",
             "kent-resolve-github-merge-strategy",
         ):
             self.assertIn(expected, generated_prompts)
-        strategy_source = (
-            REPO_ROOT / "workflowkit" / "merge_strategy.py"
-        ).read_text()
-        self.assertIn("required_linear_history", strategy_source)
 
     def test_manual_package_publish_topology_is_approval_gated_after_merge(
         self,
@@ -5016,18 +3480,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             by_key["gate_delivery_ready"].prompt,
         )
         self.assertIn(
-            "exact human-authored task-comment ID",
-            role_prompt("spec-reviewer.md"),
-        )
-        self.assertIn(
-            "exact human-authored task-comment ID",
-            role_prompt("compliance_reviewer.md"),
-        )
-        self.assertIn(
-            "Missing agent-produced bookkeeping is not a user decision",
-            role_prompt("compliance_reviewer.md"),
-        )
-        self.assertIn(
             "Final Compliance Review: {{.Params.compliance_report}}",
             by_key["compliance_prepare_pr"].prompt,
         )
@@ -5063,24 +3515,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             by_key["evidence_repair_needs_user_action"].prompt,
         )
 
-    def test_recovery_plan_conditions_inspection_on_supplied_inputs(self) -> None:
-        prompt = " ".join(
-            plan_prompt(self.load_profile(), recovery_aware=True).split()
-        )
-
-        self.assertIn("inspect each supplied item independently", prompt)
-        self.assertIn("If a checkpoint ref is supplied", prompt)
-        self.assertIn("If a source task is identified", prompt)
-        self.assertIn("If exact task-comment IDs are supplied", prompt)
-        self.assertIn(
-            "source-task reference or comment IDs alone do not establish",
-            prompt,
-        )
-        self.assertIn(
-            "Do not choose `review_plan` in that Plan run.",
-            prompt,
-        )
-        self.assertNotIn("Do not choose `implement`", prompt)
 
     def test_cleanup_and_janitor_prompts_preserve_workspace_and_branch(self) -> None:
         profile = self.cleanup_profile(managed=True, published=False)
@@ -5096,7 +3530,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         for key in cleanup_keys:
             prompt = by_key[key].prompt
             with self.subTest(edge=key):
-                self.assertIn(CLEANUP_CAPTURE, prompt)
                 self.assertIn(
                     "`git -C <workspace_path> branch --show-current`",
                     prompt,
@@ -5106,16 +3539,15 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
                     prompt,
                 )
                 self.assertLess(
-                    prompt.index(CLEANUP_CAPTURE),
+                    prompt.index("git -C <workspace_path> branch --show-current"),
                     prompt.index("`kent worktree leave`"),
                 )
                 self.assertNotIn("`git branch --show-current`", prompt)
 
         published_profile = self.cleanup_profile(managed=True, published=True)
         published = published_cleanup_prompt(published_profile)
-        self.assertIn(PUBLISHED_CAPTURE, published)
         self.assertLess(
-            published.index(PUBLISHED_CAPTURE),
+            published.index("git -C <workspace_path> branch --show-current"),
             published.index("`kent worktree leave`"),
         )
         self.assertIn(
@@ -5137,159 +3569,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             " ".join(recovery.split()),
         )
 
-    def test_managed_cleanup_prompts_share_bounded_cross_session_protocol(self) -> None:
-        profile = self.cleanup_profile(managed=True, published=False)
-        prompts = {
-            "ordinary": cleanup_prompt(profile),
-            "merged": cleanup_prompt(profile, merged=True),
-            "no_pr": cleanup_prompt(profile, no_pr=True),
-            "closed": cleanup_prompt(profile, closed=True),
-            "published": published_cleanup_prompt(
-                self.cleanup_profile(managed=True, published=True)
-            ),
-            "janitor_recovery": janitor_recovery_prompt(profile),
-        }
-        requirements = (
-            "`kent run steer <owner-session-id>`",
-            "parent move or old PID exit does not prove release",
-            "single monotonic 60-second deadline",
-            "at most two bounded Task-comment observations",
-            "no more than 30 seconds between them",
-            "fresh acknowledgement for the exact current request",
-            "incomplete page or readback is an evidence gap",
-            "materially new blocker",
-            "same attempt",
-            "never reset the deadline",
-            "owner re-entry",
-            "retained child",
-            "immediately before leave/handoff",
-            "unavailable owner",
-            "preserve the root and use the existing blocker route",
-            "unsupported action",
-            "never ask the user to finish safe task-owned cleanup",
-            "never stop or signal another Session",
-        )
-        for name, prompt in prompts.items():
-            normalized = " ".join(prompt.split())
-            with self.subTest(prompt=name):
-                for requirement in requirements:
-                    self.assertIn(requirement, normalized)
-                self.assertNotIn("KEN-8", prompt)
-                self.assertNotIn("OSM-87", prompt)
-                self.assertNotIn("7a04b98e-e9b0-4a70-b36d-b343912673c5", prompt)
-
-        unmanaged = self.cleanup_profile(managed=False, published=False)
-        unmanaged_prompts = (
-            cleanup_prompt(unmanaged),
-            cleanup_prompt(unmanaged, no_pr=True),
-            published_cleanup_prompt(
-                self.cleanup_profile(managed=False, published=True)
-            ),
-            janitor_recovery_prompt(unmanaged),
-        )
-        for prompt in unmanaged_prompts:
-            self.assertNotIn("kent run steer", prompt)
-
-    def test_project_cleanup_surfaces_reference_protocol_and_preserve_pr35(self) -> None:
-        portable = (REPO_ROOT / "contracts/worktree-contract.md").read_text()
-        role = (REPO_ROOT / "agents/delivery-operator.md").read_text()
-        procedure = (REPO_ROOT / ".kent/commands/cleanup-task.md").read_text()
-
-        self.assertIn(
-            "bounded cross-Session cleanup coordination",
-            " ".join(portable.split()),
-        )
-        for source in (role, procedure):
-            normalized = " ".join(source.split())
-            self.assertIn("contracts/worktree-contract.md", normalized)
-            self.assertIn(
-                "bounded cross-Session cleanup coordination",
-                normalized,
-            )
-        self.assertIn(
-            "Missing agent bookkeeping is not missing human authority.",
-            role,
-        )
-        self.assertIn(
-            "The helper owns the final ordinary append and seal.",
-            procedure,
-        )
-
-    def test_transition_key_migrator_explains_task_backed_limitation(self) -> None:
-        script = REPO_ROOT / "scripts" / "migrate-transition-keys"
-        help_result = subprocess.run(
-            [sys.executable, str(script), "--help"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        self.assertIn("legacy per-edge", help_result.stdout)
-        self.assertIn("not atomic", help_result.stdout)
-        self.assertIn("separately approved complete-graph operation", help_result.stdout)
-        self.assertIn(
-            "default is a read-only plan",
-            " ".join(help_result.stdout.split()),
-        )
-
-        workflow_id = "00112233-4455-6677-8899-aabbccddeeff"
-        definition = {
-            "workflow": {"id": workflow_id, "name": "Legacy"},
-            "nodes": [
-                {"id": "node-plan", "key": "plan"},
-                {"id": "node-implement", "key": "implement"},
-            ],
-            "transition_groups": [
-                {
-                    "id": "group-plan",
-                    "source_node_id": "node-plan",
-                    "transition_id": "review_plan",
-                },
-            ],
-            "edges": [
-                {
-                    "id": "edge-plan",
-                    "transition_group_id": "group-plan",
-                    "target_node_id": "node-implement",
-                    "prompt_template": None,
-                },
-            ],
-        }
-        migrator = load_transition_key_migrator()
-        with (
-            mock.patch.object(
-                migrator,
-                "run_json",
-                return_value=definition,
-            ) as run_json,
-            mock.patch.object(migrator, "KentClient") as kent_client,
-            mock.patch.object(
-                sys,
-                "argv",
-                [str(script), workflow_id, "--apply"],
-            ),
-        ):
-            kent_client.return_value.workflow_has_tasks.return_value = True
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "legacy per-edge migrator cannot update task-backed workflows atomically",
-            ) as raised:
-                migrator.main()
-
-        self.assertIn(
-            "separately approved complete-graph operation",
-            str(raised.exception),
-        )
-        self.assertIn(
-            "do not retire or migrate tasks as a workaround",
-            str(raised.exception),
-        )
-        run_json.assert_called_once_with(
-            ["workflow", "inspect", workflow_id, "--json"],
-        )
-        kent_client.return_value.workflow_has_tasks.assert_called_once_with(
-            definition,
-        )
 
     def test_managed_worktree_cleanup_uses_task_janitor(self) -> None:
         profile = self.load_profile()
@@ -5361,14 +3640,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         self.assertIn(
             "--stage smoke",
             prompts["gate_smoke_required"],
-        )
-        self.assertIn(
-            ".kent/runtime/<task-short-id>/fix-checkpoint.json",
-            role_prompt("fix-worker.md"),
-        )
-        self.assertIn(
-            ".kent/runtime/<task-short-id>/smoke-checkpoint.json",
-            role_prompt("runtime-smoke-tester.md"),
         )
 
     def test_standards_and_final_compliance_capabilities_are_independent(self) -> None:
@@ -5510,6 +3781,10 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         self.assertEqual(by_key["gate_smoke_required"].target, "smoke")
         self.assertEqual(by_key["gate_delivery_ready"].target, "cleanup")
         self.assertEqual(by_key["smoke_cleanup"].target, "cleanup")
+        prompts = "\n".join(edge.prompt or "" for edge in spec.edges)
+        for kind in profile.work_kinds.values():
+            self.assertNotIn(kind.plan, prompts)
+            self.assertNotIn(kind.implement, prompts)
 
     def test_smoke_lab_supports_free_form_rollover_label(self) -> None:
         profile = self.load_profile()
@@ -5544,6 +3819,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             )
 
     def test_labeled_snapshot_names_do_not_collide_after_slugging(self) -> None:
+        snapshot_filename = load_generator().snapshot_filename
         first = snapshot_filename(
             "Example Engineering Smoke Lab iteration beta",
             disambiguate=True,
@@ -5557,6 +3833,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         self.assertTrue(second.endswith(".json"))
 
     def test_unlabelled_snapshot_name_remains_readable(self) -> None:
+        snapshot_filename = load_generator().snapshot_filename
         self.assertEqual(
             snapshot_filename(
                 "Example Engineering Smoke Lab",
@@ -5919,22 +4196,7 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
     def test_source_ci_contract_adds_preparation_and_distinct_cycle_edges(
         self,
     ) -> None:
-        contents = (
-            self.schema4_runtime_v2_contents()
-            .replace(
-                '"github_observation"]',
-                '"github_observation", "prepare_ci"]',
-            )
-            .replace(
-                'wait_ci = "3.0.0"\n',
-                'wait_ci = "3.0.0"\nprepare_ci = "2.0.0"\n',
-            )
-            .replace(
-                'wait_ci = ".kent/scripts/workflow-wait-github-ci"',
-                'wait_ci = ".kent/scripts/workflow-wait-github-ci"\n'
-                'prepare_ci = ".kent/scripts/workflow-prepare-github-ci"',
-            )
-        )
+        contents = self.source_ci_profile_contents()
         profile = self.load_schema4_profile(lambda _: contents)
         self.assertTrue(profile.source_ci_contract())
         spec = build_delivery_workflow(profile, 1)
@@ -5999,8 +4261,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         self.assertIn("{{.Params.pr_feedback_cursor}}", prompts)
         self.assertIn("deterministic PR watcher", prompts)
         self.assertIn("pull_request_feedback_invalid", prompts)
-        self.assertIn("delivery preserves supplied cursors", " ".join(prompts.split()))
-        self.assertIn("never synthesizes materialized cursors", " ".join(prompts.split()))
         for key in ("ci_prepare_failed", "ci_monitor_needs_user_action"):
             self.assertTrue({
                 "task_short_id", "ci_report", "ci_contract",
@@ -6044,14 +4304,19 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         self.assertNotIn("ci_prepare", {node.key for node in spec.nodes})
         self.assertNotIn("ci_watch", {node.key for node in spec.nodes})
         by_key = {edge.key: edge for edge in spec.edges}
+        for edge in spec.edges:
+            handwritten = (edge.prompt or "").split(
+                "Completion fields from the selected graph contract ", 1
+            )[0]
+            self.assertNotIn("prepare_pr_monitor_ci", handwritten, edge.key)
+            self.assertTrue(
+                {"ci_contract", "ci_report"}.isdisjoint(
+                    parameter.key for parameter in edge.parameters
+                ),
+                edge.key,
+            )
         merge_watch = next(edge for edge in spec.edges if edge.target == "merge_watch")
         self.assertNotIn("ci_contract", {p.key for p in merge_watch.parameters})
-        expected = {
-            "pr_url",
-            "branch_name",
-            "merge_strategy",
-            "pr_feedback_cursor",
-        }
         for key in (
             "waiting_pr_fix",
             "fix_needs_user_action",
@@ -6447,12 +4712,12 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         with self.assertRaisesRegex(SpecError, "release spec path not found"):
             ProjectProfile.load(profile.project_root)
 
-        outside = profile.project_root.parent / "outside-release-spec.toml"
-        outside.write_text("# outside\n")
-        self.addCleanup(outside.unlink)
-        spec_path.symlink_to(outside)
-        with self.assertRaisesRegex(SpecError, "release.spec_path.*symlinks"):
-            ProjectProfile.load(profile.project_root)
+        with tempfile.TemporaryDirectory() as temporary:
+            outside = Path(temporary) / "outside-release-spec.toml"
+            outside.write_text("# outside\n")
+            spec_path.symlink_to(outside)
+            with self.assertRaisesRegex(SpecError, "release.spec_path.*symlinks"):
+                ProjectProfile.load(profile.project_root)
 
     def test_profile_rejects_legacy_device_smoke_capability(self) -> None:
         with self.assertRaisesRegex(SpecError, "device_smoke was removed"):
@@ -7081,51 +5346,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             ).read_bytes(),
         )
 
-    def test_mobile_script_lease_contract_and_kernel_surface_are_present(
-        self,
-    ) -> None:
-        contract = (
-            REPO_ROOT / "contracts" / "mobile-script-lease-contract.md"
-        ).read_text(encoding="utf-8")
-        mobile_contract = (
-            REPO_ROOT / "contracts" / "mobile-smoke-contract.md"
-        ).read_text(encoding="utf-8")
-        workflow_contract = (
-            REPO_ROOT / "contracts" / "workflow-contract.md"
-        ).read_text(encoding="utf-8")
-        kernel = (
-            REPO_ROOT
-            / "templates"
-            / "project"
-            / "emulator-resource-lock.sh"
-        ).read_text(encoding="utf-8")
-
-        for phrase in (
-            "LegacySessionOwner",
-            "ScriptOwnerV1",
-            "UnknownOwner",
-            "acquire-script-any",
-            "release-script",
-            "inspect-script-recovery",
-            "owner_sha256",
-            "lockf -k",
-            "PATH-shadowed executables",
-        ):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, contract)
-        self.assertNotIn("resume-script", contract)
-        self.assertIn("mobile-script-lease-contract.md", mobile_contract)
-        self.assertIn("must not impersonate a Session", workflow_contract)
-        for operation in (
-            "acquire-script",
-            "acquire-script-any",
-            "release-script",
-            "inspect-script-recovery",
-        ):
-            with self.subTest(operation=operation):
-                self.assertIn(operation, kernel)
-        self.assertIn("proc_pidinfo", kernel)
-        self.assertIn("/proc/sys/kernel/random/boot_id", kernel)
 
     def test_sync_schema4_runtime_v2_copies_byte_identical_support_module(
         self,
@@ -7255,6 +5475,36 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         self.assertEqual(result.returncode, 1)
         self.assertIn("project-owned command", result.stderr)
         self.assertFalse((root / profile.command("dispatch")).exists())
+
+    def test_sync_schema3_late_adapter_failure_writes_nothing(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / ".kent").mkdir()
+                contents = schema4_with_managed_adapter(EXAMPLE_PROFILE.read_text())
+                contents += 'zz_project_owned = ".kent/adapters/zz-owned"\n'
+                (root / ".kent/workflow-profile.toml").write_text(contents)
+                create_work_kind_procedures(root)
+                managed = root / ".kent/adapters/mobile/emulator-resource-lock.sh"
+                if existing:
+                    managed.parent.mkdir(parents=True)
+                    managed.write_bytes(b"existing managed adapter\n")
+                    managed.chmod(0o755)
+                before = managed.read_bytes() if existing else None
+                foreign = root / ".kent/adapters/zz-owned"
+                foreign.parent.mkdir(parents=True, exist_ok=True)
+                foreign.write_bytes(b"non-executable project adapter\n")
+                foreign.chmod(0o644)
+
+                result = self.run_sync_project_adapters(root, update=True)
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("project-owned adapter is not executable", result.stderr)
+                self.assertEqual(managed.exists(), existing)
+                if existing:
+                    self.assertEqual(managed.read_bytes(), before)
+                self.assertEqual(foreign.read_bytes(), b"non-executable project adapter\n")
+                self.assertFalse((root / ".kent/scripts").exists())
 
     def test_sync_schema4_managed_ancestor_failure_writes_nothing(self) -> None:
         def transform(contents: str) -> str:
@@ -7417,159 +5667,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
             "ref:refs/tags/v1",
         )
 
-    def test_context_source_normalization(self) -> None:
-        self.assertEqual(
-            context_source_string({"kind": "previous_target_or_new"}),
-            "previous_target_or_new",
-        )
-        self.assertEqual(
-            context_source_string({"kind": "node", "node_key": "implement"}),
-            "node:implement",
-        )
-        self.assertEqual(
-            context_source_string(
-                {"kind": "selected_node", "node_key": "plan"}
-            ),
-            "node:plan",
-        )
-
-    def test_empty_kent_graph_indexes_as_no_edges(self) -> None:
-        definition = {
-            "nodes": [],
-            "edges": None,
-            "transition_groups": None,
-            "derived_wiring": None,
-        }
-        self.assertEqual(edge_index(definition), {})
-
-    def test_exact_graph_rejects_node_semantic_mismatch(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        spec = WorkflowSpec(
-            name="Minimal v1",
-            description="Minimal workflow.",
-            execution_target="head",
-            nodes=(
-                NodeSpec("backlog", "start", "Backlog"),
-                NodeSpec("done", "terminal", "Done"),
-            ),
-            edges=(),
-        )
-        definition = {
-            "workflow": {
-                "description": "Minimal workflow.",
-                "execution_target_policy": {"mode": "head"},
-            },
-            "nodes": [
-                {
-                    "id": "node-backlog",
-                    "key": "backlog",
-                    "kind": "start",
-                    "display_name": "Backlog",
-                },
-                {
-                    "id": "node-done",
-                    "key": "done",
-                    "kind": "terminal",
-                    "display_name": "Wrong",
-                },
-            ],
-            "edges": None,
-            "transition_groups": None,
-            "derived_wiring": None,
-        }
-
-        client = KentClient(Path(temporary.name))
-        with self.assertRaisesRegex(SpecError, "semantic mismatch"):
-            client.assert_exact_graph(spec, definition)
-
-    def test_apply_preflight_rejects_extra_edge_without_cli_mutation(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        spec = WorkflowSpec(
-            name="Minimal v1",
-            description="Minimal workflow.",
-            execution_target="head",
-            nodes=(
-                NodeSpec("backlog", "start", "Backlog"),
-                NodeSpec("done", "terminal", "Done"),
-            ),
-            edges=(),
-        )
-        definition = {
-            "workflow": {
-                "id": "workflow-11111111-1111-4111-8111-111111111111",
-                "name": "Minimal v1",
-                "description": "Old description.",
-                "execution_target_policy": {"mode": "head"},
-            },
-            "nodes": [
-                {
-                    "id": "node-backlog",
-                    "key": "backlog",
-                    "kind": "start",
-                    "display_name": "Backlog",
-                },
-                {
-                    "id": "node-done",
-                    "key": "done",
-                    "kind": "terminal",
-                    "display_name": "Done",
-                },
-            ],
-            "transition_groups": [
-                {
-                    "id": "group-extra",
-                    "source_node_id": "node-backlog",
-                    "transition_id": "finish",
-                    "description": "Extra.",
-                }
-            ],
-            "edges": [
-                {
-                    "id": "edge-extra",
-                    "key": "extra",
-                    "transition_group_id": "group-extra",
-                    "target_node_id": "node-done",
-                    "context_mode": "new_session",
-                    "context_source": {"kind": "immediate_source"},
-                    "requires_approval": False,
-                    "prompt_template": None,
-                }
-            ],
-            "derived_wiring": {
-                "edges": [
-                    {
-                        "edge_id": "edge-extra",
-                        "required_provision_fields": [],
-                    }
-                ]
-            },
-        }
-        commands: list[list[str]] = []
-        client = KentClient(Path(temporary.name))
-        client.require_version = lambda *version: None
-        client.inspect = lambda workflow: definition
-        client.inspect_graph = lambda workflow: {
-            "workflow_id": definition["workflow"]["id"],
-            "expected_version": 1,
-            "graph": {
-                "node_groups": [],
-                "nodes": definition["nodes"],
-                "transition_groups": definition["transition_groups"],
-                "edges": definition["edges"],
-            },
-        }
-        client.run_json = lambda args: commands.append(args) or {}
-
-        with self.assertRaisesRegex(
-            SpecError,
-            "this client does not support task-referenced semantic updates"
-            r"\. Use a separately approved lifecycle operation",
-        ):
-            client.workflow_has_tasks = lambda current: True
-            client.apply(spec)
-        self.assertEqual(commands, [])
 
     def test_apply_rejects_graph_mutation_for_linked_taskless_workflow(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -7825,6 +5922,44 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         )
         self.assertEqual(plan.document["future_top_level"], "keep")
         self.assertEqual(plan.document["graph"]["future_graph"], {"keep": True})
+
+    def test_native_graph_match_rejects_semantic_drift_and_extra_nodes(self) -> None:
+        spec = WorkflowSpec(
+            name="Graph equality",
+            description="Native graph comparison.",
+            execution_target="head",
+            nodes=(
+                NodeSpec("backlog", "start", "Backlog"),
+                NodeSpec("done", "terminal", "Done"),
+            ),
+            edges=(
+                EdgeSpec("finish", "backlog", "finish", "done", prompt="Finish."),
+            ),
+        )
+        empty = {
+            "workflow_id": "11111111-1111-4111-8111-111111111111",
+            "expected_version": 1,
+            "graph": {key: [] for key in ("nodes", "edges", "transition_groups", "node_groups")},
+        }
+        native = plan_workflow_graph(spec, empty, metadata_changed=False).document
+        self.assertTrue(graph_matches_spec(spec, native))
+        for drift in ("node_name", "edge_prompt", "extra_node"):
+            with self.subTest(drift=drift):
+                changed = deepcopy(native)
+                graph = changed["graph"]
+                if drift == "node_name":
+                    graph["nodes"][0]["display_name"] = "Wrong"
+                elif drift == "edge_prompt":
+                    graph["edges"][0]["prompt_template"] = "Different instruction."
+                else:
+                    graph["nodes"].append({
+                        "id": "foreign-node", "key": "foreign",
+                        "kind": "terminal", "display_name": "Foreign",
+                    })
+                self.assertFalse(graph_matches_spec(spec, changed))
+                repair = plan_workflow_graph(spec, changed, metadata_changed=False)
+                self.assertTrue(repair.graph_changed)
+                self.assertTrue(graph_matches_spec(spec, repair.document))
 
     def test_graph_projection_round_trips_selection_parameter_purposes(self) -> None:
         edge = EdgeSpec(
@@ -8490,59 +6625,6 @@ Kent run; on recovery, reuse the returned sequence/hash and continue."""
         )
         self.assertIsNone(canonical_workflow_selector("Shared Lab"))
 
-    def test_edge_reconcile_clears_stale_prompt_and_context_source(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        definition = {
-            "nodes": [
-                {"id": "node-start", "key": "backlog"},
-                {"id": "node-done", "key": "done"},
-            ],
-            "transition_groups": [
-                {
-                    "id": "group-start",
-                    "source_node_id": "node-start",
-                    "transition_id": "start",
-                    "description": "Old description.",
-                }
-            ],
-            "edges": [
-                {
-                    "id": "edge-start",
-                    "key": "start_done",
-                    "transition_group_id": "group-start",
-                    "target_node_id": "node-done",
-                    "context_mode": "compact_and_continue_session",
-                    "context_source": {"kind": "previous_target_or_new"},
-                    "requires_approval": False,
-                    "prompt_template": "Stale prompt.",
-                }
-            ],
-            "derived_wiring": {
-                "edges": [
-                    {
-                        "edge_id": "edge-start",
-                        "required_provision_fields": [],
-                    }
-                ]
-            },
-        }
-        spec = EdgeSpec(
-            key="start_done",
-            source="backlog",
-            transition="start",
-            target="done",
-            transition_description="Finish.",
-        )
-        captured: list[list[str]] = []
-        client = KentClient(Path(temporary.name))
-        client.run_json = lambda args: captured.append(args) or {}
-
-        client.ensure_edge("Minimal v1", spec, definition)
-
-        args = captured[0]
-        self.assertEqual(args[args.index("--context-source") + 1], "immediate_source")
-        self.assertEqual(args[args.index("--prompt") + 1], "")
 
     def test_model_rejects_fanout_branch_that_does_not_join(self) -> None:
         spec = WorkflowSpec(

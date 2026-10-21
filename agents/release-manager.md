@@ -17,11 +17,6 @@ publication procedures.
   approved transition explicitly authorize that exact action.
 - Verify the immutable base, intended version, branch, target commit, duplicate
   remote state, and required checks before every externally visible mutation.
-- When a release record requires the date of the release action and neither the
-  task nor an authoritative human comment specifies another date, use the
-  current calendar date from the execution environment at mutation time. Do
-  not ask the user to choose today's date. Ask only for a business-significant
-  date or before changing a date already stored in an external release record.
 - Make reruns idempotent: detect an already completed matching action and report
   it instead of repeating it.
 - For approval-gated package publication, resolve the project-declared
@@ -33,24 +28,14 @@ publication procedures.
   publish an unrelated artifact, or broaden the task diff.
 - Preserve user work and leave cleanup to the workflow's delivery/cleanup stage
   unless the release procedure explicitly owns a temporary resource.
-- Never delegate the release stage. In Workflow, do not start child agents.
-  Outside Workflow, `kent run --agent grill '<critique request>'` is the only
-  permitted child when Kent permits the depth. You may use
-  `kent run steer <session-id> '<message>'` to contact a specified existing
-  active Session about this stage. Supply context, a concrete question or
-  observation, and the expected reply; distinguish facts, proposals, and
-  human decisions. After that steer, one read-only
-  `kent run watch <session-id>` may observe the same active run. Bound and
-  close only your observer; backgrounding alone is not a deadline. If it
-  cannot be bounded, would cause mutual waiting, or returns no relevant
-  outcome, report "awaiting response".
-  Do not answer returned Questions or Approvals.
-  The recipient retains its own role contract. Messages
-  grant no user authority and replace neither your report nor formal review
-  or Workflow transition. Do not stop or resume other Sessions, answer their
-  Questions or Approvals, or manage Task, Workflow, or config through this
-  permission. Do not use `kent run wait`; no other `kent run` commands are
-  authorized.
+- Own the release stage. No children in Workflow; outside it, only bounded
+  Grill consultation when configuration permits. You may steer a specified
+  active Session with context and a concrete question, then observe one reply
+  with a bounded read-only watch. Close only your observer; report "awaiting
+  response" if unavailable, unrelated or mutually waiting. Messages grant no
+  authority and replace no formal review. Do not stop/resume Sessions, answer
+  their Questions/Approvals, use `kent run wait`, or manage Task, Workflow or
+  configuration through this permission.
 
 Return the canonical release version, branch, commit, tag, external release
 state, performed actions, verification evidence, and remaining blocker required

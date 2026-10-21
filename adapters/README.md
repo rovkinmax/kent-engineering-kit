@@ -95,8 +95,8 @@ policy remain project-owned.
 Unknown non-mobile tools require `--allow-mutate` by default. A project may
 classify its own tools with executable `.kent/adapters/mcp/policy`; it receives
 `<server.tool>` and `action` and prints exactly `read-only`, `mutating`,
-`blocked`, or `inherit`. The adapter resolves this hook from the primary Git
-worktree so managed worktrees share one policy.
+`blocked`, or `inherit`. The adapter checks the current worktree's hook first,
+then the primary Git worktree fallback.
 
 ## Gradle shell postprocessor
 
@@ -120,14 +120,6 @@ postprocess_hook = "~/.kent/hooks/gradle-worktree-warning"
 Kent resolves relative postprocessor paths from the service process working
 directory. Use the stable home-relative installed path rather than a
 project-relative path.
-
-## Gradle UI story-change evidence
-
-Projects that opt into checking changes to supported UI can use the
-[story-change policy](gradle/story-change-policy.md) and its
-[bounded evidence validator](gradle/story_change_evidence.py). The adapter
-validates evidence structure and status; each project owns adoption and review
-of actual registry membership, source changes, and check results.
 
 ## Jira source adapter
 
@@ -244,18 +236,10 @@ Kent session on the machine.
 
 ### Mobile resource-lock interface
 
-Before calling the adapter, run the profile evidence command's read-only
-`identity --task <short-id> --workspace <root>` subcommand. Its closed JSON
-contains `task_id`, `task_short_id`, `project_id`, `workspace_path`, and
-`session_id`; it verifies the inherited canonical Session UUID against the
-current native Task/project/workspace. It does not require Step or R2/retention
-admission. Never parse diagnostic `kent session-id` output, invent or replace
-the inherited Session UUID, or treat a historical-only Session as current.
-Numeric short IDs are selectors, never durable Session/evidence owners.
-Kent does not promise to export `KENT_TASK_ID`; set it from the verified Task
-short ID and preserve the inherited `KENT_SESSION_ID`. New leases use the Task short ID as
-owner identity. A legacy native-ID owner may be retained only when native
-readback proves its short-ID mapping.
+Use the qualified profile identity command before acquisition. Preserve genuine
+current Session identity and verified Task short-ID lease ownership. Full
+binding, recovery and preservation rules belong to the
+[Mobile Smoke contract](../contracts/mobile-smoke-contract.md).
 
 The stdout API is command-specific: `acquire` emits a bare token, while
 `acquire-any` emits exactly `resource=<id>` and then `token=<value>`. Parse the

@@ -42,18 +42,7 @@ CODER_SELECTION_TARGETS = {
     "simple": ("implementation-simple", "xhigh"),
     "complex": ("implementation-complex", "medium"),
 }
-CODER_SELECTION_FENCE = re.compile(
-    r"(?ms)^```json[ \t]*\r?\n(.*?)^```[ \t]*$"
-)
-IMPLEMENTATION_ROLES = {
-    "implementation-worker",
-    "implementation-simple",
-    "implementation-complex",
-}
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-CHECKBOX = re.compile(
-    r"^(\s*(?:(?:[-*+]|\d+[.)])\s+|#{1,6}\s+)\[)[ xX](\])"
-)
 CODER_SELECTION_POLICY = {"disabled", "complexity"}
 DEFAULT_KENT_PATHS = (
     str(Path.home() / ".kent" / "bin" / "kent"),
@@ -210,51 +199,25 @@ def duplicate_free_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def plan_contract_adapter():
+    source = Path(__file__).with_name("workflow-plan-contract")
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("qualified plan contract adapter unavailable")
+    loader = importlib.machinery.SourceFileLoader("branch_memory_contract", str(source))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ValueError("plan contract adapter cannot be loaded")
+    contract = importlib.util.module_from_spec(spec)
+    loader.exec_module(contract)
+    return contract
+
+
 def normalized_plan_bytes(path: Path) -> bytes:
-    text = path.read_text(encoding="utf-8")
-    lines = [
-        CHECKBOX.sub(r"\1 \2", line).rstrip()
-        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    ]
-    while lines and not lines[-1]:
-        lines.pop()
-    return ("\n".join(lines) + "\n").encode("utf-8")
+    return plan_contract_adapter().normalized_plan(path).encode("utf-8")
 
 
 def plan_coder_selection(path: Path, *, short_id: str) -> dict[str, str]:
-    contents = path.read_text(encoding="utf-8")
-    selections: list[dict[str, str]] = []
-    for match in CODER_SELECTION_FENCE.finditer(contents):
-        source = match.group(1)
-        if CODER_SELECTION_SCHEMA not in source:
-            continue
-        decoded = json.loads(source, object_pairs_hook=duplicate_free_object)
-        if not isinstance(decoded, dict) or decoded.get("schema") != CODER_SELECTION_SCHEMA:
-            continue
-        if set(decoded) != CODER_SELECTION_FIELDS:
-            raise ValueError("plan coder selection has missing or unknown fields")
-        if (
-            decoded.get("task_short_id") != short_id
-            or not isinstance(decoded.get("complexity"), str)
-            or decoded.get("complexity") not in CODER_SELECTION_TARGETS
-            or not isinstance(decoded.get("rationale"), str)
-            or not decoded["rationale"].strip()
-        ):
-            raise ValueError("plan coder selection is malformed or wrong-task")
-        selections.append(
-            {
-                "schema": CODER_SELECTION_SCHEMA,
-                "task_short_id": short_id,
-                "complexity": decoded["complexity"],
-                "rationale": decoded["rationale"].strip(),
-            }
-        )
-    if len(selections) != 1:
-        raise ValueError(
-            "accepted plan must contain exactly one fenced "
-            f"{CODER_SELECTION_SCHEMA} object; found {len(selections)}"
-        )
-    return selections[0]
+    return plan_contract_adapter().plan_coder_selection(path, short_id)
 
 
 def coder_selection_snapshot(
@@ -266,15 +229,7 @@ def coder_selection_snapshot(
 ) -> tuple[str, str]:
     profile = tomllib.loads((root / ".kent/workflow-profile.toml").read_text())
     if profile.get("project_memory", {}).get("mode") == "r2":
-        source = Path(__file__).with_name("workflow-plan-contract")
-        if source.is_symlink() or not source.is_file():
-            raise ValueError("qualified plan contract adapter unavailable")
-        loader = importlib.machinery.SourceFileLoader("branch_memory_contract", str(source))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        if spec is None:
-            raise ValueError("plan contract adapter cannot be loaded")
-        contract = importlib.util.module_from_spec(spec)
-        loader.exec_module(contract)
+        contract = plan_contract_adapter()
         context = native_payload or {}
         admission = contract.memory_call(root, context, "resolve-task")
         if admission.get("mode") == "r2":

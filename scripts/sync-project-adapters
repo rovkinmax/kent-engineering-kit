@@ -119,7 +119,6 @@ COMMAND_TEMPLATES = {
         "1.0.0",
     ),
 }
-PROJECT_MEMORY_COMMAND_KEYS = ("project_memory", "project_memory_core")
 V2_COMMANDS = {
     "runtime_contracts",
     "verify",
@@ -274,23 +273,6 @@ def apply_synchronization(plan: PlannedSynchronization) -> None:
         target.chmod(0o755)
 
 
-def synchronize(
-    source: Path,
-    target: Path,
-    *,
-    key: str,
-    update: bool,
-) -> str:
-    plan = plan_synchronization(
-        source,
-        target,
-        key=key,
-        update=update,
-    )
-    apply_synchronization(plan)
-    return plan.status
-
-
 def validate_schema4_command_versions(profile: ProjectProfile) -> None:
     for key in profile.kit_managed_commands:
         template = COMMAND_TEMPLATES.get(key)
@@ -307,115 +289,15 @@ def validate_schema4_command_versions(profile: ProjectProfile) -> None:
             )
 
 
-def plan_project_memory_sources(
-    profile: ProjectProfile,
-    project_root: Path,
-    *,
-    update: bool,
-) -> dict[str, PlannedSynchronization]:
-    if not any(profile.command(key) for key in PROJECT_MEMORY_COMMAND_KEYS):
-        return {}
-    plans: dict[str, PlannedSynchronization] = {}
-    for key in PROJECT_MEMORY_COMMAND_KEYS:
-        configured_path = profile.command(key)
-        template = COMMAND_TEMPLATES[key]
-        plans[key] = plan_synchronization(
-            template.source,
-            project_target(project_root, configured_path),
-            key=key,
-            update=update,
-        )
-    return plans
-
-
-def synchronize_schema3(
-    profile: ProjectProfile,
-    project_root: Path,
-    *,
-    update: bool,
-) -> dict[str, list[dict[str, str]]]:
-    results = {"adapters": [], "commands": []}
-    project_memory_plans = plan_project_memory_sources(
-        profile,
-        project_root,
-        update=update,
-    )
-    managed_adapter_keys = set(profile.kit_managed_adapters)
-    for key, configured_path in sorted(profile.adapters.items()):
-        if not configured_path:
-            continue
-        target = project_target(project_root, configured_path)
-        if key in managed_adapter_keys:
-            source = ADAPTER_TEMPLATES.get(key)
-            if source is None:
-                raise ValueError(
-                    f"no toolkit template exists for managed adapter {key!r}"
-                )
-            status_label = synchronize(
-                source,
-                target,
-                key=key,
-                update=update,
-            )
-        else:
-            if not target.is_file():
-                raise ValueError(
-                    f"project-owned adapter not found: {target}"
-                )
-            if not os.access(target, os.X_OK):
-                raise ValueError(
-                    f"project-owned adapter is not executable: {target}"
-                )
-            status_label = "project-owned"
-        results["adapters"].append(
-            {
-                "adapter": key,
-                "status": status_label,
-                "target": str(target),
-            }
-        )
-
-    for key, configured_path in sorted(profile.commands.items()):
-        if not configured_path:
-            continue
-        target = project_target(project_root, configured_path)
-        if key in project_memory_plans:
-            plan = project_memory_plans[key]
-            apply_synchronization(plan)
-            results["commands"].append(
-                {
-                    "command": key,
-                    "status": plan.status,
-                    "target": str(plan.target),
-                }
-            )
-            continue
-        template = COMMAND_TEMPLATES.get(key)
-        if template is None or key in V2_COMMANDS:
-            continue
-        status_label = synchronize(
-            template.source,
-            target,
-            key=key,
-            update=update,
-        )
-        results["commands"].append(
-            {
-                "command": key,
-                "status": status_label,
-                "target": str(target),
-            }
-        )
-    return results
-
-
-def plan_schema4(
+def plan_project_synchronization(
     profile: ProjectProfile,
     project_root: Path,
     *,
     update: bool,
 ) -> tuple[list[PlannedSynchronization], dict[str, list[dict[str, str]]]]:
-    validate_schema4_command_versions(profile)
+    schema4 = profile.schema_version == 4
+    if schema4:
+        validate_schema4_command_versions(profile)
     managed_adapter_keys = set(profile.kit_managed_adapters)
     managed_command_keys = set(profile.kit_managed_commands)
     plans: list[PlannedSynchronization] = []
@@ -456,9 +338,12 @@ def plan_schema4(
     for key, configured_path in sorted(profile.commands.items()):
         if not configured_path:
             continue
+        template = COMMAND_TEMPLATES.get(key)
         target = project_target(project_root, configured_path)
-        if key in managed_command_keys:
-            if key in V2_COMMANDS and not profile.runtime_contracts_v2():
+        if not schema4 and (template is None or key in V2_COMMANDS):
+            continue
+        if not schema4 or key in managed_command_keys:
+            if schema4 and key in V2_COMMANDS and not profile.runtime_contracts_v2():
                 validate_project_owned_target(
                     target,
                     kind="command",
@@ -472,7 +357,6 @@ def plan_schema4(
                     }
                 )
                 continue
-            template = COMMAND_TEMPLATES.get(key)
             if template is None:
                 raise ValueError(
                     f"no toolkit template exists for managed command {key!r}"
@@ -514,20 +398,13 @@ def main() -> int:
         source=str(profile_path),
         check_files=False,
     )
-    if profile.schema_version == 4:
-        plans, results = plan_schema4(
-            profile,
-            project_root,
-            update=args.update,
-        )
-        for plan in plans:
-            apply_synchronization(plan)
-    else:
-        results = synchronize_schema3(
-            profile,
-            project_root,
-            update=args.update,
-        )
+    plans, results = plan_project_synchronization(
+        profile,
+        project_root,
+        update=args.update,
+    )
+    for plan in plans:
+        apply_synchronization(plan)
 
     print(
         json.dumps(

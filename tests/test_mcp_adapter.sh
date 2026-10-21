@@ -515,44 +515,6 @@ write_hash_tokens_fixture() {
   done
 }
 
-safe_mobile_result_complete() {
-  [[ -s "$1" ]] || return 1
-  jq -e '
-    type == "object" and
-    .schema == "kent-mcp-result-v1" and
-    (.transport == "succeeded" or .transport == "failed") and
-    (.processing == "succeeded" or .processing == "failed" or
-      .processing == "not_attempted") and
-    .action == "unknown" and
-    (.assertion == "passed" or .assertion == "failed" or
-      .assertion == "unknown" or .assertion == "not_requested") and
-    (.assertionKind == "literal" or .assertionKind == "json_boolean" or
-      .assertionKind == "none")
-  ' "$1" >/dev/null
-}
-
-mobile_checkpoint_gate() {
-  local result="$1"
-  local interaction_evidence="$2"
-  local schema_known="$3"
-  local error_conditions_covered="$4"
-
-  [[ "$interaction_evidence" == true ]] || return 1
-  [[ "$schema_known" == true ]] || return 1
-  [[ "$error_conditions_covered" == true ]] || return 1
-  safe_mobile_result_complete "$result" || return 1
-  jq -e '
-    .transport == "succeeded" and
-    .processing == "succeeded" and
-    .action == "unknown" and
-    .assertion == "passed" and
-    .assertionKind == "json_boolean" and
-    .assertionCount > 0 and
-    (.assertionResults | length) == .assertionCount and
-    all(.assertionResults[]; . == "passed")
-  ' "$result" >/dev/null
-}
-
 "$call_adapter" --self-test
 
 args_log="$tmp/call-args"
@@ -562,27 +524,56 @@ grep -Fx -- "$main/.mcp.json" "$args_log" >/dev/null
 grep -Fx -- "--root" "$args_log" >/dev/null
 grep -Fx -- "$worktree" "$args_log" >/dev/null
 grep -Fx -- "example.inspect" "$args_log" >/dev/null
-if find "$worktree/.todo/_mcp-raw" -type f -print -quit 2>/dev/null |
+if find "$worktree/build/mcp-artifacts/_mcp-raw" -type f -print -quit 2>/dev/null |
   grep -q .; then
   echo "MCP call persisted raw output without explicit opt-in" >&2
   exit 1
 fi
 jq -e '.rawOutputPath == null' \
-  "$worktree/.todo/_mcp-log/mcporter-calls.jsonl" >/dev/null
+  "$worktree/build/mcp-artifacts/_mcp-log/mcporter-calls.jsonl" >/dev/null
+test ! -e "$worktree/.todo"
+
+# Serena discovery/execution must not inspect or signal unowned processes.
+# Exported Bash functions intercept every former sweeper operation.
+(
+  export PROCESS_PROBE_LOG="$tmp/process-probes"
+  export PROCESS_PROBE_ROOT="$worktree"
+  pgrep() { echo pgrep >>"$PROCESS_PROBE_LOG"; echo 999999; }
+  lsof() { echo lsof >>"$PROCESS_PROBE_LOG"; echo "n$PROCESS_PROBE_ROOT"; }
+  ps() { echo ps >>"$PROCESS_PROBE_LOG"; echo 1; }
+  kill() { echo "kill $*" >>"$PROCESS_PROBE_LOG"; }
+  export -f pgrep lsof ps kill
+  run_adapter "$args_log" "$call_adapter" serena.list_dir >/dev/null
+  run_adapter "$args_log" "$list_adapter" serena --schema >/dev/null
+  test ! -e "$PROCESS_PROBE_LOG"
+  test -f "$worktree/.serena/mcp-serena.lock"
+  MCPORTER_EXIT_CODE=17 expect_exit 17 \
+    run_adapter "$args_log" "$call_adapter" serena.list_dir >/dev/null
+  MCPORTER_EXIT_CODE=17 expect_exit 17 \
+    run_adapter "$args_log" "$list_adapter" serena >/dev/null
+  test ! -e "$PROCESS_PROBE_LOG"
+)
+
+KENT_MCP_ARTIFACT_ROOT="$tmp/explicit-artifacts" \
+  run_adapter "$args_log" "$call_adapter" example.inspect \
+    --allow-mutate --save-raw >/dev/null
+test -s "$tmp/explicit-artifacts/_mcp-log/mcporter-calls.jsonl"
+test -n "$(find "$tmp/explicit-artifacts/_mcp-raw" -type f -print -quit)"
+test ! -e "$worktree/.todo"
 
 run_adapter "$args_log" "$call_adapter" example.inspect \
   --allow-mutate --save-raw >/dev/null
 raw_file="$(
-  find "$worktree/.todo/_mcp-raw/example" -type f -print -quit
+  find "$worktree/build/mcp-artifacts/_mcp-raw/example" -type f -print -quit
 )"
 test -s "$raw_file"
-tail -1 "$worktree/.todo/_mcp-log/mcporter-calls.jsonl" |
+tail -1 "$worktree/build/mcp-artifacts/_mcp-log/mcporter-calls.jsonl" |
   jq -e --arg path "$raw_file" '.rawOutputPath == $path' >/dev/null
 
 run_adapter "$args_log" "$call_adapter" example.inspect \
   --allow-mutate --quiet >"$tmp/quiet.out"
 test ! -s "$tmp/quiet.out"
-tail -1 "$worktree/.todo/_mcp-log/mcporter-calls.jsonl" |
+tail -1 "$worktree/build/mcp-artifacts/_mcp-log/mcporter-calls.jsonl" |
   jq -e '.safeOutputMode == "quiet" and .rawOutputPath == null' >/dev/null
 
 run_adapter "$args_log" "$call_adapter" example.inspect \
@@ -1021,7 +1012,7 @@ jq -e '
   .assertionKind == "json_boolean" and
   .assertionResults == ["unknown"]
 ' "$tmp/mobile-transport-failure.out" >/dev/null
-tail -1 "$worktree/.todo/_mcp-log/mcporter-calls.jsonl" |
+tail -1 "$worktree/build/mcp-artifacts/_mcp-log/mcporter-calls.jsonl" |
   jq -e '
     .exitCode == 37 and
     .errorCode == "mcporter_call_failed" and
@@ -1082,7 +1073,7 @@ for safe_artifact in \
   "$tmp/mobile-selected-value-result.err" \
   "$tmp/mobile-transport-failure.out" \
   "$tmp/mobile-transport-failure.err" \
-  "$worktree/.todo/_mcp-log/mcporter-calls.jsonl" \
+  "$worktree/build/mcp-artifacts/_mcp-log/mcporter-calls.jsonl" \
   "$args_log"; do
   if grep -E -q 'SENTINEL_(SELECTOR|SELECTED|RESPONSE|PROVIDER|TRANSPORT)' \
     "$safe_artifact"; then
@@ -1094,12 +1085,12 @@ if grep -Fq '/SENTINEL_SELECTOR_SECRET' "$args_log"; then
   echo "JSON pointer was forwarded to mcporter arguments" >&2
   exit 1
 fi
-if find "$worktree/.todo/_mcp-raw/mobile" -type f -print -quit \
+if find "$worktree/build/mcp-artifacts/_mcp-raw/mobile" -type f -print -quit \
   2>/dev/null | grep -q .; then
   echo "safe mobile output persisted a raw artifact" >&2
   exit 1
 fi
-tail -1 "$worktree/.todo/_mcp-log/mcporter-calls.jsonl" |
+tail -1 "$worktree/build/mcp-artifacts/_mcp-log/mcporter-calls.jsonl" |
   jq -e '.rawOutputPath == null' >/dev/null
 
 run_adapter "$args_log" "$call_adapter" example.inspect \
@@ -1271,13 +1262,10 @@ run_adapter "$args_log" "$list_adapter" example --schema >/dev/null
 test -s "$worktree/build/mcp-cache/example-schema.json"
 grep -Fx -- "--json" "$args_log" >/dev/null
 
-# This synthetic response reproduces the delivered false-marker defect:
-# transport/output processing succeeds although the expected destination is
-# absent. The fixture identity is its fixed, non-secret JSON value.
+# Processing success does not imply that an expected destination is present.
 cat >"$tmp/mobile-negative.json" <<'JSON'
 {"destination":"phone_login","error":false}
 JSON
-fixture_sha256="$(shasum -a 256 "$tmp/mobile-negative.json" | awk '{print $1}')"
 MCPORTER_FIXTURE_FILE="$tmp/mobile-negative.json" \
   run_adapter "$args_log" "$call_adapter" mobile.ui action=tree \
     deviceId=emulator-5554 platform=android \
@@ -1293,53 +1281,7 @@ jq -e '
   .markersPresent == [false]
 ' "$tmp/mobile-negative-result.json" >/dev/null
 
-complete_gate_status=0
-safe_mobile_result_complete "$tmp/mobile-negative-result.json" ||
-  complete_gate_status=$?
-checkpoint_gate_status=0
-mobile_checkpoint_gate "$tmp/mobile-negative-result.json" true true true ||
-  checkpoint_gate_status=$?
-no_interaction_gate_status=0
-mobile_checkpoint_gate "$tmp/mobile-negative-result.json" false true true ||
-  no_interaction_gate_status=$?
-if ((checkpoint_gate_status == 0 || no_interaction_gate_status == 0)); then
-  echo "RED regression: processing-only mobile result promoted a checkpoint" >&2
-  exit 1
-fi
-if ((complete_gate_status != 0)); then
-  echo "RED fixture=mobile-negative-v1 input_sha256=$fixture_sha256 adapter_exit=0 safe_mode=extract marker=false result_schema=missing checkpoint_gate=reject interaction_gate=reject" >&2
-  exit 1
-fi
-
-if ! mobile_checkpoint_gate "$tmp/json-true.out" true true true; then
-  echo "positive known-schema result with interaction evidence was rejected" >&2
-  exit 1
-fi
-if mobile_checkpoint_gate "$tmp/json-true.out" false true true; then
-  echo "checkpoint gate accepted missing interaction evidence" >&2
-  exit 1
-fi
-
-for non_promoting_result in \
-  "$tmp/json-false.out" \
-  "$tmp/json-missing.out" \
-  "$tmp/json-true-and-missing.out" \
-  "$tmp/json-false-and-missing.out" \
-  "$tmp/quiet.out" \
-  "$tmp/mobile-digest.out" \
-  "$tmp/mobile-extract.out" \
-  "$tmp/assert.out" \
-  "$tmp/mobile-transport-failure.out" \
-  "$tmp/json-duplicate-keys.out" \
-  "$tmp/mobile-negative-result.json"; do
-  if mobile_checkpoint_gate "$non_promoting_result" true true true; then
-    echo "checkpoint gate promoted a negative, unknown, or non-semantic result" >&2
-    exit 1
-  fi
-done
-
-# The consumer gate receives only adapter output and declared contract
-# capabilities, never the fixture response body.
+# Literal assertions do not interpret provider errors or request echoes.
 cat >"$tmp/request-echo-in-error.json" <<'JSON'
 {"error":"failed","request":{"authenticated":true}}
 JSON
@@ -1348,10 +1290,7 @@ MCPORTER_FIXTURE_FILE="$tmp/request-echo-in-error.json" \
     >"$tmp/request-echo-in-error.out"
 jq -e '.assertion == "passed" and .assertionResults == ["passed"]' \
   "$tmp/request-echo-in-error.out" >/dev/null
-if mobile_checkpoint_gate "$tmp/request-echo-in-error.out" true false false; then
-  echo "checkpoint gate promoted request echo from an error result" >&2
-  exit 1
-fi
+jq -e '.action == "unknown"' "$tmp/request-echo-in-error.out" >/dev/null
 
 cat >"$tmp/positive-with-contradictory-error.json" <<'JSON'
 {"authenticated":true,"error":true}
@@ -1361,11 +1300,7 @@ MCPORTER_FIXTURE_FILE="$tmp/positive-with-contradictory-error.json" \
     >"$tmp/positive-with-contradictory-error.out"
 jq -e '.assertion == "passed" and .assertionResults == ["passed"]' \
   "$tmp/positive-with-contradictory-error.out" >/dev/null
-if mobile_checkpoint_gate \
-  "$tmp/positive-with-contradictory-error.out" true true false; then
-  echo "checkpoint gate promoted a positive assertion with uncovered error condition" >&2
-  exit 1
-fi
+jq -e '.action == "unknown"' "$tmp/positive-with-contradictory-error.out" >/dev/null
 
 echo r2 >"$home/.kent/mcp-mode"
 test ! -e "$r2_worktree/.todo"

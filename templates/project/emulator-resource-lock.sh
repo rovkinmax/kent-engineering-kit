@@ -477,14 +477,6 @@ session_id_is_valid() {
   [[ "$session_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]
 }
 
-script_task_id_is_valid() {
-  [[ "$1" =~ ^task-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]
-}
-
-context_sha256_is_valid() {
-  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
-}
-
 resource_is_valid() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._=-]{0,127}$ ]]
 }
@@ -503,9 +495,6 @@ require_lock_identity() {
   fi
 }
 
-LOCK_OWNER_TOKEN=""
-LOCK_OWNER_TASK_ID=""
-LOCK_OWNER_RESOURCE=""
 OWNER_KIND=""
 OWNER_HASH=""
 OWNER_TOKEN=""

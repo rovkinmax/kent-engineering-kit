@@ -676,15 +676,6 @@ def close_descriptors(*descriptors: int) -> None:
         os.close(descriptor)
 
 
-def _unique_json_pairs(pairs):
-    value = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError("duplicate JSON key in runtime evidence")
-        value[key] = item
-    return value
-
-
 def _invalid_json_constant(value):
     raise ValueError("invalid JSON constant in runtime evidence")
 

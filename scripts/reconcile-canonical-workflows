@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare, apply, or forward-rollback a canonical Workflow revision."""
+"""Prepare or apply a reviewed canonical Workflow v2 revision."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from workflowkit.operations import (
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("prepare", "apply", "rollback"))
+    parser.add_argument("mode", choices=("prepare", "apply"))
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--expect-plan-sha256", required=True)
     parser.add_argument("--confirm")
@@ -31,12 +31,9 @@ def main() -> int:
     try:
         plan = load_plan(
             args.plan,
-            schema=(
-                "canonical-workflow-reconcile-plan-v1",
-                "canonical-workflow-reconcile-plan-v2",
-            ),
+            schema="canonical-workflow-reconcile-plan-v2",
             expected_sha256=args.expect_plan_sha256,
-            mutation=args.mode in {"apply", "rollback"},
+            mutation=args.mode == "apply",
             confirm=args.confirm,
         )
         report = reconcile_canonical_workflows(

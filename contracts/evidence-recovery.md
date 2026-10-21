@@ -1,9 +1,7 @@
 # Evidence recovery and retention
 
-This is the additive Delivery Reliability v1 protocol. Legacy unsegmented
-ledgers and terminal cleanup remain supported. Profile intent alone does not
-qualify an old installed helper: rollout must provide the complete capable
-ledger, pure runtime, CI archival, Cleanup and Janitor reader closure.
+Recovery requires the qualified ledger/runtime, archival and terminal-reader
+closure. Legacy unsegmented ledgers remain supported.
 
 ## Trust and identity
 
@@ -14,8 +12,8 @@ membership cannot authorize an effect. Historical Session pagination is not a
 prerequisite when the complete current association already proves ownership.
 There is no `KENT_TASK_ID` assumption or all-project Task inventory.
 
-New writes require canonical Session and Step UUIDs inherited from Kent on
-both 2.9 and 2.10. Ignore stale `KENT_RUN_ID`; never manufacture a Run or use
+New writes require canonical Session and Step UUIDs inherited from Kent.
+Ignore stale `KENT_RUN_ID`; never manufacture a Run or use
 a numeric Session short ID as a durable owner. JSON cannot override ownership.
 Native Task/Session and execution/source workspace bindings are checked;
 the current Step is **not independently authenticated**. New recovery requests
@@ -60,16 +58,14 @@ the provenance classification.
 Pipe that exact request to `recover --task TASK --workspace ROOT --confirm HASH`.
 The helper takes the existing exclusive Task lock and rechecks native ownership
 and the exact raw preimage. The boundary extends sequence/previous/event hashes
-with only genuine owner fields, `record_kind=evidence_recovery_boundary_v1`
-and `recovery_request_sha256`. It contains no synthetic checks, decisions,
+with only genuine owner fields, the request-version-bound boundary kind
+defined above, and `recovery_request_sha256`. It contains no synthetic checks, decisions,
 artifacts, context measurements or acceptance claims. It does not suppress a
-genuine same-Run ordinary event and cannot serve as the final ordinary event.
+genuine ordinary owner event and cannot serve as the final ordinary event.
 
-The continuation is exclusively created and fsynced first. The canonical
-manifest is staged as private
-`build/kent-workflow/TASK/recovery-HASH.tmp`, fsynced and read back, then renamed
-on the same filesystem into the fixed manifest path; both directories are
-fsynced. New manifests contain exactly `schema=evidence-recovery-v2`, `request`,
+Publication exclusively creates the continuation before atomically publishing
+the exact canonical manifest under the existing Task lock, with durable
+readback. New manifests contain exactly `schema=evidence-recovery-v2`, `request`,
 `request_sha256`, and `boundary_event_hash`. A stage is a bounded temporary
 publication artifact, not a registry, packet or third Task runtime entry.
 
@@ -167,11 +163,9 @@ Selection validates the full live source/reference closure and every existing
 prepared file; conflicting, partial or foreign bytes block. A caller-only
 old hash cannot initiate a fresh v1 operation or create a duplicate bundle.
 
-Bundle directories are 0700 and files 0600, owner-bound and no-follow; unsafe
-hardlinks/symlink components are rejected. Source artifacts are streamed from
-admitted regular files into private numbered files `000`, `001`, and so on;
-the receipt preserves their logical identities. Publication uses the private
-external `.preparing-BUNDLE_SHA256` directory and atomic rename. Complete exact
+Bundles are private, owner-bound and no-follow; unsafe links are rejected.
+The qualified helper atomically publishes a digest-bound receipt and admitted
+regular-file contents while preserving their logical identities. Complete exact
 prepared files can be reused; partial/conflicting files are preserved and block.
 Source drift or a second competing inventory blocks. Neither path unseals,
 rewrites or erases evidence.
@@ -190,3 +184,13 @@ suffix or the archive contents. Legacy Tasks without v1 or recovery have no
 retroactive archive obligation. R2 accepted-plan locator/cache schemas and
 exact packet production are separate integration seams; neither is invented
 or reconstructed by this protocol.
+
+## Sealed recovery boundary
+
+A sealed ledger remains immutable. Only an explicitly admitted project recovery
+route may record recovery outside it. Verify genuine current native identity
+and original effect authority, preserve Task/resources on mismatch, and settle
+unknown effects before any new action. Never append, reseal or automatically
+replay a completed/ambiguous cleanup. Project adapters own concrete forwarding,
+pinning, bounds and outcome mapping; shared source approval grants no live
+entry or cleanup permission.

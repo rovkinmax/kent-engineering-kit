@@ -757,6 +757,16 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
             "project_memory": {"root": str(self.base / "memory"), "project_key": "fixture",
                                "project_uid": "project-uid", "legacy_task_ids": ["old-task"]},
         }
+        self.refresh_receipt_files()
+        self.pin()
+        loader = importlib.machinery.SourceFileLoader("source_admission_fixture", str(SCRIPT))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.module = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.module)
+
+    def refresh_receipt_files(self):
+        """Bind each tracked infrastructure input, excluding mutable product data."""
+        self.receipt["files"] = []
         for root in (self.project, self.kit):
             for relative in self.git(root, "ls-files").splitlines():
                 if relative == "product.txt":
@@ -767,11 +777,6 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
                     "root": str(root), "relative_path": relative,
                     "sha256": hashlib.sha256(raw).hexdigest(),
                     "byte_size": len(raw), "mode": stat.S_IMODE(path.stat().st_mode)})
-        self.pin()
-        loader = importlib.machinery.SourceFileLoader("source_admission_fixture", str(SCRIPT))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        self.module = importlib.util.module_from_spec(spec)
-        loader.exec_module(self.module)
 
     @staticmethod
     def put(root, relative, text, mode=0o644):
@@ -827,17 +832,7 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         self.receipt["source_commit"] = self.commits[self.project]
         self.receipt["kit_commit"] = self.commits[self.kit]
         self.receipt["project_memory"]["legacy_task_ids"] = list(legacy_task_ids)
-        self.receipt["files"] = []
-        for root in (self.project, self.kit):
-            for relative in self.git(root, "ls-files").splitlines():
-                if relative == "product.txt":
-                    continue
-                path = root / relative
-                raw = path.read_bytes()
-                self.receipt["files"].append({
-                    "root": str(root), "relative_path": relative,
-                    "sha256": hashlib.sha256(raw).hexdigest(),
-                    "byte_size": len(raw), "mode": stat.S_IMODE(path.stat().st_mode)})
+        self.refresh_receipt_files()
         self.pin()
 
         self.home = self.base / "home"
@@ -891,17 +886,7 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
             self.git(root, "update-ref", "refs/remotes/origin/main", head)
         self.receipt["source_commit"] = self.commits[self.project]
         self.receipt["kit_commit"] = self.commits[self.kit]
-        self.receipt["files"] = []
-        for root in (self.project, self.kit):
-            for relative in self.git(root, "ls-files").splitlines():
-                if relative == "product.txt":
-                    continue
-                path = root / relative
-                raw = path.read_bytes()
-                self.receipt["files"].append({
-                    "root": str(root), "relative_path": relative,
-                    "sha256": hashlib.sha256(raw).hexdigest(),
-                    "byte_size": len(raw), "mode": stat.S_IMODE(path.stat().st_mode)})
+        self.refresh_receipt_files()
         self.pin()
         profile_raw = (self.project / ".kent/workflow-profile.toml").read_bytes()
         self.installation_binding["profile_sha256"] = hashlib.sha256(profile_raw).hexdigest()
@@ -1545,6 +1530,8 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         self.put(self.project, "product.txt", "dirty primary\n")
         with self.assertRaises(ValueError):
             self.inspect()
+        self.commit(self.project)
+        self.inspect()
         with self.assertRaises(ValueError):
             self.inspect(workspace_path=self.kit)
 
@@ -1554,7 +1541,7 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.inspect(workspace_path=clone)
 
-    def test_git_environment_routing_and_replacement_refs_do_not_select_another_repository(self):
+    def test_git_environment_routing_does_not_select_another_repository(self):
         with mock.patch.dict(os.environ, {"GIT_DIR": str(self.kit / ".git"),
                                          "GIT_WORK_TREE": str(self.kit),
                                          "GIT_CONFIG_COUNT": "1",
@@ -1571,7 +1558,7 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.module.git(self.project, "rev-parse", "HEAD", maximum=1)
 
-    def test_receipt_and_source_symlink_ancestors_are_rejected(self):
+    def test_receipt_symlink_ancestor_and_unsafe_mode_are_rejected(self):
         alias = self.base / "evidence-alias"
         alias.symlink_to(self.evidence, target_is_directory=True)
         with self.assertRaises(ValueError):

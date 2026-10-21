@@ -6,3 +6,5 @@ __pycache__/
 /.kent/runtime/
 /.kent/retained-evidence/
 /build/kent-workflow/
+/build/mcp-artifacts/
+/.todo/

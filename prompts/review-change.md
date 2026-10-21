@@ -6,36 +6,39 @@ behavior.
 # Preparation
 
 1. Resolve and pin the comparison baseline.
-2. Verify the diff is non-empty.
+2. Establish the requested diff or document scope.
 3. Find the governing specification, task, plan, or acceptance criteria.
 4. Find applicable `AGENTS.md`, architecture, and coding-standard sources.
 
-# Parallel Review
+# Review
 
-Resolve reviewer callability and tool permissions from the effective project
-and global configuration before starting. If two callable, read-only
-project-specialized roles can cover both axes, assign one to each. Otherwise,
-run two separate `researcher` sessions, each with its corresponding
-`agents/standards-reviewer.md` or `agents/spec-reviewer.md` contract. Use two
-independent sessions in parallel:
+Examine both axes:
 
 - Standards: repository rules, architecture, maintainability, and regression
   risks.
 - Specification fidelity: missing requirements, incorrect behavior, and scope
   creep.
 
-Give each session the exact baseline, diff command, commit list, relevant
+Ordinary review may cover both axes directly, disclosing its independence
+limits. Delegate only when independent sessions are required by governance or
+useful for the scope. In that case, check effective callability and tools first:
+use qualified read-only specialists, or callable `researcher` sessions with the
+corresponding `agents/standards-reviewer.md` or `agents/spec-reviewer.md` contract.
+
+Give each delegated session the exact baseline, diff command, commit list, relevant
 sources, and its applicable review contract. Prohibit edits, external effects,
 and further delegation. Do not invoke workflow-only roles that are not
 callable, change configuration or permissions to enable them, or duplicate a
 review pass owned by an active generated Delivery workflow. If effective
-policy cannot support both independent read-only reviews, report the capability
-blocker and do not claim the review is complete.
+policy cannot support required independent reviews, report the capability gap.
+For ordinary review, complete the available pass and disclose its independence
+limits without manufacturing a new approval requirement.
 
 # Synthesis
 
-Present the two reports separately. Do not collapse findings into one ranking;
-a change may pass one axis and fail the other.
+Preserve each axis's result and source references. Deduplicate overlapping
+findings into a prioritized synthesis; a change may pass one axis and fail the
+other.
 
 End with:
 

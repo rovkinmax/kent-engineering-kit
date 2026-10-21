@@ -1,181 +1,97 @@
 # Plan Review And Contract Revalidation
 
-## Planning Co-design And Decision Sources
+## Planning and authority
 
-After discovery and a concrete draft, Plan invokes one bounded read-only grill
-leaf before freeze and formal review. Simple work needs only short critique;
-do not invent architectural choices. Plan owns questions, source verification,
-dispositions and the authoritative artifact. Grill cannot edit, ask the user,
-spawn children or supply a formal PASS receipt. Project-owned independent
-review and approval gates remain unchanged.
+Plan owns discovery, decisions, dispositions and the authoritative artifact.
+Use bounded read-only critique for material uncertainty when it earns its cost;
+do not require a universal preliminary Grill pass. Independent Plan Review and
+applicable project governance/approval gates remain mandatory.
 
-Use [Durable context and recovery](../skills/kent-engineering-kit/references/durable-context.md)
-for the source-discovery procedure and the distinction between a reference,
-an accepted plan, and actual human authority. The `inspect` operation also
-searches `ledger.summary` for decision references;
-do not omit a decision pointer merely because it was stored there.
+Use [durable context](../skills/kent-engineering-kit/references/durable-context.md)
+to resolve task-fixed storage and original decisions. Preserve exact applicable
+human sources and scope in the plan or discoverable permitted report-only
+artifact. A proposal and its acceptance form a linked pair. Agent summaries,
+accepted snapshots and locators do not authenticate human consent.
 
-For R2 acceptance, if the current review text and normalized plan contain no
-tagged source references, the adapter may preserve locators found in the
-validated logical Task ledger, including `summary`. This fallback recovers
-pointers only; it does not parse an untrusted suffix or verify authorship,
-scope, or consent. The existing review gate still owns source verification.
+Recover missing agent bookkeeping from accessible sources; disclose genuine
+authority gaps. Do not ask for the same decision or create a parallel authority
+registry. Transient `review_context` is not the sole store: routes can omit it.
 
-Revalidation repeats grill critique only for substantive requirements, API/UX,
-architecture, authority, safety/effects, cost or evidence-strategy changes,
-or execution evidence disproving the approach. Hash drift, checkbox progress,
-typos, waiting and repeated identical failures alone are not triggers. Do not
-add routine grill calls to Fix, CI, Smoke, delivery or formal review leaves.
-Unavailable effective leaf eligibility is a concrete blocker, not a bypass.
+## Stage and evidence milestones
 
-Keep exact applicable human decision references and scope in the authoritative
-plan or existing permitted report-only evidence artifact. Make report-only
-evidence discoverable through Task records even when plan_path is
-`not-applicable`. Carry artifact pointers and relevant source context through
-review_context; reviewers add findings without replacing those references.
-Revalidation preserves applicable sources and explicitly identifies actual
-supersession. Human acceptance of an agent proposal requires the proposal and
-the exact acceptance as a linked pair.
+Specify what the current authorized stage must prove and every deferred
+obligation's responsible owner and due milestone. Preserve all actual
+constraints, including capture/reset/tool restrictions and consumed attempts.
+An explicitly authorized review-ready PR can retain external `UNVERIFIED`;
+that is not full business acceptance, merge/release authority or Task Done.
+The distinction also applies without Compliance or PR stages.
 
-Recover accessible original messages, native Question answers/comments or
-retained native read results before escalating missing agent bookkeeping.
-Agent audits are pointers, not consent. Historical author metadata and
-truncated bodies cannot establish missing permission. Disclose unavailable
-or conflicting authority; real new scope still requires a decision.
+Current-stage blockers still block. Changed authority or milestones require
+fresh independent review; neither Gate synthesis nor plan editing can turn an
+old BLOCKED report into PASS.
 
-The existing start/continue routes preserve plan_path but omit review_context;
-verify preserves review_context, and fix_continue preserves fix_context.
-Transient context is therefore not the sole authority store. Do not add an
-authority registry or repurpose plan_route_context, which owns remaining Fix
-work. Reference recovery does not waive project-owned approval gates.
+Keep a compact current working plan with immutable-history references. Ordinary
+Task plans are not portfolio JSON. Use the adapter's declared framing and
+preflight the complete request bytes; do not raise global limits or split
+away real restrictions to make a request fit.
 
 ## Owner-requested replanning
 
-Generated Fix and enabled Compliance expose `replan` to retained Plan
-Revalidation (`continue_session`, `node:plan`) before production edits. The
-producer reads the accepted task-bound snapshot from the legacy local cache or
-the admitted R2 external store, verifying schema, task identity,
-normalized-plan UTF-8 digest, plan locator (or authorized report-only
-sentinel), and profile work kind. In R2 mode the external accepted snapshot is
-authoritative; the local cache is only a validated locator. Missing/conflicting
-identity is an evidence blocker, never permission to invent a snapshot.
-`plan_change_report` distinguishes deterministic drift from agent-reported
-substantive findings. Ordinary within-contract fixes do not require replanning.
+Exposed Fix/Compliance `replan` returns substantive accepted-contract
+discrepancies to retained Plan Revalidation before production edits. Verify
+task-bound accepted snapshot, normalized digest, plan locator/sentinel and work
+kind; label deterministic drift separately from agent findings.
 
-The planner reconciles exact source authority, preserves baseline/completed
-work, and persists remaining findings, evidence pointers and permission
-boundaries in the authoritative plan or permitted discoverable report-only
-artifact before `review_plan`. Normal `continue` omits `review_context`, so
-transient handoff text alone is insufficient. This entry uses route `continue`
-and `plan_route_context=not-applicable`, not a fabricated Fix bundle. If only
-downstream ordering changed, record that no writer-owned work remains; the
-writer proceeds to normal verification without fictitious edits.
+Reconcile original authority, preserve baseline/completed work and persist
+remaining findings/evidence/permission boundaries before review. With no writer
+work left, record that fact; normal verification needs no fictitious edit.
+Ordinary within-contract repairs and execution choices need no replan.
 
-Revalidation runs independent Plan Review and each project's existing acceptance
-gates. It does not introduce universal human approval, waive a required new human
-decision or certify incomplete CI/Smoke. Plan checks complete lifecycle
-feasibility against Task authority and profile/procedures early: verification,
-runtime, PR/publication/CI and cleanup. Technical ordering within authorized
-scope belongs to planning; absent graph capability must be reported concretely,
-not disguised as another request for the same human decision.
+Material requirements, architecture, acceptance, effects, cost or evidence
+changes repeat the required review/acceptance path. Checkbox progress,
+formatting, waiting and unchanged failures alone do not. Lifecycle feasibility
+includes verification, runtime, delivery and cleanup; unavailable capability
+needs a recovery owner, not another request for existing permission.
 
-## Independent Review And Normalization
+## Graph-owned acceptance
 
-Generated Engineering Delivery independently reviews a plan before the first
-writer. The read-only review checks source authority, product decisions,
-acceptance coverage, evidence ownership, dependency boundaries, and executable
-step ordering. Unsupported decisions return to the retained Plan session
-before code changes.
+Independent Plan Review checks authority, acceptance coverage, evidence owners,
+dependencies and executable ordering. The deterministic Plan Contract Accept
+node owns acceptance; writers cannot select it. It adds no universal human
+approval or storage-level authentication of referenced decisions.
 
-The graph-owned deterministic Plan Contract Accept node owns acceptance.
-Writer nodes cannot select this operation. This deterministic acceptance step
-does not add a universal human-approval gate: existing graph and project
-approval requirements remain in force, and a new decision still needs its
-original source. In R2 mode, the adapter verifies that the current native
-Script is the configured acceptance node before writing the external
-accepted-plan head. The generic storage core does not authenticate human
-authority.
+Legacy Tasks retain the existing ignored snapshot. R2's external accepted
+head/snapshot is authoritative; a local cache is only a validated locator.
+Acceptance checks expected working and accepted heads. Publish progress by
+protected compare-and-swap, never by editing immutable revisions.
 
-For legacy Tasks, acceptance stores the existing ignored normalized snapshot
-under `.kent/runtime/<task>/plan-contract.json`. For admitted R2 Tasks, the
-accepted snapshot and its head live in the bound external project store; see
-the durable-context reference for the closed snapshot and local locator
-schemas. Do not require or manufacture a legacy snapshot for an R2 Task.
-Checkbox progress is excluded from normalization; other plan content remains
-contract data. R2 also allows a new immutable working revision when only
-checkbox progress or formatting changes, without changing the accepted
-snapshot.
+Normalization excludes checkbox progress and admitted formatting changes.
+Material normalized drift follows retained Plan Revalidation and independent
+review before a new acceptance. Each continuation/verification guard checks its
+fixed route; unchanged contract resumes that route. `delivery_context` is
+transport state and is excluded from plan content/digest.
 
-For an explicitly enabled complexity-selected writer candidate, the plan
-contains exactly one fenced `coder-selection-v1` JSON object with only
-`schema`, `task_short_id`, `complexity`, and non-empty `rationale`.
-`complexity` is `simple` or `complex`; the typed choice, not a model or role
-string, determines the protected target mapping. Plan Review emits
-`reviewed_normalized_sha256`; acceptance compares it with the current
-normalized plan before writing the existing task-bound snapshot. The accepted
-snapshot records the typed selection bound to that same digest. Before the
-first accepted snapshot, `accepted_plan_sha256` is `not-applicable`; after
-acceptance, review, branch, retry, and revalidation routes preserve the
-authoritative accepted digest.
+For enabled complexity selection, the plan contains one closed
+`coder-selection-v1` object: `schema`, `task_short_id`, `complexity`
+(`simple` or `complex`) and non-empty `rationale`. Review emits
+`reviewed_normalized_sha256`; acceptance binds the typed choice to that digest
+and maps it to protected execution settings. Before acceptance,
+`accepted_plan_sha256=not-applicable`; later routes retain the accepted digest.
+Malformed, stale, duplicate or wrong-task selection returns to planning before
+a writer starts. It cannot be repaired with caller-selected role/model values.
 
-Missing, duplicate, malformed, wrong-task, or stale choices and reviewed
-digest drift return to retained Plan Revalidation before any writer starts.
-Branch retry rechecks the accepted snapshot against the current normalized
-plan and selection. A snapshot choice that differs from the digest-bound plan
-cannot supply protected target values. These checks detect cooperative
-artifact drift; they do not authenticate task-comment order or make approval
-and snapshot writes atomic.
+Digests detect cooperative drift; they do not establish human authorship,
+task-comment order or atomic native transition acceptance.
 
-Every Implement and Fix continuation and transition to verification passes
-through a route-specific graph-owned check node. An unchanged normalized plan
-resumes that fixed route. A material change enters Plan Revalidation in the
-retained planning context, then repeats the independent review before accepting
-the new snapshot.
+## Terminal ownership
 
-Operational feedback that selects an execution detail inside the accepted
-contract stays in the active node. Feedback that changes requirements,
-architecture, acceptance criteria, safety boundaries, or planned evidence
-requires revalidation.
+Cleanup retains exact present cache bytes plus external snapshot locator/digest
+before retiring only the local cache through its qualified helper/procedure.
+A missing cache is read from external acceptance, not recreated by a checker.
+A mismatched cache is an error.
 
-The accepted-plan digest detects plan drift. It does not provide
-task-comment ordering, a monotonic authority revision, or atomic transition
-compare-and-swap. References in a plan or snapshot do not authenticate their
-source. Those guarantees must not be inferred from private database rows or
-fragile CLI text.
-
-The workflow `delivery_context` is transport state, not plan content. Exclude it
-from the accepted-plan snapshot and digest so observed PR or CI state cannot
-trigger plan revalidation.
-
-## Accepted-plan cache terminal ownership
-
-Legacy Tasks keep the existing local snapshot format and cleanup contract.
-For R2 Tasks, the immutable external accepted snapshot is authoritative; the
-local `.kent/runtime/<task>/plan-contract.json` file is only a cache of its
-verified locator. It contains exactly the R2 cache fields documented in the
-durable-context reference, not plan text or a second copy of authority.
-Acceptance may publish or refresh that locator while acceptance remains open.
-Checks read and validate the external accepted snapshot directly when the
-cache is absent; they do not recreate the cache. A mismatch between a present
-cache and the external accepted head is an error.
-
-During terminal preparation, before preparation completes and before Janitor
-retirement, the existing Cleanup owner retains the exact cache bytes when
-present and the external snapshot locator and digest under the project's
-retention protocol, then retires only that cache through the
-existing project seam. A configured non-empty `prepare_cleanup` uses its
-existing helper contract. Without that opt-in, Cleanup owns the same
-byte-verified retention and retirement responsibility; it must not ask Janitor
-to accept or delete the cache. Once terminal preparation or a seal closes
-acceptance, neither report-only preparation nor plan acceptance may recreate
-the local cache.
-
-For recovery of an already successful seal, use only the original retained
-request, report, marker and native final-event provenance with existing
-read-only validators. Do not reconstruct these sources from the seal or append
-or reseal a valid prior success. Missing or conflicting proof blocks.
-Unrelated reports, scripts and credential/device artifacts belong in
-project-owned ignored private storage outside `.kent/runtime/<task>/`, with an
-explicit owner and retention lifetime. Unknown runtime entries remain
-preserved and block terminal cleanup; no wildcard admission or sweep is
-permitted.
+Preparation, seal or sentinel closes acceptance. Retry may validate retained
+state but never recreate a cache, reaccept a plan, append/reseal prior success
+or resurrect report-only state. Retain unknown runtime entries; no wildcard
+sweep. Private reports and credential/device artifacts belong in declared
+ignored storage with owner and lifetime.

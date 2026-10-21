@@ -18,8 +18,10 @@ understanding.
   or inaccessible sources remain an explicit uncertainty.
 - Record durable terminology or architecture decisions through the project's
   declared domain documentation when appropriate.
-- Do not implement the result until the user confirms that the decision tree is
-  sufficiently resolved.
+- For terminology, inspect actual code and domain usage, test definitions with
+  edge cases, and record the chosen term without implementation trivia.
+- Finish when material decisions are resolved. Implementation follows existing
+  scope and approval gates; do not add a universal final confirmation.
 
 # Output
 

@@ -149,7 +149,7 @@ output_ext() {
 
 artifact_root() {
   local root="$1"
-  printf '%s\n' "${KENT_MCP_ARTIFACT_ROOT:-$root/.todo}"
+  printf '%s\n' "${KENT_MCP_ARTIFACT_ROOT:-$root/build/mcp-artifacts}"
 }
 
 append_call_log() {
@@ -773,81 +773,18 @@ with_server_lock_if_needed() {
   if command -v flock >/dev/null 2>&1; then
     (
       flock 9
-      run_serena_command_with_cleanup "$root" "$@"
+      "$@"
     ) 9>"$lock_file"
     return
   fi
 
   if command -v lockf >/dev/null 2>&1; then
-    printf 'serena_lock_cleanup_limited: flock not found; lockf fallback cannot cleanup Kotlin LSP orphans\n' >&2
     lockf "$lock_file" "$@"
     return
   fi
 
   printf 'serena_lock_unavailable: flock/lockf not found; running without serialization\n' >&2
   "$@"
-}
-
-run_serena_command_with_cleanup() {
-  local root="$1"
-  shift
-
-  cleanup_orphan_kotlin_lsp_processes_for_root "$root"
-  set +e
-  "$@"
-  local exit_code=$?
-  set -e
-  cleanup_orphan_kotlin_lsp_processes_for_root "$root"
-  return "$exit_code"
-}
-
-cleanup_orphan_kotlin_lsp_processes_for_root() {
-  local root="$1"
-  local physical_root pid ppid
-  local killed_pids=()
-
-  [[ "${SERENA_SKIP_LSP_CLEANUP:-}" != "1" ]] || return 0
-  command -v lsof >/dev/null 2>&1 || return 0
-
-  physical_root="$(cd "$root" && pwd -P)"
-  while IFS= read -r pid; do
-    [[ -n "$pid" ]] || continue
-    [[ "$(kotlin_lsp_cwd "$pid")" == "$physical_root" ]] || continue
-    ppid="$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d '[:space:]' || true)"
-    [[ "$ppid" == "1" ]] || continue
-    if kill "$pid" 2>/dev/null; then
-      killed_pids+=("$pid")
-    fi
-  done < <(pgrep -f 'com.jetbrains.ls.kotlinLsp.KotlinLspServerKt --stdio' 2>/dev/null || true)
-
-  wait_for_process_shutdown "${killed_pids[@]}"
-}
-
-kotlin_lsp_cwd() {
-  local pid="$1"
-  lsof -a -p "$pid" -d cwd -Fn 2>/dev/null |
-    sed -n 's/^n//p' |
-    tail -n 1
-}
-
-wait_for_process_shutdown() {
-  local pids=("$@")
-  local pid
-  local alive=()
-
-  [[ "${#pids[@]}" -gt 0 ]] || return 0
-  for _ in {1..10}; do
-    alive=()
-    for pid in "${pids[@]}"; do
-      kill -0 "$pid" 2>/dev/null && alive+=("$pid")
-    done
-    [[ "${#alive[@]}" -eq 0 ]] && return 0
-    sleep 0.2
-  done
-
-  for pid in "${alive[@]}"; do
-    kill -9 "$pid" 2>/dev/null || true
-  done
 }
 
 resolve_serena_command() {

@@ -1,376 +1,143 @@
 # Mobile Smoke Contract
 
-This contract separates safe inspection of a test application from actions
-that require explicit user authorization.
+Projects load this contract conditionally from their runtime procedure and
+supply platform targeting, installation, login, resource and evidence adapters.
 
 ## Installation And App-Data Safety
 
-- Distinguish three operations explicitly:
-  - **fresh binary**: build the current task artifact;
-  - **preserve app data**: replace the installed binary in place with a
-    compatible signer and non-downgrade version;
-  - **destructive reset**: uninstall, clear package data, downgrade, or replace
-    an incompatible signer.
-- A normal Smoke run may build a fresh binary and use the project install
-  adapter's preservation-only operation. It must not interpret "fresh APK" as
-  permission to create a fresh app profile.
-- `adb uninstall`, `pm clear`, install with downgrade permission, simulator
-  erase, clean install, or any equivalent destructive reset requires a
-  separate explicit authorization naming that action. A general authorization
-  to test, navigate, sign in, or exercise an external flow does not imply it.
-- The deterministic Android install adapter inspects the candidate and
-  installed package, then uses preservation-only `adb install -r` for
-  compatible or absent packages. It adds `-t` only for manifest-declared
-  instrumentation or test-only APKs. A valid instrumentation manifest may omit
-  versionCode and versionName: an absent minor code with an absent or zero
-  major code uses Android's effective versionCode zero and an absent name is
-  reported as null. Malformed or ambiguous metadata is never defaulted.
-  Existing packages require a known installed version and compatible signer;
-  downgrade, unknown version, unknown or mismatched signer, transport failure,
-  and install failure block replacement. It never deletes package data,
-  grants downgrade permission, or retries destructively.
-- Before install, record only the app's authentication state as
-  `authenticated`, `unauthenticated`, or `unknown`. Record the same state after
-  launch. Never store credential values, authenticated content, or secret
-  material in checkpoints, comments, reports, screenshots, or evidence.
-- A resumed Smoke session reconciles its checkpoint before rebuilding or
-  reinstalling. When the checkpoint proves the same APK digest was installed
-  successfully and the preserved flow remains authenticated, skip duplicate
-  build/install and continue from the next bounded scenario.
+Distinguish a fresh task binary, preservation-only replacement and destructive
+reset. Normal authorized Smoke may build/install through the preservation
+adapter; incompatible signer, downgrade, unknown metadata or failed replacement
+blocks installation. Never retry destructively.
+
+Uninstall, clear-data, downgrade, simulator erase or equivalent reset requires
+explicit action-specific authority. Test/login permission is not reset
+permission. Reconcile checkpoint artifact/install proof before repeating work.
+Record authentication only as authenticated, unauthenticated or unknown;
+never retain credential values or authenticated content.
 
 ## Default Authorization
 
-On an acquired test emulator or simulator, focused runtime Smoke may inspect
-and navigate an already-authenticated application UI without asking merely
-because the application is logged in.
+On an acquired test emulator/simulator, focused declared Smoke may inspect an
+already-authenticated app, navigate, scroll, move focus and exercise reversible
+local settings with original-state restoration. Package-scoped liveness/crash
+checks are permitted; open-ended exploration is not.
 
-Allowed by default:
-
-- bounded semantic inspection needed to locate the task's target;
-- task-scoped screenshots or visual inspection when semantics are
-  insufficient. On a project-declared non-production stage/test environment
-  with synthetic data, screenshots may be retained in the ignored evidence
-  directory without another user question. Limit capture to the relevant app
-  screen or control and use a reduced resolution or crop when available;
-- focus movement, scrolling, Back, and opening or closing screens, dialogs,
-  drawers, and menus;
-- reversible local preference or settings changes required by the declared
-  scenario, when the original state is captured and restored;
-- package-scoped liveness, crash, and ANR checks.
-
-These actions must remain inside the task's declared Smoke scope. Open-ended
-exploration is not authorized.
+When semantics are insufficient, use scoped visual inspection. Relevant
+reduced/cropped screenshots on declared non-production stage/test with synthetic
+data may be retained in ignored audited evidence without another question.
+Production, unknown-environment, physical-device, foreign-app and secret-bearing
+retention require explicit authority. Publication/committing evidence remains
+a separate effect.
 
 ## Explicit Authorization Required
 
-Unless the task body or a durable task comment explicitly authorizes an
-exception, Smoke must not:
+Require applicable original authority for physical devices/additional emulators,
+credentials/MFA/permissions/secrets, destructive resets and account/server/
+purchase/subscription/progress mutations. Local navigation alone is not an
+external effect. Prefer non-mutating observation or deterministic tests when
+the intended action would cross this boundary.
 
-- persist screenshots from production, an environment whose non-production
-  status cannot be established, a physical device, another app, or a screen
-  containing credentials or secrets;
-- persist broad or raw UI trees, full device logs, network payloads, or
-  authentication material;
-- perform account-, server-, purchase-, subscription-, playback-progress-, or
-  other externally observable state changes;
-- enter credentials, approve MFA, change permissions, or provision secrets;
-- use a physical device or start an additional emulator.
-- uninstall an app, clear its data, allow a package downgrade, erase a
-  simulator, or perform another destructive reset.
-
-Local UI navigation is not an external side effect. If activating an action
-could mutate account or server state, use a non-mutating observation or a
-deterministic test instead, or request a scoped exception.
-
-Capturing a focused screenshot for validation does not require user
-authorization. On a declared stage/test environment, retaining it as a scoped,
-audited task artifact also requires no additional approval. Publishing it
-outside the workflow evidence boundary or committing it to source control
-requires the normal authorization for that external action.
+Do not persist broad/raw UI trees, device logs, network or authentication
+payloads. Safe output alone does not authorize raw transport capture.
 
 ## MCP Outcome Evidence
 
-This gate applies only when a Smoke claim relies on the safe result from
-`kent-mcp-call`; it does not replace the existing authorized visual or other
-bounded observation paths.
+Process exit, successful parsing, digest/hash extraction, literal/marker matches
+and narrative do not prove action completion or authentication. Safe MCP
+assertions support a checkpoint only with complete successful transport/
+processing, a known provider/state schema and error conditions, and the required
+interaction proof. An arbitrary true boolean is insufficient; negative or
+unknown destination proof is not proof of unauthenticated state.
 
-- Safe modes other than `--quiet` emit `schema: kent-mcp-result-v1` with
-  separate `transport`, `processing`, `action`, `assertion`, and
-  `assertionKind` outcomes. Require a valid complete outcome object, successful
-  transport, and successful processing before considering its assertion.
-- `action` is always `unknown` in this adapter contract. Do not infer action
-  completion, navigation, or authentication from process exit, a successful
-  parse, a digest, extracted hashes, marker booleans, literal checks, or agent
-  narrative.
-- Promote an authenticated or passed checkpoint from this result only when a
-  task's known provider/state schema supports a `json_boolean` assertion that
-  passed for the intended destination/state, the caller can account for all
-  schema-defined error conditions, and the required interaction/navigation
-  evidence is present. The consumer must know what the selected boolean means;
-  an arbitrary true field is not provider-success proof. If the schema or its
-  error conditions cannot be established or expressed, keep the state unknown.
-- `--assert-json-true` selects exact JSON boolean values. False is a failed
-  assertion; missing, null, or a non-boolean value is unknown. Per-selector
-  results contain only fixed outcome enums. Do not persist or echo the response
-  body, selected values, pointers, raw parse errors, or provider stderr to
-  resolve ambiguity. This adapter does not guess fields such as `ok` or
-  `error`.
-- A negative destination assertion does not by itself prove that the app is
-  unauthenticated or identify the screen currently shown. A positive state
-  assertion can support a checkpoint only under the known-schema and
-  interaction requirements above.
-- `--quiet` remains empty and process-exit-only. An assertion based on literal
-  text is byte-presence evidence, not semantic state evidence. Digest and
-  extraction results, including false or mixed `markersPresent`, describe
-  processing or observation only and cannot establish authentication or pass a
-  checkpoint. If another authorized bounded observation path supplies the
-  required positive evidence, it remains usable with the existing interaction
-  proof rules.
-- Parsing, literal assertion, and extraction inputs are limited to 1 MiB;
-  selector/predicate count and size and extracted-hash count are bounded by the
-  adapter contract. These interpretation bounds do not limit the initial
-  temporary stdout/stderr capture by the tool process and must not be described
-  as bounded transport storage.
+Use the adapter's actual bounded result protocol and authorized visual/semantic
+observations. Do not retain raw values or secret-bearing output to resolve
+ambiguity.
 
 ## Authorized Login Recovery
 
-This procedure supplements Default Authorization, MCP Outcome Evidence,
-Interaction Proof, and Evidence and Recovery. It does not itself authorize
-credential entry, MFA approval, or an account mutation; require the applicable
-task-scoped authorization and project-owned procedure.
+Login guidance belongs to the project procedure. This contract grants no
+credential-entry authority.
 
-### MR-01 — Checkpoint And Authorization
-
-Reconcile the checkpoint and inspect the current authentication state before
-recovery. If the intended authenticated destination is already proven, skip
-credential entry. Reuse applicable authorization for the exact task, account,
-environment, and action. Existing authorization does not prove authentication.
-An explicitly absent, expired, revoked, or out-of-scope authorization blocks
-secret entry. If its source is unavailable, authorization is unknown; do not
-infer expiry, invalid credentials, or backend rejection from a UI symptom.
-
-### MR-02 — Target, Focus, And Safe Input
-
-Before entering any value, prove the exact eligible target and the identity and
-focus of the phone control. Before any secret entry, establish a
-project-supported secret-safe input and readback path covering transcripts,
-logs, temporary capture, and intermediate storage. A sanitized MCP result
-alone does not prove that the input path is safe. If target, focus, or safe
-input capability is failed or unavailable, stop before input and record a
-sanitized capability finding. Do not ask a human to repeat work that is
-already authorized and safely executable.
-
-### MR-03 — Full-Value Replacement And Normalization
-
-Derive country-code and number normalization from the project-owned input
-contract. Full-value replacement requires explicitly clearing the entire
-phone control, including any existing prefix, before entering the authorized
-full value. Never append a full value to a prefilled prefix. If country-code
-entry uses a separate control, verify its identity and role, select the
-authorized country code, and prove the combined value has the expected
-normalization before submission. Apply the same target, focus, full-value
-replacement, and normalization proof to code entry. Failed or unavailable
-clear or normalization proof stops submission.
-
-### MR-04 — Secret-Safe Observation And Retention
-
-Use the narrowest safe observation to prove replacement and normalization.
-Retain only sanitized categorical results such as target, focus, clear,
-normalization, and destination proof as proven, failed, or unknown. Never
-retain a secret-bearing UI tree, screenshot, log, transcript, command
-argument, response body, credential value, or low-entropy hashes of a phone
-number or code. Sanitize persisted external-action intents and outcomes too.
-
-### MR-05 — Bounded Submission And Recovery
-
-For one authorized login attempt, permit one phone submission (code request)
-and one code submission as separate bounded actions. Before each possible
-submission, persist its sanitized intent in the existing checkpoint or
-external-action ledger; record only its proven or unknown outcome afterward.
-Resuming a Session or reopening a form does not reset either attempt budget.
-After interruption or a lost response, inspect current state before any
-further action; on an unknown outcome, never automatically replay the
-submission. A failed targeting observation permits at most one bounded
-reinspection and replan before input. Do not automatically resend a rejected
-code. Bound observations by the existing action and time budgets; exhausted
-unknown evidence is a finding, not an invented external prerequisite.
-
-### MR-06 — Authenticated Destination Proof
-
-Code entry or submission is not proof of authentication. Prove the intended
-authenticated destination using a known provider/state schema, its covered
-error conditions, and the required interaction evidence. For
-`kent-mcp-result-v1`, require successful transport and processing plus a
-schema-bound `json_boolean` proving the intended destination and the required
-interaction/navigation evidence. The adapter's `action` remains unknown.
-Process exit, parsing, a digest, extracted values, literal matching, or agent
-narrative cannot replace authenticated destination proof. Another
-already-authorized bounded observation is acceptable only when it provides
-equivalent state and interaction evidence.
-
-### MR-07 — Honest Outcome Classification
-
-Classify proven authentication, explicit unauthenticated state, unknown
-destination, failed assertion, targeting or input prerequisite failure, and
-genuine missing consent separately. An unknown destination or failed
-assertion is not proof of an unauthenticated state. An invalid-code UI message
-is a symptom, not proof of backend cause, code expiry, or invalid credentials.
-Never attribute an outcome to the backend, credentials, expiry, or user
-without independent evidence.
-
-### MR-08 — Consent And External Challenges
-
-A genuine missing consent, revoked, expired, or out-of-scope authorization
-requires a consent question; do not ask again when applicable authorization
-already exists.
-Stop immediately at an external challenge requiring human completion and
-request only that external action. Do not bypass an external challenge, MFA,
-or another security control.
+- Reconcile checkpoint and destination first; skip input when already
+  authenticated. Verify original task/account/environment/action consent.
+  Unknown authority blocks secret entry, not permitted read-only diagnosis.
+- Prove exact eligible target, control identity/focus and a secret-safe input/
+  readback path covering transcripts, logs and temporary capture before input.
+- Replace the complete existing value rather than append. Verify clearing,
+  project-defined normalization and combined fields before submission.
+  Unproven target, clearing or normalization stops that submission.
+- Persist sanitized intent before external actions and proven/unknown outcome
+  afterward. Preserve every applicable original attempt/recovery limit.
+  A resumed Session, new helper or reopened form replenishes no budget.
+  Unknown effects require settlement, never automatic replay/resend.
+- Another diagnostic attempt needs changed prerequisites or a hypothesis that
+  changes the action/expected observation within remaining limits.
+- Prove the intended authenticated destination with schema-bound or equivalent
+  authorized interaction evidence. Classify explicit failure, unknown
+  destination and missing consent separately; UI symptoms alone do not establish
+  backend cause, expiry or invalid credentials.
+- Keep only categorical sanitized proof; never retain secret-bearing UI,
+  screenshots, command arguments, responses or low-entropy credential hashes.
+  Stop for external human challenges; do not bypass MFA/security controls.
 
 ## Interaction Proof
 
-- Session-owned Smoke leases keep their existing checkpoint and recovery
-  protocol. Script-owned work must use the shared typed Script-owner protocol
-  in `contracts/mobile-script-lease-contract.md`; it must not impersonate a
-  Session or place a Script token in workflow evidence. Unknown or ambiguous
-  Script ownership preserves the shared record and blocks recovery.
-- Apply the project/task form-factor constraint before locking a runtime target.
-  Never send a mixed phone/TV/watch/automotive candidate list to
-  `acquire-any`. Resolve eligible serials deterministically, acquire one exact
-  serial, and verify its identity after acquisition. If no eligible target is
-  available, release any temporary resource and return a blocker.
-- Evidence setup is fail-fast. Project-provided evidence commands may produce
-  their declared artifacts within the authorized Smoke scope. Manual
-  evidence-file creation or editing requires the first-class patch tool
-  permitted by the effective instructions. If required manual work cannot be
-  completed because that tool is unavailable, report a blocker; do not
-  substitute shell writes or shell `apply_patch`, change tool permissions, or
-  bypass the restriction. Use `set -euo pipefail` for multi-step shell setup.
-  A failed prerequisite must prevent later lock acquisition, installation, or
-  input.
+Before acquisition, verify current Task/Session identity through the qualified
+profile identity command and choose an eligible exact target/form factor.
+Persist the adapter's validated resource/token result before device actions.
+Script owners use [typed Script leases](mobile-script-lease-contract.md),
+never impersonate Sessions or place Script tokens in evidence.
 
-- Prefer semantic targeting for control behavior. Prove directional navigation
-  separately when D-pad, keyboard, or remote focus behavior is itself in scope.
-- Establish the starting focus and inspect the relevant UI source or semantic
-  node ordering. When focus order and conditional visibility are known, derive
-  the exact bounded route to the target, execute it in one deterministic call,
-  and verify the destination once.
-- If the computed route does not reach the expected target, inspect the new
-  focus and replan. Use small adaptive bursts when an exact route cannot be
-  derived, and single-step checks only near the target or after unexpected
-  movement.
-- Group a deterministic input burst and its focus observation into one tool or
-  shell call. Do not require a model round-trip between individual key events.
-- Do not locate a control by sending a fixed blind loop of D-pad, keyboard, or
-  remote-control events.
-- Before activating a mutable control, confirm its identity and focus and
-  capture its original state with the narrowest safe observation available.
-- After activation, prove the control state changed and prove the intended
-  local effect. A visible label or screen alone is not evidence that a toggle,
-  checkbox, picker, or preference changed.
-- When accessibility semantics do not expose mutable state, use the allowed
-  bounded visual inspection. Do not ask merely because a screenshot is needed.
-  On a declared stage/test environment, retain the scoped screenshot when it
-  materially supports the decision; otherwise retain only the derived
-  assertion. Never retain a broad UI artifact.
-- Restore the original state and verify the restoration before releasing the
-  shared resource. Every task-started test runner, instrumentation process, app
-  process, temporary fixture, and kept-open tool shell/TTY must be terminal or
-  restored. Poll and explicitly close every Smoke-owned background shell
-  session; an idle shell waiting for stdin still blocks managed-worktree
-  cleanup. If a failed or interrupted command leaves task-owned runtime work
-  active after release, reacquire or resume the exact resource, clean only that
-  task-owned state, record the recovery, and release again.
-- If the adapter cannot establish focus, before/after state, or the required
-  effect, return a blocker or finding. Do not infer success from the number of
-  input events sent or from the Smoke agent's own narrative.
-- A user-reported contradiction to the recorded runtime result invalidates the
-  affected evidence until a focused rerun resolves it.
+Evidence setup must succeed before acquisition/install/input. Use permitted
+project evidence commands; missing persistence capability is not permission
+for source edits, shell-write substitution or tool-policy changes.
+
+Prefer semantic targets. For required directional navigation, establish focus,
+derive bounded routes and verify results; replan on mismatch. Blind fixed
+event loops are not proof. For mutable controls, prove identity/focus, original
+state, changed state and intended local effect, then restore and verify.
+Visibility and event counts alone do not establish success.
+
+Settle owned runners, instrumentation, app processes, fixtures and kept-open
+shells before release. Interrupted work requires reconciliation and cleanup
+only of proven owned state. Verify exact-resource release; unresolved cleanup
+is not successful handoff. User-reported contradictions invalidate affected
+evidence until focused verification resolves them.
 
 ## Evidence Allocation
 
-- Before device work, classify acceptance criteria by evidence type. Runtime
-  proves rendering, focus, navigation, integration, restoration, and liveness.
-  Deterministic tests prove pure defaults, classification, filtering, paging,
-  and state-transition logic when those behaviors are not directly observable.
-- Use mixed evidence when both categories are present. Do not repeat a passing
-  deterministic criterion through runtime unless the task or project contract
-  explicitly requires end-to-end proof for that criterion.
-- Do not clear an authenticated profile, require a special fixture, or add
-  test-only product/accessibility semantics solely to force deterministic
-  internals through runtime Smoke.
-- If explicit end-to-end proof is required and its fixture or safe semantics are
-  unavailable, return the blocker. Otherwise report the runtime and
-  deterministic evidence separately and continue.
+Runtime proves rendering, focus/navigation, integration, restoration and
+liveness. Deterministic tests can prove pure defaults, classification,
+filtering, paging and state transitions. Report mixed proof explicitly.
+Repeat deterministic criteria at runtime only for explicit end-to-end
+requirements; do not reset authenticated profiles, demand special fixtures
+or add test-only product/accessibility semantics merely to duplicate proof.
+
+Assess evidence at the authorized milestone and retain later owner/due-stage
+obligations. Resource unavailability never turns required Smoke into PASS.
 
 ## Evidence and Recovery
 
-- Keep only the minimum sanitized evidence required for the Smoke decision.
-- Retained stage/test screenshots must stay in the project-declared ignored
-  evidence directory and pass the evidence audit.
-- Every required summary, report, or checklist artifact must be non-empty
-  before evidence audit and completion.
-- Run the project's evidence audit before reporting success or a blocker.
-- An authenticated screen alone is not a blocker.
-- Ask only when the required test would cross an explicit-authorization
-  boundary or a required external prerequisite is unavailable.
-- Do not mark a Smoke checklist item complete or describe Smoke as passed when
-  returning `needs_user_action`, `needs_changes`, or any other non-passing
-  transition. Kent task/transition state is authoritative over checklist text.
-- When the user grants an exception during a task, record its exact scope in a
-  durable task comment before continuing so compaction and recovery sessions do
-  not ask again. Reuse that authorization for the same account, environment,
-  action, and task scope until it is revoked or the scope materially changes.
-  Store only the authorization boundary, never credential values.
-- Resolve the current Task/Session using the profile evidence command:
-  `workflow-evidence-ledger identity --task <task-short-id> --workspace <root>`.
-  It returns exactly `task_id`, `task_short_id`, `project_id`, `workspace_path`,
-  and `session_id`, using the inherited canonical `KENT_SESSION_ID` plus native
-  current Task/project/workspace binding. Missing, foreign or historical-only
-  Sessions block. Never parse `kent session-id` diagnostic output or invent,
-  export or replace a Session UUID. This read-only command needs neither Step
-  identity nor retention/R2 admission. Set adapter `KENT_TASK_ID` from the
-  verified short ID; preserve the inherited Session UUID. A label, sole lock
-  occupancy, or Session ID alone does not establish Task ownership.
-- Keep top-level checkpoint `task_short_id` authoritative. Store
-  `task_native_id`, `task_short_id`, `lease_owner_id`, `lock_resource`, and
-  `lock_token` together in its extensible stage data. A legacy checkpoint
-  missing native identity fields may be enriched only after native readback
-  matches its existing short ID. Conflicting Task fields block recovery.
-  New leases use the verified short ID as `lease_owner_id`. A legacy lease
-  written with the native Task ID may be recovered only when readback proves
-  that exact native-ID/short-ID pair; retain that owner ID consistently through
-  release. Do not silently rewrite foreign ownership.
-- Parse lock output according to the command used: `acquire` returns one bare
-  token; `acquire-any` returns exactly one `resource=...` record followed by
-  one `token=...` record. Reject missing, empty, duplicate, malformed, or
-  unexpected records; verify that a selected resource is eligible. Persist
-  the exact resource and token in the checkpoint immediately, before any
-  device action. Keep the token only in the scoped ignored checkpoint; never
-  echo it in reports, comments, or evidence.
-- A recovery session reads and validates its checkpoint before acquisition.
-  With a recorded resource and token, call `resume` for that exact pair after
-  validating the checkpoint Task binding. A failed or mismatched resume blocks;
-  do not fall back to resource discovery. With a known resource but missing
-  token or lost acquisition output, inspect redacted `status`, prove that the
-  exact resource has one valid owner record for the verified Task, then use
-  guarded `resume-owned`. It returns the existing token and refreshes metadata;
-  it requires the existing lease and valid owner metadata.
-- If no resource is persisted, inventory only the project-eligible resource
-  list. Recover with `resume-owned` only when exactly one candidate has valid
-  metadata for the same verified Task. Zero proven matches proceeds through
-  normal fresh acquisition; multiple same-Task matches are ambiguous and block.
-  Foreign, malformed, duplicate, or resource-mismatched metadata is never
-  ownership proof. A sole occupied resource is not ownership proof.
-- Preserve the adapter's caller-TTL policy: a competing lease stays busy until
-  its age is greater than the acquiring caller's explicit TTL (`age <= TTL`
-  stays busy; replacement requires `age > TTL`). TTL is not stored in the
-  owner record. Exact-owner `resume` or `resume-owned` may refresh a still-
-  present lease even after its age is greater than an acquiring caller's TTL.
-  The first guarded operation wins: resume-first refreshes the lease, while
-  replacement-first invalidates recovery with the old owner/token.
-  `resume-owned` never creates a missing lock or reclaims a foreign or unknown
-  owner.
-  After explicit release or trap cleanup, read back `status` for the exact
-  resource and require `unlocked`. Failed or locked readback is unresolved
-  cleanup, never proof of release. `status` must continue to redact tokens.
+Use minimal ignored sanitized evidence, non-empty required reports/checklists
+and the project evidence audit before completion. Non-passing transitions must
+not mark Smoke/checklists complete. Preserve original exception locators for
+the same account/environment/action/scope; do not ask again for accessible
+existing authority.
+
+Checkpoints bind verified Task short/native identity, resource and lease owner.
+Never invent/replace inherited Session UUIDs or borrow historical ownership.
+Read exact command-specific acquisition output, validate it and retain Session
+tokens only in the permitted private checkpoint, never comments/reports.
+
+Resume only the exact checkpoint resource/token after Task-binding checks.
+A failed resume does not authorize fallback discovery. For lost acquisition
+output, `resume-owned` requires guarded proof of one valid same-Task owner,
+never merely sole occupancy. If no target was persisted, inventory only
+eligible resources; multiple same-Task matches are ambiguous.
+
+Preserve the adapter's actual TTL and guarded first-writer policy; TTL alone
+is not ownership/recovery proof. Unknown, malformed, foreign or mismatched
+records remain preserved. A legacy native-ID owner needs verified native/
+short-ID mapping. Read back `unlocked` after release; locked/failed readback
+is unresolved cleanup.

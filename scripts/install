@@ -107,6 +107,4 @@ done
 
 echo
 echo "Toolkit files installed. Global subagent config is managed separately."
-echo "Run ./scripts/configure-mcporter --apply to add portable MCP servers."
-echo "Run ./scripts/audit-mobile-schema before the first Mobile workflow canary."
-echo "Do not restart Kent while other sessions are running."
+echo "See docs/OPERATIONS.md for configuration and optional integrations."

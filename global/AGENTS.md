@@ -32,19 +32,13 @@
   it. Before repeating a question, inspect available decision references,
   including evidence summaries and linked prior Sessions; verify the original
   source rather than treating its summary as consent.
-- A specification or plan may narrow or supersede the task body only when it
-  cites an exact human-authored task-comment ID or another explicit
-  authoritative source. Agent summaries and unsupported claims that "the user
-  clarified" do not create product authority.
-- An original human Session message or native Question answer can be that
-  explicit source when its authorship, exact content, context and current
-  applicability can be verified. Cite its real Session and event/message/
-  Question identifier or equivalent verifiable locator. An agent-authored
-  audit comment may reference it and identify the scope it supersedes, but
-  does not replace the source or become human-authored. Never manufacture
-  provenance with `--author user`. Receivers verify the original decision;
-  do not require the user to retype it merely because an agent conveyed it.
-  Missing or ambiguous consent remains a concrete blocker.
+- Scope supersession requires a verifiable original human source: exact Task
+  comment, Session event/message or native Question answer, including its
+  proposal, context and current applicability. Cite that locator. Agent summaries
+  and audit comments are discovery pointers, not consent; never manufacture
+  provenance with `--author user`. Receivers verify the original rather than
+  requiring the user to repeat accessible decisions. Missing or ambiguous
+  consent blocks only the effect that needs it.
 - Missing agent-produced bookkeeping is not a user decision. Reconstruct it
   only when bounded and safe; otherwise record the gap and continue with the
   available evidence.
@@ -57,8 +51,6 @@
 - Write user-facing workflow communication in the user's preferred language;
   for this user, default to Russian. Keep code, commands, identifiers,
   structured keys, and repository artifacts in their project-defined language.
-- This includes questions, transition commentary, `blocker_reason`,
-  `closure_reason`, and approval summaries.
 - Write human-visible Session goals in the user's preferred language (Russian
   for this user), using short Markdown headings and bullet lists. Separate the
   objective, current work, boundaries and completion criteria. Keep normal
@@ -68,12 +60,10 @@
 - Make approval and blocker text decision-oriented. Use the compact Russian
   structure `Нужно от вас`, `Почему`, and `После подтверждения` when useful.
 - Questions and approvals are for real user decisions or external actions. In approval text, do not paste raw review reports; do not present task-scoped code fixes as actions the user must perform.
-- Do not request the same permission again for already-authorized reading or
-  necessary bounded diagnostic preparation. An access-controlled source or a
-  stage named Plan alone is not a new authority boundary. Ask for a genuinely
-  new decision, credential/access scope, material cost/risk or ambiguity.
-  Applicable role restrictions, governance reviews and effect gates remain
-  binding; this guidance grants no role new operational permissions.
+- Already-authorized reading and bounded diagnostic preparation need no new
+  permission merely because a source is access-controlled or the stage is Plan.
+  Ask for a new decision, access scope or material risk/cost; preserve role
+  restrictions, governance and effect gates.
 
 ## Engineering Safety
 
@@ -109,14 +99,10 @@
 - Existing and resumed sessions retain their locked system prompt and
   execution settings. Prompt changes affect new sessions; global configuration
   changes additionally require the documented Kent restart.
-- `kent task resume` confirms durable requeueing, not successful Session or
-  Script startup. Re-read task state after a short delay and diagnose a return
-  to `interrupted`.
-- A Current Node without an assigned or retained Session must re-enter through
-  a supported incoming `new_session` transition with preserved values.
-  Repeated Resume is not recovery.
-- `compact_and_continue_session` may keep the same session ID. Verify the
-  compaction event and refreshed lock rather than expecting a new ID.
+- Resume confirms requeueing, not startup: re-read native state. Missing
+  retained execution requires a supported incoming new-session recovery with
+  preserved values; repeated Resume is not recovery. A pending Question is not
+  completion, and missing attribution does not establish human consent.
 - Workflow transition keys, Script stdout, prompts, and parameters are one
   revisioned contract. Apply complete graph changes, never edge-by-edge edits.
   Task presence or status alone does not prohibit an update. Before changing a

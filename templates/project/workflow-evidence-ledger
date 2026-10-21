@@ -1701,9 +1701,12 @@ def read_entries(path: Path, *, task: str) -> List[Dict[str, Any]]:
 def summarize(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     count = len(entries)
     last_hash = entries[-1]["event_hash"] if entries else ""
-    recovered = any(entry.get("record_kind") == "evidence_recovery_boundary_v1" for entry in entries)
+    recovered = any(entry.get("record_kind") in {
+        "evidence_recovery_boundary_v1", "evidence_recovery_boundary_v2",
+    } for entry in entries)
     entries = [entry for entry in entries if entry.get("record_kind") not in {
-        "evidence_recovery_boundary_v1", "terminal_evidence_seal_v1",
+        "evidence_recovery_boundary_v1", "evidence_recovery_boundary_v2",
+        "terminal_evidence_seal_v1",
     }]
     return {
         "entry_count": count,
@@ -1973,7 +1976,10 @@ def main() -> int:
                     "ledger_path": str(path),
                     "entry_count": len(entries),
                     **({"status": "recovered_with_gap"} if any(
-                        entry.get("record_kind") == "evidence_recovery_boundary_v1"
+                        entry.get("record_kind") in {
+                            "evidence_recovery_boundary_v1",
+                            "evidence_recovery_boundary_v2",
+                        }
                         for entry in entries
                     ) else {}),
                 }

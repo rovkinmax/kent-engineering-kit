@@ -1,33 +1,20 @@
-# Delivery Context Budget
+# Delivery Context
 
 Required:
 - `AGENTS.md`, `.kent/project-contract.md`, `.kent/workflow-profile.toml`;
-- authoritative delivery/report-only permission and current gate evidence;
-- the active mapped procedure: `.kent/commands/ship-pr.md`,
-  `.kent/commands/waiting-pr.md`, or `.kent/commands/cleanup-task.md`;
-- exact branch, HEAD, PR/disposition and owned resource evidence.
+- delivery/report-only authority, current gate evidence and report identities;
+- active mapped procedure: `ship-pr.md`, `waiting-pr.md` or `cleanup-task.md`
+  under `.kent/commands/`;
+- exact branch/HEAD, disposition and resource ownership.
 
 Conditional:
-- PR feedback: only affected scope and review findings;
-- source refresh: README self-development preflight;
-- cleanup: current ownership, process, path and Git/Kent registration proofs.
-- delivery reliability v1: exact producer packet locators and the effective
-  transition contract; use checkpoint packing instead of retyping payloads;
-- damaged evidence: `contracts/evidence-recovery.md` and the exact recovery
-  request, without loading an opaque damaged suffix as decision evidence;
-- R2 acceptance: external accepted-state locators and the installed Kit skill's
+- feedback: affected source/findings; source refresh: README preflight;
+- cleanup: process/path and Git/Kent registration proofs;
+- packet carriers: exact producer locators and effective transition contract;
+- damaged evidence: `contracts/evidence-recovery.md` and exact request;
+- R2 acceptance: external locators and installed skill's
   `references/durable-context.md`.
 
-Do not preload implementation recipes, disabled CI/Smoke, consumer rollout or
-installation instructions. Before each Agent transition, append the required
-non-empty evidence event through the profile command, except for terminal
-Cleanup and its recovery. For those paths, follow the single-owner
-`prepare_cleanup` contract in `.kent/project-contract.md`: the helper owns the
-final event and seal. Do not append standalone evidence before or after the
-helper, or merely to report a blocker; retain blocker details in Task records.
-
-For Kit source delivery, read the source-verification ownership and identity
-contract in `.kent/project-contract.md`. Prepare delivery only with the
-current report/log and matching source/environment identity references for
-the exact source. Do not add a routine full validator run in Delivery;
-identity uncertainty routes back through the existing verification path.
+Do not preload disabled CI/Smoke, consumer rollout or installation recipes.
+Follow the project contract for evidence and verification ownership. Cleanup's
+helper exclusively owns final append/seal; retain blockers in Task records.

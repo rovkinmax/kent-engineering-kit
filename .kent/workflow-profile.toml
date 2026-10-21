@@ -62,7 +62,7 @@ smoke = ".kent/context/smoke.md"
 delivery = ".kent/context/delivery.md"
 
 [procedures]
-fix = ".kent/commands/fix.md"
+fix = ".kent/commands/implement.md"
 ship = ".kent/commands/ship-pr.md"
 waiting_pr = ".kent/commands/waiting-pr.md"
 cleanup = ".kent/commands/cleanup-task.md"

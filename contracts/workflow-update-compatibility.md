@@ -56,7 +56,12 @@ not merely reproduce an old graph.
 `canonical-workflow-reconcile-plan-v2` admits one task-backed/linked Workflow
 with digest-confirmed compatibility. Preserve identities, links and defaults;
 Only `implement_replan` may be added. No migration or cross-project
-atomicity. Other paths, v1 and retirement gates stay unchanged. Publication
+atomicity. Retirement remains a separate authorized effect. Publication
 does not authorize activation.
 
-V2 recovery: [runbook](../docs/KENT-UPGRADE-RUNBOOK.md#delivery-reliability-adoption).
+Before recovery, settle an attempted effect with read-only pre/poststate
+evidence. Missing pending payload is unknown, not empty. Fresh compatible
+admission is required before a new effect; missing mutable bookkeeping does
+not prevent reporting an independently proven settled result. A forward
+restore must satisfy current source admission and compatibility, not merely
+reproduce previously approved bytes.

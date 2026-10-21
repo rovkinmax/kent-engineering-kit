@@ -585,11 +585,6 @@ class ProjectProfile:
         runtime_keys = set(self.kit_managed_commands) & (
             RUNTIME_CONTRACT_COMMANDS | MONITORING_COMMANDS | {"janitor"}
         )
-        if "prepare_ci" in runtime_keys:
-            raise SpecError(
-                "prepare_ci is not a runtime-contract command; declare it "
-                "as a source-contract command"
-            )
         if "prepare_ci" in managed_commands and (
             self.command_versions.get("prepare_ci") != PREPARE_CI_VERSION
         ):

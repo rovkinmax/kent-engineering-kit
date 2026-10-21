@@ -34,10 +34,8 @@ helper reports the supplied object ID, resolved tree ID, and commit ID when the
 selector is a commit. It never falls back to `HEAD`, the index, or working-tree
 bytes.
 
-CI supplies the explicit checked-out commit ID, for example
-`--ref "$GITHUB_SHA"`. On pull requests the existing checkout behavior is
-retained, including GitHub's selected merge commit. Do not substitute a PR
-head SHA or add a new event/job for this check.
+CI supplies its explicitly selected checked-out commit, for example
+`--ref "$GITHUB_SHA"`; the project owns checkout/event policy.
 
 The optional kind map is itself read as a regular blob from the same selected
 tree. Its closed JSON form is:
@@ -46,7 +44,7 @@ tree. Its closed JSON form is:
 {
   "schema": "release-source-binding-kind-map-v1",
   "paths": {
-    "principal-policy-sha256": ".kent/workflows/specs/osome-sdk-publication-principal-policy.json"
+    "principal-policy-sha256": ".kent/workflows/specs/publication-principal-policy.json"
   }
 }
 ```
@@ -91,9 +89,7 @@ fail. Every path and mode is validated before cached blob bytes are reused.
 ## Read-only and resource boundary
 
 Only fixed Git plumbing is used: `rev-parse`, `cat-file`, and `ls-tree`.
-Commands use an argument vector without a shell, a replacement environment
-without inherited `GIT_*` routing, disabled replacement objects/lazy fetch and
-optional locks, and disabled hooks/automatic maintenance. The helper does not
+The helper does not
 read or refresh the index, inspect working bytes, access the network, or invoke
 builders, Gradle, signing, Kent, or project commands. It never prints blob
 contents.

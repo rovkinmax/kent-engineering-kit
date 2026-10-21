@@ -18,7 +18,6 @@ import hashlib
 
 sys.dont_write_bytecode = True
 
-MAX_BOOTSTRAP_REQUEST = 64 * 1024
 MAX_NATIVE_OUTPUT = 1024 * 1024
 MAX_NATIVE_TASKS = 256
 NATIVE_TASK_PAGE_LIMIT = 100
@@ -267,17 +266,6 @@ def native_read(arguments, workspace):
     if len(raw) > 1024 * 1024:
         raise ValueError("native readback exceeds limit")
     return raw
-
-
-def legacy_admission(core, primary, project_id):
-    profile = primary / ".kent/workflow-profile.toml"
-    config = None
-    if os.path.lexists(profile):
-        config = tomllib.loads(record_bytes(core, profile, private=False).decode()).get("project_memory")
-    binding = Path.home() / ".kent/project-memory-bindings" / f"{project_id}.json"
-    if config is None and not os.path.lexists(binding):
-        return None, None, None
-    raise ValueError("native R2 source admission required")
 
 
 def record_bytes(core, path, *, private=True, maximum=8 * 1024 * 1024):
@@ -1020,12 +1008,6 @@ def admitted_native_store(core, primary, project_id, primary_workspace_id, summa
     return store, task_key, {"path": str(store.path / f"tasks/{task_key}/task.json"), "sha256": digest}
 
 
-def current_session(task, session_id):
-    return any(isinstance(item, dict) and item.get("session_id") == session_id
-               for key in ("current_nodes", "live_sessions")
-               for item in (task.get(key) if isinstance(task.get(key), list) else []))
-
-
 def resolve_native(core, request, *, initialize=False):
     workspace = git_root(request["workspace_path"])
     project_id = native_read(["project", str(workspace)], workspace).decode().strip()
@@ -1078,7 +1060,7 @@ def resolve_native(core, request, *, initialize=False):
                 and not item["current_node"].get("session_id")
                 for item in scripts):
             raise ValueError("current native script ownership unresolved")
-    elif not current_session(task, session_id):
+    elif not native_current_session(task, session_id):
         raise ValueError("current native session ownership unresolved")
     assert_preadmission(project_id, workspace, primary, task_id, source["workspace_id"])
     return admitted_native_store(core, primary, project_id, source["workspace_id"], summary,

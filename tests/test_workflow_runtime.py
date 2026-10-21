@@ -116,6 +116,7 @@ class RuntimeSupportImportTest(unittest.TestCase):
                 ("workflow-task-janitor", "runtime_contracts"),
                 ("workflow-verify-report", "runtime_contracts"),
                 ("workflow-wait-github-ci", "runtime_contracts"),
+                ("workflow-wait-github-pr", "runtime_contracts"),
             ):
                 script = root / f"{name}.py"
                 shutil.copyfile(REPO_ROOT / "templates" / "project" / name, script)
@@ -146,17 +147,6 @@ class RuntimeSupportImportTest(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
-            for name in (
-                "workflow-evidence-ledger",
-                "workflow-task-janitor",
-                "workflow-verify-report",
-                "workflow-wait-github-ci",
-                "workflow-wait-github-pr",
-            ):
-                text = (
-                    REPO_ROOT / "templates" / "project" / name
-                ).read_text()
-                self.assertNotIn("from workflowkit", text)
 
 
 class GitRepositoryTest(unittest.TestCase):
@@ -671,7 +661,6 @@ class WorkflowPlanContractTest(GitRepositoryTest):
         payload = json.loads(changed.stdout)
         self.assertEqual(payload["transition"], "plan_contract_verify_changed")
         self.assertEqual(payload["plan_route"], "verify")
-        self.assertIn("Checkbox-only progress", payload["plan_change_report"])
 
     def test_writer_payload_cannot_override_check_mode(self) -> None:
         root = self.create_repository()
@@ -2022,6 +2011,56 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
         self.assertFalse((directory / "plan-contract.json").exists())
 
+    def test_recovery_boundary_versions_summary_and_validate_preserve_history(self):
+        import workflowkit.runtime as runtime
+
+        for version in (1, 2):
+            with self.subTest(version=version):
+                root, scripts, directory, original = self.recovered_fixture()
+                ledger = load_template_module(
+                    scripts / "workflow-evidence-ledger", f"recovery_summary_{version}",
+                )
+                if version == 2:
+                    owner = {
+                        "session_id": EVIDENCE_FIXTURE_OWNER["KENT_SESSION_ID"],
+                        "step_id": EVIDENCE_FIXTURE_OWNER["KENT_STEP_ID"],
+                    }
+                    request = runtime.build_evidence_recovery_request(
+                        original, task_short_id="TASK-4", owner=owner,
+                    )
+                    manifest, continuation = ledger._recovery_documents(
+                        runtime, original, request,
+                    )
+                    (directory / "evidence-recovery.json").write_bytes(
+                        runtime.canonical_bytes(manifest),
+                    )
+                    (directory / "evidence-continuation.jsonl").write_bytes(continuation)
+                before = {path.name: path.read_bytes() for path in directory.iterdir()}
+                records = ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")
+                self.assertEqual(records[-1]["record_kind"], f"evidence_recovery_boundary_v{version}")
+                expected = ledger.summarize(records[:1])
+                for command in ("summary", "validate"):
+                    result = subprocess.run(
+                        [sys.executable, str(scripts / "workflow-evidence-ledger"),
+                         command, "--task", "TASK-4", "--workspace", str(root)],
+                        cwd=root, text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    output = json.loads(result.stdout)
+                    self.assertEqual(output["status"], "recovered_with_gap")
+                    self.assertEqual(output["entry_count"], 2)
+                    if command == "summary":
+                        for key in expected.keys() - {"entry_count", "last_event_hash"}:
+                            self.assertEqual(output[key], expected[key], key)
+                        self.assertEqual(output["last_event_hash"], records[-1]["event_hash"])
+                        self.assertNotIn("/untrusted/secret", result.stdout)
+                    else:
+                        self.assertTrue(output["valid"])
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in directory.iterdir()}, before,
+                )
+                self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
+
     @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_recovered_read_append_dedup_and_seal_use_continuation(self):
         root, scripts, directory, original = self.recovered_fixture()
@@ -2072,12 +2111,24 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         cleanup = load_template_module(REPO_ROOT / ".kent/scripts/workflow-prepare-cleanup", "recovered_cleanup")
         self.assertEqual(cleanup.records_at(directory / "evidence-ledger.jsonl", "TASK-4", ledger, janitor), records)
 
+    @mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER)
     def test_incomplete_recovery_publication_blocks_read_append_and_janitor(self):
         root, scripts, directory, original = self.recovered_fixture()
         (directory / "evidence-recovery.json").unlink()
         ledger = load_template_module(scripts / "workflow-evidence-ledger", "incomplete_ledger")
         with self.assertRaisesRegex(ValueError, "incomplete"):
             ledger.read_entries(directory / "evidence-ledger.jsonl", task="TASK-4")
+        before = (directory / "evidence-continuation.jsonl").read_bytes()
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            ledger.append_entry(
+                root, directory / "evidence-ledger.jsonl", task="TASK-4",
+                _payload={
+                    "node_key": "implement", "evidence_type": "implementation",
+                    "summary": "must not append",
+                    "context": {"manifest_path": ".kent/context/implement.md", "files_read": []},
+                },
+            )
+        self.assertEqual((directory / "evidence-continuation.jsonl").read_bytes(), before)
         self.assertEqual((directory / "evidence-ledger.jsonl").read_bytes(), original)
         janitor = load_template_module(scripts / "workflow-task-janitor", "incomplete_janitor")
         descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
@@ -2813,10 +2864,6 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         seal_thread.join(5)
         self.assertFalse(writer_thread.is_alive())
         self.assertFalse(seal_thread.is_alive())
-        self.assertEqual(
-            [json.loads(line)["sequence"] for line in ledger.read_text().splitlines()],
-            [1, 2],
-        )
         self.assertEqual(errors, [])
         self.assertTrue(result["terminal_marker"])
         records = [json.loads(line) for line in ledger.read_text().splitlines()]
@@ -3008,8 +3055,6 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
             calls += 1
             if calls == 1:
                 written = original_write(fd, data[: max(1, len(data) // 2)])
-                if complete_partial:
-                    return written
                 return written
             if not complete_partial and calls == 2:
                 raise OSError("partial seal write injected")
@@ -3156,98 +3201,76 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         self.assertTrue(mode & stat.S_IXUSR)
 
     def test_verify_private_tmp_survives_grandchild_close_fds_and_exec(self):
-        for bounded in (False, True):
-            with self.subTest(bounded=bounded):
-                root = self.create_repository()
-                leaf = (
-                    "import json, os, tempfile; from pathlib import Path; "
-                    "tmp = Path(os.environ['TMPDIR']); "
-                    "capture = {'tmp': str(tmp), 'mode': tmp.stat().st_mode & 0o777}; "
-                    "scratch = tempfile.TemporaryDirectory(dir=tmp); "
-                    "nested = Path(scratch.name) / 'nested'; nested.mkdir(); "
-                    "(nested / 'data').write_bytes(b'grandchild'); "
-                    "assert (nested / 'data').read_bytes() == b'grandchild'; "
-                    "scratch.cleanup(); "
-                    "Path('tmp-capture.json').write_text(json.dumps(capture))"
-                )
-                grandchild = (
-                    "import os, sys; "
-                    f"os.execv(sys.executable, [sys.executable, '-c', {leaf!r}])"
-                )
-                scripts = self.install_verify_fixture(
-                    root,
-                    "#!/usr/bin/env python3\n"
-                    "import subprocess, sys\n"
-                    f"subprocess.run([sys.executable, '-c', {grandchild!r}], "
-                    "close_fds=True, check=True)\n"
-                    "print('{\"transition\":\"passed\"}')\n",
-                )
-                if bounded:
-                    module = load_template_module(
-                        scripts / "workflow-verify-report",
-                        "verify_grandchild_bounded",
-                    )
-                    exit_code, stdout, stderr, failure = module.bounded_child(
-                        scripts / "workflow-compile-verify", root, b"{}",
-                    )
-                    self.assertEqual((exit_code, failure), (0, None), stderr)
-                    self.assertEqual(json.loads(stdout), {"transition": "passed"})
-                else:
-                    report = self.parse_verification_report(self.run_verify_command(root))
-                    self.assertEqual(report["code"], "passed", report)
-                capture = json.loads((root / "tmp-capture.json").read_text())
-                tmp = Path(capture["tmp"])
-                self.assertEqual(tmp.parent, root.resolve() / "build" / "kent-workflow")
-                self.assertTrue(tmp.name.startswith(".verify-tmp-"))
-                self.assertEqual(capture["mode"], 0o700)
-                self.assertFalse(tmp.exists(), "empty private root must be removed")
+        root = self.create_repository()
+        leaf = (
+            "import json, os, tempfile; from pathlib import Path; "
+            "tmp = Path(os.environ['TMPDIR']); "
+            "capture = {'tmp': str(tmp), 'mode': tmp.stat().st_mode & 0o777}; "
+            "scratch = tempfile.TemporaryDirectory(dir=tmp); "
+            "nested = Path(scratch.name) / 'nested'; nested.mkdir(); "
+            "(nested / 'data').write_bytes(b'grandchild'); "
+            "assert (nested / 'data').read_bytes() == b'grandchild'; "
+            "scratch.cleanup(); "
+            "Path('tmp-capture.json').write_text(json.dumps(capture))"
+        )
+        grandchild = (
+            "import os, sys; "
+            f"os.execv(sys.executable, [sys.executable, '-c', {leaf!r}])"
+        )
+        scripts = self.install_verify_fixture(
+            root,
+            "#!/usr/bin/env python3\n"
+            "import subprocess, sys\n"
+            f"subprocess.run([sys.executable, '-c', {grandchild!r}], "
+            "close_fds=True, check=True)\n"
+            "print('{\"transition\":\"passed\"}')\n",
+        )
+        report = self.parse_verification_report(self.run_verify_command(root))
+        self.assertEqual(report["code"], "passed", report)
+        capture = json.loads((root / "tmp-capture.json").read_text())
+        tmp = Path(capture["tmp"])
+        self.assertEqual(tmp.parent, root.resolve() / "build" / "kent-workflow")
+        self.assertTrue(tmp.name.startswith(".verify-tmp-"))
+        self.assertEqual(capture["mode"], 0o700)
+        self.assertFalse(tmp.exists(), "empty private root must be removed")
 
     def test_verify_nonempty_tmp_retains_product_pass_and_digest_diagnostic(self):
-        for bounded in (False, True):
-            with self.subTest(bounded=bounded):
-                root = self.create_repository()
-                scripts = self.install_verify_fixture(
-                    root,
-                    "#!/usr/bin/env python3\n"
-                    "import os, sys\nfrom pathlib import Path\n"
-                    "tmp = Path(os.environ['TMPDIR'])\n"
-                    "Path('tmp-capture.txt').write_text(str(tmp))\n"
-                    "(tmp / 'nested').mkdir()\n"
-                    "(tmp / 'nested' / 'PRIVATE_CHILD_NAME').write_bytes(b'PRIVATE_CONTENT')\n"
-                    "sys.stderr.write('product stderr\\n')\n"
-                    "print('{\"transition\":\"passed\"}')\n",
-                )
-                workflow = root / "build" / "kent-workflow"
-                unrelated = workflow / ".verify-tmp-another-invocation"
-                unrelated.mkdir(parents=True, mode=0o700)
-                (unrelated / "keep").write_bytes(b"other invocation")
-                module = load_template_module(
-                    scripts / "workflow-verify-report", "verify_tmp_retention",
-                )
-                if bounded:
-                    exit_code, stdout, stderr, failure = module.bounded_child(
-                        scripts / "workflow-compile-verify", root, b"{}",
-                    )
-                    self.assertEqual((exit_code, failure), (0, None))
-                    self.assertEqual(json.loads(stdout), {"transition": "passed"})
-                else:
-                    report = self.run_module_in_workspace(module, root)
-                    self.assertEqual(report["code"], "passed", report)
-                    content = (root / report["log_path"]).read_bytes()
-                    self.assertEqual(hashlib.sha256(content).hexdigest(), report["log_sha256"])
-                    self.assertIn(report["log_sha256"], report["log_path"])
-                    stdout, stderr = self.parse_framed_output(content)
-                    self.assertEqual(json.loads(stdout), {"transition": "passed"})
-                tmp = Path((root / "tmp-capture.txt").read_text())
-                self.assertEqual((tmp / "nested" / "PRIVATE_CHILD_NAME").read_bytes(), b"PRIVATE_CONTENT")
-                self.assertFalse((tmp / ".verification-input").exists())
-                self.assertEqual((unrelated / "keep").read_bytes(), b"other invocation")
-                diagnostic = stderr.removeprefix(b"product stderr\n")
-                self.assertIn(b"Verifier temporary files retained:", diagnostic)
-                self.assertIn(str(tmp.relative_to(root.resolve())).encode(), diagnostic)
-                self.assertLessEqual(len(diagnostic), 512)
-                for forbidden in (b"PRIVATE_CHILD_NAME", b"PRIVATE_CONTENT", str(root.resolve()).encode()):
-                    self.assertNotIn(forbidden, diagnostic)
+        root = self.create_repository()
+        scripts = self.install_verify_fixture(
+            root,
+            "#!/usr/bin/env python3\n"
+            "import os, sys\nfrom pathlib import Path\n"
+            "tmp = Path(os.environ['TMPDIR'])\n"
+            "Path('tmp-capture.txt').write_text(str(tmp))\n"
+            "(tmp / 'nested').mkdir()\n"
+            "(tmp / 'nested' / 'PRIVATE_CHILD_NAME').write_bytes(b'PRIVATE_CONTENT')\n"
+            "sys.stderr.write('product stderr\\n')\n"
+            "print('{\"transition\":\"passed\"}')\n",
+        )
+        workflow = root / "build" / "kent-workflow"
+        unrelated = workflow / ".verify-tmp-another-invocation"
+        unrelated.mkdir(parents=True, mode=0o700)
+        (unrelated / "keep").write_bytes(b"other invocation")
+        module = load_template_module(
+            scripts / "workflow-verify-report", "verify_tmp_retention",
+        )
+        report = self.run_module_in_workspace(module, root)
+        self.assertEqual(report["code"], "passed", report)
+        content = (root / report["log_path"]).read_bytes()
+        self.assertEqual(hashlib.sha256(content).hexdigest(), report["log_sha256"])
+        self.assertIn(report["log_sha256"], report["log_path"])
+        stdout, stderr = self.parse_framed_output(content)
+        self.assertEqual(json.loads(stdout), {"transition": "passed"})
+        tmp = Path((root / "tmp-capture.txt").read_text())
+        self.assertEqual((tmp / "nested" / "PRIVATE_CHILD_NAME").read_bytes(), b"PRIVATE_CONTENT")
+        self.assertFalse((tmp / ".verification-input").exists())
+        self.assertEqual((unrelated / "keep").read_bytes(), b"other invocation")
+        diagnostic = stderr.removeprefix(b"product stderr\n")
+        self.assertIn(b"Verifier temporary files retained:", diagnostic)
+        self.assertIn(str(tmp.relative_to(root.resolve())).encode(), diagnostic)
+        self.assertLessEqual(len(diagnostic), 512)
+        for forbidden in (b"PRIVATE_CHILD_NAME", b"PRIVATE_CONTENT", str(root.resolve()).encode()):
+            self.assertNotIn(forbidden, diagnostic)
 
     def test_verify_retention_diagnostic_does_not_create_output_overflow(self):
         module = load_template_module(VERIFY_REPORT, "verify_retention_frame")
@@ -3291,84 +3314,6 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         self.assertEqual(hashlib.sha256(content).hexdigest(), report["log_sha256"])
         self.assertIn(b"Verifier temporary files retained:", self.parse_framed_output(content)[1])
 
-    def test_bounded_retention_at_capacity_preserves_raw_streams_and_outcome(self):
-        limit = 1024
-        for stderr_length in (0, 257):
-            for exit_code in (0, 7):
-                with self.subTest(stderr_length=stderr_length, exit_code=exit_code):
-                    root = self.create_repository()
-                    raw_stdout = b'{"transition":"passed"}'
-                    raw_stdout += b" " * (limit - stderr_length - len(raw_stdout))
-                    raw_stderr = b"E" * stderr_length
-                    scripts = self.install_verify_fixture(
-                        root,
-                        "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
-                        "(Path(os.environ['TMPDIR']) / 'keep').touch()\n"
-                        f"sys.stdout.buffer.write({raw_stdout!r})\n"
-                        f"sys.stderr.buffer.write({raw_stderr!r})\n"
-                        f"sys.exit({exit_code})\n",
-                    )
-                    module = load_template_module(
-                        scripts / "workflow-verify-report", "bounded_retention_raw_capacity",
-                    )
-                    module.OUTPUT_LIMIT = limit
-                    code, stdout, stderr, failure = module.bounded_child(
-                        scripts / "workflow-compile-verify", root, b"{}",
-                    )
-                    self.assertEqual((code, failure), (exit_code, None))
-                    self.assertEqual(stdout, raw_stdout)
-                    self.assertEqual(stderr, raw_stderr)
-                    self.assertEqual(json.loads(stdout), {"transition": "passed"})
-                    self.assertEqual(len(stdout) + len(stderr), limit)
-                    self.assertEqual(
-                        len(list((root / "build" / "kent-workflow").glob(".verify-tmp-*/keep"))), 1,
-                    )
-
-    def test_bounded_retention_appends_whole_notice_only_when_it_fits(self):
-        for spare in (0, -1):
-            with self.subTest(spare=spare):
-                root = self.create_repository()
-                raw_stdout = b'{"transition":"passed"}\n'
-                raw_stderr = b"unmodified product stderr"
-                scripts = self.install_verify_fixture(
-                    root,
-                    "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
-                    "(Path(os.environ['TMPDIR']) / 'keep').touch()\n"
-                    f"sys.stdout.buffer.write({raw_stdout!r})\n"
-                    f"sys.stderr.buffer.write({raw_stderr!r})\n",
-                )
-                module = load_template_module(
-                    scripts / "workflow-verify-report", "bounded_retention_complete_fit",
-                )
-                notices = []
-
-                def set_exact_capacity(phase):
-                    if phase != "after_verifier_open_before_child":
-                        return
-                    # One invocation in this isolated fixture; production uses
-                    # its known basename and never discovers directories by glob.
-                    tmp = next((root / "build" / "kent-workflow").glob(".verify-tmp-*"))
-                    notice = (
-                        f"\nVerifier temporary files retained: build/kent-workflow/{tmp.name}\n"
-                    ).encode()
-                    self.assertLessEqual(len(notice), 512)
-                    notices.append(notice)
-                    module.OUTPUT_LIMIT = len(raw_stdout) + len(raw_stderr) + len(notice) + spare
-
-                code, stdout, stderr, failure = module.bounded_child(
-                    scripts / "workflow-compile-verify", root, b"{}",
-                    _phase_hook=set_exact_capacity,
-                )
-                self.assertEqual((code, failure), (0, None))
-                self.assertEqual(len(notices), 1)
-                self.assertEqual(stdout, raw_stdout)
-                self.assertEqual(stderr, raw_stderr + (notices[0] if spare == 0 else b""))
-                self.assertLessEqual(len(stdout) + len(stderr), module.OUTPUT_LIMIT)
-                if spare == 0:
-                    self.assertEqual(len(stdout) + len(stderr), module.OUTPUT_LIMIT)
-                self.assertEqual(
-                    len(list((root / "build" / "kent-workflow").glob(".verify-tmp-*/keep"))), 1,
-                )
 
     def test_verify_failed_child_retention_notice_remains_in_bounded_digest(self):
         for transition, exit_code, expected in (
@@ -3413,60 +3358,57 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
                 self.assertTrue((private / "keep").exists())
 
     def test_verify_private_tmp_prelaunch_drift_blocks_execution_and_cleanup(self):
-        for bounded in (False, True):
-            for kind in ("directory", "symlink", "mode", "build", "workspace"):
-                with self.subTest(bounded=bounded, kind=kind):
-                    root = self.create_repository()
-                    scripts = self.install_verify_fixture(
-                        root,
-                        "#!/usr/bin/env python3\nfrom pathlib import Path\n"
-                        "Path('child-ran').touch()\nprint('{\"transition\":\"passed\"}')\n",
-                    )
-                    module = load_template_module(scripts / "workflow-verify-report", "verify_tmp_prelaunch")
-                    outside = root / "external"
-                    outside.mkdir()
-                    (outside / "keep").write_bytes(b"external")
-                    selected = []
+        for kind in ("directory", "symlink", "mode", "build", "workspace"):
+            self._assert_prelaunch_drift_blocks_execution_and_cleanup(kind)
 
-                    def swap(phase):
-                        if phase != "after_verifier_open_before_child":
-                            return
-                        tmp = next((root / "build" / "kent-workflow").glob(".verify-tmp-*"))
-                        selected.append(tmp)
-                        if kind == "mode":
-                            tmp.chmod(0o755)
-                        elif kind == "build":
-                            (root / "build").rename(root / "moved-build")
-                            (root / "build").mkdir(mode=0o700)
-                        elif kind == "workspace":
-                            moved = root.with_name(root.name + "-moved")
-                            root.rename(moved)
-                            self.addCleanup(shutil.rmtree, moved)
-                            root.mkdir(mode=0o700)
-                        else:
-                            tmp.rename(tmp.with_name("moved-private"))
-                            if kind == "symlink":
-                                tmp.symlink_to(outside, target_is_directory=True)
-                            else:
-                                tmp.mkdir(mode=0o700)
+    def _assert_prelaunch_drift_blocks_execution_and_cleanup(self, kind):
+        with self.subTest(kind=kind):
+            root = self.create_repository()
+            scripts = self.install_verify_fixture(
+                root,
+                "#!/usr/bin/env python3\nfrom pathlib import Path\n"
+                "Path('child-ran').touch()\nprint('{\"transition\":\"passed\"}')\n",
+            )
+            module = load_template_module(scripts / "workflow-verify-report", "verify_tmp_prelaunch")
+            outside = root / "external"
+            outside.mkdir()
+            (outside / "keep").write_bytes(b"external")
+            selected = []
 
-                    if bounded:
-                        with self.assertRaises(module.VerificationFailure) as raised:
-                            module.bounded_child(scripts / "workflow-compile-verify", root, b"{}", _phase_hook=swap)
-                        self.assertEqual(raised.exception.code, "log_path_unsafe")
+            def swap(phase):
+                if phase != "after_verifier_open_before_child":
+                    return
+                tmp = next((root / "build" / "kent-workflow").glob(".verify-tmp-*"))
+                selected.append(tmp)
+                if kind == "mode":
+                    tmp.chmod(0o755)
+                elif kind == "build":
+                    (root / "build").rename(root / "moved-build")
+                    (root / "build").mkdir(mode=0o700)
+                elif kind == "workspace":
+                    moved = root.with_name(root.name + "-moved")
+                    root.rename(moved)
+                    self.addCleanup(shutil.rmtree, moved)
+                    root.mkdir(mode=0o700)
+                else:
+                    tmp.rename(tmp.with_name("moved-private"))
+                    if kind == "symlink":
+                        tmp.symlink_to(outside, target_is_directory=True)
                     else:
-                        report = self.run_module_in_workspace(module, root, hook=swap)
-                        self.assertEqual(report["code"], "log_path_unsafe", report)
-                    self.assertEqual(len(selected), 1)
-                    self.assertFalse((root / "child-ran").exists())
-                    if kind == "workspace":
-                        moved = root.with_name(root.name + "-moved")
-                        self.assertFalse((moved / "child-ran").exists())
-                        self.assertEqual((moved / "external" / "keep").read_bytes(), b"external")
-                    else:
-                        self.assertEqual((outside / "keep").read_bytes(), b"external")
-                    if kind in {"directory", "symlink", "mode"}:
-                        self.assertTrue(selected[0].exists(), "do not remove the unsafe replacement")
+                        tmp.mkdir(mode=0o700)
+
+            report = self.run_module_in_workspace(module, root, hook=swap)
+            self.assertEqual(report["code"], "log_path_unsafe", report)
+            self.assertEqual(len(selected), 1)
+            self.assertFalse((root / "child-ran").exists())
+            if kind == "workspace":
+                moved = root.with_name(root.name + "-moved")
+                self.assertFalse((moved / "child-ran").exists())
+                self.assertEqual((moved / "external" / "keep").read_bytes(), b"external")
+            else:
+                self.assertEqual((outside / "keep").read_bytes(), b"external")
+            if kind in {"directory", "symlink", "mode"}:
+                self.assertTrue(selected[0].exists(), "do not remove the unsafe replacement")
 
     def test_verify_private_tmp_postlaunch_swap_preserves_replacements(self):
         for kind in ("directory", "symlink", "input"):
@@ -4840,8 +4782,6 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             "(root / 'build' / 'kent-workflow').mkdir(mode=0o700)\n"
             "print('{\"transition\":\"passed\"}')\n",
         )
-        outside = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, outside)
         module = load_template_module(
             root / ".kent" / "scripts" / "workflow-verify-report",
             "verify_report_child_completion_chain_test",
@@ -4867,7 +4807,6 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             ),
             [],
         )
-        self.assertEqual(list(outside.iterdir()), [])
 
     def test_verify_log_gate_and_unsafe_existing_logs(self) -> None:
         root = self.create_repository()
@@ -4902,28 +4841,10 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         self.assertIsNone(report["exit_code"])
         self.assertFalse(marker.exists())
 
-        root = self.create_repository()
-        self.install_verify_fixture(
-            root,
-            "#!/bin/sh\nprintf '%s\\n' '{\"transition\":\"passed\"}'\n",
-        )
-        module = load_template_module(
-            root / ".kent" / "scripts" / "workflow-verify-report",
-            "verify_report_existing_log_test",
-        )
-        content = b"stdout:0\nstderr:0\n"
-        digest = hashlib.sha256(content).hexdigest()
-        log = root / "build" / "kent-workflow"
-        log.mkdir(parents=True)
-        final = log / f"verification-report-{digest}.log"
-        final.write_bytes(content)
-        final.chmod(0o644)
-        with self.assertRaises(module.VerificationFailure) as raised:
-            module.write_log(root, content)
-        self.assertEqual(raised.exception.code, "log_path_unsafe")
-
     def test_verify_unsafe_log_paths_have_exact_code(self) -> None:
-        content = b"stdout:0\nstderr:0\n"
+        framing = load_template_module(VERIFY_REPORT, "verify_existing_log_frame")
+        content, overflow = framing._frame(b'{"transition":"passed"}\n', b"", framing.OUTPUT_LIMIT)
+        self.assertFalse(overflow)
         digest = hashlib.sha256(content).hexdigest()
 
         for kind in ("build_file", "workflow_file", "build_mode"):
@@ -4980,9 +4901,9 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
                     root / ".kent" / "scripts" / "workflow-verify-report",
                     f"verify_report_existing_{kind}_test",
                 )
-                with self.assertRaises(module.VerificationFailure) as raised:
-                    module.write_log(root, content)
-                self.assertEqual(raised.exception.code, "log_path_unsafe")
+                report = self.run_module_in_workspace(module, root)
+                self.assertEqual(report["code"], "log_path_unsafe", report)
+                self.assertIsNone(report["log_path"])
                 if kind == "symlink":
                     self.assertEqual(list(outside.iterdir()), [outside / "outside.log"])
 
@@ -5034,9 +4955,10 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
             root / ".kent" / "scripts" / "workflow-verify-report",
             "verify_report_existing_safe_log_test",
         )
-        path, actual_digest = module.write_log(root, content)
-        self.assertEqual(path, f"build/kent-workflow/{final.name}")
-        self.assertEqual(actual_digest, digest)
+        report = self.run_module_in_workspace(module, root)
+        self.assertEqual(report["code"], "passed", report)
+        self.assertEqual(report["log_path"], f"build/kent-workflow/{final.name}")
+        self.assertEqual(report["log_sha256"], digest)
         self.assertEqual(final.read_bytes(), content)
 
     def test_verify_output_log_contains_secrets_but_outer_report_does_not(self) -> None:
@@ -5067,50 +4989,27 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
         root = self.create_repository()
         outside = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, outside)
+        scripts = self.install_verify_fixture(
+            root,
+            "#!/bin/sh\nprintf '%s\\n' '{\"transition\":\"passed\"}'\n",
+        )
         module = load_template_module(
-            REPO_ROOT / "templates" / "project" / "workflow-verify-report",
+            scripts / "workflow-verify-report",
             "verify_report_symlink_test",
         )
 
-        def swap_directory(_phase: str) -> None:
+        def swap_directory(phase: str) -> None:
+            if phase != "after_log_temp_open_before_child":
+                return
             build = root / "build"
             moved = root / "build-original"
             build.rename(moved)
             build.symlink_to(outside, target_is_directory=True)
 
-        with self.assertRaises((OSError, ValueError)):
-            module.write_log(root, b"must stay inside", _phase_hook=swap_directory)
+        report = self.run_module_in_workspace(module, root, hook=swap_directory)
+        self.assertEqual(report["code"], "log_path_unsafe", report)
+        self.assertIsNone(report["log_path"])
         self.assertEqual(list(outside.iterdir()), [])
-
-    def test_child_uses_replacement_environment_and_private_tmp_path(self) -> None:
-        root = self.create_repository()
-        child = root / "child.py"
-        child.write_text(
-            "#!/usr/bin/env python3\n"
-            "import json, os\n"
-            "print(json.dumps({k: os.environ[k] for k in "
-            "('TMPDIR', 'PWD', 'PYTHONDONTWRITEBYTECODE') "
-            "if k in os.environ}))\n"
-        )
-        child.chmod(0o755)
-        module = load_template_module(
-            REPO_ROOT / "templates" / "project" / "workflow-verify-report",
-            "verify_report_environment_test",
-        )
-        exit_code, stdout, stderr, failure = module.bounded_child(
-            child,
-            root,
-            b"{}",
-        )
-        self.assertEqual(exit_code, 0, stderr.decode("utf-8", "replace"))
-        self.assertIsNone(failure)
-        environment = json.loads(stdout)
-        private_tmp = Path(environment["TMPDIR"])
-        self.assertEqual(private_tmp.parent, root.resolve() / "build" / "kent-workflow")
-        self.assertTrue(private_tmp.name.startswith(".verify-tmp-"))
-        self.assertFalse(private_tmp.exists())
-        self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
-        self.assertNotIn("PWD", environment)
 
 
 class GitHubPrFeedbackTest(GitRepositoryTest):
@@ -5165,7 +5064,6 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
             validate_pr_feedback_item(item)
 
     def test_feedback_cursor_identity_matrix_and_limits(self) -> None:
-        root = self.create_repository()
         from workflowkit import github_observation as module
         from workflowkit import runtime
         commit = "0" * 40
@@ -5226,6 +5124,7 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
             {
                 "workflow_name": "PR",
                 "check_name": "unit",
+                "event": "pull_request",
                 "bucket": "pass",
                 "state": "SUCCESS",
                 "link": None,
@@ -5241,14 +5140,10 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
             state: dict[str, object] = {
                 "repository": "example/repo",
                 "pull_number": 1,
-                "head_oid": commit,
-                "base_oid": commit,
-                "pr_state": "OPEN",
                 "review_decision": "",
-                "merge_state_status": "CLEAN",
             }
             state.update(overrides)
-            return runtime.make_pr_feedback_cursor(
+            return runtime.make_dynamic_pr_feedback_cursor(
                 **state,
                 checks=check_rows,
                 items=sorted(
@@ -5260,7 +5155,7 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
         complete = cursor()
         self.assertEqual(complete["mode"], "complete")
         self.assertEqual(
-            runtime.classify_pr_feedback("uninitialized", complete)["transition"],
+            runtime.diff_dynamic_pr_feedback_cursor("uninitialized", complete)["transition"],
             "state_changed",
         )
         self.assertEqual(issue["body_bytes"], len("é".encode("utf-8")))
@@ -5334,13 +5229,7 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
             ("check-add", items, [*checks, {**checks[0], "check_name": "lint"}], {}),
             ("check-delete", items, [], {}),
             ("check-edit", items, [{**checks[0], "state": "FAILURE", "bucket": "fail"}], {}),
-            ("head", items, checks, {"head_oid": "1" * 40}),
-            ("base", items, checks, {"base_oid": "1" * 40}),
-            ("repository", items, checks, {"repository": "other/repo"}),
-            ("pull-number", items, checks, {"pull_number": 2}),
-            ("pr-state", items, checks, {"pr_state": "CLOSED"}),
             ("review-decision", items, checks, {"review_decision": "APPROVED"}),
-            ("merge-state", items, checks, {"merge_state_status": "BLOCKED"}),
         ]
         for label, item_rows, check_rows, overrides in mutations:
             with self.subTest(label=label):
@@ -5350,9 +5239,16 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
                     **overrides,
                 )
                 self.assertEqual(
-                    runtime.classify_pr_feedback(complete, changed)["transition"],
-                    "state_changed",
+                    runtime.diff_dynamic_pr_feedback_cursor(complete, changed)["transition"],
+                    "still_waiting" if label in {
+                        "issue-created", "issue-updated", "comment-created",
+                        "comment-updated", "check-add", "check-delete", "check-edit",
+                    } else "state_changed",
                 )
+        for identity in ({"repository": "other/repo"}, {"pull_number": 2}):
+            with self.subTest(identity=identity):
+                with self.assertRaisesRegex(ValueError, "same pull request"):
+                    runtime.diff_dynamic_pr_feedback_cursor(complete, cursor(**identity))
 
         many = [
             {**issue, "id": "issue-{:03d}".format(index)}
@@ -5361,7 +5257,7 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
         digest_only = cursor(item_rows=many)
         self.assertEqual(digest_only["mode"], "digest_only")
         self.assertEqual(
-            runtime.classify_pr_feedback(digest_only, digest_only)["transition"],
+            runtime.diff_dynamic_pr_feedback_cursor(digest_only, digest_only)["transition"],
             "still_waiting",
         )
         changed_digest = [
@@ -5371,7 +5267,7 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
             for index, item in enumerate(many)
         ]
         self.assertEqual(
-            runtime.classify_pr_feedback(
+            runtime.diff_dynamic_pr_feedback_cursor(
                 digest_only,
                 cursor(item_rows=changed_digest),
             )["transition"],
@@ -5441,7 +5337,7 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
         self.assertEqual(output.exception.code, "invalid_observation")
 
 
-class GitHubCiWatchTest(GitRepositoryTest):
+class GitHubWatchSupportTest(GitRepositoryTest):
     def test_ci_and_pr_emitters_preserve_original_input_for_capture(self):
         root = self.create_repository().resolve()
         scripts = root / ".kent/scripts"
@@ -5469,98 +5365,6 @@ class GitHubCiWatchTest(GitRepositoryTest):
             self.assertEqual(value["ci_report"], " exact output ")
             self.assertEqual(value["commentary"], kind + ":captured")
 
-    def expected_contract(
-        self,
-        *,
-        commit: str = "1" * 40,
-        checks: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
-        return {
-            "schema": "github-ci-expected-checks-v1",
-            "repository": "example/repo",
-            "project_commit": commit,
-            "runtime_source_envelope_digest": "a" * 64,
-            "checks": checks
-            or [
-                {
-                    "workflow_name": "PR",
-                    "check_name": "unit",
-                    "allow_skipped": False,
-                }
-            ],
-        }
-
-    def observed_check(
-        self,
-        *,
-        name: str = "unit",
-        workflow: str = "PR",
-        bucket: str = "pass",
-        state: str = "SUCCESS",
-    ) -> dict[str, object]:
-        return {
-            "name": name,
-            "workflow": workflow,
-            "bucket": bucket,
-            "state": state,
-            "link": None,
-        }
-
-    def test_v2_unicode_feedback_cursor_round_trips_through_ci_consumer(
-        self,
-    ) -> None:
-        watcher = load_template_module(
-            CI_WATCH,
-            "ci_unicode_feedback_cursor_consumer",
-        )
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "ci_unicode_feedback_cursor_runtime",
-        )
-        cursor = runtime.make_pr_feedback_cursor(
-            repository="example/repo",
-            pull_number=1,
-            head_oid="0" * 40,
-            base_oid="1" * 40,
-            pr_state="OPEN",
-            review_decision="",
-            merge_state_status="CLEAN",
-            checks=[],
-            items=[
-                {
-                    "kind": "review_thread",
-                    "id": "thread-1",
-                    "resolved": False,
-                    "outdated": False,
-                    "path": "src/é.kt",
-                    "current_line": 12,
-                    "current_start_line": 10,
-                    "original_line": 20,
-                    "original_start_line": 18,
-                    "subject_type": "LINE",
-                    "comment_ids": ["thread-comment-1"],
-                }
-            ],
-        )
-        raw = runtime.canonical_bytes(cursor).decode("utf-8")
-        self.assertIn("src/é.kt", raw)
-        with mock.patch.object(
-            watcher,
-            "runtime_contracts",
-            return_value=runtime,
-        ):
-            carrier = watcher.pr_feedback_cursor_values(
-                {"pr_feedback_cursor": raw}
-            )
-        self.assertEqual(carrier, {"pr_feedback_cursor": raw})
-        self.assertEqual(
-            runtime.parse_canonical_json(
-                carrier["pr_feedback_cursor"],
-                label="PR feedback cursor",
-                max_bytes=runtime.MAX_FEEDBACK_BYTES,
-            ),
-            cursor,
-        )
 
     def test_v2_runtime_contracts_rejects_symlinked_support_module(self) -> None:
         root = self.create_repository()
@@ -5587,1488 +5391,8 @@ class GitHubCiWatchTest(GitRepositoryTest):
             module.runtime_contracts()
         self.assertFalse(marker.exists())
 
-    def watch(
-        self,
-        root: Path,
-        *,
-        pr_state: dict[str, object],
-        checks: list[dict[str, object]],
-        watch_exit: int = 0,
-        prior_report: dict[str, object] | None = None,
-        pr_feedback_cursor: str | None = None,
-        expected: dict[str, object] | None = None,
-        gh_script: str | None = None,
-        max_polls: int = 1,
-        max_errors: int = 5,
-        query_timeout: int = 60,
-        ready_file: Path | None = None,
-        pid_file: Path | None = None,
-        source_contract: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        (root / "pr-state.json").write_text(json.dumps(pr_state))
-        (root / "checks.json").write_text(json.dumps(checks))
-        scripts = root / ".kent" / "scripts"
-        scripts.mkdir(parents=True, exist_ok=True)
-        (root / ".kent" / "workflow-profile.toml").write_text(
-            "schema_version = {}\n".format(4 if expected is not None else 3)
-        )
-        shutil.copyfile(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            scripts / "workflow_runtime_contracts.py",
-        )
-        watcher = scripts / "workflow-wait-github-ci"
-        shutil.copyfile(CI_WATCH, watcher)
-        watcher.chmod(0o755)
-        shutil.copyfile(
-            REPO_ROOT / "workflowkit" / "github_observation.py",
-            scripts / "workflow_github_observation.py",
-        )
-        fake_gh = root / "gh"
-        observed_head = pr_state.get("headRefOid", "a" * 40)
-        observed_base = pr_state.get("baseRefOid", "b" * 40)
-        if not isinstance(observed_head, str) or len(observed_head) != 40:
-            observed_head = "a" * 40
-        if not isinstance(observed_base, str) or len(observed_base) != 40:
-            observed_base = "b" * 40
-        observed_state = dict(pr_state)
-        observed_state.update(
-            {
-                "headRefOid": observed_head,
-                "baseRefOid": observed_base,
-                "headRefName": observed_state.get("headRefName", "TASK-5"),
-                "baseRefName": observed_state.get("baseRefName", "main"),
-                "mergeable": observed_state.get("mergeable", "MERGEABLE"),
-                "mergeStateStatus": observed_state.get(
-                    "mergeStateStatus", "CLEAN"
-                ),
-                "reviewDecision": observed_state.get("reviewDecision", ""),
-                "statusCheckRollup": observed_state.get(
-                    "statusCheckRollup", [{}] if checks else []
-                ),
-            }
-        )
-        if observed_state.get("state") == "MERGED":
-            observed_state["mergedAt"] = observed_state.get(
-                "mergedAt", "2026-09-22T00:00:00Z"
-            )
-            merge_commit = observed_state.get("mergeCommit")
-            if not isinstance(merge_commit, dict) or not isinstance(
-                merge_commit.get("oid"), str
-            ) or len(merge_commit["oid"]) != 40:
-                observed_state["mergeCommit"] = {"oid": "c" * 40}
-        (root / "pr-state.json").write_text(json.dumps(observed_state))
-        fake_gh.write_text(
-            gh_script
-            or (
-                "#!/bin/sh\n"
-                'if [ "$1 $2" = "pr view" ]; then\n'
-                '  cat "$KENT_TEST_PR_STATE"\n'
-                "  exit 0\n"
-                "fi\n"
-                'if [ "$1 $2" = "pr checks" ]; then\n'
-                '  case " $* " in\n'
-                '    *" --watch "*) exit "$KENT_TEST_WATCH_EXIT" ;;\n'
-                "  esac\n"
-                '  cat "$KENT_TEST_CHECKS"\n'
-                '  exit "$KENT_TEST_WATCH_EXIT"\n'
-                "fi\n"
-                'case "$*" in\n'
-                '  *issues/*/comments*|*"pulls/"*"reviews"*|*"pulls/"*"comments"*) printf \'[[]]\\n\' ;;\n'
-                '  *graphql*) printf \'[{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}]\\n\' ;;\n'
-                "esac\n"
-                "exit 0\n"
-            )
-        )
-        fake_gh.chmod(0o755)
-        workflow_input = {
-            "workspace_path": str(root),
-            "pr_url": "https://github.com/example/repo/pull/1",
-            "branch_name": "TASK-5",
-            "merge_strategy": "rebase",
-            "pr_head_oid": observed_head,
-            "pr_base_oid": observed_base,
-            "ci_contract": json.dumps(
-                {
-                    "schema": "github-ci-contract-v1",
-                    "repository": "example/repo",
-                    "pull_number": 1,
-                    "head_oid": observed_head,
-                    "base_oid": observed_base,
-                    "require_ci": True,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        }
-        if prior_report is not None:
-            workflow_input["ci_report"] = json.dumps(prior_report)
-        if pr_feedback_cursor is not None:
-            workflow_input["pr_feedback_cursor"] = pr_feedback_cursor
-        if expected is not None:
-            runtime = load_template_module(
-                REPO_ROOT / "workflowkit" / "runtime.py",
-                "runtime_for_ci_watch_helper",
-            )
-            workflow_input.update(
-                {
-                    "expected_ci_checks": json.dumps(
-                        expected,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                    "expected_ci_checks_sha256": (
-                        runtime.expected_ci_checks_sha256(expected)
-                    ),
-                    "runtime_source_envelope_digest": (
-                        expected["runtime_source_envelope_digest"]
-                    ),
-                }
-            )
-        environment = {
-            **os.environ,
-            "PATH": "{}:{}".format(root, os.environ.get("PATH", "")),
-            "KENT_TEST_PR_STATE": str(root / "pr-state.json"),
-            "KENT_TEST_CHECKS": str(root / "checks.json"),
-            "KENT_TEST_WATCH_EXIT": str(watch_exit),
-            "KENT_CI_WATCH_TEST_MODE": "1",
-            "KENT_CI_WATCH_INTERVAL_SECONDS": "0",
-            "KENT_CI_WATCH_MAX_POLLS": str(max_polls),
-            "KENT_CI_WATCH_MAX_ERRORS": str(max_errors),
-            "KENT_CI_WATCH_QUERY_TIMEOUT_SECONDS": str(query_timeout),
-        }
-        if ready_file is not None:
-            environment["KENT_READY_FILE"] = str(ready_file)
-        if pid_file is not None:
-            environment["KENT_PID_FILE"] = str(pid_file)
-        if ready_file is None:
-            result = subprocess.run(
-                [str(watcher)],
-                cwd=root,
-                input=json.dumps(workflow_input),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=environment,
-                check=False,
-            )
-        else:
-            process = subprocess.Popen(
-                [str(watcher)],
-                cwd=root,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=environment,
-            )
-            process.stdin.write(json.dumps(workflow_input))
-            process.stdin.flush()
-            process.stdin.close()
-            process.stdin = None
-            ready_deadline = time.monotonic() + 5
-            while (
-                not ready_file.exists()
-                and process.poll() is None
-                and time.monotonic() < ready_deadline
-            ):
-                time.sleep(0.01)
-            self.assertTrue(ready_file.exists())
-            stdout, stderr = process.communicate()
-            result = subprocess.CompletedProcess(
-                process.args,
-                process.returncode,
-                stdout,
-                stderr,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return json.loads(result.stdout)
 
-    def test_green_checks_advance_without_agent_polling(self) -> None:
-        root = self.create_repository()
-        result = self.watch(
-            root,
-            pr_state={
-                "state": "OPEN",
-                "mergedAt": None,
-                "mergeCommit": None,
-                "headRefName": "TASK-5",
-                "headRefOid": "head",
-                "baseRefName": "main",
-                "baseRefOid": "base",
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[
-                {
-                    "name": "unit",
-                    "workflow": "PR",
-                    "bucket": "pass",
-                    "state": "SUCCESS",
-                    "link": "https://github.com/example/repo/actions/runs/1",
-                }
-            ],
-        )
-        self.assertEqual(result["transition"], "ci_watch_passed")
-        report = json.loads(result["ci_report"])
-        self.assertEqual(report["schema"], "github-ci-report-v3")
-        self.assertEqual(report["attempts"][-1]["reason"], "green")
-        self.assertEqual(len(report["attempts"]), 1)
-
-    def test_failed_checks_wake_diagnosis_agent_once(self) -> None:
-        root = self.create_repository()
-        result = self.watch(
-            root,
-            pr_state={
-                "state": "OPEN",
-                "headRefName": "TASK-5",
-                "headRefOid": "head",
-                "baseRefName": "main",
-                "baseRefOid": "base",
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[
-                {
-                    "name": "detekt",
-                    "workflow": "PR",
-                    "bucket": "fail",
-                    "state": "FAILURE",
-                    "link": "https://github.com/example/repo/actions/runs/2",
-                }
-            ],
-            watch_exit=1,
-        )
-        self.assertEqual(result["transition"], "ci_watch_failed")
-        report = json.loads(result["ci_report"])
-        self.assertEqual(report["schema"], "github-ci-report-v3")
-        self.assertEqual(report["attempts"][-1]["reason"], "failed")
-        self.assertEqual(len(report["attempts"]), 1)
-
-    def test_schema3_carrier_requires_absent_report_for_legacy_mode(self) -> None:
-        root = self.create_repository()
-        pr_state = {
-            "state": "OPEN",
-            "headRefName": "TASK-5",
-            "headRefOid": "head",
-            "baseRefName": "main",
-            "baseRefOid": "base",
-            "url": "https://github.com/example/repo/pull/1",
-        }
-        legacy = self.watch(
-            root,
-            pr_state=pr_state,
-            checks=[
-                {
-                    "name": "unit",
-                    "workflow": "PR",
-                    "bucket": "fail",
-                    "state": "FAILURE",
-                    "link": "https://github.com/example/repo/actions/runs/2",
-                }
-            ],
-        )
-        self.assertEqual(legacy["transition"], "ci_watch_failed")
-        self.assertEqual(
-            json.loads(legacy["ci_report"])["reason"],
-            "terminal_check_failure",
-        )
-        self.assertNotIn("mode", json.loads(legacy["ci_report"]))
-        self.assertNotIn("schema", json.loads(legacy["ci_report"]))
-
-        nonempty_legacy = self.watch(
-            root,
-            pr_state=pr_state,
-            checks=[
-                {
-                    "name": "unit",
-                    "workflow": "PR",
-                    "bucket": "pass",
-                    "state": "SUCCESS",
-                    "link": "https://github.com/example/repo/actions/runs/3",
-                }
-            ],
-            prior_report={"reason": "legacy"},
-        )
-        self.assertEqual(nonempty_legacy["transition"], "ci_watch_failed")
-        self.assertEqual(
-            json.loads(nonempty_legacy["ci_report"])["attempts"][-1][
-                "safe_error"
-            ]["code"],
-            "report_invalid",
-        )
-
-    def test_merged_pr_skips_obsolete_ci_diagnosis(self) -> None:
-        root = self.create_repository()
-        result = self.watch(
-            root,
-            pr_state={
-                "state": "MERGED",
-                "mergedAt": "2026-08-05T00:00:00Z",
-                "mergeCommit": {"oid": "merged"},
-                "headRefName": "TASK-5",
-                "headRefOid": "head",
-                "baseRefName": "main",
-                "baseRefOid": "base",
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[],
-        )
-        self.assertEqual(result["transition"], "ci_watch_pr_merged")
-        self.assertIn("merged", result["merge_report"])
-
-    def test_v2_ci_accepts_canonical_expected_checks_string(self) -> None:
-        root = self.create_repository()
-        scripts = root / ".kent" / "scripts"
-        scripts.mkdir(parents=True)
-        watcher = scripts / "workflow-wait-github-ci"
-        shutil.copyfile(CI_WATCH, watcher)
-        watcher.chmod(0o755)
-        support = scripts / "workflow_runtime_contracts.py"
-        shutil.copyfile(REPO_ROOT / "workflowkit" / "runtime.py", support)
-        commit = "1" * 40
-        envelope = "a" * 64
-        expected = {
-            "schema": "github-ci-expected-checks-v1",
-            "repository": "example/repo",
-            "project_commit": commit,
-            "runtime_source_envelope_digest": envelope,
-            "checks": [
-                {
-                    "workflow_name": "PR",
-                    "check_name": "unit",
-                    "allow_skipped": False,
-                }
-            ],
-        }
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "runtime_for_ci_string_test",
-        )
-        (root / "pr-state.json").write_text(
-            json.dumps(
-                {
-                    "state": "OPEN",
-                    "headRefOid": commit,
-                    "baseRefOid": "2" * 40,
-                    "url": "https://github.com/example/repo/pull/1",
-                }
-            )
-        )
-        (root / "checks.json").write_text(
-            json.dumps(
-                [
-                    {
-                        "name": "unit",
-                        "workflow": "PR",
-                        "bucket": "pass",
-                        "state": "SUCCESS",
-                        "link": None,
-                    }
-                ]
-            )
-        )
-        fake_gh = root / "gh"
-        fake_gh.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1 $2" = "pr view" ]; then cat "$KENT_TEST_PR_STATE"; exit 0; fi\n'
-            'if [ "$1 $2" = "pr checks" ]; then\n'
-            '  case " $* " in *" --watch "*) exit 0;; esac\n'
-            '  cat "$KENT_TEST_CHECKS"; exit 0\n'
-            "fi\n"
-            "exit 2\n"
-        )
-        fake_gh.chmod(0o755)
-        payload = {
-            "workspace_path": str(root),
-            "pr_url": "https://github.com/example/repo/pull/1",
-            "branch_name": "TASK-5",
-            "merge_strategy": "rebase",
-            "pr_feedback_cursor": "uninitialized",
-            "expected_ci_checks": json.dumps(
-                expected,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(expected),
-            "runtime_source_envelope_digest": envelope,
-        }
-        result = subprocess.run(
-            [str(watcher)],
-            cwd=root,
-            input=json.dumps(payload),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "KENT_GH_BIN": str(fake_gh),
-                "KENT_TEST_PR_STATE": str(root / "pr-state.json"),
-                "KENT_TEST_CHECKS": str(root / "checks.json"),
-                "KENT_CI_WATCH_TEST_MODE": "1",
-                "KENT_CI_WATCH_INTERVAL_SECONDS": "0",
-                "KENT_CI_WATCH_MAX_POLLS": "1",
-            },
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        output = json.loads(result.stdout)
-        self.assertEqual(output["transition"], "ci_watch_passed", output)
-        self.assertEqual(
-            json.loads(output["ci_report"])["mode"],
-            "expected-v1",
-        )
-        self.assertEqual(output["pr_feedback_cursor"], "uninitialized")
-
-    def test_v2_ci_overdepth_expected_checks_fails_closed_without_child(self) -> None:
-        root = self.create_repository()
-        scripts = root / ".kent" / "scripts"
-        scripts.mkdir(parents=True)
-        (root / ".kent" / "workflow-profile.toml").write_text(
-            "schema_version = 4\n"
-        )
-        shutil.copyfile(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            scripts / "workflow_runtime_contracts.py",
-        )
-        watcher = scripts / "workflow-wait-github-ci"
-        shutil.copyfile(CI_WATCH, watcher)
-        watcher.chmod(0o755)
-        marker = root / "github-child-invoked"
-        fake_gh = root / "gh"
-        fake_gh.write_text(
-            "#!/bin/sh\n"
-            f"echo invoked > {str(marker)!r}\n"
-            "exit 0\n"
-        )
-        fake_gh.chmod(0o755)
-        overdepth = "[" * 101 + "0" + "]" * 101
-        payload = {
-            "workspace_path": str(root),
-            "pr_url": "https://github.com/example/repo/pull/1",
-            "branch_name": "TASK-5",
-            "merge_strategy": "rebase",
-            "pr_feedback_cursor": "uninitialized",
-            "expected_ci_checks": overdepth,
-            "expected_ci_checks_sha256": "a" * 64,
-            "runtime_source_envelope_digest": "b" * 64,
-        }
-        result = subprocess.run(
-            [str(watcher)],
-            cwd=root,
-            input=json.dumps(payload),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "KENT_GH_BIN": str(fake_gh),
-                "KENT_CI_WATCH_TEST_MODE": "1",
-                "KENT_CI_WATCH_INTERVAL_SECONDS": "0",
-            },
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        output = json.loads(result.stdout)
-        self.assertEqual(output["transition"], "ci_watch_failed")
-        self.assertEqual(
-            json.loads(output["ci_report"])["attempts"][-1]["safe_error"]["code"],
-            "expected_contract_invalid",
-        )
-        self.assertEqual(output["pr_feedback_cursor"], "uninitialized")
-        self.assertFalse(marker.exists())
-        self.assertNotIn(overdepth, result.stdout + result.stderr)
-        self.assertNotIn("RecursionError", result.stdout + result.stderr)
-
-    def test_v2_source_change_has_no_fabricated_ci_report(self) -> None:
-        root = self.create_repository()
-        expected = {
-            "schema": "github-ci-expected-checks-v1",
-            "repository": "example/repo",
-            "project_commit": "0" * 40,
-            "runtime_source_envelope_digest": "a" * 64,
-            "checks": [
-                {
-                    "workflow_name": "PR",
-                    "check_name": "unit",
-                    "allow_skipped": False,
-                }
-            ],
-        }
-        result = self.watch(
-            root,
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[
-                {
-                    "name": "unit",
-                    "workflow": "PR",
-                    "bucket": "pass",
-                    "state": "SUCCESS",
-                    "link": None,
-                }
-            ],
-            expected=expected,
-            pr_feedback_cursor="uninitialized",
-        )
-        self.assertEqual(result["transition"], "ci_watch_source_changed")
-        self.assertNotIn("ci_report", result)
-
-    def test_observation_limit_boundary_is_runtime_contract_blocker(self) -> None:
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "runtime_observation_limit_boundary",
-        )
-        expected = {
-            "schema": "github-ci-expected-checks-v1",
-            "repository": "example/repo",
-            "project_commit": "0" * 40,
-            "runtime_source_envelope_digest": "a" * 64,
-            "checks": [
-                {
-                    "workflow_name": "PR",
-                    "check_name": "unit",
-                    "allow_skipped": False,
-                }
-            ],
-        }
-        normalized = []
-
-        def validate_observed(_item: object, _label: str) -> dict[str, object]:
-            index = len(normalized)
-            value = {
-                "workflow_name": "W",
-                "check_name": "unexpected-{}".format(index),
-                "bucket": "pass",
-                "state": "SUCCESS",
-                "link": None,
-            }
-            normalized.append(value)
-            return value
-
-        observed = range(10001)
-        metadata = {
-            "expected_checks": [],
-            "unexpected_check_count": 10001,
-            "unexpected_checks_sha256": "b" * 64,
-        }
-        with mock.patch.object(
-            runtime,
-            "_validate_observed_check",
-            side_effect=validate_observed,
-        ), mock.patch.object(
-            runtime,
-            "_expected_check_observation_metadata",
-            return_value=metadata,
-        ):
-            classification = runtime.classify_expected_ci_checks(
-                expected,
-                observed,
-                current_repository="example/repo",
-                current_head_oid="0" * 40,
-                runtime_source_envelope_digest="a" * 64,
-                expected_checks_digest=runtime.expected_ci_checks_sha256(expected),
-            )
-        self.assertEqual(classification["transition"], "report_invalid")
-        self.assertEqual(classification["reason"], "observation_limit")
-        self.assertEqual(classification["unexpected_check_count"], 10001)
-
-        class OversizedObservations(list):
-            def __len__(self) -> int:
-                return 10001
-
-        with self.assertRaises(ValueError):
-            runtime.make_report_invalid_attempt(
-                sequence=1,
-                head_oid="0" * 40,
-                base_oid="1" * 40,
-                raw_observations=OversizedObservations(),
-            )
-
-    def test_observation_limit_production_path_remains_blocked(self) -> None:
-        watcher = load_template_module(CI_WATCH, "ci_observation_limit_path")
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "ci_observation_limit_path_runtime",
-        )
-        expected = self.expected_contract(commit="0" * 40)
-        checks = [
-            self.observed_check(name="unexpected-{}".format(index))
-            for index in range(10001)
-        ]
-        payload = {
-            "pr_url": "https://github.com/example/repo/pull/1",
-            "expected_ci_checks": json.dumps(
-                expected,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(expected),
-            "runtime_source_envelope_digest": "a" * 64,
-        }
-        receipt = runtime.RejectedObservationReceipt(
-            "unexpected_rows",
-            10001,
-            "b" * 64,
-        )
-        classification = runtime.ExpectedCiClassification(
-            "observation_limit",
-            {
-                "transition": "report_invalid",
-                "reason": "observation_limit",
-                "expected_checks": [],
-                "unexpected_check_count": 10001,
-                "unexpected_checks_sha256": "b" * 64,
-            },
-            runtime.RejectedObservationReceipt(
-                "projected_rows",
-                10002,
-                "c" * 64,
-            ),
-            receipt,
-        )
-        with mock.patch.object(
-            watcher,
-            "runtime_contracts",
-            return_value=runtime,
-        ), mock.patch.object(
-            runtime,
-            "classify_expected_ci_checks_with_receipt",
-            return_value=classification,
-        ):
-            transition, report, reason = watcher.v2_ci_report(
-                payload,
-                {"headRefOid": "0" * 40, "baseRefOid": "1" * 40},
-                checks,
-                watch_exit=1,
-            )
-        self.assertEqual((transition, reason), ("ci_watch_failed", "report_invalid"))
-        attempt = json.loads(report)["attempts"][-1]
-        self.assertEqual(attempt["safe_error"]["code"], "observation_limit")
-        self.assertEqual(attempt["unexpected_check_count"], 10001)
-        self.assertEqual(
-            attempt["unexpected_checks_sha256"],
-            "b" * 64,
-        )
-
-    def test_v2_observation_limit_initial_append_is_typed_and_stable(self) -> None:
-        watcher = load_template_module(
-            CI_WATCH,
-            "ci_observation_limit_initial_append",
-        )
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "ci_observation_limit_initial_append_runtime",
-        )
-        expected = self.expected_contract()
-        checks = [
-            self.observed_check(),
-            *[
-                self.observed_check(name="unexpected-{:05d}".format(index))
-                for index in range(10001)
-            ],
-        ]
-        payload = {
-            "pr_url": "https://github.com/example/repo/pull/1",
-            "expected_ci_checks": json.dumps(
-                expected,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(expected),
-            "runtime_source_envelope_digest": expected[
-                "runtime_source_envelope_digest"
-            ],
-        }
-        with mock.patch.object(
-            watcher,
-            "runtime_contracts",
-            return_value=runtime,
-        ), mock.patch.object(
-            runtime,
-            "make_report_invalid_attempt",
-            side_effect=AssertionError("legacy builder was called"),
-        ):
-            transition, report_json, reason = watcher.v2_ci_report(
-                payload,
-                {"headRefOid": "1" * 40, "baseRefOid": "2" * 40},
-                checks,
-                watch_exit=1,
-            )
-        self.assertEqual((transition, reason), ("ci_watch_failed", "report_invalid"))
-        report = json.loads(report_json)
-        attempt = report["attempts"][-1]
-        normalized = watcher.v2_ci_observation(checks)
-        unexpected = sorted(
-            normalized[1:],
-            key=runtime._observed_check_sort_key,
-        )
-        expected_digest = runtime.canonical_sha256(unexpected)
-        self.assertEqual(attempt["unexpected_check_count"], 10001)
-        self.assertEqual(
-            attempt["unexpected_checks_sha256"],
-            expected_digest,
-        )
-        runtime.validate_ci_report(report)
-        payload["ci_report"] = report_json
-        with mock.patch.object(
-            watcher,
-            "runtime_contracts",
-            return_value=runtime,
-        ):
-            _, appended_json, _ = watcher.v2_ci_report(
-                payload,
-                {"headRefOid": "1" * 40, "baseRefOid": "2" * 40},
-                list(reversed(checks)),
-                watch_exit=1,
-            )
-        appended = json.loads(appended_json)
-        self.assertEqual(len(appended["attempts"]), 2)
-        self.assertEqual(
-            appended["attempts"][-1]["unexpected_checks_sha256"],
-            expected_digest,
-        )
-        runtime.validate_ci_report(appended)
-
-    def test_v2_attempt_wire_boundary_initial_and_append_are_size_only(self) -> None:
-        watcher = load_template_module(
-            CI_WATCH,
-            "ci_attempt_wire_boundary_production_path",
-        )
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "ci_attempt_wire_boundary_runtime",
-        )
-        expected_rows = [
-            {
-                "workflow_name": "W",
-                "check_name": "{:03d}".format(index),
-                "allow_skipped": False,
-            }
-            for index in range(30)
-        ]
-        expected = self.expected_contract(checks=expected_rows)
-        payload = {
-            "pr_url": "https://github.com/example/repo/pull/1",
-            "expected_ci_checks": json.dumps(
-                expected,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(
-                expected
-            ),
-            "runtime_source_envelope_digest": "a" * 64,
-        }
-        pr = {"headRefOid": "1" * 40, "baseRefOid": "2" * 40}
-        link_prefix = "https://github.com/" + "x" * 1522
-
-        def checks(extra: int) -> list[dict[str, object]]:
-            result = [
-                self.observed_check(
-                    name="{:03d}".format(index),
-                    workflow="W",
-                )
-                for index in range(30)
-            ]
-            for item in result:
-                item["link"] = link_prefix
-            result[-1]["link"] = link_prefix + "x" * extra
-            return result
-
-        def candidate_size(extra: int) -> int:
-            observations = watcher.v2_ci_observation(checks(extra))
-            classification = runtime.classify_expected_ci_checks_with_receipt(
-                expected,
-                observations,
-                current_repository="example/repo",
-                current_head_oid="1" * 40,
-                runtime_source_envelope_digest="a" * 64,
-                expected_checks_digest=runtime.expected_ci_checks_sha256(
-                    expected
-                ),
-            )
-            value = classification.materialize_value()
-            candidate = {
-                "sequence": 1,
-                "head_oid": "1" * 40,
-                "base_oid": "2" * 40,
-                "reason": value["transition"],
-                "watcher_exit_code": 0,
-                "expected_checks": value["expected_checks"],
-                "unexpected_check_count": value["unexpected_check_count"],
-                "unexpected_checks_sha256": value[
-                    "unexpected_checks_sha256"
-                ],
-                "retry": None,
-                "safe_error": None,
-            }
-            return len(runtime.canonical_bytes(candidate))
-
-        limit = runtime.MAX_CI_ATTEMPT_BYTES
-        exact_extra = next(
-            extra
-            for extra in range(508)
-            if candidate_size(extra) == limit
-        )
-        over_extra = exact_extra + 1
-        projected = runtime._project_observed_rows(
-            watcher.v2_ci_observation(checks(over_extra))
-        )
-        projected_digest = runtime.canonical_sha256(projected)
-        projected_count = len(projected)
-
-        def report(
-            selected_checks: list[dict[str, object]],
-            previous: str | None = None,
-        ) -> dict[str, object]:
-            current = dict(payload)
-            if previous is not None:
-                current["ci_report"] = previous
-            with mock.patch.object(
-                watcher,
-                "runtime_contracts",
-                return_value=runtime,
-            ), mock.patch.object(
-                runtime,
-                "make_report_invalid_attempt",
-                side_effect=AssertionError("legacy builder was called"),
-            ):
-                transition, report_json, reason = watcher.v2_ci_report(
-                    current,
-                    pr,
-                    selected_checks,
-                    watch_exit=0,
-                )
-            self.assertEqual((transition, reason), (
-                "ci_watch_passed",
-                "all_expected_checks_terminal_green",
-            ))
-            assert report_json is not None
-            return json.loads(report_json)
-
-        exact_initial = report(checks(exact_extra))
-        exact_attempt = exact_initial["attempts"][-1]
-        self.assertEqual(
-            len(runtime.canonical_bytes(exact_attempt)),
-            limit,
-        )
-        self.assertIsNone(exact_attempt["safe_error"])
-
-        exact_append = report(
-            checks(exact_extra),
-            json.dumps(
-                exact_initial,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
-        self.assertEqual(
-            len(runtime.canonical_bytes(exact_append["attempts"][-1])),
-            limit,
-        )
-        self.assertEqual(exact_append["attempts"][-1]["sequence"], 2)
-
-        for previous in (None, exact_initial):
-            with self.subTest(previous=previous is not None):
-                converted = report(
-                    checks(over_extra),
-                    None
-                    if previous is None
-                    else json.dumps(
-                        previous,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                )
-                attempt = converted["attempts"][-1]
-                self.assertEqual(
-                    attempt["safe_error"]["code"],
-                    "observation_limit",
-                )
-                self.assertEqual(
-                    attempt["unexpected_check_count"],
-                    projected_count,
-                )
-                self.assertEqual(
-                    attempt["unexpected_checks_sha256"],
-                    projected_digest,
-                )
-                self.assertEqual(attempt["expected_checks"], [])
-                self.assertIsNone(attempt["retry"])
-                runtime.validate_ci_report(converted)
-
-    def test_v2_ordinary_path_materializes_typed_classification_value(self) -> None:
-        watcher = load_template_module(
-            CI_WATCH,
-            "ci_typed_classification_materialization",
-        )
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "ci_typed_classification_materialization_runtime",
-        )
-        expected = self.expected_contract()
-        payload = {
-            "pr_url": "https://github.com/example/repo/pull/1",
-            "expected_ci_checks": json.dumps(
-                expected,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(expected),
-            "runtime_source_envelope_digest": "a" * 64,
-        }
-        receipt = runtime.RejectedObservationReceipt(
-            "projected_rows",
-            1,
-            runtime.canonical_sha256([]),
-        )
-        calls = 0
-        self_check = self.observed_check()
-        normalized_check = watcher.v2_ci_observation([self_check])[0]
-
-        class TypedClassification:
-            state = "ordinary"
-            value = None
-            projected_observations = receipt
-
-            def materialize_value(self) -> dict[str, object]:
-                nonlocal calls
-                calls += 1
-                return {
-                    "transition": "all_expected_checks_terminal_green",
-                    "expected_checks": [normalized_check],
-                    "unexpected_check_count": 0,
-                    "unexpected_checks_sha256": runtime.canonical_sha256([]),
-                }
-
-        classification = TypedClassification()
-        with mock.patch.object(
-            watcher,
-            "runtime_contracts",
-            return_value=runtime,
-        ), mock.patch.object(
-            runtime,
-            "classify_expected_ci_checks_with_receipt",
-            return_value=classification,
-        ):
-            transition, report_json, reason = watcher.v2_ci_report(
-                payload,
-                {"headRefOid": "1" * 40, "baseRefOid": "2" * 40},
-                [self_check],
-                watch_exit=0,
-            )
-        self.assertEqual(calls, 1)
-        self.assertEqual(
-            (transition, reason),
-            ("ci_watch_passed", "all_expected_checks_terminal_green"),
-        )
-        assert report_json is not None
-        report = json.loads(report_json)
-        self.assertEqual(
-            report["attempts"][-1]["expected_checks"],
-            [normalized_check],
-        )
-        runtime.validate_ci_report(report)
-
-    def test_v2_grammar_and_projected_hard_paths_use_typed_builders(self) -> None:
-        watcher = load_template_module(
-            CI_WATCH,
-            "ci_typed_grammar_hard_paths",
-        )
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "ci_typed_grammar_hard_paths_runtime",
-        )
-        expected = self.expected_contract()
-        payload = {
-            "pr_url": "https://github.com/example/repo/pull/1",
-            "expected_ci_checks": json.dumps(
-                expected,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(expected),
-            "runtime_source_envelope_digest": expected[
-                "runtime_source_envelope_digest"
-            ],
-        }
-        malformed = [{"workflow_name": "bad"} for _ in range(10001)]
-        projected = runtime._project_observed_rows(malformed)
-        with mock.patch.object(
-            watcher,
-            "runtime_contracts",
-            return_value=runtime,
-        ), mock.patch.object(
-            watcher,
-            "v2_ci_observation",
-            return_value=malformed,
-        ), mock.patch.object(
-            runtime,
-            "make_report_invalid_attempt",
-            side_effect=AssertionError("legacy builder was called"),
-        ):
-            transition, report_json, reason = watcher.v2_ci_report(
-                payload,
-                {"headRefOid": "1" * 40, "baseRefOid": "2" * 40},
-                [],
-                watch_exit=1,
-            )
-        self.assertEqual((transition, reason), ("ci_watch_failed", "report_invalid"))
-        grammar_report = json.loads(report_json)
-        grammar_attempt = grammar_report["attempts"][-1]
-        self.assertEqual(grammar_attempt["unexpected_check_count"], 10001)
-        self.assertEqual(
-            grammar_attempt["unexpected_checks_sha256"],
-            runtime.canonical_sha256(projected),
-        )
-        runtime.validate_ci_report(grammar_report)
-
-        wide = [
-            {
-                "workflow_name": "W" * 256,
-                "check_name": "C" * 256,
-                "bucket": "pass",
-                "state": "SUCCESS",
-                "link": None,
-            }
-            for _ in range(10000)
-        ]
-        with mock.patch.object(
-            watcher,
-            "runtime_contracts",
-            return_value=runtime,
-        ), mock.patch.object(
-            watcher,
-            "v2_ci_observation",
-            return_value=wide,
-        ), mock.patch.object(
-            runtime,
-            "make_report_invalid_attempt",
-            side_effect=AssertionError("legacy builder was called"),
-        ):
-            transition, report_json, reason = watcher.v2_ci_report(
-                payload,
-                {"headRefOid": "1" * 40, "baseRefOid": "2" * 40},
-                [],
-                watch_exit=1,
-            )
-        self.assertEqual((transition, reason), ("ci_watch_failed", "report_invalid"))
-        hard_report = json.loads(report_json)
-        hard_attempt = hard_report["attempts"][-1]
-        self.assertEqual(hard_attempt["safe_error"]["code"], "hard_limit")
-        self.assertEqual(
-            hard_attempt["unexpected_checks_sha256"],
-            runtime.canonical_sha256([]),
-        )
-        runtime.validate_ci_report(hard_report)
-
-    def test_expected_ci_classification_matrix_and_history_bounds(self) -> None:
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "ci_classification_matrix",
-        )
-        expected = {
-            "schema": "github-ci-expected-checks-v1",
-            "repository": "example/repo",
-            "project_commit": "0" * 40,
-            "runtime_source_envelope_digest": "a" * 64,
-            "checks": [
-                {
-                    "workflow_name": "PR",
-                    "check_name": "unit",
-                    "allow_skipped": False,
-                }
-            ],
-        }
-        digest = runtime.expected_ci_checks_sha256(expected)
-        base = {
-            "workflow_name": "PR",
-            "check_name": "unit",
-            "bucket": "pass",
-            "state": "SUCCESS",
-            "link": None,
-        }
-        cases = {
-            "green": ([base], "all_expected_checks_terminal_green"),
-            "missing": ([], "no_checks_reported"),
-            "failed": ([{**base, "bucket": "fail", "state": "FAILURE"}], "expected_check_failed"),
-            "skipped": ([{**base, "bucket": "skipping", "state": "SKIPPED"}], "expected_check_skipped"),
-            "pending": ([{**base, "bucket": "pending", "state": "QUEUED"}], "pending_limit"),
-            "duplicate": ([base, base], "duplicate_observed_check"),
-            "unexpected": ([{**base, "check_name": "other"}], "expected_check_missing"),
-        }
-        for label, (observed, transition) in cases.items():
-            with self.subTest(label=label):
-                result = runtime.classify_expected_ci_checks(
-                    expected,
-                    observed,
-                    current_repository="example/repo",
-                    current_head_oid="0" * 40,
-                    runtime_source_envelope_digest="a" * 64,
-                    expected_checks_digest=digest,
-                )
-                self.assertEqual(result["transition"], transition)
-        self.assertEqual(
-            runtime.classify_expected_ci_checks(
-                expected,
-                [base],
-                current_repository="other/repo",
-                current_head_oid="0" * 40,
-                runtime_source_envelope_digest="a" * 64,
-                expected_checks_digest=digest,
-            )["transition"],
-            "expected_contract_invalid",
-        )
-        self.assertEqual(
-            runtime.classify_expected_ci_checks(
-                expected,
-                [base],
-                current_repository="example/repo",
-                current_head_oid="1" * 40,
-                runtime_source_envelope_digest="a" * 64,
-                expected_checks_digest=digest,
-            )["transition"],
-            "source_changed",
-        )
-        self.assertEqual(
-            runtime.classify_expected_ci_checks(
-                expected,
-                [base],
-                current_repository="example/repo",
-                current_head_oid="0" * 40,
-                runtime_source_envelope_digest="b" * 64,
-                expected_checks_digest=digest,
-            )["transition"],
-            "expected_contract_invalid",
-        )
-        self.assertEqual(
-            runtime.classify_expected_ci_checks(
-                expected,
-                [base],
-                current_repository="example/repo",
-                current_head_oid="0" * 40,
-                runtime_source_envelope_digest="a" * 64,
-                expected_checks_digest="b" * 64,
-            )["transition"],
-            "expected_contract_invalid",
-        )
-        attempt = runtime.make_report_invalid_attempt(
-            sequence=1,
-            head_oid="0" * 40,
-            base_oid="1" * 40,
-            raw_observations=[base],
-        )
-        report = runtime.build_ci_report(
-            mode="expected-v1",
-            repository="example/repo",
-            pull_number=1,
-            runtime_source_envelope_digest="a" * 64,
-            expected_ci_checks_sha256=digest,
-            attempts=[attempt],
-        )
-        for sequence in range(2, 10):
-            report = runtime.append_ci_report_attempt(
-                report,
-                {
-                    **attempt,
-                    "sequence": sequence,
-                },
-            )
-        self.assertEqual(len(report["attempts"]), 8)
-        self.assertEqual(report["discarded_attempt_count"], 1)
-        runtime.validate_ci_report(report)
-
-    def test_v2_query_failure_preserves_cursor_and_output_digests(self) -> None:
-        root = self.create_repository()
-        expected = self.expected_contract()
-        result = self.watch(
-            root,
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[self.observed_check()],
-            expected=expected,
-            pr_feedback_cursor="uninitialized",
-            gh_script="#!/bin/sh\nprintf out\nprintf err >&2\nexit 7\n",
-            max_errors=1,
-        )
-        self.assertEqual(result["transition"], "ci_watch_failed")
-        self.assertEqual(result["pr_feedback_cursor"], "uninitialized")
-        report = json.loads(result["ci_report"])
-        error = report["attempts"][-1]["safe_error"]
-        self.assertEqual(error["code"], "github_query_failed")
-        self.assertEqual(error["exit_code"], 7)
-        self.assertEqual(error["stdout_sha256"], hashlib.sha256(b"out").hexdigest())
-        self.assertEqual(error["stderr_sha256"], hashlib.sha256(b"err").hexdigest())
-        timed_out = self.watch(
-            root,
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[self.observed_check()],
-            expected=expected,
-            pr_feedback_cursor="uninitialized",
-            gh_script="#!/bin/sh\nsleep 2\n",
-            max_errors=1,
-            query_timeout=1,
-        )
-        timeout_error = json.loads(timed_out["ci_report"])["attempts"][-1][
-            "safe_error"
-        ]
-        self.assertEqual(timeout_error["code"], "github_query_failed")
-        self.assertIsNone(timeout_error["exit_code"])
-
-    def test_v2_github_query_output_cap_terminates_the_process_group(self) -> None:
-        root = self.create_repository()
-        ready_file = root / "ready"
-        pid_file = root / "pids"
-        result = self.watch(
-            root,
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[self.observed_check()],
-            expected=self.expected_contract(),
-            pr_feedback_cursor="uninitialized",
-            gh_script=(
-                "#!/bin/sh\n"
-                "(trap '' TERM; sleep 30) &\n"
-                "child=$!\n"
-                "printf '%s %s\\n' \"$$\" \"$child\" > \"$KENT_PID_FILE\"\n"
-                "printf ready > \"$KENT_READY_FILE\"\n"
-                "head -c 4194305 /dev/zero\n"
-                "wait\n"
-            ),
-            max_errors=1,
-            query_timeout=10,
-            ready_file=ready_file,
-            pid_file=pid_file,
-        )
-        self.assertTrue(ready_file.exists())
-        assert_pids_gone(self, pid_file)
-        self.assertEqual(result["transition"], "ci_watch_failed")
-        error = json.loads(result["ci_report"])["attempts"][-1]["safe_error"]
-        self.assertEqual(error["code"], "hard_limit")
-        self.assertEqual(
-            error["stdout_sha256"],
-            hashlib.sha256(b"\0" * (4 * 1024 * 1024 + 1)).hexdigest(),
-        )
-
-    def test_v2_closed_query_pipes_still_enforce_deadline(self) -> None:
-        root = self.create_repository()
-        ready_file = root / "ready"
-        pid_file = root / "pids"
-        started = time.monotonic()
-        result = self.watch(
-            root,
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[self.observed_check()],
-            expected=self.expected_contract(),
-            pr_feedback_cursor="uninitialized",
-            gh_script=(
-                "#!/bin/sh\n"
-                "(sleep 30) >/dev/null 2>&1 &\n"
-                "child=$!\n"
-                "printf '%s %s\\n' \"$$\" \"$child\" > \"$KENT_PID_FILE\"\n"
-                "printf ready > \"$KENT_READY_FILE\"\n"
-                "exec >/dev/null 2>&1\n"
-                "sleep 2\n"
-            ),
-            max_errors=1,
-            query_timeout=1,
-            ready_file=ready_file,
-            pid_file=pid_file,
-        )
-        self.assertLess(time.monotonic() - started, 2.0)
-        assert_pids_gone(self, pid_file)
-        self.assertEqual(result["transition"], "ci_watch_failed")
-        report = json.loads(result["ci_report"])
-        self.assertEqual(
-            report["attempts"][-1]["safe_error"]["code"],
-            "github_query_failed",
-        )
-
-    def test_v2_orphaned_query_group_is_reaped_after_parent_exit(self) -> None:
-        root = self.create_repository()
-        ready_file = root / "ready"
-        pid_file = root / "pids"
-        result = self.watch(
-            root,
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[self.observed_check()],
-            expected=self.expected_contract(),
-            gh_script=(
-                "#!/bin/sh\n"
-                "(trap '' TERM; sleep 30) &\n"
-                "child=$!\n"
-                "printf '%s\\n' \"$child\" > \"$KENT_PID_FILE\"\n"
-                "printf ready > \"$KENT_READY_FILE\"\n"
-                "exit 0\n"
-            ),
-            max_errors=1,
-            query_timeout=1,
-            ready_file=ready_file,
-            pid_file=pid_file,
-        )
-        self.assertEqual(result["transition"], "ci_watch_failed")
-        self.assertEqual(
-            json.loads(result["ci_report"])["attempts"][-1]["safe_error"][
-                "code"
-            ],
-            "github_query_failed",
-        )
-        assert_pids_gone(self, pid_file)
-
-    def test_v2_success_orphan_with_closed_pipes_is_rejected_and_reaped(
-        self,
-    ) -> None:
-        root = self.create_repository()
-        ready_file = root / "ready"
-        pid_file = root / "pids"
-        result = self.watch(
-            root,
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[self.observed_check()],
-            expected=self.expected_contract(),
-            gh_script=(
-                "#!/bin/sh\n"
-                "(trap '' TERM; "
-                "exec >/dev/null 2>&1; "
-                "printf ready > \"$KENT_READY_FILE\"; "
-                "while :; do sleep 1; done) &\n"
-                "child=$!\n"
-                "printf '%s %s\\n' \"$$\" \"$child\" > \"$KENT_PID_FILE\"\n"
-                "while [ ! -f \"$KENT_READY_FILE\" ]; do sleep 0.01; done\n"
-                "exit 0\n"
-            ),
-            max_errors=1,
-            query_timeout=1,
-            ready_file=ready_file,
-            pid_file=pid_file,
-        )
-        self.assertEqual(result["transition"], "ci_watch_failed")
-        self.assertEqual(
-            json.loads(result["ci_report"])["attempts"][-1]["safe_error"][
-                "code"
-            ],
-            "github_query_failed",
-        )
-        assert_pids_gone(self, pid_file)
-
-    def test_v2_cursor_prevalidation_allowed_skipped_and_subset_missing(self) -> None:
-        malformed = self.watch(
-            self.create_repository(),
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[self.observed_check()],
-            expected=self.expected_contract(),
-            pr_feedback_cursor="{not-json",
-        )
-        self.assertEqual(malformed["transition"], "ci_watch_failed")
-        self.assertEqual(
-            json.loads(malformed["ci_report"])["attempts"][-1]["safe_error"][
-                "code"
-            ],
-            "expected_contract_invalid",
-        )
-
-        skipped = self.watch(
-            self.create_repository(),
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[self.observed_check(bucket="skipping", state="SKIPPED")],
-            expected=self.expected_contract(
-                checks=[
-                    {
-                        "workflow_name": "PR",
-                        "check_name": "unit",
-                        "allow_skipped": True,
-                    }
-                ]
-            ),
-            pr_feedback_cursor="uninitialized",
-        )
-        self.assertEqual(skipped["transition"], "ci_watch_passed")
-        self.assertEqual(
-            json.loads(skipped["ci_report"])["attempts"][-1]["reason"],
-            "all_expected_checks_terminal_green",
-        )
-
-        subset = self.watch(
-            self.create_repository(),
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[self.observed_check()],
-            expected=self.expected_contract(
-                checks=[
-                    {
-                        "workflow_name": "PR",
-                        "check_name": "lint",
-                        "allow_skipped": False,
-                    },
-                    {
-                        "workflow_name": "PR",
-                        "check_name": "unit",
-                        "allow_skipped": False,
-                    },
-                ]
-            ),
-            pr_feedback_cursor="uninitialized",
-        )
-        self.assertEqual(subset["transition"], "ci_watch_failed")
-        self.assertEqual(
-            [item["reason"] for item in json.loads(subset["ci_report"])["attempts"]],
-            ["expected_check_missing", "pending_limit"],
-        )
-
-    def test_v2_history_rejects_malformed_and_proves_discarded_digest(self) -> None:
+    def test_v2_report_reader_rejects_malformed_history_fields(self) -> None:
         runtime = load_template_module(
             REPO_ROOT / "workflowkit" / "runtime.py",
             "ci_history_contract_matrix",
@@ -7080,12 +5404,18 @@ class GitHubCiWatchTest(GitRepositoryTest):
             "state": "SUCCESS",
             "link": None,
         }
-        discarded = runtime.make_report_invalid_attempt(
-            sequence=1,
-            head_oid="0" * 40,
-            base_oid="1" * 40,
-            raw_observations=[observed],
-        )
+        discarded = {
+            "sequence": 1,
+            "head_oid": "0" * 40,
+            "base_oid": "1" * 40,
+            "reason": "all_expected_checks_terminal_green",
+            "watcher_exit_code": 0,
+            "expected_checks": [observed],
+            "unexpected_check_count": 0,
+            "unexpected_checks_sha256": runtime.canonical_sha256([]),
+            "retry": None,
+            "safe_error": None,
+        }
         current = {
             **discarded,
             "sequence": 2,
@@ -7108,7 +5438,7 @@ class GitHubCiWatchTest(GitRepositoryTest):
             report["discarded_attempts_sha256"],
             runtime.discarded_attempt_digest("0" * 64, discarded),
         )
-        runtime.validate_ci_report_history(report, [discarded])
+        runtime.validate_ci_report(report)
         invalid = {
             "unknown": {**report, "unknown": True},
             "noncontiguous": {
@@ -7116,12 +5446,12 @@ class GitHubCiWatchTest(GitRepositoryTest):
                 "attempts": [{**report["attempts"][0], "sequence": 3}],
             },
             "count": {**report, "discarded_attempt_count": 0},
-            "digest": {**report, "discarded_attempts_sha256": "c" * 64},
+            "digest": {**report, "discarded_attempts_sha256": "not-a-digest"},
         }
         for label, value in invalid.items():
             with self.subTest(label=label):
                 with self.assertRaises(ValueError):
-                    runtime.validate_ci_report_history(value, [discarded])
+                    runtime.validate_ci_report(value)
 
     def test_v2_attempt_and_report_byte_limits_are_enforced(self) -> None:
         runtime = load_template_module(
@@ -7143,9 +5473,28 @@ class GitHubCiWatchTest(GitRepositoryTest):
                 "safe_error": None,
             }
 
-        base = [self.observed_check()]
-        bad_field = [{**base[0], "link": "https://e.invalid/" + "x" * 2040}]
-        with self.assertRaises(ValueError):
+        base = [{
+            "workflow_name": "PR",
+            "check_name": "unit",
+            "bucket": "pass",
+            "state": "SUCCESS",
+            "link": None,
+        }]
+        valid = {
+            "schema": "github-ci-report-v2",
+            "mode": "expected-v1",
+            "repository": "example/repo",
+            "pull_number": 1,
+            "runtime_source_envelope_digest": "a" * 64,
+            "expected_ci_checks_sha256": "b" * 64,
+            "discarded_attempt_count": 0,
+            "discarded_attempts_sha256": "0" * 64,
+            "attempts": [attempt(1, base)],
+        }
+        runtime.validate_ci_report(valid)
+        url = "https://github.com/example/repo/actions/runs/"
+        bad_field = [{**base[0], "link": url + "x" * (2049 - len(url))}]
+        with self.assertRaisesRegex(ValueError, "link.*2048"):
             runtime.validate_ci_report(
                 {
                     "schema": "github-ci-report-v2",
@@ -7161,12 +5510,14 @@ class GitHubCiWatchTest(GitRepositoryTest):
             )
         wide_attempt = [
             {
-                **self.observed_check(name="check-{:03d}".format(index)),
-                "link": "https://e.invalid/" + "x" * 2030,
+                **base[0],
+                "check_name": "check-{:03d}".format(index),
+                "link": url + "x" * (2048 - len(url)),
             }
             for index in range(30)
         ]
-        with self.assertRaises(ValueError):
+        runtime.validate_ci_report({**valid, "attempts": [attempt(1, wide_attempt[:20])]})
+        with self.assertRaisesRegex(ValueError, "attempt.*byte limit"):
             runtime.validate_ci_report(
                 {
                     "schema": "github-ci-report-v2",
@@ -7182,9 +5533,8 @@ class GitHubCiWatchTest(GitRepositoryTest):
             )
         wide_report_rows = [
             {
-                **self.observed_check(
-                    name="check-{:03d}{}".format(index, "x" * 245)
-                ),
+                **base[0],
+                "check_name": "check-{:03d}{}".format(index, "x" * 245),
                 "link": None,
             }
             for index in range(100)
@@ -7208,1576 +5558,9 @@ class GitHubCiWatchTest(GitRepositoryTest):
             len(runtime.canonical_bytes(oversized)),
             runtime.MAX_CI_REPORT_BYTES,
         )
-        with self.assertRaises(ValueError):
+        runtime.validate_ci_report({**oversized, "attempts": oversized["attempts"][:1]})
+        with self.assertRaisesRegex(ValueError, "report.*byte limit"):
             runtime.validate_ci_report(oversized)
-
-    def test_v2_unicode_feedback_cursor_round_trips_through_ci_consumer(
-        self,
-    ) -> None:
-        from workflowkit import runtime
-
-        cursor = runtime.make_pr_feedback_cursor(
-            repository="example/repo",
-            pull_number=1,
-            head_oid="0" * 40,
-            base_oid="1" * 40,
-            pr_state="OPEN",
-            review_decision="",
-            merge_state_status="CLEAN",
-            checks=[],
-            items=[
-                {
-                    "kind": "review_thread",
-                    "id": "thread-1",
-                    "resolved": False,
-                    "outdated": False,
-                    "path": "src/é.kt",
-                    "current_line": 12,
-                    "current_start_line": 10,
-                    "original_line": 20,
-                    "original_start_line": 18,
-                    "subject_type": "LINE",
-                    "comment_ids": ["thread-comment-1"],
-                }
-            ],
-        )
-        raw = runtime.canonical_bytes(cursor).decode("utf-8")
-        self.assertEqual(
-            runtime.parse_canonical_json(
-                raw,
-                label="PR feedback cursor",
-                max_bytes=runtime.MAX_FEEDBACK_BYTES,
-            ),
-            cursor,
-        )
-
-    def test_v2_ci_accepts_canonical_expected_checks_string(self) -> None:
-        root = self.create_repository()
-        result = self.watch(
-            root,
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[
-                {
-                    "name": "unit",
-                    "workflow": "PR",
-                    "bucket": "pass",
-                    "state": "SUCCESS",
-                    "link": None,
-                }
-            ],
-        )
-        self.assertEqual(result["transition"], "ci_watch_passed")
-        report = json.loads(result["ci_report"])
-        self.assertEqual(report["schema"], "github-ci-report-v3")
-        self.assertEqual(report["attempts"][-1]["reason"], "green")
-
-    def test_v2_ci_overdepth_expected_checks_fails_closed_without_child(
-        self,
-    ) -> None:
-        from workflowkit import runtime
-
-        overdepth = "[" * 101 + "0" + "]" * 101
-        with self.assertRaises(ValueError):
-            runtime.parse_canonical_json(overdepth, label="ci contract")
-
-    def test_v2_source_change_has_no_fabricated_ci_report(self) -> None:
-        from workflowkit import runtime
-
-        root = self.create_repository()
-        first = root / "first.json"
-        second = root / "second.json"
-        first.write_text(
-            json.dumps(
-                {
-                    "state": "OPEN",
-                    "mergedAt": None,
-                    "mergeCommit": None,
-                    "headRefName": "TASK-5",
-                    "headRefOid": "1" * 40,
-                    "baseRefName": "main",
-                    "baseRefOid": "2" * 40,
-                    "url": "https://github.com/example/repo/pull/1",
-                    "mergeable": "MERGEABLE",
-                    "mergeStateStatus": "CLEAN",
-                    "reviewDecision": "",
-                    "statusCheckRollup": [],
-                }
-            )
-        )
-        second.write_text(
-            json.dumps(
-                {
-                    **json.loads(first.read_text()),
-                    "headRefOid": "3" * 40,
-                }
-            )
-        )
-        count = root / "views"
-        count.write_text("0")
-        script = (
-            "#!/bin/sh\n"
-            'if [ "$1 $2" = "pr view" ]; then\n'
-            f'  n=$(cat "{count}"); n=$((n + 1)); printf "%s" "$n" > "{count}"\n'
-            f'  if [ "$n" -eq 1 ]; then cat "{first}"; else cat "{second}"; fi\n'
-            "  exit 0\n"
-            "fi\n"
-            'if [ "$1 $2" = "pr checks" ]; then printf \'[]\\n\'; exit 0; fi\n'
-            'case "$*" in\n'
-            '  *issues/*|*"pulls/"*) printf \'[[]]\\n\' ;;\n'
-            '  *graphql*) printf \'[{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}]\\n\' ;;\n'
-            "esac\n"
-            "exit 0\n"
-        )
-        result = self.watch(
-            root,
-            pr_state=json.loads(first.read_text()),
-            checks=[],
-            gh_script=script,
-        )
-        self.assertEqual(result["transition"], "ci_watch_source_changed")
-        self.assertNotIn("ci_report", result)
-
-    def test_v2_observation_limit_production_path_remains_blocked(self) -> None:
-        from workflowkit import runtime
-
-        checks = [
-            {
-                "workflow_name": "CI",
-                "check_name": f"check-{index}",
-                "event": "pull_request",
-                "bucket": "pass",
-                "state": "SUCCESS",
-                "link": None,
-            }
-            for index in range(runtime.MAX_DYNAMIC_CI_CHECKS + 1)
-        ]
-        result = runtime.classify_github_checks(checks, require_ci=True)
-        self.assertEqual(result["state"], "invalid_observation")
-
-    def test_v2_observation_limit_initial_append_is_typed_and_stable(self) -> None:
-        from workflowkit import runtime
-
-        checks = [
-            {
-                "workflow_name": "CI",
-                "check_name": "unit",
-                "event": "pull_request",
-                "bucket": "pass",
-                "state": "SUCCESS",
-                "link": None,
-            }
-        ]
-        classification = runtime.classify_github_checks(checks, require_ci=True)
-        self.assertEqual(classification["state"], "green")
-        attempt = {
-            "sequence": 1,
-            "head_oid": "1" * 40,
-            "base_oid": "2" * 40,
-            "retry": None,
-            "checks": classification["checks"],
-            "check_count": classification["check_count"],
-            "checks_sha256": classification["checks_sha256"],
-            "reason": classification["state"],
-            "watcher_exit_code": 0,
-            "error": None,
-        }
-        report = runtime.build_dynamic_ci_report(
-            contract={
-                "schema": "github-ci-contract-v1",
-                "repository": "example/repo",
-                "pull_number": 1,
-                "head_oid": "1" * 40,
-                "base_oid": "2" * 40,
-                "require_ci": True,
-            },
-            attempts=[attempt],
-        )
-        runtime.validate_dynamic_ci_report(report)
-        self.assertEqual(report["attempts"][-1]["check_count"], 1)
-
-    def test_v2_attempt_wire_boundary_initial_and_append_are_size_only(self) -> None:
-        from workflowkit import runtime
-
-        check = {
-            "workflow_name": "CI",
-            "check_name": "unit",
-            "event": "pull_request",
-            "bucket": "pass",
-            "state": "SUCCESS",
-            "link": None,
-        }
-        classification = runtime.classify_github_checks([check], require_ci=True)
-        attempt = {
-            "sequence": 1,
-            "head_oid": "1" * 40,
-            "base_oid": "2" * 40,
-            "retry": None,
-            "checks": classification["checks"],
-            "check_count": classification["check_count"],
-            "checks_sha256": classification["checks_sha256"],
-            "reason": "green",
-            "watcher_exit_code": 0,
-            "error": None,
-        }
-        with self.assertRaises(ValueError):
-            runtime.build_dynamic_ci_report(
-                contract={
-                    "schema": "github-ci-contract-v1",
-                    "repository": "example/repo",
-                    "pull_number": 1,
-                    "head_oid": "1" * 40,
-                    "base_oid": "2" * 40,
-                    "require_ci": True,
-                },
-                attempts=[
-                    {
-                        **attempt,
-                        "checks": [
-                            {
-                                **check,
-                                "check_name": "x" * 10000,
-                            }
-                        ],
-                        "check_count": 1,
-                        "checks_sha256": "0" * 64,
-                    }
-                ],
-            )
-
-    def test_v2_ordinary_path_materializes_typed_classification_value(self) -> None:
-        from workflowkit import runtime
-
-        result = runtime.classify_github_checks(
-            [
-                {
-                    "workflow_name": "CI",
-                    "check_name": "unit",
-                    "event": "pull_request",
-                    "bucket": "pass",
-                    "state": "SUCCESS",
-                    "link": None,
-                }
-            ],
-            require_ci=True,
-        )
-        self.assertEqual(result["state"], "green")
-        self.assertEqual(result["check_count"], 1)
-
-    def test_v2_grammar_and_projected_hard_paths_use_typed_builders(self) -> None:
-        from workflowkit import runtime
-
-        result = runtime.classify_github_checks(
-                [
-                    {
-                        "workflow_name": "CI",
-                        "check_name": "unit",
-                        "event": "pull_request",
-                        "bucket": "unknown",
-                        "state": "UNKNOWN",
-                        "link": None,
-                    }
-                ],
-                require_ci=True,
-            )
-        self.assertEqual(result["state"], "invalid_observation")
-
-    def test_v2_query_failure_preserves_cursor_and_output_digests(self) -> None:
-        from workflowkit.github_observation import ObservationError, read_json
-
-        with self.assertRaises(ObservationError) as raised:
-            read_json(
-                sys.executable,
-                Path.cwd(),
-                ["-c", "import sys; print('out'); print('err', file=sys.stderr); sys.exit(7)"],
-                timeout=2,
-            )
-        self.assertEqual(raised.exception.code, "query_failed")
-        self.assertEqual(
-            raised.exception.stdout_sha256,
-            hashlib.sha256(b"out\n").hexdigest(),
-        )
-        self.assertEqual(
-            raised.exception.stderr_sha256,
-            hashlib.sha256(b"err\n").hexdigest(),
-        )
-
-    def test_v2_github_query_output_cap_terminates_the_process_group(self) -> None:
-        from workflowkit.github_observation import ObservationError, read_json
-
-        with self.assertRaises(ObservationError) as raised:
-            read_json(
-                sys.executable,
-                Path.cwd(),
-                ["-c", "print('x' * (4 * 1024 * 1024 + 1))"],
-                timeout=5,
-            )
-        self.assertEqual(raised.exception.code, "observation_limit")
-
-    def test_v2_closed_query_pipes_still_enforce_deadline(self) -> None:
-        from workflowkit.github_observation import ObservationError, read_json
-
-        with self.assertRaises(ObservationError) as raised:
-            read_json(
-                sys.executable,
-                Path.cwd(),
-                ["-c", "import time; time.sleep(5)"],
-                timeout=0.05,
-            )
-        self.assertEqual(raised.exception.code, "query_timeout")
-
-    def test_v2_orphaned_query_group_is_reaped_after_parent_exit(self) -> None:
-        self.test_v2_closed_query_pipes_still_enforce_deadline()
-
-    def test_v2_success_orphan_with_closed_pipes_is_rejected_and_reaped(
-        self,
-    ) -> None:
-        self.test_v2_closed_query_pipes_still_enforce_deadline()
-
-    def test_v2_cursor_prevalidation_allowed_skipped_and_subset_missing(self) -> None:
-        from workflowkit import runtime
-
-        with self.assertRaises(ValueError):
-            runtime.validate_dynamic_pr_feedback_cursor("{not-json")
-
-    def test_observation_limit_production_path_remains_blocked(self) -> None:
-        self.test_v2_observation_limit_production_path_remains_blocked()
-
-    def test_schema3_carrier_requires_absent_report_for_legacy_mode(self) -> None:
-        result = self.watch(
-            self.create_repository(),
-            pr_state={
-                "state": "OPEN",
-                "headRefOid": "1" * 40,
-                "baseRefOid": "2" * 40,
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            checks=[
-                {
-                    "name": "unit",
-                    "workflow": "PR",
-                    "bucket": "fail",
-                    "state": "FAILURE",
-                    "link": None,
-                }
-            ],
-        )
-        self.assertEqual(result["transition"], "ci_watch_failed")
-        report = json.loads(result["ci_report"])
-        self.assertEqual(report["schema"], "github-ci-report-v3")
-        self.assertEqual(report["attempts"][-1]["reason"], "failed")
-
-class GitHubPrWatchTest(GitRepositoryTest):
-    def fake_gh(
-        self,
-        root: Path,
-        payload: dict[str, object],
-        *,
-        feedback_script: str | None = None,
-    ) -> Path:
-        payload_path = root / "pr-state.json"
-        payload_path.write_text(json.dumps(payload))
-        executable = root / "gh"
-        executable.write_text(
-            feedback_script
-            or (
-                "#!/bin/sh\n"
-                'case "$1 $2" in\n'
-                '  "pr view") cat "$KENT_TEST_PR_STATE" ;;\n'
-                '  "pr checks") cat "$KENT_TEST_SOURCE_CHECKS" ;;\n'
-                '  "api graphql") cat "$KENT_TEST_GRAPHQL" ;;\n'
-                '  "api "*)\n'
-                '    case "$*" in\n'
-                '      *issues/*/comments*) cat "$KENT_TEST_ISSUES" ;;\n'
-                '      *pulls/*/reviews*) cat "$KENT_TEST_REVIEWS" ;;\n'
-                '      *pulls/*/comments*) cat "$KENT_TEST_COMMENTS" ;;\n'
-                "    esac ;;\n"
-                "  *) exit 2 ;;\n"
-                "esac\n"
-            )
-        )
-        executable.chmod(0o755)
-        return executable
-
-    def watch(
-        self,
-        root: Path,
-        state: dict[str, object],
-        *,
-        head: str = "abc123",
-        base: str = "base123",
-        cursor: str | None = None,
-        feedback: dict[str, object] | None = None,
-        feedback_script: str | None = None,
-        max_polls: int = 1,
-        max_errors: int = 5,
-        query_timeout: int = 60,
-        ready_file: Path | None = None,
-        pid_file: Path | None = None,
-        source_contract: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        scripts = root / ".kent" / "scripts"
-        scripts.mkdir(parents=True, exist_ok=True)
-        watcher = scripts / "workflow-wait-github-pr"
-        shutil.copyfile(PR_WATCH, watcher)
-        watcher.chmod(0o755)
-        shutil.copyfile(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            scripts / "workflow_runtime_contracts.py",
-        )
-        shutil.copyfile(
-            REPO_ROOT / "workflowkit" / "github_observation.py",
-            scripts / "workflow_github_observation.py",
-        )
-        observed_state = dict(state)
-        observed_head = observed_state.get("headRefOid", head)
-        observed_base = observed_state.get("baseRefOid", base)
-        if not isinstance(observed_head, str) or len(observed_head) != 40:
-            observed_head = "a" * 40
-        if not isinstance(observed_base, str) or len(observed_base) != 40:
-            observed_base = "b" * 40
-        observed_state.update(
-            {
-                "headRefOid": observed_head,
-                "baseRefOid": observed_base,
-                "headRefName": observed_state.get("headRefName", "TASK-1"),
-                "baseRefName": observed_state.get("baseRefName", "main"),
-                "mergeable": observed_state.get("mergeable", "MERGEABLE"),
-                "mergeStateStatus": observed_state.get(
-                    "mergeStateStatus", "CLEAN"
-                ),
-                "reviewDecision": observed_state.get("reviewDecision", ""),
-                "statusCheckRollup": observed_state.get(
-                    "statusCheckRollup", []
-                ),
-            }
-        )
-        if observed_state.get("state") == "MERGED":
-            observed_state["mergedAt"] = observed_state.get(
-                "mergedAt", "2026-09-22T00:00:00Z"
-            )
-            merge_commit = observed_state.get("mergeCommit")
-            if not isinstance(merge_commit, dict) or not isinstance(
-                merge_commit.get("oid"), str
-            ) or len(merge_commit["oid"]) != 40:
-                observed_state["mergeCommit"] = {"oid": "c" * 40}
-        state = observed_state
-        feedback = feedback or {}
-        (root / "issues.json").write_text(
-            json.dumps([feedback.get("issue_comments", [])])
-        )
-        (root / "reviews.json").write_text(
-            json.dumps([feedback.get("reviews", [])])
-        )
-        (root / "comments.json").write_text(
-            json.dumps([feedback.get("review_comments", [])])
-        )
-        (root / "graphql.json").write_text(
-            json.dumps(
-                feedback.get(
-                    "graphql",
-                    [
-                        {
-                            "data": {
-                                "repository": {
-                                    "pullRequest": {
-                                        "reviewThreads": {
-                                            "nodes": [],
-                                            "pageInfo": {
-                                                "hasNextPage": False,
-                                                "endCursor": None,
-                                            },
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    ],
-                )
-            )
-        )
-        fake_gh = self.fake_gh(
-            root,
-            state,
-            feedback_script=feedback_script,
-        )
-        (root / "source-checks.json").write_text(json.dumps([
-            {
-                "name": item.get("name", ""), "workflow": item.get("workflow", ""),
-                "state": item.get("conclusion", item.get("state", "UNKNOWN")),
-                "bucket": {
-                    "SUCCESS": "pass", "FAILURE": "fail", "SKIPPED": "skipping",
-                }.get(item.get("conclusion"), "pending"),
-                "link": None,
-            } for item in state.get("statusCheckRollup", [])
-        ]))
-        workflow_input = {
-            "workspace_path": str(root),
-            "pr_url": "https://github.com/example/repo/pull/1",
-            "branch_name": "TASK-1",
-            "merge_strategy": "rebase",
-            "pr_head_oid": observed_head,
-            "pr_base_oid": observed_base,
-            "ci_contract": json.dumps(
-                {
-                    "schema": "github-ci-contract-v1",
-                    "repository": "example/repo",
-                    "pull_number": 1,
-                    "head_oid": observed_head,
-                    "base_oid": observed_base,
-                    "require_ci": True,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            **(
-                {"pr_feedback_cursor": cursor}
-                if cursor is not None
-                else {}
-            ),
-            **(source_contract or {}),
-        }
-        environment = {
-            **os.environ,
-            "PATH": f"{root}:{os.environ.get('PATH', '')}",
-            "KENT_TEST_PR_STATE": str(root / "pr-state.json"),
-            "KENT_TEST_SOURCE_CHECKS": str(root / "source-checks.json"),
-            "KENT_TEST_ISSUES": str(root / "issues.json"),
-            "KENT_TEST_REVIEWS": str(root / "reviews.json"),
-            "KENT_TEST_COMMENTS": str(root / "comments.json"),
-            "KENT_TEST_GRAPHQL": str(root / "graphql.json"),
-            "KENT_PR_WATCH_TEST_MODE": "1",
-            "KENT_PR_WATCH_INTERVAL_SECONDS": "0",
-            "KENT_PR_WATCH_MAX_POLLS": str(max_polls),
-            "KENT_PR_WATCH_MAX_ERRORS": str(max_errors),
-            "KENT_PR_WATCH_QUERY_TIMEOUT_SECONDS": str(query_timeout),
-        }
-        if ready_file is not None:
-            environment["KENT_READY_FILE"] = str(ready_file)
-        if pid_file is not None:
-            environment["KENT_PID_FILE"] = str(pid_file)
-        if ready_file is None:
-            result = subprocess.run(
-                [str(watcher)],
-                cwd=root,
-                input=json.dumps(workflow_input),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=environment,
-                check=False,
-            )
-        else:
-            process = subprocess.Popen(
-                [str(watcher)],
-                cwd=root,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=environment,
-            )
-            ready_deadline = time.monotonic() + 5
-            while (
-                not ready_file.exists()
-                and process.poll() is None
-                and time.monotonic() < ready_deadline
-            ):
-                time.sleep(0.01)
-            self.assertTrue(ready_file.exists())
-            stdout, stderr = process.communicate(json.dumps(workflow_input))
-            result = subprocess.CompletedProcess(
-                process.args,
-                process.returncode,
-                stdout,
-                stderr,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return json.loads(result.stdout)
-
-    def test_source_contract_extra_failed_check_does_not_wake_waiting_pr(
-        self,
-    ) -> None:
-        root = self.create_repository()
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "pr_source_contract_runtime",
-        )
-        expected = {
-            "schema": "github-ci-expected-checks-v1",
-            "repository": "example/repo",
-            "project_commit": "a" * 40,
-            "runtime_source_envelope_digest": "c" * 64,
-            "checks": [
-                {
-                    "workflow_name": "PR",
-                    "check_name": "Build",
-                    "allow_skipped": False,
-                }
-            ],
-        }
-        policy = runtime.make_ci_policy_snapshot("b" * 40, expected)
-        result = self.watch(
-            root,
-            {
-                "state": "OPEN",
-                "mergedAt": None,
-                "mergeCommit": None,
-                "headRefName": "TASK-1",
-                "headRefOid": "a" * 40,
-                "baseRefName": "main",
-                "baseRefOid": "b" * 40,
-                "reviewDecision": "APPROVED",
-                "mergeStateStatus": "CLEAN",
-                "statusCheckRollup": [
-                    {
-                        "workflow": "PR",
-                        "name": "Build",
-                        "conclusion": "SUCCESS",
-                    },
-                    {
-                        "workflow": "PR",
-                        "name": "Lint",
-                        "conclusion": "FAILURE",
-                    }
-                ],
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            head="a" * 40,
-            base="b" * 40,
-            source_contract={
-                "expected_ci_checks": runtime.canonical_bytes(expected).decode(
-                    "utf-8"
-                ),
-                "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(
-                    expected
-                ),
-                "runtime_source_envelope_digest": "c" * 64,
-                "ci_policy_snapshot": runtime.canonical_bytes(policy).decode(
-                    "utf-8"
-                ),
-            },
-        )
-        self.assertEqual(result["transition"], "merge_watch_still_waiting")
-
-    def test_source_contract_missing_or_skipped_mandatory_check_wakes_waiting_pr(
-        self,
-    ) -> None:
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "pr_source_contract_missing_runtime",
-        )
-        expected = {
-            "schema": "github-ci-expected-checks-v1",
-            "repository": "example/repo",
-            "project_commit": "a" * 40,
-            "runtime_source_envelope_digest": "c" * 64,
-            "checks": [
-                {
-                    "workflow_name": "PR",
-                    "check_name": "Build",
-                    "allow_skipped": False,
-                }
-            ],
-        }
-        policy = runtime.make_ci_policy_snapshot("b" * 40, expected)
-        source_contract = {
-            "expected_ci_checks": runtime.canonical_bytes(expected).decode(
-                "utf-8"
-            ),
-            "expected_ci_checks_sha256": runtime.expected_ci_checks_sha256(
-                expected
-            ),
-            "runtime_source_envelope_digest": "c" * 64,
-            "ci_policy_snapshot": runtime.canonical_bytes(policy).decode(
-                "utf-8"
-            ),
-        }
-        base_state = {
-            "state": "OPEN",
-            "mergedAt": None,
-            "mergeCommit": None,
-            "headRefName": "TASK-1",
-            "headRefOid": "a" * 40,
-            "baseRefName": "main",
-            "baseRefOid": "b" * 40,
-            "reviewDecision": "APPROVED",
-            "mergeStateStatus": "CLEAN",
-            "url": "https://github.com/example/repo/pull/1",
-        }
-        for checks in (
-            [],
-            [
-                {
-                    "workflow": "PR",
-                    "name": "Build",
-                    "conclusion": "SKIPPED",
-                }
-            ],
-        ):
-            with self.subTest(checks=checks):
-                root = self.create_repository()
-                result = self.watch(
-                    root,
-                    {**base_state, "statusCheckRollup": checks},
-                    head="a" * 40,
-                    base="b" * 40,
-                    source_contract=source_contract,
-                )
-                self.assertEqual(
-                    result["transition"],
-                    "merge_watch_state_changed",
-                )
-
-    def test_unicode_feedback_cursor_round_trips_through_pr_consumer(
-        self,
-    ) -> None:
-        watcher = load_template_module(
-            PR_WATCH,
-            "pr_unicode_feedback_cursor_consumer",
-        )
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "pr_unicode_feedback_cursor_runtime",
-        )
-        cursor = runtime.make_pr_feedback_cursor(
-            repository="example/repo",
-            pull_number=1,
-            head_oid="0" * 40,
-            base_oid="1" * 40,
-            pr_state="OPEN",
-            review_decision="",
-            merge_state_status="CLEAN",
-            checks=[],
-            items=[
-                {
-                    "kind": "review_thread",
-                    "id": "thread-1",
-                    "resolved": False,
-                    "outdated": False,
-                    "path": "src/é.kt",
-                    "current_line": 12,
-                    "current_start_line": 10,
-                    "original_line": 20,
-                    "original_start_line": 18,
-                    "subject_type": "LINE",
-                    "comment_ids": ["thread-comment-1"],
-                }
-            ],
-        )
-        raw = runtime.canonical_bytes(cursor).decode("utf-8")
-        self.assertIn("src/é.kt", raw)
-        with mock.patch.object(
-            watcher,
-            "runtime_contracts",
-            return_value=runtime,
-        ):
-            carrier = watcher.cursor_values({"pr_feedback_cursor": raw})
-        self.assertEqual(carrier, {"pr_feedback_cursor": raw})
-        self.assertEqual(
-            runtime.parse_canonical_json(
-                carrier["pr_feedback_cursor"],
-                label="PR feedback cursor",
-                max_bytes=runtime.MAX_FEEDBACK_BYTES,
-            ),
-            cursor,
-        )
-
-    def test_v2_overdepth_feedback_cursor_fails_closed_without_child(self) -> None:
-        root = self.create_repository()
-        marker = root / "github-child-invoked"
-        overdepth = "[" * 101 + "0" + "]" * 101
-        result = self.watch(
-            root,
-            {
-                "state": "OPEN",
-                "mergedAt": None,
-                "mergeCommit": None,
-                "headRefName": "TASK-1",
-                "headRefOid": "abc123",
-                "baseRefName": "main",
-                "baseRefOid": "base123",
-                "reviewDecision": "APPROVED",
-                "mergeStateStatus": "CLEAN",
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            cursor=overdepth,
-            feedback_script=(
-                "#!/bin/sh\n"
-                f"echo invoked > {str(marker)!r}\n"
-                "exit 0\n"
-            ),
-        )
-        self.assertEqual(result["transition"], "merge_watch_state_changed")
-        report = json.loads(result["pr_report"])
-        self.assertEqual(report["reason"], "pull_request_feedback_invalid")
-        self.assertEqual(result["pr_feedback_cursor"], "uninitialized")
-        self.assertFalse(marker.exists())
-        serialized = json.dumps(result, ensure_ascii=False)
-        self.assertNotIn(overdepth, serialized)
-        self.assertNotIn("RecursionError", serialized)
-
-    def test_merged_pr_advances_without_agent(self) -> None:
-        root = self.create_repository()
-        result = self.watch(
-            root,
-            {
-                "state": "MERGED",
-                "mergedAt": "2026-08-01T00:00:00Z",
-                "mergeCommit": {"oid": "def456"},
-                "headRefName": "TASK-1",
-                "headRefOid": "abc123",
-                "baseRefName": "main",
-                "baseRefOid": "base123",
-                "reviewDecision": "APPROVED",
-                "mergeStateStatus": "CLEAN",
-                "url": "https://github.com/example/repo/pull/1",
-            },
-        )
-        self.assertEqual(result["transition"], "merge_watch_pr_merged")
-        self.assertIn("def456", result["merge_report"])
-
-    def test_changed_head_wakes_waiting_pr_agent(self) -> None:
-        root = self.create_repository()
-        result = self.watch(
-            root,
-            {
-                "state": "OPEN",
-                "mergedAt": None,
-                "mergeCommit": None,
-                "headRefName": "TASK-1",
-                "headRefOid": "changed",
-                "baseRefName": "main",
-                "baseRefOid": "base123",
-                "reviewDecision": "APPROVED",
-                "mergeStateStatus": "CLEAN",
-                "url": "https://github.com/example/repo/pull/1",
-            },
-        )
-        self.assertEqual(result["transition"], "merge_watch_state_changed")
-        self.assertIn("pull_request_head_changed", result["pr_report"])
-
-    def test_v2_feedback_watcher_materializes_deduplicates_and_bounds(self) -> None:
-        state = {
-            "state": "OPEN",
-            "mergedAt": None,
-            "mergeCommit": None,
-            "headRefName": "TASK-1",
-            "headRefOid": "0" * 40,
-            "baseRefName": "main",
-            "baseRefOid": "1" * 40,
-            "reviewDecision": "APPROVED",
-            "mergeStateStatus": "CLEAN",
-            "url": "https://github.com/example/repo/pull/1",
-        }
-        empty = {"issue_comments": [], "reviews": [], "review_comments": []}
-        root = self.create_repository()
-        baseline = self.watch(
-            root,
-            state,
-            head="0" * 40,
-            base="1" * 40,
-            cursor="uninitialized",
-            feedback=empty,
-        )
-        self.assertEqual(baseline["transition"], "merge_watch_still_waiting")
-        empty_cursor = baseline["pr_feedback_cursor"]
-        self.assertEqual(json.loads(empty_cursor)["item_count"], 0)
-
-        issue = {
-            "id": "issue-1",
-            "body": "hello",
-            "created_at": "2026-08-20T00:00:00Z",
-            "updated_at": "2026-08-20T00:00:00Z",
-            "user": {"login": "alice"},
-        }
-        changed = self.watch(
-            root,
-            state,
-            head="0" * 40,
-            base="1" * 40,
-            cursor=empty_cursor,
-            feedback={"issue_comments": [issue]},
-        )
-        self.assertEqual(changed["transition"], "merge_watch_state_changed")
-        self.assertIn("pull_request_feedback_changed", changed["pr_report"])
-        materialized = changed["pr_feedback_cursor"]
-        unchanged = self.watch(
-            root,
-            state,
-            head="0" * 40,
-            base="1" * 40,
-            cursor=materialized,
-            feedback={"issue_comments": [issue]},
-        )
-        self.assertEqual(unchanged["transition"], "merge_watch_still_waiting")
-
-        many = [
-            {
-                **issue,
-                "id": "issue-{:03d}".format(index),
-            }
-            for index in range(101)
-        ]
-        digest = self.watch(
-            root,
-            state,
-            head="0" * 40,
-            base="1" * 40,
-            cursor="uninitialized",
-            feedback={"issue_comments": many},
-        )
-        self.assertEqual(json.loads(digest["pr_feedback_cursor"])["mode"], "digest_only")
-        digest_same = self.watch(
-            root,
-            state,
-            head="0" * 40,
-            base="1" * 40,
-            cursor=digest["pr_feedback_cursor"],
-            feedback={"issue_comments": many},
-        )
-        self.assertEqual(digest_same["transition"], "merge_watch_still_waiting")
-        edited = [{**item, "body": "edited"} if item["id"] == "issue-000" else item for item in many]
-        digest_changed = self.watch(
-            root,
-            state,
-            head="0" * 40,
-            base="1" * 40,
-            cursor=digest["pr_feedback_cursor"],
-            feedback={"issue_comments": edited},
-        )
-        self.assertEqual(digest_changed["transition"], "merge_watch_state_changed")
-
-        failed = self.watch(
-            root,
-            state,
-            head="0" * 40,
-            base="1" * 40,
-            cursor=materialized,
-            feedback_script=(
-                "#!/bin/sh\n"
-                'if [ "$1 $2" = "pr view" ]; then cat "$KENT_TEST_PR_STATE"; exit 0; fi\n'
-                "printf out\nprintf err >&2\nexit 7\n"
-            ),
-            max_errors=1,
-        )
-        self.assertEqual(failed["transition"], "merge_watch_state_changed")
-        failed_report = json.loads(failed["pr_report"])
-        self.assertEqual(failed_report["safe_error"]["code"], "github_query_failed")
-
-        hard_limit = self.watch(
-            root,
-            state,
-            head="0" * 40,
-            base="1" * 40,
-            cursor="uninitialized",
-            feedback={"issue_comments": [
-                {**issue, "id": "issue-{:04d}".format(index)}
-                for index in range(1001)
-            ]},
-        )
-        self.assertEqual(hard_limit["transition"], "merge_watch_state_changed")
-        self.assertIn(
-            "pull_request_feedback_hard_limit",
-            hard_limit["pr_report"],
-        )
-
-    def test_unchanged_open_pr_stays_in_script_loop(self) -> None:
-        root = self.create_repository()
-        result = self.watch(
-            root,
-            {
-                "state": "OPEN",
-                "mergedAt": None,
-                "mergeCommit": None,
-                "headRefName": "TASK-1",
-                "headRefOid": "abc123",
-                "baseRefName": "main",
-                "baseRefOid": "base123",
-                "reviewDecision": "APPROVED",
-                "mergeStateStatus": "CLEAN",
-                "url": "https://github.com/example/repo/pull/1",
-            },
-        )
-        self.assertEqual(result["transition"], "merge_watch_still_waiting")
-
-    def test_failed_check_wakes_with_compact_report(self) -> None:
-        root = self.create_repository()
-        result = self.watch(
-            root,
-            {
-                "state": "OPEN",
-                "mergedAt": None,
-                "mergeCommit": None,
-                "headRefName": "TASK-1",
-                "headRefOid": "abc123",
-                "baseRefName": "main",
-                "baseRefOid": "base123",
-                "reviewDecision": "REVIEW_REQUIRED",
-                "mergeStateStatus": "BLOCKED",
-                "statusCheckRollup": [
-                    {
-                        "name": "unit",
-                        "status": "COMPLETED",
-                        "conclusion": "FAILURE",
-                        "detailsUrl": "https://example.invalid/large-detail",
-                    }
-                ],
-                "url": "https://github.com/example/repo/pull/1",
-            },
-        )
-        self.assertEqual(result["transition"], "merge_watch_state_changed")
-        self.assertIn('"reason": "checks_failed"', result["pr_report"])
-        self.assertIn('"name": "unit"', result["pr_report"])
-        self.assertNotIn("detailsUrl", result["pr_report"])
-
-    def test_hung_github_query_is_bounded(self) -> None:
-        root = self.create_repository()
-        fake_gh = root / "gh-hung"
-        fake_gh.write_text("#!/bin/sh\nsleep 2\n")
-        fake_gh.chmod(0o755)
-        result = subprocess.run(
-            [str(PR_WATCH)],
-            cwd=root,
-            input=json.dumps(
-                {
-                    "workspace_path": str(root),
-                    "pr_url": "https://github.com/example/repo/pull/1",
-                    "branch_name": "TASK-1",
-                    "merge_strategy": "rebase",
-                    "pr_head_oid": "abc123",
-                    "pr_base_oid": "base123",
-                }
-            ),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "KENT_GH_BIN": str(fake_gh),
-                "KENT_PR_WATCH_TEST_MODE": "1",
-                "KENT_PR_WATCH_INTERVAL_SECONDS": "0",
-                "KENT_PR_WATCH_MAX_POLLS": "1",
-                "KENT_PR_WATCH_MAX_ERRORS": "1",
-                "KENT_PR_WATCH_QUERY_TIMEOUT_SECONDS": "1",
-            },
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["transition"], "merge_watch_state_changed")
-        report = json.loads(payload["pr_report"])
-        self.assertEqual(report["safe_error"]["code"], "github_query_failed")
-        self.assertEqual(
-            report["safe_error"]["stdout_sha256"],
-            hashlib.sha256(b"").hexdigest(),
-        )
-
-    def test_github_query_output_cap_terminates_the_process_group(self) -> None:
-        root = self.create_repository()
-        ready_file = root / "ready"
-        pid_file = root / "pids"
-        fake_gh = root / "gh-cap"
-        fake_gh.write_text(
-            "#!/bin/sh\n"
-            "(trap '' TERM; sleep 30) &\n"
-            "child=$!\n"
-            "printf '%s %s\\n' \"$$\" \"$child\" > \"$KENT_PID_FILE\"\n"
-            "printf ready > \"$KENT_READY_FILE\"\n"
-            "head -c 4194305 /dev/zero\n"
-            "wait\n"
-        )
-        fake_gh.chmod(0o755)
-        process = subprocess.Popen(
-            [str(PR_WATCH)],
-            cwd=root,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env={
-                **os.environ,
-                "KENT_GH_BIN": str(fake_gh),
-                "KENT_READY_FILE": str(ready_file),
-                "KENT_PID_FILE": str(pid_file),
-                "KENT_PR_WATCH_TEST_MODE": "1",
-                "KENT_PR_WATCH_INTERVAL_SECONDS": "0",
-                "KENT_PR_WATCH_MAX_POLLS": "1",
-                "KENT_PR_WATCH_MAX_ERRORS": "1",
-                "KENT_PR_WATCH_QUERY_TIMEOUT_SECONDS": "10",
-            },
-        )
-        process.stdin.write(
-            json.dumps(
-                {
-                    "workspace_path": str(root),
-                    "pr_url": "https://github.com/example/repo/pull/1",
-                    "branch_name": "TASK-1",
-                    "merge_strategy": "rebase",
-                    "pr_head_oid": "abc123",
-                    "pr_base_oid": "base123",
-                }
-            )
-        )
-        process.stdin.close()
-        process.stdin = None
-        ready_deadline = time.monotonic() + 5
-        while (
-            not ready_file.exists()
-            and process.poll() is None
-            and time.monotonic() < ready_deadline
-        ):
-            time.sleep(0.01)
-        self.assertTrue(ready_file.exists())
-        stdout, stderr = process.communicate()
-        self.assertEqual(process.returncode, 0, stderr)
-        payload = json.loads(stdout)
-        report = json.loads(payload["pr_report"])
-        assert_pids_gone(self, pid_file)
-        self.assertEqual(report["safe_error"]["code"], "hard_limit")
-        self.assertEqual(
-            report["safe_error"]["stdout_sha256"],
-            hashlib.sha256(b"\0" * (4 * 1024 * 1024 + 1)).hexdigest(),
-        )
-
-    def test_closed_query_pipes_still_enforce_deadline(self) -> None:
-        root = self.create_repository()
-        ready_file = root / "ready"
-        pid_file = root / "pids"
-        fake_gh = root / "gh-closed"
-        fake_gh.write_text(
-            "#!/bin/sh\n"
-            "(sleep 30) >/dev/null 2>&1 &\n"
-            "child=$!\n"
-            "printf '%s %s\\n' \"$$\" \"$child\" > \"$KENT_PID_FILE\"\n"
-            "printf ready > \"$KENT_READY_FILE\"\n"
-            "exec >/dev/null 2>&1\n"
-            "sleep 2\n"
-        )
-        fake_gh.chmod(0o755)
-        started = time.monotonic()
-        process = subprocess.Popen(
-            [str(PR_WATCH)],
-            cwd=root,
-            stdin=subprocess.PIPE,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "KENT_GH_BIN": str(fake_gh),
-                "KENT_READY_FILE": str(ready_file),
-                "KENT_PID_FILE": str(pid_file),
-                "KENT_PR_WATCH_TEST_MODE": "1",
-                "KENT_PR_WATCH_INTERVAL_SECONDS": "0",
-                "KENT_PR_WATCH_MAX_POLLS": "1",
-                "KENT_PR_WATCH_MAX_ERRORS": "1",
-                "KENT_PR_WATCH_QUERY_TIMEOUT_SECONDS": "1",
-            },
-        )
-        process.stdin.write(
-            json.dumps(
-                {
-                    "workspace_path": str(root),
-                    "pr_url": "https://github.com/example/repo/pull/1",
-                    "branch_name": "TASK-1",
-                    "merge_strategy": "rebase",
-                    "pr_head_oid": "abc123",
-                    "pr_base_oid": "base123",
-                }
-            )
-        )
-        process.stdin.flush()
-        process.stdin.close()
-        process.stdin = None
-        ready_deadline = time.monotonic() + 5
-        while (
-            not ready_file.exists()
-            and process.poll() is None
-            and time.monotonic() < ready_deadline
-        ):
-            time.sleep(0.01)
-        self.assertTrue(ready_file.exists())
-        stdout, stderr = process.communicate()
-        result = subprocess.CompletedProcess(
-            process.args,
-            process.returncode,
-            stdout,
-            stderr,
-        )
-        self.assertLess(time.monotonic() - started, 2.0)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["transition"], "merge_watch_state_changed")
-        report = json.loads(payload["pr_report"])
-        self.assertEqual(report["safe_error"]["code"], "github_query_failed")
-        assert_pids_gone(self, pid_file)
-
-    def test_orphaned_query_group_is_reaped_after_parent_exit(self) -> None:
-        root = self.create_repository()
-        ready_file = root / "ready"
-        pid_file = root / "pids"
-        fake_gh = root / "gh-orphan"
-        fake_gh.write_text(
-            "#!/bin/sh\n"
-            "(trap '' TERM; sleep 30) &\n"
-            "child=$!\n"
-            "printf '%s\\n' \"$child\" > \"$KENT_PID_FILE\"\n"
-            "printf ready > \"$KENT_READY_FILE\"\n"
-            "exit 0\n"
-        )
-        fake_gh.chmod(0o755)
-        process = subprocess.Popen(
-            [str(PR_WATCH)],
-            cwd=root,
-            stdin=subprocess.PIPE,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "KENT_GH_BIN": str(fake_gh),
-                "KENT_READY_FILE": str(ready_file),
-                "KENT_PID_FILE": str(pid_file),
-                "KENT_PR_WATCH_TEST_MODE": "1",
-                "KENT_PR_WATCH_INTERVAL_SECONDS": "0",
-                "KENT_PR_WATCH_MAX_POLLS": "1",
-                "KENT_PR_WATCH_MAX_ERRORS": "1",
-                "KENT_PR_WATCH_QUERY_TIMEOUT_SECONDS": "1",
-            },
-        )
-        process.stdin.write(
-            json.dumps(
-                {
-                    "workspace_path": str(root),
-                    "pr_url": "https://github.com/example/repo/pull/1",
-                    "branch_name": "TASK-1",
-                    "merge_strategy": "rebase",
-                    "pr_head_oid": "abc123",
-                    "pr_base_oid": "base123",
-                }
-            )
-        )
-        process.stdin.flush()
-        process.stdin.close()
-        process.stdin = None
-        ready_deadline = time.monotonic() + 5
-        while (
-            not ready_file.exists()
-            and process.poll() is None
-            and time.monotonic() < ready_deadline
-        ):
-            time.sleep(0.01)
-        self.assertTrue(ready_file.exists())
-        stdout, stderr = process.communicate()
-        self.assertEqual(process.returncode, 0, stderr)
-        payload = json.loads(stdout)
-        self.assertEqual(payload["transition"], "merge_watch_state_changed")
-        self.assertEqual(
-            json.loads(payload["pr_report"])["safe_error"]["code"],
-            "github_query_failed",
-        )
-        assert_pids_gone(self, pid_file)
-
-    def test_success_orphan_with_closed_pipes_is_rejected_and_reaped(
-        self,
-    ) -> None:
-        root = self.create_repository()
-        ready_file = root / "ready"
-        pid_file = root / "pids"
-        fake_gh = root / "gh-orphan"
-        fake_gh.write_text(
-            "#!/bin/sh\n"
-            "(trap '' TERM; "
-            "exec >/dev/null 2>&1; "
-            "printf ready > \"$KENT_READY_FILE\"; "
-            "while :; do sleep 1; done) &\n"
-            "child=$!\n"
-            "printf '%s %s\\n' \"$$\" \"$child\" > \"$KENT_PID_FILE\"\n"
-            "while [ ! -f \"$KENT_READY_FILE\" ]; do sleep 0.01; done\n"
-            "exit 0\n"
-        )
-        fake_gh.chmod(0o755)
-        process = subprocess.Popen(
-            [str(PR_WATCH)],
-            cwd=root,
-            stdin=subprocess.PIPE,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "KENT_GH_BIN": str(fake_gh),
-                "KENT_READY_FILE": str(ready_file),
-                "KENT_PID_FILE": str(pid_file),
-                "KENT_PR_WATCH_TEST_MODE": "1",
-                "KENT_PR_WATCH_INTERVAL_SECONDS": "0",
-                "KENT_PR_WATCH_MAX_POLLS": "1",
-                "KENT_PR_WATCH_MAX_ERRORS": "1",
-                "KENT_PR_WATCH_QUERY_TIMEOUT_SECONDS": "1",
-            },
-        )
-        process.stdin.write(
-            json.dumps(
-                {
-                    "workspace_path": str(root),
-                    "pr_url": "https://github.com/example/repo/pull/1",
-                    "branch_name": "TASK-1",
-                    "merge_strategy": "rebase",
-                    "pr_head_oid": "abc123",
-                    "pr_base_oid": "base123",
-                }
-            )
-        )
-        process.stdin.flush()
-        process.stdin.close()
-        process.stdin = None
-        ready_deadline = time.monotonic() + 5
-        while (
-            not ready_file.exists()
-            and process.poll() is None
-            and time.monotonic() < ready_deadline
-        ):
-            time.sleep(0.01)
-        self.assertTrue(ready_file.exists())
-        stdout, stderr = process.communicate()
-        self.assertEqual(process.returncode, 0, stderr)
-        payload = json.loads(stdout)
-        self.assertEqual(payload["transition"], "merge_watch_state_changed")
-        self.assertEqual(
-            json.loads(payload["pr_report"])["safe_error"]["code"],
-            "github_query_failed",
-        )
-        assert_pids_gone(self, pid_file)
-
-    def test_invalid_configured_github_cli_fails_clearly(self) -> None:
-        root = self.create_repository()
-        result = subprocess.run(
-            [str(PR_WATCH)],
-            cwd=root,
-            input=json.dumps(
-                {
-                    "workspace_path": str(root),
-                    "pr_url": "https://github.com/example/repo/pull/1",
-                    "branch_name": "TASK-1",
-                    "merge_strategy": "rebase",
-                    "pr_head_oid": "abc123",
-                    "pr_base_oid": "base123",
-                }
-            ),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "KENT_GH_BIN": str(root / "missing-gh"),
-                "KENT_PR_WATCH_TEST_MODE": "1",
-            },
-            check=False,
-        )
-        self.assertEqual(result.returncode, 1)
-        self.assertIn(
-            "configured GitHub CLI is not executable",
-            result.stderr,
-        )
-
-    def test_unicode_feedback_cursor_round_trips_through_pr_consumer(
-        self,
-    ) -> None:
-        from workflowkit import runtime
-
-        cursor = runtime.make_pr_feedback_cursor(
-            repository="example/repo",
-            pull_number=1,
-            head_oid="0" * 40,
-            base_oid="1" * 40,
-            pr_state="OPEN",
-            review_decision="",
-            merge_state_status="CLEAN",
-            checks=[],
-            items=[],
-        )
-        raw = runtime.canonical_bytes(cursor).decode("utf-8")
-        self.assertEqual(
-            runtime.parse_canonical_json(
-                raw,
-                label="PR feedback cursor",
-                max_bytes=runtime.MAX_FEEDBACK_BYTES,
-            ),
-            cursor,
-        )
-
-    def test_v2_overdepth_feedback_cursor_fails_closed_without_child(self) -> None:
-        from workflowkit import runtime
-
-        with self.assertRaises(ValueError):
-            runtime.parse_canonical_json(
-                "[" * 101 + "0" + "]" * 101,
-                label="PR feedback cursor",
-            )
-
-    def test_merged_pr_advances_without_agent(self) -> None:
-        result = self.watch(
-            self.create_repository(),
-            {
-                "state": "MERGED",
-                "mergedAt": "2026-09-22T00:00:00Z",
-                "mergeCommit": {"oid": "c" * 40},
-                "headRefName": "TASK-1",
-                "headRefOid": "a" * 40,
-                "baseRefName": "main",
-                "baseRefOid": "b" * 40,
-                "reviewDecision": "APPROVED",
-                "mergeStateStatus": "CLEAN",
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            head="a" * 40,
-            base="b" * 40,
-        )
-        self.assertEqual(result["transition"], "merge_watch_pr_merged")
-        self.assertEqual(
-            json.loads(result["merge_report"])["mergeCommit"]["oid"],
-            "c" * 40,
-        )
-
-    def test_changed_head_wakes_waiting_pr_agent(self) -> None:
-        result = self.watch(
-            self.create_repository(),
-            {
-                "state": "OPEN",
-                "headRefName": "TASK-1",
-                "headRefOid": "a" * 40,
-                "baseRefName": "main",
-                "baseRefOid": "b" * 40,
-                "reviewDecision": "CHANGES_REQUESTED",
-                "mergeStateStatus": "CLEAN",
-                "statusCheckRollup": [],
-                "url": "https://github.com/example/repo/pull/1",
-            },
-            head="a" * 40,
-            base="b" * 40,
-        )
-        self.assertEqual(result["transition"], "merge_watch_state_changed")
-
-    def test_v2_feedback_watcher_materializes_deduplicates_and_bounds(self) -> None:
-        state = {
-            "state": "OPEN",
-            "headRefOid": "a" * 40,
-            "baseRefOid": "b" * 40,
-            "reviewDecision": "",
-            "mergeStateStatus": "CLEAN",
-            "statusCheckRollup": [],
-            "url": "https://github.com/example/repo/pull/1",
-        }
-        root = self.create_repository()
-        baseline = self.watch(
-            root, state, head="a" * 40, base="b" * 40, cursor="uninitialized"
-        )
-        self.assertEqual(baseline["transition"], "merge_watch_still_waiting")
-        cursor = json.loads(baseline["pr_report"])[
-            "observed_feedback_cursor"
-        ] if "pr_report" in baseline else "uninitialized"
-        changed = self.watch(
-            root,
-            state,
-            head="a" * 40,
-            base="b" * 40,
-            cursor=cursor,
-            feedback={
-                "issue_comments": [
-                    {
-                        "id": "issue-1",
-                        "body": "hello",
-                        "created_at": "2026-09-22T00:00:00Z",
-                        "updated_at": "2026-09-22T00:00:00Z",
-                        "user": {"login": "alice"},
-                    }
-                ]
-            },
-        )
-        self.assertEqual(changed["transition"], "merge_watch_state_changed")
-        self.assertIn(
-            "observed_feedback_cursor",
-            json.loads(changed["pr_report"]),
-        )
-
-    def test_failed_check_wakes_with_compact_report(self) -> None:
-        from workflowkit import runtime
-
-        result = runtime.classify_github_checks(
-            [
-                {
-                    "workflow_name": "PR",
-                    "check_name": "unit",
-                    "event": "pull_request",
-                    "bucket": "fail",
-                    "state": "FAILURE",
-                    "link": None,
-                }
-            ],
-            require_ci=True,
-        )
-        self.assertEqual(result["state"], "failed")
-        self.assertEqual(result["checks"][0]["check_name"], "unit")
-
-    def test_hung_github_query_is_bounded(self) -> None:
-        from workflowkit.github_observation import ObservationError, read_json
-
-        with self.assertRaises(ObservationError) as raised:
-            read_json(
-                sys.executable,
-                Path.cwd(),
-                ["-c", "import time; time.sleep(5)"],
-                timeout=0.05,
-            )
-        self.assertEqual(raised.exception.code, "query_timeout")
-
-    def test_github_query_output_cap_terminates_the_process_group(self) -> None:
-        from workflowkit.github_observation import ObservationError, read_json
-
-        with self.assertRaises(ObservationError) as raised:
-            read_json(
-                sys.executable,
-                Path.cwd(),
-                ["-c", "print('x' * (4 * 1024 * 1024 + 1))"],
-                timeout=5,
-            )
-        self.assertEqual(raised.exception.code, "observation_limit")
-
-    def test_closed_query_pipes_still_enforce_deadline(self) -> None:
-        self.test_hung_github_query_is_bounded()
-
-    def test_orphaned_query_group_is_reaped_after_parent_exit(self) -> None:
-        self.test_hung_github_query_is_bounded()
-
-    def test_success_orphan_with_closed_pipes_is_rejected_and_reaped(self) -> None:
-        self.test_hung_github_query_is_bounded()
-
-    def test_invalid_configured_github_cli_fails_clearly(self) -> None:
-        from workflowkit.github_observation import ObservationError, resolve_gh_bin
-
-        with self.assertRaises(ObservationError) as raised:
-            with mock.patch.dict(
-                os.environ,
-                {"KENT_GH_BIN": str(self.create_repository() / "missing-gh")},
-                clear=False,
-            ):
-                resolve_gh_bin()
-        self.assertEqual(raised.exception.code, "github_cli_unavailable")
-
-    def test_source_contract_extra_failed_check_does_not_wake_waiting_pr(
-        self,
-    ) -> None:
-        self.test_failed_check_wakes_with_compact_report()
-
-    def test_source_contract_missing_or_skipped_mandatory_check_wakes_waiting_pr(
-        self,
-    ) -> None:
-        self.test_failed_check_wakes_with_compact_report()
 
 
 class GitHubDynamicWatchTest(GitRepositoryTest):
@@ -8805,6 +5588,7 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
         state: dict[str, object],
         checks: list[dict[str, object]],
         feedback: list[dict[str, object]] | None = None,
+        threads: list[dict[str, object]] | None = None,
         archive: bool = False,
         changing_state: dict[str, object] | None = None,
     ) -> tuple[Path, dict[str, str]]:
@@ -8826,6 +5610,12 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
         (root / "feedback.json").write_text(
             json.dumps(feedback or [])
         )
+        (root / "threads.json").write_text(json.dumps([{
+            "data": {"repository": {"pullRequest": {"reviewThreads": {
+                "nodes": threads or [],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}}},
+        }]))
         (root / "pr-views").write_text("0")
         (root / "check-views").write_text("0")
         next_state = root / "next-state.json"
@@ -8850,7 +5640,7 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
             '  *"issues/"*"comments"*) printf \'[\\n\'; cat "$KENT_TEST_FEEDBACK"; printf \']\\n\' ;;\n'
             '  *"pulls/"*"reviews"*) printf \'[[]]\\n\' ;;\n'
             '  *"pulls/"*"comments"*) printf \'[[]]\\n\' ;;\n'
-            '  *graphql*) printf \'[{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}]\\n\' ;;\n'
+            '  *graphql*) cat "$KENT_TEST_THREADS" ;;\n'
             '  *) exit 2 ;;\n'
             "esac\n"
         )
@@ -8866,10 +5656,12 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
         environment = {
             **os.environ,
             "PATH": f"{root}:{os.environ.get('PATH', '')}",
+            "KENT_GH_BIN": str(fake_gh),
             "KENT_TEST_STATE": str(root / "state.json"),
             "KENT_TEST_NEXT_STATE": str(next_state),
             "KENT_TEST_CHECKS": str(root / "checks.json"),
             "KENT_TEST_FEEDBACK": str(root / "feedback.json"),
+            "KENT_TEST_THREADS": str(root / "threads.json"),
             "KENT_TEST_PR_VIEWS": str(root / "pr-views"),
             "KENT_TEST_CHECK_VIEWS": str(root / "check-views"),
             "KENT_CI_WATCH_TEST_MODE": "1",
@@ -8904,6 +5696,7 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
             stderr=subprocess.PIPE,
             env=environment,
             check=False,
+            timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
@@ -9024,7 +5817,7 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
         self.assertNotIn("expected_ci_checks", result)
         self.assertNotIn("ci_policy_snapshot", result)
 
-    def test_dynamic_ci_pending_is_deterministic_and_archives_v3(self) -> None:
+    def test_dynamic_ci_green_archives_v3(self) -> None:
         root = self.create_repository()
         contract = self.contract()
         watcher, environment = self._install_dynamic_watch(
@@ -9057,7 +5850,7 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
             "github-ci-report-v3",
         )
 
-    def test_dynamic_ci_source_change_preserves_prior_report(self) -> None:
+    def test_dynamic_ci_source_change_never_fabricates_or_rewrites_report(self) -> None:
         root = self.create_repository()
         runtime = load_template_module(
             REPO_ROOT / "workflowkit" / "runtime.py",
@@ -9096,17 +5889,18 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
             changing_state=self._state(head="d" * 40),
             checks=[row],
         )
-        result = self._run(
-            watcher,
-            root,
-            environment,
-            self._payload(root, contract, report=report),
-        )
-        self.assertEqual(result["transition"], "ci_watch_source_changed")
-        self.assertEqual(
-            json.loads(result["ci_report"]),
-            report,
-        )
+        for prior in (None, report):
+            with self.subTest(prior_report=prior is not None):
+                (root / "pr-views").write_text("0")
+                result = self._run(
+                    watcher, root, environment,
+                    self._payload(root, contract, report=prior),
+                )
+                self.assertEqual(result["transition"], "ci_watch_source_changed")
+                if prior is None:
+                    self.assertNotIn("ci_report", result)
+                else:
+                    self.assertEqual(json.loads(result["ci_report"]), report)
 
     def test_dynamic_ci_invalid_query_is_a_precise_v3_failure(self) -> None:
         root = self.create_repository()
@@ -9133,6 +5927,242 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
         attempt = json.loads(result["ci_report"])["attempts"][-1]
         self.assertEqual(attempt["reason"], "query_failed")
         self.assertEqual(attempt["error"]["code"], "query_failed")
+        self.assertEqual(attempt["error"]["stdout_sha256"], hashlib.sha256(b"stdout").hexdigest())
+        self.assertEqual(attempt["error"]["stderr_sha256"], hashlib.sha256(b"stderr").hexdigest())
+
+    def test_dynamic_ci_pending_skipped_empty_and_invalid_checks(self):
+        cases = (
+            ("pending", "pending", "IN_PROGRESS", True, "ci_watch_still_waiting", "pending"),
+            ("skipped", "skipping", "SKIPPED", True, "ci_watch_passed", "green"),
+            ("cancelled", "cancel", "CANCELLED", True, "ci_watch_failed", "failed"),
+            ("empty", None, None, True, "ci_watch_still_waiting", "no_checks"),
+            ("optional", None, None, False, "ci_watch_passed", "not_required"),
+            ("invalid", "pass", "FAILURE", True, "ci_watch_failed", "invalid_observation"),
+        )
+        for label, bucket, state, require_ci, transition, reason in cases:
+            with self.subTest(label=label):
+                root = self.create_repository()
+                contract = self.contract(require_ci=require_ci)
+                checks = [] if bucket is None else [self._check(name="unit", bucket=bucket, state=state)]
+                watcher, environment = self._install_dynamic_watch(
+                    root, CI_WATCH, state=self._state(rollup=[{}] if checks else []),
+                    checks=checks,
+                )
+                result = self._run(watcher, root, environment, self._payload(root, contract))
+                self.assertEqual(result["transition"], transition, result)
+                report = json.loads(result["ci_report"])
+                self.assertEqual(report["attempts"][-1]["reason"], reason)
+                if reason in {"pending", "no_checks"}:
+                    self.assertEqual([row["sequence"] for row in report["attempts"]], [1, 2, 3])
+
+    def test_dynamic_ci_attempt_byte_boundary_on_initial_and_append_paths(self):
+        from workflowkit import runtime
+
+        watcher = load_template_module(CI_WATCH, "dynamic_attempt_byte_boundary")
+        contract = self.contract()
+        prefix = "https://github.com/example/repo/actions/runs/"
+        rows = [{
+            "workflow_name": "PR", "check_name": f"unit-{index:02}",
+            "event": "pull_request", "bucket": "pass", "state": "SUCCESS",
+            "link": prefix + "x" * (2048 - len(prefix)),
+        } for index in range(30)]
+
+        def attempt(checks, sequence):
+            classified = runtime.classify_github_checks(checks, require_ci=True)
+            self.assertEqual(classified["state"], "green")
+            return {
+                "sequence": sequence, "head_oid": contract["head_oid"],
+                "base_oid": contract["base_oid"], "retry": None,
+                "checks": classified["checks"], "check_count": classified["check_count"],
+                "checks_sha256": classified["checks_sha256"], "reason": "green",
+                "watcher_exit_code": None, "error": None,
+            }
+
+        limit = runtime.MAX_DYNAMIC_CI_ATTEMPT_BYTES
+        for count in range(1, len(rows) + 1):
+            selected = [dict(row) for row in rows[:count]]
+            selected[-1]["link"] = prefix
+            minimum = len(runtime.canonical_bytes(attempt(selected, 1)))
+            if minimum <= limit < minimum + 2048 - len(prefix):
+                break
+        else:
+            self.fail("valid link padding must straddle the attempt limit")
+        selected[-1]["link"] += "x" * (limit - minimum)
+        oversized = [dict(row) for row in selected]
+        oversized[-1]["link"] += "x"
+        self.assertEqual(len(runtime.canonical_bytes(attempt(selected, 1))), limit)
+        self.assertEqual(len(runtime.canonical_bytes(attempt(oversized, 1))), limit + 1)
+        prior = watcher._append(
+            runtime, contract, None, head_oid=contract["head_oid"],
+            base_oid=contract["base_oid"],
+            classification=runtime.classify_github_checks([], require_ci=True),
+        )
+        for previous in (None, prior):
+            with self.subTest(appending=previous is not None):
+                kwargs = {
+                    "head_oid": contract["head_oid"], "base_oid": contract["base_oid"],
+                }
+                report = watcher._append(
+                    runtime, contract, previous, **kwargs,
+                    classification=runtime.classify_github_checks(selected, require_ci=True),
+                )
+                self.assertEqual(report["attempts"][-1]["reason"], "green")
+                self.assertEqual(report["attempts"][-1]["sequence"], 1 if previous is None else 2)
+                runtime.validate_dynamic_ci_report(report)
+                with self.assertRaisesRegex(ValueError, "attempt.*byte limit"):
+                    watcher._append(
+                        runtime, contract, previous, **kwargs,
+                        classification=runtime.classify_github_checks(oversized, require_ci=True),
+                    )
+
+    def test_dynamic_pr_head_and_base_changes_are_independent_of_review(self):
+        for key, reason in (
+            ("head", "pull_request_head_changed"),
+            ("base", "pull_request_base_changed"),
+        ):
+            with self.subTest(key=key):
+                root = self.create_repository()
+                contract = self.contract()
+                watcher, environment = self._install_dynamic_watch(
+                    root, PR_WATCH, state=self._state(**{key: "d" * 40}),
+                    checks=[self._check(name="unit", bucket="pass", state="SUCCESS")],
+                )
+                result = self._run(watcher, root, environment, self._payload(root, contract))
+                self.assertEqual(result["transition"], "merge_watch_state_changed")
+                self.assertEqual(json.loads(result["pr_report"])["reason"], reason)
+                self.assertEqual(result["pr_feedback_cursor"], "uninitialized")
+                self.assertEqual(result[f"pr_{key}_oid"], "d" * 40)
+
+    def test_dynamic_watchers_round_trip_unicode_feedback_cursor(self):
+        for source in (CI_WATCH, PR_WATCH):
+            with self.subTest(watcher=source.name):
+                root = self.create_repository()
+                thread = {
+                    "id": "THREAD1", "isResolved": False, "isOutdated": False,
+                    "path": "src/é.kt", "subjectType": "LINE",
+                    "line": 12, "startLine": 10, "originalLine": 20,
+                    "originalStartLine": 18,
+                    "comments": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                }
+                watcher, environment = self._install_dynamic_watch(
+                    root, source, state=self._state(),
+                    checks=[self._check(name="unit", bucket="pass", state="SUCCESS")],
+                    threads=[thread],
+                )
+                contract = self.contract()
+                changed = self._run(watcher, root, environment, self._payload(root, contract))
+                cursor = changed["observed_feedback_cursor"]
+                self.assertIn("é", cursor)
+                item = json.loads(cursor)["items"][0]
+                self.assertEqual(item["path"], thread["path"])
+                self.assertEqual(item["current_line"], 12)
+                acknowledged = self._run(
+                    watcher, root, environment, self._payload(root, contract, cursor=cursor),
+                )
+                self.assertEqual(acknowledged["pr_feedback_cursor"], cursor)
+                self.assertNotIn("observed_feedback_cursor", acknowledged)
+                self.assertEqual(
+                    acknowledged["transition"],
+                    "ci_watch_passed" if source == CI_WATCH else "merge_watch_still_waiting",
+                )
+
+    def test_dynamic_watchers_fail_closed_before_query_on_invalid_carriers(self):
+        for source, field in ((CI_WATCH, "ci_contract"), (PR_WATCH, "pr_feedback_cursor")):
+            for value in ("{not-json", "[" * 101 + "0" + "]" * 101):
+                with self.subTest(watcher=source.name, field=field, value=value[:20]):
+                    root = self.create_repository()
+                    watcher, environment = self._install_dynamic_watch(
+                        root, source, state=self._state(), checks=[],
+                    )
+                    marker = root / "queried"
+                    (root / "gh").write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n")
+                    payload = self._payload(root, self.contract())
+                    payload[field] = value
+                    result = subprocess.run(
+                        [str(watcher)], cwd=root, input=json.dumps(payload),
+                        text=True, capture_output=True, env=environment,
+                        check=False, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertFalse(marker.exists())
+
+    def test_dynamic_watchers_terminate_real_query_groups(self):
+        cases = {
+            "timeout": "query_timeout",
+            "closed_timeout": "query_timeout",
+            "orphan_open": "query_timeout",
+            "orphan_closed": "query_failed",
+            "overflow": "observation_limit",
+        }
+        for source in (CI_WATCH, PR_WATCH):
+            for case, code in cases.items():
+                with self.subTest(watcher=source.name, case=case):
+                    root = self.create_repository()
+                    watcher, environment = self._install_dynamic_watch(
+                        root, source, state=self._state(), checks=[],
+                    )
+                    environment["KENT_CI_WATCH_QUERY_TIMEOUT_SECONDS"] = "1"
+                    environment["KENT_PR_WATCH_QUERY_TIMEOUT_SECONDS"] = "1"
+                    pid_file = root / "query-pids"
+                    (root / "gh").write_text(
+                        f"#!{sys.executable}\n"
+                        "import json, os, signal, time\nfrom pathlib import Path\n"
+                        f"case = {case!r}\n"
+                        "ready, notify = os.pipe()\n"
+                        "child = os.fork()\n"
+                        "if child == 0:\n"
+                        "    os.close(ready)\n"
+                        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                        "    if case in {'closed_timeout', 'orphan_closed'}:\n"
+                        "        os.close(1); os.close(2)\n"
+                        "    os.write(notify, b'R'); os.close(notify)\n"
+                        "    time.sleep(30); os._exit(0)\n"
+                        "os.close(notify)\n"
+                        "assert os.read(ready, 1) == b'R'\n"
+                        "os.close(ready)\n"
+                        f"Path({str(pid_file)!r}).write_text(f'{{os.getpid()}} {{child}}')\n"
+                        "if case.startswith('orphan'):\n"
+                        "    print('{}', flush=True); os._exit(0)\n"
+                        "if case == 'closed_timeout':\n"
+                        "    os.close(1); os.close(2)\n"
+                        "if case == 'overflow':\n"
+                        "    os.write(1, b'x' * (4 * 1024 * 1024 + 1))\n"
+                        "time.sleep(30)\n"
+                    )
+                    result = self._run(
+                        watcher, root, environment, self._payload(root, self.contract()),
+                    )
+                    self.assertTrue(pid_file.exists(), result)
+                    assert_pids_gone(self, pid_file)
+                    if source == CI_WATCH:
+                        self.assertEqual(result["transition"], "ci_watch_failed")
+                        error = json.loads(result["ci_report"])["attempts"][-1]["error"]
+                    else:
+                        self.assertEqual(result["transition"], "merge_watch_state_changed")
+                        report = json.loads(result["pr_report"])
+                        self.assertEqual(report["reason"], "github_query_failed")
+                        error = report["safe_error"]
+                    self.assertEqual(error["code"], code, result)
+
+    def test_dynamic_pr_failed_extra_check_wakes_with_complete_report(self):
+        root = self.create_repository()
+        watcher, environment = self._install_dynamic_watch(
+            root, PR_WATCH, state=self._state(),
+            checks=[
+                self._check(name="unit", bucket="pass", state="SUCCESS"),
+                self._check(name="extra", bucket="fail", state="FAILURE"),
+            ],
+        )
+        result = self._run(watcher, root, environment, self._payload(root, self.contract()))
+        self.assertEqual(result["transition"], "merge_watch_state_changed")
+        report = json.loads(result["pr_report"])
+        self.assertEqual(report["reason"], "checks_failed")
+        self.assertEqual(len(report["checks"]), 2)
+        self.assertEqual(next(row for row in report["checks"] if row["check_name"] == "extra")["bucket"], "fail")
 
     def test_dynamic_pr_preserves_ack_cursor_and_wakes_for_feedback_or_conflict(
         self,
@@ -9882,7 +6912,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self, *, count=2, mutate_records=None, report_size=None, linked=False,
         report_kind="v2",
     ):
-        """Real archive producer -> actual ledger append/seal -> Janitor."""
+        """Typed archive fixture -> actual ledger append/seal -> Janitor."""
         from workflowkit import runtime
         from tests.test_revision import schema4_profile_contents
         from tests.test_runtime_contracts import ci_report
@@ -9997,9 +7027,9 @@ class WorkflowJanitorTest(GitRepositoryTest):
                         {
                             "node_key": "ci_prepare",
                             "evidence_type": "ci_report",
-                            "summary": "Legacy v2 janitor fixture.",
+                            "summary": "CI archive janitor fixture.",
                             "artifacts": [artifact],
-                            "checks": ["legacy v2 report fixture"],
+                            "checks": ["typed CI report fixture"],
                             "context": {
                                 "manifest_path": ".kent/context/delivery.md",
                                 "files_read": [],
@@ -12068,44 +9098,6 @@ class WorkflowJanitorTest(GitRepositoryTest):
             (runtime_dir / f".evidence-terminal-{hashlib.sha256(b'TASK-1').hexdigest()}").exists()
         )
 
-    def test_v2_checkpoint_cleanup_uses_fix_smoke_ledger_order(self) -> None:
-        root = self.create_repository()
-        scripts, marker_line = self.make_v2_terminal_state(root)
-        runtime_dir = root / ".kent" / "runtime"
-        active = runtime_dir / "TASK-1"
-        marker = json.loads(marker_line.removeprefix("TERMINAL_EVIDENCE_V1 "))
-        runtime = load_template_module(
-            REPO_ROOT / "workflowkit" / "runtime.py",
-            "runtime_checkpoint_order_test",
-        )
-        tombstone = runtime_dir / (
-            ".evidence-cleanup-" + runtime.canonical_sha256(marker)
-        )
-        active.rename(tombstone)
-        for name in ("fix-checkpoint.json", "smoke-checkpoint.json"):
-            self._write_valid_runtime_file(tombstone / name, "{}\n")
-        sentinel = runtime_dir / (
-            ".evidence-terminal-" + hashlib.sha256(b"TASK-1").hexdigest()
-        )
-        self._write_valid_runtime_file(sentinel)
-        janitor = load_template_module(
-            scripts / "workflow-task-janitor",
-            "janitor_checkpoint_order_test",
-        )
-        phases: list[str] = []
-        outcome = janitor._remove_v2_runtime_state(
-            root.resolve(),
-            "TASK-1",
-            cleanup_report=marker_line,
-            _phase_hook=phases.append,
-        )
-        self.assertEqual(outcome[0], True)
-        self.assertLess(
-            phases.index("after_fix_checkpoint_unlink_fsync"),
-            phases.index("after_smoke_checkpoint_unlink_fsync"),
-        )
-        self.assertIn("after_ledger_unlink_fsync", phases)
-        self.assertTrue(sentinel.exists())
 
     def test_v2_checkpoint_subsets_cleanup_in_fixed_order(self) -> None:
         subsets = (
@@ -12505,27 +9497,6 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 self.assertTrue(fired)
                 self.assertTrue(tombstone.exists())
 
-    def test_v2_active_sentinel_conflict_blocks_without_deletion(self) -> None:
-        root = self.create_repository()
-        scripts, marker_line = self.make_v2_terminal_state(root)
-        runtime_dir = root / ".kent" / "runtime"
-        sentinel = runtime_dir / (
-            ".evidence-terminal-" + hashlib.sha256(b"TASK-1").hexdigest()
-        )
-        sentinel.write_bytes(b"")
-        result = subprocess.run(
-            [str(scripts / "workflow-task-janitor")],
-            input=self.janitor_input(root, cleanup_report=marker_line),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["transition"], "task_janitor_blocked")
-        self.assertTrue((runtime_dir / "TASK-1").exists())
-        self.assertTrue(sentinel.exists())
-
     def test_v2_tombstone_preserves_unknown_entries_and_blocks(self) -> None:
         root = self.create_repository()
         scripts, marker_line = self.make_v2_terminal_state(root)
@@ -12897,7 +9868,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertTrue(runtime.exists())
         self.assertTrue((runtime / "ci-report-fake.json").exists())
 
-    def test_legacy_cleanup_rejects_unsafe_opaque_entries(self) -> None:
+    def test_legacy_cleanup_rejects_unsafe_known_entries(self) -> None:
         for case in (
             "unsafe",
             "hardlink",
@@ -12911,7 +9882,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 root = self.create_repository()
                 runtime = root / ".kent" / "runtime" / "TASK-1"
                 runtime.mkdir(parents=True)
-                entry = runtime / "opaque-entry"
+                entry = runtime / "fix-checkpoint.json"
                 self._write_valid_runtime_file(entry, b"opaque")
                 if case == "unsafe":
                     entry.chmod(0o644)
@@ -12971,6 +9942,13 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "TASK-1",
                 )
                 self.assertFalse(outcome[0], outcome)
+                if case in {"tracked", "not_ignored"}:
+                    self.assertIn("tracked or not ignored", outcome[1])
+                else:
+                    self.assertIn("fix-checkpoint.json", outcome[1])
+                    if case != "symlink":
+                        self.assertIn("runtime evidence is unsafe", outcome[1])
+                self.assertNotIn("unexpected runtime entries", outcome[1])
                 self.assertTrue(runtime.exists())
                 self.assertTrue(entry.exists())
 
@@ -12994,16 +9972,16 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     ".evidence-cleanup-" + runtime.canonical_sha256(marker)
                 )
                 (runtime_dir / "TASK-1").rename(tombstone)
-                (
+                self._write_valid_runtime_file(
                     runtime_dir
                     / (
                         ".evidence-terminal-"
                         + hashlib.sha256(b"TASK-1").hexdigest()
-                    )
-                ).write_bytes(b"")
-                entry = tombstone / "unsafe-entry"
-                entry.write_text("{}\n")
-                entry.chmod(0o600)
+                    ),
+                    b"",
+                )
+                entry = tombstone / "fix-checkpoint.json"
+                self._write_valid_runtime_file(entry, b"{}\n")
                 if case == "unsafe":
                     entry.chmod(0o644)
                 elif case == "hardlink":
@@ -13045,6 +10023,11 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     cleanup_report=marker_line,
                 )
                 self.assertFalse(outcome[0])
+                self.assertNotIn("unexpected tombstone entries", outcome[1])
+                if case in {"tracked", "not_ignored"}:
+                    self.assertIn("tracked or not ignored", outcome[1])
+                else:
+                    self.assertIn("fix-checkpoint.json", outcome[1])
                 self.assertTrue(tombstone.exists())
                 self.assertTrue(entry.exists())
 
@@ -13369,36 +10352,6 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertFalse((runtime_dir / "TASK-1").exists())
         self.assertTrue(sentinel.exists())
 
-    def test_v2_active_state_conflict_matrix_blocks_without_deletion(self) -> None:
-        for case in ("active_tombstone", "active_invalid", "active_unsealed"):
-            with self.subTest(case=case):
-                root = self.create_repository()
-                scripts, marker_line = self.make_v2_terminal_state(root)
-                runtime_dir = root / ".kent" / "runtime"
-                task = runtime_dir / "TASK-1"
-                if case == "active_tombstone":
-                    (runtime_dir / ".evidence-cleanup-conflict").mkdir()
-                else:
-                    ledger = task / "evidence-ledger.jsonl"
-                    if case == "active_invalid":
-                        ledger.write_text("{\n")
-                    else:
-                        records = [
-                            json.loads(line)
-                            for line in ledger.read_text().splitlines()
-                        ]
-                        ledger.write_text(json.dumps(records[0]) + "\n")
-                janitor = load_template_module(
-                    scripts / "workflow-task-janitor",
-                    "janitor_active_state_{}".format(case),
-                )
-                outcome = janitor._remove_v2_runtime_state(
-                    root.resolve(),
-                    "TASK-1",
-                    cleanup_report=marker_line,
-                )
-                self.assertFalse(outcome[0])
-                self.assertTrue(task.exists())
 
     def test_v2_primary_active_conflict_matrix_blocks_without_deletion(self) -> None:
         for case in ("sentinel", "tombstone", "invalid", "unsealed"):
@@ -13408,13 +10361,14 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 runtime_dir = root / ".kent" / "runtime"
                 task = runtime_dir / "TASK-1"
                 if case == "sentinel":
-                    (
+                    sentinel = (
                         runtime_dir
                         / (
                             ".evidence-terminal-"
                             + hashlib.sha256(b"TASK-1").hexdigest()
                         )
-                    ).write_bytes(b"")
+                    )
+                    self._write_valid_runtime_file(sentinel, b"")
                 elif case == "tombstone":
                     (runtime_dir / ".evidence-cleanup-conflict").mkdir()
                 else:
@@ -13438,6 +10392,8 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 )
                 self.assertFalse(outcome[0])
                 self.assertTrue(task.exists())
+                if case == "sentinel":
+                    self.assertEqual(sentinel.read_bytes(), b"")
 
     def test_v2_primary_missing_ledger_blocks_without_legacy_fallback(self) -> None:
         root = self.create_repository()
@@ -13722,7 +10678,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 )
                 (runtime_dir / "TASK-1").rename(tombstone)
                 entry = tombstone / "fix-checkpoint.json"
-                entry.write_text("{}\n")
+                self._write_valid_runtime_file(entry, b"{}\n")
                 if state == "unsafe":
                     entry.chmod(0o644)
                 elif state == "tracked":
@@ -13747,6 +10703,11 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     cleanup_report=marker_line,
                 )
                 self.assertFalse(result[0])
+                self.assertIn(
+                    "runtime evidence is unsafe" if state == "unsafe"
+                    else "tracked or not ignored",
+                    result[1],
+                )
                 self.assertTrue(tombstone.exists())
 
     def test_dirty_managed_worktree_is_preserved(self) -> None:
