@@ -41,11 +41,6 @@ CODER_SELECTION_TARGETS = {
     "simple": ("implementation-simple", "xhigh"),
     "complex": ("implementation-complex", "medium"),
 }
-IMPLEMENTATION_ROLES = {
-    "implementation-worker",
-    "implementation-simple",
-    "implementation-complex",
-}
 NOT_APPLICABLE = "not-applicable"
 DEFAULT_KENT_PATHS = (
     str(Path.home() / ".kent" / "bin" / "kent"),
@@ -1137,14 +1132,7 @@ def plan_file(root: Path, configured: str) -> tuple[Path | None, str]:
 def normalized_plan(path: Path | None) -> str:
     if path is None:
         return "not-applicable\n"
-    raw = path.read_text(encoding="utf-8")
-    lines = [
-        CHECKBOX.sub(r"\1 \2", line).rstrip()
-        for line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    ]
-    while lines and not lines[-1]:
-        lines.pop()
-    return "\n".join(lines) + "\n"
+    return inspection_normalized_plan(path.read_bytes())
 
 
 def runtime_file(root: Path, task: str) -> Path:

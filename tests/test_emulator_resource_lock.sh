@@ -161,20 +161,19 @@ stale_token="$("$adapter" acquire emulator-5554 0 7200)"
 stale_dir="$KENT_RESOURCE_LOCK_DIR/mobile-emulator-5554.lock"
 python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); data=p.read_bytes(); p.write_bytes(data.replace(b"created_at=" + next(line.split(b"=",1)[1] for line in data.splitlines() if line.startswith(b"created_at=")) + b"\n", b"created_at=1\n"))' "$stale_dir/owner"
 printf '1\n' >"$stale_dir/created_at"
-replacement_file="$temporary/replacement-token"
-"$adapter" acquire emulator-5554 5 1 \
-  >"$replacement_file" \
-  2>"$temporary/stale-reclaim.log" &
-replacement_pid=$!
-sleep 0.1
+# Complete reclamation before testing that the old owner cannot release it.
+replacement_token="$("$adapter" acquire emulator-5554 5 1 \
+  2>"$temporary/stale-reclaim.log")"
+[[ "$replacement_token" != "$stale_token" ]]
+replacement_owner="$(cat "$stale_dir/owner")"
+replacement_created_at="$(cat "$stale_dir/created_at")"
 set +e
 "$adapter" release emulator-5554 "$stale_token" >/dev/null 2>&1
 stale_release_status=$?
 set -e
-wait "$replacement_pid"
-replacement_token="$(cat "$replacement_file")"
-[[ "$replacement_token" != "$stale_token" ]]
-[[ "$stale_release_status" -eq 0 || "$stale_release_status" -eq 64 ]]
+[[ "$stale_release_status" -eq 64 ]]
+[[ "$(cat "$stale_dir/owner")" == "$replacement_owner" ]]
+[[ "$(cat "$stale_dir/created_at")" == "$replacement_created_at" ]]
 [[ "$("$adapter" status emulator-5554 | head -1)" == "locked" ]]
 "$adapter" release emulator-5554 "$replacement_token"
 

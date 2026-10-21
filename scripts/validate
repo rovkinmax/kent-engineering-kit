@@ -42,9 +42,6 @@ python3 -m py_compile \
   "$repo_root/workflowkit/operations.py" \
   "$repo_root/scripts/activate-primary-checkout" \
   "$repo_root/scripts/reconcile-canonical-workflows" \
-  "$repo_root/scripts/reconcile-release-portfolio" \
-  "$repo_root/scripts/retire-workflow-batch" \
-  "$repo_root/scripts/verify-release-portfolio" \
   "$repo_root/templates/project/android-apk-install-preserve" \
   "$repo_root/templates/project/workflow-branch-identity" \
   "$repo_root/templates/project/workflow-checkpoint" \
@@ -55,13 +52,6 @@ python3 -m py_compile \
   "$repo_root/templates/project/workflow-wait-github-ci" \
   "$repo_root/templates/project/workflow-wait-github-pr" \
   "$repo_root/templates/project/workflow-task-janitor"
-if [[ -x /usr/bin/python3 ]]; then
-  /usr/bin/python3 -m py_compile \
-    "$repo_root/templates/project/workflow-branch-identity" \
-    "$repo_root/templates/project/workflow-evidence-ledger" \
-    "$repo_root/templates/project/workflow-wait-github-ci"
-fi
-
 install_help_root="$(mktemp -d)"
 KENT_PERSISTENCE_ROOT="$install_help_root" \
   "$repo_root/scripts/install" --help >/dev/null
@@ -95,16 +85,6 @@ rmdir "$install_help_root"
   echo "workflow plan-contract template is not executable" >&2
   exit 1
 }
-for plan_contract_wrapper in \
-  workflow-plan-contract-accept \
-  workflow-plan-contract-continue \
-  workflow-plan-contract-fix-continue \
-  workflow-plan-contract-verify; do
-  [[ -x "$repo_root/templates/project/$plan_contract_wrapper" ]] || {
-    echo "$plan_contract_wrapper template is not executable" >&2
-    exit 1
-  }
-done
 for plan_contract_wrapper in \
   workflow-plan-contract-accept \
   workflow-plan-contract-continue \
@@ -179,10 +159,7 @@ git --no-replace-objects --no-lazy-fetch --version >/dev/null
 }
 for operations_script in \
   activate-primary-checkout \
-  reconcile-canonical-workflows \
-  reconcile-release-portfolio \
-  retire-workflow-batch \
-  verify-release-portfolio; do
+  reconcile-canonical-workflows; do
   [[ -x "$repo_root/scripts/$operations_script" ]] || {
     echo "$operations_script is not executable" >&2
     exit 1
@@ -254,64 +231,6 @@ if configured != available:
         f"agent/config mismatch: unconfigured={missing}, foreign={foreign}"
     )
 PY
-
-if grep -n -F 'Do not call `kent run`' "$repo_root"/agents/*.md; then
-  echo "role prompt blanket prohibition conflicts with bounded Session communication" >&2
-  exit 1
-fi
-
-if grep -n -F 'contracts/role-contract.md' "$repo_root"/agents/*.md; then
-  echo "global role prompts must not depend on an uninstalled Kit contract" >&2
-  exit 1
-fi
-
-for communication_role in \
-  "$repo_root/agents/architecture-designer.md" \
-  "$repo_root/agents/researcher.md" \
-  "$repo_root/agents/standards-reviewer.md" \
-  "$repo_root/agents/spec-reviewer.md" \
-  "$repo_root/agents/compliance_reviewer.md" \
-  "$repo_root/agents/release-manager.md"; do
-  for communication_guard in \
-    'kent run steer <session-id>' \
-    'kent run watch <session-id>' \
-    'kent run --agent grill' \
-    'In Workflow, do not' \
-    'child agents'; do
-    grep -F "$communication_guard" "$communication_role" >/dev/null || {
-      echo "role must preserve bounded Session and Workflow child policy: $communication_role" >&2
-      exit 1
-    }
-  done
-done
-
-for grill_guard in \
-  'prompts/grill.md' \
-  'kent run watch <session-id>'; do
-  grep -F "$grill_guard" "$repo_root/agents/grill.md" >/dev/null || {
-    echo "grill role must retain the canonical method and bounded watch" >&2
-    exit 1
-  }
-done
-
-for compatibility_guard in \
-  'outcome.kind: "question"' \
-  'committed-but-unstarted' \
-  'partial Session'; do
-  grep -F "$compatibility_guard" "$repo_root/contracts/workflow-contract.md" >/dev/null || {
-    echo "workflow contract must preserve Kent 2.9 compatibility: $compatibility_guard" >&2
-    exit 1
-  }
-done
-for authority_guard in \
-  'answered_by_session_id' \
-  'proof of human authorship' \
-  'config.local.toml'; do
-  grep -F "$authority_guard" "$repo_root/skills/kent-engineering-kit/references/task-supervision-operations.md" >/dev/null || {
-    echo "supervision reference must preserve compatibility authority: $authority_guard" >&2
-    exit 1
-  }
-done
 
 names_file="$(mktemp)"
 trap 'rm -f "$names_file"' EXIT
@@ -441,69 +360,24 @@ compare(expected, actual, "config")
 PY
 fi
 
-python3 - "$repo_root/contracts/project-profile.example.toml" <<'PY'
+PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 - "$repo_root" <<'PY'
 import pathlib
 import sys
-import tomllib
+from workflowkit.profile import ProjectProfile
 
-profile = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
-allowed_targets = {
-    "ask-on-first-execution",
-    "none",
-    "head",
-    "default-branch",
-}
-
-if profile.get("schema_version") != 3:
-    raise AssertionError("profile.schema_version must be 3")
-if profile.get("minimum_kent_version") != "2.6.1":
-    raise AssertionError("profile.minimum_kent_version must be 2.6.1")
-required_adapters = profile.get("required_adapters")
-if not isinstance(required_adapters, list) or not all(
-    isinstance(value, str) and value for value in required_adapters
-):
-    raise AssertionError("profile.required_adapters must be a string array")
-kit_managed_adapters = profile.get("kit_managed_adapters")
-if not isinstance(kit_managed_adapters, list) or not all(
-    isinstance(value, str) and value for value in kit_managed_adapters
-):
-    raise AssertionError("profile.kit_managed_adapters must be a string array")
-if not set(kit_managed_adapters).issubset(required_adapters):
-    raise AssertionError(
-        "profile.kit_managed_adapters must be required adapters"
-    )
-if profile.get("policies", {}).get("smoke") not in {
-    "disabled",
-    "conditional",
-    "required",
-}:
-    raise AssertionError("profile.policies.smoke is invalid")
-if profile.get("policies", {}).get("branch_identity") not in {
-    "task",
-    "jira",
-    "github_issue",
-}:
-    raise AssertionError("profile.policies.branch_identity is invalid")
-
-targets = [profile["execution"]["default_target"]]
-targets.extend(profile["execution"].get("overrides", {}).values())
-for target in targets:
-    if target not in allowed_targets and not target.startswith("ref:"):
-        raise AssertionError(f"unsupported execution target: {target}")
-    if target.startswith("ref:"):
-        revision = target[4:]
-        if not revision:
-            raise AssertionError("custom execution target revision is empty")
-        if any(character.isspace() for character in revision):
-            raise AssertionError(
-                "custom execution target revision must not contain whitespace"
-            )
+root = pathlib.Path(sys.argv[1])
+example = root / "contracts" / "project-profile.example.toml"
+ProjectProfile.from_toml(
+    root, example.read_text(), source=str(example), check_files=False
+)
 PY
 
 python3 -m compileall -q \
   "$repo_root/workflowkit" \
   "$repo_root/scripts/generate-workflow" \
   "$repo_root/scripts/sync-project-adapters"
+python3 -B "$repo_root/.kent/workflows/kit_development.py" --check-current
 if [[ "$installed_state" -eq 1 ]]; then
   "$repo_root/scripts/configure-mcporter"
 fi

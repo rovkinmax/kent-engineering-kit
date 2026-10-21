@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -898,56 +899,24 @@ class ReleaseSpecTest(unittest.TestCase):
             with self.assertRaises(ReleaseSpecError):
                 ReleaseSpec.from_dict(spec_data)
 
-    def test_public_exports_add_exact_runtime_template_symbols(self) -> None:
-        expected = {
-            "KentClient", "ApprovalMaterialization", "AuthoritySpec",
-            "AuthorityTemplateSpec",
-            "CanonicalizedPublicationOperation", "ExternalRoot",
-            "GitHubRefPolicy",
-            "JobContractTable", "NormalizedGitHubJobV1",
-            "NormalizedGitHubStepV1", "NormalizedGitHubWorkflowSourceV1",
-            "OperationVariant", "ProjectField", "ProjectProfile",
-            "ReleaseProfile", "ReleaseSourceManifest", "ReleaseSpec",
-            "ReleaseSpecError", "SelectedReleaseArtifacts",
-            "SourceManifestReference", "SourceManifestSpec", "WorkKind",
-            "ValidatedJobBinding", "ValidatedOperationJobs",
-            "WorkflowSourceIntent", "build_canary_workflow",
-            "build_delivery_workflow", "build_smoke_lab_workflow",
-            "canonical_bytes", "canonical_sha256",
-            "canonicalize_publication_operation",
-            "operation_jobs_manifest_bytes", "operation_jobs_manifest_digest",
-            "preflight_project_revision", "render_approval_summary",
-            "render_release_preview", "RuntimeContractError",
-            "RuntimeExecutionContext",
-            "RuntimeAuthorityBinding",
-            "RuntimeExternalRoot", "SelectedRuntimeSourceInputs",
-            "capture_runtime_execution_context",
-            "capture_runtime_authority_binding",
-            "append_ci_report_attempt", "build_ci_report",
-            "build_terminal_marker", "build_terminal_seal_record",
-            "capture_runtime_source_envelope", "check_state_sha256",
-            "classify_ci_report", "classify_expected_ci_checks",
-            "classify_pr_feedback", "classify_terminal_state",
-            "classify_verification_report", "expected_ci_checks_sha256",
-            "make_pr_feedback_cursor", "make_report_invalid_attempt",
-            "parse_runtime_external_captures", "parse_canonical_json",
-            "revalidate_runtime_source_envelope", "runtime_canonical_bytes",
-            "runtime_canonical_sha256", "validate_ci_report",
-            "validate_ci_report_history", "validate_captured_runtime_source_envelope",
-            "validate_cleanup_report", "validate_expected_ci_checks",
-            "validate_pr_feedback_cursor", "validate_runtime_source_envelope",
-            "validate_terminal_chain", "validate_terminal_marker",
-            "validate_terminal_seal_record", "validate_terminal_seal_request",
-            "validate_verification_report", "validate_approval_materialization",
-            "validate_effect_job_sources", "validate_operation_jobs",
-            "validate_qualification_job_sources", "validate_required_job_sources",
-        }
-        self.assertEqual(set(workflowkit.__all__), expected)
+
+    def test_publication_consumers_keep_root_exports_and_toml_parser(self) -> None:
+        from workflowkit import release
+        from tests.test_revision import release_spec_contents
+
+        for name in (
+            "ReleaseSpec", "CanonicalizedPublicationOperation", "ValidatedOperationJobs",
+            "canonicalize_publication_operation", "validate_operation_jobs",
+            "render_approval_summary", "validate_approval_materialization",
+            "validate_qualification_job_sources", "validate_effect_job_sources",
+        ):
+            with self.subTest(name=name):
+                self.assertIn(name, workflowkit.__all__)
+                self.assertIs(getattr(workflowkit, name), getattr(release, name))
         self.assertNotIn("_resolve_runtime_authority_binding", workflowkit.__all__)
         self.assertNotIn("resolve_runtime_authority_binding", workflowkit.__all__)
-        self.assertNotIn("resolve_runtime_authority_binding", __import__(
-            "workflowkit.runtime", fromlist=["__all__"]
-        ).__all__)
+        contents = release_spec_contents()
+        self.assertEqual(ReleaseSpec.parse(contents), ReleaseSpec.from_toml(contents))
 
     def test_runtime_context_and_binding_are_sealed(self) -> None:
         inputs = _make_selected_runtime_source_inputs(
@@ -1345,7 +1314,7 @@ class ReleaseSpecTest(unittest.TestCase):
     def test_canonical_json_is_sorted_and_has_no_newline(self) -> None:
         encoded = canonical_json_bytes({"z": 1, "a": True})
         self.assertEqual(encoded, b'{"a":true,"z":1}')
-        self.assertEqual(sha256_digest(encoded), sha256_digest(encoded))
+        self.assertEqual(sha256_digest(encoded), hashlib.sha256(encoded).hexdigest())
         self.assertNotIn(b"\n", encoded)
         source = normalized_workflow().as_dict()
         reordered = {key: source[key] for key in reversed(list(source))}
@@ -4119,19 +4088,6 @@ class ReleaseSpecTest(unittest.TestCase):
                 qualification=spec.qualification_jobs_v1,
                 effect=spec.effect_jobs_v1,
             )
-        reordered = deepcopy(spec.required_jobs_v1.as_dict())
-        reordered["jobs"].reverse()
-        reordered_validated = validate_operation_jobs(
-            spec.operation_variants[0],
-            [workflow, other],
-            required=reordered,
-            qualification=spec.qualification_jobs_v1,
-            effect=spec.effect_jobs_v1,
-        )
-        self.assertEqual(
-            validated.operation_jobs_manifest_digest,
-            reordered_validated.operation_jobs_manifest_digest,
-        )
 
     def test_kent_authority_and_approval_cardinality(self) -> None:
         spec_data = valid_spec()

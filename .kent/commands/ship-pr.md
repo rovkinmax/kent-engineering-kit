@@ -1,39 +1,28 @@
 # Prepare PR
 
-Confirm passing current verification/review evidence, approved scope and
-explicit Git delivery authority. Source-only approval is insufficient.
-Inspect actual branch name, HEAD, immutable task baseline and current merge
-target; never reconstruct branch identity from the Task ID.
+Require passing current-stage verification/review evidence and explicit Git
+delivery authority. Source-only approval grants no publication. Read actual
+branch, HEAD, immutable baseline and current target; never derive the branch
+name from Task ID. Follow `.kent/project-contract.md` for report/log identity
+and freshness; Delivery does not repeat routine full validation.
 
-Before preparing delivery, confirm the current typed verification report and
-retained log reference, plus matching before/after source and environment
-identity references for the exact source being delivered. Optional narrative
-handoffs reference the accepted preview and verifier artifacts rather than
-copying their complete contents. Missing, tampered or mismatched identity
-requires fresh verification through the existing Implement/verification path;
-do not run a second routine full validator in Delivery.
+When authorized, commit/push only approved Task changes and prepare its PR.
+Do not commit unrelated changes, push main, merge or bypass checks. Preserve
+installed primary and consumer/global state. Task-scoped corrections return
+through Fix and affected verification; new scope/effects need approval.
 
-When the applicable future workflow explicitly permits delivery, commit and
-push only the task branch and prepare its PR. Never commit unrelated changes,
-push directly to main, merge a PR, or bypass repository checks. Preserve the
-installed primary and consumer/global state. Integration changes requiring
-repair return through Fix and fresh verification.
+Use profile `rebase` policy and existing strategy/method checks. Verify
+repository/ruleset permissions around publication; an existing PR needs
+GitHub `canBeRebased=true` before claiming rebase feasibility. Unknown state
+requires readback. Method selection is not merge authority.
 
-Report exact branch, PR URL, head/base OIDs and evidence via generated
-parameters. Existing GitHub automation may run naturally; this flow does not
-add a separate Kent CI preparation/watch/monitor stage.
+Return exact branch, PR URL, head/base OIDs and evidence through declared
+carriers. Retain later acceptance obligations with owner/milestone: a
+review-ready PR may still have external UNVERIFIED work and is not full
+business acceptance, merge/release or Task Done. No Kent CI monitoring stage
+is added.
 
-The human-selected Kit PR policy is `rebase`, as declared in the profile.
-Use the existing strategy resolver and delivery-role method checks; do not
-fall back to another method when policy or PR state conflicts. Before and
-after publishing/updating the PR, verify applicable repository/ruleset
-permission; for an existing PR, GitHub `canBeRebased` must be true before
-declaring rebase feasibility. Unknown state needs fresh readback, not an
-assumed PASS. A confirmed blocker follows the existing delivery recovery
-gate. The selected method is a delivery requirement, never merge authority.
-
-For explicitly approved report-only qualification, create no commit, push,
-PR, tag or release. Prove no tracked/staged writes and exact HEAD equality
-with a current published branch tip; preserve that branch through qualification.
-Use the existing `report_only`/`no_pr` disposition and carriers, with explicit
-authority and retained report evidence, then proceed to owned cleanup.
+For explicit report-only qualification, create no commit, push, PR, tag or
+release. Prove no tracked/staged writes and exact HEAD equality with a current
+published branch tip; retain that branch through qualification. Use authorized
+`report_only`/`no_pr` carriers and proceed to owned cleanup.

@@ -12,8 +12,8 @@
   delegation eligibility belong in Kent configuration; role-prompt
   frontmatter must not declare `model` or `tools`.
 - Workflow fragments must use canonical parameters from `contracts/workflow-contract.md`.
-- Generated workflows require Kent 2.6.1+ and declare an explicit
-  execution-target policy.
+- Generated workflows declare an explicit execution-target policy; the project
+  profile and executable validation own minimum-version compatibility.
 - Fan-out branches are read-only, transition directly to Join, and report failures
   as structured results.
 - Do not edit live Kent workflow database records directly.

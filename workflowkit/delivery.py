@@ -674,6 +674,11 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
         for key, value in fields.items():
             if key in {"transition", "commentary"}:
                 continue
+            # Review synthesis is agent-owned, unlike opaque delivery/CI
+            # packets. Explicit, graph-declared synthesis supersedes every
+            # historical value, but never skips reconstruction of a producer.
+            if key == "review_context" and key in required and key in values:
+                continue
             if key in sources and sources[key] != value:
                 raise ValueError("producer references disagree on exact field bytes")
             sources[key] = value
@@ -904,66 +909,33 @@ def _delivery_context_enabled(profile: ProjectProfile) -> bool:
 
 def delivery_context_input(profile: ProjectProfile) -> str:
     if not _delivery_context_enabled(profile):
-        return ""
-    return (
-        "Delivery context (preserve the exact JSON string): "
-        "{{.Params.delivery_context}}\n"
-    )
-
-
-def delivery_context_input_section(profile: ProjectProfile) -> str:
-    if not _delivery_context_enabled(profile):
         return "\n\n"
-    return "\n\n" + delivery_context_input(profile) + "\n"
-
-
-def delivery_context_line_section(profile: ProjectProfile) -> str:
-    if not _delivery_context_enabled(profile):
-        return "\n"
-    return "\n" + delivery_context_input(profile)
-
-
-def delivery_context_passthrough(profile: ProjectProfile) -> str:
-    if not _delivery_context_enabled(profile):
-        return ""
     return (
-        "Preserve the exact incoming `delivery_context` JSON string on every "
-        "outgoing transition; do not normalize or rewrite nested packet strings."
+        "\n\nDelivery context (preserve the exact JSON string): "
+        "{{.Params.delivery_context}}\n\n"
     )
-
-
-def delivery_context_passthrough_section(profile: ProjectProfile) -> str:
-    if not _delivery_context_enabled(profile):
-        return "\n\n"
-    return "\n\n" + delivery_context_passthrough(profile) + "\n\n"
 
 
 def delivery_context_tail(profile: ProjectProfile) -> str:
     if not _delivery_context_enabled(profile):
         return ""
-    return "\n\n" + delivery_context_passthrough(profile)
+    return (
+        "\n\nPreserve the exact incoming `delivery_context` JSON string on every "
+        "outgoing transition that declares it; do not normalize or rewrite "
+        "nested packet strings."
+    )
 
 
 def delivery_context_pack_instruction(profile: ProjectProfile) -> str:
     if not _delivery_context_enabled(profile):
-        return ""
-    return """When a transition requires `delivery_context`, emit its compact
+        return "\n\n"
+    return """\n\nWhen a transition requires `delivery_context`, emit its compact
 closed `workflow-delivery-context-v1` JSON string. Use exactly `schema` and
 `phase=pre_pr` before any PR is observed. For `phase=post_pr`, include the
 observed `pr_url`, `branch_name`, `merge_strategy`, and
 `pr_feedback_cursor`. Include `ci_contract` and `ci_report` only when those
 exact packets were produced; preserve their string values byte-for-byte.
-Never invent absent PR or CI fields or rewrite a nested packet."""
-
-
-def delivery_context_pack_section(profile: ProjectProfile) -> str:
-    if not _delivery_context_enabled(profile):
-        return "\n\n"
-    return (
-        "\n\n"
-        + delivery_context_pack_instruction(profile)
-        + "\n\n"
-    )
+Never invent absent PR or CI fields or rewrite a nested packet.\n\n"""
 
 
 def build_delivery_workflow(
@@ -986,11 +958,6 @@ def build_delivery_workflow(
     )
     fresh_writers = profile.writer_session_policy() == "fresh_per_slice"
     coder_selection_enabled = profile.coder_selection_policy() == "complexity"
-    if coder_selection_enabled and version != 6:
-        raise SpecError(
-            "policies.coder_selection = 'complexity' is supported only by "
-            "the source candidate workflow v6"
-        )
     planner = "complexity-planner" if coder_selection_enabled else orchestrator
     writer_handoff_context = (
         "new_session"
@@ -1039,11 +1006,6 @@ def build_delivery_workflow(
         (CI_REPORT,) if profile.capability("ci_monitoring") else ()
     )
     fix_continuity_parameters = delivery_context_parameters
-    fix_continuity_parameters_without_task = tuple(
-        parameter
-        for parameter in fix_continuity_parameters
-        if parameter.key != TASK_SHORT_ID.key
-    )
     writer_recovery_context = (
         "new_session" if fresh_writers else "compact_and_continue_session"
     )
@@ -1728,7 +1690,7 @@ def build_delivery_workflow(
                     WORKSPACE,
                     REVIEW_CONTEXT,
                     TASK_SHORT_ID,
-                ) + fix_continuity_parameters_without_task,
+                ) + fix_continuity_parameters,
             ),
             recovery_edge(
                 "fix",
@@ -1763,7 +1725,7 @@ def build_delivery_workflow(
                     WORKSPACE,
                     FIX_CONTEXT,
                     TASK_SHORT_ID,
-                ) + fix_continuity_parameters_without_task,
+                ) + fix_continuity_parameters,
             )
         )
 
@@ -2237,7 +2199,6 @@ def build_delivery_workflow(
                         profile,
                         bounded=fresh_writers,
                     ),
-                    requires_approval=True,
                     transition_description=(
                         "PR preparation found task-scoped changes that must be fixed."
                     ),
@@ -2957,16 +2918,6 @@ re-lock another writer."""
             updated_edges.append(current)
         edges = updated_edges
 
-        for key in (
-            "plan_contract_continue_revalidate",
-            "plan_contract_verify_revalidate",
-            "plan_contract_fix_revalidate",
-        ):
-            for index, edge in enumerate(edges):
-                if edge.key == key:
-                    edges[index] = add_parameters(edge, (ACCEPTED_PLAN_SHA256,))
-                    break
-
         edges.extend(
             [
                 EdgeSpec(
@@ -3146,6 +3097,10 @@ def build_canary_workflow(
         capabilities=capabilities,
         policies=policies,
         procedures=procedures,
+        work_kinds={
+            key: replace(kind, plan="", implement="")
+            for key, kind in profile.work_kinds.items()
+        },
     )
     delivery_spec = build_delivery_workflow(canary_profile, version)
     spec = replace(
@@ -3191,6 +3146,10 @@ def build_smoke_lab_workflow(
         release_topology="none",
         capabilities=capabilities,
         procedures=procedures,
+        work_kinds={
+            key: replace(kind, plan="", implement="")
+            for key, kind in profile.work_kinds.items()
+        },
     )
     delivery_spec = build_delivery_workflow(lab_profile, 1)
     spec = replace(
@@ -3221,22 +3180,40 @@ def transition_key(source: str, outcome: str) -> str:
 
 
 def qualify_transition_keys(edges: list[EdgeSpec]) -> list[EdgeSpec]:
-    outcomes_by_source: dict[str, set[str]] = {}
+    parameters_by_source: dict[str, dict[str, list[str]]] = {}
     for edge in edges:
-        outcomes_by_source.setdefault(edge.source, set()).add(edge.transition)
+        fields = parameters_by_source.setdefault(edge.source, {}).setdefault(
+            edge.transition, [],
+        )
+        for parameter in edge.parameters:
+            if parameter.key not in fields:
+                fields.append(parameter.key)
 
     qualified: list[EdgeSpec] = []
     for edge in edges:
         prompt = edge.prompt
         if prompt:
             for outcome in sorted(
-                outcomes_by_source.get(edge.target, ()),
+                parameters_by_source.get(edge.target, ()),
                 key=len,
                 reverse=True,
             ):
                 prompt = prompt.replace(
                     f"`{outcome}`",
                     f"`{transition_key(edge.target, outcome)}`",
+                )
+            # The graph, not handwritten stage recipes, owns output fields.
+            contracts = []
+            for outcome, keys in parameters_by_source.get(edge.target, {}).items():
+                fields = ", ".join(f"`{key}`" for key in keys) or "(none)"
+                contracts.append(
+                    f"- `{transition_key(edge.target, outcome)}`: {fields}."
+                )
+            if contracts:
+                prompt += (
+                    "\n\nCompletion fields from the selected graph contract "
+                    "(emit only the selected transition's fields; commentary is optional):\n"
+                    + "\n".join(contracts)
                 )
         qualified.append(
             replace(
@@ -3299,9 +3276,6 @@ def recovery_edge(
             )
         recovery_context = context_instruction(profile, *manifest_contract)
         stage_contract = {
-            "plan": """
-Reconcile any declared checkpoint and source task into authoritative
-design/specification/plan artifacts before selecting implementation work.""",
             "implement": """
 Implement exactly one unchecked ready writer-owned plan step. Runtime Smoke and
 other workflow-owned review or delivery items are downstream scope even when a
@@ -3410,8 +3384,7 @@ def cleanup_evidence_owner_instruction(profile: ProjectProfile) -> str:
 Invoke it in the original Task root using the project Cleanup procedure.
 {procedure_instruction(profile, "cleanup")}
 The project command alone owns the final ordinary append and terminal seal.
-Preserve actual context metrics through its project-owned final-event contract;
-keep its payload and archive protocol in the project procedure.
+Keep its payload, optional telemetry and archive protocol in that procedure.
 
 Do not issue a standalone ledger append before the helper, after seal, or
 merely to report a blocker. Until valid terminal preparation is possible,
@@ -3481,8 +3454,8 @@ ordinary event before transition using
 Set `node_key=cleanup`, `evidence_type={evidence_type}`, and
 `context.manifest_path={manifest}`; use real unmodified current
 {identity}. Include the exact files
-read, actual checks, repeated questions and verification loops, and null for
-unavailable model/compaction counters. Then use the existing evidence
+read and actual checks. Optional telemetry must remain truthful; unavailable
+counters stay null. Then use the existing evidence
 command's `seal` operation:
 `{evidence_command} seal --task {{{{.TaskShortId}}}} --workspace <workspace>`.
 Supply the truthful request derived from actual operation reports and
@@ -3534,9 +3507,9 @@ Before transition, pipe one non-empty JSON object to
 <workspace>`. Set `node_key` to `{node_key}`, `evidence_type` to
 `{evidence_type}`, and `context.manifest_path` to `{manifest}`.
 `context.files_read` lists other project instruction files in actual read
-order; do not repeat the manifest there. Record repeated questions and
-verification loops, use null for unavailable model/compaction counters, and
-exclude secrets or broad raw evidence. Append is idempotent for the current
+order; do not repeat the manifest there. Optional telemetry must be truthful;
+leave unavailable counters null. Exclude secrets or broad raw evidence.
+Append is idempotent for the current
 {identity_scope}; on recovery, reuse the returned sequence/hash and continue."""
 
 
@@ -3562,10 +3535,10 @@ rejects any retained implementation writer before dispatch.
     )
     return f"""Resolve the deterministic branch-identity blocker before Implement.
 
-{context_instruction(profile, "delivery", "branch_identity_resolution", "delivery")}{delivery_context_input_section(profile)}Project branch policy: `{profile.branch_identity_policy()}`.
+{context_instruction(profile, "delivery", "branch_identity_resolution", "delivery")}{delivery_context_input(profile)}Project branch policy: `{profile.branch_identity_policy()}`.
 Reported blocker: {{{{.Params.blocker_reason}}}}
 
-Write all user-facing explanation in Russian. Inspect repository and task state
+Inspect repository and task state
 without editing files, renaming branches, deleting refs, pushing, or starting
 implementation. Explain the exact collision or identity ambiguity and the
 smallest safe external action that resolves it.
@@ -3589,53 +3562,16 @@ def checkpoint_instruction(profile: ProjectProfile, stage: str) -> str:
             "the current session."
         ),
         "smoke": (
-            "Record acceptance stages, lock resource/token state, exact "
-            "runtime target, completed build/install/launch work, sanitized "
-            "evidence paths, remaining scenarios, external-side-effect "
-            "ledger, restoration state, and one next permitted action. "
-            "Before any resource operation, run the profile evidence command "
-            "`identity --task {{.TaskShortId}} --workspace <root>`. Verify "
-            "`task_short_id` against the rendered Task, retain `task_id` as "
-            "the native ID and `session_id` as the verified inherited current "
-            "Session UUID. This read-only native binding requires neither Step "
-            "nor retention/R2 admission. Never parse `kent session-id` output "
-            "or invent/export/replace a Session UUID. Set adapter `KENT_TASK_ID` "
-            "to the verified short ID; preserve inherited `KENT_SESSION_ID`. "
-            "Keep top-level checkpoint "
-            "`task_short_id` authoritative and store `task_native_id`, "
-            "`task_short_id`, `lease_owner_id`, `lock_resource`, and "
-            "`lock_token` together in `stage_data`. Enrich missing fields in "
-            "a legacy checkpoint only after native readback matches its "
-            "existing short ID; conflicting fields block. Use the short ID "
-            "for new leases. Retain a legacy native-ID owner only when the "
-            "readback proves the mapping, and use that exact owner ID through "
-            "release. Parse by command: `acquire` emits one bare token; "
-            "`acquire-any` emits exactly `resource=...` then `token=...`. "
-            "Reject missing, empty, duplicate, malformed, extra, or ineligible "
-            "records, then checkpoint the exact resource and token before "
-            "device activity. Read the checkpoint before recovery. For a "
-            "recorded resource and token, call `resume` on that exact pair "
-            "after validating the Task binding; failure blocks without "
-            "discovery fallback. For a known resource with a missing token "
-            "or lost stdout, inspect redacted `status`, prove the exact "
-            "resource has one valid owner record for this Task, then use "
-            "guarded `resume-owned`. If no resource is recorded, inventory "
-            "only project-eligible resources: recover exactly one proven "
-            "same-Task candidate with `resume-owned`, use normal acquisition "
-            "for zero matches, and block on multiple matches. Foreign, "
-            "malformed, duplicate, or resource-mismatched metadata and sole "
-            "occupancy are never ownership proof. Acquisition TTL belongs to "
-            "its caller: `age <= TTL` stays busy, and replacement requires "
-            "`age > TTL`; it is not stored in a lease. Exact-owner `resume` "
-            "or `resume-owned` may refresh a still-present lease after that "
-            "age if replacement has not already won. The first guarded "
-            "operation wins: resume-first refreshes, while replacement-first "
-            "invalidates the old owner/token. `resume-owned` cannot create a "
-            "missing lock or reclaim a foreign or unknown owner. "
-            "After explicit release or trap cleanup, read back `status` for "
-            "that exact resource and require `unlocked`; otherwise cleanup "
-            "is unresolved. Never echo tokens in reports, comments, or "
-            "evidence; `status` must redact them."
+            "Record the authorized acceptance stage, exact runtime target, "
+            "completed actions, sanitized evidence, remaining scenarios, "
+            "external effects, restoration, and next action. The project "
+            "Smoke procedure and resource adapter own lease acquisition, "
+            "native identity binding, recovery and release. Preserve exact "
+            "resource/owner/token state privately in `stage_data` before "
+            "runtime effects; reconcile it before reuse, never infer ownership "
+            "from occupancy or acquire around an unresolved lease. Require "
+            "release readback and retain unresolved ownership as a blocker. "
+            "Never expose tokens in reports or evidence."
         ),
     }[stage]
     return f"""Maintain the ignored `{stage}` checkpoint with
@@ -3652,7 +3588,11 @@ def work_kind_catalog(profile: ProjectProfile) -> str:
     return "\n".join(
         (
             f"- `{key}` — {work_kind.description.rstrip('.')}; "
-            f"Plan: `{work_kind.plan}`; Implement: `{work_kind.implement}`."
+            + (
+                f"Plan: `{work_kind.plan}`; Implement: `{work_kind.implement}`."
+                if work_kind.plan or work_kind.implement
+                else "Use this stage's instructions."
+            )
         )
         for key, work_kind in profile.work_kinds.items()
     )
@@ -3679,15 +3619,17 @@ separate delivery workflow."""
 
 
 def work_kind_implement_instruction(profile: ProjectProfile) -> str:
+    mapping = (
+        "Read the selected key's Implement mapping from `.kent/workflow-profile.toml`."
+        if any(kind.implement for kind in profile.work_kinds.values())
+        else "No product Implement procedure is selected; use this isolated stage contract."
+    )
     instruction = f"""Selected work kind: `{{{{.Params.work_kind}}}}`.
 
-Use the matching Implement procedure from this profile catalog:
-
-{work_kind_catalog(profile)}
-
-The selected key must exist in the catalog and match the authoritative plan. If
-it does not, stop with `needs_user_action`; do not silently reclassify it. Load
-only the mapped Implement procedure. When that file combines planning and
+{mapping}
+The key must exist and match the authoritative plan; otherwise report the
+concrete routing blocker without reclassifying it. Load only that Implement
+procedure, if non-empty. When that file combines planning and
 execution, skip its discovery, planning, audit-launch, and scope-confirmation
 stages: execute exactly one already-approved unchecked plan step."""
     if profile.delivery_reliability_policy() == "v1":
@@ -3699,21 +3641,21 @@ def guard_owned_work_kind_instruction() -> str:
     return """Preserve the selected work kind without reclassifying it.
 Do not emit `work_kind` on `continue_implementation` or `verify`: their
 Plan Contract guard restores it from the accepted snapshot and carries it to
-the next writer. This supersedes any earlier recovery instruction requiring
-that undeclared output. Emit `work_kind` on `needs_user_action` and `replan`,
+the next writer. Emit `work_kind` on `needs_user_action` and `replan`,
 where the transition declares it; preserve all other declared carriers."""
 
 
 def work_kind_recovery_instruction(profile: ProjectProfile) -> str:
+    mapping = (
+        "Use its mapped Implement procedure from `.kent/workflow-profile.toml`."
+        if any(kind.implement for kind in profile.work_kinds.values())
+        else "Use this isolated stage contract, not a product Implement procedure."
+    )
     if profile.delivery_reliability_policy() == "v1":
-        return """Preserve the selected `{{.Params.work_kind}}` routing key. Use its
-mapped Implement procedure from `.kent/workflow-profile.toml`.
-
-""" + guard_owned_work_kind_instruction()
-    return """Preserve the selected `{{.Params.work_kind}}` routing key. Use its
-mapped Implement procedure from `.kent/workflow-profile.toml`; do not
-reclassify the task during recovery. Re-emit `work_kind` on
-`continue_implementation` or another `needs_user_action` transition."""
+        return mapping + "\n\n" + guard_owned_work_kind_instruction()
+    return """Preserve the selected `{{.Params.work_kind}}` routing key. """ + mapping + """ Do not
+reclassify the task during recovery. Emit only the selected graph transition's
+declared fields."""
 
 
 def jira_reference_instruction(profile: ProjectProfile) -> str:
@@ -3733,18 +3675,9 @@ separately. If the root issue depends on unresolved product requirements owned
 by a related issue, report that dependency instead of absorbing it.
 
 Follow related issues only one graph level and within the project procedure's
-research limit. Do not key platform discovery only on the Jira link type: use
-the linked issue summary, labels, components, fix versions, and description to
-identify an iOS, web, backend, or other sibling task.
-
-When a linked sibling task has an existing implementation in a
-project-declared reference repository, inspect that implementation and its
-tests as mandatory bounded product evidence. Record the Jira relationship,
-exact repository commit and paths, plus `checked`, `adopted`, `rejected`, and
-`conflicts` conclusions. The target platform's explicit task decisions,
-current design, and API contracts remain authoritative. If no useful Jira
-relation exists, fall back to a bounded feature fingerprint built from API operations/models,
-screen or flow names, distinctive domain terms, and user-visible copy."""
+research limit. Project procedures own reference-repository discovery and
+evidence recipes; related implementations do not supersede this task's
+explicit decisions, current design or API contracts."""
 
 
 def sentry_reference_instruction(profile: ProjectProfile) -> str:
@@ -3755,17 +3688,12 @@ def sentry_reference_instruction(profile: ProjectProfile) -> str:
 
 When the task source/body explicitly identifies a Sentry issue URL or
 unambiguous numeric Sentry issue ID, use `{profile.adapter("sentry_issues")}` to
-load the normalized issue and bounded latest-event evidence. Persist only the
-exception type/value/mechanism, bounded in-app frames, release/environment,
-first/last seen timestamps, count, status, and seen state; never persist raw
-request, user, breadcrumb, variable, or context payloads.
-
-Write durable Sentry source context into the task's normal planning artifacts
-before changing external state. Then preview and mark that exact issue seen;
-this automatic `mark-seen --allow-mutate` authority exists only for an
-explicitly Sentry-backed task. Do not resolve or mute a Sentry issue in Plan.
-Those outcomes require a later exact approval after a merged fix or an explicit
-no-action decision."""
+load normalized, bounded evidence under its project procedure. Persist only
+sanitized source context in normal planning artifacts; never raw request,
+user, breadcrumb, variable or context payloads. External mutations, including
+mark-seen, require applicable original authority and the adapter's effect
+contract. This generated prompt grants no mutation permission. Do not resolve
+or mute an issue in Plan."""
 
 
 def lifecycle_feasibility_instruction() -> str:
@@ -3925,7 +3853,7 @@ fields. On recovery or any later transition, preserve the exact incoming
     if coder_selection:
         coder_selection_contract = """
 
-For this opt-in v6 workflow, make the conservative complexity decision in the
+For configured complexity selection, make the conservative decision in the
 authoritative plan using exactly one fenced `coder-selection-v1` JSON object.
 Bind `task_short_id` to this Task, use only `simple` or `complex`, and give a
 concise evidence-based rationale. Simple is local work with an understood
@@ -3960,10 +3888,8 @@ Inventory dependency and cross-module impact before implementation. SDK or
 schema upgrades, generated-contract changes, and adaptations in modules outside
 the root issue must be identified as either a required dependency adaptation or
 a separate deferred task. Do not silently widen product behavior to make a
-dependency compile. Preserve generated enum, sealed, identifier, provider,
-status, action, and flow types through domain boundaries; free-form string
-routing requires evidence that no typed source contract exists plus an explicit
-unknown-value strategy.
+dependency compile. Apply project architecture and source-contract standards
+through the declared planning procedure.
 
 Assign every required evidence artifact an owner and a production-edit
 boundary. If the plan requires a pre-edit red run, make it the first
@@ -3977,10 +3903,9 @@ authority. First recover accessible original sources before treating missing
 agent bookkeeping as absent authority; use `needs_user_action` only for a
 remaining real decision or unavailable necessary authority.
 
-Obtain bounded read-only grill critique of the concrete draft before freezing
-the plan and before formal reviews. Plan owns questions/dispositions; grill
-cannot edit, ask the user, spawn children or supply PASS. Missing eligibility
-blocks; simple work needs short critique. Preserve project review gates.
+Use optional bounded read-only critique when it resolves a concrete risk or
+decision. It does not replace independent review or human authority; preserve
+mandatory project review gates.
 Keep exact human sources in the plan or discoverable Task evidence;
 `review_context` is not the sole durable authority carrier. Link human
 acceptance to its exact agent proposal. Recover native evidence before asking
@@ -4036,16 +3961,10 @@ closed selection and its digest binding, then read the plan's original review,
 human-approval, and evidence pointers. A missing, unsafe, mismatched, stale, or
 changed selection blocks edits and returns through Plan revalidation.
 
-Determine the only permitted coder from the snapshot: `simple` means
-`implementation-simple` / `gpt-5.6-luna` / `xhigh` / 372000 context tokens;
-`complex` means `implementation-complex` / `gpt-6.1-sol` / `medium` / 400000
-context tokens. Before any production edit, verify this Session's actual
-effective model, reasoning level, context window, and retained Session identity
-using the supported native `GetSessionExecutionEnvironment` and
-`GetSessionMainView` readbacks. The retained task Session list alone does not
-prove its historical effort or context window. If native settings are
-unavailable, stale, or drifted, stop and report the exact blocker; never
-substitute a model, start a replacement Session, or silently re-lock."""
+Before editing, verify the current Session's effective execution settings and
+identity against the accepted selection and configured role using supported
+native readbacks. If unavailable, stale, or drifted, report the exact blocker;
+never substitute settings, start a replacement Session, or silently re-lock."""
     if first_selected_session:
         selection_contract += """
 
@@ -4073,7 +3992,7 @@ after that action is verified.
     )
     return f"""Implement {{{{.TaskShortId}}}}: {{{{.TaskTitle}}}}
 
-{context_instruction(profile, "implement", "implement", "implementation")}{delivery_context_input_section(profile)}Plan: {{{{.Params.plan_path}}}}. Workspace: {{{{.Params.workspace_path}}}}.
+{context_instruction(profile, "implement", "implement", "implementation")}{delivery_context_input(profile)}Plan: {{{{.Params.plan_path}}}}. Workspace: {{{{.Params.workspace_path}}}}.
 
 {work_kind_implement_instruction(profile)}
 
@@ -4132,7 +4051,7 @@ rewrite the coder role/model.
     return f"""Independently review the proposed plan for
 {{{{.TaskShortId}}}} without editing files.
 
-{context_instruction(profile, "review", "plan_review", "review")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}
+{context_instruction(profile, "review", "plan_review", "review")}{delivery_context_input(profile)}Workspace: {{{{.Params.workspace_path}}}}
 Plan: {{{{.Params.plan_path}}}}
 Work kind: {{{{.Params.work_kind}}}}
 Requested post-review route: {{{{.Params.plan_route}}}}
@@ -4212,7 +4131,7 @@ def plan_revalidation_prompt(
     )
     return f"""Revalidate the authoritative plan for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "plan", "plan_revalidation", "plan")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}
+{context_instruction(profile, "plan", "plan_revalidation", "plan")}{delivery_context_input(profile)}Workspace: {{{{.Params.workspace_path}}}}
 Plan: {{{{.Params.plan_path}}}}
 Work kind: {{{{.Params.work_kind}}}}
 Intended route after acceptance: {{{{.Params.plan_route}}}}
@@ -4236,14 +4155,10 @@ the authoritative plan or discoverable project-permitted report-only evidence,
 not only `review_context`; do not repurpose `plan_route_context`.
 {lifecycle_feasibility_instruction()}
 
-Consult a bounded read-only grill leaf before freeze and formal review only
-when materially revising requirements, API/UX, architecture, authority,
-safety/effects, cost, or evidence strategy, or when execution disproves the
-chosen approach. Hash drift, checkbox progress, typos, operational waiting,
-and repeated identical failures alone do not require another grill call.
-Plan owns questions and dispositions; grill cannot edit, ask the user, spawn
-children, or replace independent review. Report unavailable effective leaf
-eligibility as a concrete blocker rather than claiming critique occurred.
+Optional bounded read-only critique may resolve a concrete decision or risk
+when execution disproves the approach. Routine progress, hash drift, waiting
+and repeated identical failures do not require another critique. Preserve
+mandatory project review gates; critique never substitutes for their receipts.
 When revalidation was triggered by deterministic drift, {snapshot_instruction}
 
 Choose `review_plan` after reconciliation and provide `workspace_path`,
@@ -4312,13 +4227,13 @@ and focused checks."""
 
     return f"""Apply task-scoped fixes for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "implement", "fix", "implementation")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}. Findings:
+{context_instruction(profile, "implement", "fix", "implementation")}{delivery_context_input(profile)}Workspace: {{{{.Params.workspace_path}}}}. Findings:
 {{{{.Params.fix_context}}}}
 
 {procedure_instruction(profile, "fix")}
 {bounded_contract}
 
-{checkpoint}{delivery_context_passthrough_section(profile)}Apply the `fix-worker` role contract only to concrete task-introduced or
+{checkpoint}{delivery_context_tail(profile)}Apply the `fix-worker` role contract only to concrete task-introduced or
 task-worsened findings in `fix_context`. Baseline-wide debt, an unproven
 differential, or contradictory policy is not writer scope.
 An earlier step's budget does not exclude a proven regression inside the full
@@ -4338,7 +4253,7 @@ def workspace_path_fix_prompt(profile: ProjectProfile) -> str:
 
 Verification dispatch rejected the reported workspace:
 {{{{.Params.reported_workspace_path}}}}
-Reason: {{{{.Params.fix_context}}}}{delivery_context_input_section(profile)}Treat Kent's current task execution root as authoritative. Resolve its canonical
+Reason: {{{{.Params.fix_context}}}}{delivery_context_input(profile)}Treat Kent's current task execution root as authoritative. Resolve its canonical
 repository root with `git rev-parse --show-toplevel`, or canonical current
 directory for an intentional non-Git workspace. Do not move the worktree,
 change task artifacts, or edit code.
@@ -4376,7 +4291,11 @@ Workspace: {{{{.Params.workspace_path}}}}
 Review context: {{{{.Params.review_context}}}}
 
 Apply the `spec-reviewer` role contract to the supplied task authority,
-acceptance evidence, and task delta. Do not edit files. Findings are data for
+acceptance evidence, and task delta for the current authorized stage. Retain
+later unverified obligations with an owner and due milestone; do not require
+them early or declare them satisfied. A review-ready PR is not full business
+acceptance, merge/release authority, or Task Done. This distinction applies
+even without Compliance or PR nodes. Do not edit files. Findings are data for
 Join, not a routing decision.
 
 Complete only with `reported`. Provide `spec_status` as exactly `passed`,
@@ -4423,23 +4342,30 @@ Verification report: {{{{.Params.verification_report}}}}
 {spec}
 
 Apply the `workflow-gate` role contract. Choose a delivery transition only when
-every enabled status is `passed`. Do not poll or classify PR CI here; delivery
-owns CI after PR preparation. Keep full reports in `review_context` and make
-user-facing commentary name only a real decision or external action.
+every enabled status is `passed` for the current authorized stage. Retain
+downstream unverified obligations with an owner and due milestone, including
+on paths without Compliance or PR. Do not relabel a previous `blocked` report:
+changed authority requires a fresh review by its owner. A review-ready PR
+does not establish full business acceptance, merge/release authority, or Task
+Done. Do not poll or classify PR CI here; delivery owns CI after preparation.
 
 For `needs_changes`, emit the deduplicated, dependency-ordered repair bundle
 required by the `workflow-gate` role contract.
 
-Provide `workspace_path`, a refreshed `review_context` summarizing all reports,
-{delivery_context_handoff}and the required Smoke decision fields. The refreshed `review_context` must
-record the profile Smoke policy, selected transition, rationale, and required
-scope or concrete evidence for bypassing Smoke.
+Preserve the project-owned `review_context` envelope and its qualified update
+route. Where allowed, synthesize bounded results and durable report references;
+do not impose Markdown, copy full reports, or rewrite opaque producer packets.
+Provide `workspace_path`, the resulting `review_context`, and required Smoke
+decision fields, retaining policy, rationale, scope and downstream obligations.
+{delivery_context_handoff}
 
 {smoke_decision}
 
 Choose `needs_changes` for task-scoped failures and provide `workspace_path`
-plus `fix_context`. Choose `needs_user_action` for external or contradictory
-blockers and provide `workspace_path`, `review_context`, and `blocker_reason`;
+plus `fix_context`. Technical failures belong to an existing capable recovery
+owner, not automatically product Fix or a user question. Choose
+`needs_user_action` only for an actual external action or decision and provide
+`workspace_path`, `review_context`, and `blocker_reason`;
 after approval every verification branch reruns. Choose `wont_do` only for an
 explicit cancellation decision and provide `closure_reason`."""
 
@@ -4448,14 +4374,14 @@ def smoke_prompt(profile: ProjectProfile) -> str:
     checkpoint = checkpoint_instruction(profile, "smoke")
     return f"""Run focused smoke testing for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "smoke", "smoke", "smoke")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}. Review context:
+{context_instruction(profile, "smoke", "smoke", "smoke")}{delivery_context_input(profile)}Workspace: {{{{.Params.workspace_path}}}}. Review context:
 {{{{.Params.review_context}}}}
 Smoke rationale: {{{{.Params.smoke_rationale}}}}
 Required scope: {{{{.Params.smoke_scope}}}}
 
 {procedure_instruction(profile, "smoke")}
 
-{checkpoint}{delivery_context_passthrough_section(profile)}Follow the project-specific browser, device, simulator, hardware, resource-lock,
+{checkpoint}Follow the project-specific browser, device, simulator, hardware, resource-lock,
 build, deploy, install, launch, account, and isolation rules that apply. Do not
 edit production files; route implementation findings to the single writer.
 Complete with `passed` and provide `workspace_path` plus an updated
@@ -4474,7 +4400,7 @@ def compliance_prompt(profile: ProjectProfile) -> str:
     evidence_chain = ", ".join(completed_reviews)
     return f"""Run the final read-only delivery compliance review for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "review", "compliance", "review")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}. Final review context:
+{context_instruction(profile, "review", "compliance", "review")}{delivery_context_input(profile)}Workspace: {{{{.Params.workspace_path}}}}. Final review context:
 {{{{.Params.review_context}}}}
 
 {procedure_instruction(profile, "compliance")}
@@ -4483,6 +4409,11 @@ Apply the `compliance_reviewer` role contract as a thin final attestation, not
 another broad review. Verify the final diff, authority hierarchy,
 {evidence_chain}, Gate, and any required Smoke or documented bypass. Do not
 edit files or perform state-changing actions.
+Assess the current authorized stage, preserving later unverified obligations
+with an owner and due milestone in the project-owned review carrier. A
+review-ready PR does not establish full business acceptance, merge/release
+authority, or Task Done. Changed authority requires fresh owner review, not
+relabeling a previous blocked report.
 
 Choose `ship_pr` only when the final work product is compliant. Provide
 `workspace_path`, a complete `review_context`, and `compliance_report`. Choose
@@ -4503,7 +4434,7 @@ external decisions and provide `workspace_path`, `review_context`, and
 def compliance_recovery_prompt(profile: ProjectProfile) -> str:
     return f"""Resume the final read-only delivery compliance review.
 
-{context_instruction(profile, "review", "compliance", "review")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}
+{context_instruction(profile, "review", "compliance", "review")}{delivery_context_input(profile)}Workspace: {{{{.Params.workspace_path}}}}
 Final review context: {{{{.Params.review_context}}}}
 Previous blocker: {{{{.Params.blocker_reason}}}}
 
@@ -4526,7 +4457,7 @@ only for explicit cancellation and provide `closure_reason`.{delivery_context_ta
 def evidence_repair_prompt(profile: ProjectProfile) -> str:
     return f"""Repair packaging-only workflow evidence for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "implement", "evidence_repair", "implementation")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}. Final review context:
+{context_instruction(profile, "implement", "evidence_repair", "implementation")}{delivery_context_input(profile)}Workspace: {{{{.Params.workspace_path}}}}. Final review context:
 {{{{.Params.review_context}}}}
 Allowed evidence repair:
 {{{{.Params.evidence_context}}}}
@@ -4561,7 +4492,7 @@ recovery. Choose `wont_do` only for explicit cancellation and provide
 def compliance_recheck_prompt(profile: ProjectProfile) -> str:
     return f"""Recheck final Compliance after packaging-only evidence repair.
 
-{context_instruction(profile, "review", "compliance", "review")}{delivery_context_input_section(profile)}Workspace: {{{{.Params.workspace_path}}}}
+{context_instruction(profile, "review", "compliance", "review")}{delivery_context_input(profile)}Workspace: {{{{.Params.workspace_path}}}}
 Updated review context: {{{{.Params.review_context}}}}
 
 {procedure_instruction(profile, "compliance")}
@@ -4611,30 +4542,15 @@ If no PR exists, keep `phase=pre_pr` with no PR or CI fields. After observing a
 PR, use `phase=post_pr` with its actual URL, current branch, resolved merge
 strategy, and feedback cursor. Include `ci_contract` or `ci_report` only when
 that exact packet has actually been produced; preserve each nested packet
-string byte-for-byte. Never invent earlier CI state. For the
-`prepare_pr_monitor_ci`
-handoff to source-contract CI, provide only `workspace_path`,
-`task_short_id={{.TaskShortId}}`, and this post-PR `delivery_context`."""
+string byte-for-byte. Never invent earlier CI state."""
     if source_ci:
-        monitor_handoff_contract = """Complete `prepare_pr_monitor_ci` with only
-`workspace_path`, `task_short_id={{.TaskShortId}}`, and the updated
-`delivery_context`; PR identity and CI packets belong only in that packet."""
+        monitor_handoff_contract = """For source-contract CI handoff, PR identity
+and CI packets belong only in `delivery_context`. Use exactly the selected
+graph transition's declared fields."""
     else:
-        flat_monitor_parameters = [
-            "workspace_path",
-            "pr_url",
-            "branch_name",
-            "merge_strategy",
-        ]
-        if _delivery_context_enabled(profile):
-            flat_monitor_parameters.append("pr_feedback_cursor")
-        if profile.capability("ci_monitoring"):
-            flat_monitor_parameters.append("ci_contract")
-        monitor_handoff_contract = (
-            "Flat prepare_pr_monitor_ci: "
-            + ", ".join(flat_monitor_parameters)
-            + "."
-        )
+        monitor_handoff_contract = """Return observed PR identity using the flat
+fields declared by the selected outgoing graph transition. Do not replace
+those fields with a packet-only CI handoff."""
     delivery_context_block = (
         "\n\n" + delivery_context_contract + "\n\n"
         if _delivery_context_enabled(profile)
@@ -4694,11 +4610,10 @@ through that ambiguity.
 If no PR is genuinely
 applicable, choose `no_pr` and provide `pr_report`; this path requires
 approval. Use `needs_changes` with `workspace_path` and `blocker_reason` for
-recoverable PR/branch issues; this path also requires approval. Use
+already-authorized task-scoped PR/branch correction. New scope or effects need
+their applicable authority. Use
 `needs_user_action` with `blocker_reason` for external blockers.
 
-Prepare PR preserves supplied same-PR cursor; initialize only for a new PR.
-delivery preserves supplied cursors and never synthesizes materialized cursors.
 Only the deterministic PR watcher resets invalid cursors to `uninitialized`
 with `pull_request_feedback_invalid`."""
 
@@ -4760,7 +4675,7 @@ or a proven task-scoped fix/external blocker is allowed."""
     )
     return f"""Monitor CI for {{{{.TaskShortId}}}} without editing files.
 
-{context_instruction(profile, "delivery", "ci_monitor", "delivery")}{delivery_context_pack_section(profile)}PR: {{{{.Params.pr_url}}}}
+{context_instruction(profile, "delivery", "ci_monitor", "delivery")}{delivery_context_pack_instruction(profile)}PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
@@ -4859,7 +4774,7 @@ re-entry."""
     )
     return f"""Check delivery state for {{{{.TaskShortId}}}}.
 
-{context_instruction(profile, "delivery", "waiting_pr", "delivery")}{delivery_context_pack_section(profile)}PR: {{{{.Params.pr_url}}}}
+{context_instruction(profile, "delivery", "waiting_pr", "delivery")}{delivery_context_pack_instruction(profile)}PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
@@ -4892,8 +4807,8 @@ contract.
 Use `needs_user_action` only for authentication/access failure, ambiguous or
 contradictory merge policy, or another actual human decision.
 Merely waiting for review or merge is not a blocker. Use
-`needs_changes` with `workspace_path`, `merge_strategy`, and `pr_report` when
-task code or history must change. Choose `close_without_merge` only when the
+`needs_changes` with exactly its graph-declared fields when task code or
+history must change. Choose `close_without_merge` only when the
 latest user comment explicitly approves closing or canceling this PR; provide
 `workspace_path`, `pr_report`, and `closure_reason`.{delivery_fix_handoff}"""
 
@@ -4936,34 +4851,14 @@ def managed_cleanup_coordination_instruction(
 ) -> str:
     if not profile.capability("managed_worktrees"):
         return ""
-    return """For managed worktree Cleanup and Janitor recovery, follow the
-bounded cross-Session cleanup coordination protocol in
-`contracts/worktree-contract.md` before terminal preparation, retry, or leave.
-Before contact, freeze `task_short_id`, project, exact `workspace_path`, branch,
-owner, and attempt in the cleanup Task record. Close only safe children proven
-to belong to this Task; a parent move or old PID exit does not prove release.
-For a verified active owner, use `kent run steer <owner-session-id>` once and
-require a fresh acknowledgement for the exact current request in a new
-owner-attributed Task comment naming the root, released child identities, and
-runtime disposition. Read bounded comments with
-`kent task comment list <task> --project <project> --limit <n> --offset <n>`;
-`run watch/wait`, Questions, and approvals are not acknowledgements.
-An incomplete page or readback is an evidence gap, not proof that the owner is
-unavailable. If a materially new blocker appears, raise it to the owner once
-within this same attempt and only if the deadline permits; never reset the
-deadline.
-
-Use one single monotonic 60-second deadline for the entire attempt, at most two
-bounded Task-comment observations, and no more than 30 seconds between them.
-Bound each observer to the remaining time; stop only the task-owned observer,
-never stop or signal another Session. After acknowledgement, freshly recheck
-before terminal preparation and immediately before leave/handoff. New owner
-re-entry, a retained child, or changed runtime/evidence invalidates the prior
-all-clear. Reuse the recorded attempt and Question on an identical retry; never
-ask the user to finish safe task-owned cleanup. On refusal, timeout, an
-unavailable owner, unknown ownership, incomplete evidence, or unsupported
-action, preserve the root and use the existing blocker route. Acknowledgement
-and last-read evidence are not an atomic reservation or a race-free guarantee."""
+    return """Before terminal preparation, retry or leave, follow the project
+Cleanup procedure and the bounded ownership/coordination contract in
+`contracts/worktree-contract.md`, retaining applicable attempt limits.
+Freeze the exact task root, branch, owner and resource disposition. Close only
+safe children proven task-owned; never stop or signal another Session.
+Require fresh owner acknowledgement and readback, not Task movement, old PID
+exit or occupancy as release proof. Recheck before handoff; stale or incomplete
+proof preserves the root and uses the existing recovery route."""
 
 
 def cleanup_prompt(
@@ -5150,75 +5045,13 @@ context and provide `blocker_reason`."""
 
 
 def published_cleanup_prompt(profile: ProjectProfile) -> str:
-    if not profile.capability("managed_worktrees"):
-        return f"""Perform conservative cleanup for {{{{.TaskShortId}}}} only
-after successful package publication.
+    return cleanup_prompt(profile, merged=True) + """
 
-{context_instruction(profile, "delivery", "cleanup", "delivery")}
-
-Workspace: {{{{.Params.workspace_path}}}}
-PR: {{{{.Params.pr_url}}}}
-Branch: {{{{.Params.branch_name}}}}
-Merge proof: {{{{.Params.merge_report}}}}
-Publication proof: {{{{.Params.publication_report}}}}
-
-{procedure_instruction(profile, "cleanup")}
-
-{cleanup_result_instruction()}
-
-Require a non-empty publication report proving the exact task-authorized
-package version exists in the remote registry. Do not publish, tag, push, or
-edit project files from Cleanup. Treat cleanup as report-first and preserve
-dirty, primary, ambiguous, or unrecoverable state.
-
-Complete with `done` and provide a non-empty `cleanup_report`. Use
-`needs_user_action` with `blocker_reason` only when safe cleanup requires a
-human decision."""
-
-    coordination = managed_cleanup_coordination_instruction(profile)
-    return f"""Perform conservative cleanup for {{{{.TaskShortId}}}} only after
-successful package publication.
-
-{context_instruction(profile, "delivery", "cleanup", "delivery")}
-
-Workspace: {{{{.Params.workspace_path}}}}
-PR: {{{{.Params.pr_url}}}}
-Branch: {{{{.Params.branch_name}}}}
-Merge proof: {{{{.Params.merge_report}}}}
-Publication proof: {{{{.Params.publication_report}}}}
-
-{procedure_instruction(profile, "cleanup")}
-
-{cleanup_result_instruction()}
-
-{coordination}
-
-Require a non-empty publication report proving the exact task-authorized
-package version exists in the remote registry. Do not publish, tag, push, or
-edit project files from Cleanup.
-
-Treat cleanup as report-first. Never delete the primary checkout, dirty or
-ambiguous state, or content not proven recoverable. Do not remove the managed
-worktree or local branch inside this agent session. The deterministic Task
-Janitor runs only after this resource-owning Cleanup session exits.
-
-Before leaving, retain the exact supplied `workspace_path` and `branch_name`.
-If a branch lookup is needed, use
-`git -C <workspace_path> branch --show-current`; do not resolve it from the
-post-leave working directory. Include both exact values in `cleanup_report`
-and preserve them for Janitor recovery.
-
-Close every task-owned background shell or kept-open tool session and run
-`kent worktree leave` from this Cleanup session before `run_janitor`. The
-Janitor must observe this session outside the task worktree before deletion.
-
-Complete with `run_janitor` and provide canonical `workspace_path`;
-`task_short_id` as `{{{{.TaskShortId}}}}`; `pr_url`; `branch_name`;
-`merge_report` including the publication proof; `cleanup_mode` as `merged`;
-`cleanup_session_id` from `KENT_SESSION_ID`; and a non-empty `cleanup_report`
-including the exact `workspace_path` and `branch_name`.
-Use `needs_user_action` only when conservative preservation requires a human
-decision."""
+Publication proof: {{.Params.publication_report}}
+Cleanup is allowed only after a non-empty publication report proves that the
+exact task-authorized package version exists remotely. Retain that proof in
+the cleanup report and, for Janitor, the merged report. Do not publish, tag,
+push, or edit project files from Cleanup."""
 
 
 def janitor_recovery_prompt(profile: ProjectProfile) -> str:
@@ -5253,7 +5086,7 @@ def pr_recovery_fix_prompt(
     *,
     bounded: bool = False,
 ) -> str:
-    delivery_input = delivery_context_line_section(profile)
+    delivery_input = delivery_context_input(profile)
     delivery_continuity = delivery_context_tail(profile)
     fresh_contract = ""
     completion_contract = """After resolving task-scoped code, complete with
@@ -5271,7 +5104,7 @@ containing only the remaining task-scoped issues. Choose `verify` only when no
 recovery slice remains, and provide `workspace_path`, the same
 `task_short_id`, plus refreshed `review_context`."""
 
-    return f"""Resolve an approved PR or branch recovery issue.
+    return f"""Resolve an already-authorized task-scoped PR or branch recovery issue.
 
 {context_instruction(profile, "implement", "fix", "implementation")}
 
@@ -5280,8 +5113,9 @@ Workspace: {{{{.Params.workspace_path}}}}.{delivery_input}Recovery issue: {{{{.P
 {procedure_instruction(profile, "fix")}
 {fresh_contract}
 
-The approval applies only to the exact reported PR/branch recovery. Never infer
-permission for a broader rebase or force-push. {completion_contract}
+Existing authority covers only the reported task-scoped PR/branch correction.
+Never infer new scope, push rights, a broader rebase, or force-push permission.
+{completion_contract}
 Use `needs_user_action` with `blocker_reason` if the approved recovery is still
 unsafe. Choose `wont_do` only for an explicit cancellation decision and
 provide `closure_reason`.{delivery_continuity}"""
@@ -5293,13 +5127,8 @@ def pr_feedback_fix_prompt(
     bounded: bool = False,
 ) -> str:
     context_enabled = _delivery_context_enabled(profile)
-    delivery_input = delivery_context_line_section(profile)
+    delivery_input = delivery_context_input(profile)
     delivery_continuity = delivery_context_tail(profile)
-    cursor = (
-        "\nValidated PR feedback cursor: {{.Params.pr_feedback_cursor}}\n"
-        if profile.runtime_contracts_v2() and not context_enabled
-        else ""
-    )
     pr_identity = (
         """The PR URL, branch, merge strategy, and feedback cursor are in the
 lifecycle packet above; preserve and use those exact values.
@@ -5330,7 +5159,6 @@ conflict.
 {context_instruction(profile, "implement", "fix", "implementation")}
 
 Workspace: {{{{.Params.workspace_path}}}}.{delivery_input}{pr_identity}
-{cursor}
 
 {procedure_instruction(profile, "fix")}
 {fresh_contract}

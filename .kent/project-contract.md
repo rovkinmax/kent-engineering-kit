@@ -2,211 +2,104 @@
 
 ## Authority and source
 
-`AGENTS.md` owns governance and safety. The task body, source and exact
-human-authored comment IDs define scope. A plan may supersede them only by
-citing explicit authority; an agent summary never supplies that authority.
-Keep one authoritative preview/plan and reference it from review evidence.
-Preview the file set, graph delta, rollout, rollback and restart impact.
-Two independent read-only reviews of the same preview hash must PASS before
-human approval. `.kent/commands/plan.md` owns this ordering and revalidation.
+`AGENTS.md` owns governance and safety. The task and verified original human
+decisions define scope. Use one authoritative preview/plan, two independent
+same-hash PASS reviews and explicit human approval for Kit changes.
+`.kent/commands/plan.md` owns that sequence; `.kent/workflow-profile.toml`
+maps work kinds, roles, procedures and commands.
 
-Kent owns lifecycle, execution root and resolved commit. Preserve `fixed_point`
-as the immutable task-delta baseline, separate from the moving PR target.
-Target-only commits are integration inputs, not task regressions without
-merge/replay evidence. Material scope expansion returns to reviewed planning;
-task-scoped fixes do not restart governance. Missing agent bookkeeping is not
-a user decision: reconstruct it only when bounded, otherwise disclose the
-gap and use available evidence. Ask only for real decisions or external acts.
+Kent owns lifecycle and execution identity. Preserve task `fixed_point` as
+the immutable delta baseline, distinct from a moving integration target.
+Target-only changes are not Task regressions without merge/replay evidence.
+Task-scoped repairs stay within approved boundaries; new scope/effects return
+to reviewed approval. Recover agent bookkeeping without inventing consent.
 
-## Project interfaces
+## Current workflow
 
-`.kent/workflow-profile.toml` maps work kinds, procedures and commands.
-`.kent/workflows/kit_development.py` preserves the historical v5 source spec
-and complexity-selected v6 candidate. The delivery reliability v1 builder writes
-`.kent/workflows/kit-engineering-delivery.current.spec.json` from the selected
-profile; it adds only `implement_replan` to retained Plan Revalidation.
-Historical snapshots are not rewritten for adoption. The current graph has
-21 nodes, 53 transition groups and 54 edges with coder selection disabled;
-complexity selection has 21 nodes, 55 groups and 56 edges.
-An approved same-UUID update still requires exact compatibility evidence;
-source generation does not authorize activation. General eligibility follows
-[Execution-history and compatibility policy](../contracts/workflow-contract.md#execution-history-and-compatibility-policy);
-source edits do not mutate live workflows or authorize broader driver admission.
-Historical v5 has 21 nodes, 52 transition groups and 53 edges; historical v6
-has 21 nodes, 54 transition groups and 55 edges.
-Both preserve continuous writer sessions and task branch identity. Plan's
-callable read-only leaf and the separate Plan Review node provide the two
-preview reviews. Only `plan_review_accept` adds the human approval
-specialization.
-Fix can return a substantive accepted-plan discrepancy to retained Plan
-Revalidation before production edits. This does not authorize scope expansion
-or replace either preview review or the human approval gate.
+`.kent/workflows/kit_development.py` builds one current source graph at
+`.kent/workflows/kit-engineering-delivery.current.spec.json`. The profile
+selects optional complexity routing; continuous writers, task branch identity,
+delivery reliability and the complete command closure remain required.
+Default rendering is read-only JSON. `--check`/`--check-current` verify current
+snapshot and generated parity; `--write-spec`/`--write-current-spec` write
+only that source snapshot. `--bootstrap` explicitly materializes helpers.
+
+Plan's callable leaf and the separate Plan Review node provide independent
+preview reviews. Only `plan_review_accept` adds the project approval boundary.
+Implement/Fix discrepancies return to retained Plan Revalidation without
+granting expanded scope. Current task-scoped PR correction needs no extra
+approval; new scope/risk/effects still do.
 
 Deterministic verification and independent Standards review run read-only
-through dispatch/Join/Gate. There is no CI preparation/watch/monitor stage,
-Smoke, publication or final Compliance layer. Existing repository checks
-remain unchanged. Use only existing configured roles and profile commands;
-do not add a hook, role, shared engine or alternate lifecycle.
+through dispatch/Join/Gate. There is no CI monitoring, Smoke, publication
+or final Compliance stage. Reviews assess current-stage obligations; retain
+later acceptance work with its responsible owner and milestone. Gate does
+not relabel old BLOCKED evidence after authority changes. Review-ready
+delivery is not final business acceptance, merge, release or Task Done.
 
-Generated checkpoint, plan-contract and dispatch commands use the existing
-schema-3 synchronizer. The builder explicitly materializes byte-identical
-evidence-ledger, verify-report, wait-github-pr, task-janitor,
-`workflow_runtime_contracts.py`, and the shared
-`workflow_github_observation.py` sibling from checkout-local authoritative
-sources. These six are not schema-3 synchronizer outputs or runtime-v2
-adoption.
-`prepare_cleanup` is the project-owned `.kent/scripts/workflow-prepare-cleanup`
-command, not a generated template or new node. Cleanup uses it to retain the
-known accepted-plan snapshot and prepare the existing terminal evidence seal.
-Its effect boundary and input contract are in `.kent/commands/cleanup-task.md`.
-Explicit bootstrap materializes generated commands and the sibling module
-as regular mode-0755 files. Git preserves executable identity (mode 100755),
-not exact group/other permission bits: a private checkout may validly use
-0700. Checked-out commands must remain regular, owner-executable and free
-of group/other write or special permission bits, with byte parity and no
-symlinks. Do not chmod a fresh task checkout merely to reproduce 0755.
-Do not edit generated copies; unknown, symlink or modified targets must block
-materialization until their update has bounded source authority.
+Generated commands come from checkout-local authoritative templates/modules.
+The builder preflights the entire closed copy set before materialization.
+Do not patch generated copies or overwrite modified, symlink or unknown
+targets. Explicit bootstrap creates regular mode-0755 files; Git checkouts
+may use private 0700. Require owner execute, byte parity and no group/other
+write or special permission bits. `prepare_cleanup` and `compile_verify`
+are project-owned commands, not generated copies.
+
+Source generation does not authorize activation or change a live Workflow.
+Same-UUID adoption requires the shared
+[compatibility contract](../contracts/workflow-update-compatibility.md).
+The published renderer accepts only qualified `VerifiedSourceAdmission`.
 
 ## Verification and evidence
 
-The configured verifier runs checkout-local `./scripts/validate` with an
-existing Python 3.11+. Writer and Fix procedures run affected tests and
-focused production-shaped checks; they do not duplicate the verifier's one
-fresh full source run after writer bookkeeping. Never use `--installed-state`,
-install dependencies/interpreters, or change global PATH for this flow. The
-profile's compile verifier returns only
-`{"transition":"passed"}`, `{"transition":"failed"}` or
-`{"transition":"blocked"}` on stdout, with logs on stderr.
-Runtime checkpoints/evidence belong under ignored `.kent/runtime/`; verifier
-outputs and private temporary directories use ignored `build/kent-workflow/`.
-Legacy `.todo` plans remain tracked. R2 tasks use the profile's external
-project-memory binding and immutable plan revisions. Publish progress through
-the helper with an exact expected revision; do not edit revision files, create
-a `.todo` fallback, or migrate old Tasks implicitly. The external accepted
-snapshot owns acceptance; the local runtime cache is only a validated locator.
-Knowledge is context, not scope authority. Resolve mode and original decision
-references as described in the Kit skill's `references/durable-context.md`.
+Writers/Fix run affected tests and focused production-shaped wrapper/helper
+checks. The configured verifier owns one fresh full checkout-local
+`./scripts/validate` run after writer bookkeeping, with an existing Python
+3.11+. No `--installed-state`, dependency installation or global PATH changes.
+Compile stdout contains only `{"transition":"passed"}`, `failed` or `blocked`
+in that same object shape; logs go to stderr.
 
-## Source verification ownership and identity
+The compile child emits two stderr-only `KENT_VERIFICATION_IDENTITY` records.
+The closed `kit-verification-identity-v1` contains `schema`, `source_sha256`,
+`environment_sha256`, `head`, `workspace_path`. Source identity includes
+workspace/HEAD, tracked bytes/modes/deletions, nonignored untracked source,
+in-root symlink targets and actual plan/procedure/helper/validator inputs;
+Git administration and ignored outputs are excluded. Environment identity
+includes OS/architecture, resolved Python/tool bytes and versions, and hashed
+effective environment. A validated private TMPDIR uses its stable containment
+contract, not the random basename.
 
-The existing configured verifier is the sole owner of a fresh complete
-`./scripts/validate` run for an unchanged source slice. Its report and
-content-addressed log are carried forward through existing verification and
-delivery carriers. Targeted tests and production-shaped wrapper/helper
-fixtures are earlier bounded checks, not substitutes for that verifier.
+The read-only identity reader is bounded to 20,000 entries/256 MiB. Missing
+HEAD, unsafe symlinks, unstable inputs, environment drift or tampered report
+identity invalidate a pass; validator failure stays failed. This cooperative
+freshness check is not native authentication or permission isolation.
+Uncertainty requires fresh verification, not cache reuse or skipped checks.
+Carry the complete typed report/log and matching identity references through
+existing required carriers; optional narratives reference those artifacts.
 
-The compile child emits two stderr-only
-`KENT_VERIFICATION_IDENTITY` lines around validation. Each line contains the
-closed `kit-verification-identity-v1` object with exactly
-`schema`, `source_sha256`, `environment_sha256`, `head`, and
-`workspace_path`. The source digest covers the canonical workspace, HEAD,
-tracked working bytes/modes/deletions, nonignored untracked source bytes,
-in-root symlink targets, accepted plan/procedure inputs, and the actual
-child, wrapper, runtime, identity-reader and validator bytes. Git
-administrative data and generated ignored outputs are excluded; ignored
-external inputs and dependencies remain outside this cooperative freshness
-check.
+Runtime checkpoints/evidence use ignored `.kent/runtime/`; verifier/private
+temporary outputs use ignored `build/kent-workflow/`. Resolve task-fixed
+legacy/R2 mode via project memory. R2 accepted state is external; use protected
+compare-and-swap progress updates and never edit immutable revisions or create
+a `.todo` fallback. Preserve legacy task paths.
 
-The environment digest records OS/architecture, the resolved selected Python
-version and executable bytes, validator-tool paths/versions/executable
-digests, and hashed effective environment values. It includes the replacement
-environment contract used by the report wrapper. A contained private
-`TMPDIR` is represented by its stable private-directory contract rather than
-the invocation-specific random basename; external or unvalidated paths do
-not become a reuse guarantee.
+Evidence is append-only. Use genuine current Session/Step identities and
+truthful checks/context; optional telemetry need not be invented. Historical
+schema-1 proof retains its original bytes/identity. Conflicting or fabricated
+proof blocks; do not reconstruct or reseal it. Current Step is inherited,
+not independently authenticated. The configured Cleanup helper exclusively
+owns the final ordinary append/seal and retained preparation; follow
+`.kent/commands/cleanup-task.md`, including no standalone blocker append.
 
-The identity reader is bounded and read-only: at most 20,000 source entries
-and 256 MiB of source bytes, with chunked reads. Missing/unborn HEAD,
-unsupported or external source symlinks, unreadable or unstable inputs,
-tool/environment drift, missing or tampered report identity, and source
-mutation between the two lines invalidate a passing result. A validator
-failure remains failed; identity uncertainty never becomes success. This is
-a cooperative freshness check, not native identity authentication or
-permission isolation, and uncertainty requires a fresh verifier run.
+## Effects and report-only work
 
-Evidence retains the complete typed report/log where the workflow contract
-requires it, including Gate `review_context` and terminal retention.
-Optional writer, PR and approval narratives reference the one accepted
-preview and verifier artifacts instead of copying their complete contents.
+Use the standard managed task worktree. Preserve installed primary, main,
+index, symlinks, global configuration and all consumer pins/workflows.
+README preflight owns source refresh; native default-branch selection is
+local source selection, not a remote fetch. Source authority grants no commit,
+push, merge, install, live workflow or consumer effect.
 
-Read the active context manifest first. Before each Agent transition append
-the required non-empty evidence event through the profile command, recording
-checks, artifacts, decisions and exact instruction files read. Evidence is
-append-only; do not rewrite prior slices or invent unavailable telemetry.
-Generated transition prompts own parameter carriers and completion keys.
-For terminal Cleanup, the preparation helper owns the final ordinary event
-and invokes the existing append/seal commands. Do not duplicate that append
-or append after seal, including after leaving the source worktree.
-The configured `prepare_cleanup` opts Cleanup and its recovery into this
-single-owner contract. Do not append standalone evidence before the helper
-or merely to report a blocker; retain those observations in Task records.
-Use real current unmodified Kent Session/Step UUIDs for new schema-2 evidence;
-ignore stale Run environment values and preserve historical schema-1 identities.
-Never generate,
-export or replace them to defeat deduplication. Preserve and block on
-conflicting/fabricated evidence, without reconstructing or resealing history.
-This behavioral prohibition does not provide native identity authentication:
-qualification must verify the final event's Session/Task native binding.
-Current Step comes from the inherited Kent environment, not independently
-authenticated native readback; do not claim otherwise. Historical schema-1
-proof keeps its original Session/Run/Step contract and bytes.
-
-## Source versus installed state
-
-Development uses one standard Kent-managed task worktree. Preserve the
-installed primary, its index, local main, symlinks, global configuration and
-every consumer pin/workflow during source development.
-README's explicit fetch/preflight precedes Task start: `default-branch`
-resolves local `origin/HEAD` and does not fetch. Within this self-development
-flow, after merged delivery refresh tracking only; never checkout/fast-forward
-installed main.
-
-A bounded complete package may receive one explicit human approval after two
-independent read-only reviews PASS on the same complete preview. Separately
-enumerate source changes, Git delivery and adoption effects; bind repository,
-source boundary, target branch and primary root, capable authorized owners,
-prerequisite evidence, recovery boundary and requested endpoint. Source-only
-approval grants no delivery or adoption authority. Future commit and PR
-identities must derive from the approved work and be verified before effects;
-they are not wildcard authority.
-
-A separately authorized adoption operation outside this flow may merge an
-explicitly approved PR and fast-forward the installed primary. Before effects,
-verify the exact repository/branch, clean checkout, actual installed revision,
-merge-linked target and complete activation range. Record observed and target
-revisions in that operation's evidence, not as a current-state pin in this
-standing contract. Stop on dirty or divergent state or unapproved activation
-drift; do not reset, force checkout or push directly to main. Configuration,
-symlink, consumer rollout and restart effects each require explicit inclusion
-in the approved scope; merge or fast-forward permission alone grants none.
-This separate operation does not relax Workflow gates or automatically
-authorize installed adoption.
-Its explicit authority may come from that complete-package approval; a new
-approval dialog is not required merely because the stage changes. Adoption
-remains outside the source Workflow and requires a capable authorized owner.
-Combined approval does not waive role prohibitions or grant merge/adoption
-to source Workflow nodes. Reconcile unknown remote outcomes before retrying.
-
-No live device/login actions, consumer-app implementation or rollout,
-installed-state adoption or restart is automatically authorized by this
-flow. Source-only investigation and deterministic tests of Kit adapters and
-prompts remain valid within explicit task scope, including device-resource
-and login-guidance tooling. Live workflow changes and Git delivery require
-their own explicit effect authority; source approval alone grants neither.
-This flow never merges a PR or pushes directly to main.
-
-## Report-only qualification
-
-Only explicit task authority may select report-only/no-repair qualification.
-It may use `plan_path=not-applicable`; do not manufacture a tracked plan.
-Keep the preview, exact hash, both reviews and approval in retained task
-records or ignored `build/kent-workflow/<task>/`, not arbitrary restricted
-runtime files. Implement and Fix perform no tracked or staged writes; report
-candidate defects for separately authorized repair.
-
-Use the existing `report_only` disposition and `no_pr` cleanup mode only
-under that authority and when exact HEAD equals a current published branch
-tip. Reachability from a remote ancestor is insufficient. Keep the bootstrap
-source branch published through qualification. Cleanup uses the existing
-post-session Janitor; `.kent/commands/cleanup-task.md` owns the procedure.
+Explicit report-only/no-repair authority permits `plan_path=not-applicable`
+and no tracked/staged writes. Retain evidence in Task records or ignored build
+outputs. `report_only`/`no_pr` cleanup additionally requires exact HEAD equal
+to a current published branch tip; preserve its bootstrap source branch.

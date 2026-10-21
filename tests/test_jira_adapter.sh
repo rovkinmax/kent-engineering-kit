@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 adapter="$repo_root/templates/project/jira-api.sh"
 real_jq="$(command -v jq)"
+real_path="$PATH"
 tmp="$(mktemp -d)"
 trap 'rm -r "$tmp"' EXIT
 
@@ -30,6 +31,31 @@ for ((index = 1; index <= $#; index++)); do
     break
   fi
 done
+case "$method:$url" in
+  GET:*|POST:*/rest/api/3/search/jql)
+    expected_retry=2
+    ;;
+  *)
+    expected_retry=0
+    ;;
+esac
+actual_retry=""
+retry_all=false
+for ((index = 1; index <= $#; index++)); do
+  case "${!index}" in
+    --retry)
+      next=$((index + 1))
+      actual_retry="${!next}"
+      ;;
+    --retry-all-errors) retry_all=true ;;
+  esac
+done
+[[ "$actual_retry" == "$expected_retry" ]] || {
+  echo "unexpected retry policy for $method $url: $actual_retry" >&2
+  exit 90
+}
+[[ "$retry_all" == "$([[ "$expected_retry" == 2 ]] && echo true || echo false)" ]] ||
+  exit 91
 printf 'METHOD=%s URL=%s\n' "$method" "$url" >>"${FAKE_CURL_REQUEST_LOG:-$FAKE_CURL_LOG}"
 case "$url" in
   */rest/api/3/myself)
@@ -392,5 +418,85 @@ jq -e '.key == "ABC-123" and .transitioned == true and .transition.id == "31"' \
   "$tmp/transition.json" >/dev/null
 grep -q 'METHOD=POST URL=https://acme.atlassian.net/rest/api/3/issue/ABC-123/transitions' \
   "$tmp/curl-requests.log"
+
+# Exercise the real curl retry behavior against a loopback-only 503 responder.
+python3 - "$adapter" "$tmp/project" "$real_path" <<'PY'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import os
+import subprocess
+import sys
+import threading
+
+adapter, project, real_path = sys.argv[1:]
+requests = []
+allow_transition_lookup = False
+
+
+class Handler(BaseHTTPRequestHandler):
+    def handle_request(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        requests.append((self.command, self.path))
+        lookup = (allow_transition_lookup and self.command == "GET"
+                  and "/transitions" in self.path)
+        body = ({"transitions": [{"id": "31", "name": "Start",
+                                "to": {"name": "In Progress"}}]}
+                if lookup else {"error": "fixture unavailable"})
+        raw = json.dumps(body).encode()
+        self.send_response(200 if lookup else 503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    do_GET = do_POST = do_PUT = handle_request
+
+    def log_message(self, *args):
+        pass
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+worker = threading.Thread(target=server.serve_forever, daemon=True)
+worker.start()
+environment = {
+    **os.environ,
+    "PATH": real_path,
+    "KENT_JIRA_URL": f"http://127.0.0.1:{server.server_port}",
+    "KENT_JIRA_EMAIL": "fixture@example.invalid",
+    "KENT_JIRA_API_TOKEN": "fixture-token",
+    "NO_PROXY": "*",
+    "no_proxy": "*",
+}
+cases = [
+    (["create-issue", "ABC", "--type", "Task", "--summary", "Retry fixture",
+      "--allow-mutate"], "POST", "/rest/api/3/issue", 1),
+    (["edit-issue", "ABC-123", "--summary", "Retry fixture", "--allow-mutate"],
+     "PUT", "/rest/api/3/issue/ABC-123", 1),
+    (["comment-issue", "ABC-123", "--body", "Retry fixture", "--allow-mutate"],
+     "POST", "/rest/api/3/issue/ABC-123/comment", 1),
+    (["transition-issue", "ABC-123", "--to", "31", "--allow-mutate"],
+     "POST", "/rest/api/3/issue/ABC-123/transitions", 1),
+    (["issue", "ABC-123"], "GET", "/rest/api/3/issue/ABC-123", 3),
+    (["transitions", "ABC-123"], "GET", "/rest/api/3/issue/ABC-123/transitions", 3),
+    (["search", "project = ABC"], "POST", "/rest/api/3/search/jql", 3),
+]
+try:
+    for arguments, method, path, expected in cases:
+        requests.clear()
+        allow_transition_lookup = arguments[0] == "transition-issue"
+        result = subprocess.run(
+            [adapter, *arguments], cwd=project, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+        )
+        actual = sum(verb == method and target.split("?")[0] == path
+                     for verb, target in requests)
+        assert result.returncode != 0, (arguments[0], "503 reported as success")
+        assert actual == expected, (arguments[0], actual, expected)
+finally:
+    server.shutdown()
+    server.server_close()
+    worker.join(timeout=5)
+print("Jira HTTP-503 retry matrix: 7 cases passed")
+PY
 
 echo "Jira adapter tests passed"

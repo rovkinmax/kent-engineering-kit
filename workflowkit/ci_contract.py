@@ -1,9 +1,9 @@
-"""Dynamic CI preparation and release-source admission contracts.
+"""Dynamic CI preparation, report archival and GitHub source normalization.
 
 Ordinary preparation binds a stable GitHub pull-request identity and creates
 the dynamic CI cycle contract. It does not inspect release source jobs,
-materialize commits, or infer expected checks. The legacy source-derived
-normalizer and admission helpers remain available to release-only callers.
+materialize commits, or infer expected checks. The standalone source
+normalizer remains available to release-only callers.
 Input is duplicate-free JSON, <=1 MiB/depth 100, read within two seconds.
 Workspace, canonical GitHub PR URL, branch, strategy and task short ID are real
 nonempty strings. Invalid identity exits nonzero with a safe error, no transition.
@@ -16,32 +16,10 @@ invalid reports remain invalid. CI Monitor has no positive-green route.
 Ready-initial omits the absent report; ready-retry carries a validated same-cycle
 github-ci-report-v3. Both carry the contract, task ID and cursor.
 
-P need not adopt the producer. H declares the capability and contains matching
-first-party prepare/CI-wait/PR-wait/runtime templates. Metadata matches the exact
-PR URL/head branch; re-reading preserves base branch, H and P. Merged recovery
-requires timestamp and merge-commit proof. Missing P/H objects are fetched by
-full OID from the verified HTTPS repository into the object cache only: no refs,
-tags, FETCH_HEAD, hooks, submodules or maintenance. Selected source reads have
-a cumulative 60-second/32-MiB budget plus per-command bounds. Blob sizes are
-checked before reads; external captures are regular Git blobs <=1 MiB/root,
-4 MiB total, with declared digest/order and supported builder/source-sha256 kinds.
-Builder keys are digests bound to H's profile.release.builder_path; source keys
-are path=digest. Accepted digests are lowercase hex64 or exactly sha256: followed
-by eight colon-separated lowercase hex8 groups, matching existing project
-manifests. Keys/order are preserved, not rewritten; #/@ delimiters are invalid.
-Source reads disable replacement refs, lazy fetch and inherited GIT_* routing/
-configuration. Explicit HTTPS cache fetch alone can access the network, using
-the already-resolved gh auth git-credential client, not global Git helpers or
-rewrites. Helper names may be inspected locally to reset them only in argv;
-no credential values or auth configuration are read or written by the producer.
-
-Required source DTOs from P and H are always validated, not inferred from green
-checks. Extras remain diagnostic. Aggregate --watch and branch-rule --required
-are not used in source mode; bounded observations are classified against the
-source-required identities. Required-job effective semantics (not whole release
-fields or only names) determine policy drift. Same H/envelope/effective
-policy preserves report attempts even when P advances. Changed H/policy starts
-a new report, retaining old reports in the existing task evidence area.
+Metadata matches the exact PR URL/head branch; re-reading preserves the base
+branch and both commits. Merged recovery requires timestamp and merge-commit
+proof. Same head/base preserves report attempts; a changed head or base starts
+a new cycle, retaining old reports in the task evidence area.
 
 The archive_ci_report CLI operation validates identity/report and returns only
 ci_report_artifact, or a nonzero safe error. Artifacts are content-addressed
@@ -70,44 +48,21 @@ from pathlib import Path
 import re
 import select
 import selectors
-import shlex
 import signal
 import subprocess
-import sys
 import time
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
-from .profile import ProjectProfile
-from .release import (
-    NormalizedGitHubWorkflowSourceV1,
-    ReleaseSpec,
-    ReleaseSpecError,
-    validate_required_job_sources,
-)
 from .revision import (
-    RevisionPreflightError,
-    collect_runtime_external_captures,
-    preflight_project_revision,
-    read_blob_bytes,
-    source_read_budget,
-    selected_git_command,
-    selected_git_environment,
     owned_process_group_exists,
 )
 from .runtime import (
     RuntimeContractError,
-    capture_runtime_source_envelope,
     canonical_bytes,
     validate_ci_contract,
     validate_dynamic_ci_report,
     validate_dynamic_pr_feedback_cursor,
-    make_ci_policy_snapshot,
-    validate_ci_policy_snapshot,
-    validate_ci_report,
-    validate_expected_ci_checks,
-    expected_ci_checks_sha256,
-    ci_policy_projection_sha256,
     MAX_CI_REPORT_BYTES,
     delivery_context_fields,
     validate_delivery_context,
@@ -513,92 +468,6 @@ def _validate_pr_metadata(pr: Mapping[str, Any], payload: Mapping[str, Any]) -> 
             raise CiContractError("merged_proof_missing")
     elif pr.get("mergedAt") or pr.get("mergeCommit"):
         raise CiContractError("pull_request_identity_invalid")
-
-
-def materialize_exact_commit(
-    root: Path, repository: str, oid: str, *, gh_bin: str | None = None,
-) -> None:
-    """Fetch only a verified-repository exact OID into the existing object cache."""
-    if not re.fullmatch(r"[0-9a-f]{40}", oid) or not re.fullmatch(
-        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository,
-    ):
-        raise CiContractError("source_identity_invalid")
-    env = selected_git_environment()
-    prefix = selected_git_command(root)
-    present = run_bounded_command(
-        [*prefix, "cat-file", "-t", oid], env=env, output_limit=4096,
-    )
-    if present.returncode == 0:
-        if present.stdout.strip() != b"commit":
-            raise CiContractError("source_identity_invalid")
-        return
-    # Repository-local rewriting would defeat the fixed HTTPS authority.
-    rewrites = run_bounded_command(
-        [*prefix, "config", "--local", "--get-regexp", r"^url\..*\.insteadof$"],
-        env=env, output_limit=4096,
-    )
-    if rewrites.returncode != 1:
-        raise CiContractError("source_fetch_configuration_invalid")
-    # Do not re-enable global configuration (which can rewrite repository
-    # routing). Use the same resolved first-party GitHub authentication client
-    # as metadata queries. Git exchanges credentials with gh directly; tokens
-    # never enter Python, argv, logs or persisted configuration.
-    configured_helpers = run_bounded_command(
-        [*prefix, "config", "--local", "--name-only", "--get-regexp", r"^credential(\..*)?\.helper$"],
-        env=env, output_limit=4096,
-    )
-    if configured_helpers.returncode not in (0, 1):
-        raise CiContractError("source_fetch_configuration_invalid")
-    resets = ["-c", "credential.helper="]
-    for key in configured_helpers.stdout.decode("utf-8").splitlines():
-        if not key.startswith("credential.") or not key.endswith(".helper") or any(ord(c) < 32 for c in key):
-            raise CiContractError("source_fetch_configuration_invalid")
-        resets.extend(["-c", key + "="])
-    client = str(Path(gh_bin or _github_bin()).resolve())
-    helper = "!" + shlex.quote(client) + " auth git-credential"
-    url = f"https://github.com/{repository}.git"
-    credential_key = f"credential.{url}.helper"
-    result = run_bounded_command(
-        [
-            *prefix, *resets,
-            "-c", credential_key + "=", "-c", credential_key + "=" + helper,
-            "-c", "credential.interactive=false", "-c", "credential.useHttpPath=true",
-            "-c", "http.followRedirects=false",
-            "-c", f"core.hooksPath={os.devnull}",
-            "-c", "maintenance.auto=false", "-c", "gc.auto=0",
-            "-c", "fetch.writeCommitGraph=false", "-c", "submodule.recurse=false",
-            "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
-            "fetch", "--no-write-fetch-head", "--no-tags",
-            "--no-recurse-submodules", "--no-auto-maintenance",
-            url, oid,
-        ],
-        env=env,
-    )
-    if result.returncode:
-        raise CiContractError("source_fetch_failed")
-    verified = run_bounded_command(
-        [*prefix, "cat-file", "-t", oid], env=env, output_limit=4096,
-    )
-    if verified.returncode or verified.stdout.strip() != b"commit":
-        raise CiContractError("source_fetch_failed")
-
-
-def _validate_adoption(root: Path, head: str, profile: ProjectProfile) -> None:
-    if not profile.source_ci_contract():
-        raise CiContractError("source_adoption_incomplete")
-    kit = Path(__file__).resolve().parents[1]
-    sources = {
-        "prepare_ci": kit / "templates/project/workflow-prepare-github-ci",
-        "wait_ci": kit / "templates/project/workflow-wait-github-ci",
-        "wait_pr": kit / "templates/project/workflow-wait-github-pr",
-        "runtime_contracts": kit / "workflowkit/runtime.py",
-    }
-    for capability, template in sources.items():
-        observed = read_blob_bytes(
-            root, head, profile.command(capability), label="source CI adapter",
-        )
-        if observed != template.read_bytes():
-            raise CiContractError("source_adoption_incomplete")
 
 
 def archive_ci_report(root: Path, task: str, report: Mapping[str, Any]) -> str:
@@ -1035,161 +904,6 @@ def normalize_github_workflow(
     return value
 
 
-def _required_rows(
-    root: Path,
-    profile: ProjectProfile,
-    target_commit: str,
-    repository: str | None = None,
-) -> list[dict[str, Any]]:
-    if profile.schema_version != 4 or profile.release is None:
-        raise CiContractError("source-derived CI requires a schema-4 release profile")
-    spec_raw = read_blob_bytes(
-        root,
-        target_commit,
-        profile.release.spec_path,
-        label="release spec",
-    )
-    try:
-        spec = ReleaseSpec.from_toml(
-            spec_raw.decode("utf-8"),
-            profile=profile,
-        )
-    except (UnicodeDecodeError, ValueError) as error:
-        raise CiContractError("target release spec is invalid") from error
-    if repository is not None and spec.repository != repository:
-        raise CiContractError("source_repository_mismatch")
-    return [dict(row) for row in spec.required_jobs_v1.jobs]
-
-
-def _contract_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """TOML cannot spell null; accept only the exact empty-container encoding."""
-    empty = {"image": "", "environment": {}, "ports": [], "options": ""}
-    return [
-        {**row, "container": None} if row.get("container") == empty else dict(row)
-        for row in rows
-    ]
-
-
-def _observed_sources(
-    root: Path, revision: str, rows: list[dict[str, Any]],
-) -> list[NormalizedGitHubWorkflowSourceV1]:
-    sources = []
-    for path in sorted({row["workflow_path"] for row in rows}):
-        selected = sorted({row["job_key"] for row in rows if row["workflow_path"] == path})
-        raw = read_blob_bytes(
-            root, revision, path, label="CI workflow", byte_limit=MAX_WORKFLOW_BYTES,
-        )
-        observed = normalize_github_workflow(raw, path, selected_jobs=selected)
-        # Retain the existing normalizer's workflow_name convenience alias, but
-        # the validator receives only the complete source DTO, never policy rows.
-        observed = {key: value for key, value in observed.items() if key != "workflow_name"}
-        sources.append(NormalizedGitHubWorkflowSourceV1.from_dict(observed))
-    return sources
-
-
-def _profile_at_revision(root: Path, revision: str) -> ProjectProfile:
-    raw = read_blob_bytes(
-        root,
-        revision,
-        ".kent/workflow-profile.toml",
-        label="project profile",
-    )
-    try:
-        return ProjectProfile.from_toml(
-            root,
-            raw.decode("utf-8"),
-            source=f"{revision}:.kent/workflow-profile.toml",
-            check_files=False,
-        )
-    except (UnicodeDecodeError, ValueError) as error:
-        raise CiContractError("project profile at the selected revision is invalid") from error
-
-
-def _validate_job_sources(
-    root: Path,
-    target_commit: str,
-    head_commit: str,
-    rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    try:
-        if not rows:
-            raise CiContractError("required_jobs_empty")
-        contracts = {"schema": "required_jobs_v1", "jobs": _contract_rows(rows)}
-        p_bindings = validate_required_job_sources(
-            _observed_sources(root, target_commit, rows), contracts,
-        )
-        h_bindings = validate_required_job_sources(
-            _observed_sources(root, head_commit, rows), contracts,
-        )
-        def checks(bindings):
-            return sorted(
-                [
-                    {"workflow_name": item.workflow["workflow_display_name"],
-                     "check_name": item.job["job_display_name"], "allow_skipped": False}
-                    for item in bindings
-                ],
-                key=lambda item: (item["workflow_name"], item["check_name"]),
-            )
-        result = checks(p_bindings)
-        if result != checks(h_bindings):
-            raise CiContractError("required_job_identity_drift")
-    except (ReleaseSpecError, KeyError, TypeError) as error:
-        raise CiContractError("required_job_source_invalid") from error
-    identities = {
-        (item["workflow_name"], item["check_name"]) for item in result
-    }
-    if len(identities) != len(result):
-        raise CiContractError("required CI jobs contain duplicate identities")
-    return sorted(result, key=lambda item: (item["workflow_name"], item["check_name"]))
-
-
-def _source_policy_projection(
-    root: Path,
-    target_commit: str,
-    profile: ProjectProfile,
-    rows: list[dict[str, Any]],
-) -> dict[str, Any]:
-    bindings = validate_required_job_sources(
-        _observed_sources(root, target_commit, rows),
-        {"schema": "required_jobs_v1", "jobs": _contract_rows(rows)},
-    )
-    # Effective required semantics only: unrelated release fields, unselected
-    # jobs, comments, and redundant workflow defaults do not start a new cycle.
-    return {"required": sorted(
-        [{"workflow_path": b.workflow_path,
-          "workflow_name": b.workflow["workflow_display_name"],
-          "event": b.event, "job": b.job, "policy": b.policy,
-          "step_overlays": list(b.step_overlays)} for b in bindings],
-        key=lambda row: (row["workflow_path"], row["job"]["job_key"]),
-    )}
-
-
-def derive_expected_ci_checks(
-    root: Path,
-    *,
-    repository: str,
-    target_commit: str,
-    head_commit: str,
-    runtime_source_envelope_digest: str,
-) -> dict[str, Any]:
-    if (
-        not isinstance(runtime_source_envelope_digest, str)
-        or len(runtime_source_envelope_digest) != 64
-        or set(runtime_source_envelope_digest) - SHA1_HEX
-    ):
-        raise CiContractError("runtime source envelope digest is invalid")
-    profile = _profile_at_revision(root, target_commit)
-    rows = _required_rows(root, profile, target_commit)
-    checks = _validate_job_sources(root, target_commit, head_commit, rows)
-    return {
-        "schema": "github-ci-expected-checks-v1",
-        "repository": repository,
-        "project_commit": head_commit,
-        "runtime_source_envelope_digest": runtime_source_envelope_digest,
-        "checks": checks,
-    }
-
-
 def prepare_ci_payload(
     payload: Mapping[str, Any],
     *,
@@ -1388,7 +1102,6 @@ def _prepare_ci_payload(
 __all__ = [
     "BoundedCommandError",
     "CiContractError",
-    "derive_expected_ci_checks",
     "normalize_github_workflow",
     "prepare_ci_payload",
     "read_pull_request",

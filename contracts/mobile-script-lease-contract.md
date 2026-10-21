@@ -1,9 +1,6 @@
 # Mobile Script Lease Contract
 
-This is a private candidate contract for extending the existing
-`emulator-resource-lock.sh` owner record. It does not authorize source
-publication, installed-state changes, Script lease activation, Task migration,
-or device work.
+This defines typed Script ownership for `emulator-resource-lock.sh`.
 
 ## Shared resource and owner model
 
@@ -48,20 +45,9 @@ context_sha256=<64 lowercase hexadecimal characters>
 pid=<positive decimal parent-process ID>
 ```
 
-The Puber-owned wrapper obtains `task_id` from native Task readback, computes
-the stable context digest over its verified Task/project/workflow/node,
-operation/source identity, execution root, and resolved execution base, and
-passes its actual parent PID. It does not use inherited or fabricated
-Agent Session/Step identity (or historical Session/Run/Step).
-Kent 2.10's removal of Agent Run does not change this native Script protocol.
-For terminal retained-evidence lookup, Janitor passes its actual native `_kent`
-Task/Node/transition-branch context to the ledger's read-only reader. The
-reader verifies current native `current_scripts`, the Workflow's Script node
-and path, and Task/project/execution/source workspace binding before validating
-the existing receipt, hashes and source closure. No Agent environment is
-required. `cleanup_session_id` identifies the preceding Agent and is never
-borrowed as Script identity. This seam grants no append, recover or
-retain-evidence writer capability and does not change historical proof formats.
+The project wrapper obtains Task identity from native readback, computes its
+stable context digest and passes its actual parent PID. Script identity must
+not be borrowed from an Agent Session.
 `entry_transition` is business routing context and is
 not part of the stable owner digest. The Kit adapter bounds and independently
 observes the supplied process PID; OS observations are cooperative identity,
@@ -147,11 +133,6 @@ leader has stopped.
 
 ## Activation boundary
 
-Private qualification uses disposable owners, processes, and Git fixtures only
-under `qualification/`. It does not use the real resource root, native Task
-mutation, credentials, devices, or live effects. Existing Tasks OSM-108 and
-OSM-110 remain an activation blocker while they can reach incompatible
-root-local adapters. A private candidate or passing isolated test does not
-qualify actual consumer bytes, authorize migration, or open the activation
-gate. Publication, activation, Task changes, and device use require separate
-authority.
+Isolated qualification uses disposable owners, processes and fixtures. It does
+not qualify installed consumer bytes or authorize resource/device effects.
+Publication, activation and Task migration follow their applicable effect gates.

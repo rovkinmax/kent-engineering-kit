@@ -1,676 +1,336 @@
 # Workflow Contract
 
-Platform-neutral; projects supply build,test,device,source-control,
-issue-tracker,release adapters.
-
-Generator source; nodes receive role/edge prompts,context manifest,project
-procedures; not this contract.
-
-Kit/workflow governance: `contracts/kit-change-governance.md`; product work
-exempt.
+Platform-neutral generator contract. Projects supply build, test, runtime,
+source-control, issue-tracker and release procedures. Nodes receive their
+role, edge prompt, context manifest and selected procedures rather than this
+entire maintainer contract. [Global governance](../global/AGENTS.md#authority-and-decisions)
+owns Kit/workflow change approval.
 
 ## Lifecycle
 
-- Kent task state owns workflow lifecycle.
-- Kent owns the selected execution target, execution root, and resolved Git
-  commit. Project metadata must not mirror those facts.
-- A project artifact may own writer-owned implementation-step progress.
-  Workflow-owned Standards, Specification, Gate, Smoke, Compliance, PR, CI,
-  and Cleanup work is never an implementation checkbox prerequisite.
-- Recoverable blockers use approval-gated `needs_user_action` self-loops.
-- A `needs_user_action` approval is a resume gate, not acknowledgement of
-  waiting. Do not approve it until the reported external action is complete;
-  approval restarts the same stage and requires fresh resolution evidence.
-- A post-Join blocker may approval-loop through verification dispatch so every
-  read-only branch reruns with fresh state.
-- An interrupted node run is runtime state, not a workflow decision. Inspect
-  the interruption reason before changing task state. For a transient provider
-  or transport failure, resume the interrupted node on its locked execution
-  target; do not move the task or rerun completed upstream branches.
-- Resume reports durable requeueing before Session or Script startup finishes.
-  Recheck Task state after startup. `workflow_runtime_start_failed`,
-  `workflow_script_completion_failed`, or another immediate interruption is a
-  failed recovery even when the Resume command itself succeeded.
-- A Current Node migrated without an assigned or retained Session cannot be
-  repaired by repeated Resume. Re-enter the smallest supported incoming
-  `new_session` Transition with preserved values. For a failed fan-out branch,
-  re-enter the fan-out source so every sibling and Join invariant is recreated.
-- Transition keys, Script stdout, prompts, and prior-value keys form one
-  versioned contract. Runtime baseline: Kent 2.6.1 (August 13, 2026).
-- Graph apply is complete, previewed, confirmed, and atomic. Eligibility follows
-  [policy](#execution-history-and-compatibility-policy).
-- V1 canonical reconciliation advances the same linked/default UUID once:
-  terminal tasks/anchors, settled approvals, quiescence, exact source/target,
-  unchanged links/defaults, live gate and forward restore. Preserve terminal
-  IDs/statuses/anchors. No replacement, create, promotion or concurrent
-  allocation; disclose the absent canary at live approval.
-- V2 compatibility plans follow the update policy.
-- Canonical reconciliation plans retain native `project-<lowercase UUID>`
-  identities in both workflow ownership and project links. Workflow identities
-  remain bare UUIDs. Legacy plans with bare project UUIDs must be rebuilt from
-  native readback and approved under a fresh plan hash; do not coerce them.
-- `wont_do` is terminal, requires an explicit cancellation decision, and emits
-  `closure_reason`.
-- Parallel verification branches are read-only.
-- One writer owns fixes and integration.
-- `done` means delivered or explicitly approved report-only completion.
-- When task authority declares a run report-only, read-only, audit-only, or
-  forbids repair in its frozen worktree, Implement and Fix do not edit tracked
-  or staged files. A candidate defect is reported and repaired on a separately
-  authorized revision/task; the immutable candidate is never patched in place.
-
-Runtime v2 is atomic.
+- Kent owns lifecycle, execution target/root and resolved commit. Project
+  artifacts own only implementation progress, not mirrored lifecycle state.
+- Writers complete code/test/config/documentation and deterministic-check
+  steps. Standards, Specification, Gate, Smoke, Compliance, PR, CI and Cleanup
+  remain workflow-owned even if a legacy plan lists them as writer checkboxes.
+- `needs_user_action` is a resume gate for a real decision/external action,
+  not acknowledgment of waiting or a technical problem with a capable recovery
+  owner. Confirmation restarts the stage; required resolution evidence must
+  exist first. Post-Join recovery reruns fresh read-only branches as declared.
+- Runtime interruption is not a business decision. Reconcile effect state and
+  use the smallest supported retained/new-session recovery, preserving values,
+  execution identity and fan-out/Join. Requeueing alone does not prove startup.
+- Transition keys, Script stdout, prompts and parameters form one revisioned
+  interface. Apply complete approved graphs atomically.
+- `wont_do` requires cancellation authority and a `closure_reason`.
+- `done` means the approved endpoint was actually evidenced, or explicitly
+  authorized report-only completion. Review-ready PR, merged, released and
+  full business acceptance are distinct endpoints.
+- Report-only/read-only/frozen runs perform no tracked/staged repair; preserve
+  candidate findings for an authorized repair revision/owner.
 
 ### Execution-history and compatibility policy
 
-For workflow updates, read [the authoritative policy](workflow-update-compatibility.md).
+Live updates follow the [authoritative compatibility policy](workflow-update-compatibility.md).
+Source publication does not activate graphs or reload retained instructions.
 
 ## User
 
-- Direct questions, transition commentary, `blocker_reason`, `closure_reason`,
-  approval summaries, and Needs User Action text use the user's preferred
-  conversation language; installed contract defaults them to Russian.
-- Code, commands, identifiers, structured parameter keys, and repository
-  artifacts retain their project-defined language.
-- Approval text is concise and decision-oriented. It states what the user must
-  decide or do, why it is needed, and what happens after confirmation.
-- Number independent decisions. Keep full verification reports in their
-  structured report/context parameters rather than pasting them into the
-  approval summary.
-- Task-scoped source fixes belong in `fix_context`; they are not described as
-  actions the user must perform. External dependencies only block the stage
-  whose acceptance contract actually requires them.
-- A failure outside the authoritative task boundary does not prompt the user
-  to absorb adjacent scope. Preserve the boundary and submit one
-  approval-gated `needs_user_action` transition directly. Do not first ask the
-  same scope-expansion question. Its `blocker_reason` states the exact action,
-  proof of completion, and that approval must wait until completion.
-- Missing agent-produced evidence is not a user decision. A pre-edit red-run
-  requirement must be captured before the first production edit. If the agent
-  missed it, the workflow records the absence and uses bounded reconstruction
-  or current deterministic evidence; it asks the user only when acceptance
-  genuinely depends on an external fact or product decision.
-- For issue-backed work, implementation scope contains only root issues named
-  by the task source/body or an exact human-authored task comment. Parent,
-  linked, cloned, sibling, and dependency issues remain evidence or dependency
-  context unless that authority explicitly includes them.
-- Operational dates default deterministically. If a mutation requires only the
-  date on which it is being performed and no authoritative source specifies a
-  different date, resolve the current calendar date from the execution
-  environment immediately before dry-run and mutation. Do not request approval
-  merely to select today's date. Ask when the date represents a deadline,
-  effective period, backdate, scheduled release, or another independent
-  business choice, or when changing an existing external record's date.
+Global instructions own language, original authority and question style.
+Transition summaries state the actual decision/action, reason and next result;
+reports belong in their declared structured carriers.
+
+Task-scoped correction belongs in `fix_context`, not instructions for the user
+to implement it. External dependencies block only the stage requiring them.
+Out-of-scope failures retain their boundary and capable recovery owner; no
+question asking to absorb unrelated scope.
 
 ## Writer session policy
 
-- `policies.writer_sessions = "continuous"` preserves the historical behavior:
-  writer transitions reuse or compact an existing session.
-- `policies.writer_sessions = "fresh_per_slice"` starts a fresh session for
-  every Implement step and every Fix slice, including PR-feedback and
-  PR-recovery fixes.
-- The policy does not alter approval-recovery continuity for Plan, Smoke,
-  Compliance, PR preparation/monitoring, CI monitoring, or Cleanup. Those
-  non-writer loops compact and continue their current session.
-- A fresh writer treats the preserved worktree, authoritative
-  design/specification/plan, exact task-comment IDs, existing evidence, and
-  structured transition parameters as its complete handoff.
-- Each fresh Implement session completes one ready writer-owned plan step.
-  Unchecked workflow-owned verification or delivery items in a legacy plan are
-  handoff scope, not writer work; when no writer-owned step remains, Implement
-  transitions to verification. Each fresh Fix session completes one
-  independently verifiable fix slice and uses
-  `continue_fix` with only the remaining findings when more work remains.
-- A same-node `continue_fix` checkpoint action is consumed when the transition
-  creates the next Fix session. Non-empty incoming findings are the new work
-  assignment: the session rewrites `next_action` to one concrete slice and
-  completes it. It must not emit bookkeeping-only evidence and repeat the same
-  transition without production or verification work.
-- Recovery-aware Plan may adopt an explicit checkpoint commit and source task.
-  It verifies the checkout, updates one authoritative artifact set, records
-  which newer comments supersede earlier decisions, and plans only remaining
-  work without resetting preserved implementation.
-- When a recovery task explicitly requests a Plan-only confirmation gate, Plan
-  completes through `needs_user_action` instead of selecting Implement.
-- Writer-policy changes follow
-  [policy](#execution-history-and-compatibility-policy),
-  including compatibility with retained writer instructions.
-- Verification Gate deduplicates overlapping reports into one
-  dependency-ordered Fix bundle. In continuous mode, the retained Fix session
-  resolves every compatible root-cause group before re-verification. It does
-  not create a new session for each symptom or bookkeeping handoff.
+- `continuous` retains/compacts writer context; `fresh_per_slice` creates one
+  writer per ready implementation step or independently verifiable Fix group.
+- Non-writer approval/recovery loops retain their declared continuity.
+- Handoffs preserve worktree, immutable baseline, accepted artifact, original
+  decision references, findings, checkpoint and evidence.
+- Fix deduplicates reports into a dependency-ordered bundle. Continuous Fix
+  resolves compatible groups before verification; fresh Fix carries remaining
+  findings through `continue_fix`. No symptom-per-session or bookkeeping-only
+  loop.
+- Proven earlier-step regressions within the full approved Task/file boundary
+  remain repair work. Step budgets do not exclude them. Baseline debt, foreign
+  changes and unproven target-only failures are not absorbed.
+- Policy changes require compatibility with retained writers.
 
 ### Complexity-selected Implement
 
 `coder_selection` defaults to `disabled`; `complexity` requires continuous
-writers and a source candidate, not frozen/live graphs.
-
-Review and human approval cover the task-bound choice. Plan Contract maps its
-digest to protected role/thinking values; models/roles are not self-selected.
-Only the new first Implement Session uses native `previous_node` selectors;
-later hops carry task/digest.
-
-Start requires no writer; continuation exactly one match. Missing/drift returns
-to retained Plan. A changed writer choice needs explicit recovery; no route
-replaces it. Recovery resumes Implement; Fix and mandatory gates are unchanged.
+writers. [Plan Contract](plan-contract.md) binds the typed task choice and
+reviewed digest to protected role/thinking values; agents do not choose models.
+Only first Implement entry uses native `previous_node` selectors; later routes
+carry task/digest. Start requires no existing writer, continuation exactly one.
+Drift returns to retained Plan; replacing a writer needs explicit recovery.
+Fix and mandatory gates remain unchanged.
 
 ## Portable parameters
 
-- `workspace_path` — repository or managed-worktree root, never a `.todo`
-  feature directory or another artifact path
-- `plan_path`
-- `work_kind` — stable project-profile key selected once during Plan and
-  preserved through every Implement slice
-- `plan_path` uses the literal `not-applicable` when an explicitly planless
-  project flow is allowed. Required Kent Transition parameters are never empty.
-- `spec_path`
-- `fixed_point` — immutable task-delta baseline, normally Kent's resolved
-  execution commit; it is distinct from the moving PR merge target
-- `changed_files`
-- `verification_report`
-- `review_report`
-- `standards_report`
-- `compliance_report`
-- `review_context`
-- `fix_context`
-- `verification_status`
-- `standards_status`
-- `spec_status`
-- `smoke_report`
-- `smoke_rationale`
-- `smoke_scope`
-- `blocker_reason`
-- `pr_url`
-- `branch_name`
-- `merge_strategy`
-- `pr_report`
-- `ci_report`
-- `ci_contract`
-- `delivery_context`
-- `merge_report`
-- `publication_report`
-- `closure_reason`
-- `cleanup_report`
-- `evidence_context`
-- `pr_head_oid`
-- `pr_base_oid`
-- `cleanup_mode`
-- `cleanup_session_id`
+`workspace_path` is the canonical repository/managed root, never an artifact
+directory. `fixed_point` is the immutable task baseline, not a moving merge
+target. `work_kind` is selected once from the project profile. An explicitly
+planless flow uses literal `plan_path=not-applicable`; required values are
+non-empty.
+
+Canonical keys:
+
+- `workspace_path`, `plan_path`, `work_kind`, `spec_path`, `fixed_point`,
+  `changed_files`;
+- `verification_report`, `review_report`, `standards_report`,
+  `compliance_report`, `review_context`, `fix_context`;
+- `verification_status`, `standards_status`, `spec_status`;
+- `smoke_report`, `smoke_rationale`, `smoke_scope`, `blocker_reason`;
+- `pr_url`, `branch_name`, `merge_strategy`, `pr_report`, `ci_report`,
+  `ci_contract`, `delivery_context`, `merge_report`, `publication_report`;
+- `closure_reason`, `cleanup_report`, `evidence_context`, `pr_head_oid`,
+  `pr_base_oid`, `cleanup_mode`, `cleanup_session_id`.
+
+Edges declare the exact required subset and additional protected protocol
+fields. Prompts may not require undeclared outputs.
 
 ## Delivery continuity
 
-The generator carries delivery state only for runtime-contract-v2 profiles and
-the schema-3 Kit-lite cursor profile when pull requests and
-`github_observation` are enabled. Other profiles preserve their existing
-parameters and prompt bytes.
+Enabled profiles preserve `delivery_context` as a compact closed
+`workflow-delivery-context-v1` JSON string. Pre-PR contains `schema` and
+`phase=pre_pr`; post-PR adds observed `pr_url`, `branch_name`, `merge_strategy`,
+`pr_feedback_cursor`, and only actually produced `ci_contract`/`ci_report`.
+There is no task ID in this packet.
 
-`delivery_context` is a compact JSON string using the closed
-`workflow-delivery-context-v1` shape. Before a PR exists it contains exactly
-`schema` and `phase=pre_pr`. After a PR is observed it contains `schema`,
-`phase=post_pr`, the observed `pr_url`, `branch_name`, `merge_strategy`, and
-`pr_feedback_cursor`, plus `ci_contract` and/or `ci_report` only when those
-exact packets have been produced. The packet never contains a task ID.
-Preserve nested CI packet strings byte-for-byte; do not normalize, reconstruct,
-or invent absent delivery state.
+Preserve nested producer packet strings byte-for-byte. Plan initializes
+pre-PR; acceptance excludes transport from the plan digest. Plan/branch/writer/
+verification/Gate/runtime continuations carry it only where declared.
+Gate uses current dispatch-scoped delivery state, not historical verifier
+outputs. Source-CI entries unwrap the declared packet into their deterministic
+watcher contract; profiles without source CI retain their flat observation
+inputs. Merge/publication/Cleanup use their declared result contracts.
 
-Plan initializes the pre-PR packet. The deterministic accepted-plan snapshot
-and digest exclude it because it is transport state, not plan content. Plan
-Contract, branch identity, Implement/Fix, verification dispatch, Gate, Smoke,
-and applicable Compliance continuations preserve the packet. Gate reads the
-current cycle's scoped
-`verification_dispatch_fanout_verify.delivery_context`; deterministic
-verification result edges carry only status and report and do not become
-delivery-state carriers.
+Producer packets are opaque and reconstructed through qualified helpers,
+never retyped from narrative. Agent-owned context may be synthesized in the
+project's envelope using bounded report references where allowed. Do not impose
+Markdown or indiscriminately duplicate reports.
 
-PR and CI observation agents retain their existing flat identity, report, and
-cursor inputs on watcher-to-agent edges and self-recovery loops. They pack the
-latest observed values when a Fix transition must carry delivery continuity.
-Source-contract CI producer entries and retries carry only `workspace_path`,
-`task_short_id`, and `delivery_context`; the producer unwraps that packet to
-the existing flat deterministic watcher contract. Without source-contract CI,
-PR preparation and Waiting PR retain their existing flat observation
-parameters. Merge, publication, and terminal Cleanup remain on their existing
-flat result contracts.
+An explicitly supplied graph-declared `review_context` supersedes historical
+same-key values during packing. This narrow derived-context rule grants no
+generic values-win precedence: all producers still require complete identity,
+version/digest, field and tamper validation.
 
 ## Context
 
-- Five manifests: `plan`, `implement`, `review`, `smoke`, `delivery` budget
-  required/conditional/forbidden sources. Edges carry Task values, not docs.
-- Before Agent transitions: one nonempty event via profile evidence, Git-ignored,
-  hash-chained append-only JSONL. No rewrites; provider recovery/repeated
-  completion reuses the current Session/Step sequence/hash; no append.
-- Cleanup/recovery: nonempty `commands.prepare_cleanup` owns the final
-  event/seal; blockers stay in Task records. Without it, reuse a prior seal
-  only under `.kent/commands/cleanup-task.md`'s no-helper proof checks, without
-  append/seal. A new unsealed completion with no prior Cleanup event/partial
-  seal attempt keeps ordinary append/seal ownership; invalid proof blocks.
-  Other nodes retain ordinary append. New evidence uses real unmodified Kent Session/Step
-  IDs; no dedup bypass, history reconstruction or native authentication.
-  Freeze root/branch/report before leave; no primary-relative adapters.
-- Events: Task/node/Session/Step IDs (v2; v1 retains Run), HEAD, summary, artifacts, checks, decisions,
-  exact instruction files/bytes read, repeated reads/questions, verification
-  loops. `model_calls`/`compaction_count`: stable Kent telemetry or `null`;
-  never infer.
-- No transcripts, secrets, raw authenticated
-  state, broad logs or unredacted network responses.
+Five manifests (`plan`, `implement`, `review`, `smoke`, `delivery`) declare
+required/conditional/forbidden reads. Edges carry Task values, not catalogs.
+Evidence is append-only and sanitized; use genuine inherited identity through
+the qualified project command. Unknown/damaged evidence supplies no consent,
+effect success or retry budget.
 
-Sealed cleanup: [governed exception](sealed-recovery.md).
+Record actual checks, artifacts, decisions and instruction reads. Telemetry
+is optional: preserve truthful available measurements, use null/absence when
+unknown, and do not invent model/compaction counters or mandatory agent
+bookkeeping to estimate them.
+
+A configured `prepare_cleanup` owns final ordinary event/seal. Other nodes
+retain their append responsibility; retries reconcile existing evidence rather
+than duplicate events. Without the helper, the project's declared cleanup
+procedure owns append/seal and prior-success validation. Freeze root/branch/
+reports before leave. No secrets, transcripts or raw authenticated payloads.
+See [evidence recovery](evidence-recovery.md), including sealed-state invariants.
 
 ## Branch identity
 
-- Kent task short ID is the stable lifecycle identity for comments,
-  checkpoints, runtime state, and commands, even when Git uses another branch.
-- `policies.branch_identity = "task"` keeps Kent's short-ID branch.
-- `jira` resolves `feature/<KEY>` from the source URL or exactly one Jira
-  `/browse/<KEY>` body URL; multiple candidates block before mutation.
-  Comparison/dependency keys are not branch identity.
-- `github_issue` resolves `issue-<number>` only from an exact URL in the
-  current repository; multiple body candidates without a source URL are
-  ambiguous.
-- With no usable external identity, retain the Kent short-ID branch.
-- Branch identity runs as a Script after Plan and before the first writer;
-  Plan values are preserved on every outcome.
-- Plan establishes the managed root before project-relative Scripts run.
-  Migration never renames active branches; humans may pass `--branch-name` to
-  Start, Move, or Resume. Kent 2.6.1 keeps worktrees under `base_dir` and out of
-  the source Workspace; out-of-namespace paths require Kent recovery.
-- An existing desired branch is ambiguous ownership, not an invitation to
-  reuse or overwrite it; route to a recoverable user decision.
-- PR preparation reports `git branch --show-current`; downstream stages never
-  reconstruct branch identity from the task ID.
+Task short ID remains lifecycle/checkpoint identity regardless of Git branch.
+`task` keeps it; `jira` derives `feature/<KEY>` from exact source/body Jira
+identity; `github_issue` derives `issue-<number>` only for the current repo.
+Ambiguity blocks before mutation; related/dependency keys do not select a branch.
+No usable external identity retains the Task branch.
+
+The branch Script follows Plan and preserves its values. Existing desired
+branches are ambiguous ownership, never automatic reuse. Report actual
+`git branch --show-current`; downstream nodes must not infer it from Task ID.
 
 ## Release source/publication
 
-- Profile schema 3 manual-package-publish-after-main approval-gated Publish Package,procedures.publish/roles.package_release,exact merged source,authorized package/version/destination/tag policy,JIT credentials,remote pre/poststate,no overwrite/delete,Cleanup publication_report
-- Profile schema 4 no publication node,selected-commit preflight derives profile/job sources,spec/manifest/snapshot/optional builder->regular files,raw digests/read-only preview,runtime attestation/activation false
-- Required/qualification credential-safe,effects explicit,normalized adapters: permissions/env/defaults,matrices,ordered steps/inputs,conditions/secrets,failure masking
-- github-packages-classic-pat-step-read job-local,any source-secret ref->fixed GITHUB_PACKAGES_TOKEN env,1 unconditional run-only recipient,uses/with empty,cache-read iff full-SHA restore-only,secretless default,operator-owned scope/account/SSO/expiry/rotation,Kit no enforcement/proof,source-policy rows=pull_request,push,deployment,workflow_dispatch
-- Variants concrete/runtime-bound template authority,job-manifest digests,canonical bytes,optional Script-owned Russian approval,runtime proofs bind selected sources,manual migration/apply/publication/default
-- Release-spec S3 native_agent_approvals: effect_jobs_v1.jobs=[] iff variants≠∅,no Script materializations,each variant=1 valid approval-required Kent-template Agent declaration,transitions=authority_transitions,unambiguous snapshot Agent-edge,qual/effect refs=[],qualification_jobs_v1.jobs=[]; required_jobs_v1.jobs≠∅; else S3/S1/2 effect jobs≠∅; standalone JobContractTable strict; zero jobs attest no effects/materialization
+Projects declare selected-source validation, release builder, publication
+procedure, credential source and effect approval. Source bindings/specs/
+manifests validate selected bytes, not runtime readiness or publication rights.
+Schema-3 package publication is approval-gated against exact merged source.
+Schema-4 source/graph admission remains distinct from live activation.
+Use [source-binding interfaces](release-source-bindings.md) and actual executable
+schemas; do not infer an effect from successful source checks.
 
 ## Execution targets
 
-- Generated workflows always set an explicit Kent 2.6.1 execution-target policy.
-- Profile supplies default; workflow kind may override.
-- Supported policy values are `ask-on-first-execution`, `none`, `head`,
-  `default-branch`, and `ref:<revision>`.
-- Delivery workflows should normally ask on first execution.
-- Canary workflows should normally use Source HEAD.
-- Trunk maintenance should normally use the repository default branch.
-- Release and hotfix workflows should use an explicitly selected revision.
-- `none` is reserved for intentional source-workspace execution, including
-  non-Git workspaces and small local jobs that do not need isolation.
-- Start/approval/move override may select target without mutating
-  policy.
-- Verification dispatch compares `workspace_path` to canonical execution root;
-  artifact/nested/foreign paths route metadata-only Fix before fan-out.
-- Verifier execution: `workflow-verify-report` docstring.
+Generated workflows declare an explicit policy from the profile/per-kind
+override: `ask-on-first-execution`, `none`, `head`, `default-branch` or
+`ref:<revision>`. Normally Delivery asks, Canary uses source HEAD, maintenance
+uses default branch, and release/hotfix selects an exact revision.
+`none` deliberately uses the source workspace, including non-Git/local jobs.
+Start/approval/move overrides do not mutate policy.
+
+Dispatch verifies canonical native root before fan-out; invalid paths use the
+metadata-correction route. Project verification wrappers own execution details.
 
 ## Work-kind routing
 
-- Every generated Engineering Delivery profile declares at least one
-  `[work_kinds.<key>]` entry with a description and project-relative Plan and
-  Implement procedures.
-- A task-body `work_kind: <key>` declaration is authoritative when supported.
-  Otherwise Plan classifies conservatively and blocks on ambiguity.
-- Plan uses only planning sections of a combined procedure. Implement uses the
-  selected procedure for exactly one approved plan step and never repeats
-  discovery or planning.
-- `work_kind`: v1 continuation/verify guards restore it from the accepted
-  snapshot; writers omit it there. Other declared carriers retain it.
+Every Delivery profile declares work-kind description and project-relative
+Plan/Implement procedures. Supported task-body `work_kind` is authoritative;
+otherwise classify conservatively and resolve real ambiguity. Read only the
+selected phase. Continuation guards restore accepted work kind where declared;
+other edges preserve their explicit carriers.
 
 ## Fan-out constraints
 
-- Every branch transitions directly to its Join.
-- Branch failures are reported to the Join as data.
-- A branch emits one stable parameter contract on every completion.
-- Only the post-Join gate chooses Fix, QA, Ship, or Needs User Action.
-- Early Standards Review emits `standards_status` and `standards_report`.
-  `compliance_report` is reserved for the final delivery attestation.
-- This output split applies to current and future generated graphs. Frozen
-  schema-3 Canary/Smoke graphs created before the split may retain
-  `compliance_report` as their historical early-Standards output.
-- Standards findings are differential to the pinned comparison baseline.
-  Whole-repository analyzer failures become `needs_changes` only when a new or
-  worsened task violation is proven. Pre-existing debt is non-blocking for the
-  task. An explicit absolute-clean policy that the baseline itself violates is
-  a `blocked` policy contradiction and routes to user resolution, never broad
-  Fix work.
-- Standards and Specification use `fixed_point` or the Kent-resolved execution
-  commit for task-delta review. The current merge-target tip is checked
-  separately for integration compatibility. Target-only commits added after the
-  fixed point are not task regressions unless a three-way merge or
-  method-specific replay proves a conflict or loss in the delivered tree.
-  Reviewers and Fix must not copy unrelated target files merely to make an old
-  task checkout resemble the moving target.
+Branches are read-only leaves, report structured failures directly to Join and
+emit a stable completion contract. Only post-Join Gate selects repair/runtime/
+delivery/user action. Early Standards emits `standards_status/report`; final
+Compliance owns `compliance_report`. Retained graphs keep their proven interface.
+
+Review against the immutable task baseline; moving target compatibility is
+separate. Require merge/replay evidence for target-only loss/conflicts.
+Analyzer debt is blocking only when task-introduced/worsened or when an explicit
+absolute-clean policy creates a genuine contradiction.
+
+Every enabled report must pass obligations due at the current approved stage.
+Deferred evidence retains owner and due milestone. A review-ready PR may retain
+external `UNVERIFIED` under exact authority, without full acceptance, merge/
+release or Task Done. Changed milestone/authority requires fresh review;
+Gate cannot rewrite old BLOCKED. This applies without final Compliance or PR.
 
 ## Active feedback and recovery
 
-- Task/run watch/wait observe deterministically. `kent question`/`answer`
-  handle decisions. Start/Move/Resume accept `--branch-name`; short ID owns
-  lifecycle. Resume is asynchronous: re-read state and recover the retained
-  worktree. Kent 2.6.1 preserves Script stderr.
-- Kent 2.9 `outcome.kind: "question"` is pending, not completion; an authorized
-  answer resumes the same execution. For committed-but-unstarted recovery,
-  attribution and configuration limits, follow the
-  [operations reference](../skills/kent-engineering-kit/references/task-supervision-operations.md).
-- Task comments are durable records, not active-node feedback.
-- Deliver active feedback through `kent run steer` or interactive messages;
-  the owner takes its declared transition with refreshed structured context.
-- Changed product decisions or acceptance require the next writer to update
-  the authoritative plan first, citing the exact human source (Task comment,
-  verifiable original Session message or native Question answer). Code,
-  review context and checkpoints reference that artifact, not duplicate it.
-- Narrowing or superseding the task body requires exact human authority.
-  Agent comments, implementation inference and unsupported "user clarified"
-  claims are insufficient. Plan and Specification Review recover accessible
-  original evidence before escalating missing bookkeeping, following
-  `contracts/plan-contract.md`. Use `needs_user_action` only for necessary
-  authority still unavailable or a real unresolved decision.
-- Smoke follows [contract](mobile-smoke-contract.md); record destructive-action
-  status. Scripts use [lease](mobile-script-lease-contract.md) and must not impersonate a Session; on ambiguity preserve state and block recovery.
-- Do not use a manual task move merely to inject feedback into an active node;
-  it can bypass node-owned cleanup and evidence reporting.
+Steer active owners; comments are durable context, not control. Product decision
+changes update the authoritative plan with original human sources before
+implementation. [Plan Contract](plan-contract.md) owns revalidation.
 
-Plan Review, normalized plan snapshots, and material-change revalidation are
-defined by `contracts/plan-contract.md`.
-- Resume retains locked prompts/settings; source prompt fixes require a new
-  Session. Repeated provider failures need checkpoint-aware recovery.
-- Approval-gated `compact_and_continue_session` may retain the Session ID.
-  Verify `context_compaction_completed` and a refreshed lock; cumulative
-  `model_request_count` does not measure post-compaction context.
-- Kent 2.9 plain continuation retains settings; compaction continuation applies
-  target configuration, potentially under the same ID.
-- Compaction proves context reduction/worktree continuity, not reliability.
-  Context can regrow before transition persistence; retain checkpoints,
-  authoritative artifacts and bounded remaining work.
-- Fix and Smoke checkpoints live under the ignored
-  `.kent/runtime/<task-short-id>/` directory and are written atomically through
-  the profile-owned checkpoint command. They contain one next action plus
-  completed, remaining, and mutation-ledger arrays. Checkpoints never contain
-  credentials, authenticated UI payloads, broad logs, or raw evidence.
-- A resumed Fix or Smoke stage validates and reconciles its checkpoint against
-  current Git, task, device, lock, and evidence state before skipping any work.
-  A mismatch invalidates the skip decision; it does not authorize repetition of
-  a recorded external mutation.
-- If the same checkpoint token still owns a Smoke resource, recovery renews
-  that lease through the adapter's `resume` operation instead of acquiring the
-  resource against itself. If acquisition completed but the token was lost
-  before checkpoint persistence, `resume-owned` is allowed only when guarded
-  lock metadata proves the same non-empty Kent task ID; it returns the existing
-  token and never creates or adopts a lock.
+Use supported retained/new-session recovery and capable infrastructure owners;
+never manually move an active Task to evade cleanup, borrow identity or treat
+source prompt edits as loaded instructions.
+
+Fix/Smoke checkpoints contain next action, completed/remaining work and mutation
+ledger through the qualified helper. Reconcile Git, Task, resource and effect
+state before skipping or repeating work. Unknown effects block replay; existing
+budgets and restrictions survive all identity/context changes.
+Mobile procedures conditionally use [Smoke](mobile-smoke-contract.md) and
+[Script lease](mobile-script-lease-contract.md) contracts.
 
 ## Final compliance
 
-- A PR-producing Delivery workflow with `compliance_review` enabled routes both
-  Gate `delivery_ready` and Smoke `passed` through a distinct final Compliance
-  Review before PR preparation.
-- Compliance is a thin read-only attestation over the final diff, authority
-  sources, enabled verification reports, Gate decision, and Smoke evidence or
-  bypass rationale. It does not repeat general standards, specification, code,
-  architecture, or runtime review.
-- `ship_pr` advances to PR preparation with `compliance_report`.
-- `needs_changes` returns to the single-writer Fix stage and then reruns the
-  full verification fan-out.
-- `replan` returns a substantive accepted-plan discrepancy to retained Plan
-  Revalidation before source edits. Fix exposes the same route. Producers
-  verify accepted snapshot identity and recover canonical plan/work-kind fields;
-  `plan_change_report` labels deterministic drift or agent-reported findings.
-  Normal Plan Review and project acceptance remain mandatory; there is no
-  universal new approval gate. Remaining findings must survive in durable plan
-  artifacts because normal writer continuation omits `review_context`.
-  Ordinary repairs and packaging-only defects retain their existing routes.
-  All Fix/Compliance ingress prompts expose this choice, except the narrowly
-  metadata-only invalid-workspace correction, which must first establish a
-  valid native root. See `contracts/plan-contract.md`.
-- `needs_user_action` is an approval-gated Compliance self-loop. `wont_do`
-  remains approval-gated terminal cancellation.
-- Profiles declare `standards_review` and `compliance_review` explicitly.
-  Standards emits `standards_report`; final Compliance emits
-  `compliance_report`. The two reports are distinct contracts.
-- Packaging-only Compliance defects use `repair_evidence`, not normal Fix,
-  when substantive source, verification, Gate, and Smoke decisions are already
-  valid. Evidence Repair may edit only named ignored reports, summaries,
-  checklists, or indexes and rerun their audit. It never rebuilds, reinstalls,
-  reacquires a device, or changes the underlying acceptance result. It returns
-  directly to final Compliance. Any substantive defect routes to normal Fix and
-  the full verification flow.
+Enabled PR-producing workflows route Gate/runtime readiness through a distinct
+read-only Compliance attestation. It checks final authority and evidence, not
+duplicate general reviews. `ship_pr` carries `compliance_report`;
+`needs_changes` returns to single-writer Fix and fresh verification.
+Substantive accepted-plan discrepancies use exposed `replan` before edits.
+`needs_user_action` and cancellation retain their approval gates.
+
+`repair_evidence` is only for named ignored packaging artifacts after underlying
+source/check/runtime decisions are valid. It permits no rebuild, install,
+resource reacquisition or acceptance rewrite and returns to Compliance.
 
 ## PR
 
-- `policies.pr_merge_strategy` accepts `auto`, `merge`, `squash`, or `rebase`;
-  default `auto`.
-- Prepare PR resolves the strategy once and carries the resolved
-  `merge_strategy` through CI and Waiting PR.
-- `auto` intersects repository-enabled methods, target-branch protection and
-  rulesets, and any required merge-queue method. Exactly one method must
-  remain. Zero or multiple candidates require `needs_user_action`; agents never
-  infer the user's preferred button or guess a repository default.
-- GitHub resolution is performed by the kit-owned
-  `kent-resolve-github-merge-strategy` adapter over captured API evidence. Its
-  structured result, not an agent's interpretation, selects or blocks the
-  strategy.
-- An explicit method is still validated against repository capabilities and
-  target-branch policy.
-- Generic final-tree mergeability is not method feasibility. Merge requires
-  merge commits to be allowed; squash requires squash merging to be allowed;
-  rebase requires the PR commits to replay cleanly onto the current target.
-  On GitHub, `canBeRebased=true` is required for rebase delivery.
-  `MERGEABLE/CLEAN`, a clean merge-tree, or target-ancestor proof cannot
-  override `canBeRebased=false`.
-- Conflicting rebase signals are reproduced in an isolated temporary clone or
-  branch with a forced replay. Diagnosis never mutates the task branch.
-- A history rewrite or force-push requires exact user authorization. Preserve
-  the old remote head in a local backup, pin the expected remote head, prove
-  the authorized final-tree invariant, and update only the task branch with
-  force-with-lease. Any lease, tree, target-tip, or authorization mismatch
-  returns `needs_user_action`.
-- CI may automatically retry one exact failed GitHub Actions job on an
-  unchanged PR head when first-party metadata and bounded logs prove either an
-  infrastructure cancellation or an eligible test-execution failure.
-  Infrastructure signatures include a `cancelled` execution step,
-  `The runner has received a shutdown signal`, and
-  `The operation was canceled`. Eligible test jobs are the project's
-  unambiguous UI, instrumentation, connected, smoke, or unit-test jobs after
-  tests actually started; their retryable failures include assertions,
-  fixture/setup or teardown exceptions, emulator/device failures, transport
-  errors, timeouts, and external service `5xx` responses.
-- Retry only that
-  job with `gh run rerun <run-id> --job <job-id>`, at most
-  twice after the original attempt, for three total attempts per logical job.
-  Return every retry to the deterministic watcher and preserve every attempt
-  and failure fingerprint in the CI report. A later green attempt does not
-  erase the earlier flaky or transient evidence.
-- Never automatically retry a user-cancelled or superseded run, an analyzer,
-  compiler, build-configuration, dependency-resolution, packaging, publishing,
-  or release failure, a failure before eligible tests actually started, an
-  ambiguous job identity, or a job after the retry budget is exhausted.
-  `needs_user_action` is reserved for authentication, access, ambiguous
-  identity, contradictory policy, or another actual human decision.
-- An open, green, method-feasible pull request transitions from Waiting PR to
-  a deterministic merge watcher. The watcher performs no model turns or user
-  approvals while relevant state is unchanged. It wakes Waiting PR only for a
-  changed head, requested changes, merge conflict, lost method feasibility,
-  closure, access failure, or another material event. A confirmed merge goes
-  directly to Cleanup.
-- Fix exposes a `pr_merged` recovery edge to Cleanup for a task that was
-  already delivered before stale or late workflow routing reached the writer.
-  The edge requires authoritative PR URL, branch, and merge proof; it never
-  resumes implementation or repeats verification on the merged task branch.
-- Adopting PR prompt changes follows
-  [policy](#execution-history-and-compatibility-policy),
-  including compatibility with retained PR instructions and pending decisions.
-- When the task resolves an issue in the same repository, Prepare PR adds the
-  source-control provider's closing reference (`Fixes #N` on GitHub). A
-  cross-repository, partial, or follow-up relationship is linked without a
-  closing keyword.
+`pr_merge_strategy` is `auto`, `merge`, `squash` or `rebase`. Prepare PR resolves
+it via the project adapter from repository capabilities/target rules/queue
+policy and carries the result. Ambiguous `auto` needs a real decision.
+Generic mergeability is not method feasibility; GitHub rebase requires
+`canBeRebased=true`. Conflicts may be diagnosed by isolated forced replay,
+not task-branch mutation.
 
-### CI limit
-Authority(repo/head/envelope/digest)>projection/grammar/encode; mismatch→ordinary/null; pending waits; late→Cleanup; open→diff; receipt=projected_rows×5; unexpected=sorted−expected; >10,000 before duplicate/terminal.
-Bounded canonical encoder: sorted-key compact UTF-8 parity(ensure_ascii=false,allow_nan=false); strings emitted in escaped pieces; no complete oversized token/string kept; nesting=100; RecursionError→RuntimeContractError; hash 4 MiB+1→hard_limit, not wire; observation_limit=report_invalid/[]/null,count+digest≤2147483647; hard_limit=zero count/empty digests; child≤4 MiB+1→terminate/reap groups; >48 KiB→convert; history bounded.
-Dynamic GitHub (`prepare_ci=2.0.0`, `wait_ci=3.0.0`,
-`wait_pr=3.0.0`, `github_observation=1.0.0`) carries PR identity/`require_ci`;
-observation classifies checks/feedback; fail closed. Release admission is
-separate.
+History rewriting requires exact authority, preserved old remote head,
+final-tree proof and force-with-lease. No direct protected-branch push or
+automatic method fallback.
+
+CI may retry only an exact job on unchanged PR head when bounded first-party
+evidence proves infrastructure cancellation or an unambiguous test-execution
+failure after tests began. Test failures include assertion/fixture/device/
+transport/timeout/service-5xx failures. Preserve run/head/job/attempt and every
+failure fingerprint. Retry at most twice after the original, then return each
+attempt to the deterministic watcher.
+
+Never automatically retry user-cancelled/superseded runs, ambiguous jobs,
+pre-test failures, analyzers, compilation/configuration/dependency resolution,
+packaging, publication or release. Retry allowance grants no other effects.
+
+Deterministic watchers observe checks/feedback/head/base/method together and
+wake only for material changes. Pending state is not user action. A confirmed
+merge goes to Cleanup, including exposed `pr_merged` recovery from stale Fix;
+never repair on the delivered branch for a late check. Exact PR/branch/merge
+proof remains required.
+
+Same-repository completed issues use the provider's closing reference.
+Cross-repository/partial/follow-up links do not claim closure.
 
 ## Smoke policy
 
-- Project profile schema 3 declares one Smoke policy: `disabled`,
-  `conditional`, or `required`.
-- `conditional` keeps the decision in the post-Join gate.
-- Runtime or user-observable impact, explicit acceptance criteria, and
-  uncertainty force Smoke.
-- A bypass requires positive evidence that the change cannot affect a runtime
-  artifact or user-observable behavior.
-- Resource unavailability never downgrades a Smoke requirement; the Smoke node
-  routes it to `needs_user_action`.
-- Gate and Smoke allocate evidence by modality. Runtime covers rendering,
-  focus/navigation, integration, restoration, and liveness. Passing
-  deterministic evidence may cover non-observable defaults, classification,
-  filtering, paging, and state transitions unless explicit end-to-end
-  acceptance requires runtime proof. The workflow never demands profile reset,
-  special fixtures, or test-only product semantics merely to duplicate that
-  evidence.
-- `mobile-smoke-contract.md` owns default authorization, interaction proof,
-  screenshots, side effects, evidence retention, checkpoint recovery, and
-  shared-resource behavior. Project adapters own platform-specific targeting,
-  commands, schemas, form factors, logs, and timestamp boundaries.
-- Required Smoke summaries, reports, and checklists are non-empty and pass the
-  project evidence audit before Compliance.
-- `Engineering Smoke Lab` preserves the project Smoke policy while disabling
-  PR and CI stages, so both Gate branches can be tested cheaply.
-- Smoke Lab rollover uses free-form experimental labels, not semantic versions.
+`disabled`, `conditional` or `required` comes from the profile. Conditional
+Gate evaluates runtime impact, acceptance and uncertainty at the approved
+milestone. Bypass needs positive no-runtime-impact proof; missing resources
+never waive required Smoke.
+
+Allocate runtime/deterministic/hybrid evidence explicitly. Runtime covers
+rendering, navigation, integration, restoration and liveness; passing pure
+deterministic internals need no runtime repetition absent an end-to-end rule.
+Do not demand reset, special fixtures or test-only semantics merely to repeat
+them. Required reports are non-empty and audited. Smoke Lab preserves this
+policy while disabling PR/CI and uses experimental labels.
 
 ## Role resolution
 
-- Plan uses `orchestrator`; Gate uses optional `gate` and otherwise
-  `orchestrator`.
-- Implement uses `implementation`; Fix uses `fix`.
-- Smoke uses `qa`.
-- PR preparation and Cleanup use `release`.
-- CI monitoring and Waiting PR use `ci`.
-- A node assigned to a profile role owns its transition directly and does not
-  start a duplicate child session for that same role.
-- `role-contract.md` owns role behavior boundaries and the separation from Kent
-  model/tool/delegation configuration.
-- Project profiles must map every enabled operational node to a role available
-  from the effective project or global Kent configuration.
-- Independent standards and specification reviews use global read-only roles.
-- Final PR-producing delivery uses a distinct global read-only compliance role
-  after Gate and any required Smoke. It attests the final evidence and
-  authority chain rather than repeating the earlier standards/spec reviews.
-- Standards, Specification, and Compliance nodes are leaf sessions and must
-  perform their bounded pass directly without starting child agents.
-- Implement and Fix must not launch nested final reviewers that duplicate the
-  generated graph's Standards, Specification, or Compliance stages.
-  Standalone review commands may use project-specialized reviewers when no
-  Delivery graph owns the same pass.
+Profile roles: Plan=`orchestrator`; Gate=`gate` or orchestrator;
+Implement=`implementation`; Fix=`fix`; Smoke=`qa`; PR/Cleanup=`release`;
+CI/Waiting PR=`ci`. Effective configuration must actually provide every enabled
+role and tool capability. Role prompts own behavior; Kent configuration owns
+models, reasoning, tools and delegation.
+
+Each assigned node owns its transition directly, without a duplicate same-role
+child. Standards/Spec/Compliance are independent read-only leaves. Writers
+must not duplicate them; standalone review may use callable specialists only
+when no active workflow owns that pass.
 
 ## Workflow retirement
 
-- Preview deletion before confirmation and classify every attached task.
-- Running, approval-waiting, or otherwise active tasks must finish or be
-  explicitly canceled before retirement.
-- Recreate every Backlog task in the replacement workflow before deleting the
-  source workflow. Preserve title, body, source URL, labels, and relevant
-  comments, and record the old-to-new short-ID mapping.
-- Do not move tasks between incompatible workflow graphs. Recreate the Backlog
-  record under the replacement graph instead.
-- Completed and canceled task history may be discarded when the user accepts
-  that consequence; it is not by itself a retirement blocker.
-
-### Release-live
-
-The `release-live-portfolio-plan-v1` is one closed, immutable plan for the fixed
-`<state_dir>/release-live-portfolio.journal.json` receipt and ordered members.
-`preview` is read-only; `prepare` is a separately confirmed durable local
-journal mutation that requires exact `--confirm` equal to the plan SHA-256
-before the fixed pre-D9 receipt, and performs no D9 or Workflow effect.
-`retire` revalidates all remaining preimages before every confirmed delete.
-`apply` revalidates complete D9 and each canonical stage before every effect.
-Effects settle only at exact preimage or postimage; ambiguous or foreign state
-blocks, and only one in-flight effect may exist.
-
-D9 is irreversible after the first confirmed delete. Rollback from `prepared`
-only records `rolled_back` without a live effect. Canonical rollback is a
-separately confirmed forward restore using the same journal; it never rewinds a
-revision, accepts an unjournaled postimage, or completes with an unresolved
-effect. `complete` requires all members and effects verified and a new restore
-plan is required for any later reversal. No create, replacement, Task move,
-link/default change, direct database edit, or caller-supplied effect is allowed.
+Preview deletion, classify attached history and preserve required work/results.
+Active Tasks must finish or have explicit cancellation authority; replacement/
+migration and possible terminal-history loss need applicable approval.
+Do not move Tasks across incompatible graphs or infer deletion authority from
+source retirement. Use supported operations and preserve unknown outcomes.
 
 ## Task-owned cleanup
 
-- Cleanup is report-first and resource-owning; it never removes its own
-  Kent-managed worktree.
-- Cleanup always emits the exact non-empty `git branch --show-current` value,
-  including `no_pr` and `report_only` paths. Sentinel or inferred task-ID
-  branch values are invalid and route Janitor back to Cleanup instead of
-  completing with leaked resources.
-- For managed-worktree profiles, Cleanup emits canonical workspace, task,
-  branch, PR, merge, mode, session, and preflight data to a deterministic Task
-  Janitor script after closing task-owned background shells and scheduling
-  `kent worktree leave`. Janitor verifies that Cleanup no longer targets the
-  task worktree.
-- The Janitor never deletes the primary checkout, dirty or ambiguous state, or
-  content not proven recoverable. A merged-PR cleanup re-queries GitHub and
-  requires the clean local task HEAD to equal or be an ancestor of the exact
-  branch head recorded by that merged PR. This permits safe cleanup after
-  user-authored remote commits without accepting diverged local work.
-- The same-repository remote task branch may be deleted only when its current
-  OID still equals the merged PR head. Local worktree and branch deletion uses
-  Kent's supported worktree command; a squash/rebase branch retained by Kent
-  may be deleted only under the same exact merged-PR proof.
-- No-PR/report-only cleanup requires the clean HEAD to remain reachable from a
-  remote ref. Closed-without-merge work is preserved.
-- Janitor accepts validated terminal/native success only with absent path/Git
-  registration and exact retained metadata identity; `scheduled` is pending.
-- Record preservation in `cleanup_report`. Failure may follow partial Session
-  retargeting: reconcile in Cleanup; no automatic destructive retry or later
-  branch/remote cleanup. See [worktree contract](worktree-contract.md).
-- CI bounds, recovery and Git binding: `workflow-task-janitor` docstring.
+Cleanup is resource-owning and report-first; it never deletes its own managed
+root. Emit actual branch (including no-PR/report-only), canonical workspace,
+Task/Session, mode and declared PR/merge/preflight fields after settling owned
+shells and supported leave. Janitor independently verifies release.
+
+Never delete primary, dirty, ambiguous or unrecoverable state. Merged-PR cleanup
+requires fresh provider proof and local HEAD equal/ancestor of exact PR branch
+head; same-repository remote deletion additionally requires its unchanged OID.
+No-PR/report-only preserves its declared published-recoverability proof;
+closed-unmerged work remains.
+
+Only validated terminal deletion with absent path/registration is success.
+Scheduled/partial/unknown outcomes preserve state and return to capable Cleanup,
+not an automatic destructive retry. See [worktree contract](worktree-contract.md).
 
 ## Project adapter boundary
 
-Each project provides:
+Projects supply contract/profile, executable verification, phase procedures,
+context manifests, optional idempotent setup and required runtime/delivery/
+release adapters. URLs, secrets, wrappers and policy remain project-owned.
+`required_adapters` names executable dependencies; `kit_managed_adapters` is the
+explicit synchronized subset. Validate paths before approved writes; no
+automatic migration or activation.
 
-- `.kent/project-contract.md`;
-- `.kent/workflow-profile.toml`;
-- `.kent/scripts/workflow-verify`;
-- an optional idempotent `.kent/worktrees/setup.sh` conforming to
-  `worktree-contract.md`;
-- canonical project-local role keys;
-- optional Smoke-decision, Smoke-execution, resource-lock, evidence-audit, PR,
-  CI, and release adapters.
+Schema/versioned profile, release and command interfaces are defined by the
+loader and [example profile](project-profile.example.toml). Platform details
+stay in adapters: mobile resources/evidence are conditional dependencies, not
+universal requirements.
 
-Kit provides mcporter and read-only Jira adapters. Projects own URLs,
-credential pointers, servers, wrappers, policy; Kit stores no credentials.
-
-Schema 3 keeps release_topology and known-command sync. Schema 4 requires
-managed commands, exact command_versions, and release fields topology_kind,
-adoption_mode, spec_path, builder_path, and snapshot_path. Managed-in-place
-allows appsome-release-publication, puber-release, slack-reader-release,
-and sdk-merged-main-publication; SDK allows both. Managed needs builder and
-graph intent; metadata-only needs metadata intent, no builder.
-Sync/generation/apply are manual.
-required_adapters lists executable dependencies;
-kit_managed_adapters is the exact Kit subset; others are project-owned.
-Loader is platform-neutral. Conditional or required Android Smoke uses
-mobile_resource_lock and mobile_evidence_audit. Shared code owns lock and
-evidence hygiene; projects own startup, devices, build/install, credentials,
-and acceptance. Synchronizer loads ProjectProfile and preflights paths before
-writes. No automatic migration or activation.
-
-Projects that treat Jira descriptions or comments as planning sources list
-`jira_api` in `required_adapters`, declare its project-local path, and select
-their own `[integrations.jira]` credential namespace. Related repositories may
-share a namespace intentionally; unrelated repositories remain isolated.
-
-For Jira-backed planning, issue relations discover cross-platform evidence, not
-scope. Record root scope separately from related evidence/dependencies/deferred
-issues; follow one graph level, identify siblings from metadata, and resolve
-each to its project-local reference repository. Existing sibling
-implementation/tests are mandatory. Record the relationship, source
-commit/paths, and `checked`, `adopted`, `rejected`, and `conflicts`.
-Requirements/design/API contracts remain authoritative; bounded fingerprints
-are the fallback when relations do not identify a usable sibling.
+Issue relations discover relevant evidence/dependencies, not added scope.
+Inspect linked sibling implementations when relevant to an actual requirement/
+gap, record immutable sources and adopted/rejected differences, and keep root
+authority separate. Do not impose universal sibling reconnaissance.

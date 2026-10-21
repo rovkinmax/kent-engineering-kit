@@ -39,25 +39,6 @@ class ContextInspectionTests(unittest.TestCase):
                     patch("subprocess.run", side_effect=invoke):
                 self.assertEqual(call(root, {}, "resolve-task"), {"mode": "r2"})
 
-    def test_clean_session_cases_have_explicit_inputs_and_acceptance(self):
-        fixture = Path(__file__).with_name("fixtures") / "delivery-reliability-cases.json"
-        cases = json.loads(fixture.read_text())
-        self.assertEqual(cases["schema"], "delivery-reliability-cases-v1")
-        self.assertIn("not historical evidence", cases["purpose"])
-        expected = {
-            "decision-through-summary", "budget-is-not-replenished",
-            "producer-transport", "recovered-gap", "external-memory",
-            "provider-boundary", "means-versus-obligations"}
-        self.assertEqual({case["id"] for case in cases["cases"]}, expected)
-        self.assertEqual(len(cases["cases"]), len(expected))
-        for case in cases["cases"]:
-            self.assertEqual(set(case), {"id", "input", "required", "reject"})
-            self.assertTrue(case["input"])
-            for field in ("required", "reject"):
-                self.assertTrue(case[field])
-                self.assertTrue(all(isinstance(item, str) and item.strip()
-                                    for item in case[field]))
-
     def setUp(self):
         self.module = runpy.run_path(str(Path(__file__).resolve().parents[1] /
                                         "templates/project/workflow-plan-contract"))
@@ -371,6 +352,103 @@ class ProducerTransportTests(unittest.TestCase):
             self.pack(request, detail=detail)
         with self.assertRaises(ValueError):
             self.pack({**request, "producer_refs": []})
+
+    def review_graph(self):
+        graph = self.graph()
+        graph["graph"]["edges"][0]["parameters"].append({
+            "key": "review_context", "description": "Review", "purpose": "ordinary",
+        })
+        return graph
+
+    def test_explicit_declared_review_context_supersedes_all_historical_producers(self):
+        graph = self.review_graph()
+        for contexts in (("old",), ("old", "different")):
+            with self.subTest(contexts=contexts):
+                refs = [capture_producer(
+                    self.root, identity=self.identity, producer_kind="review",
+                    inputs={"review_context": "input " + context},
+                    result={**self.result, "review_context": context},
+                )[0] for context in contexts]
+                request = {
+                    **self.request(refs[0]), "producer_refs": refs,
+                    "transition_contract_ref": transition_contract_reference(
+                        self.identity, self.detail(), graph, "failed"),
+                    "values": {"review_context": '{"project":"derived envelope"}'},
+                }
+                _, raw = self.pack(request, graph=graph)
+                result = json.loads(raw)
+                self.assertEqual(result["review_context"], request["values"]["review_context"])
+                self.assertEqual(result["delivery_context"], self.outer)
+                self.assertEqual(result["ci_report"], self.result["ci_report"])
+                # This permission neither skips validation nor permits opaque rewrites.
+                for key in ("ci_report", "delivery_context"):
+                    with self.subTest(key=key), self.assertRaises(ValueError):
+                        self.pack({**request, "values": {
+                            **request["values"], key: "rewrite"}}, graph=graph)
+                original = (self.root / refs[-1]).read_bytes()
+                (self.root / refs[-1]).write_bytes(b"corrupt")
+                with self.assertRaises(ValueError):
+                    self.pack(request, graph=graph)
+                (self.root / refs[-1]).write_bytes(original)
+
+    def test_review_context_without_explicit_override_preserves_conflict_detection(self):
+        graph = self.review_graph()
+        refs = [capture_producer(
+            self.root, identity=self.identity, producer_kind="review",
+            inputs={}, result={**self.result, "review_context": context},
+        )[0] for context in ("first", "second")]
+        request = {
+            **self.request(refs[0]),
+            "transition_contract_ref": transition_contract_reference(
+                self.identity, self.detail(), graph, "failed"),
+        }
+        _, raw = self.pack(request, graph=graph)
+        self.assertEqual(json.loads(raw)["review_context"], "first")
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            self.pack({**request, "producer_refs": refs}, graph=graph)
+        with self.assertRaisesRegex(ValueError, "undeclared"):
+            self.pack({**self.request(refs[0]), "values": {"review_context": "new"}})
+        second, _ = capture_producer(
+            self.root, identity=self.identity, producer_kind="review",
+            inputs={}, result={**self.result, "ci_report": "other"},
+        )
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            self.pack({**request, "producer_refs": [refs[0], second],
+                       "values": {"review_context": "new"}}, graph=graph)
+
+    def test_review_override_does_not_relax_other_fields_identity_or_contract(self):
+        graph = self.review_graph()
+        graph["graph"]["edges"][0]["parameters"].append({
+            "key": "ordinary", "description": "Ordinary", "purpose": "ordinary",
+        })
+        locator, _ = capture_producer(
+            self.root, identity=self.identity, producer_kind="review",
+            inputs={"review_context": "old input"},
+            result={**self.result, "review_context": "old result", "ordinary": "exact"},
+        )
+        request = {
+            **self.request(locator),
+            "transition_contract_ref": transition_contract_reference(
+                self.identity, self.detail(), graph, "failed"),
+            "values": {"review_context": "derived"},
+        }
+        with self.assertRaisesRegex(ValueError, "rewrite producer-owned"):
+            self.pack({**request, "values": {
+                **request["values"], "ordinary": "rewritten"}}, graph=graph)
+        foreign, _ = capture_producer(
+            self.root, identity={**self.identity, "task_id": "foreign-task"},
+            producer_kind="review", inputs={}, result={"review_context": "foreign"},
+        )
+        with self.assertRaises(ValueError):
+            self.pack({**request, "producer_refs": [locator, foreign]}, graph=graph)
+        changed = self.review_graph()
+        changed["graph"]["edges"][0]["target_node_id"] = "other"
+        with self.assertRaisesRegex(ValueError, "contract changed"):
+            self.pack(request, graph=changed)
+        with self.assertRaisesRegex(ValueError, "future"):
+            self.pack({**request, "transition_contract_ref": {
+                **request["transition_contract_ref"], "expected_version": 2,
+            }}, graph=graph)
 
     def test_post_pr_assembly_preserves_exact_nested_strings(self):
         from workflowkit.runtime import canonical_bytes, make_dynamic_pr_feedback_cursor

@@ -16,7 +16,7 @@ tests, architecture rules, and release procedures.
 
 | When you need to… | The Kit provides… |
 | --- | --- |
-| Understand an unfamiliar codebase | Guided exploration and domain modeling |
+| Understand an unfamiliar codebase | Guided exploration of its structure, terminology, and constraints |
 | Choose an approach | Design alternatives, architectural analysis, and grill critique |
 | Make a change | Planning, focused implementation, and test-driven slices |
 | Check the result | Independent reviews, project-owned verification, and optional runtime checks |
@@ -51,14 +51,6 @@ Prefer a guided conversation? Start with prompts for
 [reviewing a change](prompts/review-change.md), or
 [migrating Tasks](prompts/migrate-tasks.md).
 
-Use `migrate-tasks` with predecessor Tasks as arguments to prepare a reviewed
-successor migration. It preserves decisions, source work, dependencies and
-resource ownership, checks continuation/recovery contracts, and ends
-migration-only observation at the agreed handoff. Creation, execution and
-cancellation need explicit effect approvals; transfer is not product acceptance.
-The existing installer discovers it alongside other prompts. A PR does not
-install it or change locked Sessions; installation is separately authorized.
-
 ### Give a project a delivery workflow
 
 A project profile connects the Kit to your repository's tools and procedures.
@@ -71,6 +63,10 @@ Understand → Plan → Implement → Verify → Pull request → Cleanup
 The selected profile determines the actual stages, approvals, reviews, and
 optional runtime or release steps. You keep control of consequential decisions;
 the project defines how success is checked.
+
+Reviews check the obligations due at the agreed delivery stage. A review-ready
+PR can still have explicitly deferred external checks; it is not proof of full
+product acceptance or permission to merge or release.
 
 The Kit coordinates the work. Your repository remains responsible for its
 architecture, credentials, integrations, build environment, and release policy.
@@ -138,10 +134,26 @@ added tables. Reverting the source PR alone does not change the installed config
 | [Adapters](adapters/README.md) | Opt-in platform and integration support |
 | [Operations](docs/OPERATIONS.md) | Installation, project setup, and maintenance |
 | [Contracts](contracts/) | Precise workflow, role, and safety rules |
+| [Workflow engine](workflowkit/) | Profile parsing, graph generation, evidence transport, and runtime checks |
+| [Project templates](templates/project/) | Executable helpers adopted through project setup |
+| [Scripts](scripts/) | Installation, generation, synchronization, and validation entry points |
+| [Role configuration](config/subagents.toml) | Models, tools, and delegation settings, separate from role behavior |
+| [Kit project](.kent/) | This repository's own profile, procedures, and current generated workflow |
+| [Tests](tests/) | Contract, integration, and failure-path checks |
 
 ## Developing the Kit itself
 
 Start with the [development and source-selection preflight guide](docs/OPERATIONS.md#developing-the-kit).
 It covers verification and the separation between source changes and the
-installed Kit. Changes follow the [Kit change process](contracts/kit-change-governance.md);
+installed Kit. Changes follow [global governance](global/AGENTS.md#authority-and-decisions);
 a source PR does not update installed tools or live workflows.
+
+The Kit's own workflow has one [current source snapshot](.kent/workflows/kit-engineering-delivery.current.spec.json),
+built by its [project builder](.kent/workflows/kit_development.py). Historical
+source revisions belong in Git, not parallel workflow snapshots. Generated
+project helpers remain checked in so a selected revision has its executable
+dependencies; update them through the qualified generation tools.
+
+For source-only validation, run `./scripts/validate`. The development workflow
+uses the configured verifier to retain the result, log, and source identity.
+Neither check installs the Kit or changes running Tasks.

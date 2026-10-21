@@ -11,11 +11,9 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from unittest import mock
 
-from workflowkit.delivery import owner_replan_instruction
 from workflowkit.model import SpecError
 
 
@@ -197,6 +195,25 @@ class TmpdirIdentityContractTest(IdentityFixtureTest):
 
 
 class DeliveryBaselineFixtureTest(unittest.TestCase):
+    def test_focused_identity_then_wrapper_invokes_validator_once(self):
+        root = self.fixture()
+        identity = self.run_identity(root)
+        self.assertEqual(identity.returncode, 0, identity.stderr)
+        self.assertFalse((root / ".fixture-validation-count").exists())
+        wrapped = self.run_wrapper(root)
+        self.assertEqual(wrapped.returncode, 0, wrapped.stderr)
+        payload = json.loads(wrapped.stdout)
+        self.assertEqual(payload["verification_status"], "passed")
+        report = json.loads(payload["verification_report"])
+        log = (root / report["log_path"]).read_text()
+        identities = [
+            json.loads(line.split(" ", 2)[2]) for line in log.splitlines()
+            if line.startswith("KENT_VERIFICATION_IDENTITY ")
+        ]
+        self.assertEqual(len(identities), 2, log)
+        self.assertEqual(identities[0], identities[1])
+        self.assertEqual((root / ".fixture-validation-count").read_text().strip(), "1")
+
     def private_tmpdir(self, root: Path) -> str:
         path = root / "build/kent-workflow/.verify-tmp-fixture"
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -293,116 +310,6 @@ class DeliveryBaselineFixtureTest(unittest.TestCase):
             check=False,
         )
 
-    def test_baseline_counting_validator_requires_direct_and_wrapper_runs(self) -> None:
-        root = self.fixture()
-        direct = self.run_child(root)
-        self.assertEqual(direct.returncode, 0, direct.stderr)
-        self.assertEqual(json.loads(direct.stdout), {"transition": "passed"})
-
-        wrapped = self.run_wrapper(root)
-        self.assertEqual(wrapped.returncode, 0, wrapped.stderr)
-        wrapped_payload = json.loads(wrapped.stdout)
-        self.assertEqual(
-            wrapped_payload["verification_status"],
-            "passed",
-            wrapped.stdout,
-        )
-        self.assertEqual((root / ".fixture-validation-count").read_text().strip(), "2")
-        report = json.loads(wrapped_payload["verification_report"])
-        log = (root / report["log_path"]).read_text()
-        identity_lines = [
-            line for line in log.splitlines()
-            if line.startswith("KENT_VERIFICATION_IDENTITY ")
-        ]
-        self.assertEqual(len(identity_lines), 2, log)
-
-    def test_after_focused_identity_check_then_one_real_wrapper_run(self) -> None:
-        root = self.fixture()
-        identity_started = time.monotonic()
-        identity_result = self.run_identity(root)
-        identity_elapsed = time.monotonic() - identity_started
-        self.assertEqual(identity_result.returncode, 0, identity_result.stderr)
-        identity = json.loads(identity_result.stdout)
-
-        wrapper_started = time.monotonic()
-        wrapped = self.run_wrapper(root)
-        wrapper_elapsed = time.monotonic() - wrapper_started
-        self.assertEqual(wrapped.returncode, 0, wrapped.stderr)
-        wrapped_payload = json.loads(wrapped.stdout)
-        self.assertEqual(wrapped_payload["verification_status"], "passed")
-        report = json.loads(wrapped_payload["verification_report"])
-        log = (root / report["log_path"]).read_text()
-        identity_lines = [
-            line for line in log.splitlines()
-            if line.startswith("KENT_VERIFICATION_IDENTITY ")
-        ]
-        self.assertEqual(len(identity_lines), 2, log)
-        logged_before = json.loads(identity_lines[0].split(" ", 2)[2])
-        logged_after = json.loads(identity_lines[1].split(" ", 2)[2])
-        self.assertEqual(logged_before, logged_after)
-        self.assertEqual(
-            (root / ".fixture-validation-count").read_text().strip(),
-            "1",
-        )
-
-        artifact_root = ROOT / "build/kent-workflow/KEN-5/step-4"
-        artifact_root.mkdir(parents=True, exist_ok=True)
-        # Later verifier runs must not overwrite the original comparison evidence.
-        artifact = Path(tempfile.mkdtemp(prefix="after-", dir=artifact_root)) / "after-sequence.json"
-        artifact.write_text(
-            json.dumps(
-                {
-                    "schema": "ken-5-after-sequence-v1",
-                    "sample_boundary": (
-                        "One disposable Git fixture; focused identity/protocol "
-                        "check followed by one configured descriptor-launched "
-                        "wrapper validation."
-                    ),
-                    "fixed_point": (
-                        "c506961e6498530fcb43636412e18a699c9f0f3d"
-                    ),
-                    "source": {
-                        "head": identity["head"],
-                        "source_sha256": identity["source_sha256"],
-                    },
-                    "environment": {
-                        "environment_sha256": identity["environment_sha256"],
-                    },
-                    "runs": [
-                        {
-                            "label": "focused identity/protocol check",
-                            "command": (
-                                "kit-verification-identity.py "
-                                "--workspace <temporary fixture>"
-                            ),
-                            "exit_code": identity_result.returncode,
-                            "result": {"identity_captured": True},
-                            "elapsed_seconds": identity_elapsed,
-                        },
-                        {
-                            "label": "configured wrapper full validator",
-                            "command": (
-                                "./.kent/scripts/workflow-verify-report "
-                                "(descriptor-launched child)"
-                            ),
-                            "exit_code": wrapped.returncode,
-                            "result": {
-                                "verification_status": wrapped_payload[
-                                    "verification_status"
-                                ]
-                            },
-                            "log_sha256": report["log_sha256"],
-                            "identity_lines": 2,
-                            "elapsed_seconds": wrapper_elapsed,
-                        },
-                    ],
-                    "validator_invocations": 1,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
-        )
 
     def test_compile_output_has_matching_closed_identity_lines(self) -> None:
         root = self.fixture()
@@ -531,156 +438,64 @@ class DeliveryBaselineFixtureTest(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), {"transition": "blocked"})
         self.assertIn("escapes workspace", result.stderr)
 
-    def test_implement_procedure_assigns_full_run_to_configured_verifier(self) -> None:
-        procedure = (ROOT / ".kent/commands/implement.md").read_text()
-        self.assertIn("focused production-shaped checks", procedure)
-        self.assertIn("configured verifier owns one fresh full", procedure)
-        self.assertNotIn(
-            "Run relevant local tests and `./scripts/validate",
-            procedure,
-        )
-
-    def test_delivery_surfaces_share_identity_and_report_ownership(self) -> None:
-        fix = (ROOT / ".kent/commands/fix.md").read_text()
-        ship = (ROOT / ".kent/commands/ship-pr.md").read_text()
-        contract = (ROOT / ".kent/project-contract.md").read_text()
-        for text in (
-            "configured verifier owns the one fresh full source validation",
-            "source/environment identity",
-        ):
-            self.assertIn(text, fix)
-        for text in (
-            "typed verification report",
-            "matching before/after source and environment\nidentity references",
-        ):
-            self.assertIn(text, ship)
-        for text in (
-            "source_sha256",
-            "environment_sha256",
-            "Gate `review_context`",
-            "Optional writer, PR and approval narratives reference",
-        ):
-            self.assertIn(text, contract)
-        for path in (
-            ROOT / ".kent/context/implement.md",
-            ROOT / ".kent/context/review.md",
-            ROOT / ".kent/context/delivery.md",
-        ):
-            self.assertIn(".kent/project-contract.md", path.read_text())
-        operations = (ROOT / "docs/OPERATIONS.md").read_text()
-        self.assertIn("focused production-shaped wrapper/helper checks", operations)
-        self.assertIn("source/environment identity references", operations)
-
 
 class CurrentKitGraphTest(unittest.TestCase):
-    def profile(self, *, current: bool = False, complexity: bool = False):
-        profile = kit.profile_at(ROOT, check_files=False)
-        policies = {
-            key: value for key, value in profile.policies.items()
-            if key != "delivery_reliability"
-        }
-        policies["coder_selection"] = "complexity" if complexity else "disabled"
-        if current:
-            policies["delivery_reliability"] = "v1"
-        return replace(
-            profile, policies=policies,
-            commands=dict(
-                kit.CURRENT_COMMAND_TARGETS if current else kit.COMMAND_TARGETS
-            ),
-        )
-
-    def test_current_requires_opt_in_complete_commands_and_continuous_writer(self):
-        legacy = self.profile()
-        current = self.profile(current=True)
-        for invalid in (
-            legacy,
-            replace(current, commands=kit.COMMAND_TARGETS),
-            replace(current, policies={**current.policies, "delivery_reliability": "v2"}),
-            replace(current, policies={**current.policies, "writer_sessions": "fresh_per_slice"}),
-        ):
-            with self.subTest(policies=invalid.policies), self.assertRaises(SpecError):
-                kit.build_current_workflow(invalid)
-
-    def test_current_preserves_selected_baseline_and_existing_edge_contracts(self):
+    def test_current_graph_modes_and_retained_replan_contract(self):
         for complexity in (False, True):
             with self.subTest(complexity=complexity):
-                legacy = self.profile(complexity=complexity)
-                current = self.profile(current=True, complexity=complexity)
-                baseline = (
-                    kit.build_complexity_candidate_workflow(legacy)
-                    if complexity else kit.build_workflow(legacy)
-                )
-                graph = kit.build_current_workflow(current)
+                graph = kit.build_current_workflow(self.profile(complexity=complexity))
                 graph.validate()
-                self.assertEqual(graph.name, baseline.name)
-                self.assertEqual(graph.execution_target, baseline.execution_target)
-                self.assertEqual(graph.nodes, baseline.nodes)
-                before = {edge.key: edge for edge in baseline.edges}
-                after = {edge.key: edge for edge in graph.edges}
-                self.assertEqual(after.keys() - before.keys(), {"implement_replan"})
-                self.assertFalse(before.keys() - after.keys())
-                for key, edge in before.items():
-                    self.assertEqual(replace(after[key], prompt=edge.prompt), edge, key)
-                route = after["implement_replan"]
-                self.assertEqual(
-                    (route.source, route.transition, route.target, route.context,
-                     route.context_source, route.requires_approval),
-                    ("implement", "implement_replan", "plan_revalidation", "continue_session",
-                     "node:plan", False),
-                )
-                self.assertEqual(route.parameters, after["fix_replan"].parameters)
-                self.assertEqual(route.prompt, after["fix_replan"].prompt)
-                self.assertIn("replan", after["plan_contract_continue_implement"].prompt)
+                edges = {edge.key: edge for edge in graph.edges}
+                self.assertEqual(graph.execution_target, "default-branch")
                 self.assertEqual(
                     (len(graph.nodes),
                      len({(edge.source, edge.transition) for edge in graph.edges}),
                      len(graph.edges)),
                     (21, 55, 56) if complexity else (21, 53, 54),
                 )
+                route = edges["implement_replan"]
                 self.assertEqual(
-                    [edge.key for edge in graph.edges if edge.requires_approval],
-                    [edge.key for edge in baseline.edges if edge.requires_approval],
+                    (route.source, route.target, route.context, route.context_source),
+                    ("implement", "plan_revalidation", "continue_session", "node:plan"),
                 )
-                self.assertTrue(after["plan_review_accept"].requires_approval)
+                self.assertEqual(route.parameters, edges["fix_replan"].parameters)
+                self.assertFalse(route.requires_approval)
+                self.assertTrue(edges["plan_review_accept"].requires_approval)
+                self.assertFalse(edges["prepare_pr_fix"].requires_approval)
+                self.assertFalse(edges["waiting_pr_fix"].requires_approval)
+                for node in graph.nodes:
+                    if node.kind == "agent":
+                        self.assertEqual(node.completion_mode, "shell_command")
 
-    def test_historical_builders_ignore_only_current_opt_in(self):
-        legacy = self.profile()
-        current = self.profile(current=True)
-        original_policies = dict(current.policies)
-        original_commands = dict(current.commands)
-        for build, shape in (
-            (kit.build_workflow, (21, 52, 53)),
-            (kit.build_complexity_candidate_workflow, (21, 54, 55)),
-        ):
-            graph = build(current)
-            self.assertEqual(graph, build(legacy))
-            self.assertEqual(
-                (len(graph.nodes),
-                 len({(edge.source, edge.transition) for edge in graph.edges}),
-                 len(graph.edges)), shape,
-            )
-            self.assertNotIn("implement_replan", {edge.key for edge in graph.edges})
-        self.assertEqual(current.policies, original_policies)
-        self.assertEqual(current.commands, original_commands)
+    def profile(self, *, complexity: bool = False):
+        profile = kit.profile_at(ROOT, check_files=False)
+        policies = dict(profile.policies)
+        policies["coder_selection"] = "complexity" if complexity else "disabled"
+        return replace(
+            profile, policies=policies,
+            commands=dict(kit.CURRENT_COMMAND_TARGETS),
+        )
 
-    def test_r2_replanning_reads_external_authority_without_cache_repair(self):
-        legacy = owner_replan_instruction(self.profile())
-        current = owner_replan_instruction(self.profile(current=True))
-        self.assertNotIn("workflow-project-memory", legacy)
-        for required in (
-            "resolve-task", "check-plan", "resolve-plan", "exact native",
-            "current working head", "original\napproval/review locators",
-            "missing local plan-contract cache does\nnot mean missing approval",
-            "must not recreate the cache", "helper-resolved legacy",
-            "schema_version=1",
+    def test_current_requires_opt_in_complete_commands_and_continuous_writer(self):
+        current = self.profile()
+        for invalid in (
+            replace(current, policies={
+                key: value for key, value in current.policies.items()
+                if key != "delivery_reliability"
+            }),
+            replace(current, commands={
+                key: value for key, value in current.commands.items()
+                if key not in kit.MEMORY_COPIES
+            }),
+            replace(current, policies={**current.policies, "delivery_reliability": "v2"}),
+            replace(current, policies={**current.policies, "writer_sessions": "fresh_per_slice"}),
         ):
-            self.assertIn(required, current)
-        self.assertIn("plan_change_report", current)
-        self.assertIn("grants no expanded source", current)
+            with self.subTest(policies=invalid.policies), self.assertRaises(SpecError):
+                kit.build_current_workflow(invalid)
 
 
 class CurrentKitBootstrapTest(unittest.TestCase):
-    def fixture(self, *, current: bool = True) -> Path:
+    def fixture(self) -> Path:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name).resolve()
@@ -704,20 +519,6 @@ class CurrentKitBootstrapTest(unittest.TestCase):
                      root / "scripts/sync-project-adapters")
         profile = (ROOT / ".kent/workflow-profile.toml").read_text()
         profile = re.sub(r"(?ms)^\[project_memory\]\n.*?(?=^\[|\Z)", "", profile)
-        profile = re.sub(
-            r"(?m)^(?:delivery_reliability|project_memory|project_memory_core)\s*=.*\n",
-            "", profile,
-        )
-        if current:
-            profile = profile.replace(
-                "[policies]\n", '[policies]\ndelivery_reliability = "v1"\n',
-            ).replace(
-                "[commands]\n",
-                "[commands]\n" + "".join(
-                    f'{key} = "{kit.CURRENT_COMMAND_TARGETS[key]}"\n'
-                    for key in kit.MEMORY_COPIES
-                ),
-            )
         (root / ".kent/workflow-profile.toml").write_text(profile)
         return root
 
@@ -735,23 +536,19 @@ class CurrentKitBootstrapTest(unittest.TestCase):
             for path in root.rglob("*") if path.is_file() and not path.is_symlink()
         }
 
-    def test_explicit_materialization_supports_legacy_and_current_closures(self):
-        for current in (False, True):
-            with self.subTest(current=current):
-                root = self.fixture(current=current)
-                self.assertFalse((root / kit.CURRENT_COMMAND_TARGETS["project_memory"]).exists())
-                kit.bootstrap(root)
-                kit.verify_command_closure(root)
-                before = self.snapshot(root)
-                kit.bootstrap(root)
-                self.assertEqual(self.snapshot(root), before)
-                for key, source in kit.MEMORY_COPIES.items():
-                    target = root / kit.CURRENT_COMMAND_TARGETS[key]
-                    self.assertEqual(target.exists(), current)
-                    if current:
-                        self.assertFalse(target.is_symlink())
-                        self.assertEqual(target.read_bytes(), (ROOT / source).read_bytes())
-                        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+    def test_explicit_materialization_supports_complete_current_closure(self):
+        root = self.fixture()
+        self.assertFalse((root / kit.CURRENT_COMMAND_TARGETS["project_memory"]).exists())
+        kit.bootstrap(root)
+        kit.verify_command_closure(root)
+        before = self.snapshot(root)
+        kit.bootstrap(root)
+        self.assertEqual(self.snapshot(root), before)
+        for key, source in kit.MEMORY_COPIES.items():
+            target = root / kit.CURRENT_COMMAND_TARGETS[key]
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(target.read_bytes(), (ROOT / source).read_bytes())
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
 
     def test_memory_drift_blocks_before_any_generated_write(self):
         root = self.fixture()
@@ -808,16 +605,27 @@ class CurrentKitBootstrapTest(unittest.TestCase):
 
     def test_current_cli_materialization_parity_and_stale_failure_are_source_only(self):
         root = self.fixture()
+        before = self.snapshot(root)
+        result = self.run_builder(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        default_graph = json.loads(result.stdout)
+        self.assertEqual(before, self.snapshot(root))
         result = self.run_builder(root, "--bootstrap", "--write-current-spec")
         self.assertEqual(result.returncode, 0, result.stderr)
         current = root / kit.CURRENT_SPEC_PATH
         graph = json.loads(current.read_text())
+        self.assertEqual(graph, default_graph)
         self.assertEqual(graph["name"], "Kit Engineering Delivery v5")
         self.assertIn("implement_replan", {edge["key"] for edge in graph["edges"]})
-        self.assertFalse((root / kit.SPEC_PATH).exists())
-        self.assertFalse((root / kit.CANDIDATE_SPEC_PATH).exists())
+        self.assertEqual(
+            list((root / ".kent/workflows").glob("*.spec.json")), [current],
+        )
         before = self.snapshot(root)
-        result = self.run_builder(root, "--check-current")
+        for flag in ("--check", "--check-current"):
+            result = self.run_builder(root, flag)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(before, self.snapshot(root))
+        result = self.run_builder(root, "--write-spec")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(before, self.snapshot(root))
         current.write_text("{}\n")
@@ -830,10 +638,11 @@ class CurrentKitBootstrapTest(unittest.TestCase):
     def test_check_current_rejects_bootstrap_before_any_write(self):
         root = self.fixture()
         before = self.snapshot(root)
-        result = self.run_builder(root, "--check-current", "--bootstrap")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("cannot be combined with --bootstrap", result.stderr)
-        self.assertEqual(before, self.snapshot(root))
+        for flag in ("--check", "--check-current"):
+            result = self.run_builder(root, flag, "--bootstrap")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot be combined with --bootstrap", result.stderr)
+            self.assertEqual(before, self.snapshot(root))
 
     def test_current_spec_symlink_is_never_read_or_overwritten(self):
         root = self.fixture()

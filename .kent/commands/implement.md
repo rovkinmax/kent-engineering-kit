@@ -1,53 +1,42 @@
-# Implement
+# Implement and Fix
 
-Verify approved preview, both same-hash PASS receipts, human approval and
-plan-contract input before editing. Work only in the selected managed root
-and approved file set. Preserve existing unrelated changes and the immutable
-task `fixed_point`; do not mirror Kent lifecycle in project metadata.
+Read the accepted preview, both same-hash independent PASS receipts and the
+original human approval before editing. Work in the assigned managed root
+and approved file set; preserve unrelated changes and the task `fixed_point`.
+Keep discoverable references to those sources in existing Task evidence.
+Recover missing agent bookkeeping from original sources; do not invent
+consent or request the same decision merely to repair a record.
 
-Use the task-fixed storage mode returned by the project-memory adapter. For R2,
-read the external accepted plan and publish verified progress with its exact
-working revision token. Do not edit immutable content or replace a missing
-local cache with a new plan. Keep legacy task paths unchanged. A stale token
-requires reading and reconciling the current document, not overwriting it.
+Resolve task-fixed storage through the project-memory adapter. R2 progress
+uses protected writes with the exact working revision; never edit immutable
+revisions or create a `.todo` fallback. Preserve legacy Task paths.
 
-On the first accepted entry and after material plan revalidation, preserve
-discoverable references to the original human decision, approved preview
-ScopeHash and both same-hash PASS receipts in existing Task evidence outside
-the managed root. Verify original sources and read back the retained record;
-reference an existing adequate record instead of duplicating authority. Keep
-these references discoverable, not only transient `review_context`. An
-agent-authored receipt points to the original decision; it does not replace it.
-Do not repeat this capture on every writer slice when the approved scope and
-verified record are unchanged.
+Continue ready writer-owned steps and publish progress after focused checks
+pass. Workflow review, runtime acceptance and delivery are downstream work,
+not writer checkboxes. Use authoritative templates for generated commands;
+materialize only when that source update is approved.
 
-Recover missing bookkeeping from accessible original sources within a bounded
-inspection. A pending approval or downstream progression alone does not prove
-consent. If the original decision is inaccessible or references conflict,
-preserve the evidence and report that exact gap before editing; do not invent
-an audit API, substitute an agent summary, or ask for the same decision again
-merely to fill an agent-owned record. Use existing Task evidence interfaces;
-do not add approval fields to the accepted-plan cache or a parallel registry.
+For bugs, establish a deterministic reproduction before production edits.
+Run affected tests and focused production-shaped wrapper/helper checks.
+The configured verifier owns one fresh full `./scripts/validate` run after
+writer bookkeeping. Carry its typed report/log and matching source/environment
+identity through the existing handoff; uncertainty requires fresh verification.
+Do not run `--installed-state`, install tools, change global state or perform
+consumer rollout under source-only authority.
 
-The writer is continuous. Implement ready writer-owned steps, updating only
-their progress and appending evidence as each completes. Do not add review,
-verification, PR, CI or cleanup checkboxes as writer prerequisites. Hard bugs
-require deterministic reproduction before production edits. Use authoritative
-template sources and explicit approved materialization for generated files;
-never patch generated copies.
+## Fix entry
 
-Run affected unit tests and focused production-shaped checks from this
-checkout, including the configured wrapper and any applicable terminal-helper
-admission fixtures. The configured verifier owns one fresh full
-`./scripts/validate` run after writer bookkeeping; the writer does not
-duplicate that full run. Carry the accepted preview, verification
-report/log and before/after identity references through the existing
-handoff. Missing or mismatched identity requires fresh verification.
-No `--installed-state`, installs, global changes, Android/device operations
-or consumer rollout. Report failures truthfully.
-Pass finished work to existing verification dispatch; deterministic checks
-and Standards review are read-only and return through Join/Gate.
+Reproduce and repair verified task-scoped findings, preserving earlier passing
+work. A proven earlier-step regression may be repaired anywhere within the
+full approved file boundary; baseline debt and target-only failures do not
+become Task work. Refresh affected evidence after repair.
 
-For explicitly report-only/no-repair authority, perform inspection and
-verification only: no tracked or staged writes, including plan progress.
-Report candidate defects for repair under separate authority.
+A substantive accepted-plan discrepancy goes to retained Plan Revalidation
+before production edits. New scope/effects require reviewed approval; ordinary
+in-scope corrections do not. Keep review-ready delivery distinct from final
+business acceptance and retain downstream obligations with owner/milestone.
+
+Explicit report-only/no-repair authority permits inspection and checks only,
+including no tracked or staged plan edits. Report findings for the capable
+repair owner. Otherwise hand completed writer work to existing verification
+dispatch with changed files, checks, remaining work and blockers.

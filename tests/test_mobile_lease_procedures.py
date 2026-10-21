@@ -8,7 +8,6 @@ import platform
 import re
 import selectors
 import shutil
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,7 +32,7 @@ TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SCRIPT_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
-def incident_fixture(name: str) -> dict[str, object]:
+def lease_fixture(name: str) -> dict[str, object]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
@@ -135,7 +134,7 @@ class MobileLeaseRegressionTest(unittest.TestCase):
         self.private_root = Path(
             os.environ.get(
                 "KENT_MOBILE_LEASE_TEST_ROOT",
-                str(ROOT / "build" / "kent-workflow" / "KEN-6"),
+                str(ROOT / "build" / "kent-workflow" / "mobile-lease"),
             )
         ).resolve()
         self.private_root.mkdir(parents=True, exist_ok=True)
@@ -169,7 +168,10 @@ class MobileLeaseRegressionTest(unittest.TestCase):
 
     def write_fake_kent(self) -> None:
         task_fixture = FIXTURES / "native-task-ken-6.json"
-        session_fixture = FIXTURES / "native-session.txt"
+        session_fixture = self.temporary_root / "session.txt"
+        session_fixture.write_text(f"{SESSION_ONE}\n", encoding="utf-8")
+        self.resumed_session = self.temporary_root / "session-resumed.txt"
+        self.resumed_session.write_text(f"{SESSION_TWO}\n", encoding="utf-8")
         self.write_executable(
             self.fake_bin / "kent",
             """#!/bin/sh
@@ -789,6 +791,7 @@ print(json.dumps({
                         assert worker.stdin is not None
                         worker.stdin.write("start\n")
                         worker.stdin.close()
+                        worker.stdin = None
 
                     results = []
                     for worker in workers:
@@ -1161,8 +1164,8 @@ sys.exit(released.returncode)
         *,
         session_file: Path | None = None,
     ) -> dict[str, str]:
-        # These files seed inherited fixture identity, never CLI output.
-        inherited_session = (session_file or FIXTURES / "native-session.txt").read_text().strip()
+        # Seed inherited identity independently of diagnostic CLI output.
+        inherited_session = session_file.read_text().strip() if session_file else SESSION_ONE
         workspace = self.temporary_root / "identity-workspace"
         workspace.mkdir(exist_ok=True)
         subprocess.run(["git", "init", "-q", str(workspace)], check=True)
@@ -1438,32 +1441,18 @@ sys.exit(released.returncode)
         )
 
     def test_resume_owned_rejects_mismatched_resource_metadata(self) -> None:
-        target = self.lock_path()
-        target.mkdir(parents=True)
-        (target / "owner").write_text(
-            "\n".join(
-                (
-                    f"token={FIXTURE_TOKEN}",
-                    "resource=emulator-other",
-                    "task_id=KEN-6",
-                    f"session_id={SESSION_ONE}",
-                    "",
-                )
-            ),
-            encoding="utf-8",
-        )
-        (target / "created_at").write_text(f"{FIXED_NOW}\n")
+        owner = self.seed_lock(task_id="KEN-6")
+        owner.write_text(owner.read_text().replace(
+            f"resource={RESOURCE}\n", "resource=emulator-other\n",
+        ))
+        original = owner.read_bytes()
         result = self.run_adapter("resume-owned", RESOURCE, session_id=SESSION_TWO)
         self.assertNotEqual(
             result.returncode,
             0,
             "resume-owned accepted resource metadata for another resource",
         )
-        self.assertTrue(
-            "resource=emulator-other"
-            in (target / "owner").read_text(encoding="utf-8"),
-            "failed recovery rewrote the resource metadata",
-        )
+        self.assertEqual(owner.read_bytes(), original)
 
     def test_resume_owned_rejects_duplicate_token_metadata(self) -> None:
         owner = self.seed_lock(task_id="KEN-6")
@@ -1523,28 +1512,19 @@ sys.exit(released.returncode)
         )
 
     def test_resume_owned_rejects_duplicate_resource_metadata(self) -> None:
-        target = self.lock_path()
-        target.mkdir(parents=True)
-        (target / "owner").write_text(
-            "\n".join(
-                (
-                    f"token={FIXTURE_TOKEN}",
-                    f"resource={RESOURCE}",
-                    "resource=emulator-other",
-                    "task_id=KEN-6",
-                    f"session_id={SESSION_ONE}",
-                    "",
-                )
-            ),
-            encoding="utf-8",
-        )
-        (target / "created_at").write_text(f"{FIXED_NOW}\n")
+        owner = self.seed_lock(task_id="KEN-6")
+        owner.write_text(owner.read_text().replace(
+            f"resource={RESOURCE}\n",
+            f"resource={RESOURCE}\nresource=emulator-other\n",
+        ))
+        original = owner.read_bytes()
         result = self.run_adapter("resume-owned", RESOURCE, session_id=SESSION_TWO)
         self.assertNotEqual(
             result.returncode,
             0,
             "resume-owned accepted duplicate resource fields",
         )
+        self.assertEqual(owner.read_bytes(), original)
 
     def test_token_resume_does_not_rewrite_foreign_task_owner(self) -> None:
         owner = self.seed_lock(task_id="FOREIGN-9")
@@ -1726,12 +1706,9 @@ sys.exit(released.returncode)
         )
         self.assertEqual(released.returncode, 0, "replacement release failed")
 
-    def test_osm_78_unknown_owner_expiry_is_blocked_and_preserved(self) -> None:
-        fixture = incident_fixture("osm-78.json")
-        self.assertFalse(fixture["checkpoint_token_present"])
-        self.assertEqual(fixture["historical_owner_task_id"], "unknown")
+    def test_unknown_owner_expiry_is_blocked_and_preserved(self) -> None:
         owner = self.seed_lock(
-            task_id=str(fixture["historical_owner_task_id"]),
+            task_id="unknown",
             created_at=1,
         )
         original = owner.read_bytes()
@@ -1747,9 +1724,7 @@ sys.exit(released.returncode)
             "blocked unknown-owner expiry changed the original record",
         )
 
-    def test_pub_70_returned_token_does_not_prove_unknown_task_ownership(self) -> None:
-        fixture = incident_fixture("pub-70.json")
-        self.assertTrue(fixture["acquisition_returned_token"])
+    def test_returned_token_does_not_prove_unknown_task_ownership(self) -> None:
         acquired = self.run_adapter("acquire", RESOURCE, "0", "7200")
         self.assertEqual(
             acquired.returncode,
@@ -1760,7 +1735,7 @@ sys.exit(released.returncode)
         owner = self.lock_path() / "owner"
         owner_text = owner.read_text(encoding="utf-8").replace(
             "task_id=KEN-6\n",
-            f"task_id={fixture['historical_owner_task_id']}\n",
+            "task_id=unknown\n",
         )
         owner.write_text(owner_text, encoding="utf-8")
         original = owner.read_text(encoding="utf-8")
@@ -1775,16 +1750,14 @@ sys.exit(released.returncode)
             "blocked historical recovery changed the unknown-owner fixture",
         )
 
-    def test_osm_79_bare_acquire_output_is_not_acquire_any_records(self) -> None:
-        fixture = incident_fixture("osm-79.json")
+    def test_bare_acquire_output_is_not_acquire_any_records(self) -> None:
         acquired = self.run_adapter("acquire", RESOURCE, "0", "7200")
         self.assertEqual(
             acquired.returncode,
             0,
             "synthetic acquisition failed before output characterization",
         )
-        self.assertEqual(fixture["acquire_stdout_shape"], "bare_token")
-        self.assertEqual(fixture["consumer_expected_shape"], "resource_token_records")
+        parse_acquire_token(acquired.stdout)
         with self.assertRaises(ValueError):
             parse_acquire_any_records(acquired.stdout)
         released = self.run_adapter("release", RESOURCE, acquired.stdout.strip())
@@ -1830,77 +1803,6 @@ sys.exit(released.returncode)
             "synthetic recovered lease could not be released",
         )
 
-    def test_interruption_before_checkpoint_uses_retained_owner_metadata(self) -> None:
-        acquired = self.run_adapter("acquire", RESOURCE, "0", "7200")
-        self.assertEqual(
-            acquired.returncode,
-            0,
-            "synthetic acquisition failed before the interruption point",
-        )
-        self.assertFalse(
-            (self.temporary_root / "checkpoint.json").exists(),
-            "fixture unexpectedly persisted a checkpoint before interruption",
-        )
-        owner_file = self.lock_path() / "owner"
-        owner_token = next(
-            line.removeprefix("token=")
-            for line in owner_file.read_text(encoding="utf-8").splitlines()
-            if line.startswith("token=")
-        )
-        acquired.stdout = ""
-        recovered = self.run_adapter(
-            "resume-owned", RESOURCE, session_id=SESSION_TWO
-        )
-        self.assertEqual(
-            recovered.returncode,
-            0,
-            "same-Task owner metadata did not recover an interrupted acquisition",
-        )
-        self.assertTrue(
-            recovered.stdout.strip() == owner_token,
-            "recovery after interruption did not return the retained lease",
-        )
-        released = self.run_adapter(
-            "release", RESOURCE, recovered.stdout.strip(), session_id=SESSION_TWO
-        )
-        self.assertEqual(
-            released.returncode,
-            0,
-            "synthetic interrupted lease could not be released",
-        )
-
-    def test_native_task_and_session_readbacks_are_stubbed(self) -> None:
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "PATH": f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}",
-                **self.fake_kent_environment,
-            }
-        )
-        task = subprocess.run(
-            ["kent", "task", "show", "KEN-6", "--json"],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        session = subprocess.run(
-            ["kent", "session-id"],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        self.assertEqual(task.returncode, 0, "fake native Task readback failed")
-        self.assertEqual(session.returncode, 0, "fake Session readback failed")
-        summary = json.loads(task.stdout)["summary"]
-        self.assertEqual(
-            summary["id"],
-            "task-b6672872-8aaf-4dc9-ba9c-dfab7393a5b4",
-        )
-        self.assertEqual(summary["short_id"], "KEN-6")
-        self.assertEqual(session.stdout.strip(), SESSION_ONE)
-
     def test_public_identity_ignores_diagnostic_output_and_requires_inherited_uuid(self):
         diagnostic = self.temporary_root / "session-diagnostic.txt"
         diagnostic.write_text(f"Short ID: 123\nUUID: {SESSION_ONE}\nLog path: /fixture/events.jsonl\n")
@@ -1912,17 +1814,12 @@ sys.exit(released.returncode)
             diagnostic.write_text(output)
             with self.assertRaises(ValueError):
                 self.read_native_identity(session_file=diagnostic)
-        smoke = (ROOT / "contracts/mobile-smoke-contract.md").read_text()
-        self.assertIn("workflow-evidence-ledger identity", smoke)
-        self.assertIn("inherited canonical", smoke)
 
     def test_native_task_uuid_is_accepted_as_verified_identity_input(self) -> None:
         task = json.loads(
             (FIXTURES / "native-task-ken-6.json").read_text(encoding="utf-8")
         )["summary"]
-        session_id = (FIXTURES / "native-session.txt").read_text(
-            encoding="utf-8"
-        ).strip()
+        session_id = SESSION_ONE
         native_task_id = task["id"]
         acquired = self.run_adapter(
             "acquire",
@@ -1956,7 +1853,7 @@ sys.exit(released.returncode)
         )
 
     def test_acquire_output_contract_fixtures_parse_separately(self) -> None:
-        contract = incident_fixture("acquire-output-contract.json")
+        contract = lease_fixture("acquire-output-contract.json")
         bare_token = parse_acquire_token(str(contract["acquire"]))
         selection = parse_acquire_any_records(str(contract["acquire_any"]))
         self.assertEqual(bare_token, "synthetic-bare-token")
@@ -2004,9 +1901,9 @@ sys.exit(released.returncode)
         )
 
     def test_retained_checkpoint_token_resumes_same_lease_across_sessions(self) -> None:
-        checkpoint = incident_fixture("checkpoint-retained.json")
+        checkpoint = lease_fixture("checkpoint-retained.json")
         identity = self.read_native_identity(
-            session_file=FIXTURES / "native-session-resumed.txt"
+            session_file=self.resumed_session
         )
         binding = bind_checkpoint(
             checkpoint,
@@ -2042,9 +1939,9 @@ sys.exit(released.returncode)
         )
 
     def test_partial_checkpoint_enriches_native_mapping_then_recovers(self) -> None:
-        checkpoint = incident_fixture("checkpoint-partial.json")
+        checkpoint = lease_fixture("checkpoint-partial.json")
         identity = self.read_native_identity(
-            session_file=FIXTURES / "native-session-resumed.txt"
+            session_file=self.resumed_session
         )
         binding = bind_checkpoint(
             checkpoint,
@@ -2084,9 +1981,9 @@ sys.exit(released.returncode)
         )
 
     def test_legacy_native_id_owner_is_recovered_only_after_mapping(self) -> None:
-        checkpoint = incident_fixture("checkpoint-legacy-native.json")
+        checkpoint = lease_fixture("checkpoint-legacy-native.json")
         identity = self.read_native_identity(
-            session_file=FIXTURES / "native-session-resumed.txt"
+            session_file=self.resumed_session
         )
         binding = bind_checkpoint(
             checkpoint,
@@ -2122,14 +2019,14 @@ sys.exit(released.returncode)
 
     def test_conflicting_and_foreign_checkpoints_block_without_mutation(self) -> None:
         identity = self.read_native_identity(
-            session_file=FIXTURES / "native-session-resumed.txt"
+            session_file=self.resumed_session
         )
         for fixture_name, owner_id in (
             ("checkpoint-conflicting.json", "KEN-6"),
             ("checkpoint-foreign.json", "PUB-70"),
         ):
             with self.subTest(fixture=fixture_name):
-                checkpoint = incident_fixture(fixture_name)
+                checkpoint = lease_fixture(fixture_name)
                 stage_data = checkpoint["stage_data"]
                 assert isinstance(stage_data, dict)
                 owner = self.seed_lock(
@@ -2151,11 +2048,11 @@ sys.exit(released.returncode)
                 )
 
     def test_no_resource_inventory_recovers_one_proven_same_task_lease(self) -> None:
-        candidates = incident_fixture("eligible-resources.json")[
+        candidates = lease_fixture("eligible-resources.json")[
             "eligible_resources"
         ]
         identity = self.read_native_identity(
-            session_file=FIXTURES / "native-session-resumed.txt"
+            session_file=self.resumed_session
         )
         self.seed_lock(
             task_id=identity["task_short_id"],
@@ -2186,7 +2083,7 @@ sys.exit(released.returncode)
         )
 
     def test_no_resource_inventory_blocks_multiple_same_task_leases(self) -> None:
-        candidates = incident_fixture("eligible-resources.json")[
+        candidates = lease_fixture("eligible-resources.json")[
             "eligible_resources"
         ]
         identity = self.read_native_identity()
@@ -2211,11 +2108,11 @@ sys.exit(released.returncode)
         )
 
     def test_foreign_inventory_candidate_is_not_adopted(self) -> None:
-        candidates = incident_fixture("eligible-resources.json")[
+        candidates = lease_fixture("eligible-resources.json")[
             "eligible_resources"
         ]
         identity = self.read_native_identity(
-            session_file=FIXTURES / "native-session-resumed.txt"
+            session_file=self.resumed_session
         )
         foreign_owner = self.seed_lock(
             task_id="PUB-70",

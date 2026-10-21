@@ -6,7 +6,7 @@ import json
 import uuid
 from typing import Any
 
-from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
+from .model import EdgeSpec, NodeSpec, SpecError, WorkflowSpec
 
 
 # unicode.White_Space as used by Go strings.TrimSpace; Python's default strip

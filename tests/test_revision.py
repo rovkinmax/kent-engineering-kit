@@ -30,7 +30,6 @@ from workflowkit.runtime import (
     capture_runtime_authority_binding,
     capture_runtime_execution_context,
     capture_runtime_source_envelope,
-    revalidate_runtime_source_envelope,
 )
 
 
@@ -446,6 +445,51 @@ def source_manifest_contents(
 
 
 class RevisionPreflightTest(unittest.TestCase):
+    def test_requirement_paths_preserve_labels_modes_and_error_type(self) -> None:
+        requirements = {}
+        revision_module.require_path(requirements, ".kent/tool", "procedure")
+        revision_module.require_path(
+            requirements, ".kent/tool", "command", executable=True,
+        )
+        revision_module.require_path(requirements, ".kent/tool", "context")
+        self.assertEqual(
+            requirements,
+            {
+                ".kent/tool": {
+                    "labels": {"procedure", "command", "context"},
+                    "executable": True,
+                },
+            },
+        )
+        for path in ("", "/tool", "../tool", "./tool", "a//b", "a/../b", "a\\b"):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(
+                    RevisionPreflightError, "command must be a normalized",
+                ):
+                    revision_module.require_path(requirements, path, "command")
+
+    def test_git_readers_preserve_checked_and_unchecked_failure_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # An unborn repository isolates HEAD lookup even with an in-tree TMPDIR.
+            revision_module.run_git(root, "init", "--quiet")
+            for reader in (revision_module.run_git, revision_module.run_git_bytes):
+                with self.subTest(reader=reader.__name__):
+                    with self.assertRaisesRegex(
+                        RevisionPreflightError, "failed with exit",
+                    ):
+                        reader(root, "rev-parse", "--verify", "HEAD")
+                    result = reader(
+                        root, "rev-parse", "--verify", "HEAD", check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(result.stderr)
+                    expected_type = (
+                        str if reader is revision_module.run_git else bytes
+                    )
+                    self.assertIsInstance(result.stdout, expected_type)
+                    self.assertIsInstance(result.stderr, expected_type)
+
     def test_selected_source_ignores_replace_refs_and_inherited_git_routing(self) -> None:
         root = self.create_project(schema4=True)
         selected = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
@@ -1416,7 +1460,7 @@ class RevisionPreflightTest(unittest.TestCase):
         self.assertNotIn("role bytes", result.stdout)
         self.assertNotIn("runtime", result.stderr.lower())
 
-    def test_schema4_runtime_envelope_revalidation_rejects_drift(self) -> None:
+    def test_schema4_runtime_capture_binds_content_and_proven_root_order(self) -> None:
         root = self.create_project(schema4=True)
         manifest_path = root / ".kent/release/source-manifest.json"
         manifest = json.loads(manifest_path.read_text())
@@ -1445,53 +1489,22 @@ class RevisionPreflightTest(unittest.TestCase):
         ]
         captured = capture_runtime_source_envelope(inputs, captures)
         self.assertEqual(
-            revalidate_runtime_source_envelope(inputs, captured, captures),
+            capture_runtime_source_envelope(inputs, captures),
             captured,
         )
-        for bad_previous in (
-            {
-                **captured,
-                "runtime_source_envelope_digest": "1" * 64,
-            },
-            {
-                **captured,
-                "runtime_source_envelope": {
-                    **captured["runtime_source_envelope"],
-                    "external_roots": list(
-                        reversed(
-                            captured["runtime_source_envelope"]["external_roots"]
-                        )
-                    ),
-                },
-            },
-            {
-                **captured,
-                "runtime_source_envelope": {
-                    **captured["runtime_source_envelope"],
-                    "external_roots": [
-                        *captured["runtime_source_envelope"]["external_roots"],
-                        {
-                            "kind": "effective-role",
-                            "key": "extra",
-                            "byte_count": 0,
-                            "sha256": "0" * 64,
-                        },
-                    ],
-                },
-            },
-        ):
-            with self.subTest(bad_previous=bad_previous):
-                with self.assertRaises(RuntimeContractError):
-                    revalidate_runtime_source_envelope(
-                        inputs,
-                        bad_previous,
-                        captures,
-                    )
-        for bad_captures in (
+        changed = capture_runtime_source_envelope(
+            inputs,
             [
                 ("effective-role", "alpha", b"changed"),
                 ("effective-role", "beta", b"beta"),
             ],
+        )
+        self.assertNotEqual(
+            changed["runtime_source_envelope_digest"],
+            captured["runtime_source_envelope_digest"],
+        )
+        self.assertEqual(changed["project_commit"], captured["project_commit"])
+        for bad_captures in (
             [
                 ("effective-role", "beta", b"beta"),
                 ("effective-role", "alpha", b"alpha"),
@@ -1503,11 +1516,7 @@ class RevisionPreflightTest(unittest.TestCase):
         ):
             with self.subTest(bad_captures=bad_captures):
                 with self.assertRaises(RuntimeContractError):
-                    revalidate_runtime_source_envelope(
-                        inputs,
-                        captured,
-                        bad_captures,
-                    )
+                    capture_runtime_source_envelope(inputs, bad_captures)
 
     def test_schema4_runtime_proof_rejects_json_and_foreign_module_instances(
         self,

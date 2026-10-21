@@ -6,7 +6,7 @@ from contextvars import ContextVar
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import selectors
 import signal
@@ -15,7 +15,7 @@ import time
 from typing import Any, Iterable
 
 from .model import SpecError
-from .profile import ProjectProfile
+from .profile import ProjectProfile, validate_normalized_project_path
 from .release import (
     ReleaseSourceManifest,
     ReleaseSpec,
@@ -400,13 +400,7 @@ def profile_requirements(
     requirements: dict[str, dict[str, Any]] = {}
 
     def require(path: str, label: str, *, executable: bool = False) -> None:
-        normalized = normalize_project_path(path, label)
-        entry = requirements.setdefault(
-            normalized,
-            {"labels": set(), "executable": False},
-        )
-        entry["labels"].add(label)
-        entry["executable"] = entry["executable"] or executable
+        require_path(requirements, path, label, executable=executable)
 
     require(PROFILE_PATH, "profile")
     require(PROJECT_CONTRACT_PATH, "project_contract")
@@ -482,18 +476,10 @@ def require_path(
 
 
 def normalize_project_path(path: str, label: str) -> str:
-    relative = PurePosixPath(path)
-    if (
-        not path
-        or relative.is_absolute()
-        or "\\" in path
-        or relative.as_posix() != path
-        or any(part in {"", ".", ".."} for part in relative.parts)
-    ):
-        raise RevisionPreflightError(
-            f"{label} must be a normalized project-relative path: {path!r}"
-        )
-    return relative.as_posix()
+    try:
+        return validate_normalized_project_path(path, label)
+    except SpecError as error:
+        raise RevisionPreflightError(str(error)) from error
 
 
 def check_requirements(
@@ -940,13 +926,6 @@ def _external_source_digest(encoded: str) -> str:
     raise RevisionPreflightError("external capture digest encoding is invalid")
 
 
-def read_blob(root: Path, commit_oid: str, path: str, *, label: str) -> str:
-    return decode_text(
-        read_blob_bytes(root, commit_oid, path, label=label),
-        path,
-    )
-
-
 def tree_mode(root: Path, commit_oid: str, path: str) -> str:
     entry = tree_entry(root, commit_oid, path)
     if entry is None:
@@ -972,11 +951,6 @@ def run_git(
         raw.stdout.decode("utf-8", errors="replace"),
         raw.stderr.decode("utf-8", errors="replace"),
     )
-    if check and result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no output"
-        raise RevisionPreflightError(
-            f"git {' '.join(args)} failed with exit {result.returncode}: {detail}"
-        )
     return result
 
 
@@ -985,13 +959,7 @@ def run_git_bytes(
     *args: str,
     check: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
-    result = _run_git_bounded(root, *args, check=check)
-    if check and result.returncode != 0:
-        detail = result.stderr.decode(errors="replace").strip() or "no output"
-        raise RevisionPreflightError(
-            f"git {' '.join(args)} failed with exit {result.returncode}: {detail}"
-        )
-    return result
+    return _run_git_bounded(root, *args, check=check)
 
 
 def _terminate_git_process(

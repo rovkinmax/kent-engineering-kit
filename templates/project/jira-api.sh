@@ -261,12 +261,18 @@ jira_request() {
     --fail-with-body
     --connect-timeout 15
     --max-time 90
-    --retry 2
-    --retry-all-errors
     --request "$method"
     --user "${email}:${token}"
     --header "Accept: application/json"
   )
+  case "$method:$path" in
+    GET:*|POST:/rest/api/3/search/jql)
+      arguments+=(--retry 2 --retry-all-errors)
+      ;;
+    *)
+      arguments+=(--retry 0)
+      ;;
+  esac
   if [[ -n "$body" ]]; then
     arguments+=(
       --header "Content-Type: application/json"

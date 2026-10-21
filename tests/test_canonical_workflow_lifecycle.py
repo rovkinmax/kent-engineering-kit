@@ -21,7 +21,6 @@ import workflowkit.operations as operations
 REAL_ADMIT_SOURCE_ADMISSION = operations.admit_source_admission
 from workflowkit.operations import (
     EffectBlocked,
-    JournalError,
     OperationJournal,
     PlanValidationError,
     canonical_bytes,
@@ -31,13 +30,13 @@ from workflowkit.operations import (
 )
 from tests.test_workflow_retirement import (
     PROJECT_ID as RETIREMENT_PROJECT_ID,
-    make_d9_fixture as make_retirement_fixture,
+    make_workflow_fixture as make_base_workflow_fixture,
     read_log,
     read_state,
     workflow_id,
     write_state,
 )
-from tests.test_delivery_source_admission import DeliverySourceAdmissionTests
+from tests import test_delivery_source_admission as source_admission
 
 PROJECT_ID = "project-" + RETIREMENT_PROJECT_ID
 
@@ -114,9 +113,9 @@ def create_verified_source_fixture(
     workflow_id_value: str,
     *,
     local_instruction: bool = False,
-) -> tuple[DeliverySourceAdmissionTests, operations.VerifiedSourceAdmission]:
+) -> tuple[source_admission.DeliverySourceAdmissionTests, operations.VerifiedSourceAdmission]:
     """Create an offline native/install/source fixture and verify it end to end."""
-    fixture = DeliverySourceAdmissionTests(
+    fixture = source_admission.DeliverySourceAdmissionTests(
         "test_published_closure_and_cli_are_read_only"
     )
     fixture.setUp()
@@ -243,80 +242,12 @@ def synthetic_verified_source_admission(
         _token=operations._VERIFIED_SOURCE_ADMISSION_TOKEN,
     )
 
-
-def make_d9_fixture(root: Path) -> dict:
-    fixture = make_retirement_fixture(root)
+def make_workflow_fixture(root: Path) -> dict:
+    fixture = make_base_workflow_fixture(root)
     state = read_state(fixture)
     state["project_id"] = PROJECT_ID
     write_state(fixture, state)
     return fixture
-
-
-def canonical_plan(
-    fixture: dict,
-    *,
-    intent: str = "graph-only",
-    metadata: dict | None = None,
-    graph: dict | None = None,
-    d9: dict | None = None,
-    name: str = "canonical-plan.json",
-) -> tuple[operations.LoadedPlan, dict]:
-    wid = workflow_id(0)
-    target_graph = graph or {
-        "version": 2,
-        "nodes": [
-            {"id": "terminal", "kind": "terminal"},
-            {"id": "review", "kind": "agent"},
-        ],
-        "edges": [],
-        "node_groups": [],
-        "transition_groups": [],
-    }
-    item = {
-        "workflow_id": wid,
-        "project_id": PROJECT_ID,
-        "intent": intent,
-        "expected_version": 1,
-        "terminal_tasks": [{"id": "TASK-1", "status": "done"}],
-        "terminal_anchors": [{"id": "terminal", "kind": "terminal"}],
-        "links": [
-            {
-                "project_id": PROJECT_ID,
-                "workflow_id": wid,
-                "is_default": True,
-            }
-        ],
-        "default": wid,
-    }
-    if intent in {"graph-only", "graph-and-metadata"}:
-        item["graph"] = target_graph
-    if intent in {"metadata-only", "graph-and-metadata"}:
-        item["metadata"] = metadata or {
-            "name": "Canonical Workflow",
-            "description": "Canonical description",
-            "execution_target": "ask-on-first-execution",
-        }
-    value = {
-        "schema": "canonical-workflow-reconcile-plan-v1",
-        "state_dir": str(fixture["root"] / "canonical-state"),
-        "project_root": str(fixture["root"]),
-        "kent": {
-            "path": str(fixture["kent"]),
-            "sha256": hashlib.sha256(fixture["kent"].read_bytes()).hexdigest(),
-        },
-        "d9": d9 or {"none": True},
-        "workflows": [item],
-    }
-    path = fixture["root"] / name
-    raw = canonical_bytes(value)
-    path.write_bytes(raw)
-    plan = load_plan(
-        path,
-        schema="canonical-workflow-reconcile-plan-v1",
-        expected_sha256=hashlib.sha256(raw).hexdigest(),
-    )
-    return plan, value
-
 
 def graph_apply_rows(fixture: dict) -> list[list[str]]:
     return [row for row in read_log(fixture) if row[:3] == ["workflow", "graph", "apply"]]
@@ -1141,6 +1072,7 @@ def native_canonical_v2_plan(
         database = Path(fixture["root"]) / "test-home/.kent/db/main.sqlite3"
         replacement = marker + f'''
     if args[:3] == ["workflow", "graph", "apply"] or args[:2] == ["workflow", "update"]:
+        import sqlite3
         with sqlite3.connect({str(database)!r}) as connection:
             for wid, workflow in state["workflows"].items():
                 metadata = workflow["metadata"]
@@ -1348,62 +1280,90 @@ def install_v2_unresolved_graph_postimage(
     write_state(fixture, state)
     return graph_stage
 
-
-def install_effect(
-    fixture: dict,
-    plan: operations.LoadedPlan,
-    *,
-    member_status: str,
-    effect_status: str,
-    stage_name: str = "graph",
-) -> dict:
-    parsed = operations._validate_canonical_plan(plan)
-    wid = workflow_id(0)
-    with OperationJournal(
-        fixture["root"] / "canonical-state",
-        "canonical-workflow-reconcile",
-        plan,
-    ) as journal:
-        prepared = journal.state["preimage"][0]
-        stage = next(
-            stage
-            for stage in operations._canonical_progress(
-                parsed,
-                parsed["workflows"][0],
-                prepared,
-            )
-            if stage["name"] == stage_name
-        )
-        identity = operations._effect_inputs(
-            stage["command"],
-            fixture["root"],
-            None,
-            stage["stdin"],
-            canonical_sha256(stage["before"]),
-            canonical_sha256(stage["after"]),
-        )[4]
-        journal.persist(
-            {
-                **journal.state,
-                "phase": "in_progress",
-                "members": [{"workflow_id": wid, "status": member_status}],
-                "effects": {
-                    f"apply:{wid}:{stage_name}": {
-                        **identity,
-                        "status": effect_status,
-                        "attempt": 1,
-                        "child": None,
-                    }
-                },
-            }
-        )
-        return stage
-
-
 class CanonicalWorkflowLifecycleTest(unittest.TestCase):
+    def test_v2_project_fields_require_matching_native_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            _, baseline = canonical_v2_plan(fixture)
+            invalid = (
+                RETIREMENT_PROJECT_ID,
+                "workspace-" + RETIREMENT_PROJECT_ID,
+                "project-" + RETIREMENT_PROJECT_ID.upper(),
+                "project-not-a-uuid",
+                "project-" + RETIREMENT_PROJECT_ID + " ",
+                "project-123e4567-e89b-12d3-a456-426614174099",
+            )
+            for field in ("project", "link"):
+                for value in invalid:
+                    with self.subTest(field=field, value=value):
+                        document = json.loads(json.dumps(baseline))
+                        item = document["workflows"][0]
+                        target = item if field == "project" else item["links"][0]
+                        target["project_id"] = value
+                        raw = canonical_bytes(document)
+                        plan = operations.LoadedPlan(
+                            schema=operations.CANONICAL_V2_SCHEMA, value=document,
+                            raw=raw, sha256=hashlib.sha256(raw).hexdigest(),
+                        )
+                        with self.assertRaises(PlanValidationError):
+                            operations._validate_canonical_v2_plan(plan, verify_evidence=False)
+            self.assertEqual(read_log(fixture), [])
+
+    def test_v2_execution_target_selectors_are_validated_in_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            _, baseline = canonical_v2_plan(fixture, intent="graph-and-metadata")
+            valid = ("none", "head", "default-branch", "ask-on-first-execution",
+                     "ref:refs/heads/main", "ref:refs/tags/v1")
+            invalid = ("ask_on_first_execution", "default_branch", "ref:",
+                       "ref:refs/tags/v 1", "local")
+            for target in (*valid, *invalid):
+                with self.subTest(target=target):
+                    document = json.loads(json.dumps(baseline))
+                    document["workflows"][0]["target_metadata"]["execution_target"] = target
+                    raw = canonical_bytes(document)
+                    plan = operations.LoadedPlan(
+                        schema=operations.CANONICAL_V2_SCHEMA, value=document,
+                        raw=raw, sha256=hashlib.sha256(raw).hexdigest(),
+                    )
+                    if target in valid:
+                        parsed = operations._validate_canonical_v2_plan(plan, verify_evidence=False)
+                        self.assertEqual(parsed["workflows"][0]["target_metadata"]["execution_target"], target)
+                    else:
+                        with self.assertRaises(PlanValidationError):
+                            operations._validate_canonical_v2_plan(plan, verify_evidence=False)
+
+    def test_retired_v1_plan_is_rejected_before_journal_or_kent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            document = {
+                "schema": "canonical-workflow-reconcile-plan-v1",
+                "state_dir": str(root / "state"),
+            }
+            path = root / "v1.json"
+            raw = canonical_bytes(document)
+            path.write_bytes(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            plan = load_plan(
+                path, schema=document["schema"], expected_sha256=digest,
+            )
+            with mock.patch.object(operations, "_kent_json", side_effect=AssertionError("Kent read")):
+                with self.assertRaisesRegex(PlanValidationError, "canonical v2"):
+                    reconcile_canonical_workflows(plan, mode="prepare")
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve().parents[1]
+                                    / "scripts/reconcile-canonical-workflows"),
+                 "prepare", "--plan", str(path), "--expect-plan-sha256", digest,
+                 "--kent", str(root / "never-executed-kent")],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("schema", result.stderr)
+            self.assertFalse((root / "state").exists())
+
     def test_prepare_preflights_later_stage_before_persist_or_child(self):
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self, intent="graph-and-metadata")
             real_progress = operations._canonical_v2_progress
             def invalid_later_stage(*args):
@@ -1421,7 +1381,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_prepare_rejects_later_stage_exec_vector_before_persist(self):
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self, intent="graph-and-metadata")
             real_progress = operations._canonical_v2_progress
             def invalid_vector(*args):
@@ -2544,7 +2504,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_foreign_root_status_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self)
             parsed = operations._validate_canonical_v2_plan(plan)
             foreign_root = context["home"] / ".kent-foreign"
@@ -2573,7 +2533,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_wal_plan_prepare_and_fresh_new_effect_gate(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, observed = native_canonical_v2_plan(fixture, self)
             database = context["database"]
             db_digest = hashlib.sha256(database.read_bytes()).hexdigest()
@@ -2632,7 +2592,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_changed_database_blocks_dispatch_and_review_digest_drift(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self)
             with native_observer_patches(context):
                 reconcile_canonical_workflows(plan, mode="prepare")
@@ -2652,7 +2612,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             self.assertEqual(graph_apply_rows(fixture), [])
 
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self)
             value = json.loads(plan.raw)
             item = value["workflows"][0]
@@ -2674,7 +2634,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             self.assertEqual(graph_apply_rows(fixture), [])
 
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self)
             with native_observer_patches(context):
                 with mock.patch.object(
@@ -2690,7 +2650,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             self.assertEqual(graph_apply_rows(fixture), [])
 
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self)
             with native_observer_patches(context):
                 reconcile_canonical_workflows(plan, mode="prepare")
@@ -2711,7 +2671,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_settlement_uses_owned_graph_read_when_database_and_session_are_gone(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self)
             with native_observer_patches(context):
                 reconcile_canonical_workflows(plan, mode="prepare")
@@ -2742,7 +2702,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_inventory_matches_694_total_and_67_detailed_sessions(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, observed = native_canonical_v2_plan(
                 fixture,
                 self,
@@ -2790,7 +2750,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_project_readers_resolve_absolute_tilde_and_query_relative_roots(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self)
             parsed = operations._validate_canonical_v2_plan(plan)
             item = parsed["workflows"][0]
@@ -2830,7 +2790,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             metadata_changed=False,
         )
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self, synchronize_effects=True)
             value = plan.value
             item = value["workflows"][0]
@@ -2871,7 +2831,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_workflow_policy_change_preserves_task_bindings(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, observed = native_canonical_v2_plan(
                 fixture, self, production_shape=True, with_approvals=True,
                 intent="graph-and-metadata", synchronize_effects=True,
@@ -2918,7 +2878,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_execution_binding_drift_is_detected(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self, synchronize_effects=True)
             with native_observer_patches(context):
                 reconcile_canonical_workflows(plan, mode="prepare")
@@ -2931,7 +2891,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_binding_digest_protects_every_execution_field_and_referenced_root(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, observed = native_canonical_v2_plan(
                 fixture, self, production_shape=True, with_bindings=True,
             )
@@ -3021,7 +2981,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
     def test_legacy_native_evidence_is_recovery_only_and_never_upgraded_from_live_state(self) -> None:
         for outcome in ("new-dispatch", "preimage", "postimage", "final", "complete"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 plan, context, observed = native_canonical_v2_plan(
                     fixture, self, intent="graph-and-metadata" if outcome == "complete" else "graph-only")
                 value = plan.value
@@ -3088,7 +3048,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
     def test_native_frozen_approvals_survive_real_graph_and_metadata_effects(self) -> None:
         for intent in ("graph-only", "graph-and-metadata"):
             with self.subTest(intent=intent), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 state = read_state(fixture)
                 state["workflows"][workflow_id(0)]["version"] = 16
                 write_state(fixture, state)
@@ -3200,7 +3160,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
         ]
         for change, sql in changes:
             with self.subTest(change=change, sql=sql), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 plan, context, _ = native_canonical_v2_plan(
                     fixture, self, production_shape=True, with_approvals=True,
                     synchronize_effects=True,
@@ -3218,7 +3178,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
     def test_native_drift_after_graph_blocks_metadata_and_completion(self) -> None:
         for change in ("approval", "unknown-graph", "binding", "null-backlog", "retained-root"):
             with self.subTest(change=change), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 plan, context, _ = native_canonical_v2_plan(
                     fixture, self, production_shape=True, with_approvals=True,
                     intent="graph-and-metadata", synchronize_effects=True,
@@ -3261,7 +3221,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_frozen_snapshot_tampering_requires_matching_review(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(
                 fixture, self, production_shape=True, with_approvals=True,
                 synchronize_effects=True,
@@ -3286,7 +3246,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
     def test_native_frozen_approvals_settle_without_evidence_but_cannot_progress(self) -> None:
         for intent in ("graph-only", "graph-and-metadata"):
             with self.subTest(intent=intent), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 plan, context, _ = native_canonical_v2_plan(
                     fixture, self, production_shape=True, with_approvals=True,
                     intent=intent, synchronize_effects=True,
@@ -3313,7 +3273,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_frozen_approvals_unknown_recovery_postimage_blocks(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(
                 fixture, self, production_shape=True, with_approvals=True,
                 synchronize_effects=True,
@@ -3330,7 +3290,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_frozen_approvals_known_postimage_settles_then_completes_without_replay(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(
                 fixture, self, production_shape=True, with_approvals=True,
                 intent="graph-and-metadata", synchronize_effects=True,
@@ -3357,7 +3317,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_four_database_approvals_and_branches_match_reviewed_components(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, observed = native_canonical_v2_plan(
                 fixture,
                 self,
@@ -3406,7 +3366,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_unknown_backlog_without_cli_approval_payload_is_compatible(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, observed = native_canonical_v2_plan(
                 fixture,
                 self,
@@ -3436,7 +3396,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_empty_lock_requires_and_accepts_exact_postcompletion_context(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(
                 fixture,
                 self,
@@ -3532,7 +3492,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_selected_event_omission_and_terminal_state_drift_block(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(
                 fixture,
                 self,
@@ -3586,7 +3546,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(
                 dir=Path.home()
             ) as temporary:
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 plan, context, _ = native_canonical_v2_plan(fixture, self)
                 parsed = operations._validate_canonical_v2_plan(plan)
                 if mutation == "schema":
@@ -3614,7 +3574,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_missing_script_inventory_blocks_even_without_execution_list(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self)
             state = read_state(fixture)
             detail = state["workflows"][workflow_id(0)]["details"]["TASK-1"]
@@ -3632,7 +3592,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_added_event_components_do_not_inherit_missing_cache_files(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(
                 fixture,
                 self,
@@ -3656,7 +3616,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_process_identity_drift_during_observation_blocks(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(
                 fixture,
                 self,
@@ -3686,7 +3646,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_question_input_drift_and_missing_selected_event_block(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(
                 fixture,
                 self,
@@ -3737,7 +3697,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_native_copy_db_and_symlink_hardlink_sources_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, context, _ = native_canonical_v2_plan(fixture, self)
             parsed = operations._validate_canonical_v2_plan(plan)
             copied_database = context["home"] / ".kent" / "db" / "copied.sqlite3"
@@ -3776,7 +3736,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_source_gate_is_exactly_bound_and_only_in_backlog_plan_ingress(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, value = canonical_v2_plan(fixture)
             item = value["workflows"][0]
             source_graph = {
@@ -3860,29 +3820,36 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         builder = runpy.run_path(str(root / ".kent/workflows/kit_development.py"))
         profile = builder["profile_at"](root, check_files=False)
-        legacy = replace(
-            profile, commands=builder["COMMAND_TARGETS"],
-            policies={key: value for key, value in profile.policies.items() if key != "delivery_reliability"},
-        )
         for complexity in (False, True):
             with self.subTest(complexity=complexity), tempfile.TemporaryDirectory() as temporary:
-                legacy_profile = replace(
-                    legacy, policies={**legacy.policies, "coder_selection": "complexity" if complexity else "disabled"},
-                )
                 current_profile = replace(
                     profile, policies={**profile.policies, "coder_selection": "complexity" if complexity else "disabled"},
                 )
-                baseline = builder["build_complexity_candidate_workflow" if complexity else "build_workflow"](
-                    legacy_profile)
                 spec = builder["build_current_workflow"](current_profile)
                 empty = {"workflow_id": workflow_id(0), "expected_version": 16,
                          "graph": {key: [] for key in ("nodes", "edges", "node_groups", "transition_groups")}}
-                source_graph = plan_workflow_graph(baseline, empty, metadata_changed=False).document["graph"]
+                source_graph = plan_workflow_graph(spec, empty, metadata_changed=False).document["graph"]
+                # Model the one admitted migration from the current public graph,
+                # without importing a retired historical builder.
+                replan = next(edge for edge in source_graph["edges"] if edge["key"] == "implement_replan")
+                source_graph["edges"] = [
+                    edge for edge in source_graph["edges"] if edge["id"] != replan["id"]
+                ]
+                source_graph["transition_groups"] = [
+                    group for group in source_graph["transition_groups"]
+                    if group["id"] != replan["transition_group_id"]
+                ]
+                ingress_id = operations._v2_ingress_edge(source_graph, "previous graph")["id"]
+                previous_prompt = next(
+                    edge for edge in source_graph["edges"]
+                    if edge.get("prompt_template") and edge["id"] != ingress_id
+                )
+                previous_prompt["prompt_template"] = "Previously reviewed transition instructions."
                 target = plan_workflow_graph(
                     spec, {**empty, "graph": source_graph}, metadata_changed=False).document["graph"]
                 source_graph["version"] = 16
                 target["version"] = 17
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 plan, value = canonical_v2_plan(fixture)
                 item = value["workflows"][0]
                 runtime = item["runtime_refs"][0]
@@ -3982,7 +3949,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_script_paths_allow_only_exact_qualified_script_replacements(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, value = canonical_v2_plan(fixture, script_path_change=True)
             parsed = operations._validate_canonical_v2_plan(plan)
             item = parsed["workflows"][0]
@@ -4042,7 +4009,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_review_must_bind_source_admission_and_metadata_only_null_is_narrow(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             allowed, _ = canonical_v2_plan(
                 fixture,
                 intent="metadata-only",
@@ -4052,7 +4019,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             self.assertEqual(report["phase"], "prepared")
 
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, value = canonical_v2_plan(
                 fixture,
                 intent="graph-and-metadata",
@@ -4073,7 +4040,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             self.assertEqual(graph_apply_rows(fixture), [])
 
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(
                 fixture,
                 intent="metadata-only",
@@ -4089,7 +4056,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             self.assertEqual(graph_apply_rows(fixture), [])
 
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(
                 fixture,
                 intent="graph-only",
@@ -4099,7 +4066,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 reconcile_canonical_workflows(plan, mode="prepare")
 
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, value = canonical_v2_plan(fixture)
             value["workflows"][0]["source_admission"]["primary_root"] = str(
                 Path(fixture["root"]) / "different-primary"
@@ -4113,7 +4080,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_review_requires_script_path_disposition_and_source_admission_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, value = canonical_v2_plan(
                 fixture,
                 script_path_change=True,
@@ -4141,7 +4108,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 reconcile_canonical_workflows(bad_review, mode="prepare")
 
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             _, value = canonical_v2_plan(fixture, name="missing-admission.json")
             del value["workflows"][0]["source_admission"]
             missing_admission = write_canonical_v2_plan(
@@ -4154,7 +4121,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_cli_applies_reviewed_same_uuid_update_and_preserves_decision(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(
                 fixture,
                 intent="graph-and-metadata",
@@ -4237,7 +4204,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_new_task_or_changed_pending_decision_blocks_before_effect(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(fixture, pending_approval=True)
             reconcile_canonical_workflows(plan, mode="prepare")
             state = read_state(fixture)
@@ -4263,7 +4230,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             self.assertEqual(graph_apply_rows(fixture), [])
 
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(fixture, pending_approval=True)
             reconcile_canonical_workflows(plan, mode="prepare")
             state = read_state(fixture)
@@ -4282,7 +4249,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
     def test_v2_waiting_approval_without_native_payload_blocks(self) -> None:
         for payload in ("missing", "empty"):
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temporary:
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 plan, _ = canonical_v2_plan(fixture)
                 parsed = operations._validate_canonical_v2_plan(plan)
                 item = parsed["workflows"][0]
@@ -4310,7 +4277,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_waiting_approval_with_native_payload_is_fingerprinted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(fixture)
             parsed = operations._validate_canonical_v2_plan(plan)
             item = parsed["workflows"][0]
@@ -4345,7 +4312,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_active_task_without_approval_payload_remains_unknown_and_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(fixture)
             parsed = operations._validate_canonical_v2_plan(plan)
             item = parsed["workflows"][0]
@@ -4366,7 +4333,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
     def test_v2_current_scripts_are_required_and_active_scripts_block(self) -> None:
         for script_state in ("missing", "malformed", "active"):
             with self.subTest(script_state=script_state), tempfile.TemporaryDirectory() as temporary:
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 plan, _ = canonical_v2_plan(fixture)
                 parsed = operations._validate_canonical_v2_plan(plan)
                 item = parsed["workflows"][0]
@@ -4391,7 +4358,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_empty_current_scripts_prove_idle_without_live_executions_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(fixture)
             parsed = operations._validate_canonical_v2_plan(plan)
             item = parsed["workflows"][0]
@@ -4406,7 +4373,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_live_inventory_does_not_echo_plan_only_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(fixture)
             parsed = operations._validate_canonical_v2_plan(plan)
             item = parsed["workflows"][0]
@@ -4424,7 +4391,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
     def test_v2_unknown_history_and_approval_state_do_not_block_terminal_or_backlog(self) -> None:
         for state_name in ("terminal", "backlog"):
             with self.subTest(state=state_name), tempfile.TemporaryDirectory() as temporary:
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 plan, _ = canonical_v2_plan(fixture)
                 parsed = operations._validate_canonical_v2_plan(plan)
                 item = parsed["workflows"][0]
@@ -4468,7 +4435,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_unknown_approval_requires_exact_nonimpact_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(fixture)
             parsed = operations._validate_canonical_v2_plan(plan)
             item = parsed["workflows"][0]
@@ -4496,7 +4463,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_rejects_workflow_linked_from_an_unreviewed_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             fake_kent = fixture["kent"]
             source = fake_kent.read_text()
             marker = '    print(state["project_id"] + "\\tTest Project\\t" + state["project_root"])\n'
@@ -4514,7 +4481,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_runtime_drift_and_unsupported_structural_change_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(fixture)
             from workflowkit.model import NodeSpec, WorkflowSpec
 
@@ -4545,7 +4512,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             self.assertEqual(graph_apply_rows(fixture), [])
 
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, value = canonical_v2_plan(fixture)
             value["workflows"][0]["target_graph"]["edges"][0][
                 "target_node_id"
@@ -4564,7 +4531,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_timeout_with_task_progress_settles_owned_graph_without_replay(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             fake_kent = fixture["kent"]
             source = fake_kent.read_text()
             marker = (
@@ -4634,7 +4601,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_resumes_unresolved_postimage_after_task_progress_without_replay(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             plan, _ = canonical_v2_plan(fixture, intent="graph-and-metadata")
             reconcile_canonical_workflows(plan, mode="prepare")
             parsed = operations._validate_canonical_v2_plan(plan)
@@ -4714,7 +4681,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
     def test_v2_settles_attempted_graph_before_missing_evidence_blocks_next_effect(self) -> None:
         for missing in ("runtime", "review", "receipt"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temporary:
-                fixture = make_d9_fixture(Path(temporary))
+                fixture = make_workflow_fixture(Path(temporary))
                 plan, _ = canonical_v2_plan(
                     fixture,
                     intent="graph-and-metadata",
@@ -4774,7 +4741,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
     def test_v2_reverse_uses_fresh_plan_and_legacy_rollback_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
+            fixture = make_workflow_fixture(Path(temporary))
             original_description = read_state(fixture)["workflows"][
                 workflow_id(0)
             ]["metadata"]["description"]
@@ -4828,47 +4795,6 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 any(edge["key"] == "implement_replan" for edge in workflow["graph"]["edges"])
             )
             self.assertEqual(len(graph_apply_rows(fixture)), 1)
-
-    def test_native_project_identity_is_preserved_in_cli_readbacks(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            plan, _ = canonical_plan(fixture)
-            reconcile_canonical_workflows(plan, mode="prepare")
-            calls = read_log(fixture)
-            project_calls = [call for call in calls if "--project" in call]
-            self.assertTrue(project_calls)
-            for call in project_calls:
-                self.assertEqual(call[call.index("--project") + 1], PROJECT_ID)
-
-    def test_canonical_project_fields_reject_non_native_or_mismatched_ids(self) -> None:
-        invalid = (
-            RETIREMENT_PROJECT_ID,
-            "workspace-" + RETIREMENT_PROJECT_ID,
-            "project-" + RETIREMENT_PROJECT_ID.upper(),
-            "project-not-a-uuid",
-            "project-" + RETIREMENT_PROJECT_ID + " ",
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            _, baseline = canonical_plan(fixture)
-            for field in ("project", "link"):
-                for value in (*invalid, "project-123e4567-e89b-12d3-a456-426614174099"):
-                    with self.subTest(field=field, value=value):
-                        document = json.loads(json.dumps(baseline))
-                        member = document["workflows"][0]
-                        target = member if field == "project" else member["links"][0]
-                        target["project_id"] = value
-                        raw = canonical_bytes(document)
-                        path = Path(temporary) / "invalid-project.json"
-                        path.write_bytes(raw)
-                        plan = load_plan(
-                            path,
-                            schema="canonical-workflow-reconcile-plan-v1",
-                            expected_sha256=hashlib.sha256(raw).hexdigest(),
-                        )
-                        with self.assertRaises(PlanValidationError):
-                            operations._validate_canonical_plan(plan)
-            self.assertEqual(read_log(fixture), [])
 
     def test_workflow_summary_requires_closed_metadata_and_normalizes_live_targets(self) -> None:
         wid = workflow_id(0)
@@ -4994,562 +4920,6 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 if "id" not in mutation or mutation["id"] != workflow_id(1):
                     with self.assertRaises(EffectBlocked):
                         operations._canonical_metadata(source)
-
-    def test_plan_accepts_only_public_execution_target_selectors(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            targets = (
-                "ask-on-first-execution",
-                "none",
-                "head",
-                "default-branch",
-                "ref:refs/tags/v1",
-            )
-            for index, target in enumerate(targets):
-                with self.subTest(target=target):
-                    plan, _ = canonical_plan(
-                        fixture,
-                        intent="metadata-only",
-                        metadata={
-                            "name": "Canonical",
-                            "description": "Description",
-                            "execution_target": target,
-                        },
-                        name=f"target-{index}.json",
-                    )
-                    parsed = operations._validate_canonical_plan(plan)
-                    self.assertEqual(
-                        parsed["workflows"][0]["metadata"]["execution_target"],
-                        target,
-                    )
-            for index, target in enumerate((
-                "ask_on_first_execution",
-                "default_branch",
-                "ref:",
-                "ref:refs/tags/v 1",
-                "local",
-            )):
-                with self.subTest(invalid_target=target):
-                    plan, _ = canonical_plan(
-                        fixture,
-                        intent="metadata-only",
-                        metadata={
-                            "name": "Canonical",
-                            "description": "Description",
-                            "execution_target": target,
-                        },
-                        name=f"invalid-{index}.json",
-                    )
-                    with self.assertRaises(PlanValidationError):
-                        operations._validate_canonical_plan(plan)
-
-    def test_public_execution_target_selectors_cover_metadata_stage_contract(self) -> None:
-        targets = (
-            "ask-on-first-execution",
-            "none",
-            "head",
-            "default-branch",
-            "ref:refs/tags/v1",
-        )
-        for index, target in enumerate(targets):
-            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
-                fixture = make_d9_fixture(Path(temporary))
-                metadata = {
-                    "name": f"Metadata {index}",
-                    "description": "Selector contract",
-                    "execution_target": target,
-                }
-                plan, _ = canonical_plan(
-                    fixture,
-                    intent="metadata-only",
-                    metadata=metadata,
-                    name="metadata-plan.json",
-                )
-                parsed = operations._validate_canonical_plan(plan)
-                item = parsed["workflows"][0]
-                self.assertEqual(item["metadata"]["execution_target"], target)
-                reconcile_canonical_workflows(plan, mode="prepare")
-                with OperationJournal(
-                    fixture["root"] / "canonical-state",
-                    "canonical-workflow-reconcile",
-                    plan,
-                ) as journal:
-                    prepared = journal.state["preimage"][0]
-                    stage = operations._canonical_progress(parsed, item, prepared)[0]
-                    before_sha = canonical_sha256(stage["before"])
-                    after_sha = canonical_sha256(stage["after"])
-                    expected_identity = operations._effect_inputs(
-                        stage["command"],
-                        fixture["root"],
-                        None,
-                        stage["stdin"],
-                        before_sha,
-                        after_sha,
-                    )[4]
-                    self.assertEqual(
-                        stage["command"],
-                        [
-                            str(fixture["kent"]),
-                            "workflow",
-                            "update",
-                            workflow_id(0),
-                            "--name",
-                            metadata["name"],
-                            "--description",
-                            metadata["description"],
-                            "--execution-target",
-                            target,
-                            "--json",
-                        ],
-                    )
-                    self.assertEqual(
-                        journal.state["inventory"]["targets"][workflow_id(0)],
-                        {
-                            "preimage_sha256": before_sha,
-                            "target_sha256": after_sha,
-                        },
-                    )
-                report = reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-                self.assertEqual(report["phase"], "complete")
-                self.assertIn(
-                    [
-                        "workflow",
-                        "update",
-                        workflow_id(0),
-                        "--name",
-                        metadata["name"],
-                        "--description",
-                        metadata["description"],
-                        "--execution-target",
-                        target,
-                        "--json",
-                    ],
-                    read_log(fixture),
-                )
-                with OperationJournal(
-                    fixture["root"] / "canonical-state",
-                    "canonical-workflow-reconcile",
-                    plan,
-                ) as journal:
-                    effect = journal.state["effects"][f"apply:{workflow_id(0)}:metadata"]
-                    for key, value in expected_identity.items():
-                        self.assertEqual(effect[key], value)
-                final = operations._canonical_read(parsed, item)
-                self.assertEqual(final["metadata"], metadata)
-                self.assertEqual(canonical_sha256(final), after_sha)
-
-            with self.subTest(recovery_target=target), tempfile.TemporaryDirectory() as temporary:
-                fixture = make_d9_fixture(Path(temporary))
-                metadata = {
-                    "name": f"Recovery metadata {index}",
-                    "description": "Recovery selector contract",
-                    "execution_target": target,
-                }
-                plan, _ = canonical_plan(
-                    fixture,
-                    intent="metadata-only",
-                    metadata=metadata,
-                    name="recovery-plan.json",
-                )
-                parsed = operations._validate_canonical_plan(plan)
-                item = parsed["workflows"][0]
-                reconcile_canonical_workflows(plan, mode="prepare")
-                state = read_state(fixture)
-                state["workflows"][workflow_id(0)]["metadata"] = metadata
-                write_state(fixture, state)
-                stage = install_effect(
-                    fixture,
-                    plan,
-                    member_status="prepared",
-                    effect_status="unresolved",
-                    stage_name="metadata",
-                )
-                expected_identity = operations._effect_inputs(
-                    stage["command"],
-                    fixture["root"],
-                    None,
-                    stage["stdin"],
-                    canonical_sha256(stage["before"]),
-                    canonical_sha256(stage["after"]),
-                )[4]
-                report = reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-                self.assertEqual(report["phase"], "complete")
-                self.assertEqual(
-                    [row for row in read_log(fixture) if row[:2] == ["workflow", "update"]],
-                    [],
-                )
-                with OperationJournal(
-                    fixture["root"] / "canonical-state",
-                    "canonical-workflow-reconcile",
-                    plan,
-                ) as journal:
-                    effect = journal.state["effects"][f"apply:{workflow_id(0)}:metadata"]
-                    for key, value in expected_identity.items():
-                        self.assertEqual(effect[key], value)
-                    self.assertEqual(effect["status"], "verified")
-                    self.assertEqual(effect["attempt"], 1)
-                final = operations._canonical_read(parsed, item)
-                self.assertEqual(final["metadata"], metadata)
-                self.assertEqual(
-                    canonical_sha256(final),
-                    canonical_sha256(stage["after"]),
-                )
-
-    def test_validation_requires_true_but_ignores_nonblocking_diagnostics(self) -> None:
-        cases = (
-            {"valid": True, "errors": [{"code": "script_path_relative_check_skipped"}]},
-            {"valid": False},
-            {},
-            {"valid": "true"},
-        )
-        for validation in cases:
-            with self.subTest(validation=validation), tempfile.TemporaryDirectory() as temporary:
-                fixture = make_d9_fixture(Path(temporary))
-                state = read_state(fixture)
-                state["validation"] = validation
-                write_state(fixture, state)
-                plan, _ = canonical_plan(fixture)
-                if validation.get("valid") is True:
-                    report = reconcile_canonical_workflows(plan, mode="prepare")
-                    self.assertEqual(report["phase"], "prepared")
-                    with OperationJournal(
-                        fixture["root"] / "canonical-state",
-                        "canonical-workflow-reconcile",
-                        plan,
-                    ) as journal:
-                        persisted = canonical_bytes(journal.state)
-                    evidence = canonical_bytes(report)
-                    self.assertNotIn(b"script_path_relative_check_skipped", persisted)
-                    self.assertNotIn(b"script_path_relative_check_skipped", evidence)
-                    self.assertNotIn(b"errors", persisted)
-                    self.assertNotIn(b"errors", evidence)
-                else:
-                    with self.assertRaises(EffectBlocked):
-                        reconcile_canonical_workflows(plan, mode="prepare")
-
-    def test_raw_fields_and_nonterminal_plan_state_are_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            _, value = canonical_plan(fixture)
-            for mutation in (
-                lambda item: item.update(command=["/bin/echo"]),
-                lambda item: item.update(preimage={}),
-                lambda item: item["terminal_tasks"].append(
-                    {"id": "TASK-2", "status": "doing"}
-                ),
-            ):
-                candidate = json.loads(json.dumps(value))
-                mutation(candidate["workflows"][0])
-                if candidate["workflows"][0].get("terminal_tasks", [])[-1].get(
-                    "status"
-                ) == "doing":
-                    candidate["workflows"][0]["terminal_tasks"][-1]["extra"] = True
-                raw = canonical_bytes(candidate)
-                path = fixture["root"] / "invalid.json"
-                path.write_bytes(raw)
-                plan = load_plan(
-                    path,
-                    schema="canonical-workflow-reconcile-plan-v1",
-                    expected_sha256=hashlib.sha256(raw).hexdigest(),
-                )
-                with self.assertRaises(PlanValidationError):
-                    reconcile_canonical_workflows(plan, mode="prepare")
-
-    def test_missing_or_incomplete_d9_dependency_blocks_before_prepare(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            d9 = {
-                "none": False,
-                "path": str(fixture["root"] / "missing-d9.json"),
-                "sha256": "a" * 64,
-                "operation": "workflow-retirement-batch",
-                "phase": "complete",
-                "members": [workflow_id(0)],
-            }
-            plan, _ = canonical_plan(fixture, d9=d9)
-            with self.assertRaises(EffectBlocked):
-                reconcile_canonical_workflows(plan, mode="prepare")
-            self.assertFalse((fixture["root"] / "canonical-state").exists())
-
-    def test_task_detail_activity_blocks_even_when_task_list_is_terminal(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            state = read_state(fixture)
-            detail = state["workflows"][workflow_id(0)]["details"]["TASK-1"]
-            detail["summary"]["done"] = False
-            detail["status"] = {"kind": "doing", "native_state": "active"}
-            detail["current_nodes"] = [{"node_id": "implement"}]
-            write_state(fixture, state)
-            plan, _ = canonical_plan(fixture)
-            with self.assertRaises(EffectBlocked):
-                reconcile_canonical_workflows(plan, mode="prepare")
-
-    def test_project_link_default_and_revision_drift_block(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            plan, _ = canonical_plan(fixture)
-            state = read_state(fixture)
-            state["workflows"][workflow_id(0)]["default"] = False
-            write_state(fixture, state)
-            with self.assertRaises(EffectBlocked):
-                reconcile_canonical_workflows(plan, mode="prepare")
-            state["workflows"][workflow_id(0)]["default"] = True
-            state["workflows"][workflow_id(0)]["version"] = 2
-            write_state(fixture, state)
-            with self.assertRaises(EffectBlocked):
-                reconcile_canonical_workflows(plan, mode="prepare")
-
-    def test_exact_graph_apply_advances_one_version_with_complete_document(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            plan, value = canonical_plan(fixture)
-            prepared = reconcile_canonical_workflows(plan, mode="prepare")
-            self.assertEqual(prepared["phase"], "prepared")
-            report = reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-            self.assertEqual(report["phase"], "complete")
-            state = read_state(fixture)
-            workflow = state["workflows"][workflow_id(0)]
-            self.assertEqual(workflow["version"], 2)
-            self.assertEqual(workflow["graph"], {
-                key: value["workflows"][0]["graph"][key]
-                for key in ("nodes", "edges", "node_groups", "transition_groups")
-            })
-            self.assertEqual(
-                state["last_graph_document"],
-                {
-                    "workflow_id": workflow_id(0),
-                    "expected_version": 1,
-                    "graph": workflow["graph"],
-                },
-            )
-            self.assertEqual(
-                graph_apply_rows(fixture),
-                [["workflow", "graph", "apply", "-", "--confirm", "--json"]],
-            )
-
-    def test_zero_exit_graph_noop_settles_preimage_without_completion(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            plan, _ = canonical_plan(fixture)
-            reconcile_canonical_workflows(plan, mode="prepare")
-            state = read_state(fixture)
-            state["graph_noop"] = True
-            write_state(fixture, state)
-            report = reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-            self.assertEqual(report["phase"], "in_progress")
-            self.assertEqual(report["settled"], "preimage")
-            with OperationJournal(
-                fixture["root"] / "canonical-state",
-                "canonical-workflow-reconcile",
-                plan,
-            ) as journal:
-                effect = journal.state["effects"][f"apply:{workflow_id(0)}:graph"]
-                self.assertEqual(effect["status"], "settled_preimage")
-
-    def test_later_cycle_retry_reuses_identity_and_completes(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            plan, _ = canonical_plan(fixture)
-            reconcile_canonical_workflows(plan, mode="prepare")
-            state = read_state(fixture)
-            state["graph_noop"] = True
-            write_state(fixture, state)
-            reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-            state = read_state(fixture)
-            state["graph_noop"] = False
-            write_state(fixture, state)
-            report = reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-            self.assertEqual(report["phase"], "complete")
-            with OperationJournal(
-                fixture["root"] / "canonical-state",
-                "canonical-workflow-reconcile",
-                plan,
-            ) as journal:
-                effect = journal.state["effects"][f"apply:{workflow_id(0)}:graph"]
-                self.assertEqual(effect["attempt"], 2)
-
-    def test_exact_target_recovery_does_not_replay_graph_apply(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            plan, value = canonical_plan(fixture)
-            reconcile_canonical_workflows(plan, mode="prepare")
-            stage = install_effect(
-                fixture,
-                plan,
-                member_status="prepared",
-                effect_status="unresolved",
-            )
-            state = read_state(fixture)
-            workflow = state["workflows"][workflow_id(0)]
-            workflow["version"] = 2
-            workflow["graph"] = {
-                key: value["workflows"][0]["graph"][key]
-                for key in ("nodes", "edges", "node_groups", "transition_groups")
-            }
-            write_state(fixture, state)
-            report = reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-            self.assertEqual(report["phase"], "complete")
-            self.assertEqual(graph_apply_rows(fixture), [])
-            self.assertEqual(stage["after"]["version"], 2)
-
-    def test_graph_and_metadata_resume_preserves_progressive_postimages(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            metadata = {
-                "name": "Canonical v2",
-                "description": "All metadata fields",
-                "execution_target": "head",
-            }
-            plan, value = canonical_plan(
-                fixture,
-                intent="graph-and-metadata",
-                metadata=metadata,
-            )
-            reconcile_canonical_workflows(plan, mode="prepare")
-            install_effect(
-                fixture,
-                plan,
-                member_status="graph_verified",
-                effect_status="verified",
-            )
-            state = read_state(fixture)
-            workflow = state["workflows"][workflow_id(0)]
-            workflow["version"] = 2
-            workflow["graph"] = {
-                key: value["workflows"][0]["graph"][key]
-                for key in ("nodes", "edges", "node_groups", "transition_groups")
-            }
-            write_state(fixture, state)
-            report = reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-            self.assertEqual(report["phase"], "complete")
-            state = read_state(fixture)
-            self.assertEqual(state["workflows"][workflow_id(0)]["metadata"], metadata)
-            self.assertEqual(graph_apply_rows(fixture), [])
-            self.assertEqual(
-                state["last_update_argv"],
-                [
-                    "workflow",
-                    "update",
-                    workflow_id(0),
-                    "--name",
-                    metadata["name"],
-                    "--description",
-                    metadata["description"],
-                    "--execution-target",
-                    metadata["execution_target"],
-                    "--json",
-                ],
-            )
-
-    def test_concurrent_task_allocation_blocks_before_graph_effect(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            plan, _ = canonical_plan(fixture)
-            reconcile_canonical_workflows(plan, mode="prepare")
-            state = read_state(fixture)
-            workflow = state["workflows"][workflow_id(0)]
-            status = {"kind": "done", "native_state": "terminal"}
-            workflow["tasks"].append({"task_id": "TASK-2", "status": status})
-            workflow["details"]["TASK-2"] = {
-                "summary": {"id": "TASK-2", "done": True},
-                "status": status,
-                "current_nodes": [{"node_id": "terminal"}],
-                "pending_approvals": [],
-                "live_sessions": [],
-                "retained_session_count": 0,
-            }
-            write_state(fixture, state)
-            with self.assertRaises(EffectBlocked):
-                reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-            self.assertEqual(graph_apply_rows(fixture), [])
-
-    def test_terminal_anchor_loss_blocks_source_and_target_graphs(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            bad_target = {
-                "version": 2,
-                "nodes": [],
-                "edges": [],
-                "node_groups": [],
-                "transition_groups": [],
-            }
-            plan, _ = canonical_plan(fixture, graph=bad_target)
-            with self.assertRaises(PlanValidationError):
-                reconcile_canonical_workflows(plan, mode="prepare")
-            state = read_state(fixture)
-            state["workflows"][workflow_id(0)]["graph"]["nodes"] = []
-            write_state(fixture, state)
-            good_plan, _ = canonical_plan(fixture, name="good-plan.json")
-            with self.assertRaises(EffectBlocked):
-                reconcile_canonical_workflows(good_plan, mode="prepare")
-
-    def test_metadata_only_preserves_graph_version(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            metadata = {
-                "name": "Metadata only",
-                "description": "No graph mutation",
-                "execution_target": "none",
-            }
-            plan, _ = canonical_plan(
-                fixture,
-                intent="metadata-only",
-                metadata=metadata,
-            )
-            reconcile_canonical_workflows(plan, mode="prepare")
-            report = reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-            self.assertEqual(report["phase"], "complete")
-            state = read_state(fixture)
-            self.assertEqual(state["workflows"][workflow_id(0)]["version"], 1)
-            self.assertEqual(state["workflows"][workflow_id(0)]["metadata"], metadata)
-            self.assertEqual(graph_apply_rows(fixture), [])
-
-    def test_forward_restore_uses_captured_preimage_and_fresh_version(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            plan, value = canonical_plan(fixture)
-            original_graph = json.loads(
-                json.dumps(read_state(fixture)["workflows"][workflow_id(0)]["graph"])
-            )
-            reconcile_canonical_workflows(plan, mode="prepare")
-            install_effect(
-                fixture,
-                plan,
-                member_status="graph_verified",
-                effect_status="verified",
-            )
-            state = read_state(fixture)
-            workflow = state["workflows"][workflow_id(0)]
-            workflow["version"] = 2
-            workflow["graph"] = {
-                key: value["workflows"][0]["graph"][key]
-                for key in ("nodes", "edges", "node_groups", "transition_groups")
-            }
-            write_state(fixture, state)
-            report = reconcile_canonical_workflows(plan, mode="rollback", confirm=True)
-            self.assertEqual(report["phase"], "rolled_back")
-            state = read_state(fixture)
-            workflow = state["workflows"][workflow_id(0)]
-            self.assertEqual(workflow["version"], 3)
-            self.assertEqual(workflow["graph"], original_graph)
-            self.assertEqual(state["last_graph_document"]["expected_version"], 2)
-
-    def test_prepared_rollback_has_no_effect_and_complete_requires_new_plan(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            plan, _ = canonical_plan(fixture)
-            reconcile_canonical_workflows(plan, mode="prepare")
-            report = reconcile_canonical_workflows(plan, mode="rollback", confirm=True)
-            self.assertEqual(report["phase"], "rolled_back")
-            self.assertEqual(graph_apply_rows(fixture), [])
-        with tempfile.TemporaryDirectory() as temporary:
-            fixture = make_d9_fixture(Path(temporary))
-            plan, _ = canonical_plan(fixture)
-            reconcile_canonical_workflows(plan, mode="prepare")
-            reconcile_canonical_workflows(plan, mode="apply", confirm=True)
-            with self.assertRaises(JournalError):
-                reconcile_canonical_workflows(plan, mode="rollback", confirm=True)
-
 
 if __name__ == "__main__":
     unittest.main()

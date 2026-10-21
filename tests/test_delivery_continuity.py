@@ -11,15 +11,116 @@ import sys
 import tempfile
 import unittest
 
-from workflowkit.delivery import build_delivery_workflow
+from workflowkit.delivery import (
+    build_canary_workflow, build_delivery_workflow, build_smoke_lab_workflow,
+    cleanup_prompt, published_cleanup_prompt, qualify_transition_keys,
+)
 from workflowkit.delivery import (
     capture_producer, capture_script_producer, observe_script_identity,
     pack_delivery, producer_reference_closure, reconstruct_producer, transition_contract_reference,
 )
 from workflowkit.profile import ProjectProfile
+from workflowkit.model import EdgeSpec, ParameterSpec
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+class GeneratedStageContractsTests(unittest.TestCase):
+    def profile(self):
+        return ProjectProfile.from_toml(
+            REPO_ROOT, (REPO_ROOT / "contracts/project-profile.example.toml").read_text(),
+            check_files=False,
+        )
+
+    def test_completion_fields_come_from_actual_graph_across_capabilities(self):
+        for context in (False, True):
+            for ci in (False, True):
+                profile = runtime_v2_profile(ci=ci, source_ci=ci) if context else replace(
+                    self.profile(),
+                    capabilities={**self.profile().capabilities, "ci_monitoring": ci})
+                spec = build_delivery_workflow(profile, 5)
+                for incoming in spec.edges:
+                    if not incoming.prompt:
+                        continue
+                    outgoing = [edge for edge in spec.edges
+                                if edge.source == incoming.target]
+                    for edge in outgoing:
+                        fields = ", ".join(f"`{p.key}`" for p in edge.parameters) or "(none)"
+                        self.assertIn(
+                            f"`{edge.transition}`: {fields}.", incoming.prompt,
+                            (context, ci, incoming.key, edge.key))
+
+    def test_completion_contract_unions_fanout_fields_once(self):
+        edges = qualify_transition_keys([
+            EdgeSpec(key="entry", source="start", transition="begin", target="writer",
+                     prompt="Choose `done`."),
+            EdgeSpec(key="left", source="writer", transition="done", target="left",
+                     parameters=(ParameterSpec("first", "First"),)),
+            EdgeSpec(key="right", source="writer", transition="done", target="right",
+                     parameters=(ParameterSpec("second", "Second"),
+                                 ParameterSpec("first", "First"))),
+        ])
+        self.assertEqual(
+            edges[0].prompt.count("`writer_done`: `first`, `second`."), 1)
+        self.assertIn("Choose `writer_done`.", edges[0].prompt)
+
+    def test_cleanup_preserves_helper_and_legitimate_nohelper_paths(self):
+        for profile in (self.profile(), runtime_v2_profile(ci=False)):
+            without = replace(profile, commands={
+                **profile.commands, "prepare_cleanup": ""})
+            prompt = cleanup_prompt(without, merged=True)
+            self.assertIn(
+                f'`{profile.command("evidence")} append --task', prompt)
+            self.assertEqual(
+                f'`{profile.command("evidence")} seal --task' in prompt,
+                profile.runtime_contracts_v2())
+            with_helper = replace(profile, commands={
+                **profile.commands, "prepare_cleanup": ".kent/scripts/prepare-cleanup"})
+            prompt = cleanup_prompt(with_helper, merged=True)
+            self.assertIn("`.kent/scripts/prepare-cleanup`", prompt)
+            self.assertNotIn(
+                f'`{profile.command("evidence")} append --task', prompt)
+            self.assertTrue(published_cleanup_prompt(with_helper).startswith(prompt))
+            self.assertIn("{{.Params.publication_report}}",
+                          published_cleanup_prompt(with_helper))
+
+    def test_prepare_pr_fix_is_task_scoped_without_redundant_approval(self):
+        spec = build_delivery_workflow(self.profile(), 5)
+        edges = {edge.key: edge for edge in spec.edges}
+        self.assertFalse(edges["prepare_pr_fix"].requires_approval)
+        self.assertTrue(edges["prepare_pr_no_pr"].requires_approval)
+        self.assertTrue(edges["prepare_pr_needs_user_action"].requires_approval)
+
+    def test_lab_routing_does_not_load_product_plan_or_implement(self):
+        profile = self.profile()
+        for complexity in ("disabled", "complexity"):
+            selected = replace(profile, policies={
+                **profile.policies, "coder_selection": complexity})
+            for spec in (build_canary_workflow(selected, 5), build_smoke_lab_workflow(selected)):
+                prompts = "\n".join(edge.prompt or "" for edge in spec.edges)
+                for kind in profile.work_kinds.values():
+                    self.assertNotIn(kind.plan, prompts)
+                    self.assertNotIn(kind.implement, prompts)
+                self.assertNotIn("Implement mapping from", prompts)
+
+    def test_reviews_keep_stage_obligations_without_relabeling_old_statuses(self):
+        for compliance in (False, True):
+            for pr in (False, True):
+                profile = self.profile()
+                profile = replace(profile, capabilities={
+                    **profile.capabilities, "compliance_review": compliance,
+                    "pull_requests": pr, "ci_monitoring": pr, "spec_review": True})
+                spec = build_delivery_workflow(profile, 5)
+                for target in ("spec_review", "verification_gate"):
+                    prompt = next(edge.prompt for edge in spec.edges
+                                  if edge.target == target and edge.prompt)
+                    self.assertIn("current authorized stage", prompt)
+                    self.assertIn("owner and due milestone", prompt)
+                gate = next(edge.prompt for edge in spec.edges
+                            if edge.target == "verification_gate" and edge.prompt)
+                self.assertIn("fresh review", gate)
+                self.assertIn("project-owned", gate)
+                self.assertNotIn("Keep full reports in `review_context`", gate)
 
 REVALIDATION_EDGE_CONTRACTS = {
     "plan_review_revalidate": (
@@ -35,45 +136,6 @@ REVALIDATION_EDGE_CONTRACTS = {
         "plan_contract_verify_changed",
     ),
 }
-REVALIDATION_PROMPT_REQUIREMENTS = (
-    (
-        "grill timing",
-        "Consult a bounded read-only grill leaf before freeze and formal review",
-    ),
-    (
-        "material-change triggers",
-        "only when materially revising requirements, API/UX, architecture, "
-        "authority, safety/effects, cost, or evidence strategy",
-    ),
-    (
-        "execution-disproof trigger",
-        "or when execution disproves the chosen approach",
-    ),
-    (
-        "grill non-triggers",
-        "Hash drift, checkbox progress, typos, operational waiting, and "
-        "repeated identical failures alone do not require another grill call.",
-    ),
-    (
-        "unavailable eligibility blocker",
-        "Report unavailable effective leaf eligibility as a concrete blocker "
-        "rather than claiming critique occurred.",
-    ),
-    (
-        "linked proposal and human acceptance",
-        "Keep the exact proposal plus human acceptance when that pair grants authority.",
-    ),
-    (
-        "discoverable durable authority",
-        "Store durable references in the authoritative plan or discoverable "
-        "project-permitted report-only evidence, not only `review_context`;",
-    ),
-    (
-        "no agent-summary consent substitution",
-        "An agent summary or truncated historical source cannot fill missing consent.",
-    ),
-)
-
 
 def runtime_v2_profile(*, ci: bool, source_ci: bool = False) -> ProjectProfile:
     contents = (REPO_ROOT / "contracts" / "project-profile.example.toml").read_text()
@@ -263,7 +325,7 @@ def direct_parameter_references(prompt: str) -> set[str]:
 
 
 class DeliveryPackingCommandTests(unittest.TestCase):
-    def test_native_interface_exact_bytes_historical_failure_and_no_completion(self):
+    def test_native_packing_derives_review_preserves_failed_packets_and_never_completes(self):
         root = create_repository(self)
         scripts = materialize_templates(root, "workflow-checkpoint", "workflow-evidence-ledger")
         home = root / "home"
@@ -296,7 +358,8 @@ class DeliveryPackingCommandTests(unittest.TestCase):
                 }],
                 "edges": [{
                     "id": "edge", "transition_group_id": "group", "target_node_id": "fix",
-                    "parameters": [{"key": "delivery_context"}, {"key": "ci_report"}],
+                    "parameters": [{"key": "delivery_context"}, {"key": "ci_report"},
+                                   {"key": "review_context"}],
                 }],
             },
         }
@@ -321,12 +384,20 @@ class DeliveryPackingCommandTests(unittest.TestCase):
         outer = ' { "schema":"workflow-delivery-context-v1", "phase":"pre_pr" }\n'
         report = ' { "status": "failed", "head": "historical-before-repair" }\n'
         locator, _ = capture_producer(
-            root, identity=identity, producer_kind="ci-watch", inputs={},
-            result={"transition": "failed", "delivery_context": outer, "ci_report": report},
+            root, identity=identity, producer_kind="ci-watch",
+            inputs={"review_context": "previous dispatch input"},
+            result={"transition": "failed", "delivery_context": outer, "ci_report": report,
+                    "review_context": "previous dispatch result"},
         )
+        second, _ = capture_producer(
+            root, identity=identity, producer_kind="review", inputs={},
+            result={"review_context": "different producer context"},
+        )
+        review = '{"project_carrier":{"stage":"review-ready","external":"UNVERIFIED"}}'
         request = {
             "schema": "workflow-pack-delivery-v1", "transition": "failed",
-            "values": {}, "producer_refs": [locator], "delivery_mode": "preserve",
+            "values": {"review_context": review},
+            "producer_refs": [locator, second], "delivery_mode": "preserve",
             "transition_contract_ref": transition_contract_reference(identity, detail, graph, "failed"),
         }
         environment = {
@@ -353,18 +424,22 @@ class DeliveryPackingCommandTests(unittest.TestCase):
             output = json.loads(result.stdout)
             self.assertEqual(output["delivery_context"], outer)
             self.assertEqual(output["ci_report"], report)
+            self.assertEqual(output["review_context"], review)
             self.assertEqual(output["transition"], "failed")
             self.assertNotIn("values", output)
         calls = [json.loads(line) for line in command_log.read_text().splitlines()]
         self.assertTrue(calls)
         self.assertFalse(any("complete" in args for args in calls))
-        denied = subprocess.run(
-            command, cwd=root, env=environment,
-            input=json.dumps({**request, "values": {"force": "true"}}),
-            capture_output=True, text=True, check=False,
-        )
-        self.assertNotEqual(denied.returncode, 0)
-        self.assertEqual(denied.stdout, "")
+        for rewrite in ({"force": "true"}, {"ci_report": "rewritten"},
+                        {"delivery_context": "rewritten"}):
+            with self.subTest(rewrite=rewrite):
+                denied = subprocess.run(
+                    command, cwd=root, env=environment,
+                    input=json.dumps({**request, "values": {**request["values"], **rewrite}}),
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(denied.returncode, 0)
+                self.assertEqual(denied.stdout, "")
 
 
 class ScriptProducerIdentityTests(unittest.TestCase):
@@ -749,7 +824,7 @@ class ScriptProducerIdentityTests(unittest.TestCase):
 
 
 class DeliveryContinuityTest(unittest.TestCase):
-    def test_revalidation_grill_contract_in_runtime_v2_profiles(self) -> None:
+    def test_revalidation_preserves_retained_owner_and_authority(self) -> None:
         profiles = {
             "runtime-v2-with-ci": runtime_v2_profile(ci=True, source_ci=True),
             "runtime-v2-without-ci": runtime_v2_profile(ci=False),
@@ -767,7 +842,12 @@ class DeliveryContinuityTest(unittest.TestCase):
                     self.assertEqual(edge.context_source, "node:plan", key)
                     self.assertIsInstance(edge.prompt, str, key)
                     normalized = " ".join(edge.prompt.split())
-                    for label, required_text in REVALIDATION_PROMPT_REQUIREMENTS:
+                    for label, required_text in (
+                        ("optional critique", "Optional bounded read-only critique"),
+                        ("review gates", "mandatory project review gates"),
+                        ("durable authority", "not only `review_context`"),
+                        ("original consent", "An agent summary or truncated historical source cannot fill missing consent"),
+                    ):
                         with self.subTest(
                             profile=profile_name,
                             edge=key,
@@ -1044,32 +1124,19 @@ class DeliveryContinuityTest(unittest.TestCase):
                 self.assertIn("No consumer-source writes or merge", normalized_prompt)
                 self.assertIn("package publication needs separate approval", normalized_prompt)
 
-                marker = (
-                    "Complete `prepare_pr_monitor_ci`"
-                    if name == "source-ci"
-                    else "Flat prepare_pr_monitor_ci:"
+                contract = (
+                    f"`{entry.transition}`: "
+                    + ", ".join(f"`{field}`" for field in fields) + "."
                 )
-                start = normalized_prompt.index(marker)
-                end = normalized_prompt.index("If no PR is genuinely", start)
-                handoff = normalized_prompt[start:end]
-                parameter_tokens = [
-                    "task_short_id={{.TaskShortId}}"
-                    if field == "task_short_id"
-                    else f"`{field}`" if name == "source-ci"
-                    else field
-                    for field in fields
-                ]
-                positions = [handoff.index(token) for token in parameter_tokens]
-                self.assertEqual(positions, sorted(positions))
-                if name in {"kit-lite-no-ci", "runtime-v2-no-ci"}:
-                    self.assertNotIn("delivery_context", handoff)
-                elif name == "source-ci":
-                    self.assertIn(
-                        "PR identity and CI packets belong only in that packet",
-                        handoff,
-                    )
-                elif name in {"kit-lite-flat-ci", "legacy-standard-ci", "legacy-standard-no-ci"}:
-                    self.assertIn("Flat prepare_pr_monitor_ci:", handoff)
+                self.assertIn(contract, normalized_prompt)
+                if not profile.capability("ci_monitoring"):
+                    narrative = normalized_prompt.split("Completion fields", 1)[0]
+                    self.assertNotIn("prepare_pr_monitor_ci", narrative)
+                    self.assertNotIn("ci_contract", fields)
+                if name == "source-ci":
+                    self.assertIn("PR identity and CI packets belong only in", normalized_prompt)
+                else:
+                    self.assertNotIn("For source-contract CI handoff", normalized_prompt)
 
     def test_agent_prompt_parameters_exist_on_the_incoming_edge(self) -> None:
         profile = runtime_v2_profile(ci=True, source_ci=True)
@@ -1206,63 +1273,24 @@ class DeliveryContinuityTest(unittest.TestCase):
             )
         )
 
-    def test_generated_smoke_prompt_preserves_mobile_lease_contract(self) -> None:
+    def test_generated_smoke_delegates_lease_protocol_to_project_adapter(self) -> None:
         profile = runtime_v2_profile(ci=False)
         prompt = edge_map(profile)["gate_smoke_required"].prompt or ""
         for required in (
-            "`identity --task {{.TaskShortId}} --workspace <root>`",
-            "`task_id`",
-            "verified inherited current",
-            "requires neither Step nor retention/R2 admission",
-            "Never parse `kent session-id` output",
-            "preserve inherited `KENT_SESSION_ID`",
-            "`KENT_TASK_ID`",
-            "`KENT_SESSION_ID`",
-            "`task_native_id`",
-            "`task_short_id`",
-            "`lease_owner_id`",
-            "`lock_resource`",
-            "`lock_token`",
-            "`acquire` emits one bare token",
-            "`acquire-any` emits exactly `resource=...` then `token=...`",
-            "Reject missing, empty, duplicate, malformed, extra, or ineligible",
-            "`resume` on that exact pair",
-            "`resume-owned`",
-            "only project-eligible resources",
-            "multiple matches",
-            "sole occupancy",
-            "`age <= TTL` stays busy",
-            "`age > TTL`",
-            "resume-first refreshes",
-            "replacement-first invalidates",
-            "require `unlocked`",
+            "Smoke procedure and resource adapter",
+            "native identity binding",
+            "resource/owner/token state privately in `stage_data`",
+            "never infer ownership",
+            "release readback",
+            "Never expose tokens",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, prompt)
         self.assertNotIn("obtain the current Session with `kent session-id`", prompt)
         self.assertNotIn("kent task show {{.TaskShortId}} --json", prompt)
 
-        contract = (REPO_ROOT / "contracts" / "mobile-smoke-contract.md").read_text()
-        for required in (
-            "`task_id`",
-            "`task_short_id`",
-            "workflow-evidence-ledger identity",
-            "Never parse `kent session-id`",
-            "`lease_owner_id`",
-            "`lock_resource`",
-            "`lock_token`",
-            "multiple same-Task matches are ambiguous and block",
-            "`age <= TTL`",
-            "`age > TTL`",
-            "require `unlocked`",
-        ):
-            with self.subTest(contract=required):
-                self.assertIn(required, contract)
-
-        adapter_readme = (REPO_ROOT / "adapters" / "README.md").read_text()
-        self.assertIn("### Mobile resource-lock interface", adapter_readme)
-        self.assertIn("`acquire-any` emits exactly", adapter_readme)
-        self.assertIn("`contracts/mobile-smoke-contract.md`", adapter_readme)
+        self.assertNotIn("`acquire-any` emits", prompt)
+        self.assertNotIn("age <= TTL", prompt)
 
     def test_real_wrapper_stdout_projects_to_selected_edge_specs(self) -> None:
         profile = runtime_v2_profile(ci=True, source_ci=True)

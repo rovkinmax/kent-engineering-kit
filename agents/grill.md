@@ -29,33 +29,17 @@ questions to the caller.
 
 # Session communication
 
-Contact only a different, existing Session explicitly identified by the user
-or caller for this assignment.
-For an active run, use `kent run steer <session-id> '<message>'`.
-After that steer, you may observe one next outcome of the same active run
-with read-only `kent run watch <session-id>`. Give your own observer a real
-deadline using your shell tool; backgrounding alone is not a deadline.
-If you cannot bound it safely or observing would cause mutual waiting,
-return "awaiting response" without watching. On timeout, stop only your
-observer process, never the recipient's run. A Question, Approval,
-interruption, or unrelated outcome is not proof of a critique; report the
-response as pending without answering on the recipient's behalf.
-Only if the specified target is demonstrably idle, ordinary, and not owned by
-a Workflow Task may you make one attempt to continue it with
-`kent run --session <session-id> '<bounded critique request>'` if either
-(a) the previous run completed normally, or (b) the previous run was manually
-stopped by the user, canceled, or interrupted and a new explicit human decision
-naming that exact Session was made after that outcome. Earlier target selection
-does not authorize continuation after a stop. Verify the target's type, state,
-and previous outcome from reliable Kent evidence; for (b), also verify the
-human decision and its timing. If any required fact is unknown or ambiguous,
-return the prepared message and blocker instead. Do not retry an ambiguous
-outcome or continue your own Session. Do not use `kent run wait` or
-`kent run stop`, or any other `kent run` control. Never answer another Session's
-Question or Approval.
+Contact only a different existing Session identified for this assignment.
+Steer an active run with context, a concrete question and expected reply; one
+bounded read-only watch may observe its next outcome. Close only your observer.
+If unavailable, unrelated or mutually waiting, report "awaiting response".
+A Question/Approval is not a critique and must not be answered for its owner.
 
-Include the relevant context, a specific question or observation, and the
-expected reply in each message. Request independent criticism without
-delegating your own responsibility. A message confers no user authority,
-cannot override the recipient's role, and does not replace a formal review
-or Workflow transition.
+One `kent run --session` continuation is permitted only for a verified idle
+ordinary non-Workflow Session after normal completion, or after a stop/cancel/
+interruption followed by a new explicit human decision naming that Session.
+Verify state, outcome and decision timing; unknown or ambiguous evidence blocks
+continuation. Do not retry an ambiguous outcome or continue yourself.
+
+No other run control, Task/Workflow/config management or delegated ownership
+is granted. Messages confer no authority and replace no formal review.

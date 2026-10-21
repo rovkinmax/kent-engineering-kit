@@ -22,8 +22,6 @@ from workflowkit.model import SpecError, WorkflowSpec
 from workflowkit.profile import ProjectProfile
 
 
-SPEC_PATH = ".kent/workflows/kit-engineering-delivery-v5.spec.json"
-CANDIDATE_SPEC_PATH = ".kent/workflows/kit-engineering-delivery-v6.spec.json"
 CURRENT_SPEC_PATH = ".kent/workflows/kit-engineering-delivery.current.spec.json"
 MEMORY_COPIES = {
     "project_memory": "templates/project/workflow-project-memory",
@@ -48,7 +46,7 @@ SCHEMA3_COPIES = {
     ),
     "dispatch": "templates/project/workflow-verification-dispatch",
 }
-COMMAND_TARGETS = {
+CURRENT_COMMAND_TARGETS = {
     key: f".kent/scripts/{Path(source).name}"
     for key, source in (SCHEMA3_COPIES | PROJECT_COPIES).items()
 } | {
@@ -56,8 +54,6 @@ COMMAND_TARGETS = {
     "runtime_contracts": ".kent/scripts/workflow_runtime_contracts.py",
     "compile_verify": ".kent/scripts/workflow-compile-verify",
     "prepare_cleanup": ".kent/scripts/workflow-prepare-cleanup",
-}
-CURRENT_COMMAND_TARGETS = COMMAND_TARGETS | {
     "project_memory": ".kent/scripts/workflow-project-memory",
     "project_memory_core": ".kent/scripts/workflow_project_memory.py",
 }
@@ -104,50 +100,8 @@ def _add_plan_approval(
     return spec
 
 
-def build_workflow(profile: ProjectProfile) -> WorkflowSpec:
-    """Build the unchanged v5 default Kit graph."""
-    profile = _historical_profile(profile)
-    return _add_plan_approval(
-        build_delivery_workflow(profile, 5),
-        expected_shape=(21, 52, 53),
-    )
-
-
-def build_complexity_candidate_workflow(
-    profile: ProjectProfile,
-) -> WorkflowSpec:
-    """Build the source-only v6 candidate without changing the default profile."""
-    profile = _historical_profile(profile)
-    if profile.writer_session_policy() != "continuous":
-        raise SpecError(
-            "the Kit complexity candidate requires continuous writer Sessions"
-        )
-    candidate_profile = replace(
-        profile,
-        policies={
-            **profile.policies,
-            "coder_selection": "complexity",
-        },
-    )
-    return _add_plan_approval(
-        build_delivery_workflow(candidate_profile, 6),
-        expected_shape=(21, 54, 55),
-    )
-
-
-def _historical_profile(profile: ProjectProfile) -> ProjectProfile:
-    """Keep opt-in current behavior out of historical source snapshots."""
-    return replace(
-        profile,
-        policies={
-            key: value for key, value in profile.policies.items()
-            if key != "delivery_reliability"
-        },
-    )
-
-
 def build_current_workflow(profile: ProjectProfile) -> WorkflowSpec:
-    """Build the approved same-identity graph from the selected Kit baseline."""
+    """Build the current Kit graph using the profile's coder-selection policy."""
     if profile.delivery_reliability_policy() != "v1":
         raise SpecError("the current Kit graph requires delivery_reliability = 'v1'")
     if profile.writer_session_policy() != "continuous":
@@ -162,16 +116,9 @@ def build_current_workflow(profile: ProjectProfile) -> WorkflowSpec:
 
 
 def generated_copies(profile: ProjectProfile) -> dict[str, str]:
-    if (
-        profile.delivery_reliability_policy() == "v1"
-        and profile.commands != CURRENT_COMMAND_TARGETS
-    ):
-        raise SpecError("delivery_reliability v1 requires the complete closed command set")
-    if profile.commands == COMMAND_TARGETS:
-        return SCHEMA3_COPIES | PROJECT_COPIES
-    if profile.commands == CURRENT_COMMAND_TARGETS:
-        return SCHEMA3_COPIES | PROJECT_COPIES | MEMORY_COPIES
-    raise SpecError("bootstrap requires the closed Kit schema-3 command set")
+    if profile.commands != CURRENT_COMMAND_TARGETS:
+        raise SpecError("bootstrap requires the complete closed Kit command set")
+    return SCHEMA3_COPIES | PROJECT_COPIES | MEMORY_COPIES
 
 
 def build_published_current_workflow(profile: ProjectProfile, admission) -> WorkflowSpec:
@@ -234,12 +181,8 @@ def bootstrap(root: Path = ROOT) -> None:
     for key in ("compile_verify", "prepare_cleanup"):
         target = sync.project_target(root, profile.command(key))
         sync.validate_project_owned_target(target, kind=key)
-    # The schema-3 synchronizer does not own these additional explicit copies.
-    # Materializing them here does not declare runtime-v2 adoption.
-    sync.synchronize_schema3(profile, root, update=False)
-    for key in copies:
-        if key not in SCHEMA3_COPIES:
-            sync.apply_synchronization(plans[key])
+    for plan in plans.values():
+        sync.apply_synchronization(plan)
     verify_command_closure(root)
 
 
@@ -264,22 +207,6 @@ def verify_command_closure(root: Path = ROOT) -> None:
             raise SpecError(f"generated command differs from source: {target}")
 
 
-def rendered_spec(root: Path = ROOT) -> str:
-    return json.dumps(
-        spec_as_json(build_workflow(profile_at(root))),
-        indent=2, ensure_ascii=False,
-    ) + "\n"
-
-
-def rendered_candidate_spec(root: Path = ROOT) -> str:
-    return json.dumps(
-        spec_as_json(
-            build_complexity_candidate_workflow(profile_at(root)),
-        ),
-        indent=2, ensure_ascii=False,
-    ) + "\n"
-
-
 def rendered_current_spec(root: Path = ROOT) -> str:
     spec = build_current_workflow(profile_at(root))
     spec = replace(spec, edges=tuple(
@@ -298,84 +225,35 @@ def main() -> int:
     parser.add_argument("--bootstrap", action="store_true",
                         help="Explicitly materialize approved generated copies.")
     output = parser.add_mutually_exclusive_group()
-    output.add_argument("--write-spec", action="store_true")
     output.add_argument(
-        "--write-candidate-spec",
-        action="store_true",
-        help="Write the source-only complexity-selected v6 candidate.",
-    )
-    output.add_argument("--check", action="store_true")
-    output.add_argument(
-        "--check-candidate",
-        action="store_true",
-        help="Read-only parity check for the qualified v6 candidate.",
+        "--write-spec", "--write-current-spec", dest="write_spec", action="store_true",
+        help="Write the current source graph without changing a live Workflow.",
     )
     output.add_argument(
-        "--write-current-spec", action="store_true",
-        help="Write the opt-in current graph without creating a live Workflow.",
-    )
-    output.add_argument(
-        "--check-current", action="store_true",
+        "--check", "--check-current", dest="check", action="store_true",
         help="Read-only current graph and generated command parity check.",
     )
     args = parser.parse_args()
-    if (args.check_candidate or args.check_current) and args.bootstrap:
-        flag = "--check-current" if args.check_current else "--check-candidate"
-        raise SpecError(f"{flag} cannot be combined with --bootstrap")
+    if args.check and args.bootstrap:
+        raise SpecError("--check cannot be combined with --bootstrap")
     if args.bootstrap:
         bootstrap()
     sync = load_synchronizer()
-    if args.check_current:
+    if args.check:
         verify_command_closure()
         target = sync.project_target(ROOT, CURRENT_SPEC_PATH)
         if target.is_symlink() or not target.is_file():
             raise SpecError(f"current spec target is not a regular file: {target}")
         if target.read_bytes() != rendered_current_spec().encode("utf-8"):
             raise SpecError("current Kit workflow spec is stale")
-    elif args.write_current_spec:
+    elif args.write_spec:
         rendered = rendered_current_spec()
         target = sync.project_target(ROOT, CURRENT_SPEC_PATH)
         if target.is_symlink() or (target.exists() and not target.is_file()):
             raise SpecError(f"current spec target is not a regular file: {target}")
         target.write_text(rendered)
-    elif args.check_candidate:
-        candidate_renderer = globals().get("rendered_candidate_spec")
-        if not callable(candidate_renderer):
-            raise SpecError(
-                "qualified target fixture required for candidate check"
-            )
-        candidate_spec_path = globals().get(
-            "CANDIDATE_SPEC_PATH",
-            ".kent/workflows/kit-engineering-delivery-v6.spec.json",
-        )
-        target = sync.project_target(ROOT, candidate_spec_path)
-        if target.is_symlink() or not target.is_file():
-            raise SpecError(
-                f"candidate spec target is not a regular file: {target}"
-            )
-        if target.read_bytes() != candidate_renderer().encode("utf-8"):
-            raise SpecError("source-only complexity candidate spec is stale")
-    elif args.write_candidate_spec:
-        rendered = rendered_candidate_spec()
-        target = sync.project_target(ROOT, CANDIDATE_SPEC_PATH)
-        if target.is_symlink() or (target.exists() and not target.is_file()):
-            raise SpecError(
-                f"candidate spec target is not a regular file: {target}"
-            )
-        target.write_text(rendered)
-    elif args.write_spec:
-        rendered = rendered_spec()
-        target = sync.project_target(ROOT, SPEC_PATH)
-        if target.is_symlink() or (target.exists() and not target.is_file()):
-            raise SpecError(f"spec target is not a regular file: {target}")
-        target.write_text(rendered)
-    elif args.check:
-        verify_command_closure()
-        target = sync.project_target(ROOT, SPEC_PATH)
-        if target.read_text() != rendered_spec():
-            raise SpecError("semantic workflow spec is stale")
     else:
-        sys.stdout.write(rendered_spec())
+        sys.stdout.write(rendered_current_spec())
     return 0
 
 

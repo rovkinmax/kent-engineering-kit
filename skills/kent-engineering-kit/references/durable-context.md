@@ -60,9 +60,6 @@ read-only `workflow-plan-contract` inspect mode by setting
 }
 ```
 
-The request permits at most 64 unique evidence references. Each referenced
-file and the plan are bounded to 8 MiB; referenced files together are bounded
-to 32 MiB. Decision narrative inspection is bounded to 64 KiB per field.
 Evidence-reference paths must resolve inside the selected workspace, and each
 supplied digest is checked before inspection. A legacy plan path must also be
 inside that workspace; an R2 plan path must identify a revision in the
@@ -77,10 +74,8 @@ references are marked `unverified_candidate`. An unresolved or incomplete
 result means discovery could not establish the facts; it does not prove that
 approval is absent or that the original source never existed.
 
-The current text extractor recognizes `task_comment(...)`,
-`session_message(...)`, and `question_answer(...)` references. Other narrative
-is not silently promoted to an authority locator; preserve it as unresolved
-context and retrieve its original source when available.
+Tagged `task_comment(...)`, `session_message(...)` and `question_answer(...)`
+references aid source discovery; other narrative remains unresolved context.
 
 Inspect decision references in every validated evidence record field used for
 narrative, including `summary`, `decisions`, `checks`, and `artifacts`.
@@ -216,10 +211,6 @@ followed by LF and raw bytes; `artifact-read` uses `sha256`. Do not provide
 `r2-artifact-response-v1` header and binary read framing as the standalone CLI,
 not the ordinary workflow JSON envelope.
 
-These are source interfaces. Before use in an adopted project, verify the
-qualified helper and project binding; source availability alone is not
-installed qualification.
-
 ### Revisions and acceptance
 
 R2 stores immutable project and Task identities in `project.json` and
@@ -229,14 +220,10 @@ adapter limits Task-document operations to the current admitted Task. No
 operation resolves a Task from “the latest” file or a global current-Task
 pointer.
 
-Each document has an immutable revision directory containing `content.md` and
-`revision.json`, plus a `head.json` that names the current revision. The
-revision token is the digest of its closed metadata, including its document
-key, parent revision, content digest, operation ID, and source provenance.
-Publishing requires the caller's expected current revision. A per-document
-lock serializes publication; stale writers conflict instead of silently
-overwriting one another. A fully published exact retry can settle by identity;
-partial or conflicting state is not treated as a successful revision.
+Read revisions through the adapter and publish with the exact expected current
+revision. Stale writers conflict; immutable content is never edited in place.
+An exact published retry can settle by identity; partial/conflicting state is
+not successful publication.
 
 Accepting a Task plan is separate from publishing its working revision. The
 immutable `r2-accepted-plan-v1` snapshot binds the project and Task UIDs,
@@ -254,12 +241,9 @@ Workflow acceptance must preserve the references required by the existing
 graph and project gates; readers must still retrieve and verify the original
 sources.
 
-For R2 acceptance, if neither the current review text nor normalized plan has
-a tagged source reference, the adapter can recover tagged pointers from the
-validated Task ledger, including `summary`. It does not parse a damaged suffix
-or verify the source. When review or plan text already has a tagged reference,
-that reference is carried forward; this fallback does not merge in other
-ledger candidates.
+Acceptance can recover missing tagged pointers from validated ledger narrative,
+including `summary`. This discovers locators, not authorship or consent, and
+never parses damaged suffixes.
 
 R2 normalization treats line-ending changes, trailing whitespace, final blank
 lines, and checkbox progress as non-contract changes. A new immutable working
@@ -316,22 +300,9 @@ the sentinel grants no permission or positive result.
 
 ## Local locator cache and terminal closure
 
-For an R2 Task, `.kent/runtime/<task>/plan-contract.json` is only a local
-locator cache. Its closed `r2-plan-contract-cache-v1` object contains exactly:
-
-```json
-{
-  "schema": "r2-plan-contract-cache-v1",
-  "task_short_id": "TASK-123",
-  "project_uid": "project-uid",
-  "task_uid": "task-uid",
-  "task_binding_sha256": "64-lowercase-hex-digits",
-  "accepted_snapshot_path": "/absolute/R2/project/tasks/TASK-123/accepted/hash.json",
-  "accepted_snapshot_sha256": "64-lowercase-hex-digits"
-}
-```
-
-It contains neither normalized plan text nor duplicate authority fields. On
+For an R2 Task, `.kent/runtime/<task>/plan-contract.json` is only a
+`r2-plan-contract-cache-v1` locator produced by the qualified adapter, not a
+manually maintained plan/authority record. On
 read, compare it with the validated external accepted head and snapshot. If
 the cache is absent, check the external accepted state directly; do not
 recreate the cache as a read-side repair. A mismatched cache is an error, not
@@ -351,3 +322,16 @@ an off-machine backup. Do not delete or garbage-collect old revisions as part
 of ordinary Task cleanup. MCP raw objects, schema caches, call receipts,
 runtime effect checkpoints, and evidence ledgers remain in their own
 task-bound protocols; none is project knowledge or authority.
+
+## Compact plans and request framing
+
+Keep the current working plan concise and reference immutable prior revisions
+for history. Preserve every applicable restriction, acceptance obligation,
+remaining action and original decision locator; shortening is not waiver.
+Ordinary plans do not inherit operation/portfolio canonical-JSON requirements.
+
+Use each helper's declared request schema and framing. Preflight the complete
+serialized UTF-8 request, including escaping, envelope and inline content,
+against its actual bound before publication. Binary attachments use their
+header/raw-byte protocol above. Do not invent fields, raise global limits or
+turn missing agent paperwork into another human permission request.

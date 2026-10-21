@@ -27,10 +27,6 @@ class ReleaseSpecError(SpecError):
     """Raised when a release contract is malformed or inconsistent."""
 
 
-ReleaseValidationError = ReleaseSpecError
-ReleaseError = ReleaseSpecError
-
-
 SPEC_ROOTS = {
     "schema_version",
     "spec_kind",
@@ -521,10 +517,6 @@ def sha256_digest(value: bytes | bytearray | str | Any) -> str:
 
 
 canonical_bytes = canonical_json_bytes
-canonical_sha256 = sha256_digest
-sha256_hex = sha256_digest
-
-
 def _canonical_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _canonical_value(item) for key, item in value.items()}
@@ -592,10 +584,6 @@ class WorkflowSourceIntent:
     def from_toml(cls, contents: str) -> "WorkflowSourceIntent":
         return cls.from_dict(tomllib.loads(contents))
 
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "WorkflowSourceIntent":
-        return cls.from_dict(value)
-
     def validate(self, *, adoption_mode: str | None = None) -> None:
         if not UUID_RE.fullmatch(self.id):
             _error("workflow_source_intent.id must be a UUID")
@@ -658,11 +646,6 @@ class ExternalRoot:
             "key": self.key,
             "runtime_digest_required": self.runtime_digest_required,
         }
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "ExternalRoot":
-        return cls.from_dict(value)
-
 
 @dataclass(frozen=True)
 class ReleaseSourceManifest:
@@ -731,14 +714,6 @@ class ReleaseSourceManifest:
     @classmethod
     def from_json(cls, contents: str) -> "ReleaseSourceManifest":
         return cls.from_dict(json.loads(contents))
-
-    @classmethod
-    def parse(cls, contents: str) -> "ReleaseSourceManifest":
-        return cls.from_json(contents)
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "ReleaseSourceManifest":
-        return cls.from_dict(value)
 
     def validate(
         self,
@@ -843,14 +818,6 @@ class SourceManifestReference:
         result.validate()
         return result
 
-    @classmethod
-    def from_toml(cls, contents: str) -> "SourceManifestReference":
-        return cls.from_dict(tomllib.loads(contents))
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "SourceManifestReference":
-        return cls.from_dict(value)
-
     def validate(self) -> None:
         if self.schema != "release_source_manifest_v1":
             _error("source_manifest.schema must be release_source_manifest_v1")
@@ -868,9 +835,6 @@ class SourceManifestReference:
             "revision_binding": self.revision_binding,
             "runtime_attested": self.runtime_attested,
         }
-
-
-SourceManifestSpec = SourceManifestReference
 
 
 def _normalize_permissions(value: Any, label: str) -> dict[str, str]:
@@ -1045,10 +1009,6 @@ class NormalizedGitHubStepV1:
             _error("step.secret_refs must exactly match nested secret references")
         return result
 
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "NormalizedGitHubStepV1":
-        return cls.from_dict(value)
-
     def as_dict(self) -> dict[str, Any]:
         return {
             "kind": self.kind,
@@ -1177,10 +1137,6 @@ class NormalizedGitHubJobV1:
         if set(result.secret_refs) != extracted_secrets:
             _error("job.secret_refs must exactly match nested secret references")
         return result
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "NormalizedGitHubJobV1":
-        return cls.from_dict(value)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1374,13 +1330,6 @@ class NormalizedGitHubWorkflowSourceV1:
         return result
 
     @classmethod
-    def from_mapping(
-        cls,
-        value: Mapping[str, Any],
-    ) -> "NormalizedGitHubWorkflowSourceV1":
-        return cls.from_dict(value)
-
-    @classmethod
     def from_json(cls, contents: str) -> "NormalizedGitHubWorkflowSourceV1":
         return cls.from_dict(json.loads(contents))
 
@@ -1447,14 +1396,6 @@ class JobContractTable:
             jobs=tuple(sorted(rows, key=lambda row: row["contract_key"])),
         )
 
-    @classmethod
-    def from_mapping(
-        cls,
-        value: Mapping[str, Any],
-        set_kind: str,
-    ) -> "JobContractTable":
-        return cls.from_dict(value, set_kind)
-
     def as_dict(self) -> dict[str, Any]:
         return {"schema": self.schema, "jobs": list(self.jobs)}
 
@@ -1506,8 +1447,6 @@ def _validate_contract_row(
     source = {key: row[key] for key in JOB_KEYS}
     source["steps"] = source_steps
     normalized_job = NormalizedGitHubJobV1.from_dict(source)
-    if normalized_job.job_key != job_key:
-        _error(f"{label}.job_key does not match normalized job source")
     if not NORMALIZED_KEY_RE.fullmatch(job_key):
         _error(f"{label}.job_key must be a normalized key")
     for key in POLICY_FIELDS:
@@ -1578,15 +1517,6 @@ class ProjectField:
             "nullable": self.nullable,
             "approval_renderable": self.approval_renderable,
         }
-
-    @classmethod
-    def from_mapping(
-        cls,
-        value: Mapping[str, Any],
-        label: str = "project_field",
-    ) -> "ProjectField":
-        return cls.from_dict(value, label)
-
 
 _POLICY_SENTINELS = {
     "runtime",
@@ -1708,10 +1638,6 @@ class GitHubRefPolicy:
             )
         _error("ref_policy.kind is unsupported")
 
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "GitHubRefPolicy":
-        return cls.from_dict(value)
-
     def as_dict(self) -> dict[str, Any]:
         if self.kind == "exact":
             return {"kind": self.kind, "ref": self.ref}
@@ -1781,10 +1707,6 @@ class AuthorityTemplateSpec:
         else:
             _error(f"authority_kind.kind is unsupported: {kind!r}")
         return cls(kind=kind, values=dict(data))
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "AuthorityTemplateSpec":
-        return cls.from_dict(value)
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self.values)
@@ -1891,11 +1813,6 @@ class AuthoritySpec:
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self.values)
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "AuthoritySpec":
-        return cls.from_dict(value)
-
 
 @dataclass(frozen=True)
 class OperationVariant:
@@ -2016,15 +1933,6 @@ class OperationVariant:
             "project_fields": [item.as_dict() for item in self.project_fields],
         }
 
-    @classmethod
-    def from_mapping(
-        cls,
-        value: Mapping[str, Any],
-        index: int = 0,
-    ) -> "OperationVariant":
-        return cls.from_dict(value, index)
-
-
 @dataclass(frozen=True)
 class ApprovalMaterialization:
     variant_key: str
@@ -2090,14 +1998,6 @@ class ApprovalMaterialization:
             templates=templates,
         )
         return result
-
-    @classmethod
-    def from_mapping(
-        cls,
-        value: Mapping[str, Any],
-        index: int = 0,
-    ) -> "ApprovalMaterialization":
-        return cls.from_dict(value, index)
 
     def validate(self, variant: OperationVariant) -> None:
         if self.variant_key != variant.key:
@@ -2224,14 +2124,6 @@ class NativeAgentApproval:
             transitions=ordered,
         )
         return result
-
-    @classmethod
-    def from_mapping(
-        cls,
-        value: Mapping[str, Any],
-        index: int = 0,
-    ) -> "NativeAgentApproval":
-        return cls.from_dict(value, index)
 
     def validate(self, variant: OperationVariant) -> None:
         if self.variant_key != variant.key:
@@ -2463,24 +2355,6 @@ class ReleaseSpec:
         except tomllib.TOMLDecodeError as error:
             raise ReleaseSpecError(f"cannot parse release spec: {error}") from error
         return cls.from_dict(value, profile=profile)
-
-    @classmethod
-    def from_mapping(
-        cls,
-        value: Mapping[str, Any],
-        *,
-        profile: Any | None = None,
-    ) -> "ReleaseSpec":
-        return cls.from_dict(value, profile=profile)
-
-    @classmethod
-    def load(
-        cls,
-        contents: str,
-        *,
-        profile: Any | None = None,
-    ) -> "ReleaseSpec":
-        return cls.from_toml(contents, profile=profile)
 
     @classmethod
     def parse(cls, contents: str, *, profile: Any | None = None) -> "ReleaseSpec":
@@ -3042,11 +2916,6 @@ def _contract_steps(
     job: NormalizedGitHubJobV1,
     set_kind: str,
 ) -> tuple[dict[str, Any], ...]:
-    if "steps" not in row:
-        return tuple(
-            {"step_index": index, "validation_required": False}
-            for index in range(len(job.steps))
-        )
     declared = _list(row["steps"], f"contract {row['contract_key']}.steps")
     if len(declared) != len(job.steps):
         _error(f"contract {row['contract_key']!r} has step cardinality drift")
@@ -3907,8 +3776,6 @@ def render_approval_summary(
         _error("approval required_fields must appear in every transition template")
     ordered = [templates[section] for section in SUMMARY_SECTIONS]
     lines = [_render_template(_string(template, "approval template"), values) for template in ordered]
-    if len(lines) != 3:
-        _error("approval summary must contain exactly three lines")
     if any("\r" in line or "\n" in line for line in lines):
         _error("approval summary must contain exactly three physical lines")
     return "\n".join(lines)
@@ -4166,42 +4033,6 @@ def render_release_preview(
     return preview
 
 
-def load_release_spec(
-    contents: str,
-    *,
-    profile: Any | None = None,
-) -> ReleaseSpec:
-    return ReleaseSpec.from_toml(contents, profile=profile)
-
-
-def parse_release_spec(
-    contents: str,
-    *,
-    profile: Any | None = None,
-) -> ReleaseSpec:
-    return load_release_spec(contents, profile=profile)
-
-
-def parse_source_manifest(
-    value: Mapping[str, Any] | str,
-) -> ReleaseSourceManifest:
-    if isinstance(value, str):
-        return ReleaseSourceManifest.from_json(value)
-    return ReleaseSourceManifest.from_dict(value)
-
-
-def operation_jobs_manifest_bytes(validated: ValidatedOperationJobs) -> bytes:
-    if not isinstance(validated, ValidatedOperationJobs):
-        _error("operation jobs manifest requires ValidatedOperationJobs")
-    return validated.operation_jobs_manifest_bytes
-
-
-def operation_jobs_manifest_digest(validated: ValidatedOperationJobs) -> str:
-    if not isinstance(validated, ValidatedOperationJobs):
-        _error("operation jobs manifest requires ValidatedOperationJobs")
-    return validated.operation_jobs_manifest_digest
-
-
 __all__ = [
     "ApprovalMaterialization",
     "AuthoritySpec",
@@ -4216,32 +4047,22 @@ __all__ = [
     "NativeAgentApproval",
     "OperationVariant",
     "ProjectField",
-    "ReleaseError",
     "ReleaseSourceManifest",
     "ReleaseSpec",
     "ReleaseSpecError",
-    "ReleaseValidationError",
     "SelectedReleaseArtifacts",
     "SourceManifestReference",
-    "SourceManifestSpec",
     "ValidatedJobBinding",
     "ValidatedOperationJobs",
     "WorkflowSourceIntent",
     "canonical_json",
     "canonical_json_bytes",
     "canonical_bytes",
-    "canonical_sha256",
     "canonicalize_publication_operation",
-    "load_release_spec",
-    "parse_release_spec",
-    "parse_source_manifest",
-    "operation_jobs_manifest_bytes",
-    "operation_jobs_manifest_digest",
     "render_approval_summary",
     "render_release_preview",
     "validate_native_agent_approvals",
     "sha256_digest",
-    "sha256_hex",
     "validate_approval_materialization",
     "validate_effect_job_sources",
     "validate_operation_jobs",

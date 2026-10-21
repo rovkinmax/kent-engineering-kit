@@ -3,108 +3,30 @@ name: kent-engineering-kit
 description: Use the shared Kent project profile, adapter, verification, and workflow contracts.
 ---
 
-Read the active node context manifest, `.kent/workflow-profile.toml`, and
-`.kent/project-contract.md` before project work. `AGENTS.md` owns authority,
-safety, sessions, worktrees, and language. Role prompts own behavior; Kent
-configuration owns model, reasoning, verbosity, tools, and delegation.
+Read the active node context manifest, `.kent/workflow-profile.toml` and
+`.kent/project-contract.md` first. Load only their required and applicable
+conditional sources. `AGENTS.md` owns authority, governance, safety and
+language; roles own behavior, configuration owns execution settings.
 
-For unfamiliar Task/Session targeting, continuation or resource handoff, read
-the relevant section of
-[Task supervision operations](references/task-supervision-operations.md).
-The role prompt owns authority; the reference supplies native mechanics.
+Projects supply build, architecture, integrations, devices, credentials and
+release procedures. The shared workflow owns lifecycle, approval/review
+ordering, fan-out/Join, cleanup handoff and portable parameters. Maintainer
+contracts are generator sources, not a mandatory node reading catalog.
 
-For R2 task documents, missing accepted-plan caches, or recovery of earlier
-decisions, read [Durable context and recovery](references/durable-context.md).
-Resolve task-fixed legacy/R2 mode before choosing paths. Decision summaries
-and packet locators aid discovery; they do not replace original authority or
-fresh effect evidence.
+For R2 documents, missing accepted-plan caches or original decision recovery,
+read [Durable context and recovery](references/durable-context.md). Resolve
+task-fixed storage before choosing paths. Summaries/locators aid discovery;
+they supply neither original consent nor fresh effect evidence.
 
-## Boundaries
+Use supported Kent interfaces and project procedures for Task/Session
+operations. Requeueing is not startup, a pending Question is not completion,
+and unknown effects require settlement before retry.
 
-The Kit is platform-neutral. Shared workflow owns lifecycle, approvals,
-fan-out/Join, waiting, cleanup, and portable parameters. Projects own build,
-architecture, devices, integrations, credentials, and release procedures.
-Maintainer contracts are normative generator sources. Do not edit Kent's
-database directly. Workflow updates follow
-[Execution-history and compatibility policy](../../contracts/workflow-contract.md#execution-history-and-compatibility-policy);
-source edits do not mutate live workflows. Do not install,
-activate, publish, push, restart, or mutate live Workflow/Task/default state
-without explicit effect-specific authority and satisfied prerequisite checks.
-Where project governance permits a bounded combined package, one approval may
-explicitly enumerate those effects; source-only approval never grants them.
-The project contract owns scope, capable ownership and effect settlement.
+Workflow updates follow
+[compatibility policy](../../contracts/workflow-update-compatibility.md).
+Source changes do not update installed/live state or locked Sessions. Installation,
+activation, publication, restart and default/link changes require their exact
+effect authority and capable owner; a source-only approval grants none.
 
-## Operational CLIs
-
-`verify-release-portfolio` is read-only by default and binds Kit plus four
-unique project commits and exact repository identities. It reads profile,
-release source, manifest, preview, and runtime inputs from selected Git blobs.
-Optional report output uses a locked atomic write/readback contract.
-
-`retire-workflow-batch` is D9. Its canonical plan binds an absolute Kent
-executable and SHA-256, persistence database/schema, project root, Session
-roots, and typed resource identities. The driver constructs only fixed
-readbacks and `workflow delete <uuid> --json` (or `--confirm --json`).
-Sessions, worktrees, branches, and retained resources are never deleted.
-Session manifests are descriptor-relative, no-follow, bounded metadata
-(relative path, type, mode, bytes, SHA-256), never raw contents.
-
-`reconcile-canonical-workflows` accepts only typed `graph-only`,
-`metadata-only`, or `graph-and-metadata` intent. It constructs one complete
-graph apply document and closed metadata updates; plans contain no shell,
-argv, SQL, executable, command, or probe. Prepare and every phase re-read
-quiescence, terminal anchors, link/default invariants, and any declared D9
-journal. Exact pre/post settlement is required; rollback is a confirmed
-forward restore.
-
-`activate-primary-checkout` verifies exact primary root, `main`, clean baseline,
-ancestry, tracking/config/link/prompt preconditions, and source prompt digest.
-It persists `prepared -> activation_committed` before one safe fast-forward.
-Recovery settles exact baseline/target without replay. Matching regular prompts
-may be backed up once before adopting the byte-identical Kit symlink.
-
-## Plan and journal rules
-
-Plans are canonical compact JSON with duplicate-free closed objects, bounded
-lists/argv, unique identities, and a raw SHA-256 supplied by the caller.
-Mutation requires `--confirm` equal to that digest. Journals use one advisory
-lock, deterministic temporary path, file and directory fsync, atomic replace,
-and exact canonical readback. Effects use absolute executables, an exact
-replacement environment, bounded output, inherited lock ownership, and
-bounded guardian acknowledgement. Recovery never signals a PID: it settles
-only an exact postimage or preimage and blocks ambiguous state. A settled
-preimage can retry only in a later explicit invocation; same-cycle replay is
-rejected.
-
-## Verification
-
-Use `.kent/scripts/workflow-verify` or the repository profile command.
-Generated workflows declare an explicit Kent 2.6.1 execution-target policy.
-Run `./scripts/validate` for source-only deterministic verification; use
-`--installed-state` only when that separate effect is authorized.
-
-## Release-live portfolio operation
-
-`release-live-portfolio` is a separate portfolio-only operation. Its closed
-`release-live-portfolio-plan-v1` binds one absolute state directory, the exact
-Kent executable bytes, the read-only Kent database and Session roots, six
-ordered retirement members, and four ordered canonical members. The driver
-constructs no commands, SQL, probes, shells, or caller-supplied journal/report
-paths.
-
-Use `scripts/reconcile-release-portfolio` only with the exact plan digest and
-absolute Kent path:
-
-```text
-preview -> prepare -> retire -> apply -> complete
-```
-
-`prepare` is a separately confirmed durable local journal mutation: it requires
-exact `--confirm` equal to the plan SHA-256 before writing the fixed
-`<state_dir>/release-live-portfolio.journal.json` pre-D9 receipt, and performs
-no D9 or Workflow effect.
-`retire` is irreversible after its first confirmed delete. `apply` requires the
-exact D9 poststate before every canonical graph or metadata effect. `rollback`
-is a separately confirmed forward restore during canonical progression; it
-cannot undo D9 or rewind a completed operation. Existing single-project v1
-operation plans and CLIs are unchanged.
+Run the profile's verification command. Kit source verification is
+`./scripts/validate`; `--installed-state` is a separate authorized inspection.

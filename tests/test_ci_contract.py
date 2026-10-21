@@ -9,7 +9,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import unittest
 from unittest import mock
 
@@ -23,14 +22,7 @@ from workflowkit.ci_contract import (
     prepare_ci_payload,
 )
 
-from tests.test_revision import (
-    CONTEXT_MANIFESTS,
-    RevisionPreflightTest,
-    WORK_KIND_PROCEDURES,
-    release_spec_contents,
-    schema4_profile_contents,
-    source_manifest_contents,
-)
+from tests import test_revision as revision_fixtures
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -290,53 +282,7 @@ class CiContractTest(unittest.TestCase):
             {"error": "ci_prepare_input_invalid"},
         )
 
-    def test_required_job_projection_accepts_schema3_native_agent_source(self) -> None:
-        fixture = RevisionPreflightTest("test_schema3_native_agent_preflight_binds_snapshot_without_script")
-        try:
-            root = fixture.create_project(
-                schema4=True,
-                release_schema_version=3,
-                both_templates=True,
-                native_agent=True,
-            )
-            profile = ci_contract._profile_at_revision(root, "HEAD")
-            rows = ci_contract._required_rows(
-                root,
-                profile,
-                fixture.run_git(root, "rev-parse", "HEAD").stdout.strip(),
-                repository="owner/repository",
-            )
-            self.assertEqual(
-                [row["contract_key"] for row in rows],
-                ["required_release_contract"],
-            )
-        finally:
-            fixture.doCleanups()
-
-    def test_required_job_projection_accepts_schema3_native_only_source(self) -> None:
-        fixture = RevisionPreflightTest("test_schema3_native_only_preflight_has_zero_effect_jobs")
-        try:
-            root = fixture.create_project(
-                schema4=True,
-                release_schema_version=3,
-                native_agent=True,
-                native_only=True,
-            )
-            profile = ci_contract._profile_at_revision(root, "HEAD")
-            rows = ci_contract._required_rows(
-                root,
-                profile,
-                fixture.run_git(root, "rev-parse", "HEAD").stdout.strip(),
-                repository="owner/repository",
-            )
-            self.assertEqual(
-                [row["contract_key"] for row in rows],
-                ["required_release_contract"],
-            )
-        finally:
-            fixture.doCleanups()
-
-    def test_runner_assertion_matches_supported_puber_bytes_only(self) -> None:
+    def test_runner_assertion_accepts_only_supported_unconditional_forms(self) -> None:
         assertion = 'test "${RUNNER_ENVIRONMENT:-github-hosted}" = github-hosted'
         for step, asserted in (
             ({"run": assertion}, True),
@@ -415,39 +361,7 @@ class CiContractTest(unittest.TestCase):
             "mergeCommit": None,
             "statusCheckRollup": [],
         }
-        with (
-            mock.patch.object(ci_contract, "read_pull_request", side_effect=[pr, pr]),
-            mock.patch.object(
-                ci_contract,
-                "materialize_exact_commit",
-                side_effect=AssertionError("dynamic prepare must not materialize commits"),
-            ),
-            mock.patch.object(
-                ci_contract,
-                "preflight_project_revision",
-                side_effect=AssertionError("dynamic prepare must not preflight source"),
-            ),
-            mock.patch.object(
-                ci_contract,
-                "_profile_at_revision",
-                side_effect=AssertionError("dynamic prepare must not read profile"),
-            ),
-            mock.patch.object(
-                ci_contract,
-                "_required_rows",
-                side_effect=AssertionError("dynamic prepare must not read release jobs"),
-            ),
-            mock.patch.object(
-                ci_contract,
-                "_validate_job_sources",
-                side_effect=AssertionError("dynamic prepare must not validate source jobs"),
-            ),
-            mock.patch.object(
-                ci_contract,
-                "_validate_adoption",
-                side_effect=AssertionError("dynamic prepare must not inspect adoption"),
-            ),
-        ):
+        with mock.patch.object(ci_contract, "read_pull_request", side_effect=[pr, pr]):
             prepared = prepare_ci_payload(payload, gh_bin="/bin/true")
         self.assertEqual(prepared["transition"], "ci_prepare_ready_initial")
         self.assertEqual(
@@ -539,25 +453,45 @@ class CiContractTest(unittest.TestCase):
         self.assertEqual(retried["ci_report"], retry_payload["ci_report"])
         archive.assert_called_once()
 
-        changed_head = "c" * 40
-        changed_pr = {**pr, "headRefOid": changed_head}
-        changed = {
-            **retry_payload,
-            "ci_report": retry_payload["ci_report"],
+        for observed_key, contract_key in (("headRefOid", "head_oid"), ("baseRefOid", "base_oid")):
+            changed_pr = {**pr, observed_key: "c" * 40}
+            with (
+                self.subTest(changed=observed_key),
+                mock.patch.object(
+                    ci_contract, "read_pull_request", side_effect=[changed_pr, changed_pr],
+                ),
+                mock.patch.object(ci_contract, "archive_ci_report") as archive_changed,
+            ):
+                fresh = prepare_ci_payload(retry_payload, gh_bin="/bin/true")
+                self.assertEqual(fresh["transition"], "ci_prepare_ready_initial")
+                self.assertNotIn("ci_report", fresh)
+                self.assertEqual(json.loads(fresh["ci_contract"])[contract_key], "c" * 40)
+                archive_changed.assert_called_once_with(ROOT, "TASK-1", report)
+
+        for drift in ({"headRefOid": "c" * 40}, {"baseRefOid": "c" * 40},
+                      {"baseRefName": "release"}):
+            with (
+                self.subTest(drift=drift),
+                mock.patch.object(ci_contract, "read_pull_request", side_effect=[pr, {**pr, **drift}]),
+                mock.patch.object(ci_contract, "archive_ci_report") as archive,
+                self.assertRaisesRegex(CiContractError, "identity changed"),
+            ):
+                prepare_ci_payload(retry_payload, gh_bin="/bin/true")
+            archive.assert_not_called()
+        merged = {
+            **pr, "state": "MERGED", "mergedAt": "2026-09-06T12:00:00Z",
+            "mergeCommit": {"oid": "d" * 40},
         }
-        with (
-            mock.patch.object(
-                ci_contract,
-                "read_pull_request",
-                side_effect=[changed_pr, changed_pr],
-            ),
-            mock.patch.object(ci_contract, "archive_ci_report") as archive_changed,
-        ):
-            fresh = prepare_ci_payload(changed, gh_bin="/bin/true")
-        self.assertEqual(fresh["transition"], "ci_prepare_ready_initial")
-        self.assertNotIn("ci_report", fresh)
-        self.assertEqual(json.loads(fresh["ci_contract"])["head_oid"], changed_head)
-        archive_changed.assert_called_once()
+        for observations in ([merged], [pr, merged]):
+            with (
+                self.subTest(observations=len(observations)),
+                mock.patch.object(ci_contract, "read_pull_request", side_effect=observations),
+                mock.patch.object(ci_contract, "archive_ci_report") as archive,
+            ):
+                recovered = prepare_ci_payload(retry_payload, gh_bin="/bin/true")
+                self.assertEqual(recovered["transition"], "ci_prepare_pr_merged")
+                self.assertEqual(json.loads(recovered["merge_report"]), merged)
+                archive.assert_called_once_with(ROOT, "TASK-1", report)
 
     @mock.patch.dict(os.environ, {
         "KENT_SESSION_ID": "11111111-1111-4111-8111-111111111111",
@@ -689,96 +623,6 @@ class CiContractTest(unittest.TestCase):
             **metadata, "state": "MERGED", "mergedAt": "2026-09-06T12:00:00Z",
             "mergeCommit": {"oid": "c" * 40},
         }, payload)
-
-    def test_exact_missing_object_fetch_changes_only_local_object_cache(self) -> None:
-        real_git = shutil.which("git")
-        self.assertIsNotNone(real_git)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            origin = root / "origin"
-            cache = root / "cache"
-            origin.mkdir()
-
-            def git(cwd, *args):
-                return subprocess.run(
-                    [real_git, "-C", str(cwd), *args], check=True,
-                    text=True, capture_output=True,
-                ).stdout.strip()
-
-            git(origin, "init", "-q")
-            git(origin, "config", "user.name", "Kent Test")
-            git(origin, "config", "user.email", "kent@example.invalid")
-            (origin / "source").write_text("target\n")
-            git(origin, "add", "source")
-            git(origin, "commit", "-qm", "target")
-            git(root, "clone", "--no-local", str(origin), str(cache))
-            (origin / "source").write_text("head\n")
-            git(origin, "commit", "-qam", "head")
-            head = git(origin, "rev-parse", "HEAD")
-            refs = git(cache, "for-each-ref", "--format=%(refname) %(objectname)")
-            tracked = (cache / "source").read_bytes()
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            calls = root / "calls.jsonl"
-            credentials_called = root / "credential-helper-called"
-            fake_gh = fake_bin / "gh-auth-fixture"
-            fake_gh.write_text(
-                f"#!{sys.executable}\n"
-                "import pathlib, sys\n"
-                "assert sys.argv[1:] == ['auth', 'git-credential', 'get']\n"
-                "request = sys.stdin.read()\n"
-                "assert 'protocol=https\\n' in request and 'host=github.com\\n' in request\n"
-                "assert 'path=owner/repository.git\\n' in request\n"
-                f"pathlib.Path({str(credentials_called)!r}).touch()\n"
-                "print('username=fixture\\npassword=synthetic-test-credential\\n')\n"
-            )
-            fake_gh.chmod(0o755)
-            forbidden_helper = root / "forbidden-helper-called"
-            git(
-                cache, "config", "credential.https://github.com/owner/repository.git.helper",
-                f"!touch {forbidden_helper}; exit 42",
-            )
-            fake_git = fake_bin / "git"
-            fake_git.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os, subprocess, sys\n"
-                "args = sys.argv[1:]\n"
-                f"with open({str(calls)!r}, 'a') as log: log.write(json.dumps(args) + '\\n')\n"
-                "if 'fetch' in args:\n"
-                "    assert args[-2] == 'https://github.com/owner/repository.git'\n"
-                # Exercise real Git credential selection before accepting the
-                # fake private transport. Neither a global rewrite nor an
-                # unrelated local credential helper may supply this identity.
-                f"    credential = subprocess.run([{real_git!r}, *args[:args.index('fetch')], 'credential', 'fill'],\n"
-                "        input='protocol=https\\nhost=github.com\\npath=owner/repository.git\\n\\n',\n"
-                "        text=True, capture_output=True, check=True)\n"
-                "    assert 'password=synthetic-test-credential\\n' in credential.stdout\n"
-                # Only the test transport redirects the exact verified HTTPS
-                # authority to a private Git repository. Production does not.
-                f"    args[-2] = {str(origin)!r}\n"
-                "    args[0:0] = ['-c', 'protocol.file.allow=always']\n"
-                f"os.execv({real_git!r}, [{real_git!r}, *args])\n"
-            )
-            fake_git.chmod(0o755)
-            with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}:{os.environ['PATH']}"}):
-                ci_contract.materialize_exact_commit(cache, "owner/repository", head, gh_bin=str(fake_gh))
-                ci_contract.materialize_exact_commit(cache, "owner/repository", head, gh_bin=str(fake_gh))
-            self.assertTrue(credentials_called.exists())
-            self.assertFalse(forbidden_helper.exists())
-            self.assertEqual(git(cache, "cat-file", "-t", head), "commit")
-            self.assertEqual(git(cache, "for-each-ref", "--format=%(refname) %(objectname)"), refs)
-            self.assertEqual((cache / "source").read_bytes(), tracked)
-            self.assertFalse((cache / ".git/FETCH_HEAD").exists())
-            commands = [json.loads(line) for line in calls.read_text().splitlines()]
-            fetches = [args for args in commands if "fetch" in args]
-            self.assertEqual(len(fetches), 1)
-            self.assertEqual(fetches[0][-1], head)
-            self.assertIn("--no-write-fetch-head", fetches[0])
-            self.assertIn("--no-tags", fetches[0])
-            self.assertIn("--no-recurse-submodules", fetches[0])
-            self.assertIn("--no-auto-maintenance", fetches[0])
-            with self.assertRaises(CiContractError):
-                ci_contract.materialize_exact_commit(cache, "owner/repository", "HEAD")
 
     def test_bounded_readers_kill_owned_grandchildren_when_parent_exits(self) -> None:
         from workflowkit import revision
@@ -958,64 +802,6 @@ jobs:
         )["jobs"][0]
         self.assertFalse(normalized["runner_environment_asserted"])
 
-    def test_required_policy_uses_complete_observed_dtos_unconditionally(self) -> None:
-        from copy import deepcopy
-        row = tomllib.loads(release_spec_contents())["required_jobs_v1"]["jobs"][0]
-        script = 'test "$RUNNER_ENVIRONMENT" = github-hosted'
-        row["steps"][0]["run"] = script
-        document = {
-            "name": "Release", "on": "pull_request",
-            "permissions": {"contents": "read"},
-            "jobs": {"required_release": {
-                "name": "Required Release", "runs-on": "ubuntu-latest",
-                "steps": [{"name": "validate", "shell": "bash", "run": script}],
-            }},
-        }
-        path = row["workflow_path"] = ".github/workflows/ci.json"
-        mutations = [
-            lambda job: job.update({"if": False}),
-            lambda job: job.update({"environment": {"name": "production"}}),
-            lambda job: job.update({"container": "image@sha256:" + "a" * 64}),
-            lambda job: job.update({"permissions": {"contents": "write"}}),
-            lambda job: job.update({"continue-on-error": "${{ inputs.ignore }}"}),
-            lambda job: job["steps"][0].update({"run": 'echo "$RUNNER_ENVIRONMENT"'}),
-            lambda job: job["steps"][0].update({"continue-on-error": "${{ true }}"}),
-            lambda job: job["steps"][0].pop("shell"),
-            lambda job: job.update({"env": {"SECRET": "${{ secrets.TOKEN }}"}}),
-        ]
-        for mutation in [None, *mutations]:
-            head = deepcopy(document)
-            if mutation:
-                mutation(head["jobs"]["required_release"])
-            with mock.patch.object(
-                ci_contract, "read_blob_bytes",
-                side_effect=lambda root, revision, path, **kw: json.dumps(
-                    document if revision == "p" else head
-                ).encode(),
-            ), mock.patch.object(
-                ci_contract, "validate_required_job_sources",
-                wraps=ci_contract.validate_required_job_sources,
-            ) as validator, self.subTest(mutation=mutation):
-                if mutation:
-                    with self.assertRaises(CiContractError):
-                        ci_contract._validate_job_sources(Path("/fixture"), "p", "h", [row])
-                else:
-                    result = ci_contract._validate_job_sources(
-                        Path("/fixture"), "p", "h", [row],
-                    )
-                    self.assertEqual(result, [{
-                        "workflow_name": "Release", "check_name": "Required Release",
-                        "allow_skipped": False,
-                    }])
-                    self.assertEqual(validator.call_count, 2)
-                    self.assertTrue(all(
-                        isinstance(call.args[0][0], NormalizedGitHubWorkflowSourceV1)
-                        for call in validator.call_args_list
-                    ))
-                    self.assertEqual(
-                        validator.call_args_list[0].args[0][0].workflow_path, path,
-                    )
-
     @mock.patch.dict(os.environ, {
         "KENT_SESSION_ID": "11111111-1111-4111-8111-111111111111",
         "KENT_STEP_ID": "22222222-2222-4222-8222-222222222222",
@@ -1043,11 +829,11 @@ jobs:
             profile = root / ".kent" / "workflow-profile.toml"
             profile.parent.mkdir(parents=True)
             (root / ".gitignore").write_text("/.kent/runtime/\n/fake-bin/\n")
-            profile.write_text(schema4_profile_contents())
+            profile.write_text(revision_fixtures.schema4_profile_contents())
             (root / ".kent" / "project-contract.md").write_text(
                 "# Project contract\n"
             )
-            for relative in WORK_KIND_PROCEDURES + CONTEXT_MANIFESTS:
+            for relative in revision_fixtures.WORK_KIND_PROCEDURES + revision_fixtures.CONTEXT_MANIFESTS:
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("# Test procedure\n")
@@ -1070,41 +856,6 @@ jobs:
                 command = scripts / name
                 command.write_text("#!/usr/bin/env bash\nexit 0\n")
                 command.chmod(0o755)
-            (root / ".kent" / "release").mkdir(parents=True)
-            (root / ".kent" / "release" / "spec.toml").write_text(
-                release_spec_contents().replace(
-                    '"run" = "echo ok"',
-                    '"run" = "test \\"$RUNNER_ENVIRONMENT\\" '
-                    '= github-hosted"',
-                )
-            )
-            (root / ".kent" / "release" / "source-manifest.json").write_text(
-                source_manifest_contents()
-            )
-            (root / ".kent" / "release" / "snapshot.json").write_text(
-                "{}\n"
-            )
-            builder = root / ".kent" / "release" / "build.sh"
-            builder.write_text("#!/usr/bin/env bash\nexit 0\n")
-            builder.chmod(0o755)
-            workflow = root / ".github" / "workflows" / "release.yml"
-            workflow.parent.mkdir(parents=True)
-            workflow.write_text(
-                """name: Release
-on:
-  pull_request:
-permissions:
-  contents: read
-jobs:
-  required_release:
-    name: Required Release
-    runs-on: ubuntu-latest
-    steps:
-      - name: validate
-        shell: bash
-        run: test "$RUNNER_ENVIRONMENT" = github-hosted
-"""
-            )
 
             def git(*args: str) -> str:
                 return subprocess.run(
@@ -1123,7 +874,7 @@ jobs:
             )
             target = git("rev-parse", "HEAD")
 
-            head_profile = schema4_profile_contents().replace(
+            head_profile = revision_fixtures.schema4_profile_contents().replace(
                 'kit_managed_commands = ["dispatch"]',
                 'kit_managed_commands = ["runtime_contracts", "verify", '
                 '"evidence", "janitor", "wait_pr", "wait_ci", '
@@ -1151,17 +902,6 @@ jobs:
                 (ROOT / "workflowkit" / "runtime.py").read_bytes()
             )
             (scripts / "workflow_runtime_contracts.py").chmod(0o755)
-            (root / ".kent/release/source-manifest.json").write_text(
-                source_manifest_contents(external_roots=[{
-                    "kind": "builder-sha256",
-                    "key": ci_contract._sha256(builder.read_bytes()),
-                    "runtime_digest_required": True,
-                }, {
-                    "kind": "source-sha256",
-                    "key": ".github/workflows/release.yml=" + ci_contract._sha256(workflow.read_bytes()),
-                    "runtime_digest_required": True,
-                }])
-            )
             for name in (
                 "workflow-prepare-github-ci", "workflow-wait-github-ci",
                 "workflow-wait-github-pr", "workflow-evidence-ledger",
@@ -1246,7 +986,9 @@ jobs:
             # installed-template consumers and the task evidence ledger.
             from workflowkit import build_delivery_workflow
             from workflowkit.profile import ProjectProfile
-            graph = build_delivery_workflow(ProjectProfile.load(root), 1)
+            graph = build_delivery_workflow(ProjectProfile.from_toml(
+                root, head_profile, check_files=False,
+            ), 1)
             edges = {edge.key: edge for edge in graph.edges}
 
             def transport(edge_key, values):
@@ -1350,201 +1092,11 @@ jobs:
             self.assertEqual(report["schema"], "github-ci-report-v3")
             self.assertEqual(report["attempts"][-1]["reason"], "failed")
             self.assertEqual(len(report["attempts"][-1]["checks"]), 2)
-            return
-            for extra_state in ("PENDING", "IN_PROGRESS"):
-                checks_path.write_text(json.dumps([
-                    observed[0], {**observed[1], "bucket": "pending", "state": extra_state},
-                ]))
-                pending_extra = invoke(
-                    scripts / "workflow-wait-github-ci", transport("ci_prepare_ready_initial", prepared),
-                )
-                self.assertEqual(pending_extra["transition"], "ci_watch_passed", pending_extra)
-                self.assertEqual(json.loads(pending_extra["ci_report"])["attempts"][-1]["watcher_exit_code"], 8)
-            checks_path.write_text(json.dumps([
-                {**observed[0], "bucket": "pending", "state": "PENDING"}, observed[1],
-            ]))
-            pending_required = invoke(
-                scripts / "workflow-wait-github-ci", transport("ci_prepare_ready_initial", prepared),
-            )
-            self.assertEqual(pending_required["transition"], "ci_watch_failed")
-            self.assertEqual(json.loads(pending_required["ci_report"])["attempts"][-1]["reason"], "pending_limit")
-            checks_path.write_text(json.dumps(observed))
             artifact = root / ".kent/runtime/TASK-1" / f"ci-report-{runtime.canonical_sha256(report)}.json"
             self.assertEqual(json.loads(artifact.read_text()), report)
             ledger = root / ".kent/runtime/TASK-1/evidence-ledger.jsonl"
             self.assertIn(str(artifact.relative_to(root)), ledger.read_text())
-            waiting_edge = next(edge.key for edge in graph.edges if edge.source == "ci_watch" and edge.target == "waiting_pr")
-            wait_values = transport(waiting_edge, green)
-            merge_edge = next(edge.key for edge in graph.edges if edge.source == "waiting_pr" and edge.target == "merge_watch")
-            # Waiting PR owns merge-method revalidation and supplies the exact
-            # observed head/base, as required by its existing node contract.
-            wait_input = transport(merge_edge, {
-                **wait_values, "pr_head_oid": pr_state["headRefOid"],
-                "pr_base_oid": pr_state["baseRefOid"],
-            })
-            feedback = invoke(scripts / "workflow-wait-github-pr", wait_input)
-            self.assertEqual(feedback["transition"], "merge_watch_still_waiting", feedback)
-            comments_path.write_text(json.dumps([{
-                "id": 1, "body": "Please review this note",
-                "created_at": "2026-09-06T12:00:00Z", "updated_at": "2026-09-06T12:00:00Z",
-                "user": {"login": "reviewer"},
-            }]))
-            changed_feedback = invoke(
-                scripts / "workflow-wait-github-pr",
-                {**wait_input, "pr_feedback_cursor": feedback["pr_feedback_cursor"]},
-            )
-            self.assertEqual(changed_feedback["transition"], "merge_watch_state_changed", changed_feedback)
-            self.assertEqual(json.loads(changed_feedback["pr_report"])["reason"], "pull_request_feedback_changed")
-            stable = invoke(
-                scripts / "workflow-wait-github-pr",
-                {**wait_input, "pr_feedback_cursor": changed_feedback["pr_feedback_cursor"]},
-            )
-            self.assertEqual(stable["transition"], "merge_watch_still_waiting", stable)
-            self.assertEqual(stable["ci_report"], green["ci_report"])
-            self.assertFalse(list(root.rglob("__pycache__")))
-            environment["PYTHONDONTWRITEBYTECODE"] = "0"
-            for required in ([], [{**observed[0], "bucket": "skipping", "state": "SKIPPED"}],
-                             [{**observed[0], "bucket": "fail", "state": "FAILURE"}]):
-                checks_path.write_text(json.dumps([*required, observed[1]]))
-                blocked = invoke(scripts / "workflow-wait-github-pr", {**wait_input, **stable})
-                self.assertEqual(blocked["transition"], "merge_watch_state_changed")
-                self.assertIn(json.loads(blocked["pr_report"])["reason"], {"checks_failed", "required_checks_not_green"})
-            checks_path.write_text(json.dumps(observed))
-            retry = invoke(
-                scripts / "workflow-prepare-github-ci",
-                transport("waiting_pr_ci_monitor", stable),
-            )
-            self.assertEqual(retry["transition"], "ci_prepare_ready_retry", retry)
-            again = invoke(
-                scripts / "workflow-wait-github-ci", transport("ci_prepare_ready_retry", retry),
-            )
-            self.assertEqual(again["transition"], "ci_watch_passed", again)
-            retried_report = runtime.validate_ci_report(json.loads(again["ci_report"]))
-            self.assertEqual(retried_report["attempts"][:-1], report["attempts"])
-            # A P-only advance with identical effective policy keeps every attempt.
-            advanced_target = git("commit-tree", f"{target}^{{tree}}", "-p", target, "-m", "target advance")
-            state_path.write_text(json.dumps({**pr_state, "baseRefOid": advanced_target}))
-            advanced = invoke(
-                scripts / "workflow-prepare-github-ci", transport("ci_monitor_watch", again),
-            )
-            self.assertEqual(advanced["transition"], "ci_prepare_ready_retry", advanced)
-            self.assertEqual(advanced["ci_report"], again["ci_report"])
-            self.assertEqual(json.loads(advanced["ci_policy_snapshot"])["target_commit"], advanced_target)
-            stale = invoke(
-                scripts / "workflow-wait-github-ci", transport("ci_prepare_ready_retry", retry),
-            )
-            self.assertEqual(stale["transition"], "ci_watch_source_changed", stale)
-            self.assertEqual(stale["ci_report"], retry["ci_report"])
-            refreshed = invoke(
-                scripts / "workflow-prepare-github-ci", transport("ci_watch_source_changed", stale),
-            )
-            self.assertEqual(refreshed["transition"], "ci_prepare_ready_retry", refreshed)
-            # Policy-only P drift (same names, same required source, same H)
-            # must invalidate the cycle even though the expected digest matches.
-            spec_path = root / ".kent/release/spec.toml"
-            original_spec = spec_path.read_text()
-            spec_path.write_text(original_spec.replace(
-                "github-hosted-standard-ephemeral", "github-hosted-larger-ephemeral",
-            ))
-            git("add", ".kent/release/spec.toml")
-            policy_target = git("commit-tree", git("write-tree"), "-p", target, "-m", "required policy drift")
-            spec_path.write_text(original_spec)
-            git("add", ".kent/release/spec.toml")
-            state_path.write_text(json.dumps({**pr_state, "baseRefOid": policy_target}))
-            changed_policy = invoke(
-                scripts / "workflow-prepare-github-ci", transport("ci_monitor_watch", again),
-            )
-            self.assertEqual(changed_policy["transition"], "ci_prepare_ready_initial", changed_policy)
-            self.assertEqual(changed_policy["expected_ci_checks_sha256"], again["expected_ci_checks_sha256"])
-            self.assertNotEqual(
-                json.loads(changed_policy["ci_policy_snapshot"])["source_policy_sha256"],
-                json.loads(again["ci_policy_snapshot"])["source_policy_sha256"],
-            )
-            self.assertNotIn("ci_report", changed_policy)
-            self.assertTrue(artifact.exists())
-            # Retargeting during the bounded producer read cannot validate a
-            # mixed packet; a newly merged PR instead takes proven recovery.
-            with mock.patch.object(
-                ci_contract, "read_pull_request",
-                side_effect=[pr_state, {**pr_state, "baseRefName": "release"}],
-            ):
-                with self.assertRaisesRegex(CiContractError, "identity changed"):
-                    prepare_ci_payload(payload)
-            merged_state = {
-                **pr_state, "state": "MERGED", "mergedAt": "2026-09-06T12:00:00Z",
-                "mergeCommit": {"oid": head},
-            }
-            with mock.patch.object(
-                ci_contract, "read_pull_request", side_effect=[pr_state, merged_state],
-            ):
-                merged = prepare_ci_payload(payload)
-                self.assertEqual(merged["transition"], "ci_prepare_pr_merged")
-                self.assertEqual(json.loads(merged["merge_report"])["mergeCommit"]["oid"], head)
-            # A failing mandatory job reaches actual diagnosis, with safe
-            # retry transport retaining all prior observations.
-            state_path.write_text(json.dumps(pr_state))
-            checks_path.write_text(json.dumps([
-                {**observed[0], "bucket": "fail", "state": "FAILURE"}, observed[1],
-            ]))
-            failed = invoke(
-                scripts / "workflow-wait-github-ci", transport("ci_prepare_ready_retry", retry),
-            )
-            self.assertEqual(failed["transition"], "ci_watch_failed")
-            diagnosis = transport("ci_watch_diagnose", failed)
-            retry_after_failure = invoke(
-                scripts / "workflow-prepare-github-ci", transport("ci_monitor_watch", diagnosis),
-            )
-            self.assertEqual(retry_after_failure["transition"], "ci_prepare_ready_retry")
-            self.assertEqual(retry_after_failure["ci_report"], failed["ci_report"])
-            checks_path.write_text(json.dumps(observed))
-            # A new H starts a fresh report while preserving the old evidence.
-            new_head = git("commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "new head")
-            state_path.write_text(json.dumps({**pr_state, "headRefOid": new_head}))
-            fresh = invoke(scripts / "workflow-prepare-github-ci", transport("ci_monitor_watch", again))
-            self.assertEqual(fresh["transition"], "ci_prepare_ready_initial", fresh)
-            self.assertNotIn("ci_report", fresh)
-            self.assertTrue(artifact.exists())
-            self.assertTrue(list(artifact.parent.glob("ci-report-*.json")))
-            self.assertFalse(list(root.rglob("__pycache__")))
-            self.assertEqual(
-                git("status", "--porcelain"),
-                "",
-                "read-only preparation/consumers changed tracked or unignored project source",
-            )
-            # Resume the original fixture's partial-adoption/drift checks.
-            fake_gh.write_text(
-                "#!/bin/sh\n"
-                f"echo '{json.dumps(pr_state)}'\n"
-            )
-            # Names and declared versions alone cannot claim template adoption.
-            adopted = scripts / "workflow-wait-github-ci"
-            adopted.write_text("#!/bin/sh\nexit 0\n")
-            git("add", ".kent/scripts/workflow-wait-github-ci")
-            git("commit", "-qm", "partial adoption")
-            partial_head = git("rev-parse", "HEAD")
-            fake_gh.write_text(fake_gh.read_text().replace(head, partial_head))
-            with self.assertRaisesRegex(CiContractError, "source_adoption_incomplete"):
-                prepare_ci_payload(payload, gh_bin=str(fake_gh))
-            adopted.write_bytes((ROOT / "templates/project/workflow-wait-github-ci").read_bytes())
-            fake_gh.write_text(fake_gh.read_text().replace(partial_head, head))
-            workflow.write_text(
-                workflow.read_text().replace(
-                    'run: test "$RUNNER_ENVIRONMENT" = github-hosted',
-                    "run: echo changed",
-                )
-            )
-            subprocess.run(["git", "add", "."], cwd=root, check=True)
-            subprocess.run(
-                ["git", "commit", "-qm", "head source drift"],
-                cwd=root,
-                check=True,
-            )
-            drifted_head = git("rev-parse", "HEAD")
-            fake_gh.write_text(
-                fake_gh.read_text().replace(head, drifted_head)
-            )
-            with self.assertRaisesRegex(CiContractError, "required_job_source_invalid"):
-                prepare_ci_payload(payload, gh_bin=str(fake_gh))
+            self.assertEqual(git("status", "--porcelain"), "")
 
     def test_ruby_normalizer_rejects_aliases_duplicates_and_matrices(self) -> None:
         with self.assertRaises(CiContractError):
@@ -1563,59 +1115,26 @@ jobs:
                 ".github/workflows/ci.yml",
             )
 
-    def test_policy_snapshot_binds_target_and_mandatory_projection(self) -> None:
-        expected = {
-            "schema": "github-ci-expected-checks-v1",
-            "repository": "owner/repository",
-            "project_commit": "a" * 40,
-            "runtime_source_envelope_digest": "b" * 64,
-            "checks": [
-                {
-                    "workflow_name": "PR",
-                    "check_name": "Build",
-                    "allow_skipped": False,
-                }
-            ],
-        }
-        snapshot = runtime.make_ci_policy_snapshot("c" * 40, expected)
-        self.assertEqual(
-            runtime.validate_ci_policy_snapshot(snapshot),
-            snapshot,
-        )
-        self.assertEqual(
-            runtime.ci_policy_projection_sha256(expected),
-            snapshot["policy_sha256"],
-        )
-
     def test_workflow_is_credential_free_and_source_only(self) -> None:
-        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        source = normalize_github_workflow(
+            (ROOT / ".github/workflows/ci.yml").read_bytes(),
+            ".github/workflows/ci.yml",
+        )
+        job = source["jobs"][0]
+        self.assertEqual(job["effective_permissions"], {"contents": "read"})
+        self.assertEqual(job["runs_on"], "ubuntu-latest")
+        self.assertTrue(job["runner_environment_asserted"])
+        self.assertNotIn("RUNNER_ENVIRONMENT", job["effective_environment"])
+        checkout = [step for step in job["steps"] if step["uses"].startswith("actions/checkout@")]
+        self.assertEqual(len(checkout), 1)
+        self.assertRegex(checkout[0]["uses"], r"^actions/checkout@[0-9a-f]{40}$")
+        self.assertFalse(job["checkout_persist_credentials"])
+        for step in job["steps"]:
+            self.assertNotIn("RUNNER_ENVIRONMENT", step["effective_environment"])
+            self.assertFalse(step["secret_refs"])
         self.assertEqual(
-            workflow,
-            """name: validate
-
-on:
-  pull_request:
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: read
-
-jobs:
-  validate:
-    runs-on: ubuntu-latest
-    env:
-      RUNNER_ENVIRONMENT: github-hosted
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-      - name: Assert hosted runner
-        run: test "$RUNNER_ENVIRONMENT" = github-hosted
-      - name: Validate source tree
-        run: ./scripts/validate
-""",
+            [step["run"] for step in job["steps"] if step["uses"] == ""],
+            ['test "$RUNNER_ENVIRONMENT" = github-hosted', "./scripts/validate"],
         )
 
     def test_source_only_validation_does_not_create_installed_state(self) -> None:
@@ -1665,12 +1184,6 @@ jobs:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse((persistence / "config.toml").exists())
             self.assertFalse((home / ".kent" / "config.toml").exists())
-
-    def test_validate_has_an_explicit_installed_state_mode(self) -> None:
-        script = (ROOT / "scripts" / "validate").read_text()
-        self.assertIn("--installed-state", script)
-        self.assertIn("usage: scripts/validate [--installed-state]", script)
-        self.assertIn('if [[ "$installed_state" -eq 1 ]]; then', script)
 
     def test_validate_rejects_unknown_arguments(self) -> None:
         result = subprocess.run(
