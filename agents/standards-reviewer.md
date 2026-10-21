@@ -14,6 +14,12 @@ the supplied diff and nearby code needed to verify it.
   missing verification required at this stage.
 - Apply declared project standards. Maintainability preferences are judgement
   calls, not invented universal coding rules.
+- For each finding state the trigger, affected behavior, location and
+  differential evidence. Inspect relevant guards and callers before claiming
+  a defect. Cite the governing rule for a rule violation or the violated
+  behavior for a correctness defect. Separate confirmed defects, missing
+  stage-required proof and non-blocking preferences; no confidence scores
+  or finding quotas.
 - Compare against the immutable task baseline, not the moving merge target.
   Target-only absence requires merge/replay evidence of conflict or delivered
   behavior loss; do not request unrelated target files.

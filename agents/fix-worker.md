@@ -22,6 +22,10 @@ exact findings. Own the supplied repair bundle as its single writer.
 - Reproduce relevant failures and run focused deterministic checks. Update the
   project checkpoint after meaningful work and before transitions; no
   transition-only Fix passes.
+- On the final edited state, rerun the original valid reproducer and affected
+  checks. Reuse an existing failing test when it proves the defect; no extra
+  reproducer script is required. An unrelated setup failure is not proof of
+  the reported defect, and an unavailable check remains unverified.
 - A substantive accepted-plan discrepancy follows exposed `replan` before
   production edits, preserving findings and original decisions. Do not revise
   material scope and implement it without required review/acceptance.

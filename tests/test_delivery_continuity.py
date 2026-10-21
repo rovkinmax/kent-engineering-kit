@@ -26,6 +26,45 @@ from workflowkit.model import EdgeSpec, ParameterSpec
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 class GeneratedStageContractsTests(unittest.TestCase):
+    def test_writer_and_owner_recover_original_context_before_escalation(self):
+        from workflowkit.delivery import implement_prompt, owner_replan_instruction
+
+        current = ProjectProfile.from_toml(
+            REPO_ROOT, (REPO_ROOT / ".kent/workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        for profile in (self.profile(), runtime_v2_profile(ci=False), current):
+            for selected in (False, True):
+                candidate = replace(profile, policies={
+                    **profile.policies, "writer_sessions": "continuous",
+                    "coder_selection": "complexity" if selected else "disabled",
+                })
+                for fresh in (False, True):
+                    with self.subTest(memory=profile.project_memory,
+                                      selected=selected, fresh=fresh):
+                        writer = implement_prompt(
+                            candidate, fresh_session=fresh, coder_selection=selected)
+                        self.assertNotIn("as the complete handoff", writer)
+                        if fresh:
+                            self.assertIn("discovery entry points", writer)
+                            self.assertIn("before editing or repeating a question", writer)
+                            self.assertIn("do not replace original authority", writer)
+                        owner = owner_replan_instruction(candidate)
+                        self.assertIn("recover accessible bindings read-only", owner)
+                        self.assertIn("Keep production edits blocked", owner)
+                        self.assertIn("Never invent a transition", owner)
+                        self.assertIn("precise unresolved gap and responsible owner", owner)
+                        self.assertLess(owner.index("recover accessible bindings"),
+                                        owner.index("If this node can retain blocked"))
+                        self.assertIn("snapshot plan_path and work_kind", owner)
+                        if candidate.delivery_reliability_policy() == "v1":
+                            self.assertIn("For R2 mode", owner)
+                            self.assertIn("helper-resolved legacy task", owner)
+                            self.assertIn("must not recreate the cache", owner)
+                        if selected:
+                            self.assertIn("accepted_plan_sha256", writer)
+                            self.assertIn("accepted_plan_sha256", owner)
+
     def profile(self):
         return ProjectProfile.from_toml(
             REPO_ROOT, (REPO_ROOT / "contracts/project-profile.example.toml").read_text(),

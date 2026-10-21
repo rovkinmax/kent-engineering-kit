@@ -31,6 +31,56 @@ module_spec.loader.exec_module(kit)
 
 
 class KitDevelopmentWorkflowTest(unittest.TestCase):
+    def test_prompt_improvement_contracts_preserve_safety_boundaries(self) -> None:
+        expectations = {
+            "prompts/review-change.md": (
+                "agents/standards-reviewer.md", "agents/spec-reviewer.md",
+                "installed", "source-binding rule", "consumer-relative",
+                "Session-control permissions", "same cause and remedy",
+                "each axis's result", "relevant guards and callers",
+            ),
+            "agents/standards-reviewer.md": (
+                "trigger, affected behavior", "relevant guards and callers",
+                "non-blocking preferences", "no confidence scores",
+            ),
+            "agents/workflow-gate.md": (
+                "existing artifact through the qualified reader/reconstruction route",
+                "truncated carrier", "freshness",
+                "Recovery cannot turn an old BLOCKED report into PASS",
+            ),
+            "agents/build-doctor.md": (
+                "exact authorized reproducer", "bounded read-only diagnosis",
+                "cause unconfirmed", "grant no installation",
+            ),
+            "agents/fix-worker.md": (
+                "final edited state", "original valid reproducer",
+                "Reuse an existing failing test", "unavailable check remains unverified",
+            ),
+            "prompts/tdd-slice.md": (
+                "not an unrelated setup", "missing new public symbol",
+                "without weakening", "existing affected tests", "final edited state",
+            ),
+            "contracts/plan-contract.md": (
+                "decisions that cannot be inferred", "required exact values",
+                "verification conditions", "original authority",
+                "not as an implementation transcript",
+            ),
+            "agents/task-supervisor.md": (
+                "first remaining action or exact awaited change",
+                "unknown effects", "owner/cleanup duties", "fresh pre-effect readbacks",
+            ),
+            "prompts/migrate-tasks.md": (
+                "first remaining action or exact awaited change", "link completed proof",
+                "unresolved effects", "owner/cleanup duties", "fresh pre-effect readbacks",
+            ),
+        }
+        # These are instruction-contract checks, not a model-performance benchmark.
+        for path, phrases in expectations.items():
+            text = " ".join((ROOT / path).read_text().split())
+            for phrase in phrases:
+                with self.subTest(path=path, phrase=phrase):
+                    self.assertIn(phrase, text)
+
     def test_operations_project_contract_fragments_exist(self) -> None:
         operations = (ROOT / "docs/OPERATIONS.md").read_text()
         contract = (ROOT / ".kent/project-contract.md").read_text()

@@ -35,5 +35,11 @@ policy evidence. Do not edit, start children or repeat broad reviews.
 - Producer-owned packets remain opaque. Use configured reconstruction/packing;
   missing or conflicting proof is a transport failure, not a product finding
   or evidence the underlying check passed.
+- Before declaring a report missing or requesting repetition, inspect its
+  existing artifact through the qualified reader/reconstruction route.
+  A truncated carrier does not prove the artifact is absent. Recovered proof
+  must still meet current-stage source/environment identity and freshness
+  requirements; stale, inaccessible or conflicting proof remains unresolved.
+  Recovery cannot turn an old BLOCKED report into PASS.
 
 Preserve canonical workspace and emit exactly the node's declared parameters.

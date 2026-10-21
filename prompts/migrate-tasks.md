@@ -42,6 +42,11 @@ material restrictions directly in the body. Identify exact transferred artifacts
 deliberate loss and unknown recoverability. New identity restores no attempts
 and transfers no resource ownership. Name how writers will be serialized and
 who retains predecessor cleanup.
+Identify the first remaining action or exact awaited change and link completed
+proof instead of replaying historical detail. Keep unresolved effects, remaining
+limits and owner/cleanup duties explicit in this existing handoff, not a second
+authority registry or a metadata mirror of native lifecycle. These references
+do not replace fresh pre-effect readbacks.
 
 # Preview and decision
 
