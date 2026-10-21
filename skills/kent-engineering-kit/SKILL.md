@@ -13,6 +13,15 @@ release procedures. The shared workflow owns lifecycle, approval/review
 ordering, fan-out/Join, cleanup handoff and portable parameters. Maintainer
 contracts are generator sources, not a mandatory node reading catalog.
 
+When a role requires a shared Kit contract, use this installed skill's source
+binding: resolve the `kent-engineering-kit` directory under
+`${KENT_PERSISTENCE_ROOT:-$HOME/.kent}/skills` through its installer symlink.
+Its canonical parent is the Kit's `skills` directory; the next parent is the
+Kit checkout. Read the named `contracts/...` file from that checkout. Do not
+resolve it from the consumer cwd or assume a persistence-root `contracts`
+copy. If this binding or the required file cannot be verified, block only the
+dependent action and report the missing source; do not substitute a lookalike.
+
 For R2 documents, missing accepted-plan caches or original decision recovery,
 read [Durable context and recovery](references/durable-context.md). Resolve
 task-fixed storage before choosing paths. Summaries/locators aid discovery;

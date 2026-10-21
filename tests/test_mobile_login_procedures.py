@@ -8,20 +8,24 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTRACT_PATH = Path("contracts/mobile-smoke-contract.md")
-ROLE_PATH = Path("agents/runtime-smoke-tester.md")
+CONTRACTS = {
+    "runtime-smoke-tester": "mobile-smoke-contract.md",
+    "ci-monitor": "workflow-contract.md",
+    "delivery-operator": "worktree-contract.md",
+}
 
 
 class MobileLoginInstallationTest(unittest.TestCase):
-    def test_installer_provides_mobile_guidance_from_qualified_kit_source(self) -> None:
-        # Availability integration only: this does not execute login recovery.
+    def test_installed_skill_resolves_required_contracts_outside_consumer(self) -> None:
+        # Source discovery only, not model obedience or runtime qualification.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             consumer = root / "consumer"
             consumer.mkdir()
-            lookalike = consumer / CONTRACT_PATH
-            lookalike.parent.mkdir()
-            lookalike.write_text("Unqualified consumer-local contract.\n")
+            for filename in CONTRACTS.values():
+                lookalike = consumer / "contracts" / filename
+                lookalike.parent.mkdir(exist_ok=True)
+                lookalike.write_text("Unqualified consumer-local contract.\n")
             home = root / "home"
             for name, explicit_root in (("default", False), ("custom root", True)):
                 with self.subTest(persistence=name):
@@ -43,20 +47,26 @@ class MobileLoginInstallationTest(unittest.TestCase):
                         check=False,
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    installed_role = persistence / ROLE_PATH
-                    self.assertTrue(installed_role.is_symlink())
-                    self.assertEqual(installed_role.resolve(strict=True), ROOT / ROLE_PATH)
                     self.assertFalse((persistence / "contracts").exists())
 
-                    # Follow the installer's actual source binding, not cwd or
-                    # an assumed contract copy in the persistence directory.
-                    qualified_kit = installed_role.resolve(strict=True).parents[1]
-                    contract = qualified_kit / CONTRACT_PATH
-                    self.assertTrue(contract.is_file())
-                    self.assertTrue(contract.read_bytes())
-                    self.assertEqual(contract, ROOT / CONTRACT_PATH)
-                    self.assertNotEqual(contract.resolve(), lookalike.resolve())
-                    self.assertNotEqual(contract.read_bytes(), lookalike.read_bytes())
+                    installed_skill = persistence / "skills/kent-engineering-kit"
+                    self.assertTrue(installed_skill.is_symlink())
+                    qualified_kit = installed_skill.resolve(strict=True).parents[1]
+                    self.assertEqual(qualified_kit, ROOT)
+                    for role, filename in CONTRACTS.items():
+                        with self.subTest(role=role):
+                            relative_role = Path("agents") / f"{role}.md"
+                            installed_role = persistence / relative_role
+                            self.assertTrue(installed_role.is_symlink())
+                            self.assertEqual(
+                                installed_role.resolve(strict=True), ROOT / relative_role,
+                            )
+                            contract = qualified_kit / "contracts" / filename
+                            lookalike = consumer / "contracts" / filename
+                            self.assertTrue(contract.is_file())
+                            self.assertTrue(contract.read_bytes())
+                            self.assertNotEqual(contract.resolve(), lookalike.resolve())
+                            self.assertNotEqual(contract.read_bytes(), lookalike.read_bytes())
 
 
 if __name__ == "__main__":

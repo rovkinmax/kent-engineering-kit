@@ -17,10 +17,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "templates" / "project" / "workflow-branch-identity"
 
 
-def load_script_module():
+def load_script_module(path=SCRIPT):
     loader = importlib.machinery.SourceFileLoader(
-        "workflow_branch_identity",
-        str(SCRIPT),
+        path.name.replace("-", "_"),
+        str(path),
     )
     spec = importlib.util.spec_from_loader(loader.name, loader)
     if spec is None:
@@ -31,9 +31,93 @@ def load_script_module():
 
 
 BRANCH_IDENTITY = load_script_module()
+PLAN_CONTRACT = load_script_module(SCRIPT.parent / "workflow-plan-contract")
 
 
 class BranchIdentityTest(unittest.TestCase):
+    def test_plan_helper_rejects_unsafe_declarations_before_loading(self):
+        self.configure("task", coder_selection=True)
+        for configured in (None, "", 42, "/tmp/helper", "../helper",
+                           ".kent/../helper", "./helper", ".kent//helper",
+                           ".kent\\helper"):
+            with self.subTest(configured=configured), \
+                    mock.patch.object(importlib.machinery.SourceFileLoader, "exec_module") as load:
+                with self.assertRaisesRegex(ValueError, "normalized relative path"):
+                    BRANCH_IDENTITY.plan_contract_adapter(
+                        self.root, {"commands": {"plan_contract": configured}})
+                load.assert_not_called()
+        for commands in (None, [], "invalid"):
+            with self.subTest(commands=commands):
+                with self.assertRaises(ValueError):
+                    BRANCH_IDENTITY.plan_contract_adapter(
+                        self.root, {"commands": commands})
+
+    def test_plan_helper_rejects_missing_directory_and_symlink_targets(self):
+        self.configure("task", coder_selection=True)
+        helper = self.root / ".kent/plans/workflow-plan-contract"
+        link = self.root / ".kent/linked-helper"
+        link.symlink_to(helper)
+        linked_parent = self.root / ".kent/linked-directory"
+        linked_parent.symlink_to(helper.parent, target_is_directory=True)
+        external = self.root.parent / "external-helper"
+        external.write_text("raise AssertionError('external helper executed')\n")
+        external_link = self.root / ".kent/external-directory"
+        external_link.symlink_to(external.parent, target_is_directory=True)
+        paths = (
+            ".kent/missing", ".kent/plans", ".kent/linked-helper",
+            ".kent/linked-directory/workflow-plan-contract",
+            ".kent/external-directory/external-helper",
+        )
+        for configured in paths:
+            with self.subTest(configured=configured), \
+                    mock.patch.object(importlib.machinery.SourceFileLoader, "exec_module") as load:
+                with self.assertRaisesRegex(ValueError, "qualified plan contract"):
+                    BRANCH_IDENTITY.plan_contract_adapter(
+                        self.root, {"commands": {"plan_contract": configured}})
+                load.assert_not_called()
+
+    def test_materialized_branch_resolves_declared_plan_helper(self):
+        self.configure("jira", coder_selection=True)
+        self.task(
+            short_id="TASK-1",
+            source_url="https://example.atlassian.net/browse/MBL-826",
+        )
+        plan = self.prepare_coder_selection("simple")
+        self.script = self.root / "tools/workflow-branch-identity"
+        self.script.parent.mkdir()
+        self.script.write_bytes(SCRIPT.read_bytes())
+        self.script.chmod(0o755)
+        self.assertFalse(self.script.with_name("workflow-plan-contract").exists())
+
+        result, payload = self.run_script(handoff=True, coder_selection=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_ready", payload)
+        self.assertEqual(payload["target_assignee"], "implementation-simple")
+        self.assertEqual(
+            payload["accepted_plan_sha256"], self.coder_handoff["accepted_plan_sha256"]
+        )
+
+        plan.write_text(plan.read_text() + "\nChanged after acceptance.\n")
+        result, payload = self.run_script(handoff=True, coder_selection=True)
+        self.assertEqual(payload["transition"], "branch_identity_revalidate", payload)
+        self.assertIn("changed", payload["plan_change_report"])
+        self.assertNotIn("target_assignee", payload)
+
+    def test_missing_declared_helper_does_not_fall_back_to_template_sibling(self):
+        self.configure("jira", coder_selection=True)
+        self.task(source_url="https://example.atlassian.net/browse/MBL-826")
+        self.prepare_coder_selection("simple")
+        helper = self.root / ".kent/plans/workflow-plan-contract"
+        helper.rename(helper.with_name("not-the-declared-helper"))
+        self.assertTrue(SCRIPT.with_name("workflow-plan-contract").is_file())
+        branch_before = self.branch()
+        result, payload = self.run_script(handoff=True, coder_selection=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_revalidate")
+        self.assertIn("adapter unavailable", payload["plan_change_report"])
+        self.assertNotIn("target_assignee", payload)
+        self.assertEqual(self.branch(), branch_before)
+
     def test_r2_branch_uses_external_selection_without_recreating_cache(self):
         import types
         self.configure("task", coder_selection=True)
@@ -57,17 +141,17 @@ class BranchIdentityTest(unittest.TestCase):
 
         contract = types.SimpleNamespace(
             memory_call=memory_call,
+            plan_coder_selection=mock.Mock(return_value=choice),
             memory_snapshot_projection=lambda *args: {
                 "normalized_sha256": digest, "coder_selection": choice})
         with mock.patch.object(importlib.util, "module_from_spec", return_value=contract), \
-                mock.patch.object(importlib.machinery.SourceFileLoader, "exec_module"), \
-                mock.patch.object(BRANCH_IDENTITY, "plan_coder_selection",
-                                  return_value=choice) as read_choice:
+                mock.patch.object(importlib.machinery.SourceFileLoader, "exec_module") as load:
             self.assertEqual(BRANCH_IDENTITY.coder_selection_snapshot(
                 self.root, handoff, short_id="TASK-1", native_payload=context),
                 ("implementation-simple", "xhigh"))
-            read_choice.assert_called_with(
-                Path("/external/current/content.md"), short_id="TASK-1")
+            contract.plan_coder_selection.assert_called_with(
+                Path("/external/current/content.md"), "TASK-1")
+            self.assertEqual(load.call_count, 1)
             self.assertTrue(all(payload == context for _, payload, _ in calls))
             self.assertEqual(calls[-1][2], {"coder_selection": choice})
             status["comparison"] = "changed"
@@ -174,6 +258,7 @@ class BranchIdentityTest(unittest.TestCase):
             )
 
     def setUp(self) -> None:
+        self.script = SCRIPT
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name) / "project"
@@ -238,7 +323,13 @@ class BranchIdentityTest(unittest.TestCase):
             profile_contents += (
                 'writer_sessions = "continuous"\n'
                 'coder_selection = "complexity"\n'
+                '\n[commands]\n'
+                'plan_contract = ".kent/plans/workflow-plan-contract"\n'
             )
+            helper = self.root / ".kent/plans/workflow-plan-contract"
+            helper.parent.mkdir()
+            helper.write_bytes((SCRIPT.parent / "workflow-plan-contract").read_bytes())
+            helper.chmod(0o755)
         profile.write_text(profile_contents)
 
     def task(
@@ -280,7 +371,7 @@ class BranchIdentityTest(unittest.TestCase):
         if coder_selection:
             workflow_input.update(self.coder_handoff)
         result = subprocess.run(
-            [str(SCRIPT)],
+            [str(self.script)],
             cwd=self.root,
             input=json.dumps(workflow_input),
             text=True,
@@ -309,7 +400,7 @@ class BranchIdentityTest(unittest.TestCase):
             + "\n```\n"
         )
         plan.write_text(contents)
-        normalized = BRANCH_IDENTITY.normalized_plan_bytes(plan)
+        normalized = PLAN_CONTRACT.normalized_plan(plan).encode("utf-8")
         digest = hashlib.sha256(normalized).hexdigest()
         runtime = self.root / ".kent" / "runtime" / "TASK-1"
         runtime.mkdir(parents=True)
@@ -457,7 +548,7 @@ class BranchIdentityTest(unittest.TestCase):
                             '"complexity": "simple"',
                             f'"complexity": {json.dumps(malformed)}',
                         ))
-                        normalized = BRANCH_IDENTITY.normalized_plan_bytes(plan)
+                        normalized = PLAN_CONTRACT.normalized_plan(plan).encode("utf-8")
                         digest = hashlib.sha256(normalized).hexdigest()
                         snapshot.update(
                             normalized_plan=normalized.decode("utf-8"),
