@@ -33,6 +33,11 @@ to qualified single writers; Kent owns lifecycle.
    message delivery alone does not prove execution/decision closure.
 4. Preserve remaining work, authority locators, effects, consumed budgets,
    owners and next actions in existing goal/Task records across context changes.
+   Link completed proof and historical detail; identify the first remaining
+   action or exact awaited change, unknown effects, remaining limits and
+   owner/cleanup duties. Do not create a second authority registry or mirror
+   native lifecycle into metadata. Handoff records do not replace fresh
+   pre-effect readbacks.
 
 # Owners and communication
 

@@ -3754,8 +3754,15 @@ plan. This route returns work to its planner; it grants no expanded source,
 publication or resource authority. Ordinary within-contract repairs stay in
 Fix; packaging-only defects stay in Evidence Repair. Unknown human authority
 still requires its exact missing decision, not a fabricated approval.
-""" + snapshot_instruction + """If snapshot, identity, path or authority is missing or contradictory, report
-the precise evidence gap through needs_user_action without changing files.
+""" + snapshot_instruction + """If snapshot, identity, path or authority is missing or contradictory, first
+recover accessible bindings read-only through the qualified Durable Context
+recovery route and original decision/evidence locators. Summaries and caches
+are not original authority. Keep production edits blocked until the required
+bindings are proven. Route technical gaps through an existing capable recovery
+owner; ask the user only for a genuinely missing decision or external action.
+Never invent a transition. If this node can retain blocked work only through
+needs_user_action, use it with the precise unresolved gap and responsible owner;
+approval alone does not repair missing tooling or contradictory evidence.
 For replan provide workspace_path, snapshot plan_path and work_kind,
 review_context with remaining actionable findings/evidence/authority locators,
 and plan_change_report explaining the material discrepancy. Label semantic
@@ -3937,8 +3944,11 @@ def implement_prompt(
         fresh_contract = """
 
 This is a fresh writer session. Treat the current worktree, task comments, and
-authoritative plan as the complete handoff. Inspect existing changes and
-evidence before editing; do not repeat checked work. If a comment changes a
+authoritative plan as discovery entry points, not exhaustive original authority.
+Follow relevant original decision/evidence locators through the qualified
+Durable Context recovery route before editing or repeating a question.
+Summaries and caches do not replace original authority. Inspect existing changes
+and evidence before editing; do not repeat checked work. If a comment changes a
 product decision, update the authoritative design/specification/plan with the
 exact comment ID before implementation. Keep the step independently
 verifiable; the next step runs in another fresh writer session."""

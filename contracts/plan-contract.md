@@ -30,7 +30,12 @@ Current-stage blockers still block. Changed authority or milestones require
 fresh independent review; neither Gate synthesis nor plan editing can turn an
 old BLOCKED report into PASS.
 
-Keep a compact current working plan with immutable-history references. Ordinary
+Keep a compact current working plan with immutable-history references.
+Retain decisions that cannot be inferred from the code, interface constraints,
+required exact values and verification conditions, linked to their original
+authority. Include implementation bodies only when needed to resolve a material
+ambiguity, not as an implementation transcript. Compactness must not erase
+constraints or impose a fixed plan length or another plan format. Ordinary
 Task plans are not portfolio JSON. Use the adapter's declared framing and
 preflight the complete request bytes; do not raise global limits or split
 away real restrictions to make a request fit.

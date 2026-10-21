@@ -19,6 +19,13 @@ Examine both axes:
 - Specification fidelity: missing requirements, incorrect behavior, and scope
   creep.
 
+Apply the criteria in `agents/standards-reviewer.md` and
+`agents/spec-reviewer.md` for both ordinary and delegated review. Resolve those
+files from the qualified Kit checkout using the installed
+`kent-engineering-kit` skill's source-binding rule, not consumer-relative
+lookalikes. If binding fails, report the gap; do not silently substitute criteria.
+Borrowing criteria grants none of another role's Session-control permissions.
+
 Ordinary review may cover both axes directly, disclosing its independence
 limits. Delegate only when independent sessions are required by governance or
 useful for the scope. In that case, check effective callability and tools first:
@@ -36,9 +43,15 @@ limits without manufacturing a new approval requirement.
 
 # Synthesis
 
-Preserve each axis's result and source references. Deduplicate overlapping
-findings into a prioritized synthesis; a change may pass one axis and fail the
-other.
+For each finding state its trigger, affected behavior, location and differential
+evidence after inspecting relevant guards and callers. Cite the governing rule
+for a rule violation or the violated behavior for a correctness defect.
+Distinguish confirmed defects, missing verification required at this stage and
+non-blocking preferences; do not invent confidence scores or finding quotas.
+
+Preserve each axis's result and all applicable rule, requirement and source-report
+references. Deduplicate findings sharing the same cause and remedy into a
+prioritized synthesis; a change may pass one axis and fail the other.
 
 End with:
 
