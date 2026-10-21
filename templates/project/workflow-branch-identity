@@ -199,9 +199,24 @@ def duplicate_free_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def plan_contract_adapter():
-    source = Path(__file__).with_name("workflow-plan-contract")
-    if source.is_symlink() or not source.is_file():
+def plan_contract_adapter(root: Path, profile: dict[str, object]):
+    commands = profile.get("commands")
+    configured = commands.get("plan_contract") if isinstance(commands, dict) else None
+    if (
+        not isinstance(configured, str)
+        or not configured
+        or "\\" in configured
+        or Path(configured).is_absolute()
+        or any(part in {"", ".", ".."} for part in configured.split("/"))
+    ):
+        raise ValueError("commands.plan_contract must be a normalized relative path")
+    root = root.resolve()
+    source = root
+    for part in configured.split("/"):
+        source = source / part
+        if source.is_symlink():
+            raise ValueError("qualified plan contract adapter path contains a symlink")
+    if not source.is_file() or not source.resolve().is_relative_to(root):
         raise ValueError("qualified plan contract adapter unavailable")
     loader = importlib.machinery.SourceFileLoader("branch_memory_contract", str(source))
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -212,14 +227,6 @@ def plan_contract_adapter():
     return contract
 
 
-def normalized_plan_bytes(path: Path) -> bytes:
-    return plan_contract_adapter().normalized_plan(path).encode("utf-8")
-
-
-def plan_coder_selection(path: Path, *, short_id: str) -> dict[str, str]:
-    return plan_contract_adapter().plan_coder_selection(path, short_id)
-
-
 def coder_selection_snapshot(
     root: Path,
     handoff: dict[str, str],
@@ -228,14 +235,15 @@ def coder_selection_snapshot(
     native_payload: dict[str, object] | None = None,
 ) -> tuple[str, str]:
     profile = tomllib.loads((root / ".kent/workflow-profile.toml").read_text())
+    contract = None
     if profile.get("project_memory", {}).get("mode") == "r2":
-        contract = plan_contract_adapter()
+        contract = plan_contract_adapter(root, profile)
         context = native_payload or {}
         admission = contract.memory_call(root, context, "resolve-task")
         if admission.get("mode") == "r2":
             resolved = contract.memory_call(
                 root, context, "resolve-plan", plan_path=handoff["plan_path"])
-            choice = plan_coder_selection(Path(resolved["working_path"]), short_id=short_id)
+            choice = contract.plan_coder_selection(Path(resolved["working_path"]), short_id)
             status = contract.memory_call(root, context, "check-plan", coder_selection=choice)
             accepted = contract.memory_snapshot_projection(status, short_id)
             cache_path = root / ".kent/runtime" / short_id / "plan-contract.json"
@@ -308,9 +316,12 @@ def coder_selection_snapshot(
     resolved = candidate.resolve()
     if not resolved.is_relative_to(root):
         raise ValueError("accepted plan path escapes the task workspace")
-    if hashlib.sha256(normalized_plan_bytes(resolved)).hexdigest() != accepted_digest:
+    if contract is None:
+        contract = plan_contract_adapter(root, profile)
+    normalized = contract.normalized_plan(resolved).encode("utf-8")
+    if hashlib.sha256(normalized).hexdigest() != accepted_digest:
         raise ValueError("accepted normalized plan changed before branch retry")
-    if plan_coder_selection(resolved, short_id=short_id) != selection:
+    if contract.plan_coder_selection(resolved, short_id) != selection:
         raise ValueError(
             "snapshot coder selection differs from the digest-bound plan choice"
         )

@@ -31,6 +31,21 @@ module_spec.loader.exec_module(kit)
 
 
 class KitDevelopmentWorkflowTest(unittest.TestCase):
+    def test_operations_project_contract_fragments_exist(self) -> None:
+        operations = (ROOT / "docs/OPERATIONS.md").read_text()
+        contract = (ROOT / ".kent/project-contract.md").read_text()
+        fragments = re.findall(
+            r"\]\(\.\./\.kent/project-contract\.md#([a-z0-9-]+)\)", operations,
+        )
+        self.assertTrue(fragments)
+        headings = {
+            title.lower().replace(" ", "-")
+            for title in re.findall(r"^## (.+)$", contract, re.MULTILINE)
+        }
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, headings)
+
     def test_current_source_snapshot_is_explicitly_unactivated(self) -> None:
         source = json.loads(kit.rendered_current_spec())
         ingress = [edge for edge in source["edges"]

@@ -197,7 +197,7 @@ preflight. A first Task Script cannot repair stale source selection.
 After an approved delivery is merged, refresh remote tracking and repeat
 preflight before the next Task. Do not check out or fast-forward installed local
 `main` as part of ordinary source development. Installed adoption follows the
-separate [source versus installed state](../.kent/project-contract.md#source-versus-installed-state)
+separate [source versus installed state](../.kent/project-contract.md#effects-and-report-only-work)
 procedure.
 
 ### Verify and deliver
@@ -209,7 +209,7 @@ source/environment identity references through the existing handoffs. Source or
 environment drift requires fresh verification. Do not use `--installed-state`
 for source development.
 
-See [verification ownership](../.kent/project-contract.md#source-verification-ownership-and-identity)
+See [verification ownership](../.kent/project-contract.md#verification-and-evidence)
 for the exact report and identity requirements.
 Commit, push, PR creation, merge, installation, and live workflow changes retain
 their separate authorization boundaries. A merged source PR is not evidence of
