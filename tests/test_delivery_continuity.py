@@ -21,6 +21,7 @@ from workflowkit.delivery import (
 )
 from workflowkit.profile import ProjectProfile
 from workflowkit.model import EdgeSpec, ParameterSpec
+from workflowkit.graph import graph_matches_spec, plan_workflow_graph
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -379,6 +380,278 @@ def direct_parameter_references(prompt: str) -> set[str]:
 
 
 class DeliveryPackingCommandTests(unittest.TestCase):
+    def test_two_cycle_gate_retry_packs_new_context_and_projects_fresh_fanout(self):
+        """Exercise the source graph/packer contract, not Kent's Join scheduler."""
+        root = create_repository(self)
+        profile = runtime_v2_profile(ci=True, source_ci=True)
+        spec = build_delivery_workflow(profile, 1)
+        workflow_id = "44444444-4444-4444-8444-444444444444"
+        inspected = {
+            "workflow_id": workflow_id,
+            "expected_version": 1,
+            "graph": {
+                key: []
+                for key in ("node_groups", "nodes", "transition_groups", "edges")
+            },
+        }
+        projected = plan_workflow_graph(
+            spec, inspected, metadata_changed=False,
+        ).document
+        self.assertTrue(graph_matches_spec(spec, projected))
+
+        native_graph = projected["graph"]
+        nodes = {node["key"]: node for node in native_graph["nodes"]}
+        node_keys_by_id = {node["id"]: node["key"] for node in native_graph["nodes"]}
+        native_edges = {edge["key"]: edge for edge in native_graph["edges"]}
+        groups = {
+            group["id"]: group
+            for group in native_graph["transition_groups"]
+        }
+
+        retry_transition = "verification_gate_retry_verification"
+        retry_edge = native_edges["gate_retry_verification"]
+        retry_group = groups[retry_edge["transition_group_id"]]
+        self.assertEqual(
+            (node_keys_by_id[retry_group["source_node_id"]],
+             retry_group["transition_id"]),
+            ("verification_gate", retry_transition),
+        )
+        self.assertEqual(
+            node_keys_by_id[retry_edge["target_node_id"]],
+            "verification_dispatch",
+        )
+        self.assertFalse(retry_edge["requires_approval"])
+        self.assertEqual(retry_edge["context_mode"], "new_session")
+        self.assertEqual(retry_edge["context_source"], {"kind": "immediate_source"})
+        self.assertEqual(
+            [parameter["key"] for parameter in retry_edge["parameters"]],
+            ["workspace_path", "review_context", "delivery_context"],
+        )
+
+        session_id = "11111111-1111-4111-8111-111111111111"
+        identity = {
+            "task_id": "native-task",
+            "task_short_id": "KIT-1",
+            "project_id": "native-project",
+            "workspace_path": str(root),
+            "session_id": session_id,
+            "step_id": "33333333-3333-4333-8333-333333333333",
+        }
+        detail = {
+            "summary": {
+                "id": identity["task_id"],
+                "short_id": identity["task_short_id"],
+                "project_id": identity["project_id"],
+                "workflow_id": workflow_id,
+            },
+            "current_nodes": [{
+                "node_id": nodes["verification_gate"]["id"],
+                "session_id": session_id,
+            }],
+            "live_sessions": [],
+        }
+
+        cycle_a_context = (
+            '{"cycle":"A","joined_report_ref":"cycle-a-joined-report"}'
+        )
+        cycle_a_delivery = (
+            ' { "schema":"workflow-delivery-context-v1", "phase":"pre_pr" }\n'
+        )
+        cycle_a_sources = [
+            capture_producer(
+                root,
+                identity=identity,
+                producer_kind="cycle-a-deterministic",
+                inputs={"review_context": cycle_a_context},
+                result={
+                    "transition": "reported",
+                    "verification_status": "passed",
+                    "verification_report": "cycle-a-deterministic-pass",
+                },
+            )[0],
+            capture_producer(
+                root,
+                identity=identity,
+                producer_kind="cycle-a-standards",
+                inputs={},
+                result={
+                    "transition": "reported",
+                    "standards_status": "blocked",
+                    "standards_report": "cycle-a-standards-blocked",
+                },
+            )[0],
+            capture_producer(
+                root,
+                identity=identity,
+                producer_kind="cycle-a-specification",
+                inputs={},
+                result={
+                    "transition": "reported",
+                    "spec_status": "passed",
+                    "review_report": "cycle-a-specification-pass",
+                    "delivery_context": cycle_a_delivery,
+                },
+            )[0],
+        ]
+        cycle_b_context = (
+            '{"cycle":"B","resolution_ref":"owner-readback-cycle-b"}'
+        )
+        locator, emitted = pack_delivery(
+            root,
+            {
+                "schema": "workflow-pack-delivery-v1",
+                "transition": retry_transition,
+                "values": {
+                    "workspace_path": str(root),
+                    "review_context": cycle_b_context,
+                    "delivery_context": cycle_a_delivery,
+                },
+                "transition_contract_ref": transition_contract_reference(
+                    identity, detail, projected, retry_transition,
+                ),
+                "delivery_mode": "preserve",
+                "producer_refs": cycle_a_sources,
+            },
+            identity=identity,
+            task_detail=detail,
+            graph=projected,
+        )
+        completion = json.loads(emitted)
+        declared = {
+            parameter["key"] for parameter in retry_edge["parameters"]
+        }
+        self.assertEqual(
+            set(completion) - {"transition", "commentary"},
+            declared,
+        )
+        self.assertEqual(completion["transition"], retry_transition)
+        self.assertEqual(completion["workspace_path"], str(root))
+        self.assertEqual(completion["review_context"], cycle_b_context)
+        self.assertNotEqual(completion["review_context"], cycle_a_context)
+        self.assertEqual(completion["delivery_context"], cycle_a_delivery)
+        for historical_value in (
+            "cycle-a-deterministic-pass",
+            "cycle-a-standards-blocked",
+            "cycle-a-specification-pass",
+        ):
+            self.assertNotIn(historical_value, emitted.decode("utf-8"))
+
+        packed = reconstruct_producer(root, locator, identity=identity)
+        retained = json.loads(packed["binding"]["producer_refs"])["refs"]
+        self.assertEqual(retained, cycle_a_sources)
+        for source, status_field, expected_status in zip(
+            cycle_a_sources,
+            ("verification_status", "standards_status", "spec_status"),
+            ("passed", "blocked", "passed"),
+        ):
+            history = reconstruct_producer(root, source, identity=identity)
+            self.assertEqual(history["result"][status_field], expected_status)
+        self.assertEqual(
+            reconstruct_producer(root, cycle_a_sources[0], identity=identity)[
+                "inputs"
+            ]["review_context"],
+            cycle_a_context,
+        )
+
+        fanout_group = next(
+            group
+            for group in native_graph["transition_groups"]
+            if group["source_node_id"] == nodes["verification_dispatch"]["id"]
+            and group["transition_id"] == "verification_dispatch_fanout_verify"
+        )
+        fanout_edges = [
+            edge
+            for edge in native_graph["edges"]
+            if edge["transition_group_id"] == fanout_group["id"]
+        ]
+        self.assertEqual(
+            {edge["key"] for edge in fanout_edges},
+            {
+                "dispatch_deterministic_verify",
+                "dispatch_standards_review",
+                "dispatch_spec_review",
+            },
+        )
+        cycle_a_only_values = (
+            cycle_a_context,
+            "cycle-a-deterministic-pass",
+            "cycle-a-standards-blocked",
+            "cycle-a-specification-pass",
+        )
+        for edge in fanout_edges:
+            self.assertEqual(
+                node_keys_by_id[edge["target_node_id"]],
+                {
+                    "dispatch_deterministic_verify": "deterministic_verify",
+                    "dispatch_standards_review": "standards_review",
+                    "dispatch_spec_review": "spec_review",
+                }[edge["key"]],
+            )
+            self.assertEqual(edge["context_mode"], "new_session")
+            self.assertEqual(
+                [parameter["key"] for parameter in edge["parameters"]],
+                ["workspace_path", "review_context", "delivery_context"],
+            )
+            branch_inputs = {
+                parameter["key"]: completion[parameter["key"]]
+                for parameter in edge["parameters"]
+            }
+            self.assertEqual(
+                branch_inputs,
+                {
+                    "workspace_path": str(root),
+                    "review_context": cycle_b_context,
+                    # The retry preserves the exact incoming packet bytes.
+                    "delivery_context": cycle_a_delivery,
+                },
+            )
+            for stale_value in cycle_a_only_values:
+                self.assertNotIn(stale_value, json.dumps(branch_inputs))
+
+        join_key_by_edge = {
+            "deterministic_report_join": (
+                "deterministic_verify",
+                "verification_status",
+                "verification_report",
+            ),
+            "standards_report_join": (
+                "standards_review",
+                "standards_status",
+                "standards_report",
+            ),
+            "spec_report_join": (
+                "spec_review",
+                "spec_status",
+                "review_report",
+            ),
+        }
+        for edge_key, (source_key, status_key, report_key) in join_key_by_edge.items():
+            edge = native_edges[edge_key]
+            group = groups[edge["transition_group_id"]]
+            self.assertEqual(node_keys_by_id[group["source_node_id"]], source_key)
+            self.assertEqual(group["transition_id"], f"{source_key}_reported")
+            self.assertEqual(node_keys_by_id[edge["target_node_id"]], "verification_join")
+            self.assertEqual(
+                [parameter["key"] for parameter in edge["parameters"]],
+                [status_key, report_key],
+            )
+        gate_edge = native_edges["verification_join_gate"]
+        gate_group = groups[gate_edge["transition_group_id"]]
+        self.assertEqual(node_keys_by_id[gate_group["source_node_id"]], "verification_join")
+        self.assertEqual(gate_group["transition_id"], "verification_join_evaluate")
+        self.assertEqual(node_keys_by_id[gate_edge["target_node_id"]], "verification_gate")
+        gate_prompt = " ".join(gate_edge["prompt_template"].split())
+        self.assertIn("identifies the original technical blocker", gate_prompt)
+        self.assertIn(
+            "If owner resolution, changed prerequisites, evidence, or settlement "
+            "is absent, do not retry",
+            gate_prompt,
+        )
+        self.assertIn(
+            "Never relabel an old `blocked` report or reuse an old PASS as current evidence",
+            gate_prompt,
+        )
+
     def test_native_packing_derives_review_preserves_failed_packets_and_never_completes(self):
         root = create_repository(self)
         scripts = materialize_templates(root, "workflow-checkpoint", "workflow-evidence-ledger")
