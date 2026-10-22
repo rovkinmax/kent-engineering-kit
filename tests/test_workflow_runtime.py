@@ -120,6 +120,52 @@ def assert_raw_edge_projection(
     return output
 
 
+def assert_raw_native_transition_projection(
+    testcase: unittest.TestCase,
+    raw_result: subprocess.CompletedProcess[str],
+    *,
+    spec,
+    edge_key: str,
+) -> dict[str, object]:
+    output = assert_raw_edge_projection(
+        testcase, raw_result, spec=spec, edge_key=edge_key,
+    )
+    from workflowkit.graph import plan_workflow_graph
+
+    projected = plan_workflow_graph(
+        spec,
+        {
+            "workflow_id": "44444444-4444-4444-8444-444444444444",
+            "expected_version": 1,
+            "graph": {
+                "node_groups": [],
+                "nodes": [],
+                "transition_groups": [],
+                "edges": [],
+            },
+        },
+        metadata_changed=False,
+    ).document["graph"]
+    native_edge = next(
+        item for item in projected["edges"] if item["key"] == edge_key
+    )
+    expected = {
+        parameter["key"] for parameter in native_edge.get("parameters", [])
+    }
+    actual = set(output) - {"transition", "commentary"}
+    testcase.assertEqual(actual, expected, (edge_key, output, expected))
+    native_group = next(
+        group for group in projected["transition_groups"]
+        if group["id"] == native_edge["transition_group_id"]
+    )
+    testcase.assertEqual(output["transition"], native_group["transition_id"])
+    for key in expected:
+        value = output[key]
+        testcase.assertIsInstance(value, str, (edge_key, key, output))
+        testcase.assertTrue(value.strip(), (edge_key, key, output))
+    return output
+
+
 class RuntimeSupportImportTest(unittest.TestCase):
     def test_v2_commands_load_only_the_sibling_support_module(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1283,6 +1329,25 @@ class WorkflowVerificationDispatchTest(GitRepositoryTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)["commentary"].endswith("EXACT_CAPTURE_TEST"))
 
+    def test_dispatch_fails_closed_for_unsupported_delivery_reliability_policy(self) -> None:
+        root = self.create_repository()
+        (root / ".kent" / "workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v2"\n'
+        )
+        scripts = root / ".kent" / "scripts"
+        scripts.mkdir(parents=True)
+        checkpoint = scripts / "workflow-checkpoint"
+        checkpoint.write_bytes(CHECKPOINT.read_bytes())
+        checkpoint.chmod(0o755)
+
+        result = self.invoke(
+            root,
+            workspace_path=str(root / "tracked.txt"),
+            delivery_context=None,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
     def invoke(
         self,
         root: Path,
@@ -1290,6 +1355,8 @@ class WorkflowVerificationDispatchTest(GitRepositoryTest):
         workspace_path: str,
         delivery_context: str | None,
         runtime_sibling: bool = True,
+        native_context: dict[str, str] | None = None,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         scripts = root / ".kent" / "scripts"
         scripts.mkdir(parents=True, exist_ok=True)
@@ -1309,6 +1376,8 @@ class WorkflowVerificationDispatchTest(GitRepositoryTest):
         }
         if delivery_context is not None:
             payload["delivery_context"] = delivery_context
+        if native_context is not None:
+            payload["_kent"] = native_context
         return subprocess.run(
             [str(executable)],
             cwd=root,
@@ -1317,6 +1386,7 @@ class WorkflowVerificationDispatchTest(GitRepositoryTest):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env={**os.environ, **(environment or {})},
         )
 
     def test_dispatch_preserves_context_on_success_and_invalid_workspace(self) -> None:
@@ -1380,6 +1450,1157 @@ class WorkflowVerificationDispatchTest(GitRepositoryTest):
         )
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
+
+    def generated_spec(
+        self,
+        *,
+        reliability: bool,
+        delivery_context: bool,
+        coder_selection: str = "disabled",
+    ):
+        from dataclasses import replace
+
+        from workflowkit.delivery import build_delivery_workflow
+        from workflowkit.profile import ProjectProfile
+
+        profile = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        policies = dict(profile.policies)
+        policies["coder_selection"] = coder_selection
+        if reliability:
+            policies["delivery_reliability"] = "v1"
+        else:
+            policies.pop("delivery_reliability", None)
+        profile = replace(
+            profile,
+            policies=policies,
+            delivery_profile=(
+                profile.delivery_profile if delivery_context else "standard"
+            ),
+        )
+        return build_delivery_workflow(profile, 1)
+
+    def install_native_script_fixture(self, root: Path, spec):
+        scripts = root / ".kent" / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "workflow-verification-dispatch",
+            "workflow-checkpoint",
+            "workflow-evidence-ledger",
+            "workflow-plan-contract",
+            "workflow-plan-contract-accept",
+            "workflow-plan-contract-verify",
+        ):
+            source = (
+                REPO_ROOT / "templates" / "project" / name
+            )
+            target = scripts / name
+            target.write_bytes(source.read_bytes())
+            target.chmod(0o755)
+        (scripts / "workflow_runtime_contracts.py").write_bytes(
+            (REPO_ROOT / "workflowkit" / "runtime.py").read_bytes()
+        )
+
+        canonical_root = root.resolve(strict=True)
+        workflow_id = "44444444-4444-4444-8444-444444444444"
+        agent_session = "11111111-1111-4111-8111-111111111111"
+        agent_step = "22222222-2222-4222-8222-222222222222"
+        selected_edge_keys = (
+            "dispatch_invalid_workspace",
+            "fix_verify",
+            "plan_contract_checked_verify",
+        )
+        selected_edges = {
+            key: next(edge for edge in spec.edges if edge.key == key)
+            for key in selected_edge_keys
+        }
+        node_specs = {node.key: node for node in spec.nodes}
+        from workflowkit.graph import plan_workflow_graph
+
+        projected = plan_workflow_graph(
+            spec,
+            {
+                "workflow_id": workflow_id,
+                "expected_version": 1,
+                "graph": {
+                    "node_groups": [],
+                    "nodes": [],
+                    "transition_groups": [],
+                    "edges": [],
+                },
+            },
+            metadata_changed=False,
+        ).document
+        projected_graph = projected["graph"]
+        node_ids = {
+            node["key"]: node["id"] for node in projected_graph["nodes"]
+        }
+        detail = {
+            "summary": {
+                "id": "native-task",
+                "short_id": "TASK-DISPATCH",
+                "project_id": "native-project",
+                "workflow_id": workflow_id,
+            },
+            "source_workspace": {
+                "is_primary": True,
+                "workspace_id": "native-primary",
+                "root_path": str(canonical_root),
+            },
+            "project": {"default_workspace_id": "native-primary"},
+            "worktree_path": str(canonical_root),
+            "current_nodes": [
+                {"node_id": node_ids["fix"], "session_id": agent_session},
+            ],
+            "live_sessions": [],
+            "current_scripts": [],
+        }
+        graph = {
+            "workflow_id": workflow_id,
+            "expected_version": 1,
+            "graph": projected_graph,
+        }
+        native_path = root / "native-fixture.json"
+        native_path.write_text(json.dumps({"detail": detail, "graph": graph}))
+        native_bin = root / "native-bin"
+        native_bin.mkdir()
+        fake_kent = native_bin / "kent"
+        fake_kent.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "data = json.loads(Path(os.environ['KENT_TEST_NATIVE']).read_text())\n"
+            "if args[0] == 'project':\n"
+            "    detail = data['detail']\n"
+            "    source = detail['source_workspace']['root_path']\n"
+            "    workspace = detail.get('worktree_path', source)\n"
+            "    print('native-project' if args[1] == workspace else 'foreign-project')\n"
+            "elif args[:2] == ['task', 'show']: print(json.dumps(data['detail']))\n"
+            "elif args[:3] == ['workflow', 'graph', 'inspect']:\n"
+            "    print(json.dumps(data['graph']))\n"
+            "else: sys.exit(19)\n"
+        )
+        fake_kent.chmod(0o700)
+        home = root / "test-home"
+        prepare_bin = home / ".kent" / "bin"
+        prepare_bin.mkdir(parents=True)
+        (prepare_bin / "kent-prepare-github-ci").symlink_to(
+            REPO_ROOT / "scripts" / "prepare-github-ci"
+        )
+        environment = {
+            "HOME": str(home),
+            "PATH": str(native_bin) + os.pathsep + os.environ.get("PATH", ""),
+            "KENT_TEST_NATIVE": str(native_path),
+            "KENT_SESSION_ID": agent_session,
+            "KENT_STEP_ID": agent_step,
+        }
+
+        def current_script(node_key: str) -> dict[str, str]:
+            data = json.loads(native_path.read_text())
+            node_id = node_ids[node_key]
+            script_name = Path(node_specs[node_key].script_path).name
+            data["detail"]["current_scripts"] = [
+                {
+                    "current_node": {"node_id": node_id},
+                    "path": f".kent/scripts/{script_name}",
+                },
+            ]
+            native_path.write_text(json.dumps(data))
+            return {"task_id": "native-task", "node_id": node_id}
+
+        def native_transition(edge_key: str) -> str:
+            edge = selected_edges[edge_key]
+            source_id = node_ids[edge.source]
+            matches = [
+                group for group in graph["graph"]["transition_groups"]
+                if group["source_node_id"] == source_id
+                and group["transition_id"] == edge.transition
+            ]
+            if len(matches) != 1:
+                raise AssertionError(f"native group missing for {edge_key}")
+            return matches[0]["transition_id"]
+
+        return {
+            "scripts": scripts,
+            "native_path": native_path,
+            "detail": detail,
+            "graph": graph,
+            "environment": environment,
+            "canonical_root": canonical_root,
+            "agent_identity": {
+                "task_id": "native-task",
+                "task_short_id": "TASK-DISPATCH",
+                "project_id": "native-project",
+                "workspace_path": str(canonical_root),
+                "session_id": agent_session,
+                "step_id": agent_step,
+            },
+            "current_script": current_script,
+            "native_transition": native_transition,
+        }
+
+    def test_invalid_workspace_projection_keeps_v1_and_legacy_profiles_separate(self) -> None:
+        context = (
+            ' { "schema" : "workflow-delivery-context-v1", '
+            '"phase" : "pre_pr" }\n'
+        )
+        for reliability in (False, True):
+            for context_enabled in (False, True):
+                with self.subTest(
+                    reliability=reliability, context=context_enabled,
+                ):
+                    root = self.create_repository()
+                    if reliability:
+                        (root / ".kent" / "workflow-profile.toml").write_text(
+                            '[policies]\ndelivery_reliability = "v1"\n'
+                        )
+                        adapter = root / ".kent" / "scripts" / "workflow-checkpoint"
+                        adapter.parent.mkdir(parents=True)
+                        adapter.write_text(
+                            "def emit_producer_result(root, payload, result, producer_kind):\n"
+                            "    assert producer_kind == 'verification-dispatch'\n"
+                            "    return result\n"
+                        )
+                    else:
+                        (root / ".kent" / "workflow-profile.toml").write_text(
+                            "[policies]\n"
+                        )
+                    carried = context if context_enabled else None
+                    result = self.invoke(
+                        root,
+                        workspace_path=str(root / "tracked.txt"),
+                        delivery_context=carried,
+                        runtime_sibling=context_enabled,
+                    )
+                    spec = self.generated_spec(
+                        reliability=reliability,
+                        delivery_context=context_enabled,
+                    )
+                    output = assert_raw_native_transition_projection(
+                        self,
+                        result,
+                        spec=spec,
+                        edge_key="dispatch_invalid_workspace",
+                    )
+                    self.assertEqual(output["reported_workspace_path"], str(root / "tracked.txt"))
+                    if reliability:
+                        self.assertEqual(
+                            output["workspace_path"],
+                            str(root.resolve(strict=True)),
+                        )
+                    else:
+                        self.assertNotIn("workspace_path", output)
+                    if context_enabled:
+                        self.assertEqual(output["delivery_context"], context)
+                    else:
+                        self.assertNotIn("delivery_context", output)
+                    self.assertNotIn("review_context", output)
+
+    def test_v1_dispatch_capture_rejects_unqualified_or_foreign_native_identity(self) -> None:
+        root = self.create_repository()
+        (root / ".kent" / "workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v1"\n'
+        )
+        spec = self.generated_spec(reliability=True, delivery_context=True)
+        fixture = self.install_native_script_fixture(root, spec)
+        cases = (
+            "missing native context",
+            "mismatched _kent task",
+            "foreign Task readback",
+            "foreign project readback",
+            "foreign source workspace",
+            "foreign execution root",
+            "foreign Script path",
+        )
+        for case in cases:
+            with self.subTest(native_identity_case=case):
+                context = fixture["current_script"]("verification_dispatch")
+                data = json.loads(fixture["native_path"].read_text())
+                data["detail"] = json.loads(json.dumps(fixture["detail"]))
+                data["detail"]["current_scripts"] = [
+                    {
+                        "current_node": {"node_id": context["node_id"]},
+                        "path": ".kent/scripts/workflow-verification-dispatch",
+                    },
+                ]
+                selected_context: dict[str, str] | None = context
+                if case == "missing native context":
+                    selected_context = None
+                elif case == "mismatched _kent task":
+                    selected_context = {
+                        **context,
+                        "task_id": "foreign-task",
+                    }
+                elif case == "foreign Task readback":
+                    data["detail"]["summary"]["id"] = "foreign-task"
+                elif case == "foreign project readback":
+                    data["detail"]["summary"]["project_id"] = "foreign-project"
+                elif case == "foreign source workspace":
+                    data["detail"]["source_workspace"]["root_path"] = str(
+                        root.parent / "foreign-source"
+                    )
+                elif case == "foreign execution root":
+                    data["detail"]["worktree_path"] = str(
+                        root.parent / "foreign-worktree"
+                    )
+                elif case == "foreign Script path":
+                    data["detail"]["current_scripts"][0]["path"] = (
+                        ".kent/scripts/another-script"
+                    )
+                fixture["native_path"].write_text(json.dumps(data))
+                result = self.invoke(
+                    root,
+                    workspace_path=str(root / "tracked.txt"),
+                    delivery_context=None,
+                    native_context=selected_context,
+                    environment=fixture["environment"],
+                )
+                self.assertNotEqual(result.returncode, 0, case)
+                self.assertEqual(result.stdout, "", case)
+
+    def test_v1_invalid_dispatch_capture_packs_fix_verify_and_runs_plan_guard(self) -> None:
+        context = (
+            ' { "schema" : "workflow-delivery-context-v1", '
+            '"phase" : "pre_pr" }\n'
+        )
+        root = self.create_repository()
+        (root / ".kent" / "workflow-profile.toml").write_text(
+            '[policies]\n'
+            'coder_selection = "disabled"\n'
+            'delivery_reliability = "v1"\n'
+        )
+        spec = self.generated_spec(reliability=True, delivery_context=True)
+        fixture = self.install_native_script_fixture(root, spec)
+        scripts = fixture["scripts"]
+        native_context = fixture["current_script"]("verification_dispatch")
+        rejected_workspace = str(root / "tracked.txt")
+        dispatched = self.invoke(
+            root,
+            workspace_path=rejected_workspace,
+            delivery_context=context,
+            native_context=native_context,
+            environment=fixture["environment"],
+        )
+        dispatch_output = assert_raw_native_transition_projection(
+            self,
+            dispatched,
+            spec=spec,
+            edge_key="dispatch_invalid_workspace",
+        )
+        self.assertEqual(
+            dispatch_output["transition"],
+            fixture["native_transition"]("dispatch_invalid_workspace"),
+        )
+        self.assertNotEqual(
+            dispatch_output["transition"],
+            "dispatch_invalid_workspace",
+        )
+        self.assertEqual(
+            dispatch_output["workspace_path"],
+            str(fixture["canonical_root"]),
+        )
+        self.assertEqual(dispatch_output["reported_workspace_path"], rejected_workspace)
+        self.assertEqual(dispatch_output["delivery_context"], context)
+
+        from workflowkit import delivery
+
+        dispatch_locator = delivery.producer_locator(
+            dispatch_output["commentary"],
+        )
+        self.assertIsNotNone(dispatch_locator)
+        adapter = load_template_module(
+            scripts / "workflow-checkpoint",
+            "dispatch_fixture_checkpoint_reader",
+        )
+        with mock.patch.dict(os.environ, fixture["environment"]):
+            script_identity = delivery.observe_script_identity(
+                fixture["canonical_root"],
+                None,
+                native_context,
+                native_read=adapter.delivery_native_read,
+            )
+        dispatch_packet = delivery.reconstruct_producer(
+            fixture["canonical_root"],
+            dispatch_locator,
+            identity=script_identity,
+        )
+        self.assertEqual(
+            dispatch_packet["inputs"]["workspace_path"],
+            rejected_workspace,
+        )
+        self.assertEqual(
+            dispatch_packet["result"]["reported_workspace_path"],
+            rejected_workspace,
+        )
+        self.assertEqual(
+            dispatch_packet["result"]["workspace_path"],
+            str(fixture["canonical_root"]),
+        )
+        self.assertEqual(dispatch_packet["inputs"]["delivery_context"], context)
+        self.assertEqual(dispatch_packet["result"]["delivery_context"], context)
+
+        plan = root / ".todo" / "task" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\n\n- [ ] Verify workspace recovery\n")
+        plan_context = fixture["current_script"]("plan_contract")
+        accept_payload = {
+            "workspace_path": str(fixture["canonical_root"]),
+            "plan_path": ".todo/task/plan.md",
+            "work_kind": "feature",
+            "plan_route": "start",
+            "plan_route_context": "not-applicable",
+            "review_context": "Accepted test plan",
+            "task_short_id": "TASK-DISPATCH",
+            "delivery_context": context,
+            "_kent": plan_context,
+        }
+        accepted = subprocess.run(
+            [str(scripts / "workflow-plan-contract-accept")],
+            cwd=root,
+            input=json.dumps(accept_payload),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env={
+                **os.environ,
+                **fixture["environment"],
+                "KENT_PLAN_CONTRACT_MODE": "accept",
+            },
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(
+            json.loads(accepted.stdout)["transition"],
+            "plan_contract_start",
+        )
+
+        pack_identity = fixture["agent_identity"]
+        pack_transition = next(
+            edge for edge in spec.edges if edge.key == "fix_verify"
+        ).transition
+        pack_request = {
+            "schema": "workflow-pack-delivery-v1",
+            "transition": pack_transition,
+            "values": {
+                "review_context": "Workspace rejection handled by the Fix owner",
+                "task_short_id": "TASK-DISPATCH",
+            },
+            "transition_contract_ref": delivery.transition_contract_reference(
+                pack_identity,
+                fixture["detail"],
+                fixture["graph"],
+                pack_transition,
+            ),
+            "delivery_mode": "preserve",
+            "producer_refs": [dispatch_locator],
+        }
+        packed = subprocess.run(
+            [
+                sys.executable,
+                str(scripts / "workflow-checkpoint"),
+                "pack-delivery",
+                "--task",
+                "TASK-DISPATCH",
+                "--workspace",
+                str(fixture["canonical_root"]),
+            ],
+            cwd=root,
+            input=json.dumps(pack_request),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env={**os.environ, **fixture["environment"]},
+        )
+        packed_output = assert_raw_native_transition_projection(
+            self,
+            packed,
+            spec=spec,
+            edge_key="fix_verify",
+        )
+        self.assertEqual(
+            packed_output["transition"],
+            fixture["native_transition"]("fix_verify"),
+        )
+        self.assertEqual(
+            packed_output["workspace_path"],
+            str(fixture["canonical_root"]),
+        )
+        self.assertEqual(packed_output["delivery_context"], context)
+        self.assertNotIn("reported_workspace_path", packed_output)
+
+        def invoke_pack(request: dict[str, object]) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(scripts / "workflow-checkpoint"),
+                    "pack-delivery",
+                    "--task",
+                    "TASK-DISPATCH",
+                    "--workspace",
+                    str(fixture["canonical_root"]),
+                ],
+                cwd=root,
+                input=json.dumps(request),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env={**os.environ, **fixture["environment"]},
+            )
+
+        for label, values in (
+            (
+                "foreign completion workspace",
+                {
+                    **pack_request["values"],
+                    "workspace_path": str(root / "tracked.txt"),
+                },
+            ),
+            (
+                "rewritten delivery context",
+                {
+                    **pack_request["values"],
+                    "delivery_context": "rewritten context",
+                },
+            ),
+        ):
+            with self.subTest(negative_control=label):
+                denied = invoke_pack({**pack_request, "values": values})
+                self.assertNotEqual(denied.returncode, 0)
+                self.assertEqual(denied.stdout, "")
+
+        stale_locator, _ = delivery.capture_producer(
+            fixture["canonical_root"],
+            identity=script_identity,
+            producer_kind="historical-dispatch",
+            inputs={"workspace_path": rejected_workspace},
+            result={
+                "transition": dispatch_output["transition"],
+                "commentary": "immutable historical producer",
+            },
+        )
+        conflicting_refs = invoke_pack({
+            **pack_request,
+            "producer_refs": [dispatch_locator, stale_locator],
+        })
+        self.assertNotEqual(conflicting_refs.returncode, 0)
+        self.assertEqual(conflicting_refs.stdout, "")
+
+        verify_payload = {
+            key: value
+            for key, value in packed_output.items()
+            if key not in {"transition", "commentary"}
+        }
+        verify_payload["_kent"] = fixture["current_script"](
+            "plan_contract_verify",
+        )
+        verified = subprocess.run(
+            [str(scripts / "workflow-plan-contract-verify")],
+            cwd=root,
+            input=json.dumps(verify_payload),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env={**os.environ, **fixture["environment"]},
+        )
+        verify_output = assert_raw_native_transition_projection(
+            self,
+            verified,
+            spec=spec,
+            edge_key="plan_contract_checked_verify",
+        )
+        self.assertEqual(
+            verify_output["transition"],
+            fixture["native_transition"]("plan_contract_checked_verify"),
+        )
+        self.assertEqual(verify_output["delivery_context"], context)
+        self.assertEqual(
+            verify_output["workspace_path"],
+            str(fixture["canonical_root"]),
+        )
+
+    def test_r2_missing_authority_references_project_to_revalidation_edges(self) -> None:
+        import contextlib
+        import io
+
+        from workflowkit.project_memory import ProjectMemory
+
+        context = (
+            ' { "schema" : "workflow-delivery-context-v1", '
+            '"phase" : "pre_pr" }\n'
+        )
+        for selection_policy, prior_acceptance in (
+            ("disabled", False),
+            ("complexity", True),
+        ):
+            with self.subTest(
+                selection_policy=selection_policy,
+                prior_acceptance=prior_acceptance,
+            ):
+                root = self.create_repository()
+                (root / ".kent" / "workflow-profile.toml").write_text(
+                    "[policies]\n"
+                    f'coder_selection = "{selection_policy}"\n'
+                    "[project_memory]\n"
+                    'mode = "r2"\n'
+                )
+                scripts = root / ".kent" / "scripts"
+                scripts.mkdir(parents=True)
+                plan_script = scripts / "workflow-plan-contract"
+                plan_script.write_bytes(PLAN_CONTRACT.read_bytes())
+                (scripts / "workflow_runtime_contracts.py").write_bytes(
+                    (REPO_ROOT / "workflowkit" / "runtime.py").read_bytes()
+                )
+                module = load_template_module(
+                    plan_script,
+                    f"r2_missing_refs_{selection_policy}",
+                )
+                store = ProjectMemory.initialize(
+                    root.resolve(strict=True).parent
+                    / f"memory-{root.name}-{selection_policy}",
+                    "kit",
+                    f"project-{selection_policy}",
+                )
+                task = "TASK-B3"
+                task_record = store.initialize_task(task, "task-binding", [])
+                selection = {
+                    "schema": "coder-selection-v1",
+                    "task_short_id": task,
+                    "complexity": "simple",
+                    "rationale": "The accepted scope has a bounded implementation path.",
+                }
+                selection_block = (
+                    "\n```json\n" + json.dumps(selection) + "\n```\n"
+                    if selection_policy == "complexity"
+                    else ""
+                )
+                current_plan = (
+                    "Current plan contains no original source locator.\n"
+                    + selection_block
+                )
+                previous_digest = None
+                expected_head = None
+                if prior_acceptance:
+                    previous_revision = store.publish(
+                        f"tasks/{task}/plan",
+                        None,
+                        "Previously reviewed plan.\n"
+                        "session_message(project/session/event/digest)\n"
+                        + selection_block,
+                    )
+                    accepted = store.accept_plan(
+                        task,
+                        previous_revision.token,
+                        None,
+                        {
+                            "work_kind": "feature",
+                            "authority_refs": [
+                                "session_message(project/session/event/digest)"
+                            ],
+                            "plan_kind": "markdown",
+                            "coder_selection": selection,
+                        },
+                    )
+                    previous_digest = json.loads(
+                        accepted.path.read_bytes()
+                    )["normalized_sha256"]
+                    working = store.publish(
+                        f"tasks/{task}/plan",
+                        previous_revision.token,
+                        current_plan,
+                    )
+                    expected_head = store.accepted_head(task)
+                else:
+                    working = store.publish(
+                        f"tasks/{task}/plan",
+                        None,
+                        current_plan,
+                    )
+
+                normalized_digest = hashlib.sha256(
+                    module.normalized_plan(working.path).encode("utf-8")
+                ).hexdigest()
+                task_binding = hashlib.sha256(
+                    (store.path / "tasks" / task / "task.json").read_bytes()
+                ).hexdigest()
+                call_log: list[str] = []
+
+                def memory_call(_workspace, _payload, operation, **fields):
+                    call_log.append(operation)
+                    if operation == "resolve-task":
+                        return {"mode": "r2"}
+                    if operation == "accepted-head":
+                        return {"accepted_snapshot": store.accepted_head(task)}
+                    if operation == "resolve-plan":
+                        if fields["plan_path"] != "not-applicable":
+                            store.plan_revision(task, fields["plan_path"])
+                        revision = store.read(f"tasks/{task}/plan")
+                        return {
+                            "working_path": str(revision.path),
+                            "working_revision": revision.token,
+                            "working_sha256": revision.sha256,
+                        }
+                    if operation == "check-plan":
+                        status = store.check_plan(
+                            task,
+                            coder_selection=fields["coder_selection"],
+                        )
+                        status["cache_ref"] = {
+                            "schema": "r2-plan-contract-cache-v1",
+                            "task_short_id": task,
+                            "project_uid": f"project-{selection_policy}",
+                            "task_uid": task_record["task_uid"],
+                            "task_binding_sha256": task_binding,
+                            "accepted_snapshot_path": status["accepted_path"],
+                            "accepted_snapshot_sha256": status["accepted_snapshot"],
+                        }
+                        return status
+                    raise AssertionError(f"unexpected memory operation: {operation}")
+
+                payload = {
+                    "workspace_path": str(root.resolve(strict=True)),
+                    "task_short_id": task,
+                    "plan_path": str(working.path),
+                    "work_kind": "feature",
+                    "review_context": "Review context has no original source locator.",
+                    "plan_route": "verify",
+                    "plan_route_context": "not-applicable",
+                    "delivery_context": context,
+                }
+                if selection_policy == "complexity":
+                    payload["accepted_plan_sha256"] = previous_digest
+                    payload["reviewed_normalized_sha256"] = normalized_digest
+
+                raw_stdout = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        module.execute.__globals__,
+                        {"memory_call": memory_call},
+                    ),
+                    mock.patch.dict(
+                        os.environ,
+                        {"KENT_PLAN_CONTRACT_MODE": "accept"},
+                    ),
+                    mock.patch("pathlib.Path.cwd", return_value=root),
+                    mock.patch("sys.stdin", io.StringIO(json.dumps(payload))),
+                    contextlib.redirect_stdout(raw_stdout),
+                ):
+                    result_code = module.main()
+                raw_result = subprocess.CompletedProcess(
+                    ["workflow-plan-contract"],
+                    result_code,
+                    raw_stdout.getvalue(),
+                    "",
+                )
+                spec = self.generated_spec(
+                    reliability=False,
+                    delivery_context=True,
+                    coder_selection=selection_policy,
+                )
+                output = assert_raw_native_transition_projection(
+                    self,
+                    raw_result,
+                    spec=spec,
+                    edge_key="plan_contract_revalidate",
+                )
+                self.assertEqual(output["delivery_context"], context)
+                if selection_policy == "complexity":
+                    self.assertEqual(
+                        output["accepted_plan_sha256"],
+                        previous_digest,
+                    )
+                    self.assertNotEqual(
+                        output["accepted_plan_sha256"],
+                        normalized_digest,
+                    )
+                else:
+                    self.assertNotIn("accepted_plan_sha256", output)
+                self.assertEqual(store.accepted_head(task), expected_head)
+                self.assertNotIn("accept-plan", call_log)
+                self.assertFalse(
+                    (root / ".kent" / "runtime" / task / "plan-contract.json").exists()
+                )
+                self.assertFalse((root / ".todo").exists())
+
+    def test_r2_acceptance_wrapper_projects_initial_and_reacceptance_sources(self) -> None:
+        import contextlib
+        import io
+
+        from workflowkit.project_memory import ProjectMemory
+
+        context = (
+            ' { "schema" : "workflow-delivery-context-v1", '
+            '"phase" : "pre_pr" }\n'
+        )
+        locators = {
+            "plan": "session_message(project/plan-session/plan-event/plan-digest)",
+            "review_context": (
+                "question_answer(project/review-session/review-event/review-digest)"
+            ),
+            "validated_ledger": (
+                "task_comment(project/ledger-task/comment-event/comment-digest)"
+            ),
+        }
+        cases = (
+            ("disabled", "markdown", False, "plan"),
+            ("disabled", "markdown", True, "review_context"),
+            ("disabled", "markdown", False, "validated_ledger"),
+            ("disabled", "report_only", False, "review_context"),
+            ("disabled", "report_only", True, "validated_ledger"),
+            ("complexity", "markdown", False, "plan"),
+            ("complexity", "markdown", True, "review_context"),
+            ("complexity", "markdown", False, "validated_ledger"),
+        )
+        source = REPO_ROOT / "templates" / "project" / "workflow-plan-contract"
+
+        for index, (selection_policy, plan_kind, reaccept, reference_source) in enumerate(cases):
+            with self.subTest(
+                selection_policy=selection_policy,
+                plan_kind=plan_kind,
+                reaccept=reaccept,
+                reference_source=reference_source,
+            ):
+                root = self.create_repository()
+                (root / ".kent" / "workflow-profile.toml").write_text(
+                    "[policies]\n"
+                    f'coder_selection = "{selection_policy}"\n'
+                    + (
+                        'writer_sessions = "continuous"\n'
+                        if selection_policy == "complexity"
+                        else ""
+                    )
+                    + "[project_memory]\nmode = \"r2\"\n"
+                )
+                scripts = root / ".kent" / "scripts"
+                scripts.mkdir(parents=True)
+                plan_script = scripts / "workflow-plan-contract"
+                plan_script.write_bytes(source.read_bytes())
+                plan_script.chmod(0o755)
+                (scripts / "workflow_runtime_contracts.py").write_bytes(
+                    (REPO_ROOT / "workflowkit" / "runtime.py").read_bytes()
+                )
+                evidence_script = scripts / "workflow-evidence-ledger"
+                evidence_script.write_bytes(EVIDENCE.read_bytes())
+                evidence_script.chmod(0o755)
+
+                module = load_template_module(
+                    plan_script,
+                    f"r2_acceptance_wrapper_{selection_policy}_{index}",
+                )
+                store = ProjectMemory.initialize(
+                    root.resolve(strict=True).parent
+                    / f"memory-{root.name}-{index}",
+                    "kit",
+                    f"project-{selection_policy}-{index}",
+                )
+                task = f"TASK-B{index + 10}"
+                task_record = store.initialize_task(task, "task-binding", [])
+                selection = {
+                    "schema": "coder-selection-v1",
+                    "task_short_id": task,
+                    "complexity": "simple",
+                    "rationale": "The reviewed scope has a bounded implementation path.",
+                }
+                selection_block = (
+                    "\n```json\n" + json.dumps(selection) + "\n```\n"
+                    if selection_policy == "complexity"
+                    else ""
+                )
+                locator = locators[reference_source]
+
+                def plan_content(reference: str | None) -> str:
+                    if plan_kind == "report_only":
+                        return "not-applicable\n"
+                    return (
+                        "# Accepted plan\n\n"
+                        "- [ ] Implement the reviewed change.\n"
+                        + (f"\n{reference}\n" if reference is not None else "")
+                        + selection_block
+                    )
+
+                current_reference = (
+                    locator if reference_source == "plan" else None
+                )
+                previous_head = None
+                prior_digest = None
+                if reaccept:
+                    previous = store.publish(
+                        f"tasks/{task}/plan",
+                        None,
+                        plan_content("session_message(project/prior/session/prior-digest)"),
+                    )
+                    prior_metadata = {
+                        "work_kind": "feature",
+                        "authority_refs": [
+                            "session_message(project/prior/session/prior-digest)"
+                        ],
+                        "plan_kind": plan_kind,
+                    }
+                    if selection_policy == "complexity":
+                        prior_metadata["coder_selection"] = selection
+                    previous_acceptance = store.accept_plan(
+                        task, previous.token, None, prior_metadata,
+                    )
+                    prior_snapshot = json.loads(
+                        previous_acceptance.path.read_bytes()
+                    )
+                    prior_digest = prior_snapshot["normalized_sha256"]
+                    working = store.publish(
+                        f"tasks/{task}/plan",
+                        previous.token,
+                        plan_content(current_reference),
+                    )
+                    previous_head = store.accepted_head(task)
+                elif plan_kind == "report_only":
+                    working = None
+                else:
+                    working = store.publish(
+                        f"tasks/{task}/plan",
+                        None,
+                        plan_content(current_reference),
+                    )
+
+                if reference_source == "validated_ledger":
+                    ledger = root / ".kent" / "runtime" / task / "evidence-ledger.jsonl"
+                    ledger.parent.mkdir(parents=True, exist_ok=True)
+                    evidence = load_template_module(
+                        evidence_script,
+                        f"r2_acceptance_evidence_{index}",
+                    )
+                    with mock.patch.dict(os.environ, EVIDENCE_FIXTURE_OWNER):
+                        evidence.append_entry(
+                            root.resolve(strict=True),
+                            ledger,
+                            task=task,
+                            _payload={
+                                "node_key": "plan",
+                                "evidence_type": "plan_review",
+                                "summary": locator,
+                                "artifacts": [],
+                                "checks": [],
+                                "decisions": [],
+                                "context": {
+                                    "manifest_path": ".kent/workflow-profile.toml",
+                                    "files_read": [],
+                                },
+                            },
+                        )
+
+                native_bin = root / "native-bin"
+                native_bin.mkdir()
+                fake_kent = native_bin / "kent"
+                fake_kent.write_text(
+                    f"#!{sys.executable}\n"
+                    "import json\n"
+                    "print(json.dumps({'task_id': 'native-task', 'items': []}))\n"
+                )
+                fake_kent.chmod(0o700)
+
+                task_binding = hashlib.sha256(
+                    (store.path / "tasks" / task / "task.json").read_bytes()
+                ).hexdigest()
+                call_log: list[str] = []
+
+                def memory_call(_workspace, _payload, operation, **fields):
+                    call_log.append(operation)
+                    if operation == "resolve-task":
+                        return {"mode": "r2"}
+                    if operation == "accepted-head":
+                        return {"accepted_snapshot": store.accepted_head(task)}
+                    if operation == "prepare-report-only":
+                        revision = store.publish(
+                            f"tasks/{task}/plan",
+                            None,
+                            "not-applicable\n",
+                            operation_id=f"report-only-{index}",
+                            provenance=fields["provenance"],
+                        )
+                        return {
+                            "token": revision.token,
+                            "path": str(revision.path),
+                            "sha256": revision.sha256,
+                        }
+                    if operation == "resolve-plan":
+                        if fields["plan_path"] != "not-applicable":
+                            store.plan_revision(task, fields["plan_path"])
+                        revision = store.read(f"tasks/{task}/plan")
+                        return {
+                            "working_path": str(revision.path),
+                            "working_revision": revision.token,
+                            "working_sha256": revision.sha256,
+                        }
+                    if operation == "check-plan":
+                        status = store.check_plan(
+                            task,
+                            coder_selection=fields["coder_selection"],
+                        )
+                        status["cache_ref"] = {
+                            "schema": "r2-plan-contract-cache-v1",
+                            "task_short_id": task,
+                            "project_uid": f"project-{selection_policy}-{index}",
+                            "task_uid": task_record["task_uid"],
+                            "task_binding_sha256": task_binding,
+                            "accepted_snapshot_path": status["accepted_path"],
+                            "accepted_snapshot_sha256": status["accepted_snapshot"],
+                        }
+                        return status
+                    if operation == "accept-plan":
+                        accepted = store.accept_plan(
+                            task,
+                            fields["expected_revision"],
+                            fields["expected_accepted"],
+                            fields["metadata"],
+                        )
+                        return {"token": accepted.token}
+                    raise AssertionError(f"unexpected memory operation: {operation}")
+
+                review_context = (
+                    "Reviewed authority "
+                    + locator
+                    if reference_source == "review_context"
+                    else "Reviewed implementation scope."
+                )
+                payload = {
+                    "workspace_path": str(root.resolve(strict=True)),
+                    "task_short_id": task,
+                    "plan_path": (
+                        "not-applicable"
+                        if plan_kind == "report_only"
+                        else str(working.path)
+                    ),
+                    "work_kind": "feature",
+                    "review_context": review_context,
+                    "plan_route": "start",
+                    "plan_route_context": "not-applicable",
+                    "delivery_context": context,
+                    "_kent": {"task_id": "native-task"},
+                }
+                if selection_policy == "complexity":
+                    current_revision = (
+                        store.read(f"tasks/{task}/plan")
+                        if plan_kind == "report_only"
+                        else working
+                    )
+                    normalized_digest = hashlib.sha256(
+                        module.normalized_plan(current_revision.path).encode("utf-8")
+                    ).hexdigest()
+                    payload["accepted_plan_sha256"] = (
+                        prior_digest if prior_digest is not None else "not-applicable"
+                    )
+                    payload["reviewed_normalized_sha256"] = normalized_digest
+
+                spec = self.generated_spec(
+                    reliability=False,
+                    delivery_context=True,
+                    coder_selection=selection_policy,
+                )
+                revalidate_edges = [
+                    edge for edge in spec.edges
+                    if edge.key == "plan_contract_revalidate"
+                ]
+                self.assertEqual(len(revalidate_edges), 1)
+                self.assertEqual(revalidate_edges[0].source, "plan_contract")
+                self.assertEqual(revalidate_edges[0].target, "plan_revalidation")
+                self.assertEqual(revalidate_edges[0].context, "continue_session")
+                self.assertEqual(revalidate_edges[0].context_source, "node:plan")
+                self.assertFalse(revalidate_edges[0].requires_approval)
+                node_keys = {node.key for node in spec.nodes}
+                self.assertTrue({"plan", "plan_review", "plan_contract"} <= node_keys)
+                plan_approval_edges = [
+                    edge for edge in spec.edges
+                    if edge.key == "plan_review_accept"
+                    and edge.source == "plan_review"
+                    and edge.target == "plan_contract"
+                ]
+                self.assertEqual(len(plan_approval_edges), 1)
+
+                raw_stdout = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        module.execute.__globals__,
+                        {"memory_call": memory_call},
+                    ),
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            "KENT_PLAN_CONTRACT_MODE": "accept",
+                            "KENT_BIN": str(fake_kent),
+                        },
+                    ),
+                    mock.patch("pathlib.Path.cwd", return_value=root),
+                    mock.patch("sys.stdin", io.StringIO(json.dumps(payload))),
+                    contextlib.redirect_stdout(raw_stdout),
+                ):
+                    result_code = module.main()
+                raw_result = subprocess.CompletedProcess(
+                    ["workflow-plan-contract"],
+                    result_code,
+                    raw_stdout.getvalue(),
+                    "",
+                )
+                output = assert_raw_native_transition_projection(
+                    self,
+                    raw_result,
+                    spec=spec,
+                    edge_key="plan_contract_implement",
+                )
+                self.assertEqual(output["transition"], "plan_contract_start")
+                self.assertEqual(output["delivery_context"], context)
+                self.assertEqual(output["workspace_path"], str(root.resolve(strict=True)))
+                self.assertEqual(output["plan_path"], payload["plan_path"])
+                if selection_policy == "complexity":
+                    self.assertEqual(output["target_assignee"], "implementation-simple")
+                    self.assertEqual(output["target_thinking"], "xhigh")
+                else:
+                    self.assertNotIn("accepted_plan_sha256", output)
+                    self.assertNotIn("target_assignee", output)
+                    self.assertNotIn("target_thinking", output)
+
+                head = store.accepted_head(task)
+                self.assertIsInstance(head, str)
+                self.assertNotEqual(head, previous_head)
+                accepted_status = store.check_plan(
+                    task,
+                    coder_selection=(
+                        selection if selection_policy == "complexity" else None
+                    ),
+                )
+                accepted_snapshot = json.loads(
+                    Path(accepted_status["accepted_path"]).read_bytes()
+                )
+                if selection_policy == "complexity":
+                    self.assertEqual(
+                        output["accepted_plan_sha256"],
+                        accepted_snapshot["normalized_sha256"],
+                    )
+                    if prior_digest is not None:
+                        self.assertNotEqual(
+                            output["accepted_plan_sha256"],
+                            prior_digest,
+                        )
+                self.assertEqual(
+                    accepted_snapshot["authority_refs"],
+                    [locator],
+                )
+                self.assertEqual(accepted_snapshot["plan_kind"], plan_kind)
+                self.assertEqual(accepted_snapshot["parent"], previous_head)
+                self.assertEqual(
+                    "prepare-report-only" in call_log,
+                    plan_kind == "report_only" and not reaccept,
+                )
+                self.assertIn("accept-plan", call_log)
+                self.assertTrue(
+                    (
+                        root / ".kent" / "runtime" / task / "plan-contract.json"
+                    ).is_file()
+                )
+                self.assertFalse((root / ".todo").exists())
 
 
 class AndroidApkInstallPreserveTest(GitRepositoryTest):

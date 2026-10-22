@@ -509,6 +509,184 @@ class ProjectMemoryTests(unittest.TestCase):
         self.assertNotIn("plan_route_context", continuation)
         self.assertNotIn("target_assignee", continuation)
 
+    def test_r2_missing_acceptance_references_revalidates_by_selection_policy(self) -> None:
+        import contextlib
+        import io
+
+        source = Path(__file__).resolve().parents[1] / "templates/project/workflow-plan-contract"
+        selection = {
+            "schema": "coder-selection-v1",
+            "task_short_id": "OSM-130",
+            "complexity": "simple",
+            "rationale": "Bounded implementation",
+        }
+        cases = (
+            ("disabled", True, False),
+            ("disabled", True, True),
+            ("complexity", True, False),
+            ("complexity", True, True),
+            ("complexity", False, False),
+        )
+        for policy, prior_acceptance, cache_present in cases:
+            with self.subTest(
+                    policy=policy, prior_acceptance=prior_acceptance,
+                    cache_present=cache_present):
+                root = Path(self.temp.name).resolve() / (
+                    f"missing-refs-{policy}-{prior_acceptance}-{cache_present}"
+                )
+                root.mkdir()
+                subprocess.run(["git", "init", "-q", str(root)], check=True)
+                (root / ".gitignore").write_text("/.kent/runtime/\n")
+                kent = root / ".kent"
+                kent.mkdir()
+                policies = (
+                    '[policies]\n'
+                    f'coder_selection = "{policy}"\n'
+                    + ('writer_sessions = "continuous"\n' if policy == "complexity" else "")
+                    + '[project_memory]\nmode = "r2"\n'
+                )
+                (kent / "workflow-profile.toml").write_text(policies)
+                module = runpy.run_path(str(source))
+                store = ProjectMemory.initialize(
+                    root / "external-memory", "appsome", "project-a")
+                task_record = store.initialize_task("OSM-130", "task-a", [])
+
+                selection_block = (
+                    "\n```json\n" + json.dumps(selection) + "\n```\n"
+                    if policy == "complexity" else ""
+                )
+                current_plan = (
+                    "Implement the plan, but retain no current authority locator.\n"
+                    + selection_block
+                )
+                prior_digest = None
+                if prior_acceptance:
+                    prior_plan = store.publish(
+                        "tasks/OSM-130/plan",
+                        None,
+                        "Original reviewed plan.\n"
+                        "session_message(project/session/event/digest)\n"
+                        + selection_block,
+                    )
+                    metadata = {
+                        "work_kind": "feature",
+                        "authority_refs": ["session_message(project/session/event/digest)"],
+                        "plan_kind": "markdown",
+                    }
+                    if policy == "complexity":
+                        metadata["coder_selection"] = selection
+                    accepted = store.accept_plan(
+                        "OSM-130", prior_plan.token, None, metadata)
+                    accepted_snapshot = json.loads(accepted.path.read_bytes())
+                    prior_digest = accepted_snapshot["normalized_sha256"]
+                    working = store.publish(
+                        "tasks/OSM-130/plan", prior_plan.token, current_plan)
+                else:
+                    working = store.publish(
+                        "tasks/OSM-130/plan", None, current_plan)
+                current_digest = hashlib.sha256(
+                    module["normalized_plan"](working.path).encode("utf-8")
+                ).hexdigest()
+                expected_head = store.accepted_head("OSM-130")
+                task_binding = hashlib.sha256(
+                    (store.path / "tasks/OSM-130/task.json").read_bytes()
+                ).hexdigest()
+                call_log: list[str] = []
+
+                def call(_workspace, _payload, operation, **fields):
+                    call_log.append(operation)
+                    if operation == "resolve-task":
+                        return {"mode": "r2"}
+                    if operation == "accepted-head":
+                        return {"accepted_snapshot": store.accepted_head("OSM-130")}
+                    if operation == "resolve-plan":
+                        if fields["plan_path"] != "not-applicable":
+                            store.plan_revision("OSM-130", fields["plan_path"])
+                        revision = store.read("tasks/OSM-130/plan")
+                        return {
+                            "working_path": str(revision.path),
+                            "working_revision": revision.token,
+                            "working_sha256": revision.sha256,
+                        }
+                    if operation == "check-plan":
+                        status = store.check_plan(
+                            "OSM-130", coder_selection=fields["coder_selection"])
+                        status["cache_ref"] = {
+                            "schema": "r2-plan-contract-cache-v1",
+                            "task_short_id": "OSM-130",
+                            "project_uid": "project-a",
+                            "task_uid": task_record["task_uid"],
+                            "task_binding_sha256": task_binding,
+                            "accepted_snapshot_path": status["accepted_path"],
+                            "accepted_snapshot_sha256": status["accepted_snapshot"],
+                        }
+                        return status
+                    raise AssertionError(f"unexpected memory operation: {operation}")
+
+                cache = kent / "runtime/OSM-130/plan-contract.json"
+                cache_bytes = b""
+                if cache_present:
+                    if not prior_acceptance:
+                        self.fail("a missing accepted snapshot cannot have a trusted cache")
+                    status = store.check_plan(
+                        "OSM-130",
+                        coder_selection=selection if policy == "complexity" else None,
+                    )
+                    cache_ref = {
+                        "schema": "r2-plan-contract-cache-v1",
+                        "task_short_id": "OSM-130",
+                        "project_uid": "project-a",
+                        "task_uid": task_record["task_uid"],
+                        "task_binding_sha256": task_binding,
+                        "accepted_snapshot_path": status["accepted_path"],
+                        "accepted_snapshot_sha256": status["accepted_snapshot"],
+                    }
+                    cache.parent.mkdir(parents=True)
+                    cache.write_text(json.dumps(cache_ref))
+                    cache_bytes = cache.read_bytes()
+
+                payload = {
+                    "workspace_path": str(root),
+                    "task_short_id": "OSM-130",
+                    "plan_path": str(working.path),
+                    "work_kind": "feature",
+                    "review_context": "Review details without source locators.",
+                    "plan_route": "verify",
+                    "plan_route_context": "not-applicable",
+                }
+                if policy == "complexity":
+                    payload["accepted_plan_sha256"] = (
+                        prior_digest if prior_digest is not None else "not-applicable"
+                    )
+                    payload["reviewed_normalized_sha256"] = current_digest
+
+                with (
+                    patch.dict(module["execute"].__globals__, {"memory_call": call}),
+                    patch.dict(os.environ, {"KENT_PLAN_CONTRACT_MODE": "accept"}),
+                    contextlib.redirect_stdout(io.StringIO()) as output,
+                ):
+                    self.assertEqual(module["execute"](payload), 0)
+
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["transition"], "plan_contract_revalidate")
+                self.assertIn("accepted plan contract", result["plan_change_report"].lower())
+                self.assertNotIn("coder selection", result["commentary"].lower())
+                if policy == "complexity":
+                    self.assertEqual(
+                        result["accepted_plan_sha256"],
+                        prior_digest if prior_digest is not None else "not-applicable",
+                    )
+                    if prior_digest is not None:
+                        self.assertNotEqual(result["accepted_plan_sha256"], current_digest)
+                else:
+                    self.assertNotIn("accepted_plan_sha256", result)
+                self.assertEqual(store.accepted_head("OSM-130"), expected_head)
+                self.assertNotIn("accept-plan", call_log)
+                self.assertEqual(cache.exists(), cache_present)
+                if cache_present:
+                    self.assertEqual(cache.read_bytes(), cache_bytes)
+                self.assertFalse((root / ".todo").exists())
+
     def test_plan_contract_retained_writer_guard_reads_every_session_page(self) -> None:
         module = runpy.run_path(str(Path(__file__).resolve().parents[1] /
                                     "templates/project/workflow-plan-contract"))

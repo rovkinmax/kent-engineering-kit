@@ -1577,8 +1577,8 @@ def complete_accept_revalidation(
     payload: dict[str, str] = {
         "transition": "plan_contract_revalidate",
         "commentary": (
-            "Выбор исполнителя или его связь с проверенным планом "
-            "не подтверждены; требуется повторная сверка плана."
+            "Принятый контракт плана не подтверждён; "
+            "возвращаю на пересогласование перед продолжением."
         ),
         "workspace_path": str(workspace),
         "plan_path": plan_path,
@@ -1586,7 +1586,7 @@ def complete_accept_revalidation(
         "plan_route": route,
         "plan_route_context": route_context,
         "plan_change_report": (
-            "Accepted coder selection could not be validated: " + reason
+            "Accepted plan contract could not be validated: " + reason
         ),
         "review_context": review_context,
         "task_short_id": task,
@@ -1791,13 +1791,22 @@ def execute(payload: dict[str, object]) -> int:
             require_open_plan_acceptance(workspace, task)
             references = acceptance_references(workspace, task, (review_context, normalized))
             if not references:
+                revalidation_fields: dict[str, str] = {}
+                if selection_policy == "complexity":
+                    revalidation_fields["accepted_plan_sha256"] = (
+                        require_sha256(
+                            memory_accepted["normalized_sha256"],
+                            "accepted plan digest",
+                        )
+                        if memory_accepted is not None
+                        else NOT_APPLICABLE
+                    )
                 complete_accept_revalidation(
                     workspace=workspace, plan_path=configured_plan, work_kind=work_kind,
                     review_context=review_context, route=route, route_context=route_context,
                     task=task, delivery_context=delivery_context,
                     reason="Original decision/review locators are missing; recover existing sources without repeating consent.",
-                    accepted_plan_sha256=(
-                        memory_accepted["normalized_sha256"] if memory_accepted else NOT_APPLICABLE),
+                    **revalidation_fields,
                 )
                 return 0
             accepted_revision = memory_call(

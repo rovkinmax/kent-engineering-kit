@@ -177,6 +177,10 @@ REVALIDATION_EDGE_CONTRACTS = {
         "plan_review",
         "plan_review_needs_changes",
     ),
+    "plan_contract_revalidate": (
+        "plan_contract",
+        "plan_contract_revalidate",
+    ),
     "plan_contract_continue_revalidate": (
         "plan_contract_continue",
         "plan_contract_continue_changed",
@@ -944,6 +948,7 @@ class DeliveryContinuityTest(unittest.TestCase):
             "dispatch_spec_review",
             "gate_fix",
             "gate_reverify_after_user_action",
+            "gate_retry_verification",
             "gate_smoke_required",
             "gate_delivery_ready",
             "smoke_fix",

@@ -88,6 +88,20 @@ a writer starts. It cannot be repaired with caller-selected role/model values.
 Digests detect cooperative drift; they do not establish human authorship,
 task-comment order or atomic native transition acceptance.
 
+When accepted-plan validation lacks required original-authority references,
+return through retained Plan Revalidation before acceptance. Recover accessible
+authority from accepted/working state, validated evidence and the original
+Session messages/Question answers or Task comments. Validate authorship, the
+complete proposal/answer relationship, scope and supersession; a locator,
+agent summary, cache or digest does not authenticate consent. Preserve verified
+references in authoritative or discoverable permitted evidence, not only in
+transient `review_context`. For R2, preserve prior accepted state: do not execute
+accept-plan or publish/recreate a local acceptance cache while references are
+missing. Missing bookkeeping alone is not a new product question. If original
+authority cannot be validated, report the concrete gap; recovered historical
+authority does not bypass independent review, project approval gates or a
+pending native approval.
+
 ## Terminal ownership
 
 Cleanup retains exact present cache bytes plus external snapshot locator/digest

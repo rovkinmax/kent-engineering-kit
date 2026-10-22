@@ -451,7 +451,7 @@ class CurrentKitGraphTest(unittest.TestCase):
                     (len(graph.nodes),
                      len({(edge.source, edge.transition) for edge in graph.edges}),
                      len(graph.edges)),
-                    (21, 55, 56) if complexity else (21, 53, 54),
+                    (21, 56, 57) if complexity else (21, 55, 56),
                 )
                 route = edges["implement_replan"]
                 self.assertEqual(

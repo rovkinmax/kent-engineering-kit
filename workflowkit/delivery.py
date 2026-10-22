@@ -1805,6 +1805,10 @@ def build_delivery_workflow(
                 "Reject an artifact or foreign workspace path before verification."
             ),
             parameters=(
+                (WORKSPACE,)
+                if profile.delivery_reliability_policy() == "v1"
+                else ()
+            ) + (
                 REPORTED_WORKSPACE,
                 FIX_CONTEXT,
             ) + fix_continuity_parameters,
@@ -1948,6 +1952,23 @@ def build_delivery_workflow(
                     BLOCKER,
                 ) + fix_continuity_parameters,
             ),
+            EdgeSpec(
+                key="gate_retry_verification",
+                source="verification_gate",
+                transition="retry_verification",
+                target="verification_dispatch",
+                context="new_session",
+                context_source="immediate_source",
+                requires_approval=False,
+                transition_description=(
+                    "A capable owner resolved and settled a technical blocker; "
+                    "run fresh verification branches."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                ) + delivery_context_parameters,
+            ),
             cancellation_edge("verification_gate"),
         ]
     )
@@ -2034,7 +2055,9 @@ def build_delivery_workflow(
                     "smoke",
                     context=non_writer_recovery_context,
                     carry_delivery_context=delivery_context_enabled,
+                    extra_prompt=smoke_recovery_settlement_instruction(),
                 ),
+                cancellation_edge("smoke"),
             ]
         )
 
@@ -2844,6 +2867,37 @@ def build_delivery_workflow(
                     ),
                 )
             )
+    edges.append(
+        EdgeSpec(
+            key="plan_contract_revalidate",
+            source="plan_contract",
+            transition="revalidate",
+            target="plan_revalidation",
+            context="continue_session",
+            context_source="node:plan",
+            prompt=plan_revalidation_prompt(
+                profile,
+                from_review=False,
+                coder_selection=coder_selection_enabled,
+            ),
+            transition_description=(
+                "The accepted plan contract requires reconciliation; return to "
+                "the retained planner before any writer starts."
+            ),
+            parameters=(
+                WORKSPACE,
+                PLAN,
+                WORK_KIND,
+                PLAN_ROUTE,
+                PLAN_ROUTE_CONTEXT,
+                PLAN_CHANGE_REPORT,
+                REVIEW_CONTEXT,
+                TASK_SHORT_ID,
+            ) + (
+                (ACCEPTED_PLAN_SHA256,) if coder_selection_enabled else ()
+            ) + delivery_context_parameters,
+        )
+    )
     if coder_selection_enabled:
         def add_parameters(
             edge: EdgeSpec,
@@ -2970,35 +3024,6 @@ re-lock another writer."""
 
         edges.extend(
             [
-                EdgeSpec(
-                    key="plan_contract_revalidate",
-                    source="plan_contract",
-                    transition="revalidate",
-                    target="plan_revalidation",
-                    context="continue_session",
-                    context_source="node:plan",
-                    prompt=plan_revalidation_prompt(
-                        profile,
-                        from_review=False,
-                        coder_selection=True,
-                    ),
-                    transition_description=(
-                        "The accepted selection or its reviewed plan digest "
-                        "is invalid; reconcile it with the retained planner "
-                        "before any writer starts."
-                    ),
-                    parameters=(
-                        WORKSPACE,
-                        PLAN,
-                        WORK_KIND,
-                        PLAN_ROUTE,
-                        PLAN_ROUTE_CONTEXT,
-                        PLAN_CHANGE_REPORT,
-                        REVIEW_CONTEXT,
-                        TASK_SHORT_ID,
-                        ACCEPTED_PLAN_SHA256,
-                    ) + delivery_context_parameters,
-                ),
                 *(
                     [
                         EdgeSpec(
@@ -4373,18 +4398,40 @@ explicitly. Choose `wont_do` only for explicit cancellation and provide
 
 
 def workspace_path_fix_prompt(profile: ProjectProfile) -> str:
+    if profile.delivery_reliability_policy() == "v1":
+        workspace_contract = """The reliability-v1 dispatch producer supplied
+the canonical, native-qualified `workspace_path`:
+{{.Params.workspace_path}}
+Use that exact value unchanged. Treat `reported_workspace_path` only as the
+rejected input for diagnosis; do not resolve from it, replace the producer-owned
+root, or derive identity from the current directory.
+"""
+        completion_workspace = "the unchanged producer-owned root"
+    else:
+        workspace_contract = """Treat Kent's current task execution root as
+authoritative. Resolve its canonical repository root with
+`git rev-parse --show-toplevel`, or canonical current directory for an
+intentional non-Git workspace. Do not move the worktree or change task artifacts.
+"""
+        completion_workspace = "the canonical root"
     return f"""Correct invalid workflow metadata without editing production files.
 
 Verification dispatch rejected the reported workspace:
 {{{{.Params.reported_workspace_path}}}}
-Reason: {{{{.Params.fix_context}}}}{delivery_context_input(profile)}Treat Kent's current task execution root as authoritative. Resolve its canonical
-repository root with `git rev-parse --show-toplevel`, or canonical current
-directory for an intentional non-Git workspace. Do not move the worktree,
-change task artifacts, or edit code.
+Reason: {{{{.Params.fix_context}}}}{delivery_context_input(profile)}
+{workspace_contract}
+Do not edit production code.
 This is metadata correction only; do not create or update a Fix checkpoint.
+The original rejected path and reason are already preserved in the
+`reported_workspace_path` and `fix_context` inputs; retain those exact source
+locators. Update `review_context` only through the qualified project-owned
+route, preserving its required envelope and every opaque field byte-for-byte.
+Add only bounded references to those original inputs and the metadata
+correction when the project contract permits it. Do not rewrite, reserialize,
+or reshape an opaque packet, or emit undeclared fields.
 
-Complete with `verify` and provide the canonical root as `workspace_path`,
-`task_short_id={{{{.TaskShortId}}}}`, plus the preserved `review_context`. Use
+Complete with `verify` and provide {completion_workspace} as `workspace_path`,
+`task_short_id={{{{.TaskShortId}}}}`, plus refreshed `review_context`. Use
 `needs_user_action` only if Kent's execution root itself is unavailable or
 ambiguous. Choose `wont_do` only for explicit cancellation and provide
 `closure_reason`.{delivery_context_tail(profile)}"""
@@ -4458,7 +4505,9 @@ def verification_gate_prompt(profile: ProjectProfile) -> str:
 For `needs_changes`, provide `workspace_path` plus `fix_context`.
 For `needs_user_action`, provide `workspace_path`, `review_context`, and
 `blocker_reason`.
-For `wont_do`, provide only `closure_reason`."""
+For `wont_do`, provide only `closure_reason`.
+For `verification_gate_retry_verification`, provide `workspace_path` and
+`review_context`; preserve `delivery_context` only if that edge declares it."""
     if profile.smoke_policy() in {"conditional", "disabled"}:
         outcome_guidance += """
 For `delivery_ready`, provide `workspace_path`, `review_context`, and
@@ -4478,8 +4527,9 @@ Verification report: {{{{.Params.verification_report}}}}
 {standards}
 {spec}
 
-Apply the `workflow-gate` role contract. Choose a delivery transition only when
-every enabled status is `passed` for the current authorized stage. Retain
+Apply the `workflow-gate` role contract. Choose `delivery_ready` or
+`smoke_required` only when every enabled status is `passed` for the
+current authorized stage. A verification retry is not delivery readiness. Retain
 downstream unverified obligations with an owner and due milestone, including
 on paths without Compliance or PR. Do not relabel a previous `blocked` report:
 changed authority requires a fresh review by its owner. A review-ready PR
@@ -4497,10 +4547,20 @@ do not impose Markdown, copy full reports, or rewrite opaque producer packets.
 
 {smoke_decision}
 
-Technical failures belong to an existing capable recovery owner, not
-automatically product Fix or a user question. After approval on
-`needs_user_action`, every verification branch reruns. Choose `wont_do` only
-for an explicit cancellation decision."""
+Choose `verification_gate_retry_verification` only after bounded evidence
+identifies the original technical blocker, an existing capable authorized
+owner's concrete resolution, changed prerequisites, and settlement of prior
+owned processes/effects. Preserve the current Task/workspace, accepted scope,
+real attempt/spend limits, and exact incoming `delivery_context`; add bounded
+resolution references through the qualified project-owned `review_context`
+route. The Script runs every enabled verification and review branch fresh.
+Never relabel an old `blocked` report or reuse an old PASS as current evidence.
+If owner resolution, changed prerequisites, evidence, or settlement is absent,
+do not retry, poll, launch a child, repair shared infrastructure, install tools,
+or invent product Fix/user authority. Technical failures belong to an existing
+capable recovery owner. `needs_user_action` remains for a genuine external
+action or decision; after approval, every verification branch reruns. Choose
+`wont_do` only for an explicit cancellation decision."""
 
 
 def smoke_prompt(profile: ProjectProfile) -> str:
@@ -4521,7 +4581,40 @@ Complete with `passed` and provide `workspace_path` plus an updated
 `review_context` containing the decision, rationale, tested scope, evidence,
 artifacts, and untested areas. Use `needs_changes` with `workspace_path` and
 `fix_context` for task code issues. Use `needs_user_action` with
-`blocker_reason` for external blockers.{delivery_context_tail(profile)}"""
+`blocker_reason` for external blockers.
+
+{smoke_cancellation_instruction()}
+{delivery_context_tail(profile)}"""
+
+
+def smoke_cancellation_instruction() -> str:
+    return """For explicit cancellation, choose `wont_do` only after preserving
+the Smoke checkpoint/evidence and settling every owned runner, process,
+fixture, shell, and effect; restore changed state and verify resource release
+through the existing project adapter. Safe retention is allowed only when the
+existing project contract and authority qualify it; preserve concrete resource,
+owner, status, safe-state proof, and next action. Never infer ownership, TTL
+release, or a lease waiver. Unknown cleanup blocks cancellation. Do not route
+through Janitor or claim Smoke PASS, delivery readiness, or cleanup of unrelated
+resources. Record the cancellation source and settlement or qualified-retention
+references in `closure_reason` without secrets. `wont_do` retains its native
+approval: an original cancellation decision is not that approval, and a pending
+approval must not be answered or replaced. Emit only the declared
+`closure_reason` field."""
+
+
+def smoke_recovery_settlement_instruction() -> str:
+    return """On Smoke recovery, first reconcile the existing checkpoint, owned
+resources, and prior effects. Approval means only the reported external action
+is complete; it does not authorize replay of an interrupted or stopped test.
+Use only a supported, authorized safety-only continuation to stop, restore,
+settle, and verify owned work. If the original Smoke scope remains authorized
+after settlement, continue only under its existing procedure and attempt/spend
+limits. Cancellation permits safety settlement only, not ordinary runtime
+replay or resumption. Preserve exact resource/owner/status evidence and the
+next action through the project-owned checkpoint/evidence route. Unknown
+ownership or cleanup remains blocked; do not infer a TTL release or borrow a
+lease."""
 
 
 def compliance_prompt(profile: ProjectProfile) -> str:
