@@ -17,6 +17,10 @@ sys.dont_write_bytecode = True
 MAX_PROFILE_BYTES = 64 * 1024
 
 
+class _TechnicalFailure(RuntimeError):
+    """A producer-capture failure that must not trigger another observation."""
+
+
 def _sibling(name: str) -> Any:
     path = Path(__file__).with_name(name)
     if path.is_symlink() or not path.is_file():
@@ -208,7 +212,13 @@ def main() -> int:
         raise ValueError("stdin is not valid JSON: {}".format(error))
     if not isinstance(payload, dict):
         raise ValueError("stdin must be one JSON object")
-    emit = partial(_emit, producer_payload=payload)
+    producer_emit = partial(_emit, producer_payload=payload)
+
+    def emit(*args: Any, **kwargs: Any) -> None:
+        try:
+            producer_emit(*args, **kwargs)
+        except Exception as error:
+            raise _TechnicalFailure("producer_capture_failed") from error
 
     workspace = Path(_text(payload, "workspace_path")).expanduser().resolve()
     pr_url = _text(payload, "pr_url")
@@ -268,25 +278,59 @@ def main() -> int:
                 timeout=timeout,
             )
             observed = watcher.observe_pr(pr_url)
-            errors = 0
             pr = observed["pr"]
+            if pr.get("headRefName") != branch_name:
+                raise observation.ObservationError("invalid_observation")
             state = str(pr.get("state") or "").upper()
             head_oid = str(pr["headRefOid"])
             base_oid = str(pr["baseRefOid"])
             if state == "MERGED":
+                merged_values = {
+                    "workspace_path": values["workspace_path"],
+                    "pr_url": values["pr_url"],
+                    "branch_name": values["branch_name"],
+                    "merge_strategy": values["merge_strategy"],
+                    "merge_report": _merge_report(pr),
+                }
                 emit(
                     "merge_watch_pr_merged",
-                    {**values, "merge_report": _merge_report(pr)},
+                    merged_values,
                     cursor=acknowledged_text,
                 )
                 return 0
 
+            classification = runtime.classify_github_checks(
+                observed["checks"],
+                require_ci=(
+                    contract["require_ci"]
+                    if contract is not None
+                    else False
+                ),
+            )
+            if classification["state"] in {
+                "invalid_observation",
+                "observation_limit",
+            }:
+                emit(
+                    "merge_watch_state_changed",
+                    {
+                        **values,
+                        "pr_report": _pr_report(
+                            pr=pr,
+                            reason=classification["state"],
+                            checks=list(classification.get("checks", [])),
+                            observed_cursor=None,
+                        ),
+                    },
+                    cursor=acknowledged_text,
+                )
+                return 0
             current = runtime.make_dynamic_pr_feedback_cursor(
                 repository=repository,
                 pull_number=pull_number,
                 items=observed["feedback_items"],
                 review_decision=str(pr.get("reviewDecision") or ""),
-                checks=observed["checks"],
+                checks=classification["checks"],
             )
             delta = runtime.diff_dynamic_pr_feedback_cursor(
                 acknowledged,
@@ -308,14 +352,6 @@ def main() -> int:
                 _canonical(runtime, current)
                 if delta["transition"] == "state_changed"
                 else None
-            )
-            classification = runtime.classify_github_checks(
-                observed["checks"],
-                require_ci=(
-                    contract["require_ci"]
-                    if contract is not None
-                    else False
-                ),
             )
             reason = ""
             if state == "CLOSED":
@@ -344,11 +380,6 @@ def main() -> int:
                 )
             elif classification["state"] == "failed":
                 reason = "checks_failed"
-            elif classification["state"] in {
-                "invalid_observation",
-                "observation_limit",
-            }:
-                reason = classification["state"]
 
             if reason:
                 report = {
@@ -359,11 +390,7 @@ def main() -> int:
                         checks=list(classification.get("checks", [])),
                         observed_cursor=observed_text,
                     ),
-                    "pr_head_oid": head_oid,
-                    "pr_base_oid": base_oid,
                 }
-                if observed_text is not None:
-                    report["observed_feedback_cursor"] = observed_text
                 emit(
                     "merge_watch_state_changed",
                     report,
@@ -381,7 +408,10 @@ def main() -> int:
                     cursor=acknowledged_text,
                 )
                 return 0
+            errors = 0
             time.sleep(interval)
+        except _TechnicalFailure:
+            raise
         except Exception as error:
             errors += 1
             if errors < max_errors:
@@ -396,8 +426,6 @@ def main() -> int:
                         reason="github_query_failed",
                         error=error,
                     ),
-                    "pr_head_oid": initial_head,
-                    "pr_base_oid": initial_base,
                 },
                 cursor=acknowledged_text,
             )

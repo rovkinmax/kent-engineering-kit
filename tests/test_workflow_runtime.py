@@ -100,6 +100,26 @@ def assert_pids_gone(
     testcase.assertFalse(alive, "processes remained alive: {}".format(alive))
 
 
+def assert_raw_edge_projection(
+    testcase: unittest.TestCase,
+    raw_result: subprocess.CompletedProcess[str],
+    *,
+    spec,
+    edge_key: str,
+) -> dict[str, object]:
+    testcase.assertEqual(raw_result.returncode, 0, raw_result.stderr)
+    output = json.loads(raw_result.stdout)
+    edge = next((item for item in spec.edges if item.key == edge_key), None)
+    testcase.assertIsNotNone(edge, edge_key)
+    testcase.assertIsInstance(output.get("transition"), str)
+    expected = {parameter.key for parameter in edge.parameters}
+    actual = set(output) - {"transition", "commentary"}
+    testcase.assertEqual(actual, expected, (edge_key, output, expected))
+    if "commentary" in output:
+        testcase.assertIsInstance(output["commentary"], str)
+    return output
+
+
 class RuntimeSupportImportTest(unittest.TestCase):
     def test_v2_commands_load_only_the_sibling_support_module(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -404,6 +424,58 @@ class WorkflowPlanContractTest(GitRepositoryTest):
                 'coder_selection = "disabled"\n'
             )
 
+    def generated_spec(
+        self,
+        *,
+        writer_sessions: str = "continuous",
+        coder_selection: str = "disabled",
+        branch_identity: str = "task",
+        delivery_context: bool = True,
+    ):
+        from dataclasses import replace
+
+        from workflowkit.delivery import build_delivery_workflow
+        from workflowkit.profile import ProjectProfile
+
+        profile = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        policies = {
+            **profile.policies,
+            "writer_sessions": writer_sessions,
+            "coder_selection": coder_selection,
+            "branch_identity": branch_identity,
+        }
+        commands = dict(profile.commands)
+        issue_tracker = profile.issue_tracker
+        if branch_identity == "jira":
+            issue_tracker = "jira"
+            commands["branch_identity"] = ".kent/scripts/workflow-branch-identity"
+        if not delivery_context:
+            profile = replace(profile, delivery_profile="standard")
+        profile = replace(
+            profile,
+            policies=policies,
+            commands=commands,
+            issue_tracker=issue_tracker,
+        )
+        return build_delivery_workflow(profile, 1)
+
+    def coder_selection_plan(self, complexity: str = "simple") -> str:
+        return (
+            "# Plan\n\n- [ ] Implement feature\n\n"
+            "```json\n"
+            + json.dumps({
+                "schema": "coder-selection-v1",
+                "task_short_id": "TASK-PLAN",
+                "complexity": complexity,
+                "rationale": "The accepted scope has a bounded implementation path.",
+            }, indent=2)
+            + "\n```\n"
+        )
+
     def run_contract(
         self,
         root: Path,
@@ -414,6 +486,10 @@ class WorkflowPlanContractTest(GitRepositoryTest):
         spoof_route: str | None = None,
         delivery_context: str | None = None,
         review_context: str = "bounded review context",
+        accepted_plan_sha256: str | None = None,
+        reviewed_normalized_sha256: str | None = None,
+        native_task_id: str | None = None,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.ensure_disabled_complexity_profile(root)
         executable = (
@@ -455,6 +531,12 @@ class WorkflowPlanContractTest(GitRepositoryTest):
             payload["plan_contract_mode"] = spoof_mode
         if delivery_context is not None:
             payload["delivery_context"] = delivery_context
+        if accepted_plan_sha256 is not None:
+            payload["accepted_plan_sha256"] = accepted_plan_sha256
+        if reviewed_normalized_sha256 is not None:
+            payload["reviewed_normalized_sha256"] = reviewed_normalized_sha256
+        if native_task_id is not None:
+            payload["_kent"] = {"task_id": native_task_id}
         return subprocess.run(
             [str(executable)],
             cwd=root,
@@ -463,6 +545,7 @@ class WorkflowPlanContractTest(GitRepositoryTest):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env={**os.environ, **(environment or {})},
         )
 
     def test_delivery_context_survives_plan_contract_routes(self) -> None:
@@ -527,6 +610,461 @@ class WorkflowPlanContractTest(GitRepositoryTest):
                     context,
                 )
         self.assertFalse((root / ".kent/scripts/__pycache__").exists())
+
+    def test_guard_raw_outputs_match_generated_edges_for_selection_and_context_modes(self) -> None:
+        context = json.dumps(
+            {"schema": "workflow-delivery-context-v1", "phase": "pre_pr"},
+            separators=(",", ":"),
+        )
+        for selection in ("disabled", "complexity"):
+            for context_enabled in (False, True):
+                with self.subTest(selection=selection, context=context_enabled):
+                    root = self.create_repository()
+                    (root / ".kent" / "workflow-profile.toml").write_text(
+                        "[policies]\n"
+                        'writer_sessions = "continuous"\n'
+                        f'coder_selection = "{selection}"\n'
+                    )
+                    plan = root / ".todo" / "task" / "plan.md"
+                    plan.parent.mkdir(parents=True)
+                    plan.write_text(
+                        self.coder_selection_plan()
+                        if selection == "complexity"
+                        else "# Plan\n\n- [ ] Implement feature\n"
+                    )
+                    carried_context = context if context_enabled else None
+                    normalized_module = load_template_module(
+                        PLAN_CONTRACT,
+                        "runtime_plan_contract_digest",
+                    )
+                    normalized_digest = hashlib.sha256(
+                        normalized_module.inspection_normalized_plan(
+                            plan.read_bytes()
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    spec = self.generated_spec(
+                        coder_selection=selection,
+                        delivery_context=context_enabled,
+                    )
+                    session_env: dict[str, str] = {}
+                    native_task_id = None
+                    accepted_digest_input = None
+                    reviewed_digest_input = None
+                    session_inventory_path: Path | None = None
+                    if selection == "complexity":
+                        kent = root / "kent-fixture"
+                        session_inventory_path = root / "sessions.json"
+                        session_inventory_path.write_text(
+                            json.dumps(
+                                {
+                                    "task_id": "native-task",
+                                    "items": [],
+                                }
+                            )
+                        )
+                        kent.write_text(
+                            f"#!{sys.executable}\n"
+                            "import json, os\n"
+                            "with open(os.environ['KENT_TEST_SESSIONS'], encoding='utf-8') as source:\n"
+                            "    print(json.dumps(json.load(source)))\n"
+                        )
+                        kent.chmod(0o755)
+                        session_env = {
+                            "KENT_BIN": str(kent),
+                            "KENT_TEST_SESSIONS": str(session_inventory_path),
+                        }
+                        native_task_id = "native-task"
+                        accepted_digest_input = "not-applicable"
+                        reviewed_digest_input = normalized_digest
+                    accepted = self.run_contract(
+                        root,
+                        mode="accept",
+                        route="start",
+                        delivery_context=carried_context,
+                        accepted_plan_sha256=accepted_digest_input,
+                        reviewed_normalized_sha256=reviewed_digest_input,
+                        native_task_id=native_task_id,
+                        environment=session_env,
+                    )
+                    accepted_output = assert_raw_edge_projection(
+                        self,
+                        accepted,
+                        spec=spec,
+                        edge_key="plan_contract_implement",
+                    )
+                    self.assertNotIn("plan_route", accepted_output)
+                    self.assertNotIn("plan_route_context", accepted_output)
+                    if selection == "complexity":
+                        self.assertEqual(
+                            accepted_output["target_assignee"],
+                            "implementation-simple",
+                        )
+                        self.assertEqual(accepted_output["target_thinking"], "xhigh")
+                        accepted_digest = accepted_output["accepted_plan_sha256"]
+                    else:
+                        self.assertNotIn("target_assignee", accepted_output)
+                        self.assertNotIn("target_thinking", accepted_output)
+                        self.assertNotIn("accepted_plan_sha256", accepted_output)
+                        accepted_digest = None
+
+                    if session_inventory_path is not None:
+                        session_inventory_path.write_text(
+                            json.dumps(
+                                {
+                                    "task_id": "native-task",
+                                    "items": [
+                                        {
+                                            "session_id": "retained-writer",
+                                            "agent_role": "implementation-simple",
+                                        }
+                                    ],
+                                }
+                            )
+                        )
+                    stable_continue = self.run_contract(
+                        root,
+                        mode="check",
+                        route="continue",
+                        delivery_context=carried_context,
+                        accepted_plan_sha256=accepted_digest,
+                        native_task_id=native_task_id,
+                        environment=session_env,
+                    )
+                    stable_output = assert_raw_edge_projection(
+                        self,
+                        stable_continue,
+                        spec=spec,
+                        edge_key="plan_contract_checked_continue",
+                    )
+                    for omitted in (
+                        "plan_route",
+                        "plan_route_context",
+                        "target_assignee",
+                        "target_thinking",
+                    ):
+                        self.assertNotIn(omitted, stable_output)
+
+                    stable_verify = self.run_contract(
+                        root,
+                        mode="check",
+                        route="verify",
+                        delivery_context=carried_context,
+                    )
+                    verify_output = assert_raw_edge_projection(
+                        self,
+                        stable_verify,
+                        spec=spec,
+                        edge_key="plan_contract_checked_verify",
+                    )
+                    for omitted in (
+                        "plan_route",
+                        "plan_route_context",
+                        "target_assignee",
+                        "target_thinking",
+                    ):
+                        self.assertNotIn(omitted, verify_output)
+                    self.assertNotIn("accepted_plan_sha256", verify_output)
+
+                    plan.write_text(plan.read_text() + "\n- [ ] Changed acceptance\n")
+                    changed = self.run_contract(
+                        root,
+                        mode="check",
+                        route="continue",
+                        delivery_context=carried_context,
+                        accepted_plan_sha256=accepted_digest,
+                        native_task_id=native_task_id,
+                        environment=session_env,
+                    )
+                    changed_output = assert_raw_edge_projection(
+                        self,
+                        changed,
+                        spec=spec,
+                        edge_key="plan_contract_continue_revalidate",
+                    )
+                    self.assertEqual(
+                        "accepted_plan_sha256" in changed_output,
+                        selection == "complexity",
+                    )
+                    for omitted in ("target_assignee", "target_thinking"):
+                        self.assertNotIn(omitted, changed_output)
+                    if session_inventory_path is not None:
+                        session_inventory_path.write_text(
+                            json.dumps(
+                                {
+                                    "task_id": "native-task",
+                                    "items": [],
+                                }
+                            )
+                        )
+                    reviewed_after_change = hashlib.sha256(
+                        normalized_module.inspection_normalized_plan(
+                            plan.read_bytes()
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    reaccepted = self.run_contract(
+                        root,
+                        mode="accept",
+                        route="start",
+                        delivery_context=carried_context,
+                        accepted_plan_sha256=accepted_digest,
+                        reviewed_normalized_sha256=(
+                            reviewed_after_change
+                            if selection == "complexity"
+                            else None
+                        ),
+                        native_task_id=native_task_id,
+                        environment=session_env,
+                    )
+                    reaccepted_output = assert_raw_edge_projection(
+                        self,
+                        reaccepted,
+                        spec=spec,
+                        edge_key="plan_contract_implement",
+                    )
+                    if selection == "complexity":
+                        self.assertEqual(
+                            reaccepted_output["target_assignee"],
+                            "implementation-simple",
+                        )
+                        self.assertEqual(
+                            reaccepted_output["target_thinking"],
+                            "xhigh",
+                        )
+                        self.assertNotEqual(
+                            reaccepted_output["accepted_plan_sha256"],
+                            accepted_digest,
+                        )
+
+    def test_fix_continue_changed_output_matches_fresh_writer_edge(self) -> None:
+        context = json.dumps(
+            {"schema": "workflow-delivery-context-v1", "phase": "pre_pr"},
+            separators=(",", ":"),
+        )
+        root = self.create_repository()
+        (root / ".kent" / "workflow-profile.toml").write_text(
+            "[policies]\n"
+            'writer_sessions = "fresh_per_slice"\n'
+            'coder_selection = "disabled"\n'
+        )
+        plan = root / ".todo" / "task" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Plan\n\n- [ ] Implement feature\n")
+        spec = self.generated_spec(
+            writer_sessions="fresh_per_slice",
+            coder_selection="disabled",
+        )
+        accepted = self.run_contract(
+            root,
+            mode="accept",
+            route="fix_continue",
+            delivery_context=context,
+        )
+        assert_raw_edge_projection(
+            self,
+            accepted,
+            spec=spec,
+            edge_key="plan_contract_fix_continue",
+        )
+        stable = self.run_contract(
+            root,
+            mode="check",
+            route="fix_continue",
+            delivery_context=context,
+        )
+        assert_raw_edge_projection(
+            self,
+            stable,
+            spec=spec,
+            edge_key="plan_contract_checked_fix",
+        )
+        plan.write_text(plan.read_text() + "\n- [ ] Reconcile changed criterion\n")
+        changed = self.run_contract(
+            root,
+            mode="check",
+            route="fix_continue",
+            delivery_context=context,
+        )
+        changed_output = assert_raw_edge_projection(
+            self,
+            changed,
+            spec=spec,
+            edge_key="plan_contract_fix_revalidate",
+        )
+        self.assertNotIn("accepted_plan_sha256", changed_output)
+        self.assertNotIn("target_assignee", changed_output)
+        self.assertNotIn("target_thinking", changed_output)
+
+    def test_selected_branch_identity_raw_output_matches_generated_writer_edge(self) -> None:
+        from tests.test_branch_identity import BranchIdentityTest
+
+        branch_case = BranchIdentityTest(
+            "test_complexity_selection_is_revalidated_and_emitted_on_branch_entry"
+        )
+        branch_case.setUp()
+        self.addCleanup(branch_case.doCleanups)
+        branch_case.configure("jira", coder_selection=True)
+        branch_case.task(
+            short_id="TASK-1",
+            source_url="https://example.atlassian.net/browse/MBL-826",
+        )
+        plan = branch_case.root / ".todo" / "canary" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text(
+            "# Accepted plan\n\n"
+            "- [ ] Implement the reviewed behavior.\n\n"
+            "```json\n"
+            + json.dumps(
+                {
+                    "schema": "coder-selection-v1",
+                    "task_short_id": "TASK-1",
+                    "complexity": "simple",
+                    "rationale": "The accepted implementation scope supports this choice.",
+                },
+                indent=2,
+            )
+            + "\n```\n"
+        )
+        (branch_case.root / ".gitignore").write_text("/.kent/runtime/\n")
+
+        scripts = branch_case.root / ".kent" / "scripts"
+        scripts.mkdir(parents=True)
+        for source in (
+            PLAN_CONTRACT,
+            PLAN_CONTRACT_ACCEPT,
+            *PLAN_CONTRACT_CHECK.values(),
+        ):
+            target = scripts / source.name
+            target.write_bytes(source.read_bytes())
+            target.chmod(0o755)
+        (scripts / "workflow_runtime_contracts.py").write_bytes(
+            (REPO_ROOT / "workflowkit" / "runtime.py").read_bytes()
+        )
+        branch_script = scripts / "workflow-branch-identity"
+        branch_script.write_bytes(
+            (
+                REPO_ROOT
+                / "templates"
+                / "project"
+                / "workflow-branch-identity"
+            ).read_bytes()
+        )
+        branch_script.chmod(0o755)
+
+        normalized_module = load_template_module(
+            PLAN_CONTRACT,
+            "runtime_branch_plan_contract_digest",
+        )
+        reviewed_digest = hashlib.sha256(
+            normalized_module.inspection_normalized_plan(
+                plan.read_bytes()
+            ).encode("utf-8")
+        ).hexdigest()
+        delivery_context = json.dumps(
+            {"schema": "workflow-delivery-context-v1", "phase": "pre_pr"},
+            separators=(",", ":"),
+        )
+        spec = self.generated_spec(
+            coder_selection="complexity",
+            branch_identity="jira",
+        )
+        plan_input = {
+            "workspace_path": str(branch_case.root),
+            "plan_path": ".todo/canary/plan.md",
+            "work_kind": "test",
+            "plan_route": "start",
+            "plan_route_context": "not-applicable",
+            "review_context": "Reviewed selection with human approval.",
+            "task_short_id": "TASK-1",
+            "accepted_plan_sha256": "not-applicable",
+            "reviewed_normalized_sha256": reviewed_digest,
+            "delivery_context": delivery_context,
+            "_kent": {"task_id": "task-uuid"},
+        }
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "KENT_BIN": str(branch_case.kent),
+                "KENT_TASK_PAYLOAD": str(branch_case.payload_path),
+                "KENT_SESSION_PAYLOAD": str(branch_case.sessions_path),
+            }
+        )
+        accepted = subprocess.run(
+            [str(scripts / "workflow-plan-contract-accept")],
+            cwd=branch_case.root,
+            input=json.dumps(plan_input),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            check=False,
+        )
+        accepted_output = assert_raw_edge_projection(
+            self,
+            accepted,
+            spec=spec,
+            edge_key="plan_contract_branch_identity",
+        )
+        self.assertEqual(accepted_output["transition"], "plan_contract_start")
+        self.assertEqual(accepted_output["plan_route"], "start")
+        self.assertEqual(
+            accepted_output["plan_route_context"],
+            "not-applicable",
+        )
+        self.assertNotIn("target_assignee", accepted_output)
+        self.assertNotIn("target_thinking", accepted_output)
+
+        branch_case.script = branch_script
+        branch_case.coder_handoff = {
+            key: accepted_output[key]
+            for key in (
+                "task_short_id",
+                "accepted_plan_sha256",
+                "plan_route",
+                "plan_route_context",
+                "review_context",
+            )
+        }
+        branch_case.coder_handoff["delivery_context"] = delivery_context
+        result, _ = branch_case.run_script(
+            handoff=True,
+            coder_selection=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        projected = assert_raw_edge_projection(
+            self,
+            result,
+            spec=spec,
+            edge_key="branch_identity_implement",
+        )
+        self.assertEqual(projected["transition"], "branch_identity_ready")
+        self.assertEqual(projected["plan_route"], "start")
+        self.assertEqual(projected["plan_route_context"], "not-applicable")
+        self.assertEqual(projected["accepted_plan_sha256"],
+                         accepted_output["accepted_plan_sha256"])
+        self.assertEqual(projected["target_assignee"], "implementation-simple")
+        self.assertEqual(projected["target_thinking"], "xhigh")
+
+    def test_complexity_selection_rejects_fresh_writer_profile(self) -> None:
+        from workflowkit.profile import ProjectProfile
+        from workflowkit.model import SpecError
+
+        profile_text = (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text()
+        profile_text = profile_text.replace(
+            'writer_sessions = "continuous"',
+            'writer_sessions = "fresh_per_slice"',
+        ).replace(
+            'coder_selection = "disabled"',
+            'coder_selection = "complexity"',
+        )
+        with self.assertRaisesRegex(
+            SpecError,
+            "coder_selection.*requires.*continuous",
+        ):
+            ProjectProfile.from_toml(
+                REPO_ROOT,
+                profile_text,
+                check_files=False,
+            )
 
     def test_decision_references_use_durable_plan_and_route_carriers(self) -> None:
         root = self.create_repository()
@@ -4546,6 +5084,158 @@ class WorkflowVerifyReportTest(GitRepositoryTest):
                 self.assertEqual(payload["verification_status"], status)
                 self.assertEqual(report["exit_code"], exit_code)
 
+    def test_verify_post_spawn_io_failures_settle_child_and_close_handles(self) -> None:
+        from contextlib import ExitStack
+
+        for phase in (
+            "set_blocking",
+            "selector_create",
+            "register",
+            "select",
+            "read",
+            "cleanup_path",
+        ):
+            with self.subTest(phase=phase):
+                root = self.create_repository()
+                scripts = self.install_verify_fixture(
+                    root,
+                    "#!/bin/sh\nprintf 'ready\\n'\nexec /bin/sleep 60\n",
+                )
+                module = load_template_module(
+                    scripts / "workflow-verify-report",
+                    "verify_owned_child_" + phase,
+                )
+                children = []
+                selectors = []
+                original_popen = module.subprocess.Popen
+                original_selector = module.selectors.DefaultSelector
+                original_blocking = module.os.set_blocking
+                original_read = module.os.read
+                original_private_tmp_path = module._private_tmp_path
+                private_path_calls = 0
+
+                def capture_popen(*args, **kwargs):
+                    process = original_popen(*args, **kwargs)
+                    if kwargs.get("start_new_session"):
+                        children.append(process)
+                    return process
+
+                def injected_set_blocking(fd, value):
+                    if phase in {"set_blocking", "cleanup_path"} and children:
+                        raise OSError(errno.EIO, "injected post-spawn set_blocking")
+                    return original_blocking(fd, value)
+
+                class TrackingSelector(original_selector):
+                    def __init__(self):
+                        if phase == "selector_create":
+                            raise OSError(errno.EIO, "injected post-spawn selector creation")
+                        super().__init__()
+                        selectors.append(self)
+
+                    def register(self, *args, **kwargs):
+                        if phase == "register":
+                            raise OSError(errno.EIO, "injected post-spawn register")
+                        return super().register(*args, **kwargs)
+
+                    def select(self, *args, **kwargs):
+                        if phase == "select":
+                            raise ValueError("injected post-spawn select")
+                        return super().select(*args, **kwargs)
+
+                def injected_read(fd, count):
+                    pipe_fds = {
+                        stream.fileno()
+                        for process in children
+                        for stream in (process.stdout, process.stderr)
+                        if stream is not None and not stream.closed
+                    }
+                    if phase == "read" and fd in pipe_fds:
+                        raise OSError(errno.EIO, "injected post-spawn read")
+                    return original_read(fd, count)
+
+                def injected_private_tmp_path(*args, **kwargs):
+                    nonlocal private_path_calls
+                    private_path_calls += 1
+                    if phase == "cleanup_path" and private_path_calls == 2:
+                        raise module.VerificationFailure("log_path_unsafe")
+                    return original_private_tmp_path(*args, **kwargs)
+
+                try:
+                    with ExitStack() as stack:
+                        stack.enter_context(
+                            mock.patch.object(
+                                module.subprocess,
+                                "Popen",
+                                capture_popen,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                module.os,
+                                "set_blocking",
+                                injected_set_blocking,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(module.os, "read", injected_read)
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                module.selectors,
+                                "DefaultSelector",
+                                TrackingSelector,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                module, "_private_tmp_path", injected_private_tmp_path
+                            )
+                        )
+                        report = self.run_module_in_workspace(module, root)
+
+                    self.assertEqual(len(children), 1)
+                    child = children[0]
+                    self.assertEqual(report["code"], "internal_error", report)
+                    self.assertIsNotNone(child.poll(), "child must be reaped before return")
+                    self.assertTrue(child.stdout.closed)
+                    self.assertTrue(child.stderr.closed)
+                    self.assertTrue(
+                        all(selector.get_map() is None for selector in selectors)
+                    )
+                    if phase == "cleanup_path":
+                        self.assertGreaterEqual(private_path_calls, 2)
+                finally:
+                    for child in children:
+                        if child.poll() is None:
+                            module._terminate_group(child)
+                        for stream in (child.stdout, child.stderr):
+                            if stream is not None:
+                                stream.close()
+                    for selector in selectors:
+                        selector.close()
+
+    def test_verify_malformed_output_retains_published_log_reference(self) -> None:
+        root = self.create_repository()
+        self.install_verify_fixture(
+            root,
+            "#!/bin/sh\necho not-json\necho DIAGNOSTIC >&2\n",
+        )
+
+        payload = self.run_verify_command(root)
+        report = self.parse_verification_report(payload)
+
+        self.assertEqual(payload["verification_status"], "blocked")
+        self.assertEqual(report["code"], "child_output_invalid")
+        self.assertIsNone(report["exit_code"])
+        self.assertIsNotNone(report["log_path"])
+        self.assertIsNotNone(report["log_sha256"])
+        log = root / str(report["log_path"])
+        content = log.read_bytes()
+        self.assertEqual(hashlib.sha256(content).hexdigest(), report["log_sha256"])
+        stdout, stderr = self.parse_framed_output(content)
+        self.assertEqual(stdout, b"not-json\n")
+        self.assertEqual(stderr, b"DIAGNOSTIC\n")
+
     def test_verify_timeout_and_output_limit_are_bounded(self) -> None:
         root = self.create_repository()
         self.install_verify_fixture(
@@ -5687,7 +6377,18 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
         environment: dict[str, str],
         payload: dict[str, object],
     ) -> dict[str, object]:
-        result = subprocess.run(
+        result = self._run_raw(watcher, root, environment, payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def _run_raw(
+        self,
+        watcher: Path,
+        root: Path,
+        environment: dict[str, str],
+        payload: dict[str, object],
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
             [str(watcher)],
             cwd=root,
             input=json.dumps(payload),
@@ -5698,8 +6399,478 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
             check=False,
             timeout=20,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return json.loads(result.stdout)
+
+    def _generated_spec(
+        self,
+        *,
+        ci_monitoring: bool,
+        writer_sessions: str | None = None,
+        coder_selection: str | None = None,
+        branch_identity: str | None = None,
+        delivery_profile: str | None = None,
+    ):
+        from dataclasses import replace
+
+        from workflowkit.delivery import build_delivery_workflow
+        from workflowkit.profile import ProjectProfile
+
+        source = (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text()
+        profile = ProjectProfile.from_toml(
+            REPO_ROOT,
+            source,
+            check_files=False,
+        )
+        capabilities = {
+            **profile.capabilities,
+            "ci_monitoring": ci_monitoring,
+        }
+        policies = dict(profile.policies)
+        if writer_sessions is not None:
+            policies["writer_sessions"] = writer_sessions
+        if coder_selection is not None:
+            policies["coder_selection"] = coder_selection
+        commands = dict(profile.commands)
+        if ci_monitoring:
+            commands["wait_ci"] = ".kent/scripts/workflow-wait-github-ci"
+        issue_tracker = profile.issue_tracker
+        if branch_identity is not None:
+            policies["branch_identity"] = branch_identity
+            if branch_identity == "jira":
+                issue_tracker = "jira"
+            commands["branch_identity"] = ".kent/scripts/workflow-branch-identity"
+        if delivery_profile is not None:
+            profile = replace(profile, delivery_profile=delivery_profile)
+        profile = replace(
+            profile,
+            capabilities=capabilities,
+            policies=policies,
+            commands=commands,
+            issue_tracker=issue_tracker,
+        )
+        return build_delivery_workflow(profile, 1)
+
+    def _assert_raw_edge_projection(
+        self,
+        raw_result: subprocess.CompletedProcess[str],
+        *,
+        spec,
+        edge_key: str,
+    ) -> dict[str, object]:
+        return assert_raw_edge_projection(
+            self,
+            raw_result,
+            spec=spec,
+            edge_key=edge_key,
+        )
+
+    def _dynamic_report(self, contract: dict[str, object]) -> dict[str, object]:
+        from workflowkit import runtime
+
+        classification = runtime.classify_github_checks(
+            [],
+            require_ci=bool(contract["require_ci"]),
+        )
+        attempt = {
+            "sequence": 1,
+            "head_oid": contract["head_oid"],
+            "base_oid": contract["base_oid"],
+            "retry": None,
+            "checks": classification["checks"],
+            "check_count": classification["check_count"],
+            "checks_sha256": classification["checks_sha256"],
+            "reason": classification["state"],
+            "watcher_exit_code": 0,
+            "error": None,
+        }
+        return runtime.build_dynamic_ci_report(
+            contract=contract,
+            attempts=[attempt],
+        )
+
+    def _prepare_raw(
+        self,
+        root: Path,
+        environment: dict[str, str],
+        payload: dict[str, object],
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(REPO_ROOT / "scripts" / "prepare-github-ci")],
+            cwd=root,
+            input=json.dumps(payload),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            check=False,
+            timeout=20,
+        )
+
+    def test_prepare_ci_raw_stdout_projects_initial_retry_and_merged_edges(self) -> None:
+        from tests.test_delivery_continuity import runtime_v2_profile
+        from workflowkit.delivery import build_delivery_workflow
+        from workflowkit import runtime
+
+        spec = build_delivery_workflow(
+            runtime_v2_profile(ci=True, source_ci=True),
+            1,
+        )
+        url = "https://github.com/example/repo/pull/1"
+        contract = self.contract()
+        valid_report = self._dynamic_report(contract)
+
+        for case in ("initial", "retry", "merged_first_read", "merged_second_read"):
+            with self.subTest(case=case):
+                root = self.create_repository()
+                context = root / ".kent" / "context"
+                context.mkdir()
+                (context / "delivery.md").write_text("CI archive context\n")
+                states = {
+                    "initial": [self._state(), self._state()],
+                    "retry": [self._state(), self._state()],
+                    "merged_first_read": [self._state(state="MERGED")],
+                    "merged_second_read": [
+                        self._state(),
+                        self._state(state="MERGED"),
+                    ],
+                }[case]
+                state_path = root / "pr-states.json"
+                state_path.write_text(json.dumps(states))
+                count_path = root / "pr-view-count"
+                count_path.write_text("0")
+                fake_gh = root / "gh"
+                fake_gh.write_text(
+                    f"#!{sys.executable}\n"
+                    "import json, pathlib, sys\n"
+                    f"root = pathlib.Path({str(root)!r})\n"
+                    "args = sys.argv[1:]\n"
+                    "if args[:2] != ['pr', 'view']:\n"
+                    "    raise SystemExit(2)\n"
+                    "counter = root / 'pr-view-count'\n"
+                    "count = int(counter.read_text()) + 1\n"
+                    "counter.write_text(str(count))\n"
+                    "states = json.loads((root / 'pr-states.json').read_text())\n"
+                    "print(json.dumps(states[min(count - 1, len(states) - 1)]))\n"
+                )
+                fake_gh.chmod(0o755)
+                payload: dict[str, object] = {
+                    "workspace_path": str(root),
+                    "pr_url": url,
+                    "branch_name": "TASK-1",
+                    "merge_strategy": "rebase",
+                    "task_short_id": "TASK-1",
+                    "pr_feedback_cursor": "uninitialized",
+                }
+                expected_edge = "ci_prepare_ready_initial"
+                environment = {**os.environ, "KENT_GH_BIN": str(fake_gh)}
+                if case == "retry":
+                    payload["ci_contract"] = runtime.canonical_bytes(contract).decode()
+                    payload["ci_report"] = runtime.canonical_bytes(valid_report).decode()
+                    environment.update(EVIDENCE_FIXTURE_OWNER)
+                    expected_edge = "ci_prepare_ready_retry"
+                elif case.startswith("merged_"):
+                    payload["ci_contract"] = runtime.canonical_bytes(contract).decode()
+                    expected_edge = "ci_prepare_merged"
+
+                raw = self._prepare_raw(root, environment, payload)
+                output = self._assert_raw_edge_projection(
+                    raw,
+                    spec=spec,
+                    edge_key=expected_edge,
+                )
+                if case == "retry":
+                    self.assertEqual(
+                        output["ci_report"],
+                        payload["ci_report"],
+                        "retry must preserve the original report packet bytes",
+                    )
+                if case.startswith("merged_"):
+                    self.assertNotIn("task_short_id", output)
+                    self.assertNotIn("merge_strategy", output)
+                    self.assertEqual(
+                        int(count_path.read_text()),
+                        1 if case == "merged_first_read" else 2,
+                    )
+
+    def test_dynamic_watchers_raw_stdout_projects_state_changed_and_merged_edges(self) -> None:
+        ci_spec = self._generated_spec(ci_monitoring=True)
+        pr_spec = self._generated_spec(ci_monitoring=True)
+        for source, spec, changed_edge, merged_edge in (
+            (CI_WATCH, ci_spec, "ci_watch_state_changed", "ci_watch_merged"),
+            (PR_WATCH, pr_spec, "merge_watch_state_changed", "merge_watch_cleanup"),
+        ):
+            for state_kind in ("changed", "merged"):
+                with self.subTest(watcher=source.name, state=state_kind):
+                    root = self.create_repository()
+                    contract = self.contract()
+                    state = (
+                        self._state(merge_state="DIRTY")
+                        if state_kind == "changed"
+                        else self._state(state="MERGED")
+                    )
+                    watcher, environment = self._install_dynamic_watch(
+                        root,
+                        source,
+                        state=state,
+                        checks=[
+                            self._check(
+                                name="unit",
+                                bucket="pass",
+                                state="SUCCESS",
+                            )
+                        ],
+                    )
+                    payload = self._payload(
+                        root,
+                        contract,
+                        report=self._dynamic_report(contract),
+                    )
+                    raw = self._run_raw(watcher, root, environment, payload)
+                    edge_key = changed_edge if state_kind == "changed" else merged_edge
+                    output = self._assert_raw_edge_projection(
+                        raw,
+                        spec=spec,
+                        edge_key=edge_key,
+                    )
+                    if state_kind == "changed":
+                        self.assertNotIn("observed_feedback_cursor", output)
+                        self.assertEqual("pr_head_oid" in output, source == CI_WATCH)
+                        self.assertEqual("pr_base_oid" in output, source == CI_WATCH)
+                        report = json.loads(output["pr_report"])
+                        self.assertEqual(report["reason"], "merge_conflict")
+                    else:
+                        self.assertIn("merge_report", output)
+                        self.assertNotIn("pr_report", output)
+
+    def test_dynamic_ci_invalid_check_classification_precedes_cursor_construction(self) -> None:
+        root = self.create_repository()
+        watcher, environment = self._install_dynamic_watch(
+            root,
+            CI_WATCH,
+            state=self._state(),
+            checks=[
+                self._check(
+                    name="unit",
+                    bucket="fail",
+                    state="SUCCESS",
+                )
+            ],
+        )
+        cursor_calls = root / "cursor-calls"
+        runtime_sibling = (
+            root / ".kent" / "scripts" / "workflow_runtime_contracts.py"
+        )
+        runtime_source = runtime_sibling.read_text()
+        runtime_sibling.write_text(
+            runtime_source
+            + "\n_original_make_cursor = make_dynamic_pr_feedback_cursor\n"
+            + "def make_dynamic_pr_feedback_cursor(*args, **kwargs):\n"
+            + "    with open(os.environ['KENT_CURSOR_CALLS'], 'a') as output:\n"
+            + "        output.write('called\\n')\n"
+            + "    return _original_make_cursor(*args, **kwargs)\n"
+        )
+        environment["KENT_CURSOR_CALLS"] = str(cursor_calls)
+        environment["KENT_CI_WATCH_MAX_ERRORS"] = "2"
+        result = self._run_raw(
+            watcher,
+            root,
+            environment,
+            self._payload(root, self.contract()),
+        )
+        output = self._assert_raw_edge_projection(
+            result,
+            spec=self._generated_spec(ci_monitoring=True),
+            edge_key="ci_watch_diagnose",
+        )
+        report = json.loads(output["ci_report"])
+        self.assertEqual(report["attempts"][-1]["reason"], "invalid_observation")
+        self.assertFalse(cursor_calls.exists())
+        self.assertEqual((root / "pr-views").read_text(), "2")
+        self.assertEqual((root / "check-views").read_text(), "1")
+
+    def test_dynamic_ci_closed_changed_identity_never_appends_contradictory_attempt(self) -> None:
+        root = self.create_repository()
+        watcher, environment = self._install_dynamic_watch(
+            root,
+            CI_WATCH,
+            state=self._state(state="CLOSED", head="d" * 40),
+            checks=[],
+        )
+        environment["KENT_CI_WATCH_MAX_ERRORS"] = "2"
+        result = self._run_raw(
+            watcher,
+            root,
+            environment,
+            self._payload(root, self.contract()),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("closed_pull_request_identity_changed", result.stderr)
+        self.assertEqual((root / "pr-views").read_text(), "1")
+        self.assertEqual((root / "check-views").read_text(), "0")
+
+    def test_dynamic_watchers_fail_closed_on_foreign_head_branch_before_merge(self) -> None:
+        ci_spec = self._generated_spec(ci_monitoring=True)
+        pr_spec = self._generated_spec(ci_monitoring=True)
+        for source, spec, edge_key in (
+            (CI_WATCH, ci_spec, "ci_watch_diagnose"),
+            (PR_WATCH, pr_spec, "merge_watch_state_changed"),
+        ):
+            for state_name in ("OPEN", "MERGED"):
+                with self.subTest(watcher=source.name, state=state_name):
+                    root = self.create_repository()
+                    state = self._state(state=state_name)
+                    state["headRefName"] = "FOREIGN-BRANCH"
+                    watcher, environment = self._install_dynamic_watch(
+                        root,
+                        source,
+                        state=state,
+                        checks=[
+                            self._check(
+                                name="unit",
+                                bucket="pass",
+                                state="SUCCESS",
+                            )
+                        ],
+                    )
+                    environment[
+                        "KENT_CI_WATCH_MAX_ERRORS"
+                        if source == CI_WATCH
+                        else "KENT_PR_WATCH_MAX_ERRORS"
+                    ] = "1"
+                    contract = self.contract()
+                    raw = self._run_raw(
+                        watcher,
+                        root,
+                        environment,
+                        self._payload(
+                            root,
+                            contract,
+                            report=self._dynamic_report(contract),
+                        ),
+                    )
+                    output = self._assert_raw_edge_projection(
+                        raw,
+                        spec=spec,
+                        edge_key=edge_key,
+                    )
+                    self.assertNotIn("merge_report", output)
+                    if source == CI_WATCH:
+                        self.assertEqual(
+                            json.loads(output["ci_report"])["attempts"][-1]["reason"],
+                            "invalid_observation",
+                        )
+                        self.assertEqual(
+                            (root / "pr-views").read_text(),
+                            "2" if state_name == "OPEN" else "1",
+                        )
+                    else:
+                        report = json.loads(output["pr_report"])
+                        self.assertEqual(report["reason"], "github_query_failed")
+                        self.assertEqual(
+                            report["safe_error"]["code"],
+                            "invalid_observation",
+                        )
+                        self.assertNotIn("pr_head_oid", output)
+                        self.assertNotIn("pr_base_oid", output)
+
+    def test_dynamic_ci_archive_failure_does_not_repeat_observation_or_emit_result(self) -> None:
+        from tests.test_delivery_continuity import runtime_v2_profile
+        from workflowkit.delivery import build_delivery_workflow
+
+        spec = build_delivery_workflow(
+            runtime_v2_profile(ci=True, source_ci=True),
+            1,
+        )
+        root = self.create_repository()
+        watcher, environment = self._install_dynamic_watch(
+            root,
+            CI_WATCH,
+            state=self._state(merge_state="DIRTY"),
+            checks=[
+                self._check(
+                    name="unit",
+                    bucket="pass",
+                    state="SUCCESS",
+                )
+            ],
+            archive=True,
+        )
+        archive_calls = root / "archive-calls"
+        archive = Path(environment["KENT_PREPARE_GITHUB_CI_BIN"])
+        archive.write_text(
+            "#!/bin/sh\n"
+            "cat >/dev/null\n"
+            f"printf 'called\\n' >> {shlex.quote(str(archive_calls))}\n"
+            "exit 2\n"
+        )
+        archive.chmod(0o755)
+        environment["KENT_CI_WATCH_MAX_ERRORS"] = "2"
+        result = self._run_raw(
+            watcher,
+            root,
+            environment,
+            self._payload(root, self.contract(), task="TASK-1"),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("ci_report_archive_failed", result.stderr)
+        self.assertEqual((root / "pr-views").read_text(), "2")
+        self.assertEqual((root / "check-views").read_text(), "1")
+        self.assertEqual(archive_calls.read_text().splitlines(), ["called"])
+        # The valid raw result would use the generated changed-state edge,
+        # which includes task identity only for the source-CI profile.
+        edge = next(edge for edge in spec.edges if edge.key == "ci_watch_state_changed")
+        self.assertIn("task_short_id", {parameter.key for parameter in edge.parameters})
+
+    def test_dynamic_watcher_capture_failure_is_single_attempt_without_stdout(self) -> None:
+        for source in (CI_WATCH, PR_WATCH):
+            with self.subTest(watcher=source.name):
+                root = self.create_repository()
+                watcher, environment = self._install_dynamic_watch(
+                    root,
+                    source,
+                    state=self._state(merge_state="DIRTY"),
+                    checks=[
+                        self._check(
+                            name="unit",
+                            bucket="pass",
+                            state="SUCCESS",
+                        )
+                    ],
+                )
+                profile = root / ".kent" / "workflow-profile.toml"
+                profile.write_text(
+                    '[policies]\ndelivery_reliability = "v1"\n'
+                )
+                capture_calls = root / "capture-calls"
+                checkpoint = root / ".kent" / "scripts" / "workflow-checkpoint"
+                checkpoint.write_text(
+                    "from pathlib import Path\n"
+                    "def emit_producer_result(root, payload, result, producer_kind):\n"
+                    "    path = Path(root) / 'capture-calls'\n"
+                    "    with path.open('a') as output:\n"
+                    "        output.write(producer_kind + '\\n')\n"
+                    "    raise RuntimeError('injected capture failure')\n"
+                )
+                environment[
+                    "KENT_CI_WATCH_MAX_ERRORS"
+                    if source == CI_WATCH
+                    else "KENT_PR_WATCH_MAX_ERRORS"
+                ] = "2"
+                raw = self._run_raw(
+                    watcher,
+                    root,
+                    environment,
+                    self._payload(root, self.contract()),
+                )
+                self.assertNotEqual(raw.returncode, 0)
+                self.assertEqual(raw.stdout, "")
+                self.assertEqual(
+                    capture_calls.read_text().splitlines(),
+                    ["wait-ci" if source == CI_WATCH else "wait-pr"],
+                )
+                self.assertEqual((root / "pr-views").read_text(), "2")
+                self.assertEqual((root / "check-views").read_text(), "1")
 
     def _payload(
         self,
@@ -6029,9 +7200,12 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
                 )
                 result = self._run(watcher, root, environment, self._payload(root, contract))
                 self.assertEqual(result["transition"], "merge_watch_state_changed")
-                self.assertEqual(json.loads(result["pr_report"])["reason"], reason)
+                report = json.loads(result["pr_report"])
+                self.assertEqual(report["reason"], reason)
                 self.assertEqual(result["pr_feedback_cursor"], "uninitialized")
-                self.assertEqual(result[f"pr_{key}_oid"], "d" * 40)
+                self.assertEqual(report["headRefOid" if key == "head" else "baseRefOid"], "d" * 40)
+                self.assertNotIn("pr_head_oid", result)
+                self.assertNotIn("pr_base_oid", result)
 
     def test_dynamic_watchers_round_trip_unicode_feedback_cursor(self):
         for source in (CI_WATCH, PR_WATCH):
@@ -6054,11 +7228,13 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
                 )
                 contract = self.contract()
                 changed = self._run(watcher, root, environment, self._payload(root, contract))
-                cursor = changed["observed_feedback_cursor"]
+                report = json.loads(changed["pr_report"])
+                cursor = report["observed_feedback_cursor"]
                 self.assertIn("é", cursor)
                 item = json.loads(cursor)["items"][0]
                 self.assertEqual(item["path"], thread["path"])
                 self.assertEqual(item["current_line"], 12)
+                self.assertNotIn("observed_feedback_cursor", changed)
                 acknowledged = self._run(
                     watcher, root, environment, self._payload(root, contract, cursor=cursor),
                 )
@@ -6207,9 +7383,10 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
         )
         self.assertEqual(changed["transition"], "merge_watch_state_changed")
         self.assertEqual(changed["pr_feedback_cursor"], cursor)
-        observed = changed["observed_feedback_cursor"]
+        observed = json.loads(changed["pr_report"])["observed_feedback_cursor"]
         self.assertEqual(json.loads(observed)["item_count"], 1)
         self.assertIn("pull_request_feedback_changed", changed["pr_report"])
+        self.assertNotIn("observed_feedback_cursor", changed)
 
         conflict = self._state(merge_state="DIRTY")
         (root / "state.json").write_text(json.dumps(conflict))
@@ -6295,7 +7472,8 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
             self._payload(root, contract),
         )
         self.assertEqual(first["transition"], "merge_watch_state_changed")
-        observed = first["observed_feedback_cursor"]
+        observed = json.loads(first["pr_report"])["observed_feedback_cursor"]
+        self.assertNotIn("observed_feedback_cursor", first)
         second = self._run(
             watcher,
             root,

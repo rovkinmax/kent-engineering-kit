@@ -546,6 +546,14 @@ class ProjectProfile:
             required_roles.add("spec_review")
         if self.package_publish_after_main():
             required_roles.add("package_release")
+        if not any(
+            self.optional_role(role)
+            for role in ("plan_review", "spec_review", "researcher")
+        ):
+            raise SpecError(
+                "project profile requires at least one Plan Review role "
+                "among plan_review, spec_review, and researcher"
+            )
         for role in sorted(required_roles):
             self.role(role)
 

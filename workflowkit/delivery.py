@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shlex
 import stat
+import unicodedata
 
 from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
 from .profile import ProjectProfile
@@ -379,16 +380,11 @@ def _packet_emitted(base: dict, locator: str) -> bytes:
     return packet_json(result)
 
 
-def capture_producer(
+def _prepare_producer_artifacts(
     root: Path, *, identity: dict, producer_kind: str,
     inputs: dict[str, str], result: dict[str, str],
     binding: dict[str, str] | None = None,
-) -> tuple[str, bytes]:
-    """Trusted producer seam: observe native identity before calling this API.
-
-    Returns a relative base locator and the exact bytes to print only after both
-    immutable artifacts have passed durable publication/readback.
-    """
+) -> tuple[dict, dict, str, str, bytes, bytes]:
     identity = _packet_identity(root, identity)
     if set(identity) == _LEGACY_IDENTITY_KEYS:
         raise ValueError("new Agent producer requires Session/Step identity, not Run")
@@ -409,9 +405,32 @@ def capture_producer(
     name = "base-" + hashlib.sha256(raw).hexdigest() + ".json"
     locator = f"build/kent-workflow/{identity['task_short_id']}/packets/{name}"
     emitted = _packet_emitted(base, locator)
+    return identity, base, name, locator, raw, emitted
+
+
+def _publish_producer_artifacts(
+    root: Path, identity: dict, name: str, raw: bytes, emitted: bytes,
+) -> None:
     with _packet_directory(root, identity["task_short_id"], create=True) as fd:
         _packet_publish(fd, name, raw)
         _packet_publish(fd, "emitted-" + hashlib.sha256(emitted).hexdigest() + ".json", emitted)
+
+
+def capture_producer(
+    root: Path, *, identity: dict, producer_kind: str,
+    inputs: dict[str, str], result: dict[str, str],
+    binding: dict[str, str] | None = None,
+) -> tuple[str, bytes]:
+    """Trusted producer seam: observe native identity before calling this API.
+
+    Returns a relative base locator and the exact bytes to print only after both
+    immutable artifacts have passed durable publication/readback.
+    """
+    identity, _, name, locator, raw, emitted = _prepare_producer_artifacts(
+        root, identity=identity, producer_kind=producer_kind, inputs=inputs,
+        result=result, binding=binding,
+    )
+    _publish_producer_artifacts(root, identity, name, raw, emitted)
     return locator, emitted
 
 
@@ -481,6 +500,37 @@ def reconstruct_producer(root: Path, locator: str, *, identity: dict,
     return {**base, "emitted": emitted, "locator": locator}
 
 
+def _producer_ancestry(
+    root: Path, locators: list[str], *, identity: dict, read_relative=None,
+) -> tuple[dict[str, dict], int]:
+    pending = list(locators)
+    producers: dict[str, dict] = {}
+    inspected = 0
+    while pending:
+        reference = pending.pop()
+        if reference in producers:
+            continue
+        if len(producers) >= 32:
+            raise ValueError("producer retention closure exceeds file limit")
+        producer = reconstruct_producer(
+            root, reference, identity=identity, read_relative=read_relative,
+        )
+        inspected += len(producer["emitted"]) + len(packet_json(producer["inputs"]))
+        if inspected > 32 * 1024 * 1024:
+            raise ValueError("producer retention closure exceeds byte limit")
+        producers[reference] = producer
+        nested = producer["binding"].get("producer_refs")
+        if nested is not None:
+            value = packet_decode(nested.encode("utf-8"))
+            refs = value.get("refs")
+            if (set(value) != {"refs"} or not isinstance(refs, list) or len(refs) > 64
+                    or any(not isinstance(ref, str) for ref in refs)
+                    or len(set(refs)) != len(refs)):
+                raise ValueError("invalid nested producer references")
+            pending.extend(refs)
+    return producers, inspected
+
+
 def producer_locator(commentary: str) -> str | None:
     """Legacy commentary has no locator; malformed/duplicate footers fail."""
     lines = commentary.splitlines()
@@ -499,34 +549,14 @@ def producer_locator(commentary: str) -> str | None:
 def producer_reference_closure(root: Path, locator: str, *, identity: dict,
                                read_relative=None) -> list[str]:
     """Return exact base/emitted files, including packed original producers."""
-    pending = [locator]
-    seen: set[str] = set()
+    producers, _ = _producer_ancestry(
+        root, [locator], identity=identity, read_relative=read_relative,
+    )
     paths: set[str] = set()
-    inspected = 0
-    while pending:
-        reference = pending.pop()
-        if reference in seen:
-            continue
-        if len(seen) >= 32:
-            raise ValueError("producer retention closure exceeds file limit")
-        seen.add(reference)
-        producer = reconstruct_producer(root, reference, identity=identity,
-                                        read_relative=read_relative)
-        inspected += len(producer["emitted"]) + len(packet_json(producer["inputs"]))
-        if inspected > 32 * 1024 * 1024:
-            raise ValueError("producer retention closure exceeds byte limit")
+    for reference, producer in producers.items():
         paths.add(reference)
         paths.add(str(Path(reference).with_name(
             "emitted-" + hashlib.sha256(producer["emitted"]).hexdigest() + ".json")))
-        nested = producer["binding"].get("producer_refs")
-        if nested is not None:
-            value = packet_decode(nested.encode("utf-8"))
-            refs = value.get("refs")
-            if (set(value) != {"refs"} or not isinstance(refs, list) or len(refs) > 64
-                    or any(not isinstance(ref, str) for ref in refs)
-                    or len(set(refs)) != len(refs)):
-                raise ValueError("invalid nested producer references")
-            pending.extend(refs)
     return sorted(paths)
 
 
@@ -537,6 +567,15 @@ def _packet_value_identity(base: dict, identity: dict) -> None:
     for key in ("task_short_id", "workspace_path"):
         if key in base["result"] and base["result"][key] != identity[key]:
             raise ValueError("producer values override native identity")
+
+
+def _go_trim_space_empty(value: str) -> bool:
+    return not value or all(
+        char in "\t\n\v\f\r "
+        or char == "\u0085"
+        or unicodedata.category(char) in {"Zs", "Zl", "Zp"}
+        for char in value
+    )
 
 
 def _effective_transition(identity: dict, task_detail: dict, graph: dict,
@@ -661,13 +700,12 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
         not isinstance(ref, str) for ref in refs
     ) or len(set(refs)) != len(refs):
         raise ValueError("invalid completion producer references")
+    producers, inspected = _producer_ancestry(
+        root, refs, identity=identity,
+    )
     sources = {}
-    inspected = 0
     for ref in refs:
-        producer = reconstruct_producer(root, ref, identity=identity)
-        inspected += len(producer["emitted"]) + len(packet_json(producer["inputs"]))
-        if inspected > 32 * 1024 * 1024:
-            raise ValueError("producer inspection exceeds aggregate byte limit")
+        producer = producers[ref]
         # Outputs override inputs within one actual producer invocation. Across
         # producers there is no implicit latest choice or conflict precedence.
         fields = {**producer["inputs"], **producer["result"]}
@@ -699,7 +737,7 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
                 raise ValueError("post_pr assembly lacks observed PR identity")
             context[key] = value
         for key in ("ci_contract", "ci_report"):
-            if key in sources:
+            if key in sources and sources[key] != "":
                 context[key] = sources[key]
         sources["delivery_context"] = packet_json(context).decode("utf-8")
     else:
@@ -712,6 +750,9 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
             result[key] = sources[key]
     if set(result) - {"commentary"} != required:
         raise ValueError("completion is missing declared native transition fields")
+    for key in required:
+        if _go_trim_space_empty(result[key]):
+            raise ValueError(f"required completion field {key} must be non-empty")
     if "delivery_context" in result:
         from .runtime import delivery_context_fields
         delivery_context_fields(result)
@@ -719,13 +760,22 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
         if key in result and len(result[key].encode("utf-8")) > 65536:
             raise ValueError("nested CI packet exceeds its byte limit")
     result["transition"] = transition
-    return capture_producer(
+    binding = {
+        "transition_contract_sha256": actual["contract_sha256"],
+        "native_graph_version": str(actual["expected_version"]),
+        "producer_refs": packet_json({"refs": refs}).decode("utf-8"),
+    }
+    identity, base, name, locator, raw, emitted = _prepare_producer_artifacts(
         root, identity=identity, producer_kind="pack-delivery",
-        inputs={}, result=result,
-        binding={"transition_contract_sha256": actual["contract_sha256"],
-                 "native_graph_version": str(actual["expected_version"]),
-                 "producer_refs": packet_json({"refs": refs}).decode("utf-8")},
+        inputs={}, result=result, binding=binding,
     )
+    if len(producers) + 1 > 32:
+        raise ValueError("producer retention closure exceeds file limit")
+    inspected += len(emitted) + len(packet_json(base["inputs"]))
+    if inspected > 32 * 1024 * 1024:
+        raise ValueError("producer retention closure exceeds byte limit")
+    _publish_producer_artifacts(root, identity, name, raw, emitted)
+    return locator, emitted
 
 
 WORKSPACE = ParameterSpec(
@@ -3477,11 +3527,16 @@ def context_instruction(
     node_key: str,
     evidence_type: str,
 ) -> str:
+    skill_entry = (
+        f"{kit_skill_entry_instruction()}\n\n"
+        if manifest_key in {"review", "delivery"}
+        else ""
+    )
     manifest = profile.context_manifest(manifest_key)
     if node_key == "cleanup":
         owner = cleanup_evidence_owner_instruction(profile)
         if owner:
-            return f"""Read `{manifest}` first and stay inside its required and
+            return f"""{skill_entry}Read `{manifest}` first and stay inside its required and
 conditionally triggered sources.
 
 {owner}"""
@@ -3489,17 +3544,45 @@ conditionally triggered sources.
         # adopting runtime-v2. Legacy profiles with neither capability must
         # retain ordinary Cleanup completion, not invent a seal protocol.
         if profile.runtime_contracts_v2() or profile.command("runtime_contracts"):
-            return cleanup_without_preparation_instruction(
-                profile,
-                manifest,
-                evidence_type,
+            return (
+                skill_entry
+                + cleanup_without_preparation_instruction(
+                    profile,
+                    manifest,
+                    evidence_type,
+                )
             )
+    if manifest_key == "review":
+        evidence_owner = (
+            "the Gate node's"
+            if node_key == "verification_gate"
+            else "this node's"
+        )
+        return f"""{skill_entry}Read `{manifest}` first and stay inside its required and
+conditionally triggered sources.
+
+Only when this Workflow review node requires evidence, append only
+{evidence_owner} own required evidence through the qualified configured
+evidence adapter, using genuine current Task/Node/Session/Step identity. When
+no evidence is required, do not append. Do not edit sources or checkpoints,
+write the ledger directly, append for another producer, seal or recover it,
+or make other shell writes. First-class edit tools remain disabled.
+
+When required, pipe one non-empty JSON object to
+`{profile.command("evidence")} append --task {{{{.TaskShortId}}}} --workspace
+<workspace>`. Set `node_key` to `{node_key}`, `evidence_type` to
+`{evidence_type}`, and `context.manifest_path` to `{manifest}`.
+`context.files_read` lists other project instruction files in actual read
+order; do not repeat the manifest there. Optional telemetry must be truthful;
+leave unavailable counters null. Exclude secrets or broad raw evidence.
+When recovering an existing record, reuse its returned sequence/hash and
+continue."""
     identity_scope = (
         "Session/Step pair"
         if profile.delivery_reliability_policy() == "v1" or profile.runtime_contracts_v2()
         else "Kent run"
     )
-    return f"""Read `{manifest}` first and stay inside its required and
+    return f"""{skill_entry}Read `{manifest}` first and stay inside its required and
 conditionally triggered sources.
 
 Before transition, pipe one non-empty JSON object to
@@ -3511,6 +3594,14 @@ order; do not repeat the manifest there. Optional telemetry must be truthful;
 leave unavailable counters null. Exclude secrets or broad raw evidence.
 Append is idempotent for the current
 {identity_scope}; on recovery, reuse the returned sequence/hash and continue."""
+
+
+def kit_skill_entry_instruction() -> str:
+    return """Before relying on shared Kit sources,
+first read the installed `kent-engineering-kit` skill's `SKILL.md`, then follow its source-binding
+instructions to locate and read those sources. If the skill entrypoint, source
+binding, or a required source is unavailable, block only the dependent action
+and continue independent work."""
 
 
 def branch_identity_resolution_prompt(
@@ -3709,6 +3800,32 @@ has no executable route, report that capability gap instead of asking the user
 to choose an ordering that the graph cannot execute."""
 
 
+def plan_storage_guidance(profile: ProjectProfile) -> str:
+    # Resolve task-fixed storage before selecting task-plan paths.
+    if profile.delivery_reliability_policy() != "v1":
+        return """Read the accepted `.kent/runtime/{{.TaskShortId}}/plan-contract.json`
+without writing it. Verify schema_version=1, task_short_id={{.TaskShortId}},
+and the normalized plan digest; keep plan_path inside the Task workspace."""
+    if profile.project_memory is not None:
+        return """Resolve task-fixed storage mode with the configured qualified
+`workflow-project-memory` adapter and its `resolve-task` operation before
+choosing a plan path, using the exact native Task/workspace binding.
+For R2, use `check-plan` with the accepted coder selection (or null when
+disabled) and `resolve-plan` with the supplied immutable plan_path. The
+external immutable accepted snapshot is authoritative; validate it and the
+current working head and preserve original approval/review locators. Verify
+the accepted work_kind is declared by the project profile.
+The local `plan-contract.json` is a disposable cache: do not require or recreate it.
+When R2 resolution or accepted state is unavailable, never fall back to legacy
+storage. Only for a Task confirmed as inventoried legacy, use its existing
+`.kent/runtime/{{.TaskShortId}}/plan-contract.json` snapshot without writing."""
+    return """This profile has not adopted the project-memory adapter;
+do not invoke an absent helper. Use the local
+`.kent/runtime/{{.TaskShortId}}/plan-contract.json` snapshot only for a Task
+confirmed as inventoried legacy. If the Task is R2 or its mode cannot be
+proven, block; do not assume legacy mode or create a fallback."""
+
+
 def owner_replan_instruction(profile: ProjectProfile | None = None) -> str:
     continuity = (
         "\nPreserve incoming delivery_context exactly."
@@ -3722,33 +3839,30 @@ def owner_replan_instruction(profile: ProjectProfile | None = None) -> str:
         if profile is not None and profile.coder_selection_policy() == "complexity"
         else ""
     )
-    snapshot_instruction = """
-Resolve task-fixed storage mode with the qualified `workflow-project-memory`
-workflow adapter and its `resolve-task` operation before reading a plan.
-Use the exact native Task/workspace binding; do not select a mode from a
-worktree's missing profile fields or guess an external path.
-For R2 mode, use `check-plan` with the accepted coder selection (or null when
-disabled) and `resolve-plan` with the supplied immutable plan_path. Validate
-the external accepted snapshot and current working head; preserve its original
-approval/review locators. Use the returned current immutable working_path and
-accepted work_kind for replanning. A missing local plan-contract cache does
-not mean missing approval: external accepted state is authoritative. These
-read-only operations must not recreate the cache or change accepted state.
-For a helper-resolved legacy task, read the accepted
-`.kent/runtime/{{.TaskShortId}}/plan-contract.json` without writing it. Verify
-schema_version=1, task_short_id={{.TaskShortId}}, and the normalized_plan UTF-8
-SHA-256 against normalized_sha256. Resolve its plan_path as a regular non-escaping
-workspace file (or the explicitly authorized not-applicable sentinel); verify
-work_kind is declared by the project profile.
-""" if profile is not None and profile.delivery_reliability_policy() == "v1" else """
-Read the accepted `.kent/runtime/{{.TaskShortId}}/plan-contract.json` in the
-native Task's repository root, without writing it. Verify schema_version=1,
+    if profile is not None and profile.delivery_reliability_policy() == "v1":
+        snapshot_instruction = plan_storage_guidance(profile) + """
+For R2, use the returned current immutable working_path and accepted work_kind
+for replanning. For confirmed legacy, verify schema_version=1,
+task_short_id={{.TaskShortId}}, and the normalized_plan UTF-8 SHA-256 against
+normalized_sha256. Resolve plan_path as a regular non-escaping workspace file
+(or the explicitly authorized not-applicable sentinel); verify work_kind is
+declared by the project profile.
+"""
+    else:
+        snapshot_instruction = """Read the accepted
+`.kent/runtime/{{.TaskShortId}}/plan-contract.json` in the native Task's
+repository root, without writing it. Verify schema_version=1,
 task_short_id={{.TaskShortId}}, and SHA-256 of normalized_plan UTF-8 against
 normalized_sha256. Resolve plan_path within that root as a regular non-escaping
 file (or the existing explicitly authorized not-applicable sentinel); verify
 work_kind is declared by the project profile. Do not guess from Session memory.
 """
-    return """Choose `replan` before production edits when a concrete finding or verified
+    skill_entry = (
+        f"\n\n{kit_skill_entry_instruction()}"
+        if profile is not None
+        else ""
+    )
+    return skill_entry + "\n\n" + """Choose `replan` before production edits when a concrete finding or verified
 new authority requires substantive reconciliation of the accepted execution
 plan. This route returns work to its planner; it grants no expanded source,
 publication or resource authority. Ordinary within-contract repairs stay in
@@ -3953,18 +4067,19 @@ product decision, update the authoritative design/specification/plan with the
 exact comment ID before implementation. Keep the step independently
 verifiable; the next step runs in another fresh writer session."""
     delivery_context_contract = (
-        " Preserve the exact incoming `delivery_context` value on every "
-        "transition.\n\n"
+        " Preserve `delivery_context` only when the selected transition "
+        "declares it. When declared, keep the exact incoming bytes.\n\n"
         if _delivery_context_enabled(profile)
         else " "
     )
     selection_contract = ""
     if coder_selection:
-        selection_contract = """
+        selection_contract = f"""
 
 The accepted task-bound plan snapshot is the authority for the coder choice;
-do not rely on Plan conversation history or infer a replacement role. Read
-`.kent/runtime/{{.TaskShortId}}/plan-contract.json` and the authoritative plan.
+do not rely on Plan conversation history or infer a replacement role.
+{plan_storage_guidance(profile)}
+Read the authoritative plan.
 Accepted plan digest: `{{.Params.accepted_plan_sha256}}`.
 Require exact task identity and `accepted_plan_sha256` equality, validate the
 closed selection and its digest binding, then read the plan's original review,
@@ -4050,8 +4165,11 @@ def plan_review_prompt(
         """
 
 Independently compute the normalized plan SHA-256 using the Plan Contract
-checkbox normalization. Return it as `reviewed_normalized_sha256` and preserve
-the incoming `accepted_plan_sha256` exactly. Verify the single closed,
+checkbox normalization. Only on `accepted`, compute and return
+`reviewed_normalized_sha256`. Preserve the incoming `accepted_plan_sha256`
+byte-for-byte only when the selected edge declares it. Do not emit
+`reviewed_normalized_sha256` or `accepted_plan_sha256` on any outcome whose
+selected edge does not declare that field. Verify the single closed,
 task-bound `coder-selection-v1` object and its rationale; do not choose or
 rewrite the coder role/model.
 """
@@ -4115,14 +4233,9 @@ def plan_revalidation_prompt(
     coder_selection: bool = False,
 ) -> str:
     snapshot_instruction = (
-        "use the task-fixed storage mode. For R2, resolve the external accepted "
-        "snapshot through the project-memory helper and compare it with the "
-        "current external plan; `.kent/runtime/{{.TaskShortId}}/plan-contract.json` "
-        "is only a disposable cache, not required evidence. Do not recreate it "
-        "or switch to legacy storage when it is absent. For fixed legacy tasks, "
-        "compare with the prior normalized snapshot at "
-        "`.kent/runtime/{{.TaskShortId}}/plan-contract.json`. Checkbox state alone "
-        "is intentionally absent from the normalized contract."
+        plan_storage_guidance(profile)
+        + "\nCompare current plan content with the authoritative accepted snapshot. "
+        "Checkbox state alone is intentionally absent from the normalized contract."
         if profile.delivery_reliability_policy() == "v1"
         else "compare the current\nplan with the prior normalized snapshot at\n"
         "`.kent/runtime/{{.TaskShortId}}/plan-contract.json`; checkbox state alone\n"
@@ -4243,7 +4356,8 @@ and focused checks."""
 {procedure_instruction(profile, "fix")}
 {bounded_contract}
 
-{checkpoint}{delivery_context_tail(profile)}Apply the `fix-worker` role contract only to concrete task-introduced or
+{checkpoint}{delivery_context_tail(profile)}This is Source-Fix: apply the
+`fix-worker` role contract only to concrete task-introduced or
 task-worsened findings in `fix_context`. Baseline-wide debt, an unproven
 differential, or contradictory policy is not writer scope.
 An earlier step's budget does not exclude a proven regression inside the full
@@ -4267,6 +4381,7 @@ Reason: {{{{.Params.fix_context}}}}{delivery_context_input(profile)}Treat Kent's
 repository root with `git rev-parse --show-toplevel`, or canonical current
 directory for an intentional non-Git workspace. Do not move the worktree,
 change task artifacts, or edit code.
+This is metadata correction only; do not create or update a Fix checkpoint.
 
 Complete with `verify` and provide the canonical root as `workspace_path`,
 `task_short_id={{{{.TaskShortId}}}}`, plus the preserved `review_context`. Use
@@ -4335,11 +4450,23 @@ def verification_gate_prompt(profile: ProjectProfile) -> str:
         else ""
     )
     delivery_context_handoff = (
-        "Return the exact incoming `delivery_context` value on the selected "
-        "transition. Do not use context copied from a previous dispatch cycle."
-        if _delivery_context_enabled(profile)
-        else ""
+        "Return `delivery_context` only when the selected transition declares it. "
+        "When declared, preserve the exact incoming value; do not use context "
+        "copied from a previous dispatch cycle."
     )
+    outcome_guidance = """Return only fields declared by the selected transition.
+For `needs_changes`, provide `workspace_path` plus `fix_context`.
+For `needs_user_action`, provide `workspace_path`, `review_context`, and
+`blocker_reason`.
+For `wont_do`, provide only `closure_reason`."""
+    if profile.smoke_policy() in {"conditional", "disabled"}:
+        outcome_guidance += """
+For `delivery_ready`, provide `workspace_path`, `review_context`, and
+`smoke_rationale`."""
+    if profile.smoke_policy() in {"conditional", "required"}:
+        outcome_guidance += """
+For `smoke_required`, provide `workspace_path`, `review_context`,
+`smoke_rationale`, and `smoke_scope`."""
     return f"""Evaluate the joined verification reports without editing files.
 
 {context_instruction(profile, "review", "verification_gate", "review")}
@@ -4365,19 +4492,15 @@ required by the `workflow-gate` role contract.
 Preserve the project-owned `review_context` envelope and its qualified update
 route. Where allowed, synthesize bounded results and durable report references;
 do not impose Markdown, copy full reports, or rewrite opaque producer packets.
-Provide `workspace_path`, the resulting `review_context`, and required Smoke
-decision fields, retaining policy, rationale, scope and downstream obligations.
+{outcome_guidance}
 {delivery_context_handoff}
 
 {smoke_decision}
 
-Choose `needs_changes` for task-scoped failures and provide `workspace_path`
-plus `fix_context`. Technical failures belong to an existing capable recovery
-owner, not automatically product Fix or a user question. Choose
-`needs_user_action` only for an actual external action or decision and provide
-`workspace_path`, `review_context`, and `blocker_reason`;
-after approval every verification branch reruns. Choose `wont_do` only for an
-explicit cancellation decision and provide `closure_reason`."""
+Technical failures belong to an existing capable recovery owner, not
+automatically product Fix or a user question. After approval on
+`needs_user_action`, every verification branch reruns. Choose `wont_do` only
+for an explicit cancellation decision."""
 
 
 def smoke_prompt(profile: ProjectProfile) -> str:

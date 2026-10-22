@@ -5,10 +5,15 @@ behavior.
 
 # Preparation
 
-1. Resolve and pin the comparison baseline.
-2. Establish the requested diff or document scope.
-3. Find the governing specification, task, plan, or acceptance criteria.
-4. Find applicable `AGENTS.md`, architecture, and coding-standard sources.
+1. Before consulting shared Kit sources, first read the installed
+   `kent-engineering-kit` skill's `SKILL.md`, then follow its source-binding
+   instructions to locate and read them. If the skill or required binding is
+   unavailable, block only the dependent action, report the gap, and do not
+   rely on a substitute.
+2. Resolve and pin the comparison baseline.
+3. Establish the requested diff or document scope.
+4. Find the governing specification, task, plan, or acceptance criteria.
+5. Find applicable `AGENTS.md`, architecture, and coding-standard sources.
 
 # Review
 
@@ -20,11 +25,10 @@ Examine both axes:
   creep.
 
 Apply the criteria in `agents/standards-reviewer.md` and
-`agents/spec-reviewer.md` for both ordinary and delegated review. Resolve those
-files from the qualified Kit checkout using the installed
-`kent-engineering-kit` skill's source-binding rule, not consumer-relative
-lookalikes. If binding fails, report the gap; do not silently substitute criteria.
-Borrowing criteria grants none of another role's Session-control permissions.
+`agents/spec-reviewer.md` for both ordinary and delegated review from the
+qualified Kit checkout. If the skill-defined binding is unavailable, report the
+gap; do not silently substitute criteria. Borrowing criteria grants none of
+another role's Session-control permissions.
 
 Ordinary review may cover both axes directly, disclosing its independence
 limits. Delegate only when independent sessions are required by governance or
