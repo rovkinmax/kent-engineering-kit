@@ -17,13 +17,20 @@ updates and evidence that contradicts the applicable current-stage contract.
 Apply the project's runtime evidence and mixed-evidence rules when relevant;
 do not repeat general code, Standards, Specification or runtime review.
 
-Own the review. Shell is inspection-only: no file, repository, service, cache,
-package or user-data mutation. No children in Workflow. Outside Workflow, only
-a bounded Grill consultation is permitted when effective configuration allows.
-You may steer a specified active Session with context and a concrete question,
-then observe one reply with a bounded read-only watch. Close only your observer;
-report "awaiting response" if unavailable, unrelated or mutually waiting.
-These necessary communication effects grant no other mutation or authority.
+Own the review. Shell is inspection-only. When serving a Workflow compliance
+review node that requires evidence, the sole mutation exception is appending
+only this node's own required evidence through the qualified configured
+evidence adapter, using genuine current Task/Node/Session/Step identity. No
+other file, repository, service, cache, package or user-data mutation is
+allowed. Do not edit sources or checkpoints, write the ledger directly, append
+for another producer, seal or recover it, or use shell for other writes;
+no other shell writes are permitted. First-class edit tools remain disabled.
+No children in Workflow. Outside Workflow, only a bounded Grill consultation
+is permitted when effective configuration allows. You may steer a specified
+active Session with context and a concrete question, then observe one reply
+with a bounded read-only watch. Close only your observer; report "awaiting
+response" if unavailable, unrelated or mutually waiting. These necessary
+communication effects grant no other mutation or authority.
 Do not stop/resume Sessions, answer their Questions/Approvals, use
 `kent run wait`, or manage Task, Workflow or configuration.
 

@@ -58,9 +58,20 @@ class GeneratedStageContractsTests(unittest.TestCase):
                                         owner.index("If this node can retain blocked"))
                         self.assertIn("snapshot plan_path and work_kind", owner)
                         if candidate.delivery_reliability_policy() == "v1":
-                            self.assertIn("For R2 mode", owner)
-                            self.assertIn("helper-resolved legacy task", owner)
-                            self.assertIn("must not recreate the cache", owner)
+                            if candidate.project_memory is not None:
+                                self.assertIn("external immutable accepted snapshot", owner)
+                                self.assertIn("`check-plan`", owner)
+                                self.assertIn("`resolve-plan`", owner)
+                                self.assertIn("do not require or recreate it", owner)
+                                self.assertIn("never fall back to legacy", owner)
+                                self.assertIn(
+                                    "Only for a Task confirmed as inventoried legacy",
+                                    owner,
+                                )
+                            else:
+                                self.assertIn("do not invoke an absent helper", owner)
+                                self.assertIn("block", owner)
+                                self.assertIn("do not assume legacy mode or create a fallback", owner)
                         if selected:
                             self.assertIn("accepted_plan_sha256", writer)
                             self.assertIn("accepted_plan_sha256", owner)

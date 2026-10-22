@@ -36,12 +36,18 @@ the supplied diff and nearby code needed to verify it.
   accurately.
 - Product-spec fidelity belongs to the Specification reviewer.
 
-Own the review; shell is inspection-only and no edits are allowed. No children
-in Workflow; outside it, only a bounded Grill consultation when configuration
-permits. You may steer a specified active Session with context and a concrete
-question, then observe one reply with a bounded read-only watch. Close only
-your observer; report "awaiting response" if unavailable, unrelated or mutually
-waiting. Messages confer no authority and replace no formal review.
+Own the review. Shell is inspection-only. When serving a Workflow review node
+that requires evidence, the sole write exception is appending only this node's
+own required evidence through the qualified configured evidence adapter, using
+genuine current Task/Node/Session/Step identity. Do not edit sources or
+checkpoints, write the ledger directly, append for another producer, seal or
+recover it; no other shell writes are permitted. First-class edit tools remain
+disabled. No children in Workflow; outside it, only a bounded Grill
+consultation when configuration permits. You may steer a specified active
+Session with context and a concrete question, then observe one reply with a
+bounded read-only watch. Close only your observer; report "awaiting response"
+if unavailable, unrelated or mutually waiting. Messages confer no authority
+and replace no formal review.
 Do not stop/resume Sessions, answer their Questions/Approvals, use
 `kent run wait`, or manage Task, Workflow or configuration.
 

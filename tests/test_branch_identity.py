@@ -160,6 +160,81 @@ class BranchIdentityTest(unittest.TestCase):
                     self.root, handoff, short_id="TASK-1", native_payload=context)
         self.assertFalse((self.root / ".kent/runtime/TASK-1/plan-contract.json").exists())
 
+    def test_branch_identity_checks_retained_writer_on_later_session_page(self) -> None:
+        self.configure("jira", coder_selection=True)
+        self.task(source_url="https://example.atlassian.net/browse/MBL-826")
+        self.prepare_coder_selection("simple")
+        first_page = {
+            "task_id": "task-uuid",
+            "items": [{"session_id": f"review-{index}", "agent_role": "spec-reviewer"}
+                      for index in range(100)],
+            "next_offset": 100,
+        }
+        second_page = {
+            "task_id": "task-uuid",
+            "items": [{"session_id": "late-writer",
+                       "agent_role": "implementation-simple"}],
+        }
+        self.sessions_path.write_text(json.dumps({
+            "pages": {"0": first_page, "100": second_page},
+        }))
+
+        result, payload = self.run_script(handoff=True, coder_selection=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_revalidate")
+        self.assertIn("already exists", payload["plan_change_report"])
+        self.assertEqual(self.branch(), "TASK-1")
+
+    def test_branch_identity_blocks_incomplete_or_conflicting_session_inventory(self) -> None:
+        self.configure("jira", coder_selection=True)
+        self.task(source_url="https://example.atlassian.net/browse/MBL-826")
+        self.prepare_coder_selection("simple")
+        first_page = {
+            "task_id": "task-uuid",
+            "items": [{"session_id": f"review-{index}", "agent_role": "spec-reviewer"}
+                      for index in range(100)],
+            "next_offset": 100,
+        }
+        cases = {
+            "wrong_task": {"task_id": "foreign-task", "items": []},
+            "bad_offset": {"task_id": "task-uuid", "items": [], "next_offset": 101},
+            "duplicate_id": {
+                "task_id": "task-uuid",
+                "items": [{"session_id": "review-0", "agent_role": "spec-reviewer"}],
+            },
+            "wrong_offset_type": {
+                "task_id": "task-uuid", "items": [],
+                "next_offset": "101",
+            },
+            "late_native_failure": None,
+        }
+        for name, second_page in cases.items():
+            with self.subTest(case=name):
+                pages = {"0": first_page, "100": second_page}
+                if name == "late_native_failure":
+                    pages.pop("100")
+                self.sessions_path.write_text(json.dumps({"pages": pages}))
+                branch_before = self.branch()
+                result, payload = self.run_script(handoff=True, coder_selection=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(payload["transition"], "branch_identity_blocked")
+                self.assertEqual(self.branch(), branch_before)
+
+    def test_branch_identity_fails_closed_on_unknown_storage_mode_before_rename(self) -> None:
+        self.configure("jira")
+        with (self.root / ".kent/workflow-profile.toml").open(
+                "a", encoding="utf-8") as profile:
+            profile.write('\n[project_memory]\nmode = "future-mode"\n')
+        self.task(source_url="https://example.atlassian.net/browse/MBL-826")
+
+        result, payload = self.run_script(handoff=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["transition"], "branch_identity_blocked")
+        self.assertIn("storage", payload["blocker_reason"].lower())
+        self.assertEqual(self.branch(), "TASK-1")
+
     def test_handoff_preserves_exact_delivery_context(self) -> None:
         from workflowkit import runtime
 
@@ -278,11 +353,21 @@ class BranchIdentityTest(unittest.TestCase):
 
         kent = Path(temporary.name) / "kent"
         kent.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "task" ] && [ "$2" = "sessions" ]; then\n'
-            '  exec /bin/cat "$KENT_SESSION_PAYLOAD"\n'
-            "fi\n"
-            'exec /bin/cat "$KENT_TASK_PAYLOAD"\n'
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            "if args[:2] == ['task', 'sessions']:\n"
+            "    with open(os.environ['KENT_SESSION_PAYLOAD'], encoding='utf-8') as source:\n"
+            "        value = json.load(source)\n"
+            "    pages = value.get('pages')\n"
+            "    offset = int(args[args.index('--offset') + 1]) if '--offset' in args else 0\n"
+            "    response = pages.get(str(offset)) if isinstance(pages, dict) else value\n"
+            "    if response is None:\n"
+            "        raise SystemExit(2)\n"
+            "    print(json.dumps(response))\n"
+            "else:\n"
+            "    with open(os.environ['KENT_TASK_PAYLOAD'], encoding='utf-8') as source:\n"
+            "        sys.stdout.write(source.read())\n"
         )
         kent.chmod(0o755)
         self.kent = kent

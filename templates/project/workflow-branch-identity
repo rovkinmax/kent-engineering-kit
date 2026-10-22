@@ -227,38 +227,79 @@ def plan_contract_adapter(root: Path, profile: dict[str, object]):
     return contract
 
 
+def project_memory_context(
+    root: Path,
+    payload: dict[str, object],
+) -> tuple[dict[str, object], str, object | None]:
+    profile_path = root / ".kent/workflow-profile.toml"
+    if profile_path.is_symlink() or not profile_path.is_file():
+        raise ValueError("project workflow profile is missing or unsafe")
+    profile = tomllib.loads(profile_path.read_text(encoding="utf-8"))
+    memory = profile.get("project_memory")
+    if memory is None:
+        return profile, "legacy", None
+    if not isinstance(memory, dict) or memory.get("mode") not in {"legacy", "r2"}:
+        raise ValueError("project memory storage mode is unknown")
+    configured_mode = memory["mode"]
+    if configured_mode == "legacy":
+        return profile, "legacy", None
+
+    contract = plan_contract_adapter(root, profile)
+    if not isinstance(payload.get("_kent"), dict):
+        raise ValueError("R2 project memory requires native Task context")
+    admission = contract.memory_call(root, payload, "resolve-task")
+    resolved_mode = admission.get("mode")
+    if resolved_mode not in {"legacy", "r2"}:
+        raise ValueError("project memory adapter returned an unknown storage mode")
+    return profile, resolved_mode, contract
+
+
 def coder_selection_snapshot(
     root: Path,
     handoff: dict[str, str],
     *,
     short_id: str,
     native_payload: dict[str, object] | None = None,
+    contract: object | None = None,
+    resolved_memory_mode: str | None = None,
 ) -> tuple[str, str]:
-    profile = tomllib.loads((root / ".kent/workflow-profile.toml").read_text())
-    contract = None
-    if profile.get("project_memory", {}).get("mode") == "r2":
+    profile = tomllib.loads(
+        (root / ".kent/workflow-profile.toml").read_text(encoding="utf-8"))
+    memory = profile.get("project_memory")
+    if memory is None:
+        configured_memory_mode = "legacy"
+    elif isinstance(memory, dict) and memory.get("mode") in {"legacy", "r2"}:
+        configured_memory_mode = memory["mode"]
+    else:
+        raise ValueError("project memory storage mode is unknown")
+    if contract is None:
         contract = plan_contract_adapter(root, profile)
+    if resolved_memory_mode is None:
+        resolved_memory_mode = configured_memory_mode
+        if configured_memory_mode == "r2":
+            context = native_payload or {}
+            admission = contract.memory_call(root, context, "resolve-task")
+            resolved_memory_mode = admission.get("mode")
+    if resolved_memory_mode not in {"legacy", "r2"}:
+        raise ValueError("project memory adapter returned an unknown storage mode")
+    if resolved_memory_mode == "r2":
         context = native_payload or {}
-        admission = contract.memory_call(root, context, "resolve-task")
-        if admission.get("mode") == "r2":
-            resolved = contract.memory_call(
-                root, context, "resolve-plan", plan_path=handoff["plan_path"])
-            choice = contract.plan_coder_selection(Path(resolved["working_path"]), short_id)
-            status = contract.memory_call(root, context, "check-plan", coder_selection=choice)
-            accepted = contract.memory_snapshot_projection(status, short_id)
-            cache_path = root / ".kent/runtime" / short_id / "plan-contract.json"
-            if os.path.lexists(cache_path):
-                cache = contract.inspection_json(contract.inspection_read_file(
-                    cache_path, root=root, max_bytes=65536), "plan locator")
-                contract.validate_memory_cache(cache, status, short_id)
-            if (status["comparison"] != "unchanged"
-                    or accepted["normalized_sha256"] != handoff["accepted_plan_sha256"]
-                    or accepted.get("coder_selection") != choice):
-                raise ValueError("external accepted coder selection changed")
-            role, effort = CODER_SELECTION_TARGETS[choice["complexity"]]
-            return role, effort
-        if admission.get("mode") != "legacy":
-            raise ValueError("invalid task memory mode")
+        resolved = contract.memory_call(
+            root, context, "resolve-plan", plan_path=handoff["plan_path"])
+        choice = contract.plan_coder_selection(Path(resolved["working_path"]), short_id)
+        status = contract.memory_call(root, context, "check-plan", coder_selection=choice)
+        accepted = contract.memory_snapshot_projection(status, short_id)
+        cache_path = root / ".kent/runtime" / short_id / "plan-contract.json"
+        if os.path.lexists(cache_path):
+            cache = contract.inspection_json(contract.inspection_read_file(
+                cache_path, root=root, max_bytes=65536), "plan locator")
+            contract.validate_memory_cache(cache, status, short_id)
+        if (status["comparison"] != "unchanged"
+                or accepted["normalized_sha256"] != handoff["accepted_plan_sha256"]
+                or accepted.get("coder_selection") != choice):
+            raise ValueError("external accepted coder selection changed")
+        role, effort = CODER_SELECTION_TARGETS[choice["complexity"]]
+        return role, effort
     runtime = root / ".kent" / "runtime"
     task_directory = runtime / short_id
     for directory in (root / ".kent", runtime, task_directory):
@@ -334,35 +375,15 @@ def no_retained_writer(
     *,
     task: str,
     native_task_id: str,
+    contract: object,
 ) -> str | None:
-    result = run(
-        [
-            resolve_kent_bin(),
-            "task",
-            "sessions",
-            task,
-            "--project",
-            str(root),
-            "--json",
-        ],
-        cwd=root,
+    items = contract.retained_session_inventory(
+        root, task=task, native_task_id=native_task_id,
     )
-    response = json.loads(result.stdout)
-    if not isinstance(response, dict) or response.get("task_id") != native_task_id:
-        raise ValueError("retained Session readback belongs to a different Task")
-    items = response.get("items")
-    if not isinstance(items, list):
-        raise ValueError("retained Session readback has no items list")
     writers: list[dict[str, str]] = []
     for item in items:
-        if not isinstance(item, dict):
-            raise ValueError("retained Session readback contains a malformed item")
         session_id = item.get("session_id")
         role = item.get("agent_role")
-        if not isinstance(session_id, str) or not session_id.strip():
-            raise ValueError("retained Session has no identity")
-        if not isinstance(role, str) or not role.strip():
-            raise ValueError("retained Session has no assigned role")
         if role.startswith("implementation-"):
             writers.append({"session_id": session_id, "agent_role": role})
     if writers:
@@ -724,6 +745,7 @@ def apply_branch_identity(
     native_task_id = task_id(incoming)
     task = task_payload(root, native_task_id)
     short_id = task_short_id(task)
+    profile, memory_mode, contract = project_memory_context(root, incoming)
     policy = profile_policy(root)
     selection: tuple[str, str] | None = None
     if coder_selection_policy(root) == "complexity":
@@ -755,11 +777,15 @@ def apply_branch_identity(
                 handoff,
             )
         try:
+            if contract is None:
+                contract = plan_contract_adapter(root, profile)
             selection = coder_selection_snapshot(
                 root,
                 handoff,
                 short_id=short_id,
                 native_payload=incoming,
+                contract=contract,
+                resolved_memory_mode=memory_mode,
             )
         except ValueError as error:
             return revalidate_before_writer(handoff, str(error))
@@ -768,6 +794,7 @@ def apply_branch_identity(
                 root,
                 task=short_id,
                 native_task_id=native_task_id,
+                contract=contract,
             )
         except (RuntimeError, json.JSONDecodeError, ValueError) as error:
             return blocked(

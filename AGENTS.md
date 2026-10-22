@@ -5,9 +5,12 @@
 - Global skills contain reusable engineering disciplines, not framework tutorials.
 - Explicit user-driven orchestration belongs in `prompts/`; model-triggered
   disciplines belong in `skills/`.
-- Review roles disable first-class edit tools. Kent shell access is not a
-  tool-enforced read-only boundary, so their role contracts restrict it to
-  inspection.
+- Review roles disable first-class edit tools. Reviewer shell access is
+  inspection-only except for a Workflow node's required append of its own
+  evidence through the qualified configured evidence adapter, using genuine
+  current Task/Node/Session/Step identity. This permits no source/checkpoint
+  edits, direct ledger writes, another producer's append, sealing, recovery or
+  other shell writes.
 - Role prompts own behavior only. Model, reasoning, verbosity, tools, and
   delegation eligibility belong in Kent configuration; role-prompt
   frontmatter must not declare `model` or `tools`.

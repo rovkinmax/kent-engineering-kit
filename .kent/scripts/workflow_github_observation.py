@@ -274,10 +274,12 @@ def _graphql_data(value: Any) -> dict[str, Any]:
 def _connection(value: Any) -> tuple[list[Any], bool, str | None]:
     value = _object(value)
     nodes = _array(value.get("nodes"), limit=MAX_FEEDBACK_ITEMS)
-    info = _object(value.get("pageInfo"))
+    info = value.get("pageInfo")
+    if not isinstance(info, dict):
+        raise ObservationError("incomplete_observation")
     more, cursor = info.get("hasNextPage"), info.get("endCursor")
     if type(more) is not bool or (cursor is not None and not isinstance(cursor, str)):
-        raise ObservationError("invalid_observation")
+        raise ObservationError("incomplete_observation")
     if more and not cursor:
         raise ObservationError("incomplete_observation")
     return nodes, more, cursor
@@ -427,6 +429,7 @@ class GitHubObserver:
             "-F", "owner=" + owner, "-F", "name=" + name,
             "-F", "number=" + str(number), "-F", "endCursor=null",
         ]), limit=MAX_FEEDBACK_ITEMS)
+        query_count = len(pages)
         threads, page_cursors = [], set()
         count = 0
         for index, page in enumerate(pages):
@@ -444,9 +447,12 @@ class GitHubObserver:
                 count += 1 + len(comment_ids)
                 seen_cursors = set()
                 while next_page:
-                    if next_cursor in seen_cursors or count > MAX_FEEDBACK_ITEMS:
+                    if next_cursor in seen_cursors:
+                        raise ObservationError("incomplete_observation")
+                    if query_count >= MAX_FEEDBACK_ITEMS:
                         raise ObservationError("observation_limit")
                     seen_cursors.add(next_cursor)
+                    query_count += 1
                     continuation = _graphql_data(self.query([
                         "api", "graphql", "-f", "query=" + COMMENT_QUERY,
                         "-F", "threadId=" + thread_id, "-F", "endCursor=" + next_cursor,

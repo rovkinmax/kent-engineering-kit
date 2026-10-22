@@ -16,6 +16,10 @@ from typing import Any
 sys.dont_write_bytecode = True
 
 
+class _TechnicalFailure(RuntimeError):
+    """A post-observation effect or capture failure that must not be retried."""
+
+
 def _sibling(name: str) -> Any:
     path = Path(__file__).with_name(name)
     if path.is_symlink() or not path.is_file():
@@ -189,30 +193,35 @@ def _archive(
     task = values.get("task_short_id")
     if not isinstance(task, str) or not task:
         return
-    tool = os.environ.get("KENT_PREPARE_GITHUB_CI_BIN")
-    if not tool:
-        tool = str(Path.home() / ".kent/bin/kent-prepare-github-ci")
-    request = {
-        **values,
-        "operation": "archive_ci_report",
-        "ci_report": _canonical(runtime_contracts(), report),
-    }
-    result = observation.read_json(
-        tool,
-        Path(str(values["workspace_path"])),
-        [],
-        timeout=60,
-        input_bytes=json.dumps(
-            request,
-            ensure_ascii=False,
-            sort_keys=True,
-        ).encode("utf-8"),
-    )
-    if not isinstance(result, dict) or not isinstance(
-        result.get("ci_report_artifact"),
-        str,
-    ):
-        raise RuntimeError("ci_report_archive_failed")
+    try:
+        tool = os.environ.get("KENT_PREPARE_GITHUB_CI_BIN")
+        if not tool:
+            tool = str(Path.home() / ".kent/bin/kent-prepare-github-ci")
+        request = {
+            **values,
+            "operation": "archive_ci_report",
+            "ci_report": _canonical(runtime_contracts(), report),
+        }
+        result = observation.read_json(
+            tool,
+            Path(str(values["workspace_path"])),
+            [],
+            timeout=60,
+            input_bytes=json.dumps(
+                request,
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8"),
+        )
+        if not isinstance(result, dict) or not isinstance(
+            result.get("ci_report_artifact"),
+            str,
+        ):
+            raise _TechnicalFailure("ci_report_archive_failed")
+    except _TechnicalFailure:
+        raise
+    except Exception as error:
+        raise _TechnicalFailure("ci_report_archive_failed") from error
 
 
 def _merge_report(pr: dict[str, Any]) -> str:
@@ -266,7 +275,13 @@ def main() -> int:
         raise ValueError("stdin is not valid JSON: {}".format(error))
     if not isinstance(payload, dict):
         raise ValueError("stdin must be one JSON object")
-    emit = partial(_emit, producer_payload=payload)
+    producer_emit = partial(_emit, producer_payload=payload)
+
+    def emit(*args: Any, **kwargs: Any) -> None:
+        try:
+            producer_emit(*args, **kwargs)
+        except Exception as error:
+            raise _TechnicalFailure("producer_capture_failed") from error
 
     workspace = Path(_text(payload, "workspace_path")).expanduser().resolve()
     pr_url = _text(payload, "pr_url")
@@ -323,17 +338,30 @@ def main() -> int:
                 timeout=timeout,
             )
             observed = watcher.observe_pr(pr_url)
-            errors = 0
             pr = observed["pr"]
             head_oid = str(pr["headRefOid"])
             base_oid = str(pr["baseRefOid"])
+            if pr.get("headRefName") != branch_name:
+                raise observation.ObservationError("invalid_observation")
             if pr["state"] == "MERGED":
                 emit(
                     "ci_watch_pr_merged",
-                    {**values, "merge_report": _merge_report(pr)},
+                    {
+                        "workspace_path": values["workspace_path"],
+                        "pr_url": values["pr_url"],
+                        "branch_name": values["branch_name"],
+                        "merge_report": _merge_report(pr),
+                    },
                 )
                 return 0
             if pr["state"] == "CLOSED":
+                if (
+                    head_oid != contract["head_oid"]
+                    or base_oid != contract["base_oid"]
+                ):
+                    raise _TechnicalFailure(
+                        "closed_pull_request_identity_changed"
+                    )
                 report = _append(
                     runtime,
                     contract,
@@ -377,20 +405,40 @@ def main() -> int:
                 )
                 return 0
 
+            classification = runtime.classify_github_checks(
+                observed["checks"],
+                require_ci=contract["require_ci"],
+            )
+            if classification["state"] in {
+                "invalid_observation",
+                "observation_limit",
+            }:
+                report = _append(
+                    runtime,
+                    contract,
+                    previous,
+                    head_oid=head_oid,
+                    base_oid=base_oid,
+                    classification=classification,
+                )
+                _archive(observation, values, report)
+                emit(
+                    "ci_watch_failed",
+                    values,
+                    report=report,
+                    cursor=acknowledged_text,
+                )
+                return 0
             current = runtime.make_dynamic_pr_feedback_cursor(
                 repository=repository,
                 pull_number=pull_number,
                 items=observed["feedback_items"],
                 review_decision=str(pr.get("reviewDecision") or ""),
-                checks=observed["checks"],
+                checks=classification["checks"],
             )
             delta = runtime.diff_dynamic_pr_feedback_cursor(
                 acknowledged,
                 current,
-            )
-            classification = runtime.classify_github_checks(
-                observed["checks"],
-                require_ci=contract["require_ci"],
             )
             report = _append(
                 runtime,
@@ -452,8 +500,6 @@ def main() -> int:
                     "pr_head_oid": head_oid,
                     "pr_base_oid": base_oid,
                 }
-                if observed_text is not None:
-                    report_values["observed_feedback_cursor"] = observed_text
                 emit(
                     "ci_watch_state_changed",
                     report_values,
@@ -462,18 +508,6 @@ def main() -> int:
                 )
                 return 0
             if classification["state"] == "failed":
-                _archive(observation, values, report)
-                emit(
-                    "ci_watch_failed",
-                    values,
-                    report=report,
-                    cursor=acknowledged_text,
-                )
-                return 0
-            if classification["state"] in {
-                "invalid_observation",
-                "observation_limit",
-            }:
                 _archive(observation, values, report)
                 emit(
                     "ci_watch_failed",
@@ -499,7 +533,10 @@ def main() -> int:
                     cursor=acknowledged_text,
                 )
                 return 0
+            errors = 0
             time.sleep(interval)
+        except _TechnicalFailure:
+            raise
         except Exception as error:
             errors += 1
             if str(getattr(error, "code", "") or "") == "source_changed":

@@ -360,6 +360,237 @@ class ProducerTransportTests(unittest.TestCase):
         })
         return graph
 
+    def graph_with_fields(self, fields, *, source_key="gate"):
+        graph = self.graph()
+        graph["graph"]["nodes"][0]["key"] = source_key
+        graph["graph"]["edges"][0]["parameters"] = [
+            {"key": key, "description": key, "purpose": "ordinary"}
+            for key in fields
+        ]
+        return graph
+
+    def producer_chain(self, count):
+        refs = []
+        for index in range(count):
+            binding = {}
+            if refs:
+                binding["producer_refs"] = json.dumps({"refs": [refs[-1]]})
+            result = {"transition": "failed"}
+            if index == count - 1:
+                result.update({
+                    "delivery_context": self.outer,
+                    "ci_report": self.result["ci_report"],
+                })
+            locator, _ = capture_producer(
+                self.root, identity=self.identity, producer_kind=f"chain-{index}",
+                inputs={}, result=result, binding=binding,
+            )
+            refs.append(locator)
+        return refs
+
+    def artifact_snapshot(self):
+        build = self.root / "build"
+        if not build.exists():
+            return {}
+        return {
+            path.relative_to(self.root): path.read_bytes()
+            for path in build.rglob("*.json")
+        }
+
+    def test_required_synthesis_rejects_go_whitespace_without_rewriting_bytes(self):
+        locator, _ = self.capture()
+        graph = self.review_graph()
+        contract = transition_contract_reference(
+            self.identity, self.detail(), graph, "failed",
+        )
+        request = {
+            **self.request(locator),
+            "transition_contract_ref": contract,
+            "values": {"review_context": " \t\n\u0085\u00a0\u2003"},
+        }
+        before = self.artifact_snapshot()
+        with self.assertRaisesRegex(ValueError, "must be non-empty"):
+            self.pack(request, graph=graph)
+        self.assertEqual(self.artifact_snapshot(), before)
+
+        exact = " reviewed \u2003 "
+        _, emitted = self.pack(
+            {**request, "values": {"review_context": exact}}, graph=graph,
+        )
+        self.assertEqual(json.loads(emitted)["review_context"], exact)
+
+    def test_empty_required_ci_values_are_rejected_for_agent_packing(self):
+        graph = self.graph_with_fields(("ci_contract", "ci_report"))
+        locator, _ = capture_producer(
+            self.root, identity=self.identity, producer_kind="prepare-failure",
+            inputs={}, result={"ci_contract": "", "ci_report": ""},
+        )
+        request = {
+            **self.request(locator),
+            "transition_contract_ref": transition_contract_reference(
+                self.identity, self.detail(), graph, "failed",
+            ),
+        }
+        before = self.artifact_snapshot()
+        with self.assertRaisesRegex(ValueError, "must be non-empty"):
+            self.pack(request, graph=graph)
+        self.assertEqual(self.artifact_snapshot(), before)
+
+    def test_transitive_closure_and_new_root_share_the_32_base_limit(self):
+        refs = self.producer_chain(31)
+        request = self.request(refs[-1])
+        packed, _ = self.pack(request)
+        closure = producer_reference_closure(
+            self.root, packed, identity=self.identity,
+        )
+        self.assertEqual(sum("/base-" in path for path in closure), 32)
+
+        over_limit_refs = self.producer_chain(32)
+        over_limit = self.request(over_limit_refs[-1])
+        before = self.artifact_snapshot()
+        with self.assertRaisesRegex(ValueError, "file limit"):
+            self.pack(over_limit)
+        self.assertEqual(self.artifact_snapshot(), before)
+
+    def test_transitive_shared_ancestors_count_once(self):
+        shared, _ = capture_producer(
+            self.root, identity=self.identity, producer_kind="shared",
+            inputs={}, result={"transition": "failed"},
+        )
+        left, _ = capture_producer(
+            self.root, identity=self.identity, producer_kind="left",
+            inputs={}, result={"transition": "failed"},
+            binding={"producer_refs": json.dumps({"refs": [shared]})},
+        )
+        right, _ = capture_producer(
+            self.root, identity=self.identity, producer_kind="right",
+            inputs={}, result={"transition": "failed"},
+            binding={"producer_refs": json.dumps({"refs": [shared]})},
+        )
+        head, _ = capture_producer(
+            self.root, identity=self.identity, producer_kind="head",
+            inputs={}, result={
+                "transition": "failed", "delivery_context": self.outer,
+                "ci_report": self.result["ci_report"],
+            },
+            binding={"producer_refs": json.dumps({"refs": [left, right]})},
+        )
+        packed, _ = self.pack(self.request(head))
+        closure = producer_reference_closure(
+            self.root, packed, identity=self.identity,
+        )
+        self.assertEqual(sum("/base-" in path for path in closure), 5)
+
+    def test_corrupt_or_missing_transitive_ancestor_blocks_before_publication(self):
+        refs = self.producer_chain(3)
+        oldest = self.root / refs[0]
+        original = oldest.read_bytes()
+        oldest.write_bytes(original + b" ")
+        before = self.artifact_snapshot()
+        with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            self.pack(self.request(refs[-1]))
+        self.assertEqual(self.artifact_snapshot(), before)
+        oldest.write_bytes(original)
+
+        oldest_emitted = self.root / refs[0]
+        oldest_emitted = oldest_emitted.with_name(
+            "emitted-" + hashlib.sha256(
+                reconstruct_producer(
+                    self.root, refs[0], identity=self.identity,
+                )["emitted"]
+            ).hexdigest() + ".json"
+        )
+        original_emitted = oldest_emitted.read_bytes()
+        oldest_emitted.unlink()
+        before = self.artifact_snapshot()
+        with self.assertRaisesRegex(ValueError, "producer artifact is missing"):
+            self.pack(self.request(refs[-1]))
+        self.assertEqual(self.artifact_snapshot(), before)
+        oldest_emitted.write_bytes(original_emitted)
+
+    def test_outgoing_root_is_included_in_existing_byte_budget(self):
+        import workflowkit.delivery as delivery
+
+        graph = self.review_graph()
+        refs = [
+            "build/kent-workflow/KIT-1/packets/base-" + f"{index:064x}" + ".json"
+            for index in range(31)
+        ]
+        records = {
+            ref: {
+                "inputs": {},
+                "result": (
+                    {"delivery_context": self.outer, "ci_report": self.result["ci_report"]}
+                    if index == len(refs) - 1 else {"transition": "failed"}
+                ),
+                "binding": {},
+                "emitted": b"",
+                "locator": ref,
+            }
+            for index, ref in enumerate(refs)
+        }
+        request = {
+            **self.request(refs[-1]),
+            "producer_refs": [refs[-1]],
+            "transition_contract_ref": transition_contract_reference(
+                self.identity, self.detail(), graph, "failed",
+            ),
+            "values": {"review_context": "r" * 200_000},
+        }
+        before = self.artifact_snapshot()
+        # Exercise the exact boundary after a valid ancestry is reconstructed;
+        # only the candidate outgoing root can exceed the remaining budget.
+        with patch.object(
+            delivery,
+            "_producer_ancestry",
+            return_value=(records, 32 * 1024 * 1024 - 1),
+        ):
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                self.pack(request, graph=graph)
+        self.assertEqual(self.artifact_snapshot(), before)
+
+    def test_post_pr_omits_only_empty_diagnostic_ci_packets(self):
+        from workflowkit.runtime import canonical_bytes, make_dynamic_pr_feedback_cursor
+
+        graph = self.graph_with_fields(("delivery_context",), source_key="ci_watch")
+        identity_values = {
+            "pr_url": "https://github.com/owner/repo/pull/7",
+            "branch_name": "feat/exact",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": canonical_bytes(
+                make_dynamic_pr_feedback_cursor(
+                    repository="owner/repo", pull_number=7, items=[],
+                )
+            ).decode("utf-8"),
+        }
+        for ci_values, expected in (
+            ({"ci_contract": "", "ci_report": ""}, {}),
+            (
+                {"ci_contract": " contract bytes ", "ci_report": " report bytes "},
+                {"ci_contract": " contract bytes ", "ci_report": " report bytes "},
+            ),
+        ):
+            with self.subTest(ci_values=ci_values):
+                locator, _ = capture_producer(
+                    self.root, identity=self.identity, producer_kind="post-pr",
+                    inputs={}, result={**identity_values, **ci_values},
+                )
+                request = {
+                    **self.request(locator),
+                    "delivery_mode": "post_pr",
+                    "transition_contract_ref": transition_contract_reference(
+                        self.identity, self.detail(), graph, "failed",
+                    ),
+                }
+                _, emitted = self.pack(request, graph=graph)
+                context = json.loads(json.loads(emitted)["delivery_context"])
+                for key, value in expected.items():
+                    self.assertEqual(context[key], value)
+                self.assertEqual(
+                    {"ci_contract", "ci_report"} & set(context),
+                    set(expected),
+                )
+
     def test_explicit_declared_review_context_supersedes_all_historical_producers(self):
         graph = self.review_graph()
         for contexts in (("old",), ("old", "different")):

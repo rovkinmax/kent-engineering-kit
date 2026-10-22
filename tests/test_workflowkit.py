@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -2528,6 +2529,275 @@ class WorkflowKitTest(unittest.TestCase):
         }
 
         self.assertEqual(roles["verification_gate"], "default")
+
+    def test_profile_requires_one_plan_review_role_fallback(self) -> None:
+        fallback_keys = ("plan_review", "spec_review", "researcher")
+
+        def with_only_fallback(selected):
+            def transform(contents):
+                contents = contents.replace("spec_review = true\n", "spec_review = false\n")
+                contents = re.sub(
+                    r'(?m)^(?:plan_review|spec_review|researcher) = "[^"]*"\n',
+                    "",
+                    contents,
+                )
+                if selected is not None:
+                    key, role = selected
+                    contents = contents.replace(
+                        "[roles]\n",
+                        f'[roles]\n{key} = "{role}"\n',
+                        1,
+                    )
+                return contents
+
+            return transform
+
+        with self.assertRaisesRegex(
+            SpecError,
+            "requires at least one Plan Review role",
+        ):
+            self.load_profile(with_only_fallback(None))
+
+        expected_roles = {
+            "plan_review": "primary-reviewer",
+            "spec_review": "spec-reviewer",
+            "researcher": "researcher",
+        }
+        for key in fallback_keys:
+            with self.subTest(fallback=key):
+                profile = self.load_profile(
+                    with_only_fallback((key, expected_roles[key]))
+                )
+                spec = build_delivery_workflow(profile, 1)
+                plan_review = next(
+                    node for node in spec.nodes if node.key == "plan_review"
+                )
+                self.assertEqual(plan_review.agent, expected_roles[key])
+
+    def test_skill_first_entry_is_generated_for_review_and_delivery_nodes(self) -> None:
+        from workflowkit.delivery import owner_replan_instruction, plan_review_prompt
+
+        selected = self.load_profile(
+            lambda contents: contents.replace(
+                'writer_sessions = "fresh_per_slice"\n',
+                'writer_sessions = "continuous"\n'
+                'coder_selection = "complexity"\n',
+            )
+        )
+        profiles = (
+            self.load_profile(),
+            selected,
+            ProjectProfile.from_toml(
+                REPO_ROOT,
+                (REPO_ROOT / ".kent/workflow-profile.toml").read_text(),
+                check_files=False,
+            ),
+        )
+        for profile in profiles:
+            for manifest, node_key, evidence_type in (
+                ("review", "plan_review", "review"),
+                ("review", "standards_review", "review"),
+                ("review", "spec_review", "review"),
+                ("review", "verification_gate", "review"),
+                ("review", "compliance", "review"),
+                ("delivery", "prepare_pr", "delivery"),
+                ("delivery", "ci_monitor", "delivery"),
+                ("delivery", "waiting_pr", "delivery"),
+                ("delivery", "cleanup", "delivery"),
+                ("delivery", "publish_package", "delivery"),
+            ):
+                with self.subTest(
+                    profile=profile.project_name,
+                    manifest=manifest,
+                    node=node_key,
+                ):
+                    prompt = context_instruction(
+                        profile, manifest, node_key, evidence_type,
+                    )
+                    compact_prompt = " ".join(prompt.split())
+                    self.assertIn(
+                        "first read the installed `kent-engineering-kit` skill's `SKILL.md`",
+                        compact_prompt,
+                    )
+                    self.assertIn("block only the dependent action", compact_prompt)
+                    self.assertNotIn("resolve-task", compact_prompt)
+                    self.assertNotIn("project-memory helper", compact_prompt)
+                    if manifest == "review":
+                        evidence_owner = (
+                            "append only the Gate node's own required evidence"
+                            if node_key == "verification_gate"
+                            else "append only this node's own required evidence"
+                        )
+                        self.assertIn(evidence_owner, compact_prompt)
+                        self.assertIn(
+                            "genuine current Task/Node/Session/Step identity",
+                            compact_prompt,
+                        )
+                        self.assertIn("Do not edit sources or checkpoints", compact_prompt)
+                        self.assertIn("append for another producer", compact_prompt)
+                        self.assertIn("seal or recover", compact_prompt)
+
+        review = plan_review_prompt(selected, coder_selection=True)
+        review = " ".join(review.split())
+        self.assertIn(
+            "first read the installed `kent-engineering-kit` skill's `SKILL.md`",
+            review,
+        )
+        self.assertIn("block only the dependent action", review)
+        replan = owner_replan_instruction(selected)
+        replan = " ".join(replan.split())
+        self.assertIn(
+            "first read the installed `kent-engineering-kit` skill's `SKILL.md`",
+            replan,
+        )
+        self.assertIn("block only the dependent action", replan)
+
+    def test_fix_stage_contracts_keep_checkpoint_ownership_narrow(self) -> None:
+        from workflowkit.delivery import (
+            evidence_repair_prompt,
+            fix_prompt,
+            workspace_path_fix_prompt,
+        )
+
+        profile = self.load_profile()
+        source_fix = fix_prompt(profile)
+        source_fix = " ".join(source_fix.split())
+        metadata_fix = " ".join(workspace_path_fix_prompt(profile).split())
+        evidence_fix = " ".join(evidence_repair_prompt(profile).split())
+        self.assertIn("This is Source-Fix", source_fix)
+        self.assertIn("Maintain the ignored `fix` checkpoint", source_fix)
+        self.assertIn(
+            "metadata correction only; do not create or update a Fix checkpoint",
+            metadata_fix,
+        )
+        self.assertIn("Do not create or update the Fix checkpoint", evidence_fix)
+
+    def test_outcome_guidance_matches_gate_and_plan_review_contracts(self) -> None:
+        from workflowkit.delivery import (
+            plan_review_prompt,
+            verification_gate_prompt,
+        )
+
+        for policy in ("disabled", "conditional", "required"):
+            baseline = self.load_profile()
+            profile = replace(
+                baseline,
+                policies={**baseline.policies, "smoke": policy},
+            )
+            gate = verification_gate_prompt(profile)
+            compact = " ".join(gate.split())
+            self.assertNotIn(
+                "Provide `workspace_path`, the resulting `review_context`, "
+                "and required Smoke decision fields",
+                compact,
+            )
+            self.assertIn(
+                "Return `delivery_context` only when the selected transition "
+                "declares it.",
+                compact,
+            )
+            self.assertIn(
+                "For `needs_changes`, provide `workspace_path` plus `fix_context`.",
+                compact,
+            )
+            self.assertIn(
+                "For `needs_user_action`, provide `workspace_path`, "
+                "`review_context`, and `blocker_reason`.",
+                compact,
+            )
+            self.assertIn(
+                "For `wont_do`, provide only `closure_reason`.",
+                compact,
+            )
+            self.assertEqual(
+                "gate_smoke_required" in {edge.key for edge in build_delivery_workflow(profile, 1).edges},
+                policy != "disabled",
+            )
+            self.assertEqual(
+                "gate_delivery_ready" in {edge.key for edge in build_delivery_workflow(profile, 1).edges},
+                policy != "required",
+            )
+
+        complexity = self.load_profile(
+            lambda contents: contents.replace(
+                'writer_sessions = "fresh_per_slice"\n',
+                'writer_sessions = "continuous"\n'
+                'coder_selection = "complexity"\n',
+            )
+        )
+        review = plan_review_prompt(complexity, coder_selection=True)
+        review = " ".join(review.split())
+        self.assertIn(
+            "Only on `accepted`, compute and return `reviewed_normalized_sha256`.",
+            review,
+        )
+        self.assertIn(
+            "Do not emit `reviewed_normalized_sha256` or "
+            "`accepted_plan_sha256` on any outcome whose selected edge does "
+            "not declare that field.",
+            review,
+        )
+        current_profile = ProjectProfile.load(REPO_ROOT)
+        delivery_profile = replace(
+            current_profile,
+            policies={
+                **current_profile.policies,
+                "coder_selection": "complexity",
+            },
+        )
+        self.assertIn(
+            "Preserve `delivery_context` only when the selected transition declares it.",
+            " ".join(implement_prompt(delivery_profile, coder_selection=True).split()),
+        )
+
+    def test_complexity_storage_guidance_tracks_project_memory_adoption(self) -> None:
+        from workflowkit.delivery import (
+            owner_replan_instruction,
+            plan_revalidation_prompt,
+        )
+
+        def selected(contents):
+            return contents.replace(
+                'writer_sessions = "fresh_per_slice"\n',
+                'writer_sessions = "continuous"\n'
+                'coder_selection = "complexity"\n'
+                'delivery_reliability = "v1"\n',
+            )
+
+        unadopted = self.load_profile(selected)
+        # This profile-only fixture must stay external even with an in-root TMPDIR.
+        root = REPO_ROOT.parent / "kent-plan-guidance-r2-fixture"
+        r2_contents = self.project_memory_profile_contents(root).replace(
+            'writer_sessions = "fresh_per_slice"\n',
+            'writer_sessions = "continuous"\n'
+            'coder_selection = "complexity"\n'
+            'delivery_reliability = "v1"\n',
+        )
+        adopted = ProjectProfile.from_toml(
+            REPO_ROOT, r2_contents, check_files=False,
+        )
+        for name, profile in (("unadopted", unadopted), ("R2", adopted)):
+            with self.subTest(profile=name):
+                implementation = implement_prompt(profile, coder_selection=True)
+                revalidation = plan_revalidation_prompt(
+                    profile, from_review=False, coder_selection=True,
+                )
+                owner_replan = owner_replan_instruction(profile)
+                guidance = "\n".join((implementation, revalidation, owner_replan))
+                guidance = " ".join(guidance.split())
+                if name == "R2":
+                    self.assertIn("external immutable accepted snapshot", guidance)
+                    self.assertIn("local `plan-contract.json` is a disposable cache", guidance)
+                    self.assertIn("do not require or recreate it", guidance)
+                    self.assertIn("never fall back to legacy storage", guidance)
+                    self.assertIn("check-plan", guidance)
+                    self.assertIn("resolve-plan", guidance)
+                else:
+                    self.assertNotIn("workflow-project-memory", guidance)
+                    self.assertNotIn("resolve-task", guidance)
+                    self.assertIn("only for a Task confirmed as inventoried legacy", guidance)
+                    self.assertIn("If the Task is R2 or its mode cannot be proven", guidance)
+                    self.assertIn("do not assume legacy mode", guidance)
 
     def test_current_recovery_uses_guard_owned_work_kind(self) -> None:
         from workflowkit.delivery import (

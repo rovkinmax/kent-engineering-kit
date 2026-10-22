@@ -959,7 +959,13 @@ def _validate_dynamic_prepare_packets(
     raw_contract = payload.get("ci_contract", "")
     if raw_contract:
         try:
-            contract = validate_ci_contract(parse_preparation_json(raw_contract))
+            contract = validate_ci_contract(
+                runtime_contracts.parse_canonical_json(
+                    raw_contract,
+                    label="previous CI contract",
+                    max_bytes=MAX_CI_REPORT_BYTES,
+                )
+            )
         except (CiContractError, RuntimeContractError, TypeError, ValueError) as error:
             raise CiContractError("previous CI contract is invalid") from error
         if (
@@ -971,7 +977,13 @@ def _validate_dynamic_prepare_packets(
     raw_report = payload.get("ci_report", "")
     if raw_report:
         try:
-            report = validate_dynamic_ci_report(parse_preparation_json(raw_report))
+            report = validate_dynamic_ci_report(
+                runtime_contracts.parse_canonical_json(
+                    raw_report,
+                    label="previous CI report",
+                    max_bytes=runtime_contracts.MAX_DYNAMIC_CI_REPORT_BYTES,
+                )
+            )
         except (CiContractError, RuntimeContractError, TypeError, ValueError) as error:
             raise CiContractError("previous CI report is invalid") from error
         report_contract = report["contract"]
@@ -983,7 +995,13 @@ def _validate_dynamic_prepare_packets(
     cursor = payload.get("pr_feedback_cursor", "uninitialized")
     if cursor != "uninitialized":
         try:
-            validate_dynamic_pr_feedback_cursor(parse_preparation_json(cursor))
+            validate_dynamic_pr_feedback_cursor(
+                runtime_contracts.parse_canonical_json(
+                    cursor,
+                    label="previous PR feedback cursor",
+                    max_bytes=runtime_contracts.MAX_FEEDBACK_BYTES,
+                )
+            )
         except (CiContractError, RuntimeContractError, TypeError, ValueError) as error:
             raise CiContractError("previous PR feedback cursor is invalid") from error
     return contract, report, cursor
@@ -1003,15 +1021,18 @@ def _dynamic_prepare_result(
         "workspace_path": str(workspace),
         "pr_url": str(payload["pr_url"]),
         "branch_name": str(payload["branch_name"]),
-        "merge_strategy": str(payload["merge_strategy"]),
-        "pr_head_oid": contract["head_oid"],
-        "pr_base_oid": contract["base_oid"],
-        "task_short_id": str(payload["task_short_id"]),
-        "ci_contract": canonical_bytes(contract).decode("utf-8"),
-        "pr_feedback_cursor": cursor,
     }
     if merge_report is not None:
         result["merge_report"] = merge_report
+        return result
+    result.update(
+        {
+            "merge_strategy": str(payload["merge_strategy"]),
+            "task_short_id": str(payload["task_short_id"]),
+            "ci_contract": canonical_bytes(contract).decode("utf-8"),
+            "pr_feedback_cursor": cursor,
+        }
+    )
     return result
 
 

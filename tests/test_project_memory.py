@@ -12,14 +12,48 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from workflowkit.project_memory import MAX_BYTES, Conflict, MemoryError, ProjectMemory
 
 
 class ProjectMemoryTests(unittest.TestCase):
+    def create_fake_session_kent(self, pages_path: Path) -> Path:
+        executable = Path(self.temp.name) / "fake-session-kent"
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, subprocess, sys, time\n"
+            f"pages_path = {str(pages_path)!r}\n"
+            "args = sys.argv[1:]\n"
+            "if args[:2] != ['task', 'sessions']:\n"
+            "    raise SystemExit(2)\n"
+            "offset = int(args[args.index('--offset') + 1])\n"
+            "limit = int(args[args.index('--limit') + 1])\n"
+            "if limit != 100:\n"
+            "    raise SystemExit(3)\n"
+            + "with open(pages_path, encoding='utf-8') as source:\n"
+            "    pages = json.load(source)\n"
+            "page = pages[str(offset)]\n"
+            "if page == '__fail__':\n"
+            "    raise SystemExit(9)\n"
+            "if page == '__sleep__':\n"
+            "    time.sleep(5)\n"
+            "    raise SystemExit(0)\n"
+            "if page == '__overflow__':\n"
+            "    marker = pages_path + '.child-marker'\n"
+            "    child = ('import time; time.sleep(1); open(' + repr(marker) + "
+            "' , \"w\").write(\"alive\")')\n"
+            "    subprocess.Popen([sys.executable, '-c', child])\n"
+            "    while True:\n"
+            "        os.write(sys.stdout.fileno(), b'x' * 65536)\n"
+            "print(json.dumps(page))\n"
+        )
+        executable.chmod(0o755)
+        return executable
+
     def test_publication_inventory_v1_v2_closed_and_combined_limits(self):
         adapter = runpy.run_path(str(Path(__file__).resolve().parents[1] /
                                     "templates/project/workflow-project-memory"))
@@ -164,8 +198,10 @@ class ProjectMemoryTests(unittest.TestCase):
             "Implement\nsession_message(project/session/event/digest)\n")
         task_binding = hashlib.sha256(
             (self.store.path / "tasks/OSM-130/task.json").read_bytes()).hexdigest()
+        calls: list[str] = []
 
         def call(workspace, payload, operation, **fields):
+            calls.append(operation)
             if operation == "resolve-task":
                 return {"mode": "r2"}
             if operation == "accepted-head":
@@ -208,6 +244,7 @@ class ProjectMemoryTests(unittest.TestCase):
             self.assertEqual(execute(payload), 0)
         cache = root / ".kent/runtime/OSM-130/plan-contract.json"
         self.assertEqual(json.loads(cache.read_text())["schema"], "r2-plan-contract-cache-v1")
+        original_cache = cache.read_bytes()
         cache.unlink()
         with patch.dict(execute.__globals__, {"memory_call": call}), \
                 patch.dict(os.environ, {"KENT_PLAN_CONTRACT_MODE": "check",
@@ -224,14 +261,46 @@ class ProjectMemoryTests(unittest.TestCase):
         self.assertFalse((root / ".todo").exists())
         original_head = self.store.accepted_head("OSM-130")
         preparation = root / "build/kent-workflow/OSM-130/cleanup-preparation.json"
-        preparation.parent.mkdir(parents=True)
-        preparation.write_text('{"state":"prepared"}')
-        with patch.dict(execute.__globals__, {"memory_call": call}), \
-                patch.dict(os.environ, {"KENT_PLAN_CONTRACT_MODE": "accept"}), \
-                self.assertRaisesRegex(ValueError, "acceptance is closed"):
-            execute(payload)
-        self.assertEqual(self.store.accepted_head("OSM-130"), original_head)
-        self.assertFalse(cache.exists())
+        sentinel = (
+            root / ".kent/runtime"
+            / (".evidence-terminal-" + hashlib.sha256(b"OSM-130").hexdigest())
+        )
+        ledger = root / ".kent/runtime/OSM-130/evidence-ledger.jsonl"
+        for terminal in ("preparation", "sentinel", "seal"):
+            for cache_present in (False, True):
+                with self.subTest(terminal=terminal, cache_present=cache_present):
+                    preparation.unlink(missing_ok=True)
+                    sentinel.unlink(missing_ok=True)
+                    ledger.unlink(missing_ok=True)
+                    if cache_present:
+                        cache.write_bytes(original_cache)
+                    else:
+                        cache.unlink(missing_ok=True)
+                    inspection = Mock(return_value=(
+                        [{"record_kind": "terminal_evidence_seal_v1"}], "valid"))
+                    if terminal == "preparation":
+                        preparation.parent.mkdir(parents=True, exist_ok=True)
+                        preparation.write_text('{"state":"prepared"}')
+                    elif terminal == "sentinel":
+                        sentinel.write_text("terminal\n")
+                    else:
+                        ledger.write_text("{}\n")
+                    before = len(calls)
+                    with (
+                        patch.dict(execute.__globals__, {
+                            "memory_call": call,
+                            "inspection_evidence_view": inspection,
+                        }),
+                        patch.dict(os.environ, {"KENT_PLAN_CONTRACT_MODE": "accept"}),
+                        self.assertRaisesRegex(
+                            ValueError, "acceptance is closed|closes plan acceptance"),
+                    ):
+                        execute(payload)
+                    self.assertEqual(self.store.accepted_head("OSM-130"), original_head)
+                    self.assertEqual(cache.exists(), cache_present)
+                    if cache_present:
+                        self.assertEqual(cache.read_bytes(), original_cache)
+                    self.assertNotIn("accept-plan", calls[before:])
 
     def test_plan_and_branch_producers_capture_existing_output_only_when_opted_in(self):
         import io
@@ -308,6 +377,466 @@ class ProjectMemoryTests(unittest.TestCase):
                 validate({**cache, key: "different"}, status, "OSM-130")
         with self.assertRaises(ValueError):
             validate({**cache, "normalized_plan": "untrusted"}, status, "OSM-130")
+
+    def test_plan_contract_changed_guard_binds_accepted_digest_only_for_complexity(self) -> None:
+        import contextlib
+        import io
+
+        source = Path(__file__).resolve().parents[1] / "templates/project/workflow-plan-contract"
+        selection = {
+            "schema": "coder-selection-v1",
+            "task_short_id": "OSM-130",
+            "complexity": "simple",
+            "rationale": "Bounded implementation",
+        }
+        for policy in ("disabled", "complexity"):
+            with self.subTest(policy=policy):
+                root = Path(self.temp.name).resolve() / f"changed-guard-{policy}"
+                root.mkdir()
+                subprocess.run(["git", "init", "-q", str(root)], check=True)
+                (root / ".gitignore").write_text("/.kent/runtime/\n")
+                kent = root / ".kent"
+                kent.mkdir()
+                policies = (
+                    '[policies]\n'
+                    f'coder_selection = "{policy}"\n'
+                    + ('writer_sessions = "continuous"\n' if policy == "complexity" else "")
+                )
+                (kent / "workflow-profile.toml").write_text(policies)
+                plan = root / ".todo/OSM-130/plan.md"
+                plan.parent.mkdir(parents=True)
+                original = (
+                    "Implement the reviewed scope.\n"
+                    + (
+                        "\n```json\n"
+                        + json.dumps(selection)
+                        + "\n```\n"
+                        if policy == "complexity" else ""
+                    )
+                )
+                plan.write_text(original)
+                module = runpy.run_path(str(source))
+                digest = hashlib.sha256(
+                    module["normalized_plan"](plan).encode("utf-8")
+                ).hexdigest()
+                plan.write_text(original + "\nChanged after acceptance.\n")
+                snapshot = {
+                    "schema_version": 1,
+                    "task_short_id": "OSM-130",
+                    "plan_path": ".todo/OSM-130/plan.md",
+                    "work_kind": "feature",
+                    "normalized_sha256": digest,
+                    "normalized_plan": module["inspection_normalized_plan"](
+                        original.encode("utf-8")
+                    ),
+                }
+                if policy == "complexity":
+                    snapshot["coder_selection"] = selection
+                    snapshot["coder_selection_sha256"] = digest
+                cache = kent / "runtime/OSM-130/plan-contract.json"
+                cache.parent.mkdir(parents=True)
+                cache.write_text(json.dumps(snapshot))
+                payload = {
+                    "workspace_path": str(root),
+                    "task_short_id": "OSM-130",
+                    "review_context": "Reviewed implementation scope.",
+                }
+                with (
+                    patch.dict(os.environ, {
+                        "KENT_PLAN_CONTRACT_MODE": "check",
+                        "KENT_PLAN_CONTRACT_ROUTE": "verify",
+                        "KENT_PLAN_CONTRACT_STABLE_TRANSITION": "stable",
+                        "KENT_PLAN_CONTRACT_CHANGED_TRANSITION": "revalidate",
+                    }),
+                    contextlib.redirect_stdout(io.StringIO()) as output,
+                ):
+                    self.assertEqual(module["execute"](payload), 0)
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["transition"], "revalidate")
+                if policy == "complexity":
+                    self.assertEqual(result["accepted_plan_sha256"], digest)
+                else:
+                    self.assertNotIn("accepted_plan_sha256", result)
+
+    def test_plan_contract_route_context_is_only_emitted_on_branch_identity_entry(self) -> None:
+        import contextlib
+        import io
+
+        module = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-plan-contract"))
+        complete_route = module["complete_route"]
+        common = {
+            "transition": "stable",
+            "workspace": Path(self.temp.name),
+            "plan_path": ".todo/OSM-130/plan.md",
+            "work_kind": "feature",
+            "review_context": "Reviewed scope.",
+            "route_context": "Reviewed fix details.",
+            "delivery_context": None,
+            "task": "OSM-130",
+            "accepted_digest": "a" * 64,
+            "coder_selection": {
+                "schema": "coder-selection-v1",
+                "task_short_id": "OSM-130",
+                "complexity": "simple",
+                "rationale": "Bounded implementation",
+            },
+            "coder_selection_enabled": True,
+        }
+
+        def result(route: str, *, use_branch_identity: bool) -> dict[str, object]:
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                complete_route(
+                    route,
+                    **common,
+                    use_branch_identity=use_branch_identity,
+                    plan_route="start",
+                )
+            return json.loads(output.getvalue())
+
+        selected_entry = result("start", use_branch_identity=True)
+        self.assertEqual(selected_entry["plan_route"], "start")
+        self.assertEqual(selected_entry["plan_route_context"], "Reviewed fix details.")
+        self.assertNotIn("target_assignee", selected_entry)
+
+        direct_entry = result("start", use_branch_identity=False)
+        self.assertNotIn("plan_route", direct_entry)
+        self.assertNotIn("plan_route_context", direct_entry)
+        self.assertEqual(direct_entry["target_assignee"], "implementation-simple")
+
+        continuation = result("continue", use_branch_identity=True)
+        self.assertNotIn("plan_route", continuation)
+        self.assertNotIn("plan_route_context", continuation)
+        self.assertNotIn("target_assignee", continuation)
+
+    def test_plan_contract_retained_writer_guard_reads_every_session_page(self) -> None:
+        module = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-plan-contract"))
+        guard = module["implementation_session_issue"]
+        pages_path = Path(self.temp.name) / "session-pages.json"
+        first_page = {
+            "task_id": "native-task",
+            "items": [
+                {"session_id": f"review-{index}", "agent_role": "spec-reviewer"}
+                for index in range(100)
+            ],
+            "next_offset": 100,
+        }
+        second_page = {
+            "task_id": "native-task",
+            "items": [{"session_id": "late-writer",
+                       "agent_role": "implementation-simple"}],
+        }
+        pages_path.write_text(json.dumps({"0": first_page, "100": second_page}))
+        executable = self.create_fake_session_kent(pages_path)
+        with patch.dict(os.environ, {"KENT_BIN": str(executable)}):
+            issue = guard(
+                Path(self.temp.name), task="OSM-130",
+                payload={"_kent": {"task_id": "native-task"}},
+                expected_role="implementation-simple", route="start")
+
+        self.assertIsNotNone(issue)
+        self.assertIn("already exists", issue)
+
+        first_page_with_writer = {
+            **first_page,
+            "items": [dict(item) for item in first_page["items"]],
+        }
+        first_page_with_writer["items"][0]["agent_role"] = "implementation-simple"
+        pages_path.write_text(json.dumps({
+            "0": first_page_with_writer,
+            "100": second_page,
+        }))
+        with patch.dict(os.environ, {"KENT_BIN": str(executable)}):
+            issue = guard(
+                Path(self.temp.name), task="OSM-130",
+                payload={"_kent": {"task_id": "native-task"}},
+                expected_role="implementation-simple", route="continue")
+        self.assertIsNotNone(issue)
+        self.assertIn("found 2", issue)
+
+    def test_plan_contract_retained_session_inventory_fails_closed_on_bad_pages(self) -> None:
+        module = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-plan-contract"))
+        inventory = module["retained_session_inventory"]
+        pages_path = Path(self.temp.name) / "session-pages.json"
+        executable = self.create_fake_session_kent(pages_path)
+        first = {
+            "task_id": "native-task",
+            "items": [{"session_id": f"review-{index}", "agent_role": "spec-reviewer"}
+                      for index in range(100)],
+            "next_offset": 100,
+        }
+        valid_second = {
+            "task_id": "native-task",
+            "items": [{"session_id": "writer", "agent_role": "implementation-simple"}],
+        }
+
+        def invoke(pages):
+            serializable_pages = {}
+            for offset, page in pages.items():
+                if isinstance(page, subprocess.CompletedProcess):
+                    serializable_pages[str(offset)] = "__fail__"
+                elif isinstance(page, subprocess.TimeoutExpired):
+                    serializable_pages[str(offset)] = "__sleep__"
+                else:
+                    serializable_pages[str(offset)] = page
+            pages_path.write_text(json.dumps(serializable_pages))
+            with patch.dict(os.environ, {"KENT_BIN": str(executable)}):
+                return inventory(Path(self.temp.name), task="OSM-130",
+                                 native_task_id="native-task")
+
+        self.assertEqual(len(invoke({0: first, 100: valid_second})), 101)
+        bad_pages = (
+            {0: {**first, "task_id": "different-task"}},
+            {0: {**first, "next_offset": 101}},
+            {0: {**first, "next_offset": "100"}},
+            {0: {**first, "items": [], "next_offset": 100}},
+            {0: first, 100: {**valid_second, "items": [
+                {"session_id": "review-0", "agent_role": "spec-reviewer"}]}},
+            {0: first, 100: subprocess.CompletedProcess(
+                ["kent"], 1, stdout=b"", stderr=b"late failure")},
+            {0: first, 100: subprocess.TimeoutExpired(["kent"], 30)},
+        )
+        for index, pages in enumerate(bad_pages):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                if index == len(bad_pages) - 1:
+                    with patch.dict(
+                            inventory.__globals__,
+                            {"SESSION_READ_TIMEOUT_SECONDS": 0.1}):
+                        invoke(pages)
+                else:
+                    invoke(pages)
+
+    def test_plan_contract_session_output_limit_kills_owned_process_group(self) -> None:
+        module = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-plan-contract"))
+        pages_path = Path(self.temp.name) / "overflow-pages.json"
+        pages_path.write_text(json.dumps({"0": "__overflow__"}))
+        executable = self.create_fake_session_kent(pages_path)
+        started: list[subprocess.Popen[bytes]] = []
+        actual_popen = subprocess.Popen
+
+        def record_popen(*args, **kwargs):
+            process = actual_popen(*args, **kwargs)
+            started.append(process)
+            return process
+
+        fake_subprocess = type("SubprocessProxy", (), {
+            "DEVNULL": subprocess.DEVNULL,
+            "PIPE": subprocess.PIPE,
+            "Popen": staticmethod(record_popen),
+        })
+        with patch.dict(
+                module["_read_retained_session_page"].__globals__,
+                {"subprocess": fake_subprocess}):
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                module["_read_retained_session_page"](
+                    [
+                        str(executable), "task", "sessions", "OSM-130",
+                        "--project", str(self.temp.name),
+                        "--offset", "0", "--limit", "100", "--json",
+                    ],
+                    workspace=Path(self.temp.name),
+                    max_bytes=4096,
+                )
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll())
+        self.assertTrue(started[0].stdout.closed)
+        time.sleep(1.2)
+        self.assertFalse(Path(str(pages_path) + ".child-marker").exists())
+
+    def test_plan_contract_session_reader_start_failure_reaps_child_and_closes_output(self) -> None:
+        module = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-plan-contract"))
+        pages_path = Path(self.temp.name) / "reader-start-failure-pages.json"
+        pages_path.write_text(json.dumps({"0": "__sleep__"}))
+        executable = self.create_fake_session_kent(pages_path)
+        started: list[subprocess.Popen[bytes]] = []
+        actual_popen = subprocess.Popen
+
+        def record_popen(*args, **kwargs):
+            process = actual_popen(*args, **kwargs)
+            started.append(process)
+            return process
+
+        fake_subprocess = type("SubprocessProxy", (), {
+            "DEVNULL": subprocess.DEVNULL,
+            "PIPE": subprocess.PIPE,
+            "Popen": staticmethod(record_popen),
+        })
+        with (
+            patch.dict(
+                module["_read_retained_session_page"].__globals__,
+                {"subprocess": fake_subprocess},
+            ),
+            patch.object(threading.Thread, "start",
+                         side_effect=RuntimeError("thread startup failed")),
+            self.assertRaisesRegex(RuntimeError, "thread startup failed"),
+        ):
+            module["_read_retained_session_page"](
+                [
+                    str(executable), "task", "sessions", "OSM-130",
+                    "--project", str(self.temp.name),
+                    "--offset", "0", "--limit", "100", "--json",
+                ],
+                workspace=Path(self.temp.name),
+                max_bytes=4096,
+            )
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll())
+        self.assertTrue(started[0].stdout.closed)
+
+    def test_plan_contract_session_inventory_enforces_aggregate_byte_limit(self) -> None:
+        module = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-plan-contract"))
+        inventory = module["retained_session_inventory"]
+        pages_path = Path(self.temp.name) / "aggregate-pages.json"
+        first = {
+            "task_id": "native-task",
+            "items": [{"session_id": "review", "agent_role": "spec-reviewer"}],
+            "next_offset": 1,
+        }
+        second = {
+            "task_id": "native-task",
+            "items": [{"session_id": "writer", "agent_role": "implementation-simple"}],
+        }
+        first_bytes = len(json.dumps(first).encode("utf-8")) + 1
+        second_bytes = len(json.dumps(second).encode("utf-8")) + 1
+        pages_path.write_text(json.dumps({"0": first, "1": second}))
+        executable = self.create_fake_session_kent(pages_path)
+        with (
+            patch.dict(inventory.__globals__, {
+                "SESSION_MAX_PAGE_BYTES": max(first_bytes, second_bytes),
+                "SESSION_MAX_TOTAL_BYTES": first_bytes + second_bytes - 1,
+            }),
+            patch.dict(os.environ, {"KENT_BIN": str(executable)}),
+            self.assertRaisesRegex(ValueError, "byte limit"),
+        ):
+            inventory(
+                Path(self.temp.name),
+                task="OSM-130",
+                native_task_id="native-task",
+            )
+
+    def test_unknown_project_memory_mode_cannot_publish_legacy_plan_cache(self) -> None:
+        root = Path(self.temp.name).resolve() / "unknown-memory-mode"
+        root.mkdir()
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text("/.kent/runtime/\n")
+        (root / ".kent").mkdir()
+        (root / ".kent/workflow-profile.toml").write_text(
+            '[policies]\ncoder_selection = "disabled"\n'
+            '[project_memory]\nmode = "future-mode"\n')
+        plan = root / ".todo" / "OSM-130" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("Reviewed plan.\n")
+        module = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-plan-contract"))
+        payload = {
+            "workspace_path": str(root), "task_short_id": "OSM-130",
+            "plan_path": ".todo/OSM-130/plan.md", "work_kind": "test",
+            "review_context": "reviewed", "plan_route": "start",
+            "plan_route_context": "not-applicable",
+        }
+        with patch.dict(os.environ, {"KENT_PLAN_CONTRACT_MODE": "accept"}), \
+                patch.dict(module["execute"].__globals__, {
+                    "memory_call": Mock(side_effect=AssertionError(
+                        "unknown mode must fail before storage access"))}), \
+                self.assertRaisesRegex(ValueError, "unknown"):
+            module["execute"](payload)
+        self.assertFalse((root / ".kent/runtime/OSM-130/plan-contract.json").exists())
+        self.assertFalse((root / ".todo/OSM-130/plan-contract.json").exists())
+
+        task_root = Path(self.temp.name).resolve() / "unknown-task-memory-mode"
+        task_root.mkdir()
+        subprocess.run(["git", "init", "-q", str(task_root)], check=True)
+        (task_root / ".gitignore").write_text("/.kent/runtime/\n")
+        (task_root / ".kent").mkdir()
+        (task_root / ".kent/workflow-profile.toml").write_text(
+            '[policies]\ncoder_selection = "disabled"\n'
+            '[project_memory]\nmode = "r2"\n')
+        calls: list[str] = []
+
+        def unresolved_task_mode(*_args, **_kwargs):
+            calls.append("resolve-task")
+            return {"mode": "future-mode"}
+
+        task_payload = {**payload, "workspace_path": str(task_root)}
+        with patch.dict(os.environ, {"KENT_PLAN_CONTRACT_MODE": "accept"}), \
+                patch.dict(module["execute"].__globals__, {
+                    "memory_call": unresolved_task_mode}), \
+                self.assertRaisesRegex(ValueError, "task memory mode"):
+            module["execute"](task_payload)
+        self.assertEqual(calls, ["resolve-task"])
+        self.assertFalse(
+            (task_root / ".kent/runtime/OSM-130/plan-contract.json").exists())
+        self.assertFalse((task_root / ".todo/OSM-130/plan-contract.json").exists())
+
+    def test_legacy_plan_acceptance_preserves_cache_after_terminal_ownership(self) -> None:
+        root = Path(self.temp.name).resolve() / "legacy-terminal-plan"
+        root.mkdir()
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text("/.kent/runtime/\n")
+        (root / ".kent").mkdir()
+        (root / ".kent/workflow-profile.toml").write_text(
+            '[policies]\ncoder_selection = "disabled"\n')
+        plan = root / ".todo" / "OSM-130" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("Reviewed plan.\n")
+        module = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-plan-contract"))
+        execute = module["execute"]
+        payload = {
+            "workspace_path": str(root), "task_short_id": "OSM-130",
+            "plan_path": ".todo/OSM-130/plan.md", "work_kind": "test",
+            "review_context": "reviewed", "plan_route": "start",
+            "plan_route_context": "not-applicable",
+        }
+        terminal_cases = ("preparation", "sentinel", "seal")
+        for case in terminal_cases:
+            for cache_present in (False, True):
+                with self.subTest(case=case, cache_present=cache_present):
+                    runtime_task = root / ".kent/runtime/OSM-130"
+                    runtime_task.mkdir(parents=True, exist_ok=True)
+                    cache = runtime_task / "plan-contract.json"
+                    if cache_present:
+                        cache.write_bytes(b"preserve-existing-cache\n")
+                    else:
+                        cache.unlink(missing_ok=True)
+                    preparation = root / "build/kent-workflow/OSM-130/cleanup-preparation.json"
+                    sentinel = (
+                        root / ".kent/runtime"
+                        / (".evidence-terminal-" + hashlib.sha256(b"OSM-130").hexdigest())
+                    )
+                    ledger = runtime_task / "evidence-ledger.jsonl"
+                    preparation.unlink(missing_ok=True)
+                    sentinel.unlink(missing_ok=True)
+                    ledger.unlink(missing_ok=True)
+                    inspection = Mock(return_value=(
+                        [{"record_kind": "terminal_evidence_seal_v1"}], "valid"))
+                    with (
+                        patch.dict(os.environ, {"KENT_PLAN_CONTRACT_MODE": "accept"}),
+                        patch.dict(execute.__globals__, {
+                            "inspection_evidence_view": inspection}),
+                        patch.object(Path, "cwd", return_value=root),
+                        self.assertRaisesRegex(
+                            ValueError, "acceptance is closed|closes plan acceptance"),
+                    ):
+                        if case == "preparation":
+                            preparation.parent.mkdir(parents=True, exist_ok=True)
+                            preparation.write_text('{"state":"prepared"}')
+                        elif case == "sentinel":
+                            sentinel.parent.mkdir(parents=True, exist_ok=True)
+                            sentinel.write_text("terminal\n")
+                        else:
+                            ledger.write_text("{}\n")
+                        execute(payload)
+                    self.assertEqual(cache.exists(), cache_present)
+                    if cache_present:
+                        self.assertEqual(cache.read_bytes(), b"preserve-existing-cache\n")
+                    if case == "seal":
+                        inspection.assert_called_once_with(root, ledger, task="OSM-130")
 
     def test_acceptance_requires_effective_graph_script_command(self) -> None:
         adapter = runpy.run_path(str(Path(__file__).resolve().parents[1] /

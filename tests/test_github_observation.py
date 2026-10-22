@@ -325,6 +325,33 @@ class GitHubObservationTest(unittest.TestCase):
             self.observe(FakeGitHub(threads=[thread_page(more=True, cursor="unfinished")]))
         self.assertEqual(raised.exception.code, "incomplete_observation")
 
+    def test_malformed_thread_page_info_is_incomplete(self):
+        for page_info in (
+            None,
+            {},
+            {"hasNextPage": "yes", "endCursor": "cursor"},
+            {"hasNextPage": True, "endCursor": 7},
+        ):
+            with self.subTest(page_info=page_info):
+                page = {
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "reviewThreads": {
+                                    "nodes": [],
+                                    "pageInfo": page_info,
+                                }
+                            }
+                        }
+                    }
+                }
+                with self.assertRaises(ObservationError) as raised:
+                    self.observe(FakeGitHub(threads=[page]))
+                self.assertEqual(
+                    raised.exception.code,
+                    "incomplete_observation",
+                )
+
     def test_graphql_errors_with_partial_data_are_not_success(self):
         page = {**thread_page(), "errors": [{"message": "private diagnostic"}]}
         with self.assertRaises(ObservationError) as raised:
@@ -370,6 +397,109 @@ class GitHubObservationTest(unittest.TestCase):
         comments = [row for row in result["feedback_items"] if row["kind"] == "review_comment"]
         self.assertEqual([row["thread_id"] for row in comments], ["THREAD1", "THREAD1"])
         self.assertEqual(result["feedback_items"][-1]["comment_ids"], ["COMMENT1", "COMMENT2"])
+
+    def test_empty_advancing_comment_pages_use_a_query_budget(self):
+        thread = {
+            "id": "THREAD1",
+            "isResolved": False,
+            "isOutdated": False,
+            "path": "app.py",
+            "subjectType": "LINE",
+            "line": 1,
+            "startLine": None,
+            "originalLine": 1,
+            "originalStartLine": None,
+            "comments": {
+                "nodes": [],
+                "pageInfo": {"hasNextPage": True, "endCursor": "cursor-0"},
+            },
+        }
+        continuation_queries = 0
+        top_page = thread_page([thread])
+
+        def query(args):
+            nonlocal continuation_queries
+            if args[:2] == ["pr", "view"]:
+                return deepcopy(pr())
+            if args[:2] == ["pr", "checks"]:
+                return [check()]
+            if args[:2] == ["api", "graphql"]:
+                if any(argument.startswith("threadId=") for argument in args):
+                    if continuation_queries >= observation.MAX_FEEDBACK_ITEMS:
+                        raise AssertionError("comment pagination exceeded its query budget")
+                    continuation_queries += 1
+                    cursor = f"cursor-{continuation_queries}"
+                    return {
+                        "data": {
+                            "node": {
+                                "comments": {
+                                    "nodes": [],
+                                    "pageInfo": {
+                                        "hasNextPage": True,
+                                        "endCursor": cursor,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                return [deepcopy(top_page)]
+            if args[0] == "api":
+                return [[]]
+            raise AssertionError(args)
+
+        with self.assertRaises(ObservationError) as raised:
+            GitHubObserver(Path.cwd(), query=query).observe_pr(URL)
+        self.assertEqual(raised.exception.code, "observation_limit")
+        self.assertEqual(
+            continuation_queries,
+            observation.MAX_FEEDBACK_ITEMS - 1,
+        )
+
+    def test_repeated_comment_cursor_is_incomplete_not_a_budget_exhaustion(self):
+        thread = {
+            "id": "THREAD1",
+            "isResolved": False,
+            "isOutdated": False,
+            "path": "app.py",
+            "subjectType": "LINE",
+            "line": 1,
+            "startLine": None,
+            "originalLine": 1,
+            "originalStartLine": None,
+            "comments": {
+                "nodes": [],
+                "pageInfo": {"hasNextPage": True, "endCursor": "same-cursor"},
+            },
+        }
+
+        def query(args):
+            if args[:2] == ["pr", "view"]:
+                return deepcopy(pr())
+            if args[:2] == ["pr", "checks"]:
+                return [check()]
+            if args[:2] == ["api", "graphql"]:
+                if any(argument.startswith("threadId=") for argument in args):
+                    return {
+                        "data": {
+                            "node": {
+                                "comments": {
+                                    "nodes": [],
+                                    "pageInfo": {
+                                        "hasNextPage": True,
+                                        "endCursor": "same-cursor",
+                                    },
+                                }
+                            }
+                        }
+                    }
+                return [thread_page([thread])]
+            if args[0] == "api":
+                return [[]]
+            raise AssertionError(args)
+
+        with self.assertRaises(ObservationError) as raised:
+            GitHubObserver(Path.cwd(), query=query).observe_pr(URL)
+        self.assertEqual(raised.exception.code, "incomplete_observation")
 
     def test_run_observation_accepts_extra_jobs_but_preserves_failure(self):
         run = {"id": 1, "run_attempt": 2, "head_sha": HEAD, "event": "push",

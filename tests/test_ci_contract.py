@@ -377,6 +377,21 @@ class CiContractTest(unittest.TestCase):
         )
         self.assertEqual(prepared["pr_feedback_cursor"], "uninitialized")
         self.assertNotIn("ci_report", prepared)
+        self.assertNotIn("pr_head_oid", prepared)
+        self.assertNotIn("pr_base_oid", prepared)
+        self.assertEqual(
+            set(prepared),
+            {
+                "transition",
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "task_short_id",
+                "ci_contract",
+                "pr_feedback_cursor",
+            },
+        )
         for legacy in (
             "expected_ci_checks",
             "expected_ci_checks_sha256",
@@ -441,8 +456,8 @@ class CiContractTest(unittest.TestCase):
         )
         retry_payload = {
             **payload,
-            "ci_contract": json.dumps(contract, separators=(",", ":")),
-            "ci_report": json.dumps(report, separators=(",", ":")),
+            "ci_contract": runtime.canonical_bytes(contract).decode("utf-8"),
+            "ci_report": runtime.canonical_bytes(report).decode("utf-8"),
         }
         with (
             mock.patch.object(ci_contract, "read_pull_request", side_effect=[pr, pr]),
@@ -451,6 +466,22 @@ class CiContractTest(unittest.TestCase):
             retried = prepare_ci_payload(retry_payload, gh_bin="/bin/true")
         self.assertEqual(retried["transition"], "ci_prepare_ready_retry")
         self.assertEqual(retried["ci_report"], retry_payload["ci_report"])
+        self.assertNotIn("pr_head_oid", retried)
+        self.assertNotIn("pr_base_oid", retried)
+        self.assertEqual(
+            set(retried),
+            {
+                "transition",
+                "workspace_path",
+                "pr_url",
+                "branch_name",
+                "merge_strategy",
+                "task_short_id",
+                "ci_contract",
+                "pr_feedback_cursor",
+                "ci_report",
+            },
+        )
         archive.assert_called_once()
 
         for observed_key, contract_key in (("headRefOid", "head_oid"), ("baseRefOid", "base_oid")):
@@ -491,7 +522,85 @@ class CiContractTest(unittest.TestCase):
                 recovered = prepare_ci_payload(retry_payload, gh_bin="/bin/true")
                 self.assertEqual(recovered["transition"], "ci_prepare_pr_merged")
                 self.assertEqual(json.loads(recovered["merge_report"]), merged)
+                self.assertEqual(
+                    set(recovered),
+                    {
+                        "transition",
+                        "workspace_path",
+                        "pr_url",
+                        "branch_name",
+                        "merge_report",
+                    },
+                )
                 archive.assert_called_once_with(ROOT, "TASK-1", report)
+
+    def test_dynamic_prepare_rejects_noncanonical_packets_without_rewriting(self):
+        contract = {
+            "schema": "github-ci-contract-v1",
+            "repository": "owner/repository",
+            "pull_number": 17,
+            "head_oid": "a" * 40,
+            "base_oid": "b" * 40,
+            "require_ci": True,
+        }
+        attempt = {
+            "sequence": 1,
+            "head_oid": contract["head_oid"],
+            "base_oid": contract["base_oid"],
+            "retry": None,
+            "checks": [],
+            "check_count": 0,
+            "checks_sha256": runtime.canonical_sha256([]),
+            "reason": "no_checks",
+            "watcher_exit_code": 0,
+            "error": None,
+        }
+        report = runtime.build_dynamic_ci_report(
+            contract=contract,
+            attempts=[attempt],
+        )
+        cursor = runtime.make_dynamic_pr_feedback_cursor(
+            repository="owner/repository",
+            pull_number=17,
+            items=[],
+        )
+        pr_url = "https://github.com/owner/repository/pull/17"
+        pr = {
+            "state": "OPEN",
+            "headRefOid": contract["head_oid"],
+            "baseRefOid": contract["base_oid"],
+            "baseRefName": "main",
+            "headRefName": "TASK-17",
+            "url": pr_url,
+            "mergedAt": None,
+            "mergeCommit": None,
+            "statusCheckRollup": [],
+        }
+        packets = {
+            "ci_contract": json.dumps(contract, indent=2),
+            "ci_report": json.dumps(report, indent=2),
+            "pr_feedback_cursor": json.dumps(cursor, indent=2),
+        }
+        for field, raw in packets.items():
+            with self.subTest(field=field):
+                payload = {
+                    "workspace_path": str(ROOT),
+                    "pr_url": pr_url,
+                    "branch_name": "TASK-17",
+                    "merge_strategy": "rebase",
+                    "task_short_id": "TASK-17",
+                    "pr_feedback_cursor": "uninitialized",
+                    "ci_contract": runtime.canonical_bytes(contract).decode("utf-8"),
+                    field: raw,
+                }
+                with mock.patch.object(
+                    ci_contract,
+                    "read_pull_request",
+                    return_value=pr,
+                ), self.assertRaisesRegex(CiContractError, "invalid"):
+                    prepare_ci_payload(payload, gh_bin="/bin/true")
+                diagnosis = preparation_failure(payload)
+                self.assertEqual(diagnosis[field], raw)
 
     @mock.patch.dict(os.environ, {
         "KENT_SESSION_ID": "11111111-1111-4111-8111-111111111111",
@@ -944,8 +1053,8 @@ jobs:
             }
             direct = prepare_ci_payload(payload, gh_bin=str(fake_gh))
             self.assertEqual(direct["transition"], "ci_prepare_ready_initial")
-            self.assertEqual(direct["pr_head_oid"], head)
-            self.assertEqual(direct["pr_base_oid"], target)
+            self.assertNotIn("pr_head_oid", direct)
+            self.assertNotIn("pr_base_oid", direct)
             self.assertEqual(
                 json.loads(direct["ci_contract"]),
                 {

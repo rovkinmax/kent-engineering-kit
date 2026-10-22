@@ -620,6 +620,12 @@ def _run_child_fd(
     )
     child_exec_fd = -1
     tmp_exec_fd = -1
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
+    streams: list[Any] = []
+    process_group_settled = False
+    normal_completion = False
+    primary_error: BaseException | None = None
     try:
         _write_all(input_fd, input_payload)
         os.fsync(input_fd)
@@ -665,7 +671,8 @@ def _run_child_fd(
             input_stream.close()
         assert process.stdout is not None
         assert process.stderr is not None
-        for stream in (process.stdout, process.stderr):
+        streams = [process.stdout, process.stderr]
+        for stream in streams:
             os.set_blocking(stream.fileno(), False)
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
@@ -678,6 +685,7 @@ def _run_child_fd(
             if remaining <= 0 and failure is None:
                 failure = "timeout"
                 _terminate_group(process)
+                process_group_settled = True
             timeout = max(0.0, min(remaining, 0.25))
             for key, _ in selector.select(timeout):
                 chunk = os.read(key.fileobj.fileno(), 65536)
@@ -692,6 +700,7 @@ def _run_child_fd(
                         buffers[key.data].extend(chunk[:remaining_output])
                     failure = "output_limit"
                     _terminate_group(process)
+                    process_group_settled = True
                     break
                 buffers[key.data].extend(chunk)
             if failure is not None:
@@ -704,17 +713,27 @@ def _run_child_fd(
         _private_tmp_path(
             workspace, root_fd, build_fd, workflow_fd, tmp_name, tmp_fd,
         )
+        normal_completion = True
         return (
             process.returncode,
             bytes(buffers["stdout"]),
             bytes(buffers["stderr"]),
             failure,
         )
-    except VerificationFailure:
+    except VerificationFailure as error:
+        primary_error = error
         raise
-    except (OSError, ValueError):
+    except (OSError, ValueError) as error:
+        primary_error = error
         return None, b"", b"", "internal"
     finally:
+        cleanup_error: BaseException | None = None
+
+        def remember_cleanup_error(error: BaseException) -> None:
+            nonlocal cleanup_error
+            if cleanup_error is None:
+                cleanup_error = error
+
         try:
             _private_tmp_path(
                 workspace, root_fd, build_fd, workflow_fd, tmp_name, tmp_fd,
@@ -725,17 +744,43 @@ def _run_child_fd(
             )
             os.unlink(".verification-input", dir_fd=tmp_fd)
         except OSError as error:
-            raise VerificationFailure("internal_error") from error
-        finally:
+            remember_cleanup_error(error)
+        except VerificationFailure as error:
+            remember_cleanup_error(error)
+        if selector is not None:
             try:
-                os.close(input_fd)
-            except OSError:
-                pass
-            for descriptor in (child_exec_fd, tmp_exec_fd):
+                selector.close()
+            except (OSError, ValueError) as error:
+                remember_cleanup_error(error)
+        for stream in streams:
+            try:
+                stream.close()
+            except (OSError, ValueError) as error:
+                remember_cleanup_error(error)
+        try:
+            os.close(input_fd)
+        except OSError as error:
+            remember_cleanup_error(error)
+        for descriptor in (child_exec_fd, tmp_exec_fd):
+            if descriptor >= 0:
                 try:
                     os.close(descriptor)
-                except OSError:
-                    pass
+                except OSError as error:
+                    remember_cleanup_error(error)
+        if (
+            process is not None
+            and not process_group_settled
+            and (not normal_completion or cleanup_error is not None)
+        ):
+            try:
+                _terminate_group(process)
+                process_group_settled = True
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                remember_cleanup_error(error)
+        if cleanup_error is not None and primary_error is None:
+            if isinstance(cleanup_error, VerificationFailure):
+                raise cleanup_error
+            raise VerificationFailure("internal_error") from cleanup_error
 
 
 def _prechild_log_gate(
@@ -1107,7 +1152,18 @@ def run_verification(payload: dict[str, Any], *, _phase_hook=None) -> dict[str, 
         elif exit_code not in (0, None):
             code = "child_exit_nonzero"
         else:
-            transition = _parse_child(stdout)
+            try:
+                transition = _parse_child(stdout)
+            except VerificationFailure as error:
+                if error.code != "child_output_invalid":
+                    raise
+                return _report(
+                    runtime,
+                    error.code,
+                    log_path=log_path,
+                    log_sha256=log_digest,
+                    exit_code=None,
+                )
             code = {
                 "passed": "passed",
                 "failed": "verification_failed",
