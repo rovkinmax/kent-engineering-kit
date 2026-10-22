@@ -111,7 +111,7 @@ def build_current_workflow(profile: ProjectProfile) -> WorkflowSpec:
     complexity = profile.coder_selection_policy() == "complexity"
     return _add_plan_approval(
         build_delivery_workflow(profile, 6 if complexity else 5),
-        expected_shape=(21, 55, 56) if complexity else (21, 53, 54),
+        expected_shape=(21, 56, 57) if complexity else (21, 55, 56),
     )
 
 

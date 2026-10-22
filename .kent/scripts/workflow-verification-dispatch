@@ -86,6 +86,12 @@ def main() -> int:
     delivery_context = delivery_context_field(payload)
 
     execution_root = git_root(os.getcwd()) or canonical_directory(os.getcwd())
+    profile_path = Path(execution_root) / ".kent/workflow-profile.toml"
+    profile = tomllib.loads(profile_path.read_text()) if profile_path.is_file() else {}
+    policies = profile.get("policies", {})
+    if not isinstance(policies, dict):
+        raise ValueError("invalid workflow policy table")
+    delivery_reliability_policy = policies.get("delivery_reliability")
     reported_root = ""
     try:
         reported_root = canonical_directory(workspace_path)
@@ -107,6 +113,8 @@ def main() -> int:
                 f"{execution_root}"
             ),
         }
+        if delivery_reliability_policy == "v1":
+            output["workspace_path"] = execution_root
     else:
         output = {
             "transition": "verification_dispatch_fanout_verify",
@@ -119,9 +127,7 @@ def main() -> int:
     if delivery_context is not None:
         output["delivery_context"] = delivery_context
     encoded = (json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8")
-    profile_path = Path(execution_root) / ".kent/workflow-profile.toml"
-    profile = tomllib.loads(profile_path.read_text()) if profile_path.is_file() else {}
-    if profile.get("policies", {}).get("delivery_reliability") is not None:
+    if delivery_reliability_policy is not None:
         source = Path(__file__).with_name("workflow-checkpoint")
         if source.is_symlink() or not source.is_file():
             raise ValueError("qualified producer adapter is unavailable")

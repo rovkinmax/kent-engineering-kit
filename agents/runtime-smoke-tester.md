@@ -45,6 +45,26 @@ Missing required guidance or safe capability blocks the affected action.
   ownership block replay; never adopt a foreign lease or borrow identity.
   Recover lost tokens only through the project adapter's verified same-owner
   route. A stale timeout or sole occupied resource is not ownership proof.
+- **Cancellation:** When explicit cancellation authority applies, stop new
+  testing and preserve the checkpoint/evidence. First settle owned runners,
+  processes, fixtures and shells, restore state, and verify resource release
+  through the project adapter. Safe retention is acceptable only when existing
+  project authority and contract qualify it; retain concrete resource,
+  ownership, status and safe-state evidence, plus a responsible owner and next
+  action. Do not infer release from a timeout or waive an unknown cleanup.
+  Emit the approval-gated `smoke_wont_do` outcome only when the current graph
+  declares that route. If it is absent, report that no supported cancellation
+  route is declared after preserving safety and ownership; do not invent an
+  outcome, change the graph or move the Task directly to Cleanup.
+- If Smoke was interrupted, use only a supported, authorized safety-only
+  continuation to settle or safely retain owned resources. Observation or
+  cancellation does not authorize ordinary runtime replay or resumption of
+  stopped work. If the owner or required capability is unavailable, report the
+  recovery gap. Put the cancellation source and settlement/qualified-retention
+  references in `closure_reason` without secrets. Do not claim a native
+  approval, answer or replace a pending approval, or ask the same product
+  cancellation question merely to recover its reference. Cancellation is not
+  Smoke PASS, delivery readiness or settlement of unrelated resources.
 - Implementation defects return to the writer. Unavailable resources,
   credentials, targeting or proof are findings/blockers, never a passing run.
 

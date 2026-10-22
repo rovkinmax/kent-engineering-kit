@@ -17,6 +17,17 @@ owns Kit/workflow change approval.
   not acknowledgment of waiting or a technical problem with a capable recovery
   owner. Confirmation restarts the stage; required resolution evidence must
   exist first. Post-Join recovery reruns fresh read-only branches as declared.
+- Gate may route a resolved technical blockage to `retry_verification` for a
+  fresh verification cycle; this is not successful completion of the blocked
+  cycle or a substitute for `needs_user_action` when a real decision/action is
+  required. Eligibility requires evidence of the original blocker, resolution
+  by an existing capable authorized owner, changed prerequisites and
+  settlement of prior owned processes/effects. Preserve Task/root, accepted
+  scope, attempt/spend limits and current delivery context. Keep historical
+  BLOCKED reports unchanged and rerun all enabled read-only branches through
+  Join; old PASS evidence cannot satisfy the new cycle. If the owner, evidence
+  or settlement is unavailable, retain the capability gap instead of polling,
+  creating a new owner or inventing a product Fix.
 - Runtime interruption is not a business decision. Reconcile effect state and
   use the smallest supported retained/new-session recovery, preserving values,
   execution identity and fan-out/Join. Requeueing alone does not prove startup.
@@ -270,6 +281,26 @@ Cross-repository/partial/follow-up links do not claim closure.
 Gate evaluates runtime impact, acceptance and uncertainty at the approved
 milestone. Bypass needs positive no-runtime-impact proof; missing resources
 never waive required Smoke.
+
+For conditional or required Smoke, `smoke_wont_do` routes to `wont_do` only
+with cancellation authority and after owned work is settled. The outcome is
+approval-gated and carries only `closure_reason`, which records the cancellation
+source and settlement or qualified-retention references without secrets.
+Stop new testing, preserve checkpoint/evidence, settle owned processes, runners,
+fixtures and shells, restore state, and verify release through the project
+adapter. Safe retention is allowed only when existing project authority and
+contract qualify it, with evidence of the resource, ownership, status and safe
+state, a responsible owner and a next action. No default waiver, inferred TTL
+release, or direct Task move to Cleanup is permitted.
+
+An interrupted Smoke owner may continue only through a supported, authorized
+safety-only route to settle or safely retain its resources. Cancellation or
+observation alone does not authorize ordinary runtime replay or resumption of
+stopped work. Unknown ownership/cleanup or unavailable capability remains an
+explicit recovery gap. Preserve the native approval gate; do not fabricate or
+answer a pending approval, or repeat the same product cancellation question
+merely to recover its reference. Cancellation is not Smoke PASS, delivery
+readiness or cleanup of unrelated resources.
 
 Allocate runtime/deterministic/hybrid evidence explicitly. Runtime covers
 rendering, navigation, integration, restoration and liveness; passing pure

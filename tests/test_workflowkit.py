@@ -1971,6 +1971,346 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(edges["plan_review_accept"].target, "plan_contract")
         spec.validate()
 
+    def test_plan_contract_revalidation_exists_for_every_selection_and_context_mode(
+        self,
+    ) -> None:
+        from workflowkit.delivery import _delivery_context_enabled
+
+        def v1(contents: str) -> str:
+            return contents.replace(
+                "[policies]\n",
+                '[policies]\ndelivery_reliability = "v1"\n',
+            )
+
+        def complexity(contents: str) -> str:
+            return v1(contents).replace(
+                'writer_sessions = "fresh_per_slice"\n',
+                'writer_sessions = "continuous"\n'
+                'coder_selection = "complexity"\n',
+            )
+
+        runtime_v2 = self.load_schema4_profile(
+            lambda _: self.source_ci_profile_contents()
+        )
+        current = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / ".kent/workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        cases = (
+            ("legacy-disabled", self.load_profile()),
+            ("v1-disabled-no-context", self.load_profile(v1)),
+            ("v1-complexity-no-context", self.load_profile(complexity)),
+            ("runtime-v2-disabled", runtime_v2),
+            ("kit-v1-disabled", current),
+            (
+                "kit-v1-complexity",
+                replace(
+                    current,
+                    policies={
+                        **current.policies,
+                        "coder_selection": "complexity",
+                    },
+                ),
+            ),
+        )
+        common = (
+            "workspace_path",
+            "plan_path",
+            "work_kind",
+            "plan_route",
+            "plan_route_context",
+            "plan_change_report",
+            "review_context",
+            "task_short_id",
+        )
+        for name, profile in cases:
+            spec = build_delivery_workflow(profile, 1)
+            matches = [
+                edge for edge in spec.edges
+                if edge.key == "plan_contract_revalidate"
+            ]
+            with self.subTest(profile=name):
+                self.assertEqual(len(matches), 1)
+                edge = matches[0]
+                self.assertEqual(
+                    (edge.source, edge.transition, edge.target),
+                    (
+                        "plan_contract",
+                        "plan_contract_revalidate",
+                        "plan_revalidation",
+                    ),
+                )
+                self.assertEqual(
+                    (edge.context, edge.context_source, edge.requires_approval),
+                    ("continue_session", "node:plan", False),
+                )
+                expected = common
+                if profile.coder_selection_policy() == "complexity":
+                    expected += ("accepted_plan_sha256",)
+                if _delivery_context_enabled(profile):
+                    expected += ("delivery_context",)
+                self.assertEqual(
+                    tuple(parameter.key for parameter in edge.parameters),
+                    expected,
+                )
+                self.assertIn("accepted plan contract", edge.transition_description)
+                self.assertNotIn("coder choice", edge.transition_description)
+                self.assertIn("retained planning context", edge.prompt)
+
+    def test_gate_retry_is_a_fresh_unapproved_dispatch_for_every_review_matrix(
+        self,
+    ) -> None:
+        from workflowkit.delivery import (
+            _delivery_context_enabled,
+            verification_gate_prompt,
+        )
+
+        base = self.load_profile()
+        profiles = []
+        for standards in (False, True):
+            for specification in (False, True):
+                profiles.append(
+                    replace(
+                        base,
+                        capabilities={
+                            **base.capabilities,
+                            "standards_review": standards,
+                            "spec_review": specification,
+                        },
+                    )
+                )
+        current = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / ".kent/workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        profiles.append(current)
+
+        for index, profile in enumerate(profiles):
+            spec = build_delivery_workflow(profile, 1)
+            edges = {edge.key: edge for edge in spec.edges}
+            with self.subTest(profile=index):
+                edge = edges["gate_retry_verification"]
+                self.assertEqual(
+                    (edge.source, edge.transition, edge.target),
+                    (
+                        "verification_gate",
+                        "verification_gate_retry_verification",
+                        "verification_dispatch",
+                    ),
+                )
+                self.assertEqual(
+                    (edge.context, edge.context_source, edge.requires_approval),
+                    ("new_session", "immediate_source", False),
+                )
+                expected = ("workspace_path", "review_context")
+                if _delivery_context_enabled(profile):
+                    expected += ("delivery_context",)
+                self.assertEqual(
+                    tuple(parameter.key for parameter in edge.parameters),
+                    expected,
+                )
+                self.assertIsNone(edge.prompt)
+                prompt = verification_gate_prompt(profile)
+                compact = " ".join(prompt.split())
+                self.assertIn(
+                    "only when every enabled status is `passed` for the current "
+                    "authorized stage",
+                    compact,
+                )
+                self.assertIn("A verification retry is not delivery readiness.", compact)
+                self.assertIn(
+                    "changed prerequisites, and settlement of prior owned "
+                    "processes/effects",
+                    compact,
+                )
+                self.assertIn(
+                    "every enabled verification and review branch fresh",
+                    compact,
+                )
+                self.assertIn(
+                    "rewrite opaque producer packets",
+                    compact,
+                )
+                self.assertNotIn(
+                    "Continue only when every enabled branch passes",
+                    compact,
+                )
+
+    def test_smoke_cancellation_requires_approval_and_settlement(self) -> None:
+        from workflowkit.delivery import _delivery_context_enabled
+
+        current = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / ".kent/workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        base = self.load_profile()
+        for policy in ("disabled", "conditional", "required"):
+            for pull_requests in (False, True):
+                for compliance in (False, True):
+                    profile = replace(
+                        base,
+                        policies={**base.policies, "smoke": policy},
+                        capabilities={
+                            **base.capabilities,
+                            "pull_requests": pull_requests,
+                            "ci_monitoring": pull_requests,
+                            "compliance_review": compliance,
+                        },
+                    )
+                    spec = build_delivery_workflow(profile, 1)
+                    edges = {edge.key: edge for edge in spec.edges}
+                    with self.subTest(
+                        policy=policy,
+                        pull_requests=pull_requests,
+                        compliance=compliance,
+                    ):
+                        self.assertEqual(
+                            "smoke" in {n.key for n in spec.nodes},
+                            policy != "disabled",
+                        )
+                        self.assertEqual(
+                            "smoke_wont_do" in edges,
+                            policy != "disabled",
+                        )
+                        self.assertEqual(
+                            "gate_delivery_ready" in edges,
+                            policy != "required",
+                        )
+                        if policy == "disabled":
+                            continue
+                        cancel = edges["smoke_wont_do"]
+                        self.assertEqual(
+                            (cancel.source, cancel.transition, cancel.target),
+                            ("smoke", "smoke_wont_do", "wont_do"),
+                        )
+                        self.assertTrue(cancel.requires_approval)
+                        self.assertEqual(
+                            tuple(parameter.key for parameter in cancel.parameters),
+                            ("closure_reason",),
+                        )
+                        self.assertFalse(
+                            _delivery_context_enabled(profile)
+                            and "delivery_context"
+                            in {parameter.key for parameter in cancel.parameters}
+                        )
+                        initial = " ".join(
+                            edges["gate_smoke_required"].prompt.split()
+                        )
+                        for requirement in (
+                            "settling every owned runner",
+                            "restore changed state and verify resource release",
+                            "Safe retention is allowed only when",
+                            "owner, status, safe-state proof, and next action",
+                            "Unknown cleanup blocks cancellation",
+                            "Do not route through Janitor",
+                            "not that approval",
+                            "references in `closure_reason` without secrets",
+                        ):
+                            self.assertIn(requirement, initial)
+                        recovery = " ".join(
+                            edges["smoke_needs_user_action"].prompt.split()
+                        )
+                        for requirement in (
+                            "does not authorize replay",
+                            "safety-only continuation",
+                            "Cancellation permits safety settlement only",
+                            "infer a TTL release",
+                            "borrow a lease",
+                        ):
+                            self.assertIn(requirement, recovery)
+
+        current_with_smoke_role = replace(
+            current,
+            roles={**current.roles, "qa": "runtime-smoke-tester"},
+            policies={**current.policies, "smoke": "conditional"},
+        )
+        kit_spec = build_delivery_workflow(current_with_smoke_role, 1)
+        kit_edges = {edge.key: edge for edge in kit_spec.edges}
+        self.assertTrue(_delivery_context_enabled(current_with_smoke_role))
+        self.assertEqual(
+            tuple(parameter.key for parameter in kit_edges["smoke_wont_do"].parameters),
+            ("closure_reason",),
+        )
+
+
+    def test_invalid_workspace_dispatch_keeps_policy_and_context_independent(
+        self,
+    ) -> None:
+        from workflowkit.delivery import (
+            _delivery_context_enabled,
+            workspace_path_fix_prompt,
+        )
+
+        def with_v1(contents: str) -> str:
+            return contents.replace(
+                "[policies]\n",
+                '[policies]\ndelivery_reliability = "v1"\n',
+            )
+
+        runtime_v2 = self.load_schema4_profile(
+            lambda _: self.source_ci_profile_contents()
+        )
+        kit_profile = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / ".kent/workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        profiles = (
+            ("legacy-without-context", self.load_profile()),
+            ("legacy-with-context", runtime_v2),
+            ("v1-without-context", self.load_profile(with_v1)),
+            ("v1-with-context", kit_profile),
+        )
+        for name, profile in profiles:
+            spec = build_delivery_workflow(profile, 1)
+            edge = next(
+                edge for edge in spec.edges
+                if edge.key == "dispatch_invalid_workspace"
+            )
+            with self.subTest(profile=name):
+                expected = (
+                    ("workspace_path",)
+                    if profile.delivery_reliability_policy() == "v1"
+                    else ()
+                ) + ("reported_workspace_path", "fix_context")
+                if _delivery_context_enabled(profile):
+                    expected += ("delivery_context",)
+                self.assertEqual(
+                    tuple(parameter.key for parameter in edge.parameters),
+                    expected,
+                )
+                self.assertEqual(
+                    (edge.source, edge.transition, edge.target),
+                    (
+                        "verification_dispatch",
+                        "verification_dispatch_invalid_workspace",
+                        "fix",
+                    ),
+                )
+                self.assertEqual(
+                    (edge.context, edge.context_source, edge.requires_approval),
+                    ("new_session", "immediate_source", False),
+                )
+                prompt = workspace_path_fix_prompt(profile)
+                self.assertIn("reported_workspace_path", prompt)
+                self.assertIn(
+                    "metadata correction only; do not create or update a Fix checkpoint",
+                    prompt,
+                )
+                self.assertIn("preserving its required envelope", prompt)
+                if profile.delivery_reliability_policy() == "v1":
+                    self.assertIn(
+                        "canonical, native-qualified `workspace_path`",
+                        prompt,
+                    )
+                    self.assertIn("Use that exact value unchanged", prompt)
+                    self.assertNotIn("git rev-parse", prompt)
+                else:
+                    self.assertIn("Kent's current task execution root", prompt)
+                    self.assertIn("git rev-parse --show-toplevel", prompt)
 
     def test_replan_profile_matrix_and_parameter_closure(self) -> None:
         source_ci = self.schema4_runtime_v2_contents().replace(
@@ -2670,6 +3010,12 @@ class WorkflowKitTest(unittest.TestCase):
             "metadata correction only; do not create or update a Fix checkpoint",
             metadata_fix,
         )
+        self.assertIn("retain those exact source locators", metadata_fix)
+        self.assertIn(
+            "preserving its required envelope and every opaque field byte-for-byte",
+            metadata_fix,
+        )
+        self.assertIn("Do not rewrite, reserialize", metadata_fix)
         self.assertIn("Do not create or update the Fix checkpoint", evidence_fix)
 
     def test_outcome_guidance_matches_gate_and_plan_review_contracts(self) -> None:
@@ -3294,6 +3640,17 @@ class WorkflowKitTest(unittest.TestCase):
             self.assertNotIn(kind.implement, prompts)
         self.assertNotIn("gate_smoke_required", by_key)
         self.assertEqual(by_key["gate_delivery_ready"].target, "cleanup")
+        self.assertEqual(
+            by_key["gate_retry_verification"].transition,
+            "verification_gate_retry_verification",
+        )
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in by_key["gate_retry_verification"].parameters
+            ),
+            ("workspace_path", "review_context"),
+        )
 
     def test_pull_request_tail_uses_canonical_project_contract(self) -> None:
         profile = self.load_profile()
@@ -4051,6 +4408,17 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(by_key["gate_smoke_required"].target, "smoke")
         self.assertEqual(by_key["gate_delivery_ready"].target, "cleanup")
         self.assertEqual(by_key["smoke_cleanup"].target, "cleanup")
+        self.assertTrue(by_key["smoke_wont_do"].requires_approval)
+        self.assertEqual(
+            tuple(
+                parameter.key for parameter in by_key["smoke_wont_do"].parameters
+            ),
+            ("closure_reason",),
+        )
+        self.assertEqual(
+            by_key["gate_retry_verification"].transition,
+            "verification_gate_retry_verification",
+        )
         prompts = "\n".join(edge.prompt or "" for edge in spec.edges)
         for kind in profile.work_kinds.values():
             self.assertNotIn(kind.plan, prompts)

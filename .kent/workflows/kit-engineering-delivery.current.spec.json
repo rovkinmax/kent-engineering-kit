@@ -1144,9 +1144,14 @@
       "target": "fix",
       "context": "new_session",
       "context_source": "immediate_source",
-      "prompt": "Correct invalid workflow metadata without editing production files.\n\nVerification dispatch rejected the reported workspace:\n{{.Params.reported_workspace_path}}\nReason: {{.Params.fix_context}}\n\nDelivery context (preserve the exact JSON string): {{.Params.delivery_context}}\n\nTreat Kent's current task execution root as authoritative. Resolve its canonical\nrepository root with `git rev-parse --show-toplevel`, or canonical current\ndirectory for an intentional non-Git workspace. Do not move the worktree,\nchange task artifacts, or edit code.\nThis is metadata correction only; do not create or update a Fix checkpoint.\n\nComplete with `fix_verify` and provide the canonical root as `workspace_path`,\n`task_short_id={{.TaskShortId}}`, plus the preserved `review_context`. Use\n`fix_needs_user_action` only if Kent's execution root itself is unavailable or\nambiguous. Choose `fix_wont_do` only for explicit cancellation and provide\n`closure_reason`.\n\nPreserve the exact incoming `delivery_context` JSON string on every outgoing transition that declares it; do not normalize or rewrite nested packet strings.\n\nCompletion fields from the selected graph contract (emit only the selected transition's fields; commentary is optional):\n- `fix_verify`: `workspace_path`, `review_context`, `task_short_id`, `delivery_context`.\n- `fix_needs_user_action`: `blocker_reason`, `delivery_context`.\n- `fix_wont_do`: `closure_reason`.\n- `fix_pr_merged`: `workspace_path`, `pr_url`, `branch_name`, `merge_report`.\n- `fix_replan`: `workspace_path`, `plan_path`, `work_kind`, `review_context`, `plan_change_report`, `delivery_context`.",
+      "prompt": "Correct invalid workflow metadata without editing production files.\n\nVerification dispatch rejected the reported workspace:\n{{.Params.reported_workspace_path}}\nReason: {{.Params.fix_context}}\n\nDelivery context (preserve the exact JSON string): {{.Params.delivery_context}}\n\n\nThe reliability-v1 dispatch producer supplied\nthe canonical, native-qualified `workspace_path`:\n{{.Params.workspace_path}}\nUse that exact value unchanged. Treat `reported_workspace_path` only as the\nrejected input for diagnosis; do not resolve from it, replace the producer-owned\nroot, or derive identity from the current directory.\n\nDo not edit production code.\nThis is metadata correction only; do not create or update a Fix checkpoint.\nThe original rejected path and reason are already preserved in the\n`reported_workspace_path` and `fix_context` inputs; retain those exact source\nlocators. Update `review_context` only through the qualified project-owned\nroute, preserving its required envelope and every opaque field byte-for-byte.\nAdd only bounded references to those original inputs and the metadata\ncorrection when the project contract permits it. Do not rewrite, reserialize,\nor reshape an opaque packet, or emit undeclared fields.\n\nComplete with `fix_verify` and provide the unchanged producer-owned root as `workspace_path`,\n`task_short_id={{.TaskShortId}}`, plus refreshed `review_context`. Use\n`fix_needs_user_action` only if Kent's execution root itself is unavailable or\nambiguous. Choose `fix_wont_do` only for explicit cancellation and provide\n`closure_reason`.\n\nPreserve the exact incoming `delivery_context` JSON string on every outgoing transition that declares it; do not normalize or rewrite nested packet strings.\n\nCompletion fields from the selected graph contract (emit only the selected transition's fields; commentary is optional):\n- `fix_verify`: `workspace_path`, `review_context`, `task_short_id`, `delivery_context`.\n- `fix_needs_user_action`: `blocker_reason`, `delivery_context`.\n- `fix_wont_do`: `closure_reason`.\n- `fix_pr_merged`: `workspace_path`, `pr_url`, `branch_name`, `merge_report`.\n- `fix_replan`: `workspace_path`, `plan_path`, `work_kind`, `review_context`, `plan_change_report`, `delivery_context`.",
       "transition_description": "Reject an artifact or foreign workspace path before verification.",
       "parameters": [
+        {
+          "key": "workspace_path",
+          "description": "Repository or managed-worktree root; never an artifact directory.",
+          "purpose": "ordinary"
+        },
         {
           "key": "reported_workspace_path",
           "description": "Rejected workspace value emitted by an upstream writer.",
@@ -1229,7 +1234,7 @@
       "target": "verification_gate",
       "context": "new_session",
       "context_source": "immediate_source",
-      "prompt": "Evaluate the joined verification reports without editing files.\n\nBefore relying on shared Kit sources,\nfirst read the installed `kent-engineering-kit` skill's `SKILL.md`, then follow its source-binding\ninstructions to locate and read those sources. If the skill entrypoint, source\nbinding, or a required source is unavailable, block only the dependent action\nand continue independent work.\n\nRead `.kent/context/review.md` first and stay inside its required and\nconditionally triggered sources.\n\nOnly when this Workflow review node requires evidence, append only\nthe Gate node's own required evidence through the qualified configured\nevidence adapter, using genuine current Task/Node/Session/Step identity. When\nno evidence is required, do not append. Do not edit sources or checkpoints,\nwrite the ledger directly, append for another producer, seal or recover it,\nor make other shell writes. First-class edit tools remain disabled.\n\nWhen required, pipe one non-empty JSON object to\n`.kent/scripts/workflow-evidence-ledger append --task {{.TaskShortId}} --workspace\n<workspace>`. Set `node_key` to `verification_gate`, `evidence_type` to\n`review`, and `context.manifest_path` to `.kent/context/review.md`.\n`context.files_read` lists other project instruction files in actual read\norder; do not repeat the manifest there. Optional telemetry must be truthful;\nleave unavailable counters null. Exclude secrets or broad raw evidence.\nWhen recovering an existing record, reuse its returned sequence/hash and\ncontinue.\n\nWorkspace: {{.Params.verification_dispatch_fanout_verify.workspace_path}}\nReview context: {{.Params.verification_dispatch_fanout_verify.review_context}}\nDelivery context: {{.Params.verification_dispatch_fanout_verify.delivery_context}}\nVerification status: {{.Params.verification_status}}\nVerification report: {{.Params.verification_report}}\nStandards status: {{.Params.standards_status}}\nStandards report: {{.Params.standards_report}}\nSpecification review: not enabled by the project profile.\n\nApply the `workflow-gate` role contract. Choose a delivery transition only when\nevery enabled status is `passed` for the current authorized stage. Retain\ndownstream unverified obligations with an owner and due milestone, including\non paths without Compliance or PR. Do not relabel a previous `blocked` report:\nchanged authority requires a fresh review by its owner. A review-ready PR\ndoes not establish full business acceptance, merge/release authority, or Task\nDone. Do not poll or classify PR CI here; delivery owns CI after preparation.\n\nFor `verification_gate_needs_changes`, emit the deduplicated, dependency-ordered repair bundle\nrequired by the `workflow-gate` role contract.\n\nPreserve the project-owned `review_context` envelope and its qualified update\nroute. Where allowed, synthesize bounded results and durable report references;\ndo not impose Markdown, copy full reports, or rewrite opaque producer packets.\nReturn only fields declared by the selected transition.\nFor `verification_gate_needs_changes`, provide `workspace_path` plus `fix_context`.\nFor `verification_gate_needs_user_action`, provide `workspace_path`, `review_context`, and\n`blocker_reason`.\nFor `verification_gate_wont_do`, provide only `closure_reason`.\nFor `verification_gate_delivery_ready`, provide `workspace_path`, `review_context`, and\n`smoke_rationale`.\nReturn `delivery_context` only when the selected transition declares it. When declared, preserve the exact incoming value; do not use context copied from a previous dispatch cycle.\n\nProject policy disables runtime Smoke for this workflow.\nChoose `verification_gate_delivery_ready` and set `smoke_rationale` to the profile policy. Do not\ninvent a Smoke requirement that the project cannot execute.\n\nTechnical failures belong to an existing capable recovery owner, not\nautomatically product Fix or a user question. After approval on\n`verification_gate_needs_user_action`, every verification branch reruns. Choose `verification_gate_wont_do` only\nfor an explicit cancellation decision.\n\nCompletion fields from the selected graph contract (emit only the selected transition's fields; commentary is optional):\n- `verification_gate_needs_changes`: `workspace_path`, `fix_context`, `delivery_context`.\n- `verification_gate_needs_user_action`: `workspace_path`, `review_context`, `blocker_reason`, `delivery_context`.\n- `verification_gate_wont_do`: `closure_reason`.\n- `verification_gate_delivery_ready`: `workspace_path`, `review_context`, `smoke_rationale`, `delivery_context`.",
+      "prompt": "Evaluate the joined verification reports without editing files.\n\nBefore relying on shared Kit sources,\nfirst read the installed `kent-engineering-kit` skill's `SKILL.md`, then follow its source-binding\ninstructions to locate and read those sources. If the skill entrypoint, source\nbinding, or a required source is unavailable, block only the dependent action\nand continue independent work.\n\nRead `.kent/context/review.md` first and stay inside its required and\nconditionally triggered sources.\n\nOnly when this Workflow review node requires evidence, append only\nthe Gate node's own required evidence through the qualified configured\nevidence adapter, using genuine current Task/Node/Session/Step identity. When\nno evidence is required, do not append. Do not edit sources or checkpoints,\nwrite the ledger directly, append for another producer, seal or recover it,\nor make other shell writes. First-class edit tools remain disabled.\n\nWhen required, pipe one non-empty JSON object to\n`.kent/scripts/workflow-evidence-ledger append --task {{.TaskShortId}} --workspace\n<workspace>`. Set `node_key` to `verification_gate`, `evidence_type` to\n`review`, and `context.manifest_path` to `.kent/context/review.md`.\n`context.files_read` lists other project instruction files in actual read\norder; do not repeat the manifest there. Optional telemetry must be truthful;\nleave unavailable counters null. Exclude secrets or broad raw evidence.\nWhen recovering an existing record, reuse its returned sequence/hash and\ncontinue.\n\nWorkspace: {{.Params.verification_dispatch_fanout_verify.workspace_path}}\nReview context: {{.Params.verification_dispatch_fanout_verify.review_context}}\nDelivery context: {{.Params.verification_dispatch_fanout_verify.delivery_context}}\nVerification status: {{.Params.verification_status}}\nVerification report: {{.Params.verification_report}}\nStandards status: {{.Params.standards_status}}\nStandards report: {{.Params.standards_report}}\nSpecification review: not enabled by the project profile.\n\nApply the `workflow-gate` role contract. Choose `verification_gate_delivery_ready` or\n`smoke_required` only when every enabled status is `passed` for the\ncurrent authorized stage. A verification retry is not delivery readiness. Retain\ndownstream unverified obligations with an owner and due milestone, including\non paths without Compliance or PR. Do not relabel a previous `blocked` report:\nchanged authority requires a fresh review by its owner. A review-ready PR\ndoes not establish full business acceptance, merge/release authority, or Task\nDone. Do not poll or classify PR CI here; delivery owns CI after preparation.\n\nFor `verification_gate_needs_changes`, emit the deduplicated, dependency-ordered repair bundle\nrequired by the `workflow-gate` role contract.\n\nPreserve the project-owned `review_context` envelope and its qualified update\nroute. Where allowed, synthesize bounded results and durable report references;\ndo not impose Markdown, copy full reports, or rewrite opaque producer packets.\nReturn only fields declared by the selected transition.\nFor `verification_gate_needs_changes`, provide `workspace_path` plus `fix_context`.\nFor `verification_gate_needs_user_action`, provide `workspace_path`, `review_context`, and\n`blocker_reason`.\nFor `verification_gate_wont_do`, provide only `closure_reason`.\nFor `verification_gate_retry_verification`, provide `workspace_path` and\n`review_context`; preserve `delivery_context` only if that edge declares it.\nFor `verification_gate_delivery_ready`, provide `workspace_path`, `review_context`, and\n`smoke_rationale`.\nReturn `delivery_context` only when the selected transition declares it. When declared, preserve the exact incoming value; do not use context copied from a previous dispatch cycle.\n\nProject policy disables runtime Smoke for this workflow.\nChoose `verification_gate_delivery_ready` and set `smoke_rationale` to the profile policy. Do not\ninvent a Smoke requirement that the project cannot execute.\n\nChoose `verification_gate_retry_verification` only after bounded evidence\nidentifies the original technical blocker, an existing capable authorized\nowner's concrete resolution, changed prerequisites, and settlement of prior\nowned processes/effects. Preserve the current Task/workspace, accepted scope,\nreal attempt/spend limits, and exact incoming `delivery_context`; add bounded\nresolution references through the qualified project-owned `review_context`\nroute. The Script runs every enabled verification and review branch fresh.\nNever relabel an old `blocked` report or reuse an old PASS as current evidence.\nIf owner resolution, changed prerequisites, evidence, or settlement is absent,\ndo not retry, poll, launch a child, repair shared infrastructure, install tools,\nor invent product Fix/user authority. Technical failures belong to an existing\ncapable recovery owner. `verification_gate_needs_user_action` remains for a genuine external\naction or decision; after approval, every verification branch reruns. Choose\n`verification_gate_wont_do` only for an explicit cancellation decision.\n\nCompletion fields from the selected graph contract (emit only the selected transition's fields; commentary is optional):\n- `verification_gate_needs_changes`: `workspace_path`, `fix_context`, `delivery_context`.\n- `verification_gate_needs_user_action`: `workspace_path`, `review_context`, `blocker_reason`, `delivery_context`.\n- `verification_gate_retry_verification`: `workspace_path`, `review_context`, `delivery_context`.\n- `verification_gate_wont_do`: `closure_reason`.\n- `verification_gate_delivery_ready`: `workspace_path`, `review_context`, `smoke_rationale`, `delivery_context`.",
       "transition_description": "All direct verification branches reported; evaluate them.",
       "parameters": [],
       "assignee_selection": "configured",
@@ -1325,6 +1330,36 @@
       "assignee_selection": "configured",
       "thinking_selection": "configured",
       "requires_approval": true
+    },
+    {
+      "key": "gate_retry_verification",
+      "source": "verification_gate",
+      "transition": "verification_gate_retry_verification",
+      "target": "verification_dispatch",
+      "context": "new_session",
+      "context_source": "immediate_source",
+      "prompt": null,
+      "transition_description": "A capable owner resolved and settled a technical blocker; run fresh verification branches.",
+      "parameters": [
+        {
+          "key": "workspace_path",
+          "description": "Repository or managed-worktree root; never an artifact directory.",
+          "purpose": "ordinary"
+        },
+        {
+          "key": "review_context",
+          "description": "Implementation, fix, report, and artifact context required by verification.",
+          "purpose": "ordinary"
+        },
+        {
+          "key": "delivery_context",
+          "description": "Closed workflow-delivery-context-v1 JSON string: pre_pr, or post_pr with observed PR identity and only produced CI packets.",
+          "purpose": "ordinary"
+        }
+      ],
+      "assignee_selection": "configured",
+      "thinking_selection": "configured",
+      "requires_approval": false
     },
     {
       "key": "verification_gate_wont_do",
@@ -2059,6 +2094,66 @@
         {
           "key": "plan_change_report",
           "description": "Material replanning reason: deterministic contract drift or explicitly agent-reported findings and original authority.",
+          "purpose": "ordinary"
+        },
+        {
+          "key": "delivery_context",
+          "description": "Closed workflow-delivery-context-v1 JSON string: pre_pr, or post_pr with observed PR identity and only produced CI packets.",
+          "purpose": "ordinary"
+        }
+      ],
+      "assignee_selection": "configured",
+      "thinking_selection": "configured",
+      "requires_approval": false
+    },
+    {
+      "key": "plan_contract_revalidate",
+      "source": "plan_contract",
+      "transition": "plan_contract_revalidate",
+      "target": "plan_revalidation",
+      "context": "continue_session",
+      "context_source": "node:plan",
+      "prompt": "Revalidate the authoritative plan for {{.TaskShortId}}.\n\nRead `.kent/context/plan.md` first and stay inside its required and\nconditionally triggered sources.\n\nBefore transition, pipe one non-empty JSON object to\n`.kent/scripts/workflow-evidence-ledger append --task {{.TaskShortId}} --workspace\n<workspace>`. Set `node_key` to `plan_revalidation`, `evidence_type` to\n`plan`, and `context.manifest_path` to `.kent/context/plan.md`.\n`context.files_read` lists other project instruction files in actual read\norder; do not repeat the manifest there. Optional telemetry must be truthful;\nleave unavailable counters null. Exclude secrets or broad raw evidence.\nAppend is idempotent for the current\nSession/Step pair; on recovery, reuse the returned sequence/hash and continue.\n\nDelivery context (preserve the exact JSON string): {{.Params.delivery_context}}\n\nWorkspace: {{.Params.workspace_path}}\nPlan: {{.Params.plan_path}}\nWork kind: {{.Params.work_kind}}\nIntended route after acceptance: {{.Params.plan_route}}\nRoute context: {{.Params.plan_route_context}}\nCurrent context: {{.Params.review_context}}\nDetected plan-contract change: {{.Params.plan_change_report}}\n\nContinue the retained planning context. Re-read current task comments and exact\nauthority sources. Distinguish operational feedback that fits the accepted\ncontract from material changes to requirements, architecture, acceptance,\nsafety, or evidence. Reconcile only material changes in the authoritative\ndesign/specification/plan and cite exact human-authored task-comment IDs or\nother explicit sources. Do not edit production code or execute verification.\nPreserve still-applicable human source references and artifact pointers through\nrevalidation; explicitly identify genuine supersession. Recover accessible\noriginal messages, native answers/comments or retained native read results\nbefore asking for a decision already made. Keep the exact proposal plus human\nacceptance when that pair grants authority. An agent summary or truncated\nhistorical source cannot fill missing consent. Store durable references in\nthe authoritative plan or discoverable project-permitted report-only evidence,\nnot only `review_context`; do not repurpose `plan_route_context`.\nBefore accepting an execution plan, check the whole required lifecycle\nagainst the Task's actual authority and project profile: deterministic checks,\nruntime evidence, publication/PR/CI order and cleanup/resource preservation.\nUse accessible graph/procedure facts; do not execute those effects in Plan.\nResolve technical ordering within authorized scope yourself. Ask only for the\nexact new scope, risk, cost or authority decision, not permission to inspect or\nrepeat a decision already established. Explain known consequences of one\ndecision together; keep independent product decisions separate. If the graph\nhas no executable route, report that capability gap instead of asking the user\nto choose an ordering that the graph cannot execute.\n\nOptional bounded read-only critique may resolve a concrete decision or risk\nwhen execution disproves the approach. Routine progress, hash drift, waiting\nand repeated identical failures do not require another critique. Preserve\nmandatory project review gates; critique never substitutes for their receipts.\nWhen revalidation was triggered by deterministic drift, Resolve task-fixed storage mode with the configured qualified\n`workflow-project-memory` adapter and its `resolve-task` operation before\nchoosing a plan path, using the exact native Task/workspace binding.\nFor R2, use `check-plan` with the accepted coder selection (or null when\ndisabled) and `resolve-plan` with the supplied immutable plan_path. The\nexternal immutable accepted snapshot is authoritative; validate it and the\ncurrent working head and preserve original approval/review locators. Verify\nthe accepted work_kind is declared by the project profile.\nThe local `plan-contract.json` is a disposable cache: do not require or recreate it.\nWhen R2 resolution or accepted state is unavailable, never fall back to legacy\nstorage. Only for a Task confirmed as inventoried legacy, use its existing\n`.kent/runtime/{{.TaskShortId}}/plan-contract.json` snapshot without writing.\nCompare current plan content with the authoritative accepted snapshot. Checkbox state alone is intentionally absent from the normalized contract.\n\nChoose `plan_revalidation_review_plan` after reconciliation and provide `workspace_path`,\n`plan_path`, unchanged `work_kind`, unchanged `plan_route`,\nunchanged `plan_route_context`, `task_short_id={{.TaskShortId}}`, and\nrefreshed `review_context`. Preserve the remaining bounded Fix bundle only in\n`plan_route_context` when the route is `fix_continue`; otherwise use\n`not-applicable`. The independent Plan Review will run again before the new\nnormalized snapshot is accepted. Use `plan_revalidation_needs_user_action` with preserved\ncontext and `blocker_reason` only for a real unresolved decision or external\nauthority. Choose `plan_revalidation_wont_do` only for explicit cancellation and provide\n`closure_reason`.\n\nPreserve the exact incoming `delivery_context` JSON string on every outgoing transition that declares it; do not normalize or rewrite nested packet strings.\n\nCompletion fields from the selected graph contract (emit only the selected transition's fields; commentary is optional):\n- `plan_revalidation_review_plan`: `workspace_path`, `plan_path`, `work_kind`, `plan_route`, `plan_route_context`, `review_context`, `task_short_id`, `delivery_context`.\n- `plan_revalidation_needs_user_action`: `blocker_reason`, `workspace_path`, `plan_path`, `work_kind`, `plan_route`, `plan_route_context`, `review_context`, `task_short_id`, `delivery_context`.\n- `plan_revalidation_wont_do`: `closure_reason`.",
+      "transition_description": "The accepted plan contract requires reconciliation; return to the retained planner before any writer starts.",
+      "parameters": [
+        {
+          "key": "workspace_path",
+          "description": "Repository or managed-worktree root; never an artifact directory.",
+          "purpose": "ordinary"
+        },
+        {
+          "key": "plan_path",
+          "description": "Path to the approved implementation plan, or the literal not-applicable.",
+          "purpose": "ordinary"
+        },
+        {
+          "key": "work_kind",
+          "description": "Stable project-profile work kind selected during Plan.",
+          "purpose": "ordinary"
+        },
+        {
+          "key": "plan_route",
+          "description": "Post-review route: start, continue, verify, or fix_continue.",
+          "purpose": "ordinary"
+        },
+        {
+          "key": "plan_route_context",
+          "description": "Route-specific context; use not-applicable unless continuing a Fix bundle.",
+          "purpose": "ordinary"
+        },
+        {
+          "key": "plan_change_report",
+          "description": "Material replanning reason: deterministic contract drift or explicitly agent-reported findings and original authority.",
+          "purpose": "ordinary"
+        },
+        {
+          "key": "review_context",
+          "description": "Implementation, fix, report, and artifact context required by verification.",
+          "purpose": "ordinary"
+        },
+        {
+          "key": "task_short_id",
+          "description": "Stable human-readable Kent task short ID.",
           "purpose": "ordinary"
         },
         {
