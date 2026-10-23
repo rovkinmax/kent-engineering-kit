@@ -57,8 +57,12 @@ models, reasoning settings, tools, and delegation eligibility.
 
 Coordinate a Kent restart and reopen Desktop after global configuration changes;
 do not interrupt other active work. Use new sessions to load the adopted
-instructions and settings. Existing sessions retain their locked configuration
-and prompts.
+instructions and settings. Ordinary continuation and resume retain the current
+Session's locked configuration and prompts. Compaction or a workflow context
+reset can clear that lock; the next dispatch may load changed instructions and
+settings even when the Session ID is unchanged. Before adoption, assess those
+refresh boundaries against retained helper versions, carried values and pending
+decisions. Do not assume an existing Session permanently isolates old prompts.
 
 File installation and role configuration do **not** create, activate, or change a
 project's workflows. Installed hooks remain opt-in through project configuration.
