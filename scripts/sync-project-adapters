@@ -42,11 +42,11 @@ class CommandTemplate:
 COMMAND_TEMPLATES = {
     "prepare_ci": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-prepare-github-ci",
-        "3.0.0",
+        "3.1.0",
     ),
     "runtime_contracts": CommandTemplate(
         REPO_ROOT / "workflowkit" / "runtime.py",
-        "2.1.0",
+        "2.2.0",
     ),
     "branch_identity": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-branch-identity",
@@ -54,7 +54,7 @@ COMMAND_TEMPLATES = {
     ),
     "checkpoint": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-checkpoint",
-        "1.1.0",
+        "1.2.0",
     ),
     "evidence": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-evidence-ledger",
@@ -88,7 +88,7 @@ COMMAND_TEMPLATES = {
     ),
     "wait_ci": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-wait-github-ci",
-        "4.0.0",
+        "4.1.0",
     ),
     "dispatch": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-verification-dispatch",
@@ -96,15 +96,15 @@ COMMAND_TEMPLATES = {
     ),
     "janitor": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-task-janitor",
-        "3.0.0",
+        "3.1.0",
     ),
     "wait_pr": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-wait-github-pr",
-        "4.0.0",
+        "4.1.0",
     ),
     "github_observation": CommandTemplate(
         REPO_ROOT / "workflowkit" / "github_observation.py",
-        "1.0.0",
+        "1.1.0",
     ),
     "verify": CommandTemplate(
         REPO_ROOT / "templates" / "project" / "workflow-verify-report",
@@ -276,12 +276,12 @@ def apply_synchronization(plan: PlannedSynchronization) -> None:
 
 
 def validate_schema4_command_versions(profile: ProjectProfile) -> None:
-    legacy_runtime = (
+    prior_runtime = (
         profile.runtime_contracts_v2()
-        and not profile.runtime_contracts_v2_1()
+        and not profile.runtime_contracts_v2_2()
     )
     for key in profile.kit_managed_commands:
-        if legacy_runtime and key in V2_COMMANDS:
+        if prior_runtime and key in V2_COMMANDS:
             continue
         template = COMMAND_TEMPLATES.get(key)
         if template is None:
@@ -353,7 +353,7 @@ def plan_project_synchronization(
         if not schema4 or key in managed_command_keys:
             if (
                 schema4 and key in V2_COMMANDS
-                and not profile.runtime_contracts_v2_1()
+                and not profile.runtime_contracts_v2_2()
             ):
                 validate_project_owned_target(
                     target,

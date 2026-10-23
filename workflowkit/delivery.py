@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shlex
 import stat
+import time
 import unicodedata
 
 from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
@@ -402,6 +403,13 @@ def prepare_ci_protocol(
 def source_admission_gate(admission: dict[str, object], *,
                           project_id: str, workflow_id: str, project_root: str) -> str:
     """Render already validated deployment inputs without I/O or authority checks."""
+    if admission.get("schema") == "delivery-source-admission-v2":
+        return _source_admission_gate_v2(
+            admission,
+            project_id=project_id,
+            workflow_id=workflow_id,
+            project_root=project_root,
+        )
     canonical = json.dumps(admission, ensure_ascii=False, sort_keys=True,
                            separators=(",", ":"), allow_nan=False).encode("utf-8")
     receipt = admission["receipt_ref"]
@@ -443,6 +451,124 @@ Missing identity, source drift or incompatible retained readers requires
 preserving state and reporting the concrete gap. Do not fetch, provision,
 select another baseline or create a .todo fallback. This check is procedural,
 not an engine sandbox or a reservation against subsequent source changes.
+{SOURCE_ADMISSION_END}"""
+
+
+def admit_script_source_ingress(root, native_context, *, kent_path):
+    """Expose current native Script source admission through the delivery API."""
+    from .operations import admit_script_source_ingress as admit
+
+    return admit(root, native_context, kent_path=kent_path)
+
+
+def _source_admission_gate_v2(
+    admission: dict[str, object],
+    *,
+    project_id: str,
+    workflow_id: str,
+    project_root: str,
+) -> str:
+    """Render the closed full V2 native ingress frame; V1 remains byte-stable."""
+    expected = {
+        "schema", "receipt_ref", "primary_workspace_id", "primary_root",
+        "kit_root", "source_ref", "kit_ref", "ci_helper", "helper_bindings",
+        "binding", "ingress",
+    }
+    if set(admission) != expected:
+        raise ValueError("source admission v2 fields are invalid")
+    binding = admission["binding"]
+    ingress = admission["ingress"]
+    receipt = admission["receipt_ref"]
+    helpers = admission["helper_bindings"]
+    if not isinstance(binding, dict) or not isinstance(ingress, dict):
+        raise ValueError("source admission v2 binding or ingress is invalid")
+    if binding == {"kind": "plan-publication"}:
+        pass
+    elif (
+        set(binding) == {"kind", "installation_binding_sha256"}
+        and binding.get("kind") == "r2-installed"
+        and isinstance(binding.get("installation_binding_sha256"), str)
+    ):
+        pass
+    else:
+        raise ValueError("source admission v2 binding variant is invalid")
+    if (
+        set(ingress) != {"kind", "edge_id"}
+        or ingress.get("kind") not in {"agent-edge", "script-edge"}
+        or not isinstance(ingress.get("edge_id"), str)
+        or not ingress["edge_id"]
+    ):
+        raise ValueError("source admission v2 ingress is invalid")
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"path", "sha256"}
+        or not isinstance(receipt.get("path"), str)
+        or not isinstance(receipt.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"])
+        or not isinstance(helpers, list)
+        or any(
+            not isinstance(helper, dict)
+            or set(helper) != {"link", "target"}
+            or not isinstance(helper.get("link"), str)
+            or not isinstance(helper.get("target"), str)
+            for helper in helpers
+        )
+    ):
+        raise ValueError("source admission v2 receipt or helper binding is invalid")
+    if any(not isinstance(admission[key], str) or not admission[key]
+           for key in (
+               "primary_workspace_id", "primary_root", "kit_root",
+               "source_ref", "kit_ref", "ci_helper",
+           )):
+        raise ValueError("source admission v2 input is invalid")
+
+    frame = {
+        "project_id": project_id,
+        "workflow_id": workflow_id,
+        "source_admission": admission,
+    }
+    frame_text = json.dumps(
+        frame, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    )
+    command = [
+        "python3", str(Path(admission["kit_root"]) / "scripts/inspect-delivery-source"),
+        "--receipt", receipt["path"], "--receipt-sha256", receipt["sha256"],
+        "--project-id", project_id, "--workflow-id", workflow_id,
+        "--project-root", project_root, "--kit-root", admission["kit_root"],
+        "--primary-root", admission["primary_root"],
+        "--source-ref", admission["source_ref"], "--kit-ref", admission["kit_ref"],
+        "--ci-helper", admission["ci_helper"],
+    ]
+    for helper in sorted(helpers, key=lambda item: item["link"]):
+        command.extend(("--installed-helper", helper["link"], helper["target"]))
+    invocation = shlex.join(command) + ' --workspace "$(git rev-parse --show-toplevel)"'
+    if binding["kind"] == "r2-installed":
+        ingress_guidance = """For an admitted R2 Task, first use the qualified
+installed project-memory adapter's initialize-task interface with the actual
+Git root and inherited native Session identity. Select task-fixed mode before
+source inspection; preserve inventoried legacy Tasks unchanged."""
+    else:
+        ingress_guidance = """This is a plan-publication source admission only.
+Do not initialize an R2 Task, call project-memory, perform a CAS write, or
+create a legacy fallback."""
+    return f"""{SOURCE_ADMISSION_BEGIN}
+{frame_text}
+Published source admission comes before project-local helpers. At first
+storage ingress, use the exact mode bound by source_admission.binding.
+{ingress_guidance}
+For the admitted source, run the exact read-only guard:
+
+```sh
+{invocation}
+```
+
+Proceed only on verified admission. A receipt proves byte closure, not Task
+approval, reader compatibility or permission for an external effect. Missing
+identity, source drift or incompatible retained readers requires preserving
+state and reporting the concrete gap. Do not fetch, provision, select another
+baseline or create a .todo fallback. This check is procedural, not an engine
+sandbox or a reservation against subsequent source changes.
 {SOURCE_ADMISSION_END}"""
 
 
@@ -638,7 +764,8 @@ def observe_script_delivery_graph(
 def capture_script_producer(root: Path, *, task: str | None, native_context: dict,
                             producer_kind: str, inputs: dict[str, str],
                             result: dict[str, str], native_read,
-                            binding: dict[str, str] | None = None) -> tuple[str, bytes]:
+                            binding: dict[str, str] | None = None,
+                            github_retry_constraint: str | None = None) -> tuple[str, bytes]:
     """Actual Script adapter seam; never synthesize Agent Session/Run/Step."""
     identity = observe_script_identity(root, task, native_context, native_read=native_read)
     retained = (binding or {}).get("producer_refs")
@@ -663,7 +790,8 @@ def capture_script_producer(root: Path, *, task: str | None, native_context: dic
                 identity=identity,
             )
     return capture_producer(root, identity=identity, producer_kind=producer_kind,
-                            inputs=inputs, result=result, binding=binding)
+                            inputs=inputs, result=result, binding=binding,
+                            github_retry_constraint=github_retry_constraint)
 
 
 @contextmanager
@@ -825,15 +953,23 @@ def capture_producer(
     root: Path, *, identity: dict, producer_kind: str,
     inputs: dict[str, str], result: dict[str, str],
     binding: dict[str, str] | None = None,
+    github_retry_constraint: str | None = None,
 ) -> tuple[str, bytes]:
     """Trusted producer seam: observe native identity before calling this API.
 
     Returns a relative base locator and the exact bytes to print only after both
     immutable artifacts have passed durable publication/readback.
     """
+    identity = _packet_identity(root, identity)
+    bound = _capture_retry_binding(
+        root,
+        identity=identity,
+        binding=binding,
+        github_retry_constraint=github_retry_constraint,
+    )
     identity, _, name, locator, raw, emitted = _prepare_producer_artifacts(
         root, identity=identity, producer_kind=producer_kind, inputs=inputs,
-        result=result, binding=binding,
+        result=result, binding=bound,
     )
     _publish_producer_artifacts(root, identity, name, raw, emitted)
     return locator, emitted
@@ -894,6 +1030,10 @@ def reconstruct_producer(root: Path, locator: str, *, identity: dict,
             raise ValueError("invalid producer kind")
         for key in ("inputs", "result", "binding"):
             _packet_strings(base[key], key)
+        if "github_retry_constraint" in base["binding"]:
+            _parse_github_retry_constraint(
+                base["binding"]["github_retry_constraint"]
+            )
         _packet_value_identity(base, identity)
         if packet_json(base) != raw:
             raise ValueError("noncanonical producer artifact")
@@ -934,6 +1074,239 @@ def _producer_ancestry(
                 raise ValueError("invalid nested producer references")
             pending.extend(refs)
     return producers, inspected
+
+
+def _parse_github_retry_constraint(value: object) -> dict:
+    from .runtime import parse_canonical_json, validate_github_retry_constraint
+
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 1024:
+        raise ValueError("invalid GitHub provider retry binding")
+    try:
+        parsed = parse_canonical_json(
+            value, label="GitHub provider retry binding", max_bytes=1024,
+        )
+        return validate_github_retry_constraint(parsed)
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid GitHub provider retry binding") from error
+
+
+def _historical_provider_failure(producer: dict) -> bool:
+    """Fail closed for legacy terminal provider failures lacking timing."""
+    kind = producer.get("producer_kind")
+    result = producer.get("result")
+    if not isinstance(result, dict):
+        return False
+    transition = result.get("transition")
+    if kind == "wait-ci" and transition == "ci_watch_failed":
+        raw = result.get("ci_report")
+        try:
+            from .runtime import (
+                parse_canonical_json, validate_dynamic_ci_report,
+            )
+
+            report = validate_dynamic_ci_report(
+                parse_canonical_json(
+                    raw, label="historical CI provider report",
+                    max_bytes=65536,
+                )
+            )
+        except (TypeError, ValueError):
+            return True
+        return report["attempts"][-1]["reason"] in {
+            "query_failed", "query_timeout", "incomplete_observation",
+            "invalid_observation", "observation_limit",
+        }
+    if kind == "wait-pr" and transition == "merge_watch_state_changed":
+        raw = result.get("pr_report")
+        if not isinstance(raw, str):
+            return True
+        try:
+            report = packet_decode(raw.encode("utf-8"))
+        except (UnicodeError, ValueError):
+            return True
+        return report.get("reason") == "github_query_failed"
+    if kind == "prepare-ci" and transition == "ci_prepare_failed":
+        raw = result.get("ci_preparation_diagnostic")
+        if raw is None:
+            # The legacy carrier has no failure code to distinguish transport
+            # from other preparation errors, so preserve its uncertainty.
+            return True
+        try:
+            from .runtime import parse_canonical_json
+
+            diagnostic = parse_canonical_json(
+                raw, label="historical CI preparation diagnostic",
+                max_bytes=65536,
+            )
+        except (TypeError, ValueError):
+            return True
+        return (
+            not isinstance(diagnostic, dict)
+            or diagnostic.get("schema") != "workflow-ci-preparation-diagnostic-v1"
+            or diagnostic.get("code") == "github_query_failed"
+        )
+    return False
+
+
+def _producer_github_retry_constraints(producers: dict[str, dict]) -> list[dict]:
+    constraints = []
+    for producer in producers.values():
+        binding = producer.get("binding")
+        if not isinstance(binding, dict):
+            raise ValueError("producer retry binding is invalid")
+        raw = binding.get("github_retry_constraint")
+        if raw is not None:
+            constraints.append(_parse_github_retry_constraint(raw))
+        elif _historical_provider_failure(producer):
+            constraints.append({
+                "schema": "github-provider-retry-v1",
+                "provider_host": "github.com",
+                "kind": "unknown",
+            })
+    return constraints
+
+
+def _capture_retry_binding(
+    root: Path,
+    *,
+    identity: dict,
+    binding: dict[str, str] | None,
+    github_retry_constraint: str | None,
+) -> dict[str, str]:
+    from .runtime import canonical_bytes, merge_github_retry_constraints
+
+    retained = _packet_strings(binding or {}, "producer binding")
+    constraints = []
+    if "github_retry_constraint" in retained:
+        constraints.append(
+            _parse_github_retry_constraint(retained["github_retry_constraint"])
+        )
+    if github_retry_constraint is not None:
+        constraints.append(_parse_github_retry_constraint(github_retry_constraint))
+
+    reference_text = retained.get("producer_refs")
+    if reference_text is not None:
+        try:
+            reference_packet = packet_decode(reference_text.encode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise ValueError("invalid Script producer references") from error
+        references = reference_packet.get("refs")
+        if (
+            set(reference_packet) != {"refs"}
+            or not isinstance(references, list)
+            or len(references) > 64
+            or any(not isinstance(reference, str) for reference in references)
+            or len(set(references)) != len(references)
+        ):
+            raise ValueError("invalid Script producer references")
+        if references:
+            producers, _ = _producer_ancestry(
+                root, references, identity=identity,
+            )
+            constraints.extend(_producer_github_retry_constraints(producers))
+
+    merged = merge_github_retry_constraints(constraints)
+    if merged is not None:
+        retained["github_retry_constraint"] = canonical_bytes(merged).decode("utf-8")
+    return retained
+
+
+class GitHubProviderRetryBlocked(RuntimeError):
+    """Fixed safe refusal with no provider response or retry deadline."""
+
+    __slots__ = ("_state",)
+    _MESSAGE = "GitHub provider read is blocked by inherited retry state"
+
+    def __init__(self, state: str) -> None:
+        if state not in {"not_before", "unknown"}:
+            raise ValueError("invalid GitHub provider retry refusal")
+        object.__setattr__(self, "_state", state)
+        super().__init__(self._MESSAGE)
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+
+class _PreparedGitHubProviderReadGuard:
+    """Immutable in-memory restriction snapshot for pre/post-delete checks."""
+
+    __slots__ = ("_constraint_json",)
+
+    def __init__(self, constraint: dict | None) -> None:
+        from .runtime import canonical_bytes
+
+        object.__setattr__(
+            self,
+            "_constraint_json",
+            canonical_bytes(constraint) if constraint is not None else None,
+        )
+
+    def __setattr__(self, _name, _value) -> None:
+        raise AttributeError("prepared GitHub provider guard is immutable")
+
+    def __call__(self) -> None:
+        from .runtime import (
+            evaluate_github_retry_constraint, parse_canonical_json,
+        )
+
+        constraint = (
+            parse_canonical_json(
+                self._constraint_json,
+                label="prepared GitHub provider retry binding",
+                max_bytes=1024,
+            )
+            if self._constraint_json is not None
+            else None
+        )
+        state = evaluate_github_retry_constraint(
+            constraint,
+            now_unix_ms=time.time_ns() // 1_000_000,
+        )
+        if state != "clear":
+            raise GitHubProviderRetryBlocked(state)
+
+
+def prepare_github_provider_read_guard(
+    root: Path,
+    refs: list[str],
+    identity: dict,
+) -> _PreparedGitHubProviderReadGuard:
+    """Authenticate ancestry while present and return a clock-only callable.
+
+    ``identity`` is either the actual current Script observation or the
+    qualified current Agent identity projection. It is never synthesized from
+    Task values or an unrelated process environment.
+    """
+    identity = _packet_identity(root, identity)
+    if set(identity) not in (_IDENTITY_KEYS, _SCRIPT_IDENTITY_KEYS):
+        raise ValueError("GitHub provider guard requires native Agent or Script identity")
+    if (
+        not isinstance(refs, list)
+        or len(refs) > 64
+        or any(not isinstance(reference, str) for reference in refs)
+        or len(set(refs)) != len(refs)
+    ):
+        raise ValueError("invalid GitHub provider producer references")
+    if refs:
+        producers, _ = _producer_ancestry(root, refs, identity=identity)
+        constraints = _producer_github_retry_constraints(producers)
+    else:
+        constraints = []
+    from .runtime import merge_github_retry_constraints
+
+    return _PreparedGitHubProviderReadGuard(
+        merge_github_retry_constraints(constraints)
+    )
+
+
+def require_github_provider_read(
+    root: Path,
+    refs: list[str],
+    identity: dict,
+) -> None:
+    """Return only when exact inherited GitHub provider retry state is clear."""
+    prepare_github_provider_read_guard(root, refs, identity)()
 
 
 def producer_locator(commentary: str) -> str | None:
@@ -1526,6 +1899,14 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
         "native_graph_version": str(actual["expected_version"]),
         "producer_refs": packet_json({"refs": refs}).decode("utf-8"),
     }
+    from .runtime import canonical_bytes, merge_github_retry_constraints
+    inherited_retry = merge_github_retry_constraints(
+        _producer_github_retry_constraints(producers)
+    )
+    if inherited_retry is not None:
+        binding["github_retry_constraint"] = canonical_bytes(
+            inherited_retry,
+        ).decode("utf-8")
     identity, base, name, locator, raw, emitted = _prepare_producer_artifacts(
         root, identity=identity, producer_kind="pack-delivery",
         inputs={}, result=result, binding=binding,

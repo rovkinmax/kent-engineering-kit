@@ -32,3 +32,9 @@ For explicit report-only qualification, create no commit, push, PR, tag or
 release. Prove no tracked/staged writes and exact HEAD equality with a current
 published branch tip; retain that branch through qualification. Use authorized
 `report_only`/`no_pr` carriers and proceed to owned cleanup.
+
+Before each GitHub API provider child, require the qualified inherited
+provider-read guard using the exact current incoming commentary footer and
+actual native Agent/Script identity. An active or unknown retry restriction
+blocks the request and follows the existing safe failure route; it does not
+authorize a new retry, sleep, or reset of retained producer state.

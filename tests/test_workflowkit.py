@@ -142,6 +142,27 @@ def schema4_with_managed_adapter(contents: str) -> str:
 
 
 class WorkflowKitTest(unittest.TestCase):
+    def test_script_source_ingress_public_api_delegates_exactly(self) -> None:
+        import workflowkit.delivery as delivery
+
+        native_context = {"task_id": "native-task", "node_id": "source-script"}
+        expected = object()
+        with mock.patch(
+            "workflowkit.operations.admit_script_source_ingress",
+            return_value=expected,
+        ) as admit:
+            result = delivery.admit_script_source_ingress(
+                "/workspace",
+                native_context,
+                kent_path="/bin/kent",
+            )
+        self.assertIs(result, expected)
+        admit.assert_called_once_with(
+            "/workspace",
+            native_context,
+            kent_path="/bin/kent",
+        )
+
     def test_test_classes_do_not_shadow_methods(self) -> None:
         duplicates = []
         for path in sorted((REPO_ROOT / "tests").glob("test_*.py")):
@@ -258,6 +279,69 @@ class WorkflowKitTest(unittest.TestCase):
         altered = {**admission, "installation_binding_sha256": "c" * 64}
         self.assertNotEqual(gate, source_admission_gate(altered, **arguments))
         self.assertIn("--receipt-sha256 " + "a" * 64, gate)
+
+    def test_source_admission_v2_gate_carries_exact_full_ingress_frame(self) -> None:
+        from workflowkit.delivery import (
+            SOURCE_ADMISSION_BEGIN, SOURCE_ADMISSION_END, source_admission_gate,
+        )
+
+        admission = {
+            "schema": "delivery-source-admission-v2",
+            "receipt_ref": {"path": "/private/receipt.json", "sha256": "a" * 64},
+            "primary_workspace_id": "workspace-native",
+            "primary_root": "/project",
+            "kit_root": "/kit",
+            "source_ref": "refs/remotes/origin/main",
+            "kit_ref": "refs/remotes/origin/main",
+            "ci_helper": "/home/.kent/bin/kent-prepare-github-ci",
+            "helper_bindings": [{
+                "link": "/home/.kent/bin/kent-project-memory",
+                "target": "/kit/.kent/scripts/workflow-project-memory",
+            }],
+            "binding": {"kind": "plan-publication"},
+            "ingress": {"kind": "script-edge", "edge_id": "edge-1"},
+        }
+        arguments = {
+            "project_id": "project-native",
+            "workflow_id": "workflow-native",
+            "project_root": "/project",
+        }
+        gate = source_admission_gate(admission, **arguments)
+        lines = gate.splitlines()
+        self.assertEqual(lines[0], SOURCE_ADMISSION_BEGIN)
+        self.assertEqual(lines[-1], SOURCE_ADMISSION_END)
+        expected_frame = {
+            "project_id": arguments["project_id"],
+            "workflow_id": arguments["workflow_id"],
+            "source_admission": admission,
+        }
+        self.assertEqual(json.loads(lines[1]), expected_frame)
+        self.assertEqual(
+            lines[1],
+            json.dumps(
+                expected_frame, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        self.assertNotIn("source_admission_sha256", lines[1])
+        self.assertIn("Do not initialize an R2 Task", gate)
+        self.assertIn("--receipt-sha256 " + "a" * 64, gate)
+
+        r2_admission = {
+            **admission,
+            "binding": {
+                "kind": "r2-installed",
+                "installation_binding_sha256": "b" * 64,
+            },
+            "ingress": {"kind": "agent-edge", "edge_id": "edge-2"},
+        }
+        r2_gate = source_admission_gate(r2_admission, **arguments)
+        self.assertEqual(
+            json.loads(r2_gate.splitlines()[1])["source_admission"],
+            r2_admission,
+        )
+        self.assertIn("initialize-task", r2_gate)
+        self.assertNotEqual(gate, r2_gate)
 
 
     def cleanup_profile(self, *, managed: bool, published: bool) -> ProjectProfile:
@@ -5014,7 +5098,7 @@ class WorkflowKitTest(unittest.TestCase):
                 )
             )
 
-    def test_schema_four_runtime_and_source_ci_current_family_versions(self) -> None:
+    def test_schema_four_runtime_and_source_ci_previous_family_versions(self) -> None:
         contents = self.source_ci_profile_contents().replace(
             "[policies]\n",
             '[policies]\ndelivery_reliability = "v1"\n',
@@ -5031,10 +5115,44 @@ class WorkflowKitTest(unittest.TestCase):
 
         profile = self.load_schema4_profile(lambda _: contents)
         self.assertTrue(profile.runtime_contracts_v2_1())
+        self.assertFalse(profile.runtime_contracts_v2_2())
         self.assertTrue(profile.source_ci_contract_v3())
         self.assertEqual(profile.delivery_reliability_policy(), "v1")
         loader = SourceFileLoader(
             "sync_project_adapters_current_family_test",
+            str(REPO_ROOT / "scripts/sync-project-adapters"),
+        )
+        module_spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.assertIsNotNone(module_spec)
+        if module_spec is None:
+            raise AssertionError("could not load the adapter synchronizer")
+        synchronizer = importlib.util.module_from_spec(module_spec)
+        sys.modules[loader.name] = synchronizer
+        loader.exec_module(synchronizer)
+        synchronizer.validate_schema4_command_versions(profile)
+
+    def test_schema_four_runtime_and_source_ci_current_family_versions(self) -> None:
+        contents = self.source_ci_profile_contents().replace(
+            "[policies]\n",
+            '[policies]\ndelivery_reliability = "v1"\n',
+        )
+        for old, new in (
+            ('runtime_contracts = "2.0.0"', 'runtime_contracts = "2.2.0"'),
+            ('evidence = "2.0.0"', 'evidence = "2.1.0"'),
+            ('janitor = "2.0.0"', 'janitor = "3.1.0"'),
+            ('wait_pr = "3.0.0"', 'wait_pr = "4.1.0"'),
+            ('wait_ci = "3.0.0"', 'wait_ci = "4.1.0"'),
+            ('github_observation = "1.0.0"', 'github_observation = "1.1.0"'),
+            ('prepare_ci = "2.0.0"', 'prepare_ci = "3.1.0"'),
+        ):
+            contents = contents.replace(old, new)
+
+        profile = self.load_schema4_profile(lambda _: contents)
+        self.assertTrue(profile.runtime_contracts_v2_1())
+        self.assertTrue(profile.runtime_contracts_v2_2())
+        self.assertTrue(profile.source_ci_contract_v3())
+        loader = SourceFileLoader(
+            "sync_project_adapters_d15_family_test",
             str(REPO_ROOT / "scripts/sync-project-adapters"),
         )
         module_spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -6206,11 +6324,12 @@ class WorkflowKitTest(unittest.TestCase):
     ) -> None:
         contents = self.schema4_runtime_v2_contents()
         for old, new in (
-            ('runtime_contracts = "2.0.0"', 'runtime_contracts = "2.1.0"'),
+            ('runtime_contracts = "2.0.0"', 'runtime_contracts = "2.2.0"'),
             ('evidence = "2.0.0"', 'evidence = "2.1.0"'),
-            ('janitor = "2.0.0"', 'janitor = "3.0.0"'),
-            ('wait_pr = "3.0.0"', 'wait_pr = "4.0.0"'),
-            ('wait_ci = "3.0.0"', 'wait_ci = "4.0.0"'),
+            ('janitor = "2.0.0"', 'janitor = "3.1.0"'),
+            ('wait_pr = "3.0.0"', 'wait_pr = "4.1.0"'),
+            ('wait_ci = "3.0.0"', 'wait_ci = "4.1.0"'),
+            ('github_observation = "1.0.0"', 'github_observation = "1.1.0"'),
         ):
             contents = contents.replace(old, new)
         root, profile = self.create_schema4_sync_project(
@@ -6232,6 +6351,43 @@ class WorkflowKitTest(unittest.TestCase):
             },
             set(profile.kit_managed_commands),
         )
+
+    def test_sync_schema4_runtime_v2_1_preserves_previous_command_sources(
+        self,
+    ) -> None:
+        contents = self.schema4_runtime_v2_contents()
+        for old, new in (
+            ('runtime_contracts = "2.0.0"', 'runtime_contracts = "2.1.0"'),
+            ('evidence = "2.0.0"', 'evidence = "2.1.0"'),
+            ('janitor = "2.0.0"', 'janitor = "3.0.0"'),
+            ('wait_pr = "3.0.0"', 'wait_pr = "4.0.0"'),
+            ('wait_ci = "3.0.0"', 'wait_ci = "4.0.0"'),
+        ):
+            contents = contents.replace(old, new)
+        root, profile = self.create_schema4_sync_project(
+            lambda _: contents,
+        )
+        expected = {}
+        for key in profile.kit_managed_commands:
+            target = root / profile.command(key)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"pinned runtime 2.1 source: {key}\n")
+            target.chmod(0o755)
+            expected[key] = target.read_bytes()
+
+        result = self.run_sync_project_adapters(root, update=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            {
+                item["command"] for item in payload["commands"]
+                if item["status"] == "project-owned"
+            } & set(profile.kit_managed_commands),
+            set(profile.kit_managed_commands),
+        )
+        for key, content in expected.items():
+            self.assertEqual((root / profile.command(key)).read_bytes(), content)
 
     def test_sync_schema4_version_mismatch_does_not_write(self) -> None:
         root, profile = self.create_schema4_sync_project(
@@ -6378,7 +6534,7 @@ class WorkflowKitTest(unittest.TestCase):
                 )
                 .replace(
                     'dispatch = "1.0.0"\n',
-                    'dispatch = "1.0.0"\nwait_pr = "4.0.0"\n',
+                    'dispatch = "1.0.0"\nwait_pr = "4.1.0"\n',
                 )
                 .replace(
                     'wait_pr = ".kent/scripts/workflow-wait-github-pr"',

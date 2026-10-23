@@ -16,6 +16,14 @@ fresh PR-target check before treating merged cleanup as successful.
 Do not append standalone evidence before it, after seal or for a blocker;
 retain preflight/blocker observations in existing Task records.
 
+Before retiring the root, the Janitor must authenticate current commentary
+refs and producer ancestry, then prepare the immutable GitHub provider-read
+guard while all required artifacts are still available. Invoke that
+clock-only guard immediately before every later GitHub API child, including
+after deletion; it must not reread the retired root. An active or unknown
+restriction means no request and no automatic retry or new artifact. Preserve
+the existing safe failure route and exact producer bytes.
+
 ## Terminal preparation
 
 Read back retained authority outside the retiring root. Reuse adequate Task

@@ -52,22 +52,36 @@ RELEASE_TOPOLOGY_ADOPTIONS = {
 }
 WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
-RUNTIME_CONTRACT_VERSION = "2.1.0"
+RUNTIME_CONTRACT_VERSION = "2.2.0"
+PREVIOUS_RUNTIME_CONTRACT_VERSION = "2.1.0"
 LEGACY_RUNTIME_CONTRACT_VERSION = "2.0.0"
 VERIFY_COMMAND_VERSION = "2.0.0"
-CHECKPOINT_VERSION = "1.1.0"
-PREPARE_CI_VERSION = "3.0.0"
+CHECKPOINT_VERSION = "1.2.0"
+PREVIOUS_CHECKPOINT_VERSION = "1.1.0"
+PREPARE_CI_VERSION = "3.1.0"
+PREVIOUS_PREPARE_CI_VERSION = "3.0.0"
 LEGACY_PREPARE_CI_VERSION = "2.0.0"
-JANITOR_VERSION = "3.0.0"
+JANITOR_VERSION = "3.1.0"
+PREVIOUS_JANITOR_VERSION = "3.0.0"
 LEGACY_JANITOR_VERSION = "2.0.0"
-WAIT_CI_VERSION = "4.0.0"
+WAIT_CI_VERSION = "4.1.0"
+PREVIOUS_WAIT_CI_VERSION = "4.0.0"
 LEGACY_WAIT_CI_VERSION = "3.0.0"
-WAIT_PR_VERSION = "4.0.0"
+WAIT_PR_VERSION = "4.1.0"
+PREVIOUS_WAIT_PR_VERSION = "4.0.0"
 LEGACY_WAIT_PR_VERSION = "3.0.0"
-GITHUB_OBSERVATION_VERSION = "1.0.0"
+GITHUB_OBSERVATION_VERSION = "1.1.0"
+PREVIOUS_GITHUB_OBSERVATION_VERSION = "1.0.0"
+RUNTIME_EVIDENCE_VERSION = "2.1.0"
 SUPPORTED_RUNTIME_CONTRACT_VERSIONS = {
     LEGACY_RUNTIME_CONTRACT_VERSION,
+    PREVIOUS_RUNTIME_CONTRACT_VERSION,
     RUNTIME_CONTRACT_VERSION,
+}
+SUPPORTED_PREPARE_CI_VERSIONS = {
+    LEGACY_PREPARE_CI_VERSION,
+    PREVIOUS_PREPARE_CI_VERSION,
+    PREPARE_CI_VERSION,
 }
 RUNTIME_CONTRACT_COMMANDS = {
     "runtime_contracts",
@@ -651,7 +665,7 @@ class ProjectProfile:
         runtime_version = self.command_versions.get("runtime_contracts")
         if "prepare_ci" in managed_commands and (
             self.command_versions.get("prepare_ci")
-            not in {PREPARE_CI_VERSION, LEGACY_PREPARE_CI_VERSION}
+            not in SUPPORTED_PREPARE_CI_VERSIONS
         ):
             raise SpecError("prepare_ci adoption has an unsupported command version")
         runtime_versions = {
@@ -670,6 +684,9 @@ class ProjectProfile:
                     "contract command version"
                 )
             current_family = runtime_version == RUNTIME_CONTRACT_VERSION
+            previous_family = (
+                runtime_version == PREVIOUS_RUNTIME_CONTRACT_VERSION
+            )
             expected = set(RUNTIME_CONTRACT_COMMANDS)
             if self.capabilities.get("managed_worktrees", False):
                 expected.add("janitor")
@@ -688,22 +705,42 @@ class ProjectProfile:
                 "runtime_contracts": runtime_version,
                 "verify": VERIFY_COMMAND_VERSION,
                 "evidence": (
-                    RUNTIME_CONTRACT_VERSION
-                    if current_family else LEGACY_RUNTIME_CONTRACT_VERSION
+                    RUNTIME_EVIDENCE_VERSION
+                    if current_family or previous_family
+                    else LEGACY_RUNTIME_CONTRACT_VERSION
                 ),
-                "janitor": JANITOR_VERSION if current_family else LEGACY_JANITOR_VERSION,
-                "wait_ci": WAIT_CI_VERSION if current_family else LEGACY_WAIT_CI_VERSION,
-                "wait_pr": WAIT_PR_VERSION if current_family else LEGACY_WAIT_PR_VERSION,
-                OBSERVATION_COMMAND: GITHUB_OBSERVATION_VERSION,
+                "janitor": (
+                    JANITOR_VERSION if current_family else
+                    PREVIOUS_JANITOR_VERSION if previous_family else
+                    LEGACY_JANITOR_VERSION
+                ),
+                "wait_ci": (
+                    WAIT_CI_VERSION if current_family else
+                    PREVIOUS_WAIT_CI_VERSION if previous_family else
+                    LEGACY_WAIT_CI_VERSION
+                ),
+                "wait_pr": (
+                    WAIT_PR_VERSION if current_family else
+                    PREVIOUS_WAIT_PR_VERSION if previous_family else
+                    LEGACY_WAIT_PR_VERSION
+                ),
+                OBSERVATION_COMMAND: (
+                    GITHUB_OBSERVATION_VERSION
+                    if current_family
+                    else PREVIOUS_GITHUB_OBSERVATION_VERSION
+                ),
             }
             if "prepare_ci" in managed_commands:
                 expected_versions["prepare_ci"] = (
-                    PREPARE_CI_VERSION
-                    if current_family else LEGACY_PREPARE_CI_VERSION
+                    PREPARE_CI_VERSION if current_family else
+                    PREVIOUS_PREPARE_CI_VERSION if previous_family else
+                    LEGACY_PREPARE_CI_VERSION
                 )
             if "checkpoint" in managed_commands:
                 expected_versions["checkpoint"] = (
-                    CHECKPOINT_VERSION if current_family else "1.0.0"
+                    CHECKPOINT_VERSION if current_family else
+                    PREVIOUS_CHECKPOINT_VERSION if previous_family else
+                    "1.0.0"
                 )
             for key in sorted(expected):
                 if self.command_versions.get(key) != expected_versions[key]:
@@ -885,20 +922,31 @@ class ProjectProfile:
             self.schema_version == 4
             and "prepare_ci" in self.kit_managed_commands
             and self.command_versions.get("prepare_ci")
-            in {PREPARE_CI_VERSION, LEGACY_PREPARE_CI_VERSION}
+            in SUPPORTED_PREPARE_CI_VERSIONS
         )
 
     def runtime_contracts_v2_1(self) -> bool:
         return (
             self.runtime_contracts_v2()
             and self.command_versions.get("runtime_contracts")
-            == RUNTIME_CONTRACT_VERSION
+            in {
+                PREVIOUS_RUNTIME_CONTRACT_VERSION,
+                RUNTIME_CONTRACT_VERSION,
+            }
         )
 
     def source_ci_contract_v3(self) -> bool:
         return (
             self.source_ci_contract()
-            and self.command_versions.get("prepare_ci") == PREPARE_CI_VERSION
+            and self.command_versions.get("prepare_ci")
+            in {PREVIOUS_PREPARE_CI_VERSION, PREPARE_CI_VERSION}
+        )
+
+    def runtime_contracts_v2_2(self) -> bool:
+        return (
+            self.runtime_contracts_v2()
+            and self.command_versions.get("runtime_contracts")
+            == RUNTIME_CONTRACT_VERSION
         )
 
     def command(self, key: str) -> str:

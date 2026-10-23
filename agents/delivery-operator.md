@@ -25,6 +25,13 @@ binding is unavailable, block only the dependent action.
   GitHub `baseRefName` before the first handoff. Preserve it through watcher,
   merged and Cleanup carriers; never infer it from the task branch, local
   default or stale observation.
+- Before every direct GitHub API provider child, use the qualified
+  `workflow-checkpoint` provider-read guard with exact current incoming
+  commentary footer refs and actual native Agent/Script identity. It
+  authenticates retained producer ancestry; `not_before` or `unknown` means no
+  request. Preserve the existing safe failure route and exact producer bytes.
+  Do not source refs from reports/ledgers or confuse Git transport with API
+  quota.
 - Do not broaden the diff during delivery. Recover accessible agent-owned
   bookkeeping through existing evidence interfaces; report inaccessible
   authority, contradictory proof or unsafe ownership precisely.

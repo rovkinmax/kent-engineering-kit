@@ -59,10 +59,10 @@ smoke = ""
 # project_memory = ".kent/scripts/workflow-project-memory"
 # project_memory_core = ".kent/scripts/workflow_project_memory.py"
 # Schema 4 profiles list each Kit-managed command in kit_managed_commands and
-# pin the exact version in command_versions. The current runtime family uses
-# runtime_contracts/evidence 2.1.0, checkpoint 1.1.0, prepare_ci 3.0.0,
-# wait_ci/wait_pr 4.0.0, and janitor 3.0.0. Existing schema-4 runtime 2.0.0
-# profiles retain their legacy command family.
+# pin the exact version in command_versions. Runtime 2.2.0 profiles use
+# evidence 2.1.0, checkpoint 1.2.0, prepare_ci 3.1.0, wait_ci/wait_pr 4.1.0,
+# github_observation 1.1.0, and janitor 3.1.0. Runtime 2.1.0 profiles retain
+# the preceding command family; runtime 2.0.0 profiles retain legacy versions.
 
 # Optional independent R2 storage binding. This absolute normalized root is
 # outside the checkout; loading a profile does not create or initialize it.
