@@ -156,6 +156,18 @@ readers validate the stored base by its own schema and compare Task/root
 binding, not the historical Run against the current owner. Packet footer,
 checkpoint and R2 document formats are unchanged.
 
+The explicit Script CI archive path appends a closed
+`schema_version=3`, `record_kind=script_ci_archive_v1` row. It binds the
+native Script identity, Task/workspace, sequence/predecessor, validated CI
+report digest and its content-addressed artifact locator. The row participates
+in evidence-chain validation and hashing but is not an ordinary Agent event,
+final-event count or telemetry sample; it cannot replace the required genuine
+final ordinary event before a terminal seal. The archive command uses its
+explicit `--script-ci-v1` boundary and a qualified in-process reader provider.
+Stdin cannot supply reader proof, graph identity or a deployment receipt.
+Schema-1/2 evidence and the legacy CI archive path remain readable without
+rewriting historical bytes.
+
 Retention selects an existing verified v1 receipt or exact `.preparing-HASH`
 publication before constructing a new v2 receipt. It preserves the original
 confirm/hash, including when preparation stopped before `receipt.json`.
