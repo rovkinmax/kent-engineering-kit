@@ -25,6 +25,16 @@ JSON_INPUT_TIMEOUT_SECONDS = 2.0
 MAX_JSON_INPUT_BYTES = 1024 * 1024
 
 
+class GitHubProviderReadBlocked(RuntimeError):
+    """A guard refusal with no serialized deadline or provider detail."""
+
+    code = "query_failed"
+
+    def __init__(self, state: str = "unknown") -> None:
+        self.state = state if state in {"not_before", "unknown"} else "unknown"
+        super().__init__("github_provider_retry_blocked")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Write and validate ignored task-local workflow checkpoints."
@@ -36,6 +46,12 @@ def parse_args() -> argparse.Namespace:
         subparser.add_argument("--stage", required=True, choices=STAGES)
         subparser.add_argument("--task", required=True)
         subparser.add_argument("--workspace", type=Path, default=Path.cwd())
+    provider_read = subparsers.add_parser(
+        "require-github-provider-read",
+        help="Check inherited GitHub retry constraints before a provider read.",
+    )
+    provider_read.add_argument("--task", required=True)
+    provider_read.add_argument("--workspace", type=Path, default=Path.cwd())
     packing = subparsers.add_parser(
         "pack-delivery",
         help="Pack exact producer-owned strings into native completion JSON; never submit it.",
@@ -299,8 +315,8 @@ def _delivery_protocol_profile_enabled(root: Path) -> bool:
     ) or bool(
         isinstance(versions, dict)
         and (
-            versions.get("runtime_contracts") == "2.1.0"
-            or versions.get("prepare_ci") == "3.0.0"
+            versions.get("runtime_contracts") in {"2.1.0", "2.2.0"}
+            or versions.get("prepare_ci") in {"3.0.0", "3.1.0"}
         )
     )
 
@@ -339,6 +355,7 @@ def current_script_delivery_protocol(
         "target_required": target_required,
         "context_schema": context_schema,
         "node_key": current_nodes[0]["key"],
+        "identity": identity,
     }
 
 
@@ -377,7 +394,14 @@ def delivery_reliability_enabled(root: Path) -> bool:
     return policy == "v1"
 
 
-def emit_producer_result(root: Path, payload: dict, result, producer_kind: str) -> bytes:
+def emit_producer_result(
+    root: Path,
+    payload: dict,
+    result,
+    producer_kind: str,
+    *,
+    github_retry_constraint: str | None = None,
+) -> bytes:
     """Shared Script adapter; return bytes, never print or complete a Task.
 
     Supply original serialized bytes (or text) when legacy wire formatting must
@@ -392,6 +416,11 @@ def emit_producer_result(root: Path, payload: dict, result, producer_kind: str) 
         return raw
     if not isinstance(payload, dict):
         raise ValueError("producer workflow input must be an object")
+    if github_retry_constraint is not None and not isinstance(
+        github_retry_constraint,
+        str,
+    ):
+        raise ValueError("GitHub provider retry constraint must be canonical JSON")
     module = delivery_module()
     output = module.packet_decode(raw)
     inputs = {key: value for key, value in payload.items()
@@ -407,12 +436,101 @@ def emit_producer_result(root: Path, payload: dict, result, producer_kind: str) 
                 sort_keys=True,
                 separators=(",", ":"),
             )
-    _, emitted = module.capture_script_producer(
-        root, task=None, native_context=payload.get("_kent"),
-        producer_kind=producer_kind, inputs=inputs, result=output,
-        native_read=delivery_native_read, binding=binding,
-    )
+    capture_args = {
+        "root": root,
+        "task": None,
+        "native_context": payload.get("_kent"),
+        "producer_kind": producer_kind,
+        "inputs": inputs,
+        "result": output,
+        "native_read": delivery_native_read,
+        "binding": binding,
+    }
+    if github_retry_constraint is not None:
+        capture_args["github_retry_constraint"] = github_retry_constraint
+    _, emitted = module.capture_script_producer(**capture_args)
     return emitted
+
+
+def _validated_provider_refs(refs: object) -> list[str]:
+    if (
+        not isinstance(refs, list)
+        or len(refs) > 64
+        or any(not isinstance(reference, str) for reference in refs)
+        or len(refs) != len(set(refs))
+    ):
+        raise ValueError("invalid GitHub provider producer references")
+    return refs
+
+
+def provider_refs_from_payload(root: Path, payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub provider guard input must be an object")
+    commentary = payload.get("commentary")
+    if commentary is None:
+        return []
+    if not isinstance(commentary, str):
+        raise ValueError("GitHub provider commentary is invalid")
+    module = delivery_module()
+    locator = module.producer_locator(commentary)
+    return [] if locator is None else [locator]
+
+
+def require_github_provider_refs(
+    root: Path,
+    refs: object,
+    identity: dict,
+) -> None:
+    module = delivery_module()
+    require_read = getattr(module, "require_github_provider_read", None)
+    if not callable(require_read):
+        raise GitHubProviderReadBlocked()
+    try:
+        require_read(root, _validated_provider_refs(refs), identity)
+    except BaseException as error:
+        blocked_type = getattr(module, "GitHubProviderRetryBlocked", None)
+        if isinstance(blocked_type, type) and isinstance(error, blocked_type):
+            raise GitHubProviderReadBlocked(
+                getattr(error, "state", "unknown"),
+            ) from None
+        raise
+
+
+def require_github_provider_read(
+    root: Path,
+    payload: object,
+    identity: dict,
+) -> None:
+    require_github_provider_refs(
+        root,
+        provider_refs_from_payload(root, payload),
+        identity,
+    )
+
+
+def is_github_provider_read_blocked(error: BaseException) -> bool:
+    return isinstance(error, GitHubProviderReadBlocked)
+
+
+def require_github_provider_read_command(root: Path, task: str) -> int:
+    if not TASK_KEY.fullmatch(task):
+        raise ValueError("invalid task key")
+    request = read_json_input("require-github-provider-read")
+    if not isinstance(request, dict) or set(request) != {"refs"}:
+        raise ValueError("invalid GitHub provider guard request")
+    refs = _validated_provider_refs(request["refs"])
+    identity = current_delivery_identity(root, task)
+    try:
+        require_github_provider_refs(root, refs, identity)
+    except GitHubProviderReadBlocked as error:
+        sys.stdout.write(json.dumps(
+            {"allowed": False, "state": error.state},
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n")
+        return 3
+    sys.stdout.write('{"allowed":true}\n')
+    return 0
 
 
 def pack_delivery_command(root: Path, task: str) -> int:
@@ -936,6 +1054,8 @@ def main() -> int:
         return pack_delivery_command(root, args.task)
     if args.command == "derive-feedback-decision":
         return derive_feedback_decision_command(root, args.task)
+    if args.command == "require-github-provider-read":
+        return require_github_provider_read_command(root, args.task)
     path = checkpoint_path(root, args.task, args.stage)
 
     if args.command == "write":

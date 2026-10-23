@@ -487,6 +487,107 @@ def parse_canonical_json(
     return value
 
 
+GITHUB_PROVIDER_RETRY_CONSTRAINT_SCHEMA = "github-provider-retry-v1"
+_MAX_GITHUB_RETRY_UNIX_MS = 9_223_372_036_854_775_807
+
+
+def validate_github_retry_constraint(value: object) -> dict[str, Any]:
+    """Validate the closed, non-secret GitHub provider retry binding."""
+    if not isinstance(value, Mapping):
+        raise RuntimeContractError("GitHub provider retry constraint must be an object")
+    data = dict(value)
+    kind = data.get("kind")
+    expected = (
+        {"schema", "provider_host", "kind", "not_before_unix_ms"}
+        if kind == "not_before"
+        else {"schema", "provider_host", "kind"}
+        if kind == "unknown"
+        else set()
+    )
+    if not expected or set(data) != expected:
+        raise RuntimeContractError("GitHub provider retry constraint fields are invalid")
+    if (
+        data["schema"] != GITHUB_PROVIDER_RETRY_CONSTRAINT_SCHEMA
+        or data["provider_host"] != "github.com"
+    ):
+        raise RuntimeContractError("GitHub provider retry constraint identity is invalid")
+    result: dict[str, Any] = {
+        "schema": GITHUB_PROVIDER_RETRY_CONSTRAINT_SCHEMA,
+        "provider_host": "github.com",
+        "kind": kind,
+    }
+    if kind == "not_before":
+        deadline = data["not_before_unix_ms"]
+        if (
+            not isinstance(deadline, int)
+            or isinstance(deadline, bool)
+            or deadline < 0
+            or deadline > _MAX_GITHUB_RETRY_UNIX_MS
+        ):
+            raise RuntimeContractError("GitHub provider retry deadline is invalid")
+        result["not_before_unix_ms"] = deadline
+    return result
+
+
+def merge_github_retry_constraints(
+    values: Iterable[object | None],
+) -> dict[str, Any] | None:
+    """Monotonically merge provider restrictions; unknown absorbs deadlines."""
+    unknown = False
+    deadline: int | None = None
+    present = False
+    for value in values:
+        if value is None:
+            continue
+        present = True
+        constraint = validate_github_retry_constraint(value)
+        if constraint["kind"] == "unknown":
+            unknown = True
+        else:
+            current = constraint["not_before_unix_ms"]
+            deadline = current if deadline is None else max(deadline, current)
+    if not present:
+        return None
+    if unknown:
+        return {
+            "schema": GITHUB_PROVIDER_RETRY_CONSTRAINT_SCHEMA,
+            "provider_host": "github.com",
+            "kind": "unknown",
+        }
+    assert deadline is not None
+    return {
+        "schema": GITHUB_PROVIDER_RETRY_CONSTRAINT_SCHEMA,
+        "provider_host": "github.com",
+        "kind": "not_before",
+        "not_before_unix_ms": deadline,
+    }
+
+
+def evaluate_github_retry_constraint(
+    value: object | None,
+    *,
+    now_unix_ms: int,
+) -> str:
+    """Pure status evaluation; production callers supply no clock override."""
+    if (
+        not isinstance(now_unix_ms, int)
+        or isinstance(now_unix_ms, bool)
+        or now_unix_ms < 0
+        or now_unix_ms > _MAX_GITHUB_RETRY_UNIX_MS
+    ):
+        raise RuntimeContractError("GitHub provider retry clock value is invalid")
+    if value is None:
+        return "clear"
+    constraint = validate_github_retry_constraint(value)
+    if constraint["kind"] == "unknown":
+        return "unknown"
+    return (
+        "not_before"
+        if now_unix_ms < constraint["not_before_unix_ms"]
+        else "clear"
+    )
+
+
 def _object(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise RuntimeContractError(f"{label} must be an object")
@@ -4577,6 +4678,7 @@ __all__ = [
     "CI_POLICY_SNAPSHOT_SCHEMA",
     "EXPECTED_CHECKS_SCHEMA",
     "EXTERNAL_CAPTURE_SCHEMA",
+    "GITHUB_PROVIDER_RETRY_CONSTRAINT_SCHEMA",
     "MAX_CANONICAL_JSON_NESTING",
     "RuntimeContractError",
     "RuntimeAuthorityBinding",
@@ -4604,10 +4706,12 @@ __all__ = [
     "classify_github_checks",
     "classify_verification_report",
     "discarded_attempt_digest",
+    "evaluate_github_retry_constraint",
     "expected_ci_checks_sha256",
     "delivery_context_fields",
     "make_dynamic_pr_feedback_cursor",
     "make_report_invalid_attempt",
+    "merge_github_retry_constraints",
     "is_ordinary_evidence_record",
     "parse_runtime_external_captures",
     "parse_canonical_json",
@@ -4624,6 +4728,7 @@ __all__ = [
     "validate_expected_ci_checks",
     "validate_ci_policy_snapshot",
     "validate_dynamic_pr_feedback_cursor",
+    "validate_github_retry_constraint",
     "validate_script_ci_archive_record",
     "validate_pr_feedback_item",
     "validate_runtime_source_envelope",

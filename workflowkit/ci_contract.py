@@ -56,10 +56,12 @@ import sys
 import time
 import tomllib
 import types
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
 from . import revision as revision_contracts
+from . import github_observation as provider_observation
+from .github_observation import ObservationError
 from .revision import (
     owned_process_group_exists,
 )
@@ -273,8 +275,8 @@ def observe_script_delivery_protocol(
     ) or (
         isinstance(command_versions, dict)
         and (
-            command_versions.get("runtime_contracts") == "2.1.0"
-            or command_versions.get("prepare_ci") == "3.0.0"
+            command_versions.get("runtime_contracts") in {"2.1.0", "2.2.0"}
+            or command_versions.get("prepare_ci") in {"3.0.0", "3.1.0"}
         )
     )
     if not current_family:
@@ -1213,7 +1215,10 @@ def run_bounded_command(
     timeout: float = PREPARE_TIMEOUT_SECONDS,
     output_limit: int = MAX_GITHUB_OUTPUT_BYTES,
     env: Mapping[str, str] | None = None,
+    provider_guard: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    if provider_guard is not None:
+        provider_guard()
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -1343,35 +1348,135 @@ def _github_bin() -> str:
     raise CiContractError("GitHub CLI was not found")
 
 
+def github_provider_read_guard(
+    root: Path,
+    payload: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> Callable[[], None]:
+    """Bind each provider read to verified incoming producer ancestry."""
+    from . import delivery as delivery_contracts
+
+    commentary = payload.get("commentary")
+    references = []
+    if commentary is not None:
+        if not isinstance(commentary, str):
+            raise CiContractError("delivery_context_invalid")
+        locator = delivery_contracts.producer_locator(commentary)
+        if locator is not None:
+            references.append(locator)
+    require_read = getattr(
+        delivery_contracts,
+        "require_github_provider_read",
+        None,
+    )
+    if not callable(require_read):
+        raise CiContractError("github_provider_guard_unavailable")
+
+    def require() -> None:
+        require_read(root, references, dict(identity))
+
+    return require
+
+
 def read_pull_request(
     workspace: Path,
     pr_url: str,
     *,
     gh_bin: str | None = None,
+    provider_guard: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    result = run_bounded_command(
-        [
-            gh_bin or _github_bin(),
-            "pr",
-            "view",
-            pr_url,
-            "--json",
-            "state,headRefOid,baseRefOid,baseRefName,headRefName,url,mergedAt,mergeCommit",
-        ],
-        cwd=workspace,
-    )
+    child_env = None
+    if provider_guard is not None:
+        child_env = os.environ.copy()
+        child_env["GH_DEBUG"] = "api"
+    command = [
+        gh_bin or _github_bin(),
+        "pr",
+        "view",
+        pr_url,
+        "--json",
+        "state,headRefOid,baseRefOid,baseRefName,headRefName,url,mergedAt,mergeCommit",
+    ]
+    try:
+        result = run_bounded_command(
+            command,
+            cwd=workspace,
+            env=child_env,
+            provider_guard=provider_guard,
+        )
+    except BoundedCommandError as error:
+        if provider_guard is None:
+            raise
+        observed_at_ns = time.time_ns()
+        retry_evidence, retry_after = provider_observation._provider_retry_metadata(
+            error.stderr,
+            now_unix_ns=observed_at_ns,
+        )
+        retry_unknown = (
+            retry_evidence is None
+            or error.code == "hard_limit"
+        )
+        raise ObservationError(
+            "github_query_failed",
+            exit_code=error.exit_code,
+            stdout=error.stdout,
+            stderr=error.stderr,
+            rate_limited=retry_evidence is True and not retry_unknown,
+            retry_after_seconds=retry_after,
+            provider_retry_unknown=retry_unknown,
+            provider_retry_captured=True,
+            provider_retry_observed_at_ns=observed_at_ns,
+        ) from error
     if result.returncode != 0:
-        raise BoundedCommandError(
+        if provider_guard is None:
+            raise BoundedCommandError(
+                "github_query_failed",
+                exit_code=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
+        observed_at_ns = time.time_ns()
+        retry_evidence, retry_after = provider_observation._provider_retry_metadata(
+            result.stderr,
+            now_unix_ns=observed_at_ns,
+        )
+        retry_unknown = retry_evidence is None
+        raise ObservationError(
             "github_query_failed",
             exit_code=result.returncode,
             stdout=result.stdout,
             stderr=result.stderr,
+            rate_limited=retry_evidence is True and not retry_unknown,
+            retry_after_seconds=retry_after,
+            provider_retry_unknown=retry_unknown,
+            provider_retry_captured=True,
+            provider_retry_observed_at_ns=observed_at_ns,
         )
     try:
         value = parse_preparation_json(result.stdout)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        if provider_guard is not None:
+            observed_at_ns = time.time_ns()
+            raise ObservationError(
+                "github_query_failed",
+                stdout=result.stdout,
+                stderr=result.stderr,
+                provider_retry_unknown=True,
+                provider_retry_captured=True,
+                provider_retry_observed_at_ns=observed_at_ns,
+            ) from error
         raise CiContractError("GitHub PR metadata is not valid JSON") from error
     if not isinstance(value, dict):
+        if provider_guard is not None:
+            observed_at_ns = time.time_ns()
+            raise ObservationError(
+                "github_query_failed",
+                stdout=result.stdout,
+                stderr=result.stderr,
+                provider_retry_unknown=True,
+                provider_retry_captured=True,
+                provider_retry_observed_at_ns=observed_at_ns,
+            )
         raise CiContractError("GitHub PR metadata must be an object")
     return value
 
@@ -2064,6 +2169,7 @@ def prepare_ci_payload(
     *,
     gh_bin: str | None = None,
     report_archiver=None,
+    provider_guard: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     payload = unwrap_delivery_context_payload(payload)
     validate_preparation_identity(payload)
@@ -2076,6 +2182,7 @@ def prepare_ci_payload(
         payload,
         gh_bin=gh_bin,
         report_archiver=report_archiver,
+        provider_guard=provider_guard,
     )
 
 
@@ -2204,6 +2311,7 @@ def _prepare_ci_payload(
     *,
     gh_bin: str | None = None,
     report_archiver=None,
+    provider_guard: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     archive_report = report_archiver or archive_ci_report
     workspace = Path(payload["workspace_path"]).resolve()
@@ -2218,7 +2326,12 @@ def _prepare_ci_payload(
         or expected_base_branch.startswith("-")
     ):
         raise CiContractError("target_branch_invalid")
-    first = read_pull_request(workspace, pr_url, gh_bin=gh_bin)
+    first = read_pull_request(
+        workspace,
+        pr_url,
+        gh_bin=gh_bin,
+        provider_guard=provider_guard,
+    )
     _validate_pr_metadata(first, payload)
     if (
         expected_base_branch is not None
@@ -2250,7 +2363,12 @@ def _prepare_ci_payload(
             pr_base_branch=expected_base_branch,
             merge_report=json.dumps(first, sort_keys=True),
         )
-    second = read_pull_request(workspace, pr_url, gh_bin=gh_bin)
+    second = read_pull_request(
+        workspace,
+        pr_url,
+        gh_bin=gh_bin,
+        provider_guard=provider_guard,
+    )
     _validate_pr_metadata(second, payload)
     if (
         expected_base_branch is not None

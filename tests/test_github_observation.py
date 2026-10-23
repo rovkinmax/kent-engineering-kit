@@ -395,7 +395,11 @@ class ProviderRetryMetadataTransportTest(unittest.TestCase):
             "sys.stdout.write('secret stdout'); "
             "sys.exit(1)"
         )
-        with self.assertRaises(ObservationError) as raised:
+        with mock.patch.object(
+            observation.time,
+            "time_ns",
+            return_value=1_000_000_000_000,
+        ), self.assertRaises(ObservationError) as raised:
             read_json(
                 sys.executable,
                 Path.cwd(),
@@ -405,10 +409,64 @@ class ProviderRetryMetadataTransportTest(unittest.TestCase):
         error = raised.exception
         self.assertTrue(error.rate_limited)
         self.assertEqual(error.retry_after_seconds, 120)
+        self.assertEqual(
+            observation.provider_retry_constraint(
+                error,
+                interval=30,
+                failure_count=1,
+            ),
+            '{"kind":"not_before","not_before_unix_ms":1120000,'
+            '"provider_host":"github.com","schema":"github-provider-retry-v1"}',
+        )
+        self.assertEqual(error._provider_retry_observed_at_ns, 1_000_000_000_000)
         safe = repr(error.as_dict())
         self.assertNotIn("secret stdout", safe)
         self.assertNotIn("SECRET response body", safe)
         self.assertNotIn("secret-marker", safe)
+        self.assertNotIn("_provider_retry_observed_at_ns", repr(error.as_dict()))
+
+    def test_captured_failure_without_timing_is_unknown_and_local_errors_are_omitted(self):
+        command = "import sys; sys.stderr.write('provider transport failed\\n'); sys.exit(1)"
+        with mock.patch.object(
+            observation.time,
+            "time_ns",
+            return_value=5_000_000_000,
+        ), self.assertRaises(ObservationError) as raised:
+            read_bytes(
+                sys.executable,
+                Path.cwd(),
+                ["-c", command],
+                capture_provider_retry=True,
+            )
+        error = raised.exception
+        self.assertEqual(
+            observation.provider_retry_constraint(
+                error,
+                interval=30,
+                failure_count=1,
+            ),
+            '{"kind":"unknown","provider_host":"github.com",'
+            '"schema":"github-provider-retry-v1"}',
+        )
+        self.assertIsNone(
+            observation.provider_retry_constraint(
+                ObservationError("query_failed"),
+                interval=30,
+                failure_count=1,
+            )
+        )
+
+    def test_provider_guard_runs_before_subprocess_creation(self):
+        blocked = RuntimeError("provider read was blocked")
+        with mock.patch.object(observation.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(RuntimeError, "provider read was blocked"):
+                read_json(
+                    sys.executable,
+                    Path.cwd(),
+                    ["-c", "pass"],
+                    provider_guard=lambda: (_ for _ in ()).throw(blocked),
+                )
+        popen.assert_not_called()
 
     def test_invalid_or_oversized_transport_never_enables_retry(self):
         trace = self.response(
