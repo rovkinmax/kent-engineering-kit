@@ -101,9 +101,12 @@
   Preserve the failing boundary, evidence and effect status, then use an
   authorized recovery route or separately scoped repair owner. Do not turn a
   transport failure into product work or an unobserved effect into success.
-- Existing and resumed sessions retain their locked system prompt and
-  execution settings. Prompt changes affect new sessions; global configuration
-  changes additionally require the documented Kent restart.
+- Ordinary continuation and resume preserve the current Session's locked system
+  prompt and execution settings. Compaction or a workflow context reset can
+  clear that lock, so the next dispatch may load changed instructions and
+  settings even with the same Session ID. Include these refresh boundaries in
+  compatibility checks with retained helpers and carried values. Global
+  configuration changes still require the documented Kent restart.
 - Resume confirms requeueing, not startup: re-read native state. Missing
   retained execution requires a supported incoming new-session recovery with
   preserved values; repeated Resume is not recovery. A pending Question is not
