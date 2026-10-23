@@ -8111,7 +8111,15 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
                     "def current_script_delivery_protocol(root, *, task, native_context):\n"
                     f"    return {{'protocol': 'legacy', 'target_required': False, "
                     f"'context_schema': 'workflow-delivery-context-v1', "
-                    f"'node_key': {'ci_watch' if source == CI_WATCH else 'merge_watch'!r}}}\n"
+                    f"'node_key': {'ci_watch' if source == CI_WATCH else 'merge_watch'!r}, "
+                    "'identity': {'task_id': 'native-task', 'task_short_id': 'TASK-1', "
+                    "'project_id': 'native-project', 'workspace_path': str(root), "
+                    "'invocation_kind': 'script', 'node_id': 'native-watcher', "
+                    "'transition_branch_key': None}}\n"
+                    "def require_github_provider_read(root, payload, identity):\n"
+                    "    assert identity['workspace_path'] == str(root)\n"
+                    "def is_github_provider_read_blocked(error):\n"
+                    "    return False\n"
                     "def emit_producer_result(root, payload, result, producer_kind):\n"
                     "    path = Path(root) / 'capture-calls'\n"
                     "    with path.open('a') as output:\n"
@@ -8131,6 +8139,7 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
                 )
                 self.assertNotEqual(raw.returncode, 0)
                 self.assertEqual(raw.stdout, "")
+                self.assertIn("producer_capture_failed", raw.stderr)
                 self.assertEqual(
                     capture_calls.read_text().splitlines(),
                     ["wait-ci" if source == CI_WATCH else "wait-pr"],

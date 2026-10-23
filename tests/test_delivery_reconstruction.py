@@ -281,6 +281,262 @@ class ProducerTransportTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 producer_locator(text)
 
+    def _script_identity(self):
+        return {
+            key: self.identity[key]
+            for key in ("task_id", "task_short_id", "project_id", "workspace_path")
+        } | {
+            "invocation_kind": "script",
+            "node_id": "janitor",
+            "transition_branch_key": None,
+        }
+
+    def _retry_constraint(self, kind, deadline=None):
+        value = {
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": kind,
+        }
+        if kind == "not_before":
+            value["not_before_unix_ms"] = deadline
+        from workflowkit.runtime import canonical_bytes
+        return canonical_bytes(value).decode("utf-8")
+
+    def test_capture_and_pack_merge_constraints_without_rewriting_outputs(self):
+        import workflowkit.delivery as delivery
+
+        earlier, earlier_bytes = self.capture(
+            github_retry_constraint=self._retry_constraint("not_before", 1000),
+        )
+        later, later_bytes = self.capture(
+            github_retry_constraint=self._retry_constraint("not_before", 3000),
+        )
+        self.assertNotIn("github_retry_constraint", json.loads(earlier_bytes))
+        inherited, inherited_bytes = capture_producer(
+            self.root,
+            identity=self.identity,
+            producer_kind="cleanup-agent",
+            inputs={"delivery_context": self.outer},
+            result=self.result,
+            binding={
+                "producer_refs": delivery.packet_json({
+                    "refs": [earlier, later],
+                }).decode("utf-8"),
+            },
+            github_retry_constraint=self._retry_constraint("not_before", 2000),
+        )
+        inherited_binding = self.read(inherited)["binding"]
+        self.assertEqual(
+            json.loads(inherited_binding["github_retry_constraint"]),
+            {
+                "schema": "github-provider-retry-v1",
+                "provider_host": "github.com",
+                "kind": "not_before",
+                "not_before_unix_ms": 3000,
+            },
+        )
+        packed, packed_bytes = self.pack(self.request(inherited))
+        packet = self.read(packed)
+        self.assertEqual(
+            json.loads(packet["binding"]["github_retry_constraint"]),
+            json.loads(inherited_binding["github_retry_constraint"]),
+        )
+        self.assertEqual(json.loads(packed_bytes)["ci_report"], self.result["ci_report"])
+        self.assertEqual(json.loads(inherited_bytes)["delivery_context"], self.outer)
+
+    def test_unknown_is_sticky_and_legacy_terminal_failure_is_unknown(self):
+        import workflowkit.delivery as delivery
+
+        deadline, _ = self.capture(
+            github_retry_constraint=self._retry_constraint("not_before", 500),
+        )
+        unknown, _ = self.capture(
+            github_retry_constraint=self._retry_constraint("unknown"),
+        )
+        merged, _ = capture_producer(
+            self.root,
+            identity=self.identity,
+            producer_kind="handoff",
+            inputs={},
+            result={"transition": "failed"},
+            binding={
+                "producer_refs": delivery.packet_json({
+                    "refs": [deadline, unknown],
+                }).decode("utf-8"),
+            },
+        )
+        self.assertEqual(
+            json.loads(self.read(merged)["binding"]["github_retry_constraint"])["kind"],
+            "unknown",
+        )
+
+        historical, _ = capture_producer(
+            self.root,
+            identity=self.identity,
+            producer_kind="wait-pr",
+            inputs={},
+            result={
+                "transition": "merge_watch_state_changed",
+                "pr_report": json.dumps({"reason": "github_query_failed"}),
+            },
+        )
+        from workflowkit.delivery import prepare_github_provider_read_guard
+        guard = prepare_github_provider_read_guard(
+            self.root, [historical], self._script_identity(),
+        )
+        with patch("workflowkit.delivery.time.time_ns", return_value=999_000_000):
+            with self.assertRaises(delivery.GitHubProviderRetryBlocked) as raised:
+                guard()
+        self.assertEqual(raised.exception.state, "unknown")
+        self.assertNotIn("deadline", str(raised.exception))
+        self.assertEqual(
+            prepare_github_provider_read_guard(
+                self.root, [], self._script_identity(),
+            )(),
+            None,
+        )
+
+    def test_guard_denial_keeps_known_retry_binding_without_report_rewrites(self):
+        import workflowkit.delivery as delivery
+        from workflowkit.delivery import prepare_github_provider_read_guard
+
+        source, _ = self.capture(
+            github_retry_constraint=self._retry_constraint("not_before", 5000),
+        )
+        with patch(
+            "workflowkit.delivery.time.time_ns",
+            return_value=4_999_000_000,
+        ):
+            with self.assertRaises(
+                delivery.GitHubProviderRetryBlocked,
+            ) as blocked:
+                prepare_github_provider_read_guard(
+                    self.root,
+                    [source],
+                    self._script_identity(),
+                )()
+        self.assertEqual(blocked.exception.state, "not_before")
+        refs = delivery.packet_json({"refs": [source]}).decode("utf-8")
+        failures = (
+            ("wait-ci", {"transition": "ci_watch_failed"}, "ci_report"),
+            (
+                "wait-pr",
+                {
+                    "transition": "merge_watch_state_changed",
+                    "pr_report": delivery.packet_json({
+                        "reason": "github_query_failed",
+                    }).decode("utf-8"),
+                },
+                None,
+            ),
+            (
+                "prepare-ci",
+                {
+                    "transition": "ci_prepare_failed",
+                    "ci_preparation_diagnostic": delivery.packet_json({
+                        "schema": "workflow-ci-preparation-diagnostic-v1",
+                        "code": "github_query_failed",
+                    }).decode("utf-8"),
+                },
+                None,
+            ),
+        )
+        expected = json.loads(self._retry_constraint("not_before", 5000))
+        for kind, result, absent_field in failures:
+            with self.subTest(producer_kind=kind):
+                denied, emitted = capture_producer(
+                    self.root,
+                    identity=self.identity,
+                    producer_kind=kind,
+                    inputs={},
+                    result=result,
+                    binding={"producer_refs": refs},
+                )
+                producer = self.read(denied)
+                self.assertEqual(
+                    json.loads(
+                        producer["binding"]["github_retry_constraint"],
+                    ),
+                    expected,
+                )
+                self.assertEqual(producer["result"], result)
+                if absent_field is not None:
+                    self.assertNotIn(absent_field, producer["result"])
+                    self.assertNotIn(absent_field, json.loads(emitted))
+                with patch(
+                    "workflowkit.delivery.time.time_ns",
+                    return_value=4_999_000_000,
+                ):
+                    with self.assertRaises(
+                        delivery.GitHubProviderRetryBlocked,
+                    ) as raised:
+                        prepare_github_provider_read_guard(
+                            self.root,
+                            [denied],
+                            self._script_identity(),
+                        )()
+                self.assertEqual(raised.exception.state, "not_before")
+
+    def test_prepared_guard_samples_clock_after_root_removal(self):
+        import workflowkit.delivery as delivery
+        from workflowkit.delivery import prepare_github_provider_read_guard
+
+        source, _ = self.capture(
+            github_retry_constraint=self._retry_constraint("not_before", 5000),
+        )
+        guard = prepare_github_provider_read_guard(
+            self.root, [source], self._script_identity(),
+        )
+        retired_root = self.root.with_name(self.root.name + "-retired")
+        self.root.rename(retired_root)
+        with patch("workflowkit.delivery.time.time_ns", return_value=4_999_000_000):
+            with self.assertRaises(delivery.GitHubProviderRetryBlocked) as raised:
+                guard()
+        self.assertEqual(raised.exception.state, "not_before")
+        with patch("workflowkit.delivery.time.time_ns", return_value=5_000_000_000):
+            self.assertIsNone(guard())
+
+    def test_prepared_unknown_guard_stays_blocked_after_source_disappears(self):
+        import workflowkit.delivery as delivery
+        from workflowkit.delivery import prepare_github_provider_read_guard
+
+        source, _ = self.capture(
+            github_retry_constraint=self._retry_constraint("unknown"),
+        )
+        guard = prepare_github_provider_read_guard(
+            self.root, [source], self._script_identity(),
+        )
+        retired_root = self.root.with_name(self.root.name + "-retired")
+        self.root.rename(retired_root)
+        with patch("workflowkit.delivery.time.time_ns", return_value=99_000_000_000):
+            with self.assertRaises(delivery.GitHubProviderRetryBlocked) as raised:
+                guard()
+        self.assertEqual(raised.exception.state, "unknown")
+
+    def test_guard_accepts_qualified_agent_identity_without_script_impersonation(self):
+        import workflowkit.delivery as delivery
+        from workflowkit.delivery import prepare_github_provider_read_guard
+
+        source, _ = self.capture(
+            github_retry_constraint=self._retry_constraint("not_before", 5000),
+        )
+        with patch("workflowkit.delivery.time.time_ns", return_value=4_999_000_000):
+            with self.assertRaises(delivery.GitHubProviderRetryBlocked) as raised:
+                prepare_github_provider_read_guard(
+                    self.root, [source], self.identity,
+                )()
+        self.assertEqual(raised.exception.state, "not_before")
+        self.assertNotIn("invocation_kind", self.identity)
+        for invalid in (
+            {key: value for key, value in self.identity.items() if key != "step_id"},
+            {**self.identity, "run_id": "legacy-run"},
+            {**self.identity, "extra": "not-closed"},
+        ):
+            with self.subTest(identity=invalid), self.assertRaises(ValueError):
+                prepare_github_provider_read_guard(
+                    self.root, [source], invalid,
+                )
+
     def graph(self):
         return {
             "workflow_id": "workflow", "expected_version": 1,

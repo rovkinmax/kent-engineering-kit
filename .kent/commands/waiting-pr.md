@@ -13,6 +13,12 @@ change only the target in the v2 packet; preserve CI packets and retry state.
 This packer mode adds no graph edge or authority. Never infer a target from
 the task branch, repository default or watcher output.
 
+Before every GitHub API provider child, use the qualified provider-read guard
+with the exact incoming commentary footer and actual native Agent/Script
+identity. It authenticates all retained producer ancestry. Active or unknown
+timing means no request; preserve the existing failure route and local retry
+budget/delay without adding sleeps, retries or state resets.
+
 Pending checks or merge time is waiting, not a new user decision. Route
 actionable task-scoped feedback to Fix, preserving authority and baseline;
 require refreshed evidence after source changes. Ask only when an actual

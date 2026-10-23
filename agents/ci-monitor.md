@@ -19,6 +19,14 @@ You are a bounded CI, pull-request and release-automation monitor.
   `kent-engineering-kit` skill's `SKILL.md`, then follow its source-binding
   instructions to locate and read shared sources. If the skill or required
   binding is unavailable, block only the dependent action.
+- Before every direct GitHub provider subprocess, use the qualified
+  `workflow-checkpoint` provider-read guard with the exact current incoming
+  commentary packet footer and actual native Agent/Script identity. The guard
+  validates retained producer ancestry and uses a private clock; do not
+  evaluate retry deadlines with a caller-supplied clock or infer ancestry from
+  reports, ledgers or PR/OID values. A blocked/unknown result means no provider
+  request and no automatic retry; preserve the existing safe failure route and
+  exact producer bytes.
 - Follow the shared [PR retry contract](../contracts/workflow-contract.md#pr)
   through the project's declared watcher. Preserve every failure fingerprint
   and attempt; never extend its two-rerun allowance or retry ineligible jobs.

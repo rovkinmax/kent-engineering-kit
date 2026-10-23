@@ -1745,6 +1745,8 @@ class ScriptProducerIdentityTests(unittest.TestCase):
     def test_shared_emitter_retains_incoming_retry_packet_ancestry(self):
         import importlib.machinery
         import importlib.util
+        import io
+        import types
         from unittest.mock import patch
 
         import workflowkit.delivery as delivery
@@ -1868,6 +1870,276 @@ class ScriptProducerIdentityTests(unittest.TestCase):
                     '{"transition":"ci_prepare_failed"}',
                     "prepare-ci",
                 )
+
+    def test_prepare_cli_capture_agent_pack_next_script_guard_vertical(self):
+        import importlib.machinery
+        import importlib.util
+        import io
+        import types
+        from unittest.mock import Mock, patch
+
+        from workflowkit import delivery
+        from workflowkit.runtime import canonical_bytes
+
+        self.context = {"task_id": "native-task", "node_id": "script-node"}
+        current_script_path = ".kent/scripts/workflow-prepare-github-ci"
+        self.detail["current_scripts"] = [{
+            "current_node": {"node_id": "script-node"},
+            "path": current_script_path,
+        }]
+        self.graph["graph"]["nodes"][0].update(
+            key="ci_prepare",
+            script_path=current_script_path,
+        )
+        script_identity = self.observe()
+        deadline = canonical_bytes({
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": "not_before",
+            "not_before_unix_ms": 5000,
+        }).decode("utf-8")
+        upstream, _ = delivery.capture_producer(
+            self.root,
+            identity=script_identity,
+            producer_kind="wait-ci",
+            inputs={},
+            result={"transition": "ci_watch_failed"},
+            github_retry_constraint=deadline,
+        )
+
+        scripts = self.root / ".kent/scripts"
+        scripts.mkdir(exist_ok=True)
+        checkpoint_path = scripts / "workflow-checkpoint"
+        checkpoint_path.write_bytes(
+            (REPO_ROOT / "templates/project/workflow-checkpoint").read_bytes(),
+        )
+        checkpoint_path.chmod(0o755)
+        profile_path = self.root / ".kent/workflow-profile.toml"
+        profile_path.write_text(
+            profile_path.read_text() + 'delivery_reliability = "v1"\n',
+            encoding="utf-8",
+        )
+        payload = {
+            "_kent": self.context,
+            "workspace_path": str(self.root),
+            "task_short_id": "KIT-1",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "TASK-17",
+            "merge_strategy": "squash",
+        }
+        # Use the actual current packet footer, not a report or an older carrier.
+        upstream_emitted = reconstruct_producer(
+            self.root,
+            upstream,
+            identity=script_identity,
+        )["emitted"]
+        payload["commentary"] = json.loads(upstream_emitted)["commentary"]
+
+        loader = importlib.machinery.SourceFileLoader(
+            "prepare_ci_retry_vertical_test",
+            str(REPO_ROOT / "scripts/prepare-github-ci"),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.assertIsNotNone(spec)
+        if spec is None:
+            raise AssertionError("could not load prepare CI CLI")
+        prepare_cli = importlib.util.module_from_spec(spec)
+        loader.exec_module(prepare_cli)
+        observed = types.SimpleNamespace(
+            identity=script_identity,
+            graph=self.graph,
+            profile=types.SimpleNamespace(command=lambda _key: ""),
+        )
+        provider_children = Mock()
+        checkpoint_modules = []
+        output = io.BytesIO()
+        original_exec_module = importlib.machinery.SourceFileLoader.exec_module
+
+        def execute_source(source_loader, module):
+            original_exec_module(source_loader, module)
+            if Path(source_loader.path).resolve() == checkpoint_path.resolve():
+                module.delivery_module = lambda: delivery
+                module.delivery_native_read = self.read
+                checkpoint_modules.append(module)
+
+        def prepare_until_provider(payload_value, *, provider_guard, **_kwargs):
+            provider_guard()
+            provider_children()
+            return payload_value
+
+        with (
+            patch.object(
+                prepare_cli,
+                "read_preparation_input",
+                return_value=payload,
+            ),
+            patch.object(
+                prepare_cli,
+                "observe_script_delivery_protocol",
+                return_value=(
+                    observed,
+                    "typed-v1",
+                    False,
+                    "workflow-delivery-context-v2",
+                    self.read,
+                ),
+            ),
+            patch.object(
+                prepare_cli,
+                "prepare_ci_payload",
+                side_effect=prepare_until_provider,
+            ),
+            patch.object(
+                importlib.machinery.SourceFileLoader,
+                "exec_module",
+                new=execute_source,
+            ),
+            patch.object(prepare_cli.Path, "cwd", return_value=self.root),
+            patch.object(
+                prepare_cli.sys,
+                "stdout",
+                types.SimpleNamespace(buffer=output),
+            ),
+            patch.object(delivery.time, "time_ns", return_value=4_999_000_000),
+        ):
+            self.assertEqual(prepare_cli.main(), 0)
+        provider_children.assert_not_called()
+        self.assertEqual(len(checkpoint_modules), 1)
+        produced = json.loads(output.getvalue())
+        emitted_locator = delivery.producer_locator(produced["commentary"])
+        emitted_producer = reconstruct_producer(
+            self.root,
+            emitted_locator,
+            identity=script_identity,
+        )
+        self.assertEqual(
+            json.loads(emitted_producer["binding"]["github_retry_constraint"]),
+            json.loads(deadline),
+        )
+        self.assertEqual(
+            json.loads(emitted_producer["result"]["ci_preparation_diagnostic"])["code"],
+            "github_query_failed",
+        )
+
+        agent_identity = {
+            key: script_identity[key]
+            for key in (
+                "task_id", "task_short_id", "project_id", "workspace_path",
+            )
+        }
+        agent_identity.update(
+            session_id="11111111-1111-4111-8111-111111111111",
+            step_id="22222222-2222-4222-8222-222222222222",
+        )
+        task_detail = {
+            "summary": {
+                "id": agent_identity["task_id"],
+                "short_id": agent_identity["task_short_id"],
+                "project_id": agent_identity["project_id"],
+                "workflow_id": self.graph["workflow_id"],
+            },
+            "current_nodes": [{
+                "node_id": "agent-node",
+                "session_id": agent_identity["session_id"],
+            }],
+        }
+        agent_graph = {
+            "workflow_id": self.graph["workflow_id"],
+            "expected_version": 4,
+            "graph": {
+                "nodes": [{
+                    "id": "agent-node",
+                    "key": "prepare",
+                    "kind": "agent",
+                }],
+                "transition_groups": [{
+                    "id": "handoff",
+                    "source_node_id": "agent-node",
+                    "transition_id": "handoff",
+                }],
+                "edges": [{
+                    "id": "handoff-edge",
+                    "key": "prepare_handoff",
+                    "transition_group_id": "handoff",
+                    "target_node_id": "next-script",
+                    "parameters": [
+                        {"key": key}
+                        for key in (
+                            "workspace_path",
+                            "task_short_id",
+                            "ci_preparation_diagnostic",
+                        )
+                    ],
+                }],
+            },
+        }
+        contract = transition_contract_reference(
+            agent_identity,
+            task_detail,
+            agent_graph,
+            "handoff",
+        )
+        packed_locator, packed_raw = delivery.pack_delivery(
+            self.root,
+            {
+                "schema": "workflow-pack-delivery-v1",
+                "transition": "handoff",
+                "values": {},
+                "transition_contract_ref": contract,
+                "delivery_mode": "preserve",
+                "producer_refs": [emitted_locator],
+            },
+            identity=agent_identity,
+            task_detail=task_detail,
+            graph=agent_graph,
+        )
+        packed = json.loads(packed_raw)
+        self.assertEqual(
+            json.loads(reconstruct_producer(
+                self.root,
+                packed_locator,
+                identity=agent_identity,
+            )["binding"]["github_retry_constraint"]),
+            json.loads(deadline),
+        )
+
+        self.context = {"task_id": "native-task", "node_id": "next-script"}
+        next_script_path = ".kent/scripts/workflow-wait-github-pr"
+        self.detail["current_scripts"] = [{
+            "current_node": {"node_id": "next-script"},
+            "path": next_script_path,
+        }]
+        self.graph["graph"]["nodes"] = [{
+            "id": "next-script",
+            "key": "merge_watch",
+            "kind": "script",
+            "script_path": next_script_path,
+        }]
+        next_identity = self.observe()
+        next_payload = {
+            "commentary": packed["commentary"],
+            "workspace_path": str(self.root),
+            "task_short_id": "KIT-1",
+        }
+        with patch.object(
+            checkpoint_modules[0],
+            "delivery_module",
+            return_value=delivery,
+        ), patch.object(
+            delivery.time,
+            "time_ns",
+            return_value=4_999_000_000,
+        ):
+            with self.assertRaises(
+                checkpoint_modules[0].GitHubProviderReadBlocked,
+            ) as blocked:
+                checkpoint_modules[0].require_github_provider_read(
+                    self.root,
+                    next_payload,
+                    next_identity,
+                )
+        self.assertEqual(blocked.exception.state, "not_before")
+        self.assertEqual(packed["commentary"], json.loads(packed_raw)["commentary"])
 
     def test_invalid_workspace_input_is_evidence_not_owner_identity_or_packed_result(self):
         identity = self.observe()

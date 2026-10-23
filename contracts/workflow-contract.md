@@ -154,6 +154,23 @@ same-key values during packing. This narrow derived-context rule grants no
 generic values-win precedence: all producers still require complete identity,
 version/digest, field and tamper validation.
 
+GitHub provider retry restrictions live only in the existing producer binding
+field `github_retry_constraint`; they are not graph fields, business carriers
+or report data. Its canonical closed DTO is either
+`{"schema":"github-provider-retry-v1","provider_host":"github.com","kind":"not_before","not_before_unix_ms":<integer>}`
+or the same schema/host with `kind:"unknown"` and no deadline. Merging retains
+the greatest deadline; `unknown` absorbs all constraints. Duplicate handoffs,
+PR/head changes and delivery remapping cannot reset or clear retained state.
+Before every GitHub API provider child, use the qualified provider-read guard
+with exact incoming commentary footer refs and actual native Agent/Script
+identity. The guard authenticates full producer ancestry; an active deadline
+or unknown timing means no request. Do not mine reports or ledgers for refs,
+or persist raw headers, bodies, debug output or credentials. Existing local
+retry budgets and delays remain unchanged; this restriction adds no sleep,
+retry budget, global limiter or automatic recovery. It does not blanket-block
+Git transport operations such as fetch, `ls-remote` or push, whose existing
+independent authority checks still apply.
+
 ## Context
 
 Five manifests (`plan`, `implement`, `review`, `smoke`, `delivery`) declare
@@ -295,6 +312,10 @@ never repair on the delivered branch for a late check. Exact PR/branch/merge
 proof remains required. With target-family continuity enabled, every fresh
 PR read must also match the carried `pr_base_branch`; a missing or changed
 target is not success evidence.
+
+Every GitHub API read must first pass the inherited provider-read guard.
+Preserve the existing watcher retry allowance and delay; provider timing
+restricts the next API request without creating a new retry or sleep policy.
 
 Same-repository completed issues use the provider's closing reference.
 Cross-repository/partial/follow-up links do not claim closure.
