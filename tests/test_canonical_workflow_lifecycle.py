@@ -1626,6 +1626,13 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
         fixture.refresh_receipt_files()
         fixture.pin()
         fixture.binding_path.unlink()
+        # Source-only admission must work without any native Task evidence.
+        fixture.native_bin.write_text(fixture.native_bin.read_text().replace(
+            "args = sys.argv[1:]\n",
+            "args = sys.argv[1:]\n"
+            "if args and args[0] == 'task':\n"
+            "    sys.exit(2)\n",
+        ))
         admission = {
             "schema": "delivery-source-admission-v2",
             "receipt_ref": {

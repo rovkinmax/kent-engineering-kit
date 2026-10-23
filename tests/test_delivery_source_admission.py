@@ -17,6 +17,184 @@ import unittest
 import py_compile
 from unittest import mock
 
+import workflowkit.operations as operations
+
+
+class SourceOnlyNativeIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.kent = self.root / "kent"
+        self.project_id = "project-fixture"
+        self.row = {
+            "workspace_id": "workspace-fixture",
+            "root_path": str(self.root),
+            "is_default": True,
+        }
+
+    def page(self, rows=None, **extra):
+        return {
+            "project_id": self.project_id, "offset": 0,
+            "workspaces": [dict(self.row)] if rows is None else rows,
+            **extra,
+        }
+
+    def resolve(self, pages, *, source_only=True, native_projects=None, readback=None):
+        with mock.patch.object(
+            operations, "_project_rows",
+            return_value=native_projects if native_projects is not None else [
+                {"id": self.project_id, "path": str(self.root)},
+            ],
+        ), mock.patch.object(
+            operations, "_run",
+            return_value=readback if readback is not None else (
+                0, self.project_id.encode(), b"",
+            ),
+        ), mock.patch.object(operations, "_kent_json", side_effect=pages) as native:
+            result = operations._source_native_identity(
+                project_id=self.project_id, project_root=self.root,
+                primary_root=self.root, kent_path=self.kent,
+                source_only=source_only,
+            )
+        return result, native.call_args_list
+
+    def test_zero_task_project_uses_native_catalog_only(self):
+        identity, calls = self.resolve([self.page()])
+        self.assertEqual(identity, "workspace-fixture")
+        self.assertEqual(calls, [mock.call(
+            self.kent,
+            ["project", "workspaces", "--project", self.project_id,
+             "--offset", "0", "--limit", "100", "--json"],
+            cwd=self.root,
+        )])
+
+    def test_catalog_pagination_is_forward_and_project_bound(self):
+        other = self.root / "other"
+        other.mkdir()
+        identity, calls = self.resolve([
+            self.page([{
+                "workspace_id": "workspace-other", "root_path": str(other),
+                "is_default": False,
+            }], next_offset=1),
+            self.page(offset=1),
+        ])
+        self.assertEqual(identity, "workspace-fixture")
+        self.assertEqual(calls[1].args[1][-5:], [
+            "--offset", "1", "--limit", "100", "--json",
+        ])
+
+    def test_unavailable_nondefault_workspace_does_not_block_primary_identity(self):
+        identity, _ = self.resolve([self.page([
+            {
+                "workspace_id": "workspace-unavailable",
+                "root_path": str(self.root / "unavailable"),
+                "is_default": False,
+            },
+            self.row,
+        ])])
+        self.assertEqual(identity, "workspace-fixture")
+
+    def test_invalid_or_missing_native_catalog_blocks(self):
+        cases = [
+            [self.page(project_id="project-foreign")],
+            [{"offset": 0, "workspaces": [self.row]}],
+            [{"project_id": self.project_id, "workspaces": [self.row]}],
+            [self.page(offset=1)],
+            [self.page(offset=False)],
+            [self.page(offset="0")],
+            [self.page(workspaces=None)],
+            [{"project_id": self.project_id, "offset": 0, "items": [self.row]}],
+            [self.page([])],
+            [self.page([{**self.row, "workspace_id": ""}])],
+            [self.page([{**self.row, "workspace_id": "../workspace"}])],
+            [self.page([{**self.row, "workspace_id": True}])],
+            [self.page([{**self.row, "is_default": 1}])],
+            [self.page([{**self.row, "is_default": False}])],
+            [self.page([{**self.row, "root_path": str(self.root.parent)}])],
+            [self.page([{**self.row, "root_path": "relative"}])],
+            [self.page([{**self.row, "root_path": str(self.root / "absent")}])],
+            [self.page([self.row, self.row])],
+            [self.page([self.row, {**self.row, "workspace_id": "workspace-other"}])],
+            [self.page([self.row, {
+                **self.row, "workspace_id": "workspace-other", "is_default": False,
+            }])],
+            [self.page(next_offset=0)],
+            [self.page(next_offset=True)],
+            [self.page(next_offset="1")],
+            [self.page([], next_offset=1)],
+            [self.page(next_offset=1), self.page(offset=0)],
+            [self.page(next_offset=1), self.page(offset=1, project_id="foreign")],
+            [self.page(next_offset=1), self.page(offset=1)],
+            [self.page([None])],
+            [operations.OperationError("native catalog unavailable")],
+        ]
+        for pages in cases:
+            with self.subTest(pages=pages), self.assertRaises(
+                (operations.OperationError, operations.PlanValidationError),
+            ):
+                self.resolve(pages)
+
+    def test_catalog_root_cannot_be_a_symlink(self):
+        link = self.root / "alias"
+        link.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(operations.PlanValidationError):
+            self.resolve([self.page([{**self.row, "root_path": str(link)}])])
+
+    def test_catalog_inventory_is_bounded(self):
+        pages = [
+            self.page([{
+                **self.row, "workspace_id": f"workspace-{index}",
+            }], offset=index, next_offset=index + 1)
+            for index in range(operations.MAX_LIST + 1)
+        ]
+        with self.assertRaisesRegex(operations.OperationError, "bounded inventory"):
+            self.resolve(pages)
+
+    def test_catalog_does_not_replace_native_project_readbacks(self):
+        for arguments in (
+            {"native_projects": []},
+            {"native_projects": [{"id": self.project_id, "path": str(self.root.parent)}]},
+            {"readback": (0, b"project-foreign", b"")},
+            {"readback": (1, b"", b"unavailable")},
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(
+                operations.PlanValidationError,
+            ):
+                self.resolve([], **arguments)
+
+    def test_legacy_identity_still_requires_task_evidence(self):
+        with self.assertRaisesRegex(
+            operations.PlanValidationError, "unavailable or ambiguous",
+        ):
+            self.resolve([{"tasks": []}], source_only=False)
+
+    def test_only_v2_plan_publication_selects_catalog_identity(self):
+        variants = (
+            (operations.SOURCE_ADMISSION_SCHEMA, None, False),
+            (operations.SOURCE_ADMISSION_V2_SCHEMA, {"kind": "r2-installed"}, False),
+            (operations.SOURCE_ADMISSION_V2_SCHEMA, {"kind": "plan-publication"}, True),
+        )
+        for schema, binding, source_only in variants:
+            with self.subTest(schema=schema, binding=binding):
+                value = {
+                    "schema": schema, "primary_root": str(self.root),
+                    "kit_root": str(self.root),
+                }
+                if binding is not None:
+                    value["binding"] = binding
+                with mock.patch.object(
+                    operations, "_source_native_identity",
+                    side_effect=operations.PlanValidationError("identity boundary"),
+                ) as identity, self.assertRaisesRegex(
+                    operations.PlanValidationError, "identity boundary",
+                ):
+                    operations._source_binding(
+                        value, project_id=self.project_id,
+                        project_root=self.root, kent_path=self.kent,
+                    )
+                self.assertEqual(identity.call_args.kwargs["source_only"], source_only)
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/inspect-delivery-source"
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -962,6 +1140,11 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
             "    print('project-test')\n"
             "elif args == ['project', 'list']:\n"
             "    print('project-test\\tFixture\\t' + project)\n"
+            "elif args == ['project', 'workspaces', '--project', 'project-test', "
+            "'--offset', '0', '--limit', '100', '--json']:\n"
+            "    print(json.dumps({'project_id': 'project-test', 'offset': 0,\n"
+            "        'workspaces': [{'workspace_id': 'workspace-test',\n"
+            "            'root_path': project, 'is_default': True}]}))\n"
             "elif args == ['worktree', 'status', '--session', 'session-native', '--json']:\n"
             "    print(json.dumps(worktree_status))\n"
             "elif (len(args) == 6 and args[:2] == ['task', 'show'] and "
