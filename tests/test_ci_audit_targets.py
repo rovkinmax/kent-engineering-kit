@@ -69,6 +69,8 @@ class TargetBranchContinuityTest(unittest.TestCase):
         interval_seconds: int = 30,
         sleep_calls=None,
     ):
+        from workflowkit.github_observation import provider_retry_constraint
+
         module = load_template(ROOT / "templates/project" / source, source.replace("-", "_"))
         captured = io.BytesIO()
         watcher = types.SimpleNamespace(
@@ -87,6 +89,7 @@ class TargetBranchContinuityTest(unittest.TestCase):
             GitHubObserver=lambda *_args, **_kwargs: watcher,
             ObservationError=ObservationError,
             parse_pr_url=lambda _url: ("owner/repository", 17),
+            provider_retry_constraint=provider_retry_constraint,
         )
         with (
             mock.patch.object(module, "runtime_contracts", return_value=runtime),
@@ -767,6 +770,194 @@ class TargetBranchContinuityTest(unittest.TestCase):
         diagnostic = json.loads(output["ci_preparation_diagnostic"])
         self.assertEqual(diagnostic["code"], "delivery_context_invalid")
         self.assertEqual(diagnostic["classification"], "invalid_input")
+
+
+class ProviderRetryCiPreparationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.workspace = Path(self.temporary.name).resolve()
+
+    def test_read_pull_request_guard_runs_before_child_and_sets_scoped_debug(self):
+        child = self.workspace / "fake-gh"
+        child.write_text(
+            "#!/bin/sh\n"
+            'test "$GH_DEBUG" = "api" || exit 41\n'
+            "printf '%s\\n' '< HTTP/2.0 429' >&2\n"
+            "printf '%s\\n' '< Retry-After: 120' >&2\n"
+            "printf '\\n' >&2\n"
+            "printf '%s\\n' '< {\"message\":\"API rate limit exceeded\"}' >&2\n"
+            "printf '%s\\n' '* Request took 41ms' >&2\n"
+            "printf '%s' 'secret stdout'\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        child.chmod(0o755)
+        blocked = RuntimeError("inherited provider read blocked")
+        with mock.patch.object(ci_contract.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "inherited provider read blocked",
+            ):
+                ci_contract.read_pull_request(
+                    self.workspace,
+                    "https://github.com/owner/repository/pull/17",
+                    gh_bin=str(child),
+                    provider_guard=lambda: (_ for _ in ()).throw(blocked),
+                )
+        popen.assert_not_called()
+
+        from workflowkit.github_observation import (
+            ObservationError,
+            provider_retry_constraint,
+        )
+
+        with (
+            mock.patch.object(
+                ci_contract.time,
+                "time_ns",
+                return_value=1_000_000_000_000,
+            ),
+            self.assertRaises(ObservationError) as raised,
+        ):
+            ci_contract.read_pull_request(
+                self.workspace,
+                "https://github.com/owner/repository/pull/17",
+                gh_bin=str(child),
+                provider_guard=mock.Mock(),
+            )
+        error = raised.exception
+        self.assertEqual(
+            provider_retry_constraint(
+                error,
+                interval=30,
+                failure_count=1,
+            ),
+            '{"kind":"not_before","not_before_unix_ms":1120000,'
+            '"provider_host":"github.com","schema":"github-provider-retry-v1"}',
+        )
+        self.assertNotIn("secret stdout", repr(error.as_dict()))
+        self.assertNotIn("Retry-After", repr(error.as_dict()))
+
+    def test_prepare_ci_threads_same_guard_to_each_provider_read(self):
+        payload = {
+            "workspace_path": str(self.workspace),
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "TASK-17",
+            "merge_strategy": "squash",
+            "task_short_id": "TASK-17",
+            "pr_base_branch": "main",
+        }
+        pr = TargetBranchContinuityTest()._pr(state="OPEN", base_name="main")
+        guard = mock.Mock()
+        with mock.patch.object(
+            ci_contract,
+            "read_pull_request",
+            side_effect=[pr, pr],
+        ) as read:
+            ci_contract.prepare_ci_payload(
+                payload,
+                gh_bin="/bin/true",
+                provider_guard=guard,
+            )
+        self.assertEqual(read.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs["provider_guard"] is guard
+                for call in read.call_args_list)
+        )
+
+    def test_typed_prepare_guard_denial_uses_existing_safe_failure_carrier(self):
+        module = load_template(
+            ROOT / "scripts/prepare-github-ci",
+            "prepare_ci_guard_denial",
+        )
+        scripts = self.workspace / ".kent/scripts"
+        scripts.mkdir(parents=True)
+        (self.workspace / ".kent/workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v1"\n',
+            encoding="utf-8",
+        )
+        checkpoint = scripts / "workflow-checkpoint"
+        checkpoint.write_text(
+            "def emit_producer_result(root, payload, result, producer_kind):\n"
+            "    return result\n",
+            encoding="utf-8",
+        )
+        identity = {
+            "task_id": "native-task-id",
+            "task_short_id": "TASK-17",
+            "project_id": "native-project-id",
+            "workspace_path": str(self.workspace),
+            "invocation_kind": "script",
+            "node_id": "native-ci-prepare",
+            "transition_branch_key": None,
+        }
+        observed = types.SimpleNamespace(
+            identity=identity,
+            graph={"graph": {"nodes": [{
+                "id": "native-ci-prepare",
+                "key": "ci_prepare",
+            }]}},
+        )
+        payload = {
+            "workspace_path": str(self.workspace),
+            "task_short_id": "TASK-17",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "TASK-17",
+            "merge_strategy": "squash",
+            "pr_base_branch": "main",
+            "_kent": {
+                "task_id": "native-task-id",
+                "node_id": "native-ci-prepare",
+            },
+            "commentary": "inherited producer commentary",
+        }
+        blocked = RuntimeError("github_provider_retry_blocked")
+        guard = mock.Mock(side_effect=blocked)
+        output = io.BytesIO()
+
+        def prepare(_payload, *, provider_guard, **_kwargs):
+            provider_guard()
+            self.fail("preparation continued after guard denial")
+
+        with (
+            mock.patch.object(
+                module,
+                "read_preparation_input",
+                return_value=payload,
+            ),
+            mock.patch.object(
+                module,
+                "observe_script_delivery_protocol",
+                return_value=(
+                    observed,
+                    "typed-v1",
+                    True,
+                    "delivery-context-v2",
+                    mock.Mock(),
+                ),
+            ),
+            mock.patch.object(
+                module,
+                "github_provider_read_guard",
+                return_value=guard,
+            ),
+            mock.patch.object(module, "prepare_ci_payload", side_effect=prepare),
+            mock.patch.object(module.Path, "cwd", return_value=self.workspace),
+            mock.patch.object(
+                module.sys,
+                "stdout",
+                types.SimpleNamespace(buffer=output),
+            ),
+        ):
+            self.assertEqual(module.main(), 0)
+        result = json.loads(output.getvalue())
+        diagnostic = json.loads(result["ci_preparation_diagnostic"])
+        self.assertEqual(result["transition"], "ci_prepare_failed")
+        self.assertEqual(diagnostic["code"], "github_query_failed")
+        self.assertEqual(diagnostic["classification"], "transient")
+        self.assertNotIn("github_retry_constraint", result)
+        guard.assert_called_once_with()
 
 
 class PrepareCiGraphProtocolDispatchTest(unittest.TestCase):
@@ -2001,6 +2192,471 @@ class ProviderRetryWaiterTest(unittest.TestCase):
                     30,
                 )
 
+    def _run_guarded_waiter(self, watcher_name: str, scenario: str):
+        from workflowkit import github_observation
+
+        module = load_template(
+            ROOT / "templates/project" / watcher_name,
+            watcher_name.replace("-", "_") + "_guarded_retry",
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        (root / ".kent").mkdir()
+        (root / ".kent/workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v1"\n',
+            encoding="utf-8",
+        )
+        contract = {
+            "schema": "github-ci-contract-v1",
+            "repository": "owner/repository",
+            "pull_number": 17,
+            "head_oid": "a" * 40,
+            "base_oid": "b" * 40,
+            "require_ci": True,
+        }
+        report = runtime.build_dynamic_ci_report(
+            contract=contract,
+            attempts=[{
+                "sequence": 1,
+                "head_oid": contract["head_oid"],
+                "base_oid": contract["base_oid"],
+                "retry": None,
+                "checks": [],
+                "check_count": 0,
+                "checks_sha256": runtime.canonical_sha256([]),
+                "reason": "query_failed",
+                "watcher_exit_code": 1,
+                "error": {
+                    "code": "query_failed",
+                    "message": "query_failed",
+                    "stdout_sha256": hashlib.sha256(b"").hexdigest(),
+                    "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                },
+            }],
+        )
+        report_text = runtime.canonical_bytes(report).decode("utf-8")
+        payload = {
+            "workspace_path": str(root),
+            "task_short_id": "TASK-17",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "TASK-17",
+            "merge_strategy": "squash",
+            "pr_base_branch": "main",
+            "pr_head_oid": contract["head_oid"],
+            "pr_base_oid": contract["base_oid"],
+            "ci_contract": runtime.canonical_bytes(contract).decode("utf-8"),
+            "ci_report": report_text,
+            "pr_feedback_cursor": "uninitialized",
+            "commentary": "retained incoming commentary",
+            "_kent": {
+                "task_id": "native-task-id",
+                "node_id": "native-waiter-node",
+            },
+        }
+        identity = {
+            "task_id": "native-task-id",
+            "task_short_id": "TASK-17",
+            "project_id": "native-project-id",
+            "workspace_path": str(root),
+            "invocation_kind": "script",
+            "node_id": "native-waiter-node",
+            "transition_branch_key": None,
+        }
+        inherited_state = "unknown" if scenario == "inherited_block" else None
+        require_calls = []
+        child_calls = []
+        sleep = mock.Mock()
+        archives = mock.Mock()
+        emitted = []
+
+        class ProviderBlocked(RuntimeError):
+            def __init__(self, state: str):
+                self.state = state
+
+        blocked_error = ProviderBlocked(inherited_state or "unknown")
+
+        class Checkpoint:
+            @staticmethod
+            def require_github_provider_read(_root, _payload, _identity):
+                require_calls.append((_root, _payload, _identity))
+                if inherited_state is not None:
+                    raise blocked_error
+
+            @staticmethod
+            def is_github_provider_read_blocked(error):
+                return isinstance(error, ProviderBlocked)
+
+            @staticmethod
+            def emit_producer_result(
+                _root,
+                producer_payload,
+                result,
+                producer_kind,
+                **kwargs,
+            ):
+                emitted.append({
+                    "payload": producer_payload,
+                    "result": result,
+                    "producer_kind": producer_kind,
+                    "kwargs": kwargs,
+                })
+                return result
+
+        if scenario == "unknown_terminal":
+            failure = github_observation.ObservationError(
+                "query_failed",
+                provider_retry_unknown=True,
+                provider_retry_captured=True,
+                provider_retry_observed_at_ns=1_000_000_000_000,
+            )
+        else:
+            failure = github_observation.ObservationError(
+                "query_failed",
+                rate_limited=True,
+                retry_after_seconds=120,
+                provider_retry_captured=True,
+                provider_retry_observed_at_ns=1_000_000_000_000,
+            )
+
+        def observer_factory(*_args, provider_guard=None, **_kwargs):
+            def observe_pr(_url):
+                if provider_guard is not None:
+                    provider_guard()
+                child_calls.append("gh")
+                raise failure
+
+            return types.SimpleNamespace(observe_pr=observe_pr)
+
+        output = io.BytesIO()
+        node_key = "ci_watch" if "github-ci" in watcher_name else "merge_watch"
+        protocol = {
+            "protocol": "typed-v1",
+            "identity": identity,
+            "node_key": node_key,
+            "target_required": True,
+            "context_schema": "delivery-context-v2",
+        }
+        max_errors = 2 if scenario == "local_block" else 1
+        if scenario == "unknown_terminal":
+            max_errors = 5
+        with (
+            mock.patch.object(module, "runtime_contracts", return_value=runtime),
+            mock.patch.object(
+                module,
+                "github_observation",
+                return_value=types.SimpleNamespace(
+                    GitHubObserver=observer_factory,
+                    ObservationError=github_observation.ObservationError,
+                    parse_pr_url=lambda _url: ("owner/repository", 17),
+                    provider_retry_constraint=(
+                        github_observation.provider_retry_constraint
+                    ),
+                ),
+            ),
+            mock.patch.object(
+                module,
+                "_current_delivery_protocol",
+                return_value=protocol,
+            ),
+            mock.patch.object(module, "_sibling", return_value=Checkpoint),
+            mock.patch.object(module, "_archive", archives, create=True),
+            mock.patch.object(module.Path, "cwd", return_value=root),
+            mock.patch.object(module.time, "sleep", sleep),
+            mock.patch.object(
+                module.time,
+                "time_ns",
+                return_value=1_000_000_000_000,
+            ),
+            mock.patch.object(module.sys, "stdin", io.StringIO(json.dumps(payload))),
+            mock.patch.object(
+                module.sys,
+                "stdout",
+                types.SimpleNamespace(buffer=output),
+            ),
+            mock.patch.dict(os.environ, {
+                "KENT_CI_WATCH_TEST_MODE": "1",
+                "KENT_CI_WATCH_MAX_POLLS": "1",
+                "KENT_CI_WATCH_MAX_ERRORS": str(max_errors),
+                "KENT_CI_WATCH_INTERVAL_SECONDS": "30",
+                "KENT_PR_WATCH_TEST_MODE": "1",
+                "KENT_PR_WATCH_MAX_POLLS": "1",
+                "KENT_PR_WATCH_MAX_ERRORS": str(max_errors),
+                "KENT_PR_WATCH_INTERVAL_SECONDS": "30",
+            }),
+        ):
+            self.assertEqual(module.main(), 0)
+        return {
+            "result": json.loads(output.getvalue()),
+            "child_calls": child_calls,
+            "require_calls": require_calls,
+            "sleep": sleep,
+            "archives": archives,
+            "emitted": emitted,
+            "report_text": report_text,
+            "payload": payload,
+        }
+
+    def test_terminal_errors_capture_retry_constraint_without_stdout_fields(self):
+        for watcher_name in (
+            "workflow-wait-github-ci",
+            "workflow-wait-github-pr",
+        ):
+            for scenario, expected_kind in (
+                ("known_terminal", "not_before"),
+                ("unknown_terminal", "unknown"),
+            ):
+                with self.subTest(watcher=watcher_name, scenario=scenario):
+                    outcome = self._run_guarded_waiter(watcher_name, scenario)
+                    self.assertEqual(len(outcome["child_calls"]), 1)
+                    self.assertEqual(len(outcome["emitted"]), 1)
+                    capture = outcome["emitted"][0]
+                    self.assertEqual(capture["payload"], outcome["payload"])
+                    self.assertEqual(
+                        capture["producer_kind"],
+                        "wait-ci" if "github-ci" in watcher_name else "wait-pr",
+                    )
+                    self.assertEqual(
+                        json.loads(
+                            capture["kwargs"]["github_retry_constraint"]
+                        )["kind"],
+                        expected_kind,
+                    )
+                    self.assertNotIn(
+                        "github_retry_constraint",
+                        capture["result"].decode("utf-8"),
+                    )
+
+    def test_guard_denial_does_not_query_sleep_archive_or_rewrite_ci_report(self):
+        for watcher_name in (
+            "workflow-wait-github-ci",
+            "workflow-wait-github-pr",
+        ):
+            for scenario in ("inherited_block", "local_block"):
+                with self.subTest(watcher=watcher_name, scenario=scenario):
+                    outcome = self._run_guarded_waiter(watcher_name, scenario)
+                    self.assertEqual(
+                        len(outcome["child_calls"]),
+                        0 if scenario == "inherited_block" else 1,
+                    )
+                    self.assertEqual(
+                        len(outcome["require_calls"]),
+                        1 if scenario == "inherited_block" else 2,
+                    )
+                    if scenario == "local_block":
+                        outcome["sleep"].assert_called_once_with(120)
+                    else:
+                        outcome["sleep"].assert_not_called()
+                    outcome["archives"].assert_not_called()
+                    if "github-ci" in watcher_name:
+                        self.assertEqual(
+                            outcome["result"]["transition"],
+                            "ci_watch_failed",
+                        )
+                        self.assertEqual(
+                            outcome["result"]["ci_report"],
+                            outcome["report_text"],
+                        )
+                        self.assertEqual(
+                            len(
+                                json.loads(
+                                    outcome["result"]["ci_report"]
+                                )["attempts"]
+                            ),
+                            len(
+                                json.loads(outcome["report_text"])["attempts"]
+                            ),
+                        )
+                    else:
+                        self.assertEqual(
+                            outcome["result"]["transition"],
+                            "merge_watch_state_changed",
+                        )
+                        self.assertEqual(
+                            json.loads(
+                                outcome["result"]["pr_report"]
+                            )["reason"],
+                            "github_query_failed",
+                        )
+                    self.assertNotIn(
+                        "github_retry_constraint",
+                        outcome["emitted"][0]["result"].decode("utf-8"),
+                    )
+
+
+class CheckpointProviderGuardCommandTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        (self.root / ".kent").mkdir()
+        self.module = load_template(
+            ROOT / "templates/project/workflow-checkpoint",
+            "checkpoint_provider_guard_test",
+        )
+        self.identity = {
+            "task_id": "native-task-id",
+            "task_short_id": "TASK-17",
+            "project_id": "native-project-id",
+            "workspace_path": str(self.root),
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "step_id": "22222222-2222-4222-8222-222222222222",
+        }
+        self.refs = [
+            "build/kent-workflow/TASK-17/packets/base-"
+            + "a" * 64
+            + ".json",
+        ]
+
+    def _run_guard(self, state: str | None):
+        calls = []
+
+        class ProviderBlocked(RuntimeError):
+            def __init__(self, blocked_state: str):
+                self.state = blocked_state
+
+        def require(root, refs, identity):
+            calls.append((root, refs, identity))
+            if state is not None:
+                raise ProviderBlocked(state)
+
+        fake_delivery = types.SimpleNamespace(
+            GitHubProviderRetryBlocked=ProviderBlocked,
+            require_github_provider_read=require,
+        )
+        read_fd, write_fd = os.pipe()
+        os.write(
+            write_fd,
+            json.dumps({"refs": self.refs}).encode("utf-8"),
+        )
+        os.close(write_fd)
+        output = io.StringIO()
+        with (
+            os.fdopen(read_fd, "r", encoding="utf-8") as input_stream,
+            mock.patch.object(self.module.sys, "stdin", input_stream),
+            mock.patch.object(self.module.sys, "stdout", output),
+            mock.patch.object(
+                self.module,
+                "current_delivery_identity",
+                return_value=self.identity,
+            ),
+            mock.patch.object(
+                self.module,
+                "delivery_module",
+                return_value=fake_delivery,
+            ),
+        ):
+            code = self.module.require_github_provider_read_command(
+                self.root,
+                "TASK-17",
+            )
+        return code, output.getvalue(), calls
+
+    def test_agent_guard_cli_passes_real_identity_and_exact_refs(self):
+        code, output, calls = self._run_guard(None)
+        self.assertEqual(code, 0)
+        self.assertEqual(output, '{"allowed":true}\n')
+        self.assertEqual(calls, [(self.root, self.refs, self.identity)])
+
+    def test_active_and_unknown_guard_cli_return_only_fixed_state(self):
+        for state in ("not_before", "unknown"):
+            with self.subTest(state=state):
+                code, output, calls = self._run_guard(state)
+                self.assertEqual(code, 3)
+                self.assertEqual(
+                    json.loads(output),
+                    {"allowed": False, "state": state},
+                )
+                self.assertNotIn("deadline", output)
+                self.assertEqual(calls, [(self.root, self.refs, self.identity)])
+
+    def test_foreign_identity_failure_is_not_rewritten_as_a_guard_block(self):
+        fake_delivery = types.SimpleNamespace(
+            GitHubProviderRetryBlocked=RuntimeError,
+            require_github_provider_read=mock.Mock(
+                side_effect=ValueError("producer identity mismatch"),
+            ),
+        )
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, json.dumps({"refs": self.refs}).encode("utf-8"))
+        os.close(write_fd)
+        output = io.StringIO()
+        with (
+            os.fdopen(read_fd, "r", encoding="utf-8") as input_stream,
+            mock.patch.object(self.module.sys, "stdin", input_stream),
+            mock.patch.object(self.module.sys, "stdout", output),
+            mock.patch.object(
+                self.module,
+                "current_delivery_identity",
+                return_value=self.identity,
+            ),
+            mock.patch.object(
+                self.module,
+                "delivery_module",
+                return_value=fake_delivery,
+            ),
+            self.assertRaisesRegex(ValueError, "producer identity mismatch"),
+        ):
+            self.module.require_github_provider_read_command(
+                self.root,
+                "TASK-17",
+            )
+        fake_delivery.require_github_provider_read.assert_called_once_with(
+            self.root,
+            self.refs,
+            self.identity,
+        )
+        self.assertEqual(output.getvalue(), "")
+
+    def test_emitter_keeps_retry_constraint_binding_only_and_preserves_bytes(self):
+        (self.root / ".kent/workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v1"\n',
+            encoding="utf-8",
+        )
+        captured = {}
+
+        def capture_script_producer(**kwargs):
+            captured.update(kwargs)
+            return "locator", b"original-emitted-bytes"
+
+        fake_delivery = types.SimpleNamespace(
+            packet_decode=lambda raw: json.loads(raw),
+            producer_locator=lambda _text: self.refs[0],
+            capture_script_producer=capture_script_producer,
+        )
+        constraint = (
+            '{"kind":"not_before","not_before_unix_ms":1234567890,'
+            '"provider_host":"github.com","schema":"github-provider-retry-v1"}'
+        )
+        payload = {
+            "_kent": {"task_id": "native-task-id", "node_id": "native-node-id"},
+            "commentary": "prior result\n" + self.refs[0],
+        }
+        with mock.patch.object(
+            self.module,
+            "delivery_module",
+            return_value=fake_delivery,
+        ):
+            emitted = self.module.emit_producer_result(
+                self.root,
+                payload,
+                b'{"transition":"ci_watch_failed"}\n',
+                "wait-ci",
+                github_retry_constraint=constraint,
+            )
+        self.assertEqual(emitted, b"original-emitted-bytes")
+        self.assertEqual(
+            captured["binding"]["producer_refs"],
+            json.dumps(
+                {"refs": [self.refs[0]]},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        self.assertEqual(captured["github_retry_constraint"], constraint)
+        self.assertEqual(captured["result"], {"transition": "ci_watch_failed"})
+
 
 class CheckpointFeedbackDecisionTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -2419,13 +3075,9 @@ class CheckpointFeedbackDecisionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rewrote the acknowledged cursor"):
             self._derive(ref, decision="preserve_acknowledged_cursor")
 
-        broken_ref = self._source(
-            binding={"producer_refs": '{"refs":["not-a-producer-ref"]}'}
-        )
         with self.assertRaises(ValueError):
-            self._derive(
-                broken_ref,
-                decision="preserve_acknowledged_cursor",
+            self._source(
+                binding={"producer_refs": '{"refs":["not-a-producer-ref"]}'}
             )
         with self.assertRaisesRegex(ValueError, "invalid feedback decision request"):
             self.module.derive_feedback_decision(

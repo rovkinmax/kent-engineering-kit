@@ -23,11 +23,13 @@ from workflowkit.ci_contract import (
     parse_preparation_json,
     prepare_ci_payload,
     preparation_failure,
+    github_provider_read_guard,
     read_preparation_input,
     typed_preparation_failure,
     unwrap_delivery_context_payload,
     validate_preparation_identity,
 )
+from workflowkit.github_observation import provider_retry_constraint
 
 
 def main() -> int:
@@ -59,6 +61,7 @@ def main() -> int:
         return 2
 
     typed_protocol = protocol == "typed-v1"
+    github_retry_constraint = None
     if operation is not None:
         try:
             payload = unwrap_delivery_context_payload(original_payload)
@@ -145,6 +148,11 @@ def main() -> int:
                 raise CiContractError("target_branch_invalid")
         if typed_protocol:
             assert observed is not None
+            provider_guard = github_provider_read_guard(
+                Path(payload["workspace_path"]).resolve(),
+                original_payload,
+                observed.identity,
+            )
 
             def typed_archiver(workspace, task, report):
                 archive_payload = {
@@ -167,10 +175,17 @@ def main() -> int:
             output = prepare_ci_payload(
                 payload,
                 report_archiver=typed_archiver,
+                provider_guard=provider_guard,
             )
         else:
             output = prepare_ci_payload(payload)
     except (RuntimeError, OSError, ValueError, KeyError, TypeError) as error:
+        if typed_protocol:
+            github_retry_constraint = provider_retry_constraint(
+                error,
+                interval=0,
+                failure_count=1,
+            )
         if typed_protocol:
             try:
                 output = typed_preparation_failure(original_payload, error)
@@ -198,8 +213,21 @@ def main() -> int:
             raise ValueError("producer adapter cannot be loaded")
         adapter = importlib.util.module_from_spec(spec)
         loader.exec_module(adapter)
-        encoded = adapter.emit_producer_result(
-            workspace, original_payload, encoded, "prepare-ci")
+        if github_retry_constraint is None:
+            encoded = adapter.emit_producer_result(
+                workspace,
+                original_payload,
+                encoded,
+                "prepare-ci",
+            )
+        else:
+            encoded = adapter.emit_producer_result(
+                workspace,
+                original_payload,
+                encoded,
+                "prepare-ci",
+                github_retry_constraint=github_retry_constraint,
+            )
     sys.stdout.buffer.write(encoded)
     return 0
 

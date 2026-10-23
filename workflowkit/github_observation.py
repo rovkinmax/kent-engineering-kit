@@ -37,7 +37,9 @@ class ObservationError(RuntimeError):
                  stdout: bytes = b"", stderr: bytes = b"",
                  rate_limited: bool = False,
                  retry_after_seconds: int | None = None,
-                 provider_retry_unknown: bool = False) -> None:
+                 provider_retry_unknown: bool = False,
+                 provider_retry_captured: bool = False,
+                 provider_retry_observed_at_ns: int | None = None) -> None:
         super().__init__(code)
         self.code = code
         self.exit_code = exit_code
@@ -46,6 +48,10 @@ class ObservationError(RuntimeError):
         self.rate_limited = rate_limited
         self.retry_after_seconds = retry_after_seconds
         self.provider_retry_unknown = provider_retry_unknown
+        # These private fields are local coordination data only. They are
+        # deliberately absent from as_dict(), exception text and all packets.
+        self._provider_retry_captured = provider_retry_captured
+        self._provider_retry_observed_at_ns = provider_retry_observed_at_ns
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -94,6 +100,68 @@ _RETRY_HEADERS = {
 }
 
 
+def provider_retry_constraint(
+    error: BaseException,
+    *,
+    interval: int,
+    failure_count: int,
+) -> str | None:
+    """Return a closed retry DTO for one captured provider failure.
+
+    The observation timestamp is sampled at the provider transport boundary
+    and stays private on ``ObservationError``. This helper never inspects raw
+    stderr or serialized diagnostics. Callers supply only the existing local
+    interval and failure index so secondary-limit timing matches that policy.
+    """
+    if not getattr(error, "_provider_retry_captured", False):
+        return None
+    observed_at_ns = getattr(error, "_provider_retry_observed_at_ns", None)
+    rate_limited = getattr(error, "rate_limited", False) is True
+    retry_unknown = getattr(error, "provider_retry_unknown", False) is True
+    if not rate_limited and not retry_unknown:
+        return None
+    retry_is_known = (
+        type(observed_at_ns) is int
+        and observed_at_ns >= 0
+        and rate_limited
+        and not retry_unknown
+    )
+    if retry_is_known:
+        try:
+            delay = error.retry_delay_seconds(  # type: ignore[attr-defined]
+                interval=interval,
+                failure_count=failure_count,
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            retry_is_known = False
+        else:
+            retry_is_known = type(delay) is int and delay >= 0
+    if retry_is_known:
+        deadline_ms = (observed_at_ns + delay * 1_000_000_000 + 999_999) // 1_000_000
+        if deadline_ms > 9_223_372_036_854_775_807:
+            retry_is_known = False
+        else:
+            constraint = {
+                "schema": "github-provider-retry-v1",
+                "provider_host": "github.com",
+                "kind": "not_before",
+                "not_before_unix_ms": deadline_ms,
+            }
+    if not retry_is_known:
+        constraint = {
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": "unknown",
+        }
+    return json.dumps(
+        constraint,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
 def _http_date_timestamp(value: str | None) -> float | None:
     if value is None or len(value) > 64:
         return None
@@ -106,7 +174,11 @@ def _http_date_timestamp(value: str | None) -> float | None:
         return None
 
 
-def _provider_retry_metadata(stderr: bytes) -> tuple[bool | None, int | None]:
+def _provider_retry_metadata(
+    stderr: bytes,
+    *,
+    now_unix_ns: int | None = None,
+) -> tuple[bool | None, int | None]:
     """Extract allowlisted timing from one complete final gh API response."""
     current: dict[str, Any] | None = None
     final_response: dict[str, Any] | None = None
@@ -181,7 +253,11 @@ def _provider_retry_metadata(stderr: bytes) -> tuple[bool | None, int | None]:
     body_rate_limited = final_response["body_rate_limited"]
     body_primary_rate_limited = final_response["body_primary_rate_limited"]
     body_secondary_rate_limited = final_response["body_secondary_rate_limited"]
-    local_now = time.time()
+    local_now = (
+        now_unix_ns / 1_000_000_000
+        if type(now_unix_ns) is int and now_unix_ns >= 0
+        else time.time()
+    )
     provider_now = _http_date_timestamp(headers.get("date"))
     reference_now = (
         min(local_now, provider_now)
@@ -355,6 +431,7 @@ def _read_transport(
     input_bytes: bytes | None = None,
     accepted_exit_codes: tuple[int, ...] = (0,),
     capture_provider_retry: bool = False,
+    provider_guard: Callable[[], None] | None = None,
 ) -> tuple[bytes, bytes]:
     if input_bytes is not None and len(input_bytes) > 1024 * 1024:
         raise ObservationError("observation_limit")
@@ -366,6 +443,8 @@ def _read_transport(
         if capture_provider_retry:
             child_env = os.environ.copy()
             child_env["GH_DEBUG"] = "api"
+        if provider_guard is not None:
+            provider_guard()
         process = subprocess.Popen(
             [executable, *args], cwd=workspace,
             stdin=input_stream if input_bytes is not None else subprocess.DEVNULL,
@@ -413,8 +492,9 @@ def _read_transport(
         process.stderr.close()
     stdout, stderr = bytes(output["stdout"]), bytes(output["stderr"])
     if failure or process.returncode not in accepted_exit_codes:
+        observed_at_ns = time.time_ns() if capture_provider_retry else None
         retry_evidence, retry_after = (
-            _provider_retry_metadata(stderr)
+            _provider_retry_metadata(stderr, now_unix_ns=observed_at_ns)
             if capture_provider_retry
             else (False, None)
         )
@@ -427,6 +507,8 @@ def _read_transport(
             rate_limited=rate_limited,
             retry_after_seconds=retry_after,
             provider_retry_unknown=retry_unknown,
+            provider_retry_captured=capture_provider_retry,
+            provider_retry_observed_at_ns=observed_at_ns,
         )
     return stdout, stderr
 
@@ -440,6 +522,8 @@ def read_bytes(
     limit: int = MAX_QUERY_BYTES,
     input_bytes: bytes | None = None,
     accepted_exit_codes: tuple[int, ...] = (0,),
+    capture_provider_retry: bool = False,
+    provider_guard: Callable[[], None] | None = None,
 ) -> bytes:
     """Run a bounded command and return its raw stdout bytes."""
     stdout, _ = _read_transport(
@@ -450,6 +534,8 @@ def read_bytes(
         limit=limit,
         input_bytes=input_bytes,
         accepted_exit_codes=accepted_exit_codes,
+        capture_provider_retry=capture_provider_retry,
+        provider_guard=provider_guard,
     )
     return stdout
 
@@ -464,6 +550,7 @@ def read_json(
     input_bytes: bytes | None = None,
     accepted_exit_codes: tuple[int, ...] = (0,),
     capture_provider_retry: bool = False,
+    provider_guard: Callable[[], None] | None = None,
 ) -> Any:
     """Run bounded transport, then decode strict UTF-8 JSON."""
     stdout, stderr = _read_transport(
@@ -475,15 +562,19 @@ def read_json(
         input_bytes=input_bytes,
         accepted_exit_codes=accepted_exit_codes,
         capture_provider_retry=capture_provider_retry,
+        provider_guard=provider_guard,
     )
     try:
         return json.loads(stdout.decode("utf-8"))
     except (ValueError, UnicodeDecodeError, RecursionError) as error:
+        observed_at_ns = time.time_ns() if capture_provider_retry else None
         raise ObservationError(
             "invalid_observation",
             stdout=stdout,
             stderr=stderr,
             provider_retry_unknown=capture_provider_retry,
+            provider_retry_captured=capture_provider_retry,
+            provider_retry_observed_at_ns=observed_at_ns,
         ) from error
 
 
@@ -572,12 +663,14 @@ def _feedback_item(kind: str, raw: dict[str, Any], *, thread_id: str | None = No
 
 class GitHubObserver:
     def __init__(self, workspace: Path, *, gh_bin: str | None = None,
-                 timeout: float = 60, query: Callable[[list[str]], Any] | None = None) -> None:
+                 timeout: float = 60, query: Callable[[list[str]], Any] | None = None,
+                 provider_guard: Callable[[], None] | None = None) -> None:
         self.workspace = workspace
         self._subprocess_query = query is None
         self.timeout = timeout
         self.gh_bin = gh_bin if query else (gh_bin or resolve_gh_bin())
         self.query = query or self._query
+        self.provider_guard = provider_guard
 
     def _query(self, args: list[str]) -> Any:
         assert self.gh_bin is not None
@@ -587,6 +680,7 @@ class GitHubObserver:
             args,
             timeout=self.timeout,
             capture_provider_retry=True,
+            provider_guard=self.provider_guard,
         )
 
     def read_pr(self, pr_url: str) -> dict[str, Any]:
@@ -622,6 +716,7 @@ class GitHubObserver:
                 timeout=self.timeout,
                 accepted_exit_codes=(0, 1, 8),
                 capture_provider_retry=True,
+                provider_guard=self.provider_guard,
             ))
         else:
             value = _array(self.query([

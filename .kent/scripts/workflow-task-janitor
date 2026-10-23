@@ -30,6 +30,7 @@ races: POSIX unlink is not an atomic inode compare-and-swap.
 from __future__ import annotations
 
 import json
+import importlib
 import importlib.machinery
 import importlib.util
 import errno
@@ -72,6 +73,7 @@ SAFE_JANITOR_FAILURE_MESSAGES = {
 _NATIVE_KENT = None
 _ORIGINAL_CLEANUP_REPORT: str | None = None
 _CLEANUP_REPORT_RUNTIME = None
+_PROVIDER_CONTEXT: dict[str, object] | None = None
 RUNTIME_EVIDENCE_ENTRIES = frozenset({
     "evidence-ledger.jsonl",
     "fix-checkpoint.json",
@@ -94,6 +96,237 @@ class JanitorSafetyError(ValueError):
             raise ValueError("unknown Janitor safety failure code")
         self.code = code
         super().__init__(SAFE_JANITOR_FAILURE_MESSAGES[code])
+
+
+class JanitorProviderReadBlocked(RuntimeError):
+    """Fixed safe refusal before a GitHub API child is started."""
+
+    def __init__(self, state: str = "unknown") -> None:
+        self.state = state if state in {"not_before", "unknown"} else "unknown"
+        super().__init__("github_provider_retry_blocked")
+
+
+class JanitorProviderProvenanceBlocked(RuntimeError):
+    """The opted-in Janitor did not receive its current producer carrier."""
+
+    def __init__(self) -> None:
+        super().__init__("github_provider_provenance_missing")
+
+
+def delivery_reliability_enabled(workspace: Path) -> bool:
+    """Safely resolve the explicit profile opt-in before requiring Kit helpers."""
+    root_fd = os.open(
+        workspace,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    descriptors = [root_fd]
+    try:
+        try:
+            kent_fd = os.open(
+                ".kent",
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            return False
+        descriptors.append(kent_fd)
+        try:
+            profile_fd = os.open(
+                "workflow-profile.toml",
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=kent_fd,
+            )
+        except FileNotFoundError:
+            return False
+        with os.fdopen(profile_fd, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o022
+                or metadata.st_size > 64 * 1024
+            ):
+                raise RuntimeError("workflow profile is unsafe")
+            raw = stream.read(64 * 1024 + 1)
+            after = os.fstat(stream.fileno())
+            if (
+                len(raw) > 64 * 1024
+                or (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise RuntimeError("workflow profile changed during read")
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+    profile = tomllib.loads(raw.decode("utf-8"))
+    policies = profile.get("policies", {})
+    if not isinstance(policies, dict):
+        raise RuntimeError("workflow profile policy table is invalid")
+    policy = policies.get("delivery_reliability")
+    if policy not in (None, "v1"):
+        raise RuntimeError("workflow delivery reliability policy is unsupported")
+    return policy == "v1"
+
+
+def checkpoint_module():
+    sibling = Path(__file__).with_name("workflow-checkpoint")
+    if sibling.is_symlink() or not sibling.is_file():
+        raise RuntimeError("producer adapter is unavailable or unsafe")
+    loader = importlib.machinery.SourceFileLoader(
+        "janitor_workflow_checkpoint",
+        str(sibling),
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("producer adapter is unavailable or unsafe")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def provider_modules(checkpoint):
+    """Load observer/runtime only from the Kit source qualified by checkpoint."""
+    delivery = checkpoint.delivery_module()
+    package_root = Path(delivery.__file__).resolve().parent
+    expected = {
+        "github_observation": package_root / "github_observation.py",
+        "runtime": package_root / "runtime.py",
+    }
+    loaded = {}
+    for name, path in expected.items():
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise RuntimeError("qualified provider support module is unsafe")
+        module = importlib.import_module(f"workflowkit.{name}")
+        if Path(module.__file__).resolve() != path:
+            raise RuntimeError("unexpected qualified provider support module")
+        loaded[name] = module
+    return delivery, loaded["github_observation"], loaded["runtime"]
+
+
+def prepare_provider_guard(
+    workspace: Path,
+    task_short_id: str,
+    payload: dict[str, object],
+) -> dict[str, object] | None:
+    """Bind opted-in provider reads to this Script's exact incoming carrier."""
+    if not delivery_reliability_enabled(workspace):
+        # Legacy projects without an explicit v1 opt-in retain their prior path.
+        return None
+    checkpoint = checkpoint_module()
+    if not checkpoint.delivery_reliability_enabled(workspace):
+        raise RuntimeError("qualified producer adapter rejected opted-in policy")
+
+    commentary = payload.get("commentary")
+    if not isinstance(commentary, str):
+        raise JanitorProviderProvenanceBlocked()
+    delivery, observation, runtime = provider_modules(checkpoint)
+    try:
+        locator = delivery.producer_locator(commentary)
+    except (TypeError, ValueError):
+        raise JanitorProviderProvenanceBlocked() from None
+    if locator is None or not isinstance(_NATIVE_KENT, dict):
+        raise JanitorProviderProvenanceBlocked()
+    try:
+        identity = delivery.observe_script_identity(
+            workspace,
+            task_short_id,
+            _NATIVE_KENT,
+            native_read=checkpoint.delivery_native_read,
+        )
+        prepared_guard = delivery.prepare_github_provider_read_guard(
+            workspace,
+            [locator],
+            identity,
+        )
+    except Exception:
+        raise JanitorProviderProvenanceBlocked() from None
+    return {
+        "checkpoint": checkpoint,
+        "delivery": delivery,
+        "observation": observation,
+        "runtime": runtime,
+        "workspace": workspace,
+        "payload": payload,
+        "refs": [locator],
+        "identity": identity,
+        "prepared_guard": prepared_guard,
+        "pending_constraints": [],
+        "post_delete": False,
+    }
+
+
+def github_provider_read_guard() -> None:
+    context = _PROVIDER_CONTEXT
+    if context is None:
+        return
+    try:
+        context["prepared_guard"]()
+        pending = [
+            json.loads(value)
+            for value in context["pending_constraints"]
+        ]
+        merged = context["runtime"].merge_github_retry_constraints(pending)
+        state = context["runtime"].evaluate_github_retry_constraint(
+            merged,
+            now_unix_ms=time.time_ns() // 1_000_000,
+        )
+    except JanitorProviderReadBlocked:
+        raise
+    except Exception as error:
+        blocked_type = getattr(
+            context["delivery"],
+            "GitHubProviderRetryBlocked",
+            None,
+        )
+        if isinstance(blocked_type, type) and isinstance(error, blocked_type):
+            state = getattr(error, "state", "unknown")
+            raise JanitorProviderReadBlocked(state) from None
+        raise JanitorProviderReadBlocked() from None
+    if state != "clear":
+        raise JanitorProviderReadBlocked(state)
+
+
+def pending_provider_constraint() -> str | None:
+    context = _PROVIDER_CONTEXT
+    if context is None or not context["pending_constraints"]:
+        return None
+    merged = context["runtime"].merge_github_retry_constraints(
+        [json.loads(value) for value in context["pending_constraints"]]
+    )
+    if merged is None:
+        return None
+    return context["runtime"].canonical_bytes(merged).decode("utf-8")
+
+
+def provider_blocked_complete(
+    report: str,
+    blocker: str,
+    *,
+    github_retry_constraint: str | None = None,
+) -> None:
+    """Emit a blocked producer only while the managed Task root still exists."""
+    context = _PROVIDER_CONTEXT
+    if (
+        context is None
+        or context["post_delete"]
+        or not context["workspace"].is_dir()
+    ):
+        complete("task_janitor_blocked", report, blocker)
+        return
+    complete(
+        "task_janitor_blocked",
+        report,
+        blocker,
+        producer_payload=context["payload"],
+        github_retry_constraint=github_retry_constraint,
+    )
 
 
 def runtime_state_names(task: str) -> tuple[str, str]:
@@ -579,27 +812,53 @@ def github_pr(workspace: Path, pr_url: str) -> dict[str, object]:
 
     for attempt in range(1, GITHUB_LOOKUP_ATTEMPTS + 1):
         try:
-            result = run(
-                [
+            command = [
+                "pr",
+                "view",
+                pr_url,
+                "--json",
+                "state,mergedAt,headRefName,headRefOid,baseRefName,isCrossRepository,url",
+            ]
+            if _PROVIDER_CONTEXT is None:
+                result = run(
+                    [os.environ.get("KENT_GH_BIN", "gh"), *command],
+                    cwd=workspace,
+                )
+                payload = json.loads(result.stdout)
+            else:
+                observation = _PROVIDER_CONTEXT["observation"]
+                payload = observation.read_json(
                     os.environ.get("KENT_GH_BIN", "gh"),
-                    "pr",
-                    "view",
-                    pr_url,
-                    "--json",
-                    "state,mergedAt,headRefName,headRefOid,baseRefName,isCrossRepository,url",
-                ],
-                cwd=workspace,
-            )
-            payload = json.loads(result.stdout)
+                    workspace,
+                    command,
+                    capture_provider_retry=True,
+                    provider_guard=github_provider_read_guard,
+                )
             if not isinstance(payload, dict):
                 raise RuntimeError("gh returned a non-object PR payload")
             return payload
+        except JanitorProviderReadBlocked:
+            raise
         except (
             OSError,
             RuntimeError,
             json.JSONDecodeError,
             subprocess.TimeoutExpired,
         ) as error:
+            context = _PROVIDER_CONTEXT
+            if context is not None:
+                observation = context["observation"]
+                constraint = observation.provider_retry_constraint(
+                    error,
+                    interval=max(0, int(retry_delay)),
+                    failure_count=attempt,
+                )
+                if constraint is not None:
+                    context["pending_constraints"].append(constraint)
+                    if attempt < GITHUB_LOOKUP_ATTEMPTS:
+                        github_provider_read_guard()
+                if context["post_delete"]:
+                    raise RuntimeError("GitHub provider read failed after worktree deletion") from None
             if attempt < GITHUB_LOOKUP_ATTEMPTS and retry_delay:
                 time.sleep(retry_delay)
 
@@ -2997,7 +3256,14 @@ def format_cleanup_report(
     return result + marker_line
 
 
-def complete(transition: str, report: str, blocker: str = "") -> None:
+def complete(
+    transition: str,
+    report: str,
+    blocker: str = "",
+    *,
+    producer_payload: dict[str, object] | None = None,
+    github_retry_constraint: str | None = None,
+) -> None:
     report = format_cleanup_report(
         _ORIGINAL_CLEANUP_REPORT,
         report,
@@ -3006,7 +3272,19 @@ def complete(transition: str, report: str, blocker: str = "") -> None:
     payload = {"transition": transition, "cleanup_report": report}
     if blocker:
         payload["blocker_reason"] = blocker
-    print(json.dumps(payload, ensure_ascii=False))
+    encoded = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    if producer_payload is not None:
+        context = _PROVIDER_CONTEXT
+        if context is None or context["post_delete"]:
+            raise RuntimeError("provider producer is unavailable after worktree deletion")
+        encoded = context["checkpoint"].emit_producer_result(
+            context["workspace"],
+            producer_payload,
+            encoded,
+            "task-janitor",
+            github_retry_constraint=github_retry_constraint,
+        )
+    sys.stdout.write(encoded.decode("utf-8"))
 
 
 def deletion_result_kind(payload: dict) -> str:
@@ -3603,8 +3881,10 @@ def check_terminal_postconditions(
 
 def main() -> int:
     global _NATIVE_KENT, _ORIGINAL_CLEANUP_REPORT, _CLEANUP_REPORT_RUNTIME
+    global _PROVIDER_CONTEXT
     _ORIGINAL_CLEANUP_REPORT = None
     _CLEANUP_REPORT_RUNTIME = None
+    _PROVIDER_CONTEXT = None
     try:
         payload = json.load(sys.stdin, object_pairs_hook=_unique_json_pairs)
     except json.JSONDecodeError as error:
@@ -3771,6 +4051,29 @@ def main() -> int:
         )
         return 0
 
+    try:
+        _PROVIDER_CONTEXT = prepare_provider_guard(
+            workspace,
+            task_short_id,
+            payload,
+        )
+    except JanitorProviderProvenanceBlocked:
+        complete(
+            "task_janitor_blocked",
+            previous_report,
+            "Current Janitor producer provenance is unavailable; no GitHub "
+            "provider read or cleanup effect was attempted.",
+        )
+        return 0
+    except Exception:
+        complete(
+            "task_janitor_blocked",
+            previous_report,
+            "GitHub provider guard preparation failed; no provider read or "
+            "cleanup effect was attempted.",
+        )
+        return 0
+
     merged_pr: dict[str, object] | None = None
     merged_head_oid = ""
     origin_route: dict[str, object] | None = None
@@ -3807,6 +4110,22 @@ def main() -> int:
             json.JSONDecodeError,
             subprocess.TimeoutExpired,
         ) as error:
+            if isinstance(error, JanitorProviderReadBlocked):
+                provider_blocked_complete(
+                    previous_report,
+                    "GitHub provider read is blocked by inherited retry state; "
+                    "no cleanup effect was attempted.",
+                    github_retry_constraint=pending_provider_constraint(),
+                )
+                return 0
+            if pending_provider_constraint() is not None:
+                provider_blocked_complete(
+                    previous_report,
+                    "GitHub provider retry state prevents further PR evidence "
+                    "reads; no deletion claim is made.",
+                    github_retry_constraint=pending_provider_constraint(),
+                )
+                return 0
             complete(
                 "task_janitor_blocked",
                 f"{previous_report}\nJanitor preserved {workspace}: "
@@ -4014,10 +4333,27 @@ def main() -> int:
                 origin_route=origin_route,
             ):
                 raise RuntimeError("published branch changed before native deletion")
+        github_provider_read_guard()
 
     try:
         validate_delete_witness()
     except Exception as error:
+        if isinstance(error, JanitorProviderReadBlocked):
+            provider_blocked_complete(
+                previous_report,
+                "GitHub provider read is blocked by inherited retry state; "
+                "managed worktree deletion was not attempted.",
+                github_retry_constraint=pending_provider_constraint(),
+            )
+            return 0
+        if pending_provider_constraint() is not None:
+            provider_blocked_complete(
+                previous_report,
+                "GitHub provider retry state prevents further reads; managed "
+                "worktree deletion was not attempted.",
+                github_retry_constraint=pending_provider_constraint(),
+            )
+            return 0
         complete(
             "task_janitor_blocked",
             f"{previous_report}\nJanitor preserved {workspace}: "
@@ -4038,6 +4374,8 @@ def main() -> int:
         _effect_status=native_effect,
         _before_delete=validate_delete_witness,
     )
+    if _PROVIDER_CONTEXT is not None:
+        _PROVIDER_CONTEXT["post_delete"] = not workspace.is_dir()
     if not deletion_ok:
         if native_effect.get("state") == "uncertain":
             try:

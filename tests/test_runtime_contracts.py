@@ -91,6 +91,86 @@ class RetainedScriptReaderTest(unittest.TestCase):
                 validate(selected=selected)
 
 
+class GitHubRetryConstraintTests(unittest.TestCase):
+    def test_closed_retry_constraint_and_boundary_evaluation(self):
+        deadline = {
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": "not_before",
+            "not_before_unix_ms": 1234,
+        }
+        unknown = {
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": "unknown",
+        }
+        self.assertEqual(
+            runtime_module.validate_github_retry_constraint(deadline), deadline,
+        )
+        self.assertEqual(
+            runtime_module.validate_github_retry_constraint(unknown), unknown,
+        )
+        self.assertEqual(
+            runtime_module.evaluate_github_retry_constraint(
+                deadline, now_unix_ms=1233,
+            ),
+            "not_before",
+        )
+        self.assertEqual(
+            runtime_module.evaluate_github_retry_constraint(
+                deadline, now_unix_ms=1234,
+            ),
+            "clear",
+        )
+        self.assertEqual(
+            runtime_module.evaluate_github_retry_constraint(
+                unknown, now_unix_ms=10_000,
+            ),
+            "unknown",
+        )
+        self.assertEqual(
+            runtime_module.evaluate_github_retry_constraint(
+                None, now_unix_ms=0,
+            ),
+            "clear",
+        )
+
+    def test_retry_merge_is_monotonic_and_unknown_absorbs(self):
+        first = {
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": "not_before",
+            "not_before_unix_ms": 1234,
+        }
+        later = {**first, "not_before_unix_ms": 9000}
+        unknown = {
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": "unknown",
+        }
+        self.assertEqual(runtime_module.merge_github_retry_constraints([]), None)
+        self.assertEqual(
+            runtime_module.merge_github_retry_constraints([later, first]), later,
+        )
+        self.assertEqual(
+            runtime_module.merge_github_retry_constraints([later, unknown]),
+            unknown,
+        )
+        for invalid in (
+            {**first, "provider_host": "example.com"},
+            {**first, "not_before_unix_ms": True},
+            {**first, "extra": "not-closed"},
+            {**unknown, "not_before_unix_ms": 1},
+            {**first, "not_before_unix_ms": -1},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeContractError):
+                runtime_module.validate_github_retry_constraint(invalid)
+        with self.assertRaises(RuntimeContractError):
+            runtime_module.evaluate_github_retry_constraint(
+                first, now_unix_ms=True,
+            )
+
+
 class EvidenceRecoveryViewTest(unittest.TestCase):
     def test_typed_script_ci_archive_row_is_closed_and_chain_bound(self):
         identity = {

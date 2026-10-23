@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from test_workflow_runtime import (
@@ -199,6 +200,591 @@ class JanitorAuditS3Test(unittest.TestCase):
             finally:
                 os.chdir(previous_cwd)
         return code, json.loads(output.getvalue())
+
+    def _provider_context(
+        self,
+        janitor,
+        *,
+        workspace: Path,
+        observation,
+        prepared_guard,
+        pending_constraints: list[str] | None = None,
+        post_delete: bool = False,
+    ) -> dict[str, object]:
+        from workflowkit import delivery, runtime
+
+        checkpoint = mock.Mock()
+        checkpoint.emit_producer_result.side_effect = (
+            lambda _root, _payload, result, _kind, **_kwargs: result
+        )
+        context = {
+            "checkpoint": checkpoint,
+            "delivery": delivery,
+            "observation": observation,
+            "runtime": runtime,
+            "workspace": workspace,
+            "payload": {},
+            "refs": [],
+            "identity": {},
+            "prepared_guard": prepared_guard,
+            "pending_constraints": pending_constraints or [],
+            "post_delete": post_delete,
+        }
+        janitor._PROVIDER_CONTEXT = context
+        return context
+
+    def test_provider_guard_uses_current_commentary_footer_and_native_identity(self) -> None:
+        from workflowkit import delivery
+
+        root = self.fixtures.create_repository()
+        (root / ".kent" / "workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v1"\n'
+        )
+        current = (
+            "build/kent-workflow/TASK-1/packets/base-"
+            + "a" * 64
+            + ".json"
+        )
+        old = (
+            "build/kent-workflow/TASK-1/packets/base-"
+            + "b" * 64
+            + ".json"
+        )
+        commentary = f"Current carrier\nKENT_PACKET_SOURCE_V1 {current}"
+        payload = {
+            "commentary": commentary,
+            "cleanup_report": f"Old report\nKENT_PACKET_SOURCE_V1 {old}",
+        }
+        native = {
+            "task_id": "native-task",
+            "node_id": "janitor-node",
+            "transition_branch_key": "cleanup",
+        }
+        identity = {"invocation_kind": "script", "native": "readback"}
+        prepared = mock.Mock()
+        checkpoint = mock.Mock()
+        checkpoint.delivery_reliability_enabled.return_value = True
+        provider_delivery = mock.Mock(wraps=delivery)
+        provider_delivery.observe_script_identity.return_value = identity
+        provider_delivery.prepare_github_provider_read_guard.return_value = prepared
+        observation = mock.Mock()
+        runtime = mock.Mock()
+        janitor = self.janitor("janitor_current_commentary_guard")
+
+        with (
+            mock.patch.object(janitor, "checkpoint_module", return_value=checkpoint),
+            mock.patch.object(
+                janitor,
+                "provider_modules",
+                return_value=(provider_delivery, observation, runtime),
+            ),
+            mock.patch.object(janitor, "_NATIVE_KENT", native),
+        ):
+            context = janitor.prepare_provider_guard(root, "TASK-1", payload)
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["refs"], [current])
+        provider_delivery.producer_locator.assert_called_once_with(commentary)
+        provider_delivery.observe_script_identity.assert_called_once_with(
+            root,
+            "TASK-1",
+            native,
+            native_read=checkpoint.delivery_native_read,
+        )
+        provider_delivery.prepare_github_provider_read_guard.assert_called_once_with(
+            root,
+            [current],
+            identity,
+        )
+        self.assertNotIn(old, context["refs"])
+
+    def test_provider_guard_ignores_older_cleanup_report_footer(self) -> None:
+        root = self.fixtures.create_repository()
+        (root / ".kent" / "workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v1"\n'
+        )
+        janitor = self.janitor("janitor_no_stale_commentary_fallback")
+        checkpoint = mock.Mock()
+        checkpoint.delivery_reliability_enabled.return_value = True
+        with (
+            mock.patch.object(janitor, "checkpoint_module", return_value=checkpoint),
+            mock.patch.object(janitor, "provider_modules") as provider_modules,
+        ):
+            with self.assertRaises(janitor.JanitorProviderProvenanceBlocked):
+                janitor.prepare_provider_guard(
+                    root,
+                    "TASK-1",
+                    {
+                        "cleanup_report": (
+                            "Old report\nKENT_PACKET_SOURCE_V1 "
+                            "build/kent-workflow/TASK-1/packets/base-"
+                            + "a" * 64
+                            + ".json"
+                        )
+                    },
+                )
+        provider_modules.assert_not_called()
+
+    def test_opted_in_profile_rejected_by_checkpoint_fails_closed(self) -> None:
+        root = self.fixtures.create_repository()
+        (root / ".kent" / "workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v1"\n'
+        )
+        janitor = self.janitor("janitor_profile_adapter_disagreement")
+        checkpoint = mock.Mock()
+        checkpoint.delivery_reliability_enabled.return_value = False
+        payload = {
+            "commentary": (
+                "Current carrier\nKENT_PACKET_SOURCE_V1 "
+                "build/kent-workflow/TASK-1/packets/base-"
+                + "a" * 64
+                + ".json"
+            )
+        }
+
+        with (
+            mock.patch.object(janitor, "checkpoint_module", return_value=checkpoint),
+            mock.patch.object(janitor, "provider_modules") as provider_modules,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "qualified producer adapter rejected opted-in policy",
+            ):
+                janitor.prepare_provider_guard(root, "TASK-1", payload)
+
+        provider_modules.assert_not_called()
+
+    def test_provider_guard_rejects_malformed_current_footer(self) -> None:
+        from workflowkit import delivery
+
+        root = self.fixtures.create_repository()
+        (root / ".kent" / "workflow-profile.toml").write_text(
+            '[policies]\ndelivery_reliability = "v1"\n'
+        )
+        janitor = self.janitor("janitor_malformed_current_footer")
+        checkpoint = mock.Mock()
+        checkpoint.delivery_reliability_enabled.return_value = True
+        provider_delivery = mock.Mock(wraps=delivery)
+        identity = {
+            "task_id": "native-task",
+            "node_id": "janitor-node",
+            "transition_branch_key": "cleanup",
+        }
+        with (
+            mock.patch.object(janitor, "checkpoint_module", return_value=checkpoint),
+            mock.patch.object(
+                janitor,
+                "provider_modules",
+                return_value=(provider_delivery, mock.Mock(), mock.Mock()),
+            ),
+            mock.patch.object(janitor, "_NATIVE_KENT", identity),
+        ):
+            with self.assertRaises(janitor.JanitorProviderProvenanceBlocked):
+                janitor.prepare_provider_guard(
+                    root,
+                    "TASK-1",
+                    {
+                        "commentary": (
+                            "Malformed current carrier\n"
+                            "KENT_PACKET_SOURCE_V1 not-a-qualified-locator"
+                        )
+                    },
+                )
+
+        provider_delivery.observe_script_identity.assert_not_called()
+        provider_delivery.prepare_github_provider_read_guard.assert_not_called()
+
+    def test_opted_in_main_blocks_without_current_footer_before_gh_or_delete(self) -> None:
+        import shutil
+
+        root, worktree, scripts, _marker = self.fixtures.make_managed_worktree(
+            with_v2=False
+        )
+        profile = worktree / ".kent" / "workflow-profile.toml"
+        profile.write_text('[policies]\ndelivery_reliability = "v1"\n')
+        self.fixtures.run_git(worktree, "add", ".kent/workflow-profile.toml")
+        self.fixtures.run_git(worktree, "commit", "-q", "-m", "enable reliability")
+        shutil.copyfile(
+            REPO_ROOT / "templates/project/workflow-checkpoint",
+            scripts / "workflow-checkpoint",
+        )
+        old_locator = (
+            "build/kent-workflow/TASK-1/packets/base-"
+            + "c" * 64
+            + ".json"
+        )
+        original_report = (
+            "Prior cleanup\nKENT_PACKET_SOURCE_V1 " + old_locator
+        )
+        payload = json.loads(
+            self.fixtures.janitor_input(
+                worktree,
+                branch_name="TASK-1",
+                pr_url="https://github.com/example/repo/pull/1",
+                cleanup_mode="merged",
+                pr_base_branch="main",
+                cleanup_report=original_report,
+            )
+        )
+        gh_called = root / "gh-called"
+        fake_gh = root / "gh"
+        fake_gh.write_text(
+            "#!/bin/sh\n"
+            f"touch {str(gh_called)!r}\n"
+            "exit 1\n"
+        )
+        fake_gh.chmod(0o755)
+        wrapper_called = root / "wrapper-called"
+        janitor = load_template_module(
+            scripts / "workflow-task-janitor",
+            "janitor_missing_current_commentary",
+        )
+        output = io.StringIO()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    **os.environ,
+                    "KENT_GH_BIN": str(fake_gh),
+                    "KENT_WORKTREE_WRAPPER": str(
+                        self.fixtures.completed_wrapper(root)
+                    ),
+                    "KENT_TEST_WRAPPER_MARKER": str(wrapper_called),
+                    "KENT_TEST_PRIMARY": str(root),
+                },
+            ),
+            mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))),
+            mock.patch.object(sys, "stdout", output),
+        ):
+            self.assertEqual(janitor.main(), 0)
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["transition"], "task_janitor_blocked")
+        self.assertEqual(result["cleanup_report"], original_report)
+        self.assertIn("Current Janitor producer provenance is unavailable", result["blocker_reason"])
+        self.assertFalse(gh_called.exists())
+        self.assertFalse(wrapper_called.exists())
+        self.assertTrue(worktree.is_dir())
+
+    def test_delete_boundary_blocks_and_emits_inherited_retry_binding_predelete(self) -> None:
+        from workflowkit.runtime import canonical_bytes
+
+        root, worktree, scripts, _marker = self.fixtures.make_managed_worktree(
+            with_v2=False
+        )
+        janitor = load_template_module(
+            scripts / "workflow-task-janitor",
+            "janitor_delete_boundary_provider_guard",
+        )
+        payload = json.loads(
+            self.fixtures.janitor_input(
+                worktree,
+                branch_name="TASK-1",
+                cleanup_mode="no_pr",
+                pr_base_branch="not-applicable",
+                cleanup_report="Original cleanup report.",
+                commentary=(
+                    "Current incoming carrier\nKENT_PACKET_SOURCE_V1 "
+                    "build/kent-workflow/TASK-1/packets/base-"
+                    + "d" * 64
+                    + ".json"
+                ),
+            )
+        )
+        constraint = canonical_bytes({
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": "unknown",
+        }).decode("utf-8")
+        context = self._provider_context(
+            janitor,
+            workspace=worktree,
+            observation=SimpleNamespace(
+                read_json=mock.Mock(),
+                provider_retry_constraint=mock.Mock(),
+            ),
+            prepared_guard=mock.Mock(
+                side_effect=janitor.JanitorProviderReadBlocked("unknown")
+            ),
+            pending_constraints=[constraint],
+        )
+        context["payload"] = payload
+        delete = mock.Mock(side_effect=AssertionError("delete must remain uncalled"))
+        output = io.StringIO()
+
+        with (
+            mock.patch.object(
+                janitor,
+                "prepare_provider_guard",
+                return_value=context,
+            ),
+            mock.patch.object(janitor, "admit_origin_route", return_value={}),
+            mock.patch.object(janitor, "head_matches_current_remote", return_value=True),
+            mock.patch.object(janitor, "admit_local_branch_for_native_delete"),
+            mock.patch.object(
+                janitor,
+                "_admit_managed_runtime_parent",
+                return_value=(True, "runtime parent admitted"),
+            ),
+            mock.patch.object(janitor, "_prepare_v2_managed_runtime_state", return_value=None),
+            mock.patch.object(janitor, "cleanup_session_uses_workspace", return_value=False),
+            mock.patch.object(
+                janitor,
+                "capture_kent_worktree_record",
+                return_value={
+                    "variant": "registered",
+                    "root": str(worktree),
+                    "worktree_id": "test-worktree-record",
+                },
+            ),
+            mock.patch.object(janitor, "delete_managed_worktree", delete),
+            mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))),
+            mock.patch.object(sys, "stdout", output),
+        ):
+            self.assertEqual(janitor.main(), 0)
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["transition"], "task_janitor_blocked")
+        self.assertEqual(result["cleanup_report"], "Original cleanup report.")
+        self.assertIn("managed worktree deletion was not attempted", result["blocker_reason"])
+        self.assertTrue(worktree.is_dir())
+        delete.assert_not_called()
+        context["checkpoint"].emit_producer_result.assert_called_once()
+        call = context["checkpoint"].emit_producer_result.call_args
+        self.assertEqual(call.args[0], worktree)
+        self.assertEqual(call.args[1], payload)
+        self.assertEqual(call.args[3], "task-janitor")
+        self.assertEqual(call.kwargs["github_retry_constraint"], constraint)
+
+    def test_unknown_inherited_constraint_blocks_before_provider_child(self) -> None:
+        from workflowkit.delivery import _PreparedGitHubProviderReadGuard
+
+        primary = self.fixtures.create_repository()
+        removed_task_root = primary / ".kent" / "worktrees" / "gone"
+        children: list[str] = []
+
+        def read_json(_executable, _workspace, _args, **kwargs):
+            kwargs["provider_guard"]()
+            children.append("gh")
+            return {}
+
+        observation = SimpleNamespace(
+            read_json=read_json,
+            provider_retry_constraint=lambda *_args, **_kwargs: None,
+        )
+        janitor = self.janitor("janitor_unknown_provider_guard")
+        self._provider_context(
+            janitor,
+            workspace=removed_task_root,
+            observation=observation,
+            prepared_guard=_PreparedGitHubProviderReadGuard({
+                "schema": "github-provider-retry-v1",
+                "provider_host": "github.com",
+                "kind": "unknown",
+            }),
+            post_delete=True,
+        )
+
+        with self.assertRaises(janitor.JanitorProviderReadBlocked) as blocked:
+            janitor.github_pr(
+                primary,
+                "https://github.com/example/repo/pull/1",
+            )
+
+        self.assertEqual(blocked.exception.state, "unknown")
+        self.assertEqual(str(blocked.exception), "github_provider_retry_blocked")
+        self.assertEqual(children, [])
+
+    def test_expired_local_deadline_allows_guarded_read_with_fresh_clock(self) -> None:
+        from workflowkit.delivery import _PreparedGitHubProviderReadGuard
+        from workflowkit.runtime import canonical_bytes
+
+        primary = self.fixtures.create_repository()
+        removed_task_root = primary / ".kent" / "worktrees" / "gone"
+        (primary / ".kent" / "worktrees").mkdir()
+        children: list[str] = []
+
+        def read_json(_executable, _workspace, _args, **kwargs):
+            self.assertFalse(removed_task_root.exists())
+            kwargs["provider_guard"]()
+            children.append("gh")
+            return {"state": "MERGED"}
+
+        observation = SimpleNamespace(
+            read_json=read_json,
+            provider_retry_constraint=lambda *_args, **_kwargs: None,
+        )
+        janitor = self.janitor("janitor_expired_provider_deadline")
+        constraint = canonical_bytes({
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": "not_before",
+            "not_before_unix_ms": 1000,
+        }).decode("utf-8")
+        self._provider_context(
+            janitor,
+            workspace=removed_task_root,
+            observation=observation,
+            prepared_guard=_PreparedGitHubProviderReadGuard(None),
+            pending_constraints=[constraint],
+            post_delete=True,
+        )
+
+        with mock.patch.object(janitor.time, "time_ns", return_value=1_000_000_000) as clock:
+            result = janitor.github_pr(
+                primary,
+                "https://github.com/example/repo/pull/1",
+            )
+
+        self.assertEqual(result["state"], "MERGED")
+        self.assertEqual(children, ["gh"])
+        self.assertEqual(clock.call_count, 2)
+
+    def test_inherited_deadline_is_resampled_after_task_root_removal(self) -> None:
+        from workflowkit.delivery import _PreparedGitHubProviderReadGuard
+
+        primary = self.fixtures.create_repository()
+        removed_task_root = primary / ".kent" / "worktrees" / "gone"
+        children: list[str] = []
+        read_calls = 0
+
+        def read_json(_executable, _workspace, _args, **kwargs):
+            nonlocal read_calls
+            read_calls += 1
+            kwargs["provider_guard"]()
+            children.append("gh")
+            return {"state": "MERGED"}
+
+        observation = SimpleNamespace(
+            read_json=read_json,
+            provider_retry_constraint=lambda *_args, **_kwargs: None,
+        )
+        janitor = self.janitor("janitor_inherited_expiry_after_delete")
+        prepared = _PreparedGitHubProviderReadGuard({
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": "not_before",
+            "not_before_unix_ms": 1000,
+        })
+        self._provider_context(
+            janitor,
+            workspace=removed_task_root,
+            observation=observation,
+            prepared_guard=prepared,
+            post_delete=True,
+        )
+
+        with mock.patch.object(
+            janitor.time,
+            "time_ns",
+            side_effect=[999_000_000, 1_000_000_000, 1_000_000_000],
+        ) as clock:
+            with self.assertRaises(janitor.JanitorProviderReadBlocked) as blocked:
+                janitor.github_pr(
+                    primary,
+                    "https://github.com/example/repo/pull/1",
+                )
+            result = janitor.github_pr(
+                primary,
+                "https://github.com/example/repo/pull/1",
+            )
+
+        self.assertEqual(blocked.exception.state, "not_before")
+        self.assertEqual(read_calls, 2)
+        self.assertEqual(children, ["gh"])
+        self.assertEqual(result["state"], "MERGED")
+        self.assertEqual(clock.call_count, 3)
+
+    def test_unknown_local_retry_constraint_blocks_without_sleep_or_second_child(self) -> None:
+        from workflowkit.delivery import _PreparedGitHubProviderReadGuard
+        from workflowkit.runtime import canonical_bytes
+
+        primary = self.fixtures.create_repository()
+        error = RuntimeError("sensitive provider detail")
+        error._provider_retry_captured = True
+        children: list[str] = []
+        constraint = canonical_bytes({
+            "schema": "github-provider-retry-v1",
+            "provider_host": "github.com",
+            "kind": "unknown",
+        }).decode("utf-8")
+
+        def read_json(_executable, _workspace, _args, **kwargs):
+            kwargs["provider_guard"]()
+            children.append("gh")
+            raise error
+
+        observation = SimpleNamespace(
+            read_json=read_json,
+            provider_retry_constraint=lambda *_args, **_kwargs: constraint,
+        )
+        janitor = self.janitor("janitor_local_unknown_retry")
+        context = self._provider_context(
+            janitor,
+            workspace=primary,
+            observation=observation,
+            prepared_guard=_PreparedGitHubProviderReadGuard(None),
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"KENT_JANITOR_GH_RETRY_DELAY_SECONDS": "2"},
+            ),
+            mock.patch.object(janitor.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(janitor.JanitorProviderReadBlocked) as blocked:
+                janitor.github_pr(
+                    primary,
+                    "https://github.com/example/repo/pull/1",
+                )
+
+        self.assertEqual(blocked.exception.state, "unknown")
+        self.assertEqual(children, ["gh"])
+        self.assertEqual(context["pending_constraints"], [constraint])
+        sleep.assert_not_called()
+
+    def test_post_delete_provider_failure_is_not_retried_or_emitted(self) -> None:
+        from workflowkit.delivery import _PreparedGitHubProviderReadGuard
+
+        primary = self.fixtures.create_repository()
+        removed_task_root = primary / ".kent" / "worktrees" / "gone"
+        children: list[str] = []
+
+        def read_json(_executable, _workspace, _args, **kwargs):
+            kwargs["provider_guard"]()
+            children.append("gh")
+            raise RuntimeError("private provider detail")
+
+        observation = SimpleNamespace(
+            read_json=read_json,
+            provider_retry_constraint=lambda *_args, **_kwargs: None,
+        )
+        janitor = self.janitor("janitor_post_delete_provider_failure")
+        context = self._provider_context(
+            janitor,
+            workspace=removed_task_root,
+            observation=observation,
+            prepared_guard=_PreparedGitHubProviderReadGuard(None),
+            post_delete=True,
+        )
+        with (
+            mock.patch.object(janitor.time, "sleep") as sleep,
+            mock.patch.object(janitor, "complete") as complete,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "GitHub provider read failed after worktree deletion",
+            ):
+                janitor.github_pr(
+                    primary,
+                    "https://github.com/example/repo/pull/1",
+                )
+
+        self.assertEqual(children, ["gh"])
+        sleep.assert_not_called()
+        complete.assert_not_called()
+        context["checkpoint"].emit_producer_result.assert_not_called()
 
     def test_origin_admission_allows_multi_fetch_with_one_explicit_push(self) -> None:
         root = self.fixtures.create_repository()
@@ -2254,6 +2840,7 @@ class JanitorAuditS3Test(unittest.TestCase):
             mock.patch.dict(os.environ, environment),
             mock.patch.object(janitor, "evidence_ledger", guarded_ledger_loader),
             mock.patch.object(janitor, "runtime_contracts", guarded_runtime_loader),
+            mock.patch.object(janitor, "prepare_provider_guard", return_value=None),
             mock.patch.object(
                 sys,
                 "stdin",
