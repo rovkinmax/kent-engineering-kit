@@ -38,7 +38,7 @@ VERSION_TIMEOUT_SECONDS = 10.0
 CHUNK_BYTES = 1024 * 1024
 MAX_SYMLINK_BYTES = 4096
 
-PATH_TOOLS = ("bash", "sh", "git", "ruby", "jq")
+PATH_TOOLS = ("bash", "sh", "git", "ruby", "jq", "python3")
 OPTIONAL_ENVIRONMENT = (
     "HOME",
     "JAVA_HOME",
@@ -181,10 +181,10 @@ def _git_path_inventory(workspace: Path, git: Path) -> list[bytes]:
             "-z",
         ],
     )
-    entries = [item for item in raw.split(b"\0") if item]
+    entries = sorted({item for item in raw.split(b"\0") if item})
     if len(entries) > MAX_SOURCE_ENTRIES:
         raise IdentityError("identity source-entry bound exceeded")
-    return sorted(set(entries))
+    return entries
 
 
 def _git_head(workspace: Path, git: Path) -> str:
@@ -238,6 +238,9 @@ def _source_record(
     *,
     index_mode: int | None,
     byte_count: list[int],
+    source_entry_count: list[int],
+    direct_regular_paths: set[Path],
+    referenced_regular_paths: set[Path],
 ) -> dict[str, Any]:
     path = _relative_path(workspace, raw_path)
     encoded_path = _fs_text(raw_path)
@@ -269,12 +272,59 @@ def _source_record(
             resolved_target.relative_to(workspace)
         except (OSError, RuntimeError, ValueError) as error:
             raise IdentityError("identity source symlink escapes workspace") from error
-        return {
+        try:
+            endpoint_metadata = resolved_target.lstat()
+        except OSError as error:
+            raise IdentityError("identity symlink endpoint is unreadable") from error
+        record = {
             "kind": "symlink",
             "mode": mode,
             "path": encoded_path,
             "target": _fs_text(target),
         }
+        if stat.S_ISREG(endpoint_metadata.st_mode):
+            endpoint_relative = resolved_target.relative_to(workspace)
+            endpoint_path = _fs_text(os.fsencode(str(endpoint_relative)))
+            record["endpoint_path"] = endpoint_path
+            if (
+                resolved_target not in direct_regular_paths
+                and resolved_target not in referenced_regular_paths
+            ):
+                source_entry_count[0] += 1
+                if source_entry_count[0] > MAX_SOURCE_ENTRIES:
+                    raise IdentityError("identity source-entry bound exceeded")
+                endpoint_mode = stat.S_IMODE(endpoint_metadata.st_mode)
+                file_digest, size = _hash_file(
+                    resolved_target,
+                    limit=MAX_FILE_BYTES,
+                )
+                byte_count[0] += size
+                if byte_count[0] > MAX_SOURCE_BYTES:
+                    raise IdentityError("identity source-byte bound exceeded")
+                try:
+                    after = resolved_target.lstat()
+                except OSError as error:
+                    raise IdentityError(
+                        "identity symlink endpoint changed during read"
+                    ) from error
+                if (
+                    after.st_dev != endpoint_metadata.st_dev
+                    or after.st_ino != endpoint_metadata.st_ino
+                    or after.st_size != endpoint_metadata.st_size
+                    or stat.S_IMODE(after.st_mode) != endpoint_mode
+                ):
+                    raise IdentityError(
+                        "identity symlink endpoint changed during read"
+                    )
+                record["endpoint"] = {
+                    "kind": "file",
+                    "mode": endpoint_mode,
+                    "path": endpoint_path,
+                    "sha256": file_digest,
+                    "size": size,
+                }
+                referenced_regular_paths.add(resolved_target)
+        return record
     if not stat.S_ISREG(metadata.st_mode):
         raise IdentityError("identity source contains unsupported file type")
 
@@ -305,8 +355,26 @@ def _source_record(
 def _source_identity(workspace: Path, git: Path, head: str) -> str:
     paths = _git_path_inventory(workspace, git)
     modes = _index_modes(workspace, git)
+    direct_regular_paths: set[Path] = set()
+    for raw_path in paths:
+        path = _relative_path(workspace, raw_path)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise IdentityError("identity source metadata is unreadable") from error
+        if stat.S_ISREG(metadata.st_mode):
+            try:
+                resolved_path = path.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise IdentityError("identity source changed during read") from error
+            if resolved_path.is_relative_to(workspace):
+                direct_regular_paths.add(resolved_path)
     records = []
     byte_count = [0]
+    source_entry_count = [len(paths)]
+    referenced_regular_paths: set[Path] = set()
     for raw_path in paths:
         records.append(
             _source_record(
@@ -314,6 +382,9 @@ def _source_identity(workspace: Path, git: Path, head: str) -> str:
                 raw_path,
                 index_mode=modes.get(raw_path),
                 byte_count=byte_count,
+                source_entry_count=source_entry_count,
+                direct_regular_paths=direct_regular_paths,
+                referenced_regular_paths=referenced_regular_paths,
             )
         )
 
