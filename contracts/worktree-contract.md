@@ -17,6 +17,11 @@ copying unrelated machine state.
 - Cleanup closes task-owned shells and leaves before post-session Janitor
   deletion. Native refusal must not be bypassed with force or foreign-owner
   cancellation. Reconcile partial effects before retry.
+- For workflows carrying `pr_base_branch`, Cleanup freezes that exact
+  authority-bound target and the Janitor re-observes the PR target before
+  merged cleanup. Non-merged cleanup uses explicit `not-applicable`; it is
+  absence of target evidence, not proof of a branch name. See the
+  [delivery continuity contract](workflow-contract.md#delivery-continuity).
 - Deletion succeeds only with validated terminal/native success, absent path
   and Git registration, and exact retained worktree identity. `scheduled`
   remains pending; unknown results return to Cleanup.
