@@ -470,6 +470,11 @@ def replacement_environment(tmp_path: str) -> dict[str, str]:
     )
     environment["PATH"] = os.pathsep.join(dict.fromkeys(path_entries))
     environment.update(valid)
+    python_override = os.environ.get("KENT_ENGINEERING_KIT_PYTHON")
+    if python_override is not None:
+        environment["KENT_ENGINEERING_KIT_PYTHON"] = _validated_interpreter(
+            python_override
+        )
     return environment
 
 
@@ -1044,7 +1049,11 @@ def _parse_child(stdout: bytes) -> str:
     if not isinstance(value, dict) or set(value) != {"transition"}:
         raise VerificationFailure("child_output_invalid")
     transition = value["transition"]
-    if transition not in {"passed", "failed", "blocked"}:
+    if not isinstance(transition, str) or transition not in {
+        "passed",
+        "failed",
+        "blocked",
+    }:
         raise VerificationFailure("child_output_invalid")
     return transition
 
@@ -1079,12 +1088,14 @@ def run_verification(payload: dict[str, Any], *, _phase_hook=None) -> dict[str, 
             create=True,
             failure_code="log_path_unsafe",
         )
+        descriptors.append(build_fd)
         workflow_fd = _open_directory(
             build_fd,
             "kent-workflow",
             create=True,
             failure_code="log_path_unsafe",
         )
+        descriptors.append(workflow_fd)
         tmp_name = f".verify-tmp-{os.getpid()}-{time.time_ns()}"
         try:
             os.mkdir(tmp_name, 0o700, dir_fd=workflow_fd)
@@ -1097,7 +1108,7 @@ def run_verification(payload: dict[str, Any], *, _phase_hook=None) -> dict[str, 
             create=False,
             failure_code="log_path_unsafe",
         )
-        descriptors.extend((build_fd, workflow_fd, tmp_fd))
+        descriptors.append(tmp_fd)
         if _phase_hook is not None:
             _phase_hook("after_log_dir_open_before_revalidation")
         _revalidate_log_chain(root_fd, build_fd, workflow_fd)
