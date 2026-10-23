@@ -32,6 +32,18 @@ _SCRIPT_IDENTITY_KEYS = {
     "task_id", "task_short_id", "project_id", "workspace_path",
     "invocation_kind", "node_id", "transition_branch_key",
 }
+_PR_TARGET_CARRIER_FIELDS = {
+    "pr_url",
+    "branch_name",
+    "pr_report",
+    "merge_report",
+    "pr_feedback_cursor",
+    "pr_head_oid",
+    "pr_base_oid",
+    "ci_contract",
+    "ci_report",
+    "publication_report",
+}
 _CONTROL_KEYS = {
     "task", "task_id", "project_id", "workspace",
     "session", "session_id", "run", "run_id", "step", "step_id",
@@ -46,6 +58,345 @@ Do not begin Task work or run project-local helpers from this candidate.
 Final native rendering requires qualified published sources, the installed
 binding, and an approved update with verified compatibility and a quiet window.
 A source snapshot or matching Workflow UUID is not activation proof."""
+
+
+_OBSERVED_SCRIPT_DELIVERY_TOKEN = object()
+
+
+class ObservedScriptDeliveryGraph:
+    """Fresh native graph obtained from the current Script's native context."""
+
+    __slots__ = (
+        "_identity_raw", "_task_detail_raw", "_graph_raw", "profile", "_token",
+    )
+
+    def __init__(self, *, identity, task_detail, graph, profile, _token):
+        if _token is not _OBSERVED_SCRIPT_DELIVERY_TOKEN:
+            raise TypeError("ObservedScriptDeliveryGraph is created by native observation")
+        self._identity_raw = packet_json(identity)
+        self._task_detail_raw = packet_json(task_detail)
+        self._graph_raw = packet_json(graph)
+        self.profile = profile
+        self._token = _token
+
+    @property
+    def identity(self):
+        return packet_decode(self._identity_raw)
+
+    @property
+    def task_detail(self):
+        return packet_decode(self._task_detail_raw)
+
+    @property
+    def graph(self):
+        return packet_decode(self._graph_raw)
+
+
+def _observed_delivery_values(
+    observation: ObservedScriptDeliveryGraph,
+) -> tuple[ProjectProfile, dict, dict, dict]:
+    if (
+        not isinstance(observation, ObservedScriptDeliveryGraph)
+        or observation._token is not _OBSERVED_SCRIPT_DELIVERY_TOKEN
+    ):
+        raise SpecError("delivery protocol selection requires a fresh native Script observation")
+    return (
+        observation.profile,
+        observation.identity,
+        observation.task_detail,
+        observation.graph,
+    )
+
+
+def _native_delivery_transitions(graph: dict) -> list[dict]:
+    if (
+        not isinstance(graph, dict)
+        or not isinstance(graph.get("workflow_id"), str)
+        or not isinstance(graph.get("graph"), dict)
+    ):
+        raise SpecError("native delivery graph identity is invalid")
+    definition = graph["graph"]
+    nodes = definition.get("nodes")
+    groups = definition.get("transition_groups")
+    edges = definition.get("edges")
+    if (
+        not isinstance(nodes, list)
+        or len(nodes) > 4096
+        or not isinstance(groups, list)
+        or len(groups) > 8192
+        or not isinstance(edges, list)
+        or len(edges) > 16384
+        or any(not isinstance(row, dict) for row in (*nodes, *groups, *edges))
+    ):
+        raise SpecError("native delivery graph exceeds its structural bound")
+    node_keys_by_id = {}
+    seen_node_keys = set()
+    for node in nodes:
+        identifier = node.get("id")
+        key = node.get("key")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier in node_keys_by_id
+            or not isinstance(key, str)
+            or not _PACKET_KEY.fullmatch(key)
+            or key in seen_node_keys
+        ):
+            raise SpecError("native delivery node identity is invalid")
+        node_keys_by_id[identifier] = key
+        seen_node_keys.add(key)
+    groups_by_id = {}
+    for group in groups:
+        identifier = group.get("id")
+        if not isinstance(identifier, str) or not identifier or identifier in groups_by_id:
+            raise SpecError("native delivery transition-group identity is invalid")
+        groups_by_id[identifier] = group
+    result = []
+    edge_ids = set()
+    for edge in edges:
+        identifier = edge.get("id")
+        group = groups_by_id.get(edge.get("transition_group_id"))
+        parameters = edge.get("parameters")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier in edge_ids
+            or not isinstance(group, dict)
+            or not isinstance(parameters, list)
+            or any(
+                not isinstance(parameter, dict)
+                or not isinstance(parameter.get("key"), str)
+                or not _PACKET_KEY.fullmatch(parameter["key"])
+                for parameter in parameters
+            )
+        ):
+            raise SpecError("native delivery transition edge is invalid")
+        edge_ids.add(identifier)
+        fields = [parameter["key"] for parameter in parameters]
+        if len(fields) != len(set(fields)):
+            raise SpecError("native delivery transition repeats a field")
+        source_id = group.get("source_node_id")
+        transition = group.get("transition_id")
+        target_id = edge.get("target_node_id")
+        source = node_keys_by_id.get(source_id)
+        target = node_keys_by_id.get(target_id)
+        if (
+            source is None
+            or target is None
+            or not isinstance(transition, str)
+            or not transition
+        ):
+            raise SpecError("native delivery transition identity is incomplete")
+        result.append({
+            "id": identifier,
+            "source": source,
+            "transition": transition,
+            "target": target,
+            "fields": frozenset(fields),
+        })
+    return result
+
+
+def _post_pr_transitions(graph: dict) -> list[dict]:
+    return [
+        edge for edge in _native_delivery_transitions(graph)
+        if edge["fields"] & _PR_TARGET_CARRIER_FIELDS
+        and not (
+            edge["source"] == "prepare_pr"
+            and edge["transition"] == "prepare_pr_no_pr"
+        )
+    ]
+
+
+def _target_branch_graph(profile: ProjectProfile, graph: dict) -> bool:
+    selected = _delivery_target_family(profile)
+    post_pr = _post_pr_transitions(graph)
+    carries_target = any("pr_base_branch" in edge["fields"] for edge in post_pr)
+    if not selected:
+        if carries_target:
+            raise SpecError(
+                "legacy delivery profile is paired with a target-branch graph"
+            )
+        return False
+    if profile.capability("pull_requests"):
+        if not post_pr or any(
+            "pr_base_branch" not in edge["fields"] for edge in post_pr
+        ):
+            raise SpecError(
+                "current delivery profile lacks closed PR target carriers"
+            )
+    elif carries_target:
+        raise SpecError(
+            "non-PR delivery profile unexpectedly declares a PR target carrier"
+        )
+    return True
+
+
+def _delivery_target_family(profile: ProjectProfile) -> bool:
+    return bool(
+        profile.delivery_reliability_policy() == "v1"
+        and _delivery_context_enabled(profile)
+        and profile.capability("pull_requests")
+        and (
+            profile.schema_version == 3
+            or profile.runtime_contracts_v2_1()
+        )
+    )
+
+
+def _current_profile_for_pack(root: Path) -> ProjectProfile | None:
+    """Read the current profile without following checkout-controlled links."""
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors = []
+    try:
+        root_fd = os.open(root, directory_flags)
+        descriptors.append(root_fd)
+        try:
+            kent_fd = os.open(".kent", directory_flags, dir_fd=root_fd)
+        except FileNotFoundError:
+            return None
+        descriptors.append(kent_fd)
+        try:
+            profile_fd = os.open(
+                "workflow-profile.toml",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=kent_fd,
+            )
+        except FileNotFoundError:
+            return None
+        with os.fdopen(profile_fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or before.st_mode & 0o7022
+                or before.st_size > 64 * 1024
+            ):
+                raise ValueError("unsafe current delivery profile")
+            raw = stream.read(64 * 1024 + 1)
+            after = os.fstat(stream.fileno())
+            if (
+                len(raw) > 64 * 1024
+                or len(raw) != before.st_size
+                or (before.st_dev, before.st_ino, before.st_size,
+                    before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise ValueError("current delivery profile changed during read")
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+    profile = ProjectProfile.from_toml(
+        root,
+        raw.decode("utf-8"),
+        source=str(root / ".kent" / "workflow-profile.toml"),
+    )
+    if profile.project_root != root:
+        raise ValueError("delivery profile belongs to another workspace")
+    return profile
+
+
+def delivery_context_schema(
+    observation: ObservedScriptDeliveryGraph,
+) -> str | None:
+    """Select the closed context schema only from a fresh native graph."""
+    profile, _, _, graph = _observed_delivery_values(observation)
+    if not _delivery_context_enabled(profile):
+        if any(
+            "delivery_context" in edge["fields"]
+            for edge in _native_delivery_transitions(graph)
+        ):
+            raise SpecError(
+                "native graph declares delivery_context outside its profile contract"
+            )
+        return None
+    latest = _target_branch_graph(profile, graph)
+    return (
+        "workflow-delivery-context-v2"
+        if latest else "workflow-delivery-context-v1"
+    )
+
+
+def pr_base_branch_required(
+    observation: ObservedScriptDeliveryGraph,
+) -> bool:
+    """Require target identity only for the current profile/native graph pair."""
+    profile, _, _, graph = _observed_delivery_values(observation)
+    return _target_branch_graph(profile, graph)
+
+
+def prepare_ci_protocol(
+    observation: ObservedScriptDeliveryGraph,
+) -> str | None:
+    """Select legacy or typed diagnostic routing from current profile and graph."""
+    profile, _, _, graph = _observed_delivery_values(observation)
+    transitions = _native_delivery_transitions(graph)
+    typed_route_names = {
+        "ci_monitor_retry_preparation",
+        "ci_monitor_preparation_needs_user_action",
+    }
+    typed_route_present = any(
+        edge["transition"] in typed_route_names
+        or "ci_preparation_diagnostic" in edge["fields"]
+        for edge in transitions
+    )
+    source_ci_enabled = (
+        profile.source_ci_contract()
+        and profile.capability("ci_monitoring")
+    )
+    if not source_ci_enabled:
+        if typed_route_present:
+            raise SpecError(
+                "native graph declares typed CI preparation routes outside its profile contract"
+            )
+        return None
+    failures = [
+        edge for edge in transitions
+        if edge["source"] == "ci_prepare"
+        and edge["transition"] == "ci_prepare_failed"
+        and edge["target"] == "ci_monitor"
+    ]
+    if len(failures) != 1:
+        raise SpecError("native CI preparation failure route is missing or ambiguous")
+    if profile.source_ci_contract_v3():
+        required = {
+            "workspace_path", "task_short_id", "ci_preparation_diagnostic",
+        }
+        if failures[0]["fields"] != required:
+            raise SpecError(
+                "current CI preparation diagnostic carrier differs from its contract"
+            )
+        retries = [
+            edge for edge in transitions
+            if edge["source"] == "ci_monitor"
+            and edge["transition"] == "ci_monitor_retry_preparation"
+            and edge["target"] == "ci_prepare"
+        ]
+        needs_action = [
+            edge for edge in transitions
+            if edge["source"] == "ci_monitor"
+            and edge["transition"]
+            == "ci_monitor_preparation_needs_user_action"
+            and edge["target"] == "ci_monitor"
+        ]
+        if (
+            len(retries) != 1
+            or retries[0]["fields"] != {
+                "workspace_path", "task_short_id", "delivery_context",
+            }
+            or len(needs_action) != 1
+            or needs_action[0]["fields"] != {
+                "workspace_path", "task_short_id",
+                "ci_preparation_diagnostic", "blocker_reason",
+            }
+        ):
+            raise SpecError("native CI preparation recovery routes differ from their contract")
+        return "typed-v1"
+    if "ci_preparation_diagnostic" in failures[0]["fields"]:
+        raise SpecError("legacy CI profile is paired with a typed diagnostic route")
+    return "legacy"
 
 
 def source_admission_gate(admission: dict[str, object], *,
@@ -172,7 +523,7 @@ def _script_path(root: Path, value: object) -> str:
 
 
 def observe_script_identity(root: Path, task: str | None, native_context: dict, *,
-                            native_read) -> dict:
+                            native_read, return_details: bool = False) -> dict:
     """Observe one native Script invocation from actual injected ``_kent``.
 
     ``native_read`` is a trusted adapter's bounded read-only native CLI reader,
@@ -243,12 +594,45 @@ def observe_script_identity(root: Path, task: str | None, native_context: dict, 
             or _script_path(root, nodes[0].get("script_path"))
             != _script_path(root, matches[0].get("path"))):
         raise ValueError("native graph does not own the current Script path")
-    return _packet_identity(root, {
+    identity = _packet_identity(root, {
         "task_id": summary["id"], "task_short_id": summary["short_id"], "project_id": project,
         "workspace_path": str(root), "invocation_kind": "script",
         "node_id": native_context["node_id"],
         "transition_branch_key": native_context.get("transition_branch_key"),
     })
+    if return_details:
+        return identity, detail, graph
+    return identity
+
+
+def observe_script_delivery_graph(
+    root: Path,
+    task: str | None,
+    native_context: dict,
+    *,
+    native_read,
+) -> ObservedScriptDeliveryGraph:
+    """Observe current native Task/graph; never accept caller graph bytes."""
+    if not root.is_absolute() or root.resolve() != root:
+        raise ValueError("native Script workspace is invalid")
+    profile = ProjectProfile.load(root)
+    identity, fresh_detail, graph = observe_script_identity(
+        root,
+        task,
+        native_context,
+        native_read=native_read,
+        return_details=True,
+    )
+    if profile.project_root != root:
+        raise ValueError("native Script profile belongs to another workspace")
+
+    return ObservedScriptDeliveryGraph(
+        identity=identity,
+        task_detail=fresh_detail,
+        graph=graph,
+        profile=profile,
+        _token=_OBSERVED_SCRIPT_DELIVERY_TOKEN,
+    )
 
 
 def capture_script_producer(root: Path, *, task: str | None, native_context: dict,
@@ -257,6 +641,27 @@ def capture_script_producer(root: Path, *, task: str | None, native_context: dic
                             binding: dict[str, str] | None = None) -> tuple[str, bytes]:
     """Actual Script adapter seam; never synthesize Agent Session/Run/Step."""
     identity = observe_script_identity(root, task, native_context, native_read=native_read)
+    retained = (binding or {}).get("producer_refs")
+    if retained is not None:
+        try:
+            reference_packet = packet_decode(retained.encode("utf-8"))
+            references = reference_packet.get("refs")
+        except (AttributeError, UnicodeError, ValueError) as error:
+            raise ValueError("invalid Script producer references") from error
+        if (
+            set(reference_packet) != {"refs"}
+            or not isinstance(references, list)
+            or len(references) > 64
+            or any(not isinstance(reference, str) for reference in references)
+            or len(set(references)) != len(references)
+        ):
+            raise ValueError("invalid Script producer references")
+        for reference in references:
+            producer_reference_closure(
+                root,
+                reference,
+                identity=identity,
+            )
     return capture_producer(root, identity=identity, producer_kind=producer_kind,
                             inputs=inputs, result=result, binding=binding)
 
@@ -662,6 +1067,202 @@ def transition_contract_reference(identity: dict, task_detail: dict, graph: dict
     return _effective_transition(identity, task_detail, graph, transition)[0]
 
 
+def _validated_feedback_decision(
+    refs: list[str],
+    producers: dict[str, dict],
+    *,
+    identity: dict,
+    graph: dict,
+    profile: ProjectProfile | None,
+) -> dict[str, str] | None:
+    """Admit only an exact Agent derivative of one watcher state-change result."""
+    candidates = [
+        reference for reference in refs
+        if (
+            producers[reference].get("producer_kind") == "feedback-decision"
+            or "feedback_decision"
+            in producers[reference].get("binding", {})
+        )
+    ]
+    if not candidates:
+        return None
+    if len(candidates) != 1 or len(refs) != 1:
+        raise ValueError("feedback decision must be the sole packing producer")
+    derivative_ref = candidates[0]
+    derivative = producers[derivative_ref]
+    if (
+        derivative["identity"].get("session_id") != identity["session_id"]
+        or derivative["identity"].get("step_id") != identity["step_id"]
+    ):
+        raise ValueError("feedback decision was not produced by the current Agent")
+    binding = derivative["binding"]
+    if (
+        derivative["producer_kind"] != "feedback-decision"
+        or set(binding) != {"producer_refs", "feedback_decision"}
+        or set(derivative["inputs"]) != {"producer_ref", "decision", "reason"}
+    ):
+        raise ValueError("feedback decision derivative is incomplete")
+    try:
+        ancestry_packet = packet_decode(binding["producer_refs"].encode("utf-8"))
+        decision = packet_decode(binding["feedback_decision"].encode("utf-8"))
+    except (UnicodeError, ValueError) as error:
+        raise ValueError("feedback decision binding is invalid") from error
+    if (
+        packet_json(ancestry_packet).decode("utf-8") != binding["producer_refs"]
+        or set(ancestry_packet) != {"refs"}
+        or not isinstance(ancestry_packet["refs"], list)
+        or len(ancestry_packet["refs"]) != 1
+        or any(not isinstance(value, str) for value in ancestry_packet["refs"])
+        or packet_json(decision).decode("utf-8") != binding["feedback_decision"]
+        or set(decision) != {
+            "schema", "source_ref", "decision",
+            "old_cursor_sha256", "new_cursor_sha256", "reason_sha256",
+        }
+        or decision.get("schema") != "workflow-feedback-decision-v1"
+    ):
+        raise ValueError("feedback decision binding is invalid")
+    source_ref = ancestry_packet["refs"][0]
+    if (
+        not isinstance(decision.get("decision"), str)
+        or not isinstance(derivative["inputs"]["reason"], str)
+        or _go_trim_space_empty(derivative["inputs"]["reason"])
+        or derivative["inputs"]["producer_ref"] != source_ref
+        or decision["source_ref"] != source_ref
+        or decision["decision"] not in {
+            "acknowledge_all_reported_feedback",
+            "preserve_acknowledged_cursor",
+        }
+        or derivative["inputs"]["decision"] != decision["decision"]
+    ):
+        raise ValueError("feedback decision source or choice is invalid")
+    source = producers.get(source_ref)
+    if source is None:
+        raise ValueError("feedback decision source is not retained")
+    expected_transition = {
+        "wait-pr": "merge_watch_state_changed",
+        "wait-ci": "ci_watch_state_changed",
+    }.get(source["producer_kind"])
+    if (
+        expected_transition is None
+        or source["result"].get("transition") != expected_transition
+        or source["schema"] != "workflow-producer-source-v1"
+        or source["identity"].get("invocation_kind") != "script"
+    ):
+        raise ValueError("feedback decision source is not a qualified watcher result")
+    if profile is None:
+        raise ValueError("feedback decision requires a current project profile")
+    expected_source_node = {
+        "wait-pr": "merge_watch",
+        "wait-ci": "ci_watch",
+    }[source["producer_kind"]]
+    command_key = {
+        "wait-pr": "wait_pr",
+        "wait-ci": "wait_ci",
+    }[source["producer_kind"]]
+    source_nodes = [
+        node for node in graph.get("graph", {}).get("nodes", [])
+        if node.get("id") == source["identity"].get("node_id")
+    ]
+    configured_script = profile.command(command_key)
+    if (
+        len(source_nodes) != 1
+        or source_nodes[0].get("key") != expected_source_node
+        or source_nodes[0].get("kind") != "script"
+        or not configured_script
+        or _script_path(
+            profile.project_root,
+            source_nodes[0].get("script_path"),
+        ) != _script_path(profile.project_root, configured_script)
+    ):
+        raise ValueError("feedback decision source does not match the native watcher node")
+    source_edges = [
+        edge for edge in _native_delivery_transitions(graph)
+        if edge["source"] == expected_source_node
+        and edge["transition"] == expected_transition
+    ]
+    if not source_edges or any(
+        not {"pr_url", "pr_report", "pr_feedback_cursor"} <= edge["fields"]
+        for edge in source_edges
+    ):
+        raise ValueError("feedback decision source transition lacks its cursor carrier")
+    old_cursor = source["result"].get("pr_feedback_cursor")
+    new_cursor = derivative["result"].get("pr_feedback_cursor")
+    report_raw = source["result"].get("pr_report")
+    if not isinstance(old_cursor, str) or not isinstance(new_cursor, str):
+        raise ValueError("feedback decision cursor is missing")
+    if not isinstance(report_raw, str):
+        raise ValueError("feedback decision source report is missing")
+    try:
+        from .runtime import (
+            canonical_bytes,
+            validate_dynamic_pr_feedback_cursor,
+        )
+        from .github_observation import parse_pr_url
+
+        def checked_cursor(raw: str) -> str:
+            if raw == "uninitialized":
+                return raw
+            parsed = validate_dynamic_pr_feedback_cursor(raw)
+            canonical = canonical_bytes(parsed).decode("utf-8")
+            if canonical != raw:
+                raise ValueError("feedback cursor is not canonical")
+            return canonical
+
+        old_cursor = checked_cursor(old_cursor)
+        new_cursor = checked_cursor(new_cursor)
+        report = packet_decode(report_raw.encode("utf-8"))
+        if not isinstance(report, dict):
+            raise ValueError("feedback source report is invalid")
+        pr_url = source["result"].get("pr_url")
+        if not isinstance(pr_url, str):
+            raise ValueError("feedback source PR URL is missing")
+        repository, pull_number = parse_pr_url(pr_url)
+        if report.get("url") not in (None, "") and parse_pr_url(report["url"]) != (
+            repository, pull_number,
+        ):
+            raise ValueError("feedback report URL differs from its source PR")
+        candidate_raw = report.get("observed_feedback_cursor")
+        if "observed_feedback_cursor" in report and not isinstance(candidate_raw, str):
+            raise ValueError("feedback candidate cursor is invalid")
+        candidate = checked_cursor(candidate_raw) if candidate_raw is not None else None
+        for cursor in (old_cursor, new_cursor, candidate):
+            if cursor is None:
+                continue
+            if cursor == "uninitialized":
+                continue
+            parsed = validate_dynamic_pr_feedback_cursor(cursor)
+            if (
+                parsed["repository"] != repository
+                or parsed["pull_number"] != pull_number
+            ):
+                raise ValueError("feedback cursor belongs to another PR")
+    except (KeyError, TypeError, UnicodeError, ValueError) as error:
+        raise ValueError("feedback decision source evidence is invalid") from error
+    if decision["decision"] == "acknowledge_all_reported_feedback":
+        if candidate is None or candidate == "uninitialized" or new_cursor != candidate:
+            raise ValueError("feedback decision does not acknowledge the observed cursor")
+    elif new_cursor != old_cursor:
+        raise ValueError("preserve decision changed the acknowledged cursor")
+    reason = derivative["inputs"]["reason"]
+    hashes = {
+        "old_cursor_sha256": hashlib.sha256(old_cursor.encode("utf-8")).hexdigest(),
+        "new_cursor_sha256": hashlib.sha256(new_cursor.encode("utf-8")).hexdigest(),
+        "reason_sha256": hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+    }
+    if any(decision.get(key) != value for key, value in hashes.items()):
+        raise ValueError("feedback decision digest binding is invalid")
+    expected_result = dict(source["result"])
+    expected_result["pr_feedback_cursor"] = new_cursor
+    if derivative["result"] != expected_result:
+        raise ValueError("feedback decision changed source report or CI bytes")
+    return {
+        "decision": decision["decision"],
+        "source_ref": source_ref,
+        "old_cursor": old_cursor,
+        "new_cursor": new_cursor,
+    }
+
+
 def pack_delivery(root: Path, request: dict, *, identity: dict,
                   task_detail: dict, graph: dict) -> tuple[str, bytes]:
     """Pack only; caller owns native completion and success/effect freshness.
@@ -703,6 +1304,23 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
     producers, inspected = _producer_ancestry(
         root, refs, identity=identity,
     )
+    current_profile = (
+        _current_profile_for_pack(root)
+        if any(
+            producers[reference].get("producer_kind") == "feedback-decision"
+            or "feedback_decision"
+            in producers[reference].get("binding", {})
+            for reference in refs
+        )
+        else None
+    )
+    feedback_decision = _validated_feedback_decision(
+        refs,
+        producers,
+        identity=identity,
+        graph=graph,
+        profile=current_profile,
+    )
     sources = {}
     for ref in refs:
         producer = producers[ref]
@@ -724,22 +1342,156 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
         if key in values and (key not in sources or values[key] != sources[key]):
             raise ValueError("packet values require exact producer-owned bytes")
     mode = request["delivery_mode"]
+    if feedback_decision is not None and mode not in {"preserve", "post_pr"}:
+        raise ValueError("feedback decisions require preserve or post_pr packing")
     if mode == "preserve":
         if "delivery_context" in required and "delivery_context" not in sources:
             raise ValueError("preserve mode requires original outer delivery context")
+        if (
+            feedback_decision is not None
+            and feedback_decision["decision"]
+            == "acknowledge_all_reported_feedback"
+            and "delivery_context" in required
+        ):
+            try:
+                from .runtime import validate_delivery_context
+                context = validate_delivery_context(
+                    packet_decode(
+                        sources["delivery_context"].encode("utf-8")
+                    )
+                )
+            except (KeyError, UnicodeError, ValueError) as error:
+                raise ValueError("feedback ACK has no valid outer context") from error
+            if (
+                context.get("phase") != "post_pr"
+                or context.get("pr_feedback_cursor")
+                != feedback_decision["new_cursor"]
+            ):
+                raise ValueError(
+                    "feedback ACK cannot preserve a stale outer cursor; "
+                    "use post_pr packing"
+                )
     elif mode == "post_pr":
         if "delivery_context" in values:
             raise ValueError("post_pr mode cannot override assembled delivery context")
-        context = {"schema": "workflow-delivery-context-v1", "phase": "post_pr"}
-        for key in ("pr_url", "branch_name", "merge_strategy", "pr_feedback_cursor"):
-            value = sources.get(key, values.get(key))
-            if not isinstance(value, str) or not value:
-                raise ValueError("post_pr assembly lacks observed PR identity")
-            context[key] = value
-        for key in ("ci_contract", "ci_report"):
-            if key in sources and sources[key] != "":
-                context[key] = sources[key]
-        sources["delivery_context"] = packet_json(context).decode("utf-8")
+        profile = _current_profile_for_pack(root)
+        if profile is not None:
+            if not _delivery_context_enabled(profile):
+                raise ValueError("post_pr packing is outside the profile contract")
+            target_required = _target_branch_graph(profile, graph)
+        else:
+            # Generic producer fixtures and pre-profile projects retain their
+            # historical field-list behavior. Qualified projects select from
+            # the current profile and complete native graph above.
+            target_required = "pr_base_branch" in required
+        context_schema = (
+            "workflow-delivery-context-v2"
+            if target_required else "workflow-delivery-context-v1"
+        )
+        prior_raw = sources.get("delivery_context")
+        if prior_raw is not None:
+            try:
+                from .runtime import validate_delivery_context
+                prior = validate_delivery_context(
+                    packet_decode(prior_raw.encode("utf-8"))
+                )
+            except (ValueError, UnicodeError) as error:
+                raise ValueError("post_pr source context is invalid") from error
+            if prior.get("phase") == "post_pr":
+                if prior.get("schema") != context_schema:
+                    raise ValueError(
+                        "post_pr source context schema differs from current profile"
+                    )
+                for key in (
+                    "pr_url", "branch_name", "pr_base_branch",
+                    "merge_strategy", "pr_feedback_cursor",
+                    "ci_contract", "ci_report",
+                ):
+                    observed = sources.get(key, values.get(key))
+                    if (
+                        observed is not None
+                        and not (
+                            key == "pr_feedback_cursor"
+                            and feedback_decision is not None
+                            and feedback_decision["decision"]
+                            == "acknowledge_all_reported_feedback"
+                        )
+                        and prior.get(key, "") != observed
+                    ):
+                        raise ValueError(
+                            "flat and nested post_pr producer identity disagree"
+                        )
+                if (
+                    feedback_decision is not None
+                    and feedback_decision["decision"]
+                    == "acknowledge_all_reported_feedback"
+                ):
+                    # The derivative is the explicit authority to advance the
+                    # cursor; rebuild only the outer envelope from its exact
+                    # source fields, retaining opaque CI packet bytes.
+                    context = {
+                        "schema": context_schema,
+                        "phase": "post_pr",
+                    }
+                else:
+                    # A retry route without an ACK carries only the exact
+                    # original context; do not normalize its bytes.
+                    sources["delivery_context"] = prior_raw
+                    context = None
+            else:
+                context = {
+                    "schema": context_schema,
+                    "phase": "post_pr",
+                }
+        else:
+            context = {
+                "schema": context_schema,
+                "phase": "post_pr",
+            }
+        if context is None:
+            pass
+        else:
+            context_fields = (
+                "pr_url", "branch_name", "merge_strategy", "pr_feedback_cursor",
+            ) + (("pr_base_branch",) if target_required else ())
+            for key in context_fields:
+                value = sources.get(key, values.get(key))
+                if not isinstance(value, str) or not value:
+                    raise ValueError("post_pr assembly lacks observed PR identity")
+                if key == "pr_base_branch" and key not in sources:
+                    raise ValueError("post_pr target branch must come from a producer")
+                context[key] = value
+            for key in ("ci_contract", "ci_report"):
+                if key in sources and sources[key] != "":
+                    context[key] = sources[key]
+            sources["delivery_context"] = packet_json(context).decode("utf-8")
+    elif mode == "post_pr_target_revalidated":
+        if "delivery_context" in values or "pr_base_branch" not in required:
+            raise ValueError("target revalidation requires a declared current target carrier")
+        prior_raw = sources.get("delivery_context")
+        observed_target = sources.get("pr_base_branch")
+        if not isinstance(prior_raw, str) or not isinstance(observed_target, str) or not observed_target:
+            raise ValueError("target revalidation lacks producer-owned context or branch")
+        try:
+            from .runtime import validate_delivery_context
+            prior = validate_delivery_context(packet_decode(prior_raw.encode("utf-8")))
+        except (ValueError, UnicodeError) as error:
+            raise ValueError("target revalidation context is invalid") from error
+        if (
+            prior.get("schema") != "workflow-delivery-context-v2"
+            or prior.get("phase") != "post_pr"
+        ):
+            raise ValueError("target revalidation requires an original v2 post-PR context")
+        for key in (
+            "pr_url", "branch_name", "merge_strategy", "pr_feedback_cursor",
+            "ci_contract", "ci_report",
+        ):
+            if prior.get(key, "") != sources.get(key, ""):
+                raise ValueError("target revalidation changed non-target producer bytes")
+        if prior.get("pr_base_branch") == observed_target:
+            raise ValueError("target revalidation did not observe a target change")
+        prior["pr_base_branch"] = observed_target
+        sources["delivery_context"] = packet_json(prior).decode("utf-8")
     else:
         raise ValueError("unsupported delivery packing mode")
     result = dict(values)
@@ -754,8 +1506,17 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
         if _go_trim_space_empty(result[key]):
             raise ValueError(f"required completion field {key} must be non-empty")
     if "delivery_context" in result:
-        from .runtime import delivery_context_fields
+        from .runtime import delivery_context_fields, validate_delivery_context
         delivery_context_fields(result)
+        context = validate_delivery_context(
+            packet_decode(result["delivery_context"].encode("utf-8"))
+        )
+        for key in (
+            "pr_url", "branch_name", "merge_strategy", "pr_feedback_cursor",
+            "pr_base_branch", "ci_contract", "ci_report",
+        ):
+            if key in context and key in result and context[key] != result[key]:
+                raise ValueError("flat and nested delivery identity disagree")
     for key in ("ci_report", "ci_contract"):
         if key in result and len(result[key].encode("utf-8")) > 65536:
             raise ValueError("nested CI packet exceeds its byte limit")
@@ -943,8 +1704,17 @@ CI_CONTRACT = ParameterSpec(
 )
 DELIVERY_CONTEXT = ParameterSpec(
     "delivery_context",
-    "Closed workflow-delivery-context-v1 JSON string: pre_pr, or post_pr with "
-    "observed PR identity and only produced CI packets.",
+    "Closed workflow-delivery-context-v1/v2 JSON string: pre_pr, or post_pr "
+    "with observed PR identity and only produced CI packets.",
+)
+PR_BASE_BRANCH = ParameterSpec(
+    "pr_base_branch",
+    "Exact freshly observed GitHub pull-request target branch.",
+)
+CI_PREPARATION_DIAGNOSTIC = ParameterSpec(
+    "ci_preparation_diagnostic",
+    "Closed diagnostic-v1 for the original CI preparation input and any "
+    "validated resume context.",
 )
 
 
@@ -969,6 +1739,19 @@ def delivery_context_input(profile: ProjectProfile) -> str:
 def delivery_context_tail(profile: ProjectProfile) -> str:
     if not _delivery_context_enabled(profile):
         return ""
+    if _delivery_target_family(profile):
+        return (
+            "\n\nPreserve the exact incoming `delivery_context` JSON string on every "
+            "outgoing transition that declares it; do not normalize or rewrite "
+            "nested packet strings. On every fresh PR observation, compare the "
+            "actual `baseRefName` with the carried `pr_base_branch` before "
+            "reporting success, merge, or cleanup. A retarget is an explicit "
+            "owner decision: require existing authority and fresh PR "
+            "observation, then use `post_pr_target_revalidated` to change only "
+            "the target in the v2 packet. This packer mode adds no graph edge "
+            "or authority; preserve CI bytes and retry state and do not infer "
+            "a target from a watcher observation."
+        )
     return (
         "\n\nPreserve the exact incoming `delivery_context` JSON string on every "
         "outgoing transition that declares it; do not normalize or rewrite "
@@ -979,6 +1762,16 @@ def delivery_context_tail(profile: ProjectProfile) -> str:
 def delivery_context_pack_instruction(profile: ProjectProfile) -> str:
     if not _delivery_context_enabled(profile):
         return "\n\n"
+    if _delivery_target_family(profile):
+        return """\n\nWhen a transition requires `delivery_context`, emit its compact
+closed `workflow-delivery-context-v2` JSON string. Use exactly `schema` and
+`phase=pre_pr` before any PR is observed. For `phase=post_pr`, include the
+observed `pr_url`, `branch_name`, `pr_base_branch`, `merge_strategy`, and
+`pr_feedback_cursor`. `pr_base_branch` is the exact current GitHub PR target
+branch, not the task branch or an inferred default. Include `ci_contract` and
+`ci_report` only when those exact packets were produced; preserve their string
+values byte-for-byte. Historical v1 strings remain byte-for-byte unchanged.
+Never invent absent PR or CI fields or rewrite a nested packet.\n\n"""
     return """\n\nWhen a transition requires `delivery_context`, emit its compact
 closed `workflow-delivery-context-v1` JSON string. Use exactly `schema` and
 `phase=pre_pr` before any PR is observed. For `phase=post_pr`, include the
@@ -1043,6 +1836,10 @@ def build_delivery_workflow(
         )
     cursor_enabled = _delivery_context_enabled(profile)
     delivery_context_enabled = cursor_enabled
+    target_branch_enabled = _delivery_target_family(profile)
+    source_ci_v3 = (
+        source_ci and profile.source_ci_contract_v3()
+    )
     delivery_context_parameters = (
         (DELIVERY_CONTEXT,) if delivery_context_enabled else ()
     )
@@ -1367,6 +2164,38 @@ def build_delivery_workflow(
             ),
             cancellation_edge("plan_review"),
             EdgeSpec(
+                key="plan_review_resume_continue",
+                source="plan_review",
+                transition="resume_continue",
+                target="plan_contract_continue",
+                transition_description=(
+                    "The previously accepted plan, approval, and independent "
+                    "review still apply; guard the unchanged contract before "
+                    "resuming writer work."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ) + delivery_context_parameters,
+            ),
+            EdgeSpec(
+                key="plan_review_resume_verify",
+                source="plan_review",
+                transition="resume_verify",
+                target="plan_contract_verify",
+                transition_description=(
+                    "The previously accepted plan, approval, and independent "
+                    "review still apply; guard the unchanged contract before "
+                    "verification."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ) + delivery_context_parameters,
+            ),
+            EdgeSpec(
                 key="plan_revalidation_review",
                 source="plan_revalidation",
                 transition="review_plan",
@@ -1407,6 +2236,38 @@ def build_delivery_workflow(
                 ),
             ),
             cancellation_edge("plan_revalidation"),
+            EdgeSpec(
+                key="plan_revalidation_resume_continue",
+                source="plan_revalidation",
+                transition="resume_continue",
+                target="plan_contract_continue",
+                transition_description=(
+                    "No new finding or material change invalidates the prior "
+                    "accepted review; guard the unchanged contract before "
+                    "resuming writer work."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ) + delivery_context_parameters,
+            ),
+            EdgeSpec(
+                key="plan_revalidation_resume_verify",
+                source="plan_revalidation",
+                transition="resume_verify",
+                target="plan_contract_verify",
+                transition_description=(
+                    "No new finding or material change invalidates the prior "
+                    "accepted review; guard the unchanged contract before "
+                    "verification."
+                ),
+                parameters=(
+                    WORKSPACE,
+                    REVIEW_CONTEXT,
+                    TASK_SHORT_ID,
+                ) + delivery_context_parameters,
+            ),
             EdgeSpec(
                 key="plan_contract_continue_revalidate",
                 source="plan_contract_continue",
@@ -1465,6 +2326,43 @@ def build_delivery_workflow(
             ),
         ]
     )
+    if fresh_writers:
+        edges.extend(
+            [
+                EdgeSpec(
+                    key="plan_review_resume_fix_continue",
+                    source="plan_review",
+                    transition="resume_fix_continue",
+                    target="plan_contract_fix_continue",
+                    transition_description=(
+                        "The previously accepted plan, approval, and review "
+                        "still apply; guard the exact remaining bounded Fix "
+                        "bundle before resuming it."
+                    ),
+                    parameters=(
+                        WORKSPACE,
+                        FIX_CONTEXT,
+                        TASK_SHORT_ID,
+                    ) + fix_continuity_parameters,
+                ),
+                EdgeSpec(
+                    key="plan_revalidation_resume_fix_continue",
+                    source="plan_revalidation",
+                    transition="resume_fix_continue",
+                    target="plan_contract_fix_continue",
+                    transition_description=(
+                        "No new finding or material change invalidates the "
+                        "prior accepted review; guard the exact remaining "
+                        "bounded Fix bundle before resuming it."
+                    ),
+                    parameters=(
+                        WORKSPACE,
+                        FIX_CONTEXT,
+                        TASK_SHORT_ID,
+                    ) + fix_continuity_parameters,
+                ),
+            ]
+        )
     if fresh_writers:
         edges.append(
             EdgeSpec(
@@ -2328,19 +3226,30 @@ def build_delivery_workflow(
                             source="ci_prepare",
                             transition="failed",
                             target="ci_monitor",
-                            prompt=ci_prompt(profile),
+                            prompt=(
+                                ci_preparation_failure_prompt(profile)
+                                if source_ci_v3 else ci_prompt(profile)
+                            ),
                             transition_description=(
                                 "CI preparation could not establish or validate "
                                 "the current PR identity and CI cycle contract."
                             ),
                             parameters=(
-                                WORKSPACE,
-                                PR_URL,
-                                BRANCH_NAME,
-                                MERGE_STRATEGY,
-                                *ci_contract_parameters,
-                                CI_REPORT,
-                            ) + pr_cursor_parameters,
+                                (
+                                    WORKSPACE,
+                                    TASK_SHORT_ID,
+                                    CI_PREPARATION_DIAGNOSTIC,
+                                )
+                                if source_ci_v3
+                                else (
+                                    WORKSPACE,
+                                    PR_URL,
+                                    BRANCH_NAME,
+                                    MERGE_STRATEGY,
+                                    *ci_contract_parameters,
+                                    CI_REPORT,
+                                ) + pr_cursor_parameters
+                            ),
                         ),
                         EdgeSpec(
                             key="ci_prepare_merged",
@@ -2476,6 +3385,47 @@ def build_delivery_workflow(
                             "run is ready for deterministic preparation."
                         ),
                         parameters=ci_monitor_watch_parameters,
+                    ),
+                    *(
+                        [
+                            EdgeSpec(
+                                key="ci_monitor_retry_preparation",
+                                source="ci_monitor",
+                                transition="retry_preparation",
+                                target="ci_prepare",
+                                transition_description=(
+                                    "A typed preparation diagnostic permits a "
+                                    "fresh deterministic retry with its original "
+                                    "validated PR and CI context."
+                                ),
+                                parameters=(
+                                    WORKSPACE,
+                                    TASK_SHORT_ID,
+                                    *delivery_context_parameters,
+                                ),
+                            ),
+                            EdgeSpec(
+                                key="ci_monitor_preparation_needs_user_action",
+                                source="ci_monitor",
+                                transition="preparation_needs_user_action",
+                                target="ci_monitor",
+                                context=non_writer_recovery_context,
+                                prompt=ci_preparation_user_action_prompt(profile),
+                                requires_approval=True,
+                                transition_description=(
+                                    "The preparation diagnostic requires an "
+                                    "actual human decision or external recovery."
+                                ),
+                                parameters=(
+                                    WORKSPACE,
+                                    TASK_SHORT_ID,
+                                    CI_PREPARATION_DIAGNOSTIC,
+                                    BLOCKER,
+                                ),
+                            ),
+                        ]
+                        if source_ci_v3
+                        else []
                     ),
                     EdgeSpec(
                         key="ci_monitor_merged",
@@ -2918,7 +3868,11 @@ def build_delivery_workflow(
             "plan_review",
             "plan_review_accept",
             "plan_review_revalidate",
+            "plan_review_resume_continue",
+            "plan_review_resume_verify",
             "plan_revalidation_review",
+            "plan_revalidation_resume_continue",
+            "plan_revalidation_resume_verify",
             "plan_review_needs_user_action",
             "plan_revalidation_needs_user_action",
             "plan_needs_user_action",
@@ -2928,6 +3882,13 @@ def build_delivery_workflow(
             "fix_replan",
             "compliance_replan",
         }
+        if fresh_writers:
+            carried_digest_edges.update(
+                {
+                    "plan_review_resume_fix_continue",
+                    "plan_revalidation_resume_fix_continue",
+                }
+            )
         branch_edges = {
             "plan_contract_branch_identity",
             "branch_identity_implement",
@@ -3126,6 +4087,22 @@ re-lock another writer."""
         else edge
         for edge in edges
     ]
+    if target_branch_enabled:
+        updated_edges = []
+        for edge in edges:
+            if any(
+                parameter.key in _PR_TARGET_CARRIER_FIELDS
+                for parameter in edge.parameters
+            ) and edge.key != "prepare_pr_no_pr" and not any(
+                parameter.key == PR_BASE_BRANCH.key
+                for parameter in edge.parameters
+            ):
+                edge = replace(
+                    edge,
+                    parameters=edge.parameters + (PR_BASE_BRANCH,),
+                )
+            updated_edges.append(edge)
+        edges = updated_edges
     edges = qualify_transition_keys(edges)
     spec = WorkflowSpec(
         name=profile.workflow_name("delivery", version),
@@ -3972,18 +4949,23 @@ an explicit confirmation request. Do not choose `review_plan` in that Plan
 run."""
     context_contract = ""
     if _delivery_context_enabled(profile):
+        context_schema = (
+            "workflow-delivery-context-v2"
+            if _delivery_target_family(profile)
+            else "workflow-delivery-context-v1"
+        )
         if recovery_aware:
-            context_contract = """If no lifecycle packet was supplied, initialize
+            context_contract = f"""If no lifecycle packet was supplied, initialize
 `delivery_context` before the first Plan transition, including a recovery
 transition. Use the compact JSON string
-`{"schema":"workflow-delivery-context-v1","phase":"pre_pr"}`. On the first
+`{{"schema":"{context_schema}","phase":"pre_pr"}}`. On the first
 `review_plan` handoff, provide it unchanged. Never add placeholder PR or CI
 fields. On every later transition, preserve the exact incoming `delivery_context`
 string."""
         else:
-            context_contract = """If no lifecycle packet was supplied, initialize
+            context_contract = f"""If no lifecycle packet was supplied, initialize
 `delivery_context` as the compact JSON string
-`{"schema":"workflow-delivery-context-v1","phase":"pre_pr"}`. On the first
+`{{"schema":"{context_schema}","phase":"pre_pr"}}`. On the first
 `review_plan` handoff, provide it unchanged. Never add placeholder PR or CI
 fields. On recovery or any later transition, preserve the exact incoming
 `delivery_context` string."""
@@ -4181,6 +5163,18 @@ def plan_review_prompt(
     *,
     coder_selection: bool = False,
 ) -> str:
+    fresh_writers = profile.writer_session_policy() == "fresh_per_slice"
+    fix_resume = (
+        """
+Choose `plan_review_resume_fix_continue` only when this is a fresh-per-slice
+profile, the exact previously accepted `fix_continue` contract and its approval
+remain applicable, there are no new findings or authority/milestone changes,
+and the remaining bounded Fix bundle is unchanged. Set `fix_context` to the
+exact remaining bundle carried in `plan_route_context`.
+"""
+        if fresh_writers
+        else ""
+    )
     selection_context = (
         "Previous accepted plan digest: {{.Params.accepted_plan_sha256}}\n"
         if coder_selection
@@ -4236,6 +5230,15 @@ Check:
 - writer steps are executable, dependency ordered, and do not hide workflow
   stages as implementation work.
 
+Choose `plan_review_resume_continue` or `plan_review_resume_verify` only when
+the exact previously accepted contract is unchanged, its prior independent
+PASS review and required human approval still apply, and there are no new
+findings or authority/milestone changes. Put this fresh review result in
+`review_context`. Use Continue only when writer-owned work remains; use Verify
+only when it is complete. These fixed-route edges always pass through the
+existing Plan Contract guard; they cannot accept or continue a changed
+contract. Otherwise use the existing acceptance or revalidation path.
+{fix_resume}
 Choose `accepted` only when implementation or verification may safely follow.
 Provide `workspace_path`, `plan_path`, `work_kind`, unchanged `plan_route`,
 unchanged `plan_route_context`, `task_short_id={{{{.TaskShortId}}}}`, a concise
@@ -4277,6 +5280,29 @@ def plan_revalidation_prompt(
         if coder_selection
         else ""
     )
+    resume_contract = """
+Choose `plan_revalidation_resume_continue` or
+`plan_revalidation_resume_verify` only when the current contract is still the
+exact previously accepted contract, its prior independent PASS review and
+required approval remain applicable, with no new findings or
+authority/milestone changes. Preserve the result and original
+authority references in `review_context`; Continue is only for remaining
+writer-owned work, and Verify is only when it is complete. These fixed-route
+edges always pass through the existing Plan Contract guard and cannot accept
+or continue a changed contract. If reconciliation changed the contract, a
+negative review finding remains unresolved, or prior approval/review no longer
+applies, use `review_plan` so the existing independent review and acceptance
+gates run.
+"""
+    if profile.writer_session_policy() == "fresh_per_slice":
+        resume_contract += """
+
+Choose `plan_revalidation_resume_fix_continue` only when the unchanged
+previously accepted `fix_continue` contract, its independent PASS review and
+approval still apply, with no new findings or authority/milestone changes.
+Set `fix_context` to the exact remaining bounded Fix bundle preserved in
+`plan_route_context`.
+"""
     return f"""Revalidate the authoritative plan for {{{{.TaskShortId}}}}.
 
 {context_instruction(profile, "plan", "plan_revalidation", "plan")}{delivery_context_input(profile)}Workspace: {{{{.Params.workspace_path}}}}
@@ -4308,6 +5334,8 @@ when execution disproves the approach. Routine progress, hash drift, waiting
 and repeated identical failures do not require another critique. Preserve
 mandatory project review gates; critique never substitutes for their receipts.
 When revalidation was triggered by deterministic drift, {snapshot_instruction}
+
+{resume_contract}
 
 Choose `review_plan` after reconciliation and provide `workspace_path`,
 `plan_path`, unchanged `work_kind`, unchanged `plan_route`,
@@ -4759,16 +5787,29 @@ def prepare_pr_prompt(profile: ProjectProfile) -> str:
     )
     delivery_context_contract = ""
     if _delivery_context_enabled(profile):
-        delivery_context_contract = """Incoming lifecycle packet:
-{{.Params.delivery_context}}
+        context_schema = (
+            "workflow-delivery-context-v2"
+            if _delivery_target_family(profile)
+            else "workflow-delivery-context-v1"
+        )
+        target_field = (
+            ", exact `pr_base_branch` from `baseRefName`"
+            if _delivery_target_family(profile)
+            else ""
+        )
+        delivery_context_contract = f"""Incoming lifecycle packet:
+{{{{.Params.delivery_context}}}}
 
 Before any transition that carries `delivery_context`, construct its compact
-closed `workflow-delivery-context-v1` JSON value from observed delivery state.
+closed `{context_schema}` JSON value from observed delivery state.
 If no PR exists, keep `phase=pre_pr` with no PR or CI fields. After observing a
 PR, use `phase=post_pr` with its actual URL, current branch, resolved merge
-strategy, and feedback cursor. Include `ci_contract` or `ci_report` only when
-that exact packet has actually been produced; preserve each nested packet
-string byte-for-byte. Never invent earlier CI state."""
+strategy, and feedback cursor{target_field}. Include `ci_contract` or
+`ci_report` only when that exact packet has actually been produced; preserve
+each nested packet string byte-for-byte. On the current target-branch family,
+first resolve the permitted intended target from applicable task/project
+authority, and stop for an actual decision if none exists or the observed base
+differs. Never infer the target from a watcher observation or silently retarget."""
     if source_ci:
         monitor_handoff_contract = """For source-contract CI handoff, PR identity
 and CI packets belong only in `delivery_context`. Use exactly the selected
@@ -4833,6 +5874,18 @@ through that ambiguity.
 
 {monitor_handoff_contract}
 
+{("For the target-branch continuity family, establish the permitted target "
+  "before PR creation from applicable task/project authority. Read the PR's "
+  "actual `baseRefName` after creation and again before the first handoff; "
+  "carry that exact value as `pr_base_branch`. Compare it on every later fresh "
+  "PR read before success, merged shortcuts, or cleanup. Do not infer a target "
+  "from a default branch or watcher observation. A difference requires "
+  "applicable existing owner authority and fresh PR observation; when "
+  "authorized, use `post_pr_target_revalidated` to change only the target in "
+  "the v2 packet, preserving CI bytes and retry state. This packer mode adds "
+  "no graph edge or authority."
+  if _delivery_target_family(profile) else "")}
+
 If no PR is genuinely
 applicable, choose `no_pr` and provide `pr_report`; this path requires
 approval. Use `needs_changes` with `workspace_path` and `blocker_reason` for
@@ -4846,6 +5899,7 @@ with `pull_request_feedback_invalid`."""
 
 def ci_prompt(profile: ProjectProfile) -> str:
     source_ci = profile.source_ci_contract() and profile.capability("ci_monitoring")
+    source_ci_v3 = source_ci and profile.source_ci_contract_v3()
     delivery_fix_handoff = (
         """\n\nFor `needs_changes`, pack the latest observed PR identity, cursor,
 and any produced CI packets in `delivery_context`; preserve packet bytes and
@@ -4896,13 +5950,19 @@ and the exact PR identity in `delivery_context` when choosing `watch_ci`.
 Supply `task_short_id` as its own transition parameter. This always re-enters
 deterministic preparation, never the watcher directly. Only a bounded retry
 or a proven task-scoped fix/external blocker is allowed."""
-        if source_ci
+        if source_ci and not source_ci_v3
+        else ""
+    )
+    target_branch = (
+        "\nPR target branch (`baseRefName`): {{.Params.pr_base_branch}}\n"
+        if _delivery_target_family(profile)
         else ""
     )
     return f"""Monitor CI for {{{{.TaskShortId}}}} without editing files.
 
 {context_instruction(profile, "delivery", "ci_monitor", "delivery")}{delivery_context_pack_instruction(profile)}PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
+{target_branch}
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
 Deterministic CI report: {{{{.Params.ci_report}}}}
@@ -4946,6 +6006,54 @@ external blocker.{delivery_fix_handoff}
 Never use `needs_user_action` merely because CI is still running."""
 
 
+def ci_preparation_failure_prompt(profile: ProjectProfile) -> str:
+    """Handle v3 preparation failure without pretending CI packets exist."""
+    return f"""Classify the failed CI preparation for {{{{.TaskShortId}}}}.
+
+{context_instruction(profile, "delivery", "ci_monitor", "delivery")}
+Workspace: {{{{.Params.workspace_path}}}}
+Task: {{{{.Params.task_short_id}}}}
+Closed preparation diagnostic: {{{{.Params.ci_preparation_diagnostic}}}}
+
+This route carries exactly `workspace_path`, `task_short_id`, and
+`ci_preparation_diagnostic`; it does not contain a CI report, CI contract, or
+flat PR identity. Validate the diagnostic as
+`workflow-ci-preparation-diagnostic-v1`. Do not invent or reconstruct any
+omitted packet.
+
+For a transient failure or an archive blocker that may have cleared, choose
+`retry_preparation` only when the diagnostic contains its validated
+`resume_context`. Pass that exact compact JSON string as `delivery_context`,
+with `workspace_path` and `task_short_id={{.TaskShortId}}`; do not reset
+history, authority, or retry limits. Never route this preparation failure
+directly to the CI watcher.
+
+For invalid input, identity conflict, an unavailable original context, or a
+genuine external/authority decision, choose `preparation_needs_user_action`
+with the unchanged diagnostic and a precise `blocker_reason`. Approval does not
+repair contradictory evidence. If the diagnostic does not support either
+declared route, preserve the blocker and do not fabricate context."""
+
+
+def ci_preparation_user_action_prompt(profile: ProjectProfile) -> str:
+    return f"""Resolve the human-action blocker from CI preparation for {{{{.TaskShortId}}}}.
+
+{context_instruction(profile, "delivery", "ci_monitor", "delivery")}
+Workspace: {{{{.Params.workspace_path}}}}
+Task: {{{{.Params.task_short_id}}}}
+Original closed preparation diagnostic:
+{{{{.Params.ci_preparation_diagnostic}}}}
+Blocker: {{{{.Params.blocker_reason}}}}
+
+Re-read the exact original input and decision/evidence sources before taking
+any action. Preserve the diagnostic bytes and original PR/CI context; do not
+invent missing packets, discard invalid supplied packets, or reset retry
+history. Resume only through the declared `retry_preparation` route after the
+blocker is genuinely resolved and the diagnostic still validates. Otherwise
+remain blocked with the precise external or authority gap; approval alone does
+not repair technical or contradictory evidence."""
+
+
 def waiting_pr_prompt(profile: ProjectProfile) -> str:
     source_ci = profile.source_ci_contract() and profile.capability("ci_monitoring")
     delivery_fix_handoff = (
@@ -4967,6 +6075,11 @@ and omit unproduced fields."""
     cursor = (
         "\nIncremental PR feedback cursor: {{.Params.pr_feedback_cursor}}\n"
         if profile.runtime_contracts_v2()
+        else ""
+    )
+    target_branch = (
+        "\nPR target branch (`baseRefName`): {{.Params.pr_base_branch}}\n"
+        if _delivery_target_family(profile)
         else ""
     )
     ci_recheck = (
@@ -5002,6 +6115,7 @@ re-entry."""
 
 {context_instruction(profile, "delivery", "waiting_pr", "delivery")}{delivery_context_pack_instruction(profile)}PR: {{{{.Params.pr_url}}}}
 Branch: {{{{.Params.branch_name}}}}
+{target_branch}
 Resolved merge strategy: {{{{.Params.merge_strategy}}}}
 Workspace: {{{{.Params.workspace_path}}}}
 {cursor}

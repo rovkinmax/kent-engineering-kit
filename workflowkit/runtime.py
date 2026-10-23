@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import posixpath
 import re
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
@@ -158,7 +159,8 @@ CI_POLICY_SNAPSHOT_SCHEMA = "github-ci-policy-snapshot-v1"
 CI_CONTRACT_SCHEMA = "github-ci-contract-v1"
 DYNAMIC_CI_REPORT_SCHEMA = "github-ci-report-v3"
 DYNAMIC_PR_CURSOR_SCHEMA = "github-pr-feedback-cursor-v2"
-DELIVERY_CONTEXT_SCHEMA = "workflow-delivery-context-v1"
+DELIVERY_CONTEXT_V1_SCHEMA = "workflow-delivery-context-v1"
+DELIVERY_CONTEXT_SCHEMA = "workflow-delivery-context-v2"
 MAX_DELIVERY_CONTEXT_BYTES = 256 * 1024
 
 
@@ -549,12 +551,15 @@ def _validate_delivery_context(value: Mapping[str, Any]) -> dict[str, Any]:
             "pr_feedback_cursor",
             "ci_contract",
             "ci_report",
+            "pr_base_branch",
         }
     else:
         raise RuntimeContractError("delivery context.phase is unsupported")
     data = _closed(data, keys, "delivery context")
-    if data.get("schema") != DELIVERY_CONTEXT_SCHEMA:
+    schema = data.get("schema")
+    if schema not in {DELIVERY_CONTEXT_V1_SCHEMA, DELIVERY_CONTEXT_SCHEMA}:
         raise RuntimeContractError("unsupported delivery context schema")
+    version_two = schema == DELIVERY_CONTEXT_SCHEMA
     required = (
         {"schema", "phase"}
         if phase == "pre_pr"
@@ -567,6 +572,8 @@ def _validate_delivery_context(value: Mapping[str, Any]) -> dict[str, Any]:
             "pr_feedback_cursor",
         }
     )
+    if phase == "post_pr" and version_two:
+        required.add("pr_base_branch")
     if set(data) - {"ci_contract", "ci_report"} != required:
         raise RuntimeContractError("delivery context has missing fields")
     if phase == "post_pr":
@@ -610,6 +617,16 @@ def _validate_delivery_context(value: Mapping[str, Any]) -> dict[str, Any]:
             raise RuntimeContractError(
                 "delivery context.branch_name is invalid"
             )
+        if version_two:
+            base_branch = _string(
+                data["pr_base_branch"],
+                "delivery context.pr_base_branch",
+                max_bytes=4096,
+            )
+            if base_branch != base_branch.strip() or base_branch.startswith("-"):
+                raise RuntimeContractError(
+                    "delivery context.pr_base_branch is invalid"
+                )
         merge_strategy = _string(
             data["merge_strategy"],
             "delivery context.merge_strategy",
@@ -2099,6 +2116,7 @@ EVIDENCE_RECOVERY_SCHEMA = "evidence-recovery-v2"
 EVIDENCE_BOUNDARY_KIND = "evidence_recovery_boundary_v2"
 EVIDENCE_BOUNDARY_KINDS = {"evidence_recovery_boundary_v1", EVIDENCE_BOUNDARY_KIND}
 EVIDENCE_RECOVERY_FILES = ("evidence-recovery.json", "evidence-continuation.jsonl")
+SCRIPT_CI_ARCHIVE_RECORD_KIND = "script_ci_archive_v1"
 LEGACY_OWNER_PROVENANCE = {
     "schema": "kent-owner-provenance-v1",
     "session_task_binding": "native-readback",
@@ -2121,11 +2139,157 @@ def validate_owner_provenance(value, *, version=None):
     return dict(value)
 
 
+def _script_ci_archive_identity(value: Any, *, task_short_id: str,
+                                workspace_path: str) -> dict[str, Any]:
+    keys = {
+        "task_id", "task_short_id", "project_id", "workspace_path",
+        "invocation_kind", "node_id", "transition_branch_key",
+    }
+    identity = _closed(value, keys, "script CI archive identity")
+    if set(identity) != keys:
+        raise RuntimeContractError("script CI archive identity is incomplete")
+    for key in ("task_id", "task_short_id", "project_id", "workspace_path",
+                "invocation_kind", "node_id"):
+        _string(identity[key], f"script_identity.{key}", max_bytes=4096)
+    branch = identity["transition_branch_key"]
+    if branch is not None:
+        _string(branch, "script_identity.transition_branch_key", max_bytes=4096)
+    if (
+        identity["task_short_id"] != task_short_id
+        or identity["workspace_path"] != workspace_path
+        or identity["invocation_kind"] != "script"
+    ):
+        raise RuntimeContractError("script CI archive identity does not match its record")
+    if not TASK_RE.fullmatch(task_short_id):
+        raise RuntimeContractError("script CI archive task key is invalid")
+    if (
+        not workspace_path.startswith("/")
+        or workspace_path != posixpath.normpath(workspace_path)
+        or "\x00" in workspace_path
+    ):
+        raise RuntimeContractError("script CI archive workspace path is invalid")
+    return identity
+
+
+def build_script_ci_archive_record(
+    *,
+    task_short_id: str,
+    workspace_path: str,
+    script_identity: Mapping[str, Any],
+    report_sha256: str,
+    sequence: int,
+    previous_hash: str,
+) -> dict[str, Any]:
+    """Build the closed Script-owned CI archive row without filesystem effects."""
+    task_short_id = _string(task_short_id, "task_short_id", max_bytes=256)
+    workspace_path = _string(workspace_path, "workspace_path", max_bytes=4096)
+    identity = _script_ci_archive_identity(
+        script_identity,
+        task_short_id=task_short_id,
+        workspace_path=workspace_path,
+    )
+    sequence = _integer(sequence, "sequence", minimum=1)
+    report_sha256 = _digest(report_sha256, "report_sha256")
+    if previous_hash:
+        previous_hash = _digest(previous_hash, "previous_hash")
+    elif not isinstance(previous_hash, str):
+        raise RuntimeContractError("previous_hash must be a string")
+    unsigned = {
+        "schema_version": 3,
+        "record_kind": SCRIPT_CI_ARCHIVE_RECORD_KIND,
+        "sequence": sequence,
+        "task_short_id": task_short_id,
+        "workspace_path": workspace_path,
+        "script_identity": identity,
+        "report_sha256": report_sha256,
+        "artifacts": [
+            f".kent/runtime/{task_short_id}/ci-report-{report_sha256}.json"
+        ],
+        "previous_hash": previous_hash,
+    }
+    return {**unsigned, "event_hash": _event_hash(unsigned)}
+
+
+def validate_script_ci_archive_record(
+    value: Mapping[str, Any],
+    *,
+    task_short_id: str | None = None,
+    workspace_path: str | None = None,
+    sequence: int | None = None,
+    previous_hash: str | None = None,
+) -> dict[str, Any]:
+    """Validate one exact typed Script archive row and optional chain binding."""
+    keys = {
+        "schema_version", "record_kind", "sequence", "task_short_id",
+        "workspace_path", "script_identity", "report_sha256", "artifacts",
+        "previous_hash", "event_hash",
+    }
+    data = _closed(value, keys, "script CI archive record")
+    if set(data) != keys:
+        raise RuntimeContractError("script CI archive record is incomplete")
+    task = _string(data["task_short_id"], "task_short_id", max_bytes=256)
+    workspace = _string(data["workspace_path"], "workspace_path", max_bytes=4096)
+    if (
+        type(data["schema_version"]) is not int
+        or data["schema_version"] != 3
+        or data["record_kind"] != SCRIPT_CI_ARCHIVE_RECORD_KIND
+    ):
+        raise RuntimeContractError("unsupported script CI archive record")
+    actual_sequence = _integer(data["sequence"], "sequence", minimum=1)
+    identity = _script_ci_archive_identity(
+        data["script_identity"], task_short_id=task,
+        workspace_path=workspace,
+    )
+    report_sha256 = _digest(data["report_sha256"], "report_sha256")
+    expected_artifacts = [
+        f".kent/runtime/{task}/ci-report-{report_sha256}.json"
+    ]
+    if data["artifacts"] != expected_artifacts:
+        raise RuntimeContractError("script CI archive artifact locator is invalid")
+    prior = data["previous_hash"]
+    if prior:
+        prior = _digest(prior, "previous_hash")
+    elif not isinstance(prior, str):
+        raise RuntimeContractError("previous_hash must be a string")
+    if task_short_id is not None and task != task_short_id:
+        raise RuntimeContractError("script CI archive task does not match")
+    if workspace_path is not None and workspace != workspace_path:
+        raise RuntimeContractError("script CI archive workspace does not match")
+    if sequence is not None and actual_sequence != sequence:
+        raise RuntimeContractError("script CI archive sequence does not match")
+    if previous_hash is not None and prior != previous_hash:
+        raise RuntimeContractError("script CI archive predecessor does not match")
+    unsigned = {key: item for key, item in data.items() if key != "event_hash"}
+    event_hash = _digest(data["event_hash"], "event_hash")
+    if _event_hash(unsigned) != event_hash:
+        raise RuntimeContractError("script CI archive record has an invalid hash")
+    return data
+
+
+def is_ordinary_evidence_record(record: Mapping[str, Any]) -> bool:
+    """Identify normal legacy ledger events, excluding typed and boundary rows."""
+    if not isinstance(record, Mapping):
+        return False
+    try:
+        version = evidence_identity_version(dict(record))
+    except (RuntimeContractError, TypeError, ValueError):
+        return False
+    return (
+        version in (1, 2)
+        and record.get("record_kind") not in {
+            TERMINAL_SEAL_SCHEMA, *EVIDENCE_BOUNDARY_KINDS,
+        }
+    )
+
+
 def evidence_identity_version(data):
     """Outer record version selects ownership; historical bytes remain opaque."""
     version = data.get("schema_version")
-    if type(version) is not int or version not in (1, 2):
+    if type(version) is not int or version not in (1, 2, 3):
         raise RuntimeContractError("ledger record has unsupported schema")
+    if version == 3:
+        validate_script_ci_archive_record(data)
+        return version
     if version == 2:
         if "run_id" in data or data.get("record_kind") == TERMINAL_SEAL_SCHEMA:
             raise RuntimeContractError("inconsistent evidence identity version")
@@ -2157,6 +2321,13 @@ def _evidence_record(raw: bytes, task: str, sequence: int, previous: str) -> dic
         raise RuntimeContractError("invalid evidence JSON") from error
     data = _object(data, "evidence record")
     evidence_identity_version(data)
+    if data.get("schema_version") == 3:
+        return validate_script_ci_archive_record(
+            data,
+            task_short_id=task,
+            sequence=sequence,
+            previous_hash=previous,
+        )
     if (
         type(data.get("schema_version")) is not int
         or data["schema_version"] not in (1, 2)
@@ -4420,6 +4591,7 @@ __all__ = [
     "VERIFICATION_REPORT_SCHEMA",
     "build_ci_report",
     "build_dynamic_ci_report",
+    "build_script_ci_archive_record",
     "append_dynamic_ci_report",
     "build_terminal_marker",
     "build_terminal_seal_record",
@@ -4436,6 +4608,7 @@ __all__ = [
     "delivery_context_fields",
     "make_dynamic_pr_feedback_cursor",
     "make_report_invalid_attempt",
+    "is_ordinary_evidence_record",
     "parse_runtime_external_captures",
     "parse_canonical_json",
     "parse_terminal_marker_line",
@@ -4451,6 +4624,7 @@ __all__ = [
     "validate_expected_ci_checks",
     "validate_ci_policy_snapshot",
     "validate_dynamic_pr_feedback_cursor",
+    "validate_script_ci_archive_record",
     "validate_pr_feedback_item",
     "validate_runtime_source_envelope",
     "validate_terminal_chain",

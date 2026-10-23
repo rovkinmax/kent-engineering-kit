@@ -16,6 +16,12 @@ repository/ruleset permissions around publication; an existing PR needs
 GitHub `canBeRebased=true` before claiming rebase feasibility. Unknown state
 requires readback. Method selection is not merge authority.
 
+When the current graph declares `pr_base_branch`, establish the target from
+the applicable existing authority, then verify the new PR's actual
+`baseRefName` before handoff. Do not infer it from the task branch, local
+default or an earlier observation. Preserve the exact target in declared PR,
+CI, merge and Cleanup carriers.
+
 Return exact branch, PR URL, head/base OIDs and evidence through declared
 carriers. Retain later acceptance obligations with owner/milestone: a
 review-ready PR may still have external UNVERIFIED work and is not full

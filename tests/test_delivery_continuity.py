@@ -155,12 +155,31 @@ class GeneratedStageContractsTests(unittest.TestCase):
                 self.assertNotIn("Implement mapping from", prompts)
 
     def test_reviews_keep_stage_obligations_without_relabeling_old_statuses(self):
+        from workflowkit.delivery import plan_review_prompt, spec_review_prompt
+
         for compliance in (False, True):
             for pr in (False, True):
                 profile = self.profile()
                 profile = replace(profile, capabilities={
                     **profile.capabilities, "compliance_review": compliance,
                     "pull_requests": pr, "ci_monitoring": pr, "spec_review": True})
+                plan_review = " ".join(plan_review_prompt(profile).split())
+                self.assertIn(
+                    "acceptance criteria map to owned deterministic, review, or runtime evidence",
+                    plan_review,
+                )
+                self.assertIn(
+                    "writer steps are executable, dependency ordered, and do not hide workflow stages as implementation work",
+                    plan_review,
+                )
+                spec_review = " ".join(spec_review_prompt(profile).split())
+                self.assertIn("current authorized stage", spec_review)
+                self.assertIn("owner and due milestone", spec_review)
+                self.assertIn("do not require them early or declare them satisfied", spec_review)
+                self.assertIn(
+                    "A review-ready PR is not full business acceptance, merge/release authority, or Task Done",
+                    spec_review,
+                )
                 spec = build_delivery_workflow(profile, 5)
                 for target in ("spec_review", "verification_gate"):
                     prompt = next(edge.prompt for edge in spec.edges
@@ -192,7 +211,12 @@ REVALIDATION_EDGE_CONTRACTS = {
     ),
 }
 
-def runtime_v2_profile(*, ci: bool, source_ci: bool = False) -> ProjectProfile:
+def runtime_v2_profile(
+    *,
+    ci: bool,
+    source_ci: bool = False,
+    current_family: bool = False,
+) -> ProjectProfile:
     contents = (REPO_ROOT / "contracts" / "project-profile.example.toml").read_text()
     contents = contents.replace(
         "schema_version = 3\n",
@@ -255,6 +279,20 @@ def runtime_v2_profile(*, ci: bool, source_ci: bool = False) -> ProjectProfile:
                 'prepare_ci = ".kent/scripts/workflow-prepare-github-ci"\n',
             )
         )
+    if current_family:
+        contents = contents.replace(
+            "[policies]\n",
+            '[policies]\ndelivery_reliability = "v1"\n',
+        )
+        for old, new in (
+            ('runtime_contracts = "2.0.0"', 'runtime_contracts = "2.1.0"'),
+            ('evidence = "2.0.0"', 'evidence = "2.1.0"'),
+            ('janitor = "2.0.0"', 'janitor = "3.0.0"'),
+            ('wait_pr = "3.0.0"', 'wait_pr = "4.0.0"'),
+            ('wait_ci = "3.0.0"', 'wait_ci = "4.0.0"'),
+            ('prepare_ci = "2.0.0"', 'prepare_ci = "3.0.0"'),
+        ):
+            contents = contents.replace(old, new)
     return ProjectProfile.from_toml(REPO_ROOT, contents, check_files=False)
 
 
@@ -380,6 +418,563 @@ def direct_parameter_references(prompt: str) -> set[str]:
 
 
 class DeliveryPackingCommandTests(unittest.TestCase):
+    def test_feedback_decision_derivative_updates_only_acknowledged_cursor(self):
+        from unittest.mock import patch
+
+        from workflowkit.runtime import canonical_bytes, make_dynamic_pr_feedback_cursor
+
+        root = create_repository(self)
+        profile = replace(
+            runtime_v2_profile(
+                ci=True,
+                source_ci=True,
+                current_family=True,
+            ),
+            project_root=root,
+        )
+        workflow_id = "44444444-4444-4444-8444-444444444444"
+        nodes = [
+            {"id": "ci-monitor", "key": "ci_monitor", "kind": "agent"},
+            {
+                "id": "ci-watch",
+                "key": "ci_watch",
+                "kind": "script",
+                "script_path": ".kent/scripts/workflow-wait-github-ci",
+            },
+            {"id": "waiting-pr", "key": "waiting_pr", "kind": "agent"},
+        ]
+        graph = {
+            "workflow_id": workflow_id,
+            "expected_version": 1,
+            "graph": {
+                "nodes": nodes,
+                "transition_groups": [
+                    {
+                        "id": "retry-group",
+                        "source_node_id": "ci-monitor",
+                        "transition_id": "watch_ci",
+                    },
+                    {
+                        "id": "target-group",
+                        "source_node_id": "waiting-pr",
+                        "transition_id": "ci_required",
+                    },
+                    {
+                        "id": "watch-state-changed",
+                        "source_node_id": "ci-watch",
+                        "transition_id": "ci_watch_state_changed",
+                    },
+                ],
+                "edges": [
+                    {
+                        "id": "retry-edge",
+                        "key": "ci_monitor_watch",
+                        "transition_group_id": "retry-group",
+                        "target_node_id": "ci-watch",
+                        "parameters": [
+                            {"key": key}
+                            for key in (
+                                "workspace_path", "task_short_id",
+                                "delivery_context",
+                            )
+                        ],
+                    },
+                    {
+                        "id": "target-edge",
+                        "key": "waiting_pr_ci_required",
+                        "transition_group_id": "target-group",
+                        "target_node_id": "ci-watch",
+                        "parameters": [
+                            {"key": key}
+                            for key in (
+                                "workspace_path", "pr_url", "branch_name",
+                                "merge_strategy", "pr_feedback_cursor",
+                                "pr_base_branch",
+                            )
+                        ],
+                    },
+                    {
+                        "id": "watch-state-changed-edge",
+                        "key": "ci_watch_state_changed",
+                        "transition_group_id": "watch-state-changed",
+                        "target_node_id": "ci-monitor",
+                        "parameters": [
+                            {"key": key}
+                            for key in (
+                                "pr_url", "pr_report", "pr_feedback_cursor",
+                                "pr_base_branch",
+                            )
+                        ],
+                    },
+                ],
+            },
+        }
+        identity = {
+            "task_id": "native-task",
+            "task_short_id": "KIT-1",
+            "project_id": "native-project",
+            "workspace_path": str(root),
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "step_id": "33333333-3333-4333-8333-333333333333",
+        }
+        detail = {
+            "summary": {
+                "id": identity["task_id"],
+                "short_id": identity["task_short_id"],
+                "project_id": identity["project_id"],
+                "workflow_id": workflow_id,
+            },
+            "current_nodes": [{
+                "node_id": "ci-monitor",
+                "session_id": identity["session_id"],
+            }],
+            "live_sessions": [],
+        }
+        script_identity = {
+            "task_id": identity["task_id"],
+            "task_short_id": identity["task_short_id"],
+            "project_id": identity["project_id"],
+            "workspace_path": identity["workspace_path"],
+            "invocation_kind": "script",
+            "node_id": "ci-watch",
+            "transition_branch_key": None,
+        }
+        pr_url = "https://github.com/owner/repo/pull/7"
+        old_cursor = canonical_bytes(make_dynamic_pr_feedback_cursor(
+            repository="owner/repo",
+            pull_number=7,
+            items=[],
+        )).decode("utf-8")
+        candidate_cursor = canonical_bytes(make_dynamic_pr_feedback_cursor(
+            repository="owner/repo",
+            pull_number=7,
+            items=[{
+                "kind": "issue_comment",
+                "id": "comment-1",
+                "author_login": "reviewer",
+                "created_at": "2026-10-22T12:00:00Z",
+                "updated_at": "2026-10-22T12:00:00Z",
+                "body_bytes": 12,
+                "body_sha256": "a" * 64,
+            }],
+        )).decode("utf-8")
+        pr_report = (
+            ' { "reason":"pull_request_feedback_changed", '
+            '"observed_feedback_cursor":'
+            + json.dumps(candidate_cursor, ensure_ascii=False)
+            + ' }\n'
+        )
+        ci_contract = ' { "contract": "original bytes" }\n'
+        ci_report = ' {"report":"original bytes"}\n'
+        context = {
+            "schema": "workflow-delivery-context-v2",
+            "phase": "post_pr",
+            "pr_url": pr_url,
+            "branch_name": "feat/feedback",
+            "pr_base_branch": "main",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": old_cursor,
+            "ci_contract": ci_contract,
+            "ci_report": ci_report,
+        }
+        old_context = (
+            ' { "schema":"workflow-delivery-context-v2", '
+            '"phase":"post_pr", '
+            '"pr_url":' + json.dumps(pr_url) + ', '
+            '"branch_name":"feat/feedback", '
+            '"pr_base_branch":"main", '
+            '"merge_strategy":"rebase", '
+            '"pr_feedback_cursor":' + json.dumps(old_cursor) + ', '
+            '"ci_contract":' + json.dumps(ci_contract) + ', '
+            '"ci_report":' + json.dumps(ci_report) + ' }\n'
+        )
+        self.assertEqual(json.loads(old_context), context)
+        source_result = {
+            "transition": "ci_watch_state_changed",
+            "workspace_path": str(root),
+            "task_short_id": "KIT-1",
+            "pr_url": pr_url,
+            "branch_name": "feat/feedback",
+            "pr_base_branch": "main",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": old_cursor,
+            "pr_report": pr_report,
+            "ci_contract": ci_contract,
+            "ci_report": ci_report,
+            "delivery_context": old_context,
+        }
+        source_ref, _ = capture_producer(
+            root,
+            identity=script_identity,
+            producer_kind="wait-ci",
+            inputs={},
+            result=source_result,
+        )
+        reason = "Reviewed all current feedback items."
+
+        def make_derivative(decision_name, cursor):
+            decision_record = {
+                "schema": "workflow-feedback-decision-v1",
+                "source_ref": source_ref,
+                "decision": decision_name,
+                "old_cursor_sha256": __import__("hashlib").sha256(
+                    old_cursor.encode("utf-8")
+                ).hexdigest(),
+                "new_cursor_sha256": __import__("hashlib").sha256(
+                    cursor.encode("utf-8")
+                ).hexdigest(),
+                "reason_sha256": __import__("hashlib").sha256(
+                    reason.encode("utf-8")
+                ).hexdigest(),
+            }
+            refs_packet = json.dumps(
+                {"refs": [source_ref]},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            derived_result = {
+                **source_result,
+                "pr_feedback_cursor": cursor,
+            }
+            return capture_producer(
+                root,
+                identity=identity,
+                producer_kind="feedback-decision",
+                inputs={
+                    "producer_ref": source_ref,
+                    "decision": decision_name,
+                    "reason": reason,
+                },
+                result=derived_result,
+                binding={
+                    "producer_refs": refs_packet,
+                    "feedback_decision": json.dumps(
+                        decision_record,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
+            )[0]
+
+        ack_ref = make_derivative(
+            "acknowledge_all_reported_feedback",
+            candidate_cursor,
+        )
+        request = {
+            "schema": "workflow-pack-delivery-v1",
+            "transition": "watch_ci",
+            "values": {},
+            "delivery_mode": "post_pr",
+            "producer_refs": [ack_ref],
+            "transition_contract_ref": transition_contract_reference(
+                identity,
+                detail,
+                graph,
+                "watch_ci",
+            ),
+        }
+        profile_path = root / ".kent" / "workflow-profile.toml"
+        profile_path.write_text(
+            (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text()
+        )
+        with patch.object(ProjectProfile, "from_toml", return_value=profile):
+            ack_locator, ack_raw = pack_delivery(
+                root,
+                request,
+                identity=identity,
+                task_detail=detail,
+                graph=graph,
+            )
+            with self.assertRaisesRegex(ValueError, "stale"):
+                pack_delivery(
+                    root,
+                    {**request, "delivery_mode": "preserve"},
+                    identity=identity,
+                    task_detail=detail,
+                    graph=graph,
+                )
+        completion = json.loads(ack_raw)
+        new_context = json.loads(completion["delivery_context"])
+        self.assertEqual(new_context["pr_feedback_cursor"], candidate_cursor)
+        self.assertEqual(new_context["ci_contract"], ci_contract)
+        self.assertEqual(new_context["ci_report"], ci_report)
+        packed = reconstruct_producer(root, ack_locator, identity=identity)
+        self.assertEqual(
+            json.loads(packed["binding"]["producer_refs"])["refs"],
+            [ack_ref],
+        )
+
+        preserve_ref = make_derivative(
+            "preserve_acknowledged_cursor",
+            old_cursor,
+        )
+        with patch.object(ProjectProfile, "from_toml", return_value=profile):
+            _, preserve_raw = pack_delivery(
+                root,
+                {**request, "producer_refs": [preserve_ref], "delivery_mode": "preserve"},
+                identity=identity,
+                task_detail=detail,
+                graph=graph,
+            )
+        preserved_completion = json.loads(preserve_raw)
+        self.assertEqual(preserved_completion["delivery_context"], old_context)
+
+    def test_source_ci_retry_preserves_qualified_post_pr_v2_context(self):
+        from unittest.mock import patch
+
+        from workflowkit.runtime import canonical_bytes, make_dynamic_pr_feedback_cursor
+
+        root = create_repository(self)
+        profile = replace(
+            runtime_v2_profile(
+                ci=True,
+                source_ci=True,
+                current_family=True,
+            ),
+            project_root=root,
+        )
+        spec = build_delivery_workflow(profile, 1)
+        workflow_id = "44444444-4444-4444-8444-444444444444"
+        node_ids = {node.key: "node-" + node.key for node in spec.nodes}
+        group_ids = {}
+        native_edges = []
+        for index, edge in enumerate(spec.edges):
+            group_key = (edge.source, edge.transition)
+            group_id = group_ids.setdefault(
+                group_key,
+                "group-{}-{}".format(*group_key),
+            )
+            native_edges.append({
+                "id": f"edge-{index}",
+                "key": edge.key,
+                "transition_group_id": group_id,
+                "target_node_id": node_ids[edge.target],
+                "parameters": [
+                    {"key": parameter.key}
+                    for parameter in edge.parameters
+                ],
+            })
+        graph = {
+            "workflow_id": workflow_id,
+            "expected_version": 1,
+            "graph": {
+                "nodes": [
+                    {
+                        "id": node_ids[node.key],
+                        "key": node.key,
+                        "kind": node.kind,
+                        **(
+                            {"script_path": node.script_path}
+                            if node.script_path is not None else {}
+                        ),
+                    }
+                    for node in spec.nodes
+                ],
+                "transition_groups": [
+                    {
+                        "id": group_id,
+                        "source_node_id": node_ids[source],
+                        "transition_id": transition,
+                    }
+                    for (source, transition), group_id in group_ids.items()
+                ],
+                "edges": native_edges,
+            },
+        }
+        native = graph["graph"]
+        nodes = {node["key"]: node for node in native["nodes"]}
+        retry_edge = next(
+            edge for edge in native["edges"]
+            if edge["key"] == "ci_monitor_retry_preparation"
+        )
+        retry_group = next(
+            group
+            for group in native["transition_groups"]
+            if group["id"] == retry_edge["transition_group_id"]
+        )
+        transition = retry_group["transition_id"]
+        required = {
+            parameter["key"] for parameter in retry_edge["parameters"]
+        }
+        self.assertEqual(
+            required,
+            {"workspace_path", "task_short_id", "delivery_context"},
+        )
+
+        identity = {
+            "task_id": "native-task",
+            "task_short_id": "KIT-1",
+            "project_id": "native-project",
+            "workspace_path": str(root),
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "step_id": "33333333-3333-4333-8333-333333333333",
+        }
+        detail = {
+            "summary": {
+                "id": identity["task_id"],
+                "short_id": identity["task_short_id"],
+                "project_id": identity["project_id"],
+                "workflow_id": workflow_id,
+            },
+            "current_nodes": [{
+                "node_id": nodes["ci_monitor"]["id"],
+                "session_id": identity["session_id"],
+            }],
+            "live_sessions": [],
+        }
+        cursor = canonical_bytes(make_dynamic_pr_feedback_cursor(
+            repository="owner/repo",
+            pull_number=7,
+            items=[],
+        )).decode("utf-8")
+        ci_contract = ' { "contract": "original bytes" }\n'
+        ci_report = ' {"report":"original bytes"}\n'
+        flat = {
+            "pr_url": "https://github.com/owner/repo/pull/7",
+            "branch_name": "feat/retry",
+            "pr_base_branch": "release/2026",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": cursor,
+            "ci_contract": ci_contract,
+            "ci_report": ci_report,
+        }
+        prior_context = {
+            "schema": "workflow-delivery-context-v2",
+            "phase": "post_pr",
+            **flat,
+        }
+        prior_raw = (
+            ' { "schema":"workflow-delivery-context-v2", '
+            '"phase":"post_pr", '
+            '"pr_url":"https://github.com/owner/repo/pull/7", '
+            '"branch_name":"feat/retry", '
+            '"pr_base_branch":"release/2026", '
+            '"merge_strategy":"rebase", '
+            '"pr_feedback_cursor":'
+            + json.dumps(cursor, ensure_ascii=False)
+            + ', "ci_contract":'
+            + json.dumps(ci_contract, ensure_ascii=False)
+            + ', "ci_report":'
+            + json.dumps(ci_report, ensure_ascii=False)
+            + " }\n"
+        )
+        self.assertEqual(json.loads(prior_raw), prior_context)
+        source, _ = capture_producer(
+            root,
+            identity=identity,
+            producer_kind="incoming-pr-context",
+            inputs={},
+            result={
+                "transition": "watch_ci",
+                "workspace_path": str(root),
+                "task_short_id": identity["task_short_id"],
+                "delivery_context": prior_raw,
+                **flat,
+            },
+        )
+        request = {
+            "schema": "workflow-pack-delivery-v1",
+            "transition": transition,
+            "values": {},
+            "delivery_mode": "post_pr",
+            "producer_refs": [source],
+            "transition_contract_ref": transition_contract_reference(
+                identity,
+                detail,
+                graph,
+                transition,
+            ),
+        }
+        with patch.object(ProjectProfile, "from_toml", return_value=profile):
+            _, emitted = pack_delivery(
+                root,
+                request,
+                identity=identity,
+                task_detail=detail,
+                graph=graph,
+            )
+        completion = json.loads(emitted)
+        self.assertEqual(set(completion) - {"transition", "commentary"}, required)
+        self.assertEqual(completion["delivery_context"], prior_raw)
+        preserved = json.loads(completion["delivery_context"])
+        self.assertEqual(preserved["pr_base_branch"], "release/2026")
+        self.assertEqual(preserved["ci_contract"], ci_contract)
+        self.assertEqual(preserved["ci_report"], ci_report)
+
+        inconsistent, _ = capture_producer(
+            root,
+            identity=identity,
+            producer_kind="inconsistent-incoming-pr-context",
+            inputs={},
+            result={
+                "transition": "watch_ci",
+                "workspace_path": str(root),
+                "task_short_id": identity["task_short_id"],
+                "delivery_context": prior_raw,
+                **{**flat, "pr_base_branch": "main"},
+            },
+        )
+        with patch.object(ProjectProfile, "from_toml", return_value=profile):
+            with self.assertRaisesRegex(ValueError, "flat and nested"):
+                pack_delivery(
+                    root,
+                    {**request, "producer_refs": [inconsistent]},
+                    identity=identity,
+                    task_detail=detail,
+                    graph=graph,
+                )
+
+        v1_context = json.dumps({
+            "schema": "workflow-delivery-context-v1",
+            "phase": "post_pr",
+            **{key: value for key, value in flat.items() if key != "pr_base_branch"},
+        }, separators=(",", ":"))
+        legacy_source, _ = capture_producer(
+            root,
+            identity=identity,
+            producer_kind="legacy-post-pr-context",
+            inputs={},
+            result={
+                "transition": "watch_ci",
+                "workspace_path": str(root),
+                "task_short_id": identity["task_short_id"],
+                "delivery_context": v1_context,
+                **flat,
+            },
+        )
+        with patch.object(ProjectProfile, "from_toml", return_value=profile):
+            with self.assertRaisesRegex(ValueError, "schema differs"):
+                pack_delivery(
+                    root,
+                    {**request, "producer_refs": [legacy_source]},
+                    identity=identity,
+                    task_detail=detail,
+                    graph=graph,
+                )
+
+        broken_graph = json.loads(json.dumps(graph))
+        for edge in broken_graph["graph"]["edges"]:
+            fields = {parameter["key"] for parameter in edge["parameters"]}
+            if edge["key"] != "prepare_pr_no_pr" and "pr_base_branch" in fields and fields & {
+                "pr_url", "pr_feedback_cursor", "pr_report", "merge_report",
+                "ci_contract", "ci_report", "pr_head_oid", "pr_base_oid",
+                "publication_report",
+            }:
+                edge["parameters"] = [
+                    parameter for parameter in edge["parameters"]
+                    if parameter["key"] != "pr_base_branch"
+                ]
+                break
+        with patch.object(ProjectProfile, "from_toml", return_value=profile):
+            with self.assertRaisesRegex(ValueError, "target carriers"):
+                pack_delivery(
+                    root,
+                    request,
+                    identity=identity,
+                    task_detail=detail,
+                    graph=broken_graph,
+                )
+
     def test_two_cycle_gate_retry_packs_new_context_and_projects_fresh_fanout(self):
         """Exercise the source graph/packer contract, not Kent's Join scheduler."""
         root = create_repository(self)
@@ -770,6 +1365,165 @@ class DeliveryPackingCommandTests(unittest.TestCase):
 
 
 class ScriptProducerIdentityTests(unittest.TestCase):
+    def test_native_graph_selectors_gate_target_and_source_ci_protocols(self):
+        from unittest.mock import patch
+        from workflowkit import delivery
+        from workflowkit.model import SpecError
+
+        def current_native_graph(profile):
+            profile = replace(profile, project_root=self.root)
+            spec = build_delivery_workflow(profile, 1)
+            node_ids = {node.key: "node-" + node.key for node in spec.nodes}
+            nodes = []
+            for node in spec.nodes:
+                row = {
+                    "id": node_ids[node.key],
+                    "key": node.key,
+                    "kind": node.kind,
+                }
+                if node.script_path is not None:
+                    row["script_path"] = node.script_path
+                nodes.append(row)
+            groups = {}
+            native_edges = []
+            for index, edge in enumerate(spec.edges):
+                group_key = (edge.source, edge.transition)
+                group_id = groups.setdefault(
+                    group_key,
+                    "group-{}-{}".format(*group_key),
+                )
+                native_edges.append({
+                    "id": f"edge-{index}",
+                    "key": edge.key,
+                    "transition_group_id": group_id,
+                    "target_node_id": node_ids[edge.target],
+                    "parameters": [
+                        {"key": parameter.key}
+                        for parameter in edge.parameters
+                    ],
+                })
+            script_node = next(node for node in spec.nodes if node.kind == "script")
+            self.detail = {
+                **self.detail,
+                "summary": {
+                    **self.detail["summary"],
+                    "workflow_id": "44444444-4444-4444-8444-444444444444",
+                },
+                "source_workspace": {
+                    "is_primary": True,
+                    "workspace_id": "primary",
+                    "root_path": str(self.root),
+                },
+                "project": {"default_workspace_id": "primary"},
+                "worktree_path": str(self.root),
+                "current_scripts": [{
+                    "current_node": {"node_id": node_ids[script_node.key]},
+                    "path": script_node.script_path,
+                }],
+            }
+            self.graph = {
+                "workflow_id": "44444444-4444-4444-8444-444444444444",
+                "expected_version": 1,
+                "graph": {
+                    "nodes": nodes,
+                    "transition_groups": [
+                        {
+                            "id": group_id,
+                            "source_node_id": node_ids[source],
+                            "transition_id": transition,
+                        }
+                        for (source, transition), group_id in groups.items()
+                    ],
+                    "edges": native_edges,
+                },
+            }
+            context = {
+                **self.context,
+                "node_id": node_ids[script_node.key],
+            }
+            return profile, context
+
+        profiles = (
+            (
+                runtime_v2_profile(ci=True, source_ci=True),
+                "legacy",
+                False,
+                "workflow-delivery-context-v1",
+            ),
+            (
+                ProjectProfile.from_toml(
+                    REPO_ROOT,
+                    (REPO_ROOT / ".kent/workflow-profile.toml").read_text(),
+                    check_files=False,
+                ),
+                None,
+                True,
+                "workflow-delivery-context-v2",
+            ),
+            (
+                runtime_v2_profile(
+                    ci=True,
+                    source_ci=True,
+                    current_family=True,
+                ),
+                "typed-v1",
+                True,
+                "workflow-delivery-context-v2",
+            ),
+        )
+        for base_profile, expected_protocol, expected_target, expected_schema in profiles:
+            with self.subTest(protocol=expected_protocol):
+                profile, context = current_native_graph(base_profile)
+                with patch.object(
+                    ProjectProfile,
+                    "load",
+                    return_value=profile,
+                ):
+                    observation = delivery.observe_script_delivery_graph(
+                        self.root,
+                        "KIT-1",
+                        context,
+                        native_read=self.read,
+                    )
+                    self.assertEqual(
+                        delivery.prepare_ci_protocol(observation),
+                        expected_protocol,
+                    )
+                    self.assertEqual(
+                        delivery.pr_base_branch_required(observation),
+                        expected_target,
+                    )
+                    self.assertEqual(
+                        delivery.delivery_context_schema(observation),
+                        expected_schema,
+                    )
+                    if expected_target:
+                        target_edge = next(
+                            edge for edge in self.graph["graph"]["edges"]
+                            if {
+                                parameter["key"] for parameter in edge["parameters"]
+                            } >= {
+                                "pr_base_branch", "pr_head_oid", "pr_feedback_cursor",
+                            }
+                        )
+                        target_edge["parameters"] = [
+                            parameter for parameter in target_edge["parameters"]
+                            if parameter["key"] not in {
+                                "pr_base_branch", "pr_url", "pr_feedback_cursor",
+                            }
+                        ]
+                        broken = delivery.observe_script_delivery_graph(
+                            self.root,
+                            "KIT-1",
+                            context,
+                            native_read=self.read,
+                        )
+                        with self.assertRaisesRegex(
+                            SpecError,
+                            "target carriers",
+                        ):
+                            delivery.pr_base_branch_required(broken)
+
     def test_versioned_agent_archives_keep_legacy_bytes_and_reject_mixed_owners(self):
         import hashlib
         from workflowkit import delivery
@@ -988,6 +1742,133 @@ class ScriptProducerIdentityTests(unittest.TestCase):
         self.assertEqual(stored["identity"]["task_short_id"], "KIT-1")
         self.assertNotIn("task_short_id", payload)
 
+    def test_shared_emitter_retains_incoming_retry_packet_ancestry(self):
+        import importlib.machinery
+        import importlib.util
+        from unittest.mock import patch
+
+        import workflowkit.delivery as delivery
+
+        agent_identity = {
+            key: self.observe()[key]
+            for key in (
+                "task_id", "task_short_id", "project_id", "workspace_path",
+            )
+        }
+        agent_identity.update(
+            session_id="11111111-1111-4111-8111-111111111111",
+            step_id="22222222-2222-4222-8222-222222222222",
+        )
+        context = ' { "schema":"workflow-delivery-context-v1", "phase":"pre_pr" }\n'
+        shared_child, _ = capture_producer(
+            self.root,
+            identity=agent_identity,
+            producer_kind="shared-ci-child",
+            inputs={},
+            result={
+                "transition": "watch_ci",
+                "workspace_path": str(self.root),
+                "task_short_id": "KIT-1",
+                "delivery_context": context,
+                "ci_report": ' {"report":"shared"} ',
+            },
+        )
+        first_retry, _ = capture_producer(
+            self.root,
+            identity=agent_identity,
+            producer_kind="first-retry-pack",
+            inputs={},
+            result={
+                "transition": "retry_preparation",
+                "workspace_path": str(self.root),
+                "task_short_id": "KIT-1",
+                "delivery_context": context,
+            },
+            binding={
+                "producer_refs": delivery.packet_json(
+                    {"refs": [shared_child]}
+                ).decode("utf-8"),
+            },
+        )
+        retry_pack, retry_emitted = capture_producer(
+            self.root,
+            identity=agent_identity,
+            producer_kind="repeated-retry-pack",
+            inputs={},
+            result={
+                "transition": "retry_preparation",
+                "workspace_path": str(self.root),
+                "task_short_id": "KIT-1",
+                "delivery_context": context,
+            },
+            binding={
+                "producer_refs": delivery.packet_json(
+                    {"refs": [shared_child, first_retry]}
+                ).decode("utf-8"),
+            },
+        )
+        profile = self.root / ".kent/workflow-profile.toml"
+        profile.write_text(profile.read_text() + 'delivery_reliability = "v1"\n')
+
+        loader = importlib.machinery.SourceFileLoader(
+            "checkpoint_retry_ancestry_test",
+            str(REPO_ROOT / "templates/project/workflow-checkpoint"),
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        incoming_payload = {
+            "_kent": self.context,
+            "workspace_path": str(self.root),
+            "task_short_id": "KIT-1",
+            "delivery_context": context,
+            "commentary": json.loads(retry_emitted)["commentary"],
+        }
+        with patch.object(module, "delivery_module", return_value=delivery), \
+                patch.object(module, "delivery_native_read", side_effect=self.read):
+            output = module.emit_producer_result(
+                self.root,
+                incoming_payload,
+                json.dumps({
+                    "transition": "ci_prepare_failed",
+                    "workspace_path": str(self.root),
+                    "task_short_id": "KIT-1",
+                    "ci_preparation_diagnostic": '{"schema":"diagnostic"}',
+                }),
+                "prepare-ci",
+            )
+        final = json.loads(output)
+        final_locator = delivery.producer_locator(final["commentary"])
+        final_producer = reconstruct_producer(
+            self.root,
+            final_locator,
+            identity=self.observe(),
+        )
+        self.assertEqual(
+            json.loads(final_producer["binding"]["producer_refs"])["refs"],
+            [retry_pack],
+        )
+        closure = delivery.producer_reference_closure(
+            self.root,
+            final_locator,
+            identity=self.observe(),
+        )
+        self.assertEqual(
+            {path for path in closure if "/base-" in path},
+            {shared_child, first_retry, retry_pack, final_locator},
+        )
+        with patch.object(module, "delivery_module", return_value=delivery), \
+                patch.object(module, "delivery_native_read", side_effect=self.read):
+            # A malformed incoming footer is not silently treated as an
+            # ancestry-free Script execution.
+            with self.assertRaisesRegex(ValueError, "footer"):
+                module.emit_producer_result(
+                    self.root,
+                    {**incoming_payload, "commentary": "KENT_PACKET_SOURCE_V1 ../bad"},
+                    '{"transition":"ci_prepare_failed"}',
+                    "prepare-ci",
+                )
+
     def test_invalid_workspace_input_is_evidence_not_owner_identity_or_packed_result(self):
         identity = self.observe()
         foreign = str(self.root / "foreign-root")
@@ -1200,7 +2081,11 @@ class DeliveryContinuityTest(unittest.TestCase):
             "plan_review",
             "plan_review_accept",
             "plan_review_revalidate",
+            "plan_review_resume_continue",
+            "plan_review_resume_verify",
             "plan_revalidation_review",
+            "plan_revalidation_resume_continue",
+            "plan_revalidation_resume_verify",
             "plan_contract_continue_revalidate",
             "plan_contract_verify_revalidate",
             "plan_contract_branch_identity",
@@ -1334,6 +2219,90 @@ class DeliveryContinuityTest(unittest.TestCase):
             ("workspace_path", "task_short_id", "delivery_context"),
         )
 
+    def test_current_family_carries_target_and_emits_v2_context(self) -> None:
+        profile = ProjectProfile.from_toml(
+            REPO_ROOT,
+            (REPO_ROOT / ".kent" / "workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        edges = edge_map(profile)
+        pr_fields = {
+            "pr_url",
+            "pr_feedback_cursor",
+            "pr_report",
+            "merge_report",
+            "ci_contract",
+            "ci_report",
+            "pr_head_oid",
+            "pr_base_oid",
+            "publication_report",
+        }
+        for key, edge in edges.items():
+            fields = {parameter.key for parameter in edge.parameters}
+            if key != "prepare_pr_no_pr" and fields & pr_fields:
+                with self.subTest(edge=key):
+                    self.assertIn("pr_base_branch", fields)
+        self.assertNotIn(
+            "pr_base_branch",
+            {parameter.key for parameter in edges["prepare_pr_no_pr"].parameters},
+        )
+        janitor_fields = {
+            parameter.key for parameter in edges["cleanup_task_janitor"].parameters
+        }
+        self.assertIn("pr_base_branch", janitor_fields)
+        self.assertIn("workflow-delivery-context-v2", edges["start_plan"].prompt)
+        prepare_prompt = next(
+            edge.prompt for edge in build_delivery_workflow(profile, 1).edges
+            if edge.target == "prepare_pr"
+            and edge.prompt
+            and edge.prompt.startswith("Prepare delivery for")
+        )
+        self.assertIn("actual `baseRefName`", prepare_prompt)
+        self.assertIn("pr_base_branch", prepare_prompt)
+        waiting_prompt = edges["prepare_pr_waiting_pr"].prompt or ""
+        self.assertIn("baseRefName", waiting_prompt)
+
+    def test_source_ci_v3_has_exact_failure_and_recovery_routes(self) -> None:
+        profile = runtime_v2_profile(
+            ci=True,
+            source_ci=True,
+            current_family=True,
+        )
+        self.assertTrue(profile.source_ci_contract_v3())
+        edges = edge_map(profile)
+        self.assertEqual(
+            tuple(parameter.key for parameter in edges["ci_prepare_failed"].parameters),
+            ("workspace_path", "task_short_id", "ci_preparation_diagnostic"),
+        )
+        self.assertEqual(
+            tuple(
+                parameter.key
+                for parameter in edges["ci_monitor_retry_preparation"].parameters
+            ),
+            ("workspace_path", "task_short_id", "delivery_context"),
+        )
+        user_action = edges["ci_monitor_preparation_needs_user_action"]
+        self.assertEqual(
+            tuple(parameter.key for parameter in user_action.parameters),
+            (
+                "workspace_path",
+                "task_short_id",
+                "ci_preparation_diagnostic",
+                "blocker_reason",
+            ),
+        )
+        self.assertTrue(user_action.requires_approval)
+        self.assertIn("ci_preparation_diagnostic", user_action.prompt or "")
+        failure_prompt = edges["ci_prepare_failed"].prompt or ""
+        self.assertIn("exactly `workspace_path`, `task_short_id`", failure_prompt)
+        self.assertNotIn("Deterministic CI report: {{.Params.ci_report}}", failure_prompt)
+
+        ci_off = edge_map(
+            runtime_v2_profile(ci=False, current_family=True)
+        )
+        self.assertNotIn("ci_monitor_retry_preparation", ci_off)
+        self.assertNotIn("ci_monitor_preparation_needs_user_action", ci_off)
+
     def test_prepare_pr_handoff_matches_flat_profile_edges_and_authority(self) -> None:
         kit_lite = ProjectProfile.from_toml(
             REPO_ROOT,
@@ -1366,6 +2335,7 @@ class DeliveryContinuityTest(unittest.TestCase):
                     "branch_name",
                     "merge_strategy",
                     "pr_feedback_cursor",
+                    "pr_base_branch",
                 ),
             ),
             "kit-lite-flat-ci": (
@@ -1377,6 +2347,7 @@ class DeliveryContinuityTest(unittest.TestCase):
                     "merge_strategy",
                     "pr_feedback_cursor",
                     "ci_contract",
+                    "pr_base_branch",
                 ),
             ),
             "runtime-v2-no-ci": (

@@ -3344,6 +3344,150 @@ class WorkflowKitTest(unittest.TestCase):
             "plan_revalidation",
         )
 
+    def test_plan_review_and_revalidation_resume_only_through_fixed_guards(self) -> None:
+        from workflowkit.delivery import (
+            plan_revalidation_prompt,
+            plan_review_prompt,
+        )
+
+        baseline = self.load_profile()
+        cases = (
+            ("fresh", baseline),
+            (
+                "continuous",
+                replace(
+                    baseline,
+                    policies={
+                        **baseline.policies,
+                        "writer_sessions": "continuous",
+                    },
+                ),
+            ),
+            (
+                "continuous-complexity",
+                replace(
+                    baseline,
+                    policies={
+                        **baseline.policies,
+                        "writer_sessions": "continuous",
+                        "coder_selection": "complexity",
+                    },
+                ),
+            ),
+        )
+        for name, profile in cases:
+            with self.subTest(profile=name):
+                spec = build_delivery_workflow(profile, 1)
+                edges = {edge.key: edge for edge in spec.edges}
+                delivery_fields = (
+                    ("delivery_context",)
+                    if "delivery_context"
+                    in {p.key for p in edges["plan_review"].parameters}
+                    else ()
+                )
+                digest_fields = (
+                    ("accepted_plan_sha256",)
+                    if profile.coder_selection_policy() == "complexity"
+                    else ()
+                )
+                for source in ("plan_review", "plan_revalidation"):
+                    for route, target, fields in (
+                        (
+                            "continue",
+                            "plan_contract_continue",
+                            ("workspace_path", "review_context", "task_short_id")
+                            + delivery_fields
+                            + digest_fields,
+                        ),
+                        (
+                            "verify",
+                            "plan_contract_verify",
+                            ("workspace_path", "review_context", "task_short_id")
+                            + delivery_fields
+                            + digest_fields,
+                        ),
+                    ):
+                        key = f"{source}_resume_{route}"
+                        edge = edges[key]
+                        self.assertEqual(edge.source, source)
+                        self.assertEqual(edge.target, target)
+                        self.assertEqual(
+                            edge.transition,
+                            f"{source}_resume_{route}",
+                        )
+                        self.assertEqual(
+                            tuple(parameter.key for parameter in edge.parameters),
+                            fields,
+                        )
+                        self.assertFalse(edge.requires_approval)
+                        checked = (
+                            "plan_contract_checked_continue"
+                            if route == "continue"
+                            else "plan_contract_checked_verify"
+                        )
+                        self.assertEqual(
+                            edges[checked].target,
+                            "implement" if route == "continue"
+                            else "verification_dispatch",
+                        )
+                        self.assertEqual(
+                            edges[f"plan_contract_{route}_revalidate"].target,
+                            "plan_revalidation",
+                        )
+                if profile.writer_session_policy() == "fresh_per_slice":
+                    for source in ("plan_review", "plan_revalidation"):
+                        edge = edges[f"{source}_resume_fix_continue"]
+                        self.assertEqual(edge.source, source)
+                        self.assertEqual(
+                            edge.target, "plan_contract_fix_continue",
+                        )
+                        self.assertEqual(
+                            tuple(parameter.key for parameter in edge.parameters),
+                            ("workspace_path", "fix_context", "task_short_id")
+                            + delivery_fields
+                            + digest_fields,
+                        )
+                        self.assertFalse(edge.requires_approval)
+                        self.assertEqual(
+                            edges["plan_contract_checked_fix"].target,
+                            "fix",
+                        )
+                        self.assertEqual(
+                            edges["plan_contract_fix_revalidate"].target,
+                            "plan_revalidation",
+                        )
+                    self.assertIn(
+                        "plan_revalidation_resume_fix_continue",
+                        " ".join(plan_revalidation_prompt(
+                            profile, from_review=False,
+                        ).split()),
+                    )
+                else:
+                    self.assertNotIn("plan_contract_fix_continue", {
+                        node.key for node in spec.nodes
+                    })
+                    self.assertNotIn("plan_review_resume_fix_continue", edges)
+                    self.assertNotIn(
+                        "plan_revalidation_resume_fix_continue", edges,
+                    )
+
+                review_prompt = " ".join(plan_review_prompt(profile).split())
+                revalidation_prompt = " ".join(
+                    plan_revalidation_prompt(
+                        profile, from_review=False,
+                    ).split()
+                )
+                for prompt in (review_prompt, revalidation_prompt):
+                    self.assertIn("exact previously accepted contract", prompt)
+                    self.assertIn("prior independent PASS review", prompt)
+                    self.assertIn("no new findings", prompt)
+                    self.assertIn("authority/milestone", prompt)
+                    self.assertIn("existing Plan Contract guard", prompt)
+                    self.assertIn("cannot accept or continue a changed contract", prompt)
+                self.assertIn("fresh review result in `review_context`", review_prompt)
+                self.assertIn("negative review finding remains unresolved", revalidation_prompt)
+                self.assertEqual(edges["plan_review_accept"].target, "plan_contract")
+
 
     def test_delivery_preserves_continuous_writer_compatibility(self) -> None:
         profile = self.load_profile(
@@ -4591,6 +4735,9 @@ class WorkflowKitTest(unittest.TestCase):
         root_key_values = {
             "kit_managed_commands": 'kit_managed_commands = []\n',
             "command_versions": "[command_versions]\ndispatch = \"1.0.0\"\n",
+            "ci_archive_reader_sources": (
+                'ci_archive_reader_sources = ["src/evidence_reader.py"]\n'
+            ),
             "release": (
                 "[release]\n"
                 'topology_kind = "appsome-release-publication"\n'
@@ -4611,6 +4758,42 @@ class WorkflowKitTest(unittest.TestCase):
                     "schema 3 does not support root keys",
                 ):
                     self.load_profile(add_root_key)
+
+    def test_schema_four_ci_archive_reader_sources_are_closed_and_bounded(
+        self,
+    ) -> None:
+        profile = self.load_schema4_profile(
+            lambda contents: contents.replace(
+                "schema_version = 4\n",
+                'schema_version = 4\nci_archive_reader_sources = '
+                '["src/evidence_reader.py", "tools/plan_reader.py"]\n',
+            )
+        )
+        self.assertEqual(
+            profile.ci_archive_reader_sources,
+            ("src/evidence_reader.py", "tools/plan_reader.py"),
+        )
+
+        invalid_values = (
+            '["src/../reader.py"]',
+            '["/absolute/reader.py"]',
+            '["src/*.py"]',
+            '["src\\\\reader.py"]',
+            '["src/reader.py", "src/reader.py"]',
+            '[""]',
+        )
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaisesRegex(
+                SpecError,
+                "ci_archive_reader_sources",
+            ):
+                self.load_schema4_profile(
+                    lambda contents, value=value: contents.replace(
+                        "schema_version = 4\n",
+                        "schema_version = 4\n"
+                        f"ci_archive_reader_sources = {value}\n",
+                    )
+                )
 
     def test_schema_four_accepts_release_profile_and_disables_legacy_publish(
         self,
@@ -4831,6 +5014,38 @@ class WorkflowKitTest(unittest.TestCase):
                 )
             )
 
+    def test_schema_four_runtime_and_source_ci_current_family_versions(self) -> None:
+        contents = self.source_ci_profile_contents().replace(
+            "[policies]\n",
+            '[policies]\ndelivery_reliability = "v1"\n',
+        )
+        for old, new in (
+            ('runtime_contracts = "2.0.0"', 'runtime_contracts = "2.1.0"'),
+            ('evidence = "2.0.0"', 'evidence = "2.1.0"'),
+            ('janitor = "2.0.0"', 'janitor = "3.0.0"'),
+            ('wait_pr = "3.0.0"', 'wait_pr = "4.0.0"'),
+            ('wait_ci = "3.0.0"', 'wait_ci = "4.0.0"'),
+            ('prepare_ci = "2.0.0"', 'prepare_ci = "3.0.0"'),
+        ):
+            contents = contents.replace(old, new)
+
+        profile = self.load_schema4_profile(lambda _: contents)
+        self.assertTrue(profile.runtime_contracts_v2_1())
+        self.assertTrue(profile.source_ci_contract_v3())
+        self.assertEqual(profile.delivery_reliability_policy(), "v1")
+        loader = SourceFileLoader(
+            "sync_project_adapters_current_family_test",
+            str(REPO_ROOT / "scripts/sync-project-adapters"),
+        )
+        module_spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.assertIsNotNone(module_spec)
+        if module_spec is None:
+            raise AssertionError("could not load the adapter synchronizer")
+        synchronizer = importlib.util.module_from_spec(module_spec)
+        sys.modules[loader.name] = synchronizer
+        loader.exec_module(synchronizer)
+        synchronizer.validate_schema4_command_versions(profile)
+
     def test_source_ci_contract_adds_preparation_and_distinct_cycle_edges(
         self,
     ) -> None:
@@ -5039,6 +5254,7 @@ class WorkflowKitTest(unittest.TestCase):
                 "merge_strategy",
                 "merge_report",
                 "pr_feedback_cursor",
+                "pr_base_branch",
             ),
         )
         for key in flat_observation_edges:
@@ -5988,8 +6204,17 @@ class WorkflowKitTest(unittest.TestCase):
     def test_sync_schema4_runtime_v2_copies_byte_identical_support_module(
         self,
     ) -> None:
+        contents = self.schema4_runtime_v2_contents()
+        for old, new in (
+            ('runtime_contracts = "2.0.0"', 'runtime_contracts = "2.1.0"'),
+            ('evidence = "2.0.0"', 'evidence = "2.1.0"'),
+            ('janitor = "2.0.0"', 'janitor = "3.0.0"'),
+            ('wait_pr = "3.0.0"', 'wait_pr = "4.0.0"'),
+            ('wait_ci = "3.0.0"', 'wait_ci = "4.0.0"'),
+        ):
+            contents = contents.replace(old, new)
         root, profile = self.create_schema4_sync_project(
-            lambda _: self.schema4_runtime_v2_contents()
+            lambda _: contents
         )
         result = self.run_sync_project_adapters(root)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -6153,7 +6378,7 @@ class WorkflowKitTest(unittest.TestCase):
                 )
                 .replace(
                     'dispatch = "1.0.0"\n',
-                    'dispatch = "1.0.0"\nwait_pr = "3.0.0"\n',
+                    'dispatch = "1.0.0"\nwait_pr = "4.0.0"\n',
                 )
                 .replace(
                     'wait_pr = ".kent/scripts/workflow-wait-github-pr"',

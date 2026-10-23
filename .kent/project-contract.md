@@ -37,6 +37,15 @@ later acceptance work with its responsible owner and milestone. Gate does
 not relabel old BLOCKED evidence after authority changes. Review-ready
 delivery is not final business acceptance, merge, release or Task Done.
 
+The current schema-3 Kit profile explicitly opts into delivery reliability v1.
+Its generated graph uses delivery-context-v2 post-PR packets with the exact
+observed `pr_base_branch`; fresh PR observations compare GitHub `baseRefName`
+before success, merge or Cleanup. This profile has CI monitoring disabled, so
+it does not acquire source-CI recovery routes. Schema-4 profiles using current
+runtime/prepare-CI versions select the typed source-CI v3 failure diagnostic
+and its two existing CI-monitor recovery routes; older profile families keep
+their declared v1 context and legacy source-CI carriers.
+
 Generated commands come from checkout-local authoritative templates/modules.
 The builder preflights the entire closed copy set before materialization.
 Do not patch generated copies or overwrite modified, symlink or unknown
@@ -49,6 +58,9 @@ Source generation does not authorize activation or change a live Workflow.
 Same-UUID adoption requires the shared
 [compatibility contract](../contracts/workflow-update-compatibility.md).
 The published renderer accepts only qualified `VerifiedSourceAdmission`.
+The source-CI archive boundary uses the explicit Script archive interface and
+the current profile/native graph selectors; project reader paths are bounded
+static inputs, not caller-supplied graph or deployment proof.
 
 ## Verification and evidence
 

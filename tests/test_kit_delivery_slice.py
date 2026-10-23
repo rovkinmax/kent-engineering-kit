@@ -451,7 +451,7 @@ class CurrentKitGraphTest(unittest.TestCase):
                     (len(graph.nodes),
                      len({(edge.source, edge.transition) for edge in graph.edges}),
                      len(graph.edges)),
-                    (21, 56, 57) if complexity else (21, 55, 56),
+                    (21, 60, 61) if complexity else (21, 59, 60),
                 )
                 route = edges["implement_replan"]
                 self.assertEqual(
@@ -463,6 +463,35 @@ class CurrentKitGraphTest(unittest.TestCase):
                 self.assertTrue(edges["plan_review_accept"].requires_approval)
                 self.assertFalse(edges["prepare_pr_fix"].requires_approval)
                 self.assertFalse(edges["waiting_pr_fix"].requires_approval)
+                pr_target_fields = {
+                    "pr_url",
+                    "branch_name",
+                    "pr_report",
+                    "merge_report",
+                    "pr_feedback_cursor",
+                    "pr_head_oid",
+                    "pr_base_oid",
+                    "ci_contract",
+                    "ci_report",
+                    "publication_report",
+                }
+                for edge in graph.edges:
+                    fields = {parameter.key for parameter in edge.parameters}
+                    if edge.key != "prepare_pr_no_pr" and fields & pr_target_fields:
+                        with self.subTest(complexity=complexity, edge=edge.key):
+                            self.assertIn("pr_base_branch", fields)
+                self.assertNotIn(
+                    "pr_base_branch",
+                    {parameter.key for parameter in edges["prepare_pr_no_pr"].parameters},
+                )
+                self.assertNotIn(
+                    "ci_monitor_retry_preparation",
+                    {edge.key for edge in graph.edges},
+                )
+                self.assertNotIn(
+                    "ci_monitor_preparation_needs_user_action",
+                    {edge.key for edge in graph.edges},
+                )
                 for node in graph.nodes:
                     if node.kind == "agent":
                         self.assertEqual(node.completion_mode, "shell_command")

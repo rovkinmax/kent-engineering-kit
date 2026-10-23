@@ -99,7 +99,8 @@ Canonical keys:
 - `verification_status`, `standards_status`, `spec_status`;
 - `smoke_report`, `smoke_rationale`, `smoke_scope`, `blocker_reason`;
 - `pr_url`, `branch_name`, `merge_strategy`, `pr_report`, `ci_report`,
-  `ci_contract`, `delivery_context`, `merge_report`, `publication_report`;
+  `ci_contract`, `delivery_context`, `merge_report`, `publication_report`,
+  `pr_base_branch`, `ci_preparation_diagnostic`;
 - `closure_reason`, `cleanup_report`, `evidence_context`, `pr_head_oid`,
   `pr_base_oid`, `cleanup_mode`, `cleanup_session_id`.
 
@@ -109,10 +110,18 @@ fields. Prompts may not require undeclared outputs.
 ## Delivery continuity
 
 Enabled profiles preserve `delivery_context` as a compact closed
-`workflow-delivery-context-v1` JSON string. Pre-PR contains `schema` and
-`phase=pre_pr`; post-PR adds observed `pr_url`, `branch_name`, `merge_strategy`,
+`workflow-delivery-context-v1` or `workflow-delivery-context-v2` JSON string.
+Legacy profiles keep v1 bytes unchanged. Current target-family profiles use
+v2: pre-PR contains `schema` and `phase=pre_pr`; post-PR adds observed
+`pr_url`, `branch_name`, exact `pr_base_branch`, `merge_strategy`,
 `pr_feedback_cursor`, and only actually produced `ci_contract`/`ci_report`.
-There is no task ID in this packet.
+There is no task ID in this packet. `pr_base_branch` is the exact GitHub
+`baseRefName`, not the task branch or an inferred default. Re-observe and
+compare it before reporting PR success, merge, publication or cleanup. A
+target change requires applicable existing owner authority and fresh PR
+observation. When authorized, `post_pr_target_revalidated` changes only the
+target in the v2 packet and preserves CI packet bytes and retry state; it adds
+no graph edge or authority.
 
 Preserve nested producer packet strings byte-for-byte. Plan initializes
 pre-PR; acceptance excludes transport from the plan digest. Plan/branch/writer/
@@ -121,6 +130,19 @@ Gate uses current dispatch-scoped delivery state, not historical verifier
 outputs. Source-CI entries unwrap the declared packet into their deterministic
 watcher contract; profiles without source CI retain their flat observation
 inputs. Merge/publication/Cleanup use their declared result contracts.
+
+Source-CI v3 requires the current `prepare_ci` contract and a freshly observed
+native Script Task/Workflow graph. Its `ci_prepare_failed` carrier is exactly
+`workspace_path`, `task_short_id`, and `ci_preparation_diagnostic`. The
+existing CI monitor adds only `retry_preparation` with
+`workspace_path`, `task_short_id`, and `delivery_context`, plus
+`preparation_needs_user_action` with
+`workspace_path`, `task_short_id`, `ci_preparation_diagnostic`, and
+`blocker_reason`; the latter retains its approval and self-recovery semantics.
+These are existing-node routes. CI-off profiles receive neither route.
+Legacy source-CI profiles retain their declared legacy carrier and routes.
+Protocol selectors derive from current profile plus freshly observed native
+graph, never caller-supplied graph data.
 
 Producer packets are opaque and reconstructed through qualified helpers,
 never retyped from narrative. Agent-owned context may be synthesized in the
@@ -270,7 +292,9 @@ Deterministic watchers observe checks/feedback/head/base/method together and
 wake only for material changes. Pending state is not user action. A confirmed
 merge goes to Cleanup, including exposed `pr_merged` recovery from stale Fix;
 never repair on the delivered branch for a late check. Exact PR/branch/merge
-proof remains required.
+proof remains required. With target-family continuity enabled, every fresh
+PR read must also match the carried `pr_base_branch`; a missing or changed
+target is not success evidence.
 
 Same-repository completed issues use the provider's closing reference.
 Cross-repository/partial/follow-up links do not claim closure.

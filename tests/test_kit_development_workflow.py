@@ -103,6 +103,11 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
             "agents/ci-monitor.md": (
                 "first read the installed `kent-engineering-kit` skill's `SKILL.md`",
                 "block only the dependent action",
+                "complete transitive dependent-job closure",
+                "source-qualified job",
+                "effect-label set",
+                "do not infer effects from job names",
+                "Do not invent a rerun endpoint",
                 "only this node's own required evidence",
                 "qualified configured evidence adapter",
                 "genuine current Task/Node/Session/Step identity",
@@ -133,6 +138,8 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
                 "Do not perform Source-Fix repairs or reproducer/checkpoint duties in that node",
                 "does not create or update a Fix checkpoint",
                 "metadata correction creates no Fix checkpoint",
+                "final edited state", "original valid reproducer",
+                "Reuse an existing failing test", "unavailable check remains unverified",
             ),
             "agents/delivery-operator.md": (
                 "first read the installed `kent-engineering-kit` skill's `SKILL.md`",
@@ -141,10 +148,6 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
             "agents/build-doctor.md": (
                 "exact authorized reproducer", "bounded read-only diagnosis",
                 "cause unconfirmed", "grant no installation",
-            ),
-            "agents/fix-worker.md": (
-                "final edited state", "original valid reproducer",
-                "Reuse an existing failing test", "unavailable check remains unverified",
             ),
             "prompts/tdd-slice.md": (
                 "not an unrelated setup", "missing new public symbol",
@@ -1503,7 +1506,8 @@ class CleanupPreparationTest(unittest.TestCase):
         report = "Fixture retained authority\n" + json.loads(sealed.stdout)["terminal_marker"]
         result = self.admission(root, report)
         self.assertFalse(result[0], result)
-        self.assertIn("plan-contract.json", result[1])
+        self.assertIn("unknown_runtime_entry", result[1])
+        self.assertNotIn("plan-contract.json", result[1])
         self.assertTrue((root / ".kent/runtime/TASK-1").exists())
         self.assertEqual(source.read_bytes(), expected)
         tombstones = list((root / ".kent/runtime").glob(".evidence-cleanup-*"))
