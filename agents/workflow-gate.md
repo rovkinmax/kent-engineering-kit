@@ -65,6 +65,11 @@ disabled.
 - Preserve project-owned `review_context` envelopes via their qualified route.
   Synthesize bounded context and durable report references as allowed; do not
   impose Markdown or copy every report indiscriminately.
+- Preserve the exact declared `delivery_context` version and bytes across
+  retries. For v2 target-family continuity, keep the observed `pr_base_branch`
+  unchanged unless applicable existing owner authority permits a freshly
+  observed retarget. The `post_pr_target_revalidated` packer changes only that
+  target; it cannot alter CI packet bytes or replenish retry budget.
 - Producer-owned packets remain opaque. Use configured reconstruction/packing;
   missing or conflicting proof is a transport failure, not a product finding
   or evidence the underlying check passed.

@@ -27,6 +27,21 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 CHECKBOX = re.compile(
     r"^(\s*(?:(?:[-*+]|\d+[.)])\s+|#{1,6}\s+)\[)[ xX](\])"
 )
+OPERATIONAL_CHECKBOX = re.compile(
+    r"^( {0,3}(?:[-*+]|\d+[.)]|#{1,6}) {1,4}\[)([ xX])(\])"
+)
+FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE_CLOSE = re.compile(r"^ {0,3}(`+|~+)[ \t]*$")
+HTML_BLOCK_TAG = re.compile(
+    r"^ {0,3}</?(?:address|article|aside|base|basefont|blockquote|body|caption|"
+    r"center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|"
+    r"figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|"
+    r"legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|"
+    r"p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|"
+    r"tr|track|ul)(?:[ \t/>]|$)",
+    re.IGNORECASE,
+)
+HTML_STANDALONE_TAG = re.compile(r"^ {0,3}</?[A-Za-z][^\r\n]*>[ \t]*$")
 MODES = {"accept", "check"}
 ROUTES = {"start", "continue", "verify", "fix_continue"}
 ROUTE_CONTEXT_DEFAULT = "not-applicable"
@@ -255,6 +270,227 @@ def inspection_normalized_plan(raw: bytes) -> str:
     while lines and not lines[-1]:
         lines.pop()
     return "\n".join(lines) + "\n"
+
+
+def inspection_markdown_lines(text: str) -> list[str]:
+    """Split only on CommonMark line endings, retaining their original bytes."""
+    lines: list[str] = []
+    start = 0
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] == "\r":
+            end = cursor + 1
+            if end < len(text) and text[end] == "\n":
+                end += 1
+            lines.append(text[start:end])
+            start = end
+            cursor = end
+        elif text[cursor] == "\n":
+            end = cursor + 1
+            lines.append(text[start:end])
+            start = end
+            cursor = end
+        else:
+            cursor += 1
+    if start < len(text):
+        lines.append(text[start:])
+    return lines
+
+
+def inspection_raw_comparison(accepted: bytes, working: bytes) -> str:
+    """Compare immutable plan bytes without normalizing literals or whitespace."""
+    if accepted == working:
+        return "exact"
+    try:
+        left = accepted.decode("utf-8")
+        right = working.decode("utf-8")
+    except UnicodeError:
+        return "changed"
+
+    def operational_positions(text: str) -> dict[int, int]:
+        rows = inspection_markdown_lines(text)
+        bodies = [row.rstrip("\r\n") for row in rows]
+        offsets: list[int] = []
+        total = 0
+        for row in rows:
+            offsets.append(total)
+            total += len(row)
+
+        blocked: set[int] = set()
+        fence_state: tuple[str, int] | None = None
+        html_end: str | None = None
+        html_until_blank = False
+        directive = False
+        frontmatter = False
+        frontmatter_candidate = True
+        for row_number, body in enumerate(bodies):
+            if fence_state is not None:
+                blocked.add(row_number)
+                close = FENCE_CLOSE.match(body)
+                if (close and close.group(1)[0] == fence_state[0]
+                        and len(close.group(1)) >= fence_state[1]):
+                    fence_state = None
+                continue
+            opener = FENCE_OPEN.match(body)
+            if opener is not None:
+                blocked.add(row_number)
+                if not (opener.group(1)[0] == "`" and "`" in opener.group(2)):
+                    fence_state = (opener.group(1)[0], len(opener.group(1)))
+                continue
+
+            if directive:
+                blocked.add(row_number)
+                if re.match(r"^ {0,3}:::+[ \t]*$", body):
+                    directive = False
+                continue
+            if re.match(r"^ {0,3}:::+(?:[ \t]+.*)?$", body):
+                blocked.add(row_number)
+                directive = True
+                continue
+            if frontmatter:
+                blocked.add(row_number)
+                if body.strip() in {"---", "..."}:
+                    frontmatter = False
+                continue
+            if frontmatter_candidate and not body.strip():
+                continue
+            if frontmatter_candidate:
+                frontmatter_candidate = False
+                if body.strip() == "---":
+                    blocked.add(row_number)
+                    frontmatter = True
+                    continue
+
+            leading = len(body) - len(body.lstrip(" "))
+            if leading >= 4 or body.startswith("\t"):
+                blocked.add(row_number)
+                continue
+            if html_end is not None:
+                blocked.add(row_number)
+                if html_end.lower() in body.lower():
+                    html_end = None
+                continue
+            if html_until_blank:
+                blocked.add(row_number)
+                if not body.strip():
+                    html_until_blank = False
+                continue
+
+            start = body.lstrip(" ")
+            if "<!--" in body:
+                blocked.add(row_number)
+                comment_start = body.index("<!--") + len("<!--")
+                if "-->" not in body[comment_start:]:
+                    html_end = "-->"
+                continue
+            raw_html = re.match(
+                r"^ {0,3}<(script|style|pre|textarea)\b", body, re.IGNORECASE,
+            )
+            if raw_html is not None:
+                blocked.add(row_number)
+                closing = f"</{raw_html.group(1)}"
+                if closing.lower() not in body.lower():
+                    html_end = closing
+                continue
+            if "<![CDATA[" in body:
+                blocked.add(row_number)
+                cdata_start = body.index("<![CDATA[") + len("<![CDATA[")
+                if "]]>" not in body[cdata_start:]:
+                    html_end = "]]>"
+            elif "<?" in body:
+                blocked.add(row_number)
+                instruction_start = body.index("<?") + 2
+                if "?>" not in body[instruction_start:]:
+                    html_end = "?>"
+            elif re.search(r"<![A-Z]", body):
+                blocked.add(row_number)
+                declaration_start = body.index("<!") + 2
+                if ">" not in body[declaration_start:]:
+                    html_end = ">"
+            elif HTML_BLOCK_TAG.match(body):
+                blocked.add(row_number)
+                html_until_blank = True
+            elif HTML_STANDALONE_TAG.match(body):
+                # Type 7 HTML blocks permit any complete standalone tag name.
+                blocked.add(row_number)
+                html_until_blank = True
+
+        code_spans: list[tuple[int, int]] = []
+        delimiters: list[tuple[int, int, int, int]] = []
+        paragraph = 0
+        for row_number, body in enumerate(bodies):
+            if row_number in blocked or not body.strip():
+                paragraph += 1
+                continue
+            for marker in re.finditer(r"`+", body):
+                slash_count = 0
+                previous = marker.start() - 1
+                while previous >= 0 and body[previous] == "\\":
+                    slash_count += 1
+                    previous -= 1
+                if slash_count % 2 == 0:
+                    delimiters.append((
+                        offsets[row_number] + marker.start(), len(marker.group()),
+                        row_number, paragraph,
+                    ))
+
+        next_same: list[int | None] = [None] * len(delimiters)
+        next_by_width: dict[tuple[int, int], int] = {}
+        for delimiter_index in range(len(delimiters) - 1, -1, -1):
+            _, width, _, paragraph = delimiters[delimiter_index]
+            key = (paragraph, width)
+            next_same[delimiter_index] = next_by_width.get(key)
+            next_by_width[key] = delimiter_index
+        cursor = 0
+        while cursor < len(delimiters):
+            closing = next_same[cursor]
+            if closing is None:
+                cursor += 1
+            else:
+                begin, width, _, _ = delimiters[cursor]
+                code_spans.append((begin, delimiters[closing][0] + width))
+                cursor = closing + 1
+
+        result: dict[int, int] = {}
+        span_index = 0
+        for row_number, body in enumerate(bodies):
+            if row_number in blocked:
+                continue
+            marker = OPERATIONAL_CHECKBOX.match(body)
+            if marker is None:
+                continue
+            status_position = offsets[row_number] + marker.start(2)
+            while (span_index < len(code_spans)
+                   and code_spans[span_index][1] <= status_position):
+                span_index += 1
+            if (span_index < len(code_spans)
+                    and code_spans[span_index][0] <= status_position
+                    < code_spans[span_index][1]):
+                continue
+            result[row_number] = marker.start(2)
+        return result
+
+    left_rows = inspection_markdown_lines(left)
+    right_rows = inspection_markdown_lines(right)
+    if len(left_rows) != len(right_rows):
+        return "changed"
+    left_positions = operational_positions(left)
+    right_positions = operational_positions(right)
+    progressed = False
+    for row_number, (before, after) in enumerate(zip(left_rows, right_rows)):
+        if before == after:
+            continue
+        before_position = left_positions.get(row_number)
+        after_position = right_positions.get(row_number)
+        if (before_position is None or before_position != after_position
+                or len(before) != len(after)
+                or before[before_position] not in " xX"
+                or after[after_position] not in " xX"
+                or before[:before_position] + before[before_position + 1:]
+                != after[:after_position] + after[after_position + 1:]):
+            return "changed"
+        progressed = True
+    return "checkbox_progress" if progressed else "changed"
 
 
 def inspection_project_memory_mode(root: Path) -> str:
@@ -562,6 +798,18 @@ def inspection_legacy_plan(
             ).hexdigest() != snapshot["normalized_sha256"]
         ):
             raise ValueError("accepted plan snapshot identity or digest is invalid")
+        accepted_raw = snapshot.get("raw_plan")
+        accepted_raw_sha256 = snapshot.get("raw_sha256")
+        if accepted_raw is not None or accepted_raw_sha256 is not None:
+            if (
+                not isinstance(accepted_raw, str)
+                or not isinstance(accepted_raw_sha256, str)
+                or hashlib.sha256(accepted_raw.encode("utf-8")).hexdigest()
+                != accepted_raw_sha256
+                or inspection_normalized_plan(accepted_raw.encode("utf-8"))
+                != snapshot["normalized_plan"]
+            ):
+                raise ValueError("accepted raw plan snapshot identity or digest is invalid")
         if coder_selection_policy(root) == "complexity":
             selection = validate_coder_selection(snapshot.get("coder_selection"), task)
             if snapshot.get("coder_selection_sha256") != snapshot["normalized_sha256"]:
@@ -574,11 +822,26 @@ def inspection_legacy_plan(
             "snapshot_path": str(snapshot_path),
             "snapshot_sha256": hashlib.sha256(snapshot_raw).hexdigest(),
         }
-        comparison = (
-            "unchanged"
-            if accepted["normalized_sha256"] == working["normalized_sha256"]
-            else "changed"
-        )
+        if isinstance(accepted_raw, str):
+            accepted["raw_sha256"] = accepted_raw_sha256
+            raw_comparison = inspection_raw_comparison(
+                accepted_raw.encode("utf-8"), raw,
+            )
+            comparison = (
+                "unchanged"
+                if accepted["normalized_sha256"] == working["normalized_sha256"]
+                and raw_comparison in {"exact", "checkbox_progress"}
+                else "changed"
+            )
+        else:
+            comparison = "unknown"
+            unresolved.append({
+                "locator": str(snapshot_path),
+                "reason": (
+                    "original legacy raw plan bytes are unavailable; "
+                    "normalized text cannot establish an unchanged contract"
+                ),
+            })
         return accepted, working, comparison
     except FileNotFoundError:
         unresolved.append({
@@ -608,6 +871,11 @@ def inspection_r2_plan(
         resolved = memory_call(root, native_payload, "resolve-plan", plan_path=plan_path)
         if (
             not isinstance(resolved.get("supplied_revision"), str)
+            or not isinstance(resolved.get("supplied_sha256"), str)
+            or not SHA256.fullmatch(resolved["supplied_sha256"])
+            or resolved.get("supplied_comparison") not in {
+                "exact", "checkbox_progress", "changed",
+            }
             or not isinstance(resolved.get("working_revision"), str)
             or not isinstance(resolved.get("working_path"), str)
             or not isinstance(resolved.get("working_sha256"), str)
@@ -625,6 +893,9 @@ def inspection_r2_plan(
         if (
             not isinstance(accepted_source, dict)
             or checked.get("comparison") not in {"unchanged", "changed"}
+            or checked.get("raw_comparison") not in {
+                "exact", "checkbox_progress", "changed",
+            }
             or not isinstance(checked.get("accepted_snapshot"), str)
             or not isinstance(checked.get("accepted_path"), str)
         ):
@@ -632,11 +903,14 @@ def inspection_r2_plan(
         accepted = {
             "revision": accepted_source.get("revision_token"),
             "normalized_sha256": accepted_source.get("normalized_sha256"),
+            "raw_sha256": accepted_source.get("raw_sha256"),
             "snapshot_path": checked["accepted_path"],
             "snapshot_sha256": checked["accepted_snapshot"],
         }
         working = {
             "supplied_revision": resolved["supplied_revision"],
+            "supplied_sha256": resolved["supplied_sha256"],
+            "supplied_comparison": resolved["supplied_comparison"],
             "revision": resolved["working_revision"],
             "plan_path": resolved["working_path"],
             "raw_sha256": resolved["working_sha256"],
@@ -646,7 +920,13 @@ def inspection_r2_plan(
             source_locator=checked["accepted_path"],
             candidates=candidates, unresolved=unresolved,
         )
-        return accepted, working, checked["comparison"]
+        comparison = (
+            "unchanged"
+            if checked["comparison"] == "unchanged"
+            and resolved["supplied_comparison"] in {"exact", "checkbox_progress"}
+            else "changed"
+        )
+        return accepted, working, comparison
     except (OSError, ValueError, KeyError, TypeError) as error:
         unresolved.append({
             "locator": plan_path,
@@ -1427,6 +1707,17 @@ def load_snapshot(
         raise ValueError(
             "accepted plan snapshot normalized_plan digest is invalid"
         )
+    raw_plan = payload.get("raw_plan")
+    raw_sha256 = payload.get("raw_sha256")
+    if raw_plan is not None or raw_sha256 is not None:
+        if not isinstance(raw_plan, str) or not isinstance(raw_sha256, str):
+            raise ValueError("accepted raw plan snapshot is incomplete")
+        raw = raw_plan.encode("utf-8")
+        if (len(raw) > MAX_INSPECTION_FILE_BYTES
+                or not SHA256.fullmatch(raw_sha256)
+                or hashlib.sha256(raw).hexdigest() != raw_sha256
+                or inspection_normalized_plan(raw) != normalized):
+            raise ValueError("accepted raw plan snapshot identity or digest is invalid")
     if require_coder_selection:
         selection = validate_coder_selection(payload.get("coder_selection"), task)
         selection_digest = require_sha256(
@@ -1450,9 +1741,18 @@ def write_snapshot(
     work_kind: str,
     normalized: str,
     digest: str,
+    raw_plan: bytes,
     coder_selection: dict[str, str] | None,
 ) -> None:
     ensure_safe_directory(path.parent, root, create=True)
+    if len(raw_plan) > MAX_INSPECTION_FILE_BYTES:
+        raise ValueError("accepted raw plan exceeds the inspection size limit")
+    try:
+        raw_text = raw_plan.decode("utf-8")
+    except UnicodeError as error:
+        raise ValueError("accepted raw plan is not valid UTF-8") from error
+    if inspection_normalized_plan(raw_plan) != normalized:
+        raise ValueError("accepted raw plan does not match its normalized snapshot")
     payload = {
         "schema_version": 1,
         "task_short_id": task,
@@ -1460,6 +1760,8 @@ def write_snapshot(
         "work_kind": work_kind,
         "normalized_sha256": digest,
         "normalized_plan": normalized,
+        "raw_sha256": hashlib.sha256(raw_plan).hexdigest(),
+        "raw_plan": raw_text,
     }
     if coder_selection is not None:
         payload["coder_selection"] = coder_selection
@@ -1616,6 +1918,7 @@ def execute(payload: dict[str, object]) -> int:
     memory_mode = False
     memory_accepted = None
     memory_head = None
+    memory_status = None
     project_memory_mode = inspection_project_memory_mode(workspace)
     if project_memory_mode == "unknown":
         raise ValueError(
@@ -1628,12 +1931,23 @@ def execute(payload: dict[str, object]) -> int:
         memory_mode = admission["mode"] == "r2"
     if memory_mode:
         memory_head = memory_call(workspace, payload, "accepted-head")["accepted_snapshot"]
+        if memory_head is None and os.path.lexists(snapshot_path):
+            raise ValueError(
+                "R2 accepted plan head is missing while a local cache exists; "
+                "preserving the conflicting cache"
+            )
         if memory_head is not None:
             status = memory_call(workspace, payload, "check-plan", coder_selection=None)
+            if (status.get("accepted_snapshot") != memory_head
+                    or status.get("raw_comparison") not in {
+                        "exact", "checkbox_progress", "changed",
+                    }):
+                raise ValueError("R2 accepted plan readback differs from its accepted head")
             if snapshot_path.exists() or snapshot_path.is_symlink():
                 cache = inspection_json(inspection_read_file(
                     snapshot_path, root=workspace, max_bytes=65536), "plan locator")
                 validate_memory_cache(cache, status, task)
+            memory_status = status
             memory_accepted = memory_snapshot_projection(status, task)
 
     if mode == "accept":
@@ -1667,33 +1981,62 @@ def execute(payload: dict[str, object]) -> int:
         raise ValueError(f"unsupported plan_route: {route!r}")
 
     memory_revision = None
+    resolved = None
     report_only = configured_plan == "not-applicable"
     if memory_mode:
         if mode == "accept" and report_only and memory_head is None:
             require_open_plan_acceptance(workspace, task)
             memory_call(workspace, payload, "prepare-report-only", provenance=[])
         resolved = memory_call(workspace, payload, "resolve-plan", plan_path=configured_plan)
+        supplied_revision = require_sha256(
+            resolved.get("supplied_revision"), "supplied plan revision",
+        )
+        supplied_sha256 = require_sha256(
+            resolved.get("supplied_sha256"), "supplied plan raw digest",
+        )
+        supplied_comparison = resolved.get("supplied_comparison")
+        if supplied_comparison not in {"exact", "checkbox_progress", "changed"}:
+            raise ValueError("R2 resolver returned an invalid supplied-plan comparison")
         plan = Path(require_string(resolved, "working_path"))
         if not report_only:
             configured_plan = str(plan)
         portable_plan_path = configured_plan
-        memory_revision = require_string(resolved, "working_revision")
-        raw = inspection_read_file(plan, root=None, max_bytes=MAX_INSPECTION_FILE_BYTES)
-        if hashlib.sha256(raw).hexdigest() != resolved["working_sha256"]:
+        memory_revision = require_sha256(
+            resolved.get("working_revision"), "working plan revision",
+        )
+        raw_plan = inspection_read_file(plan, root=None, max_bytes=MAX_INSPECTION_FILE_BYTES)
+        working_sha256 = require_sha256(
+            resolved.get("working_sha256"), "working plan raw digest",
+        )
+        if hashlib.sha256(raw_plan).hexdigest() != working_sha256:
             raise ValueError("working memory plan bytes changed")
+        if (supplied_comparison == "exact" and supplied_sha256 != working_sha256
+                or supplied_comparison == "checkbox_progress"
+                and supplied_sha256 == working_sha256):
+            raise ValueError("R2 supplied-plan comparison conflicts with its raw digests")
+        if mode == "check" and memory_status is not None and (
+                memory_status.get("working_revision") != memory_revision
+                or memory_status.get("working_sha256") != working_sha256):
+            raise ValueError("R2 working plan changed during contract inspection")
     else:
         plan, portable_plan_path = plan_file(workspace, configured_plan)
-    normalized = normalized_plan(plan)
+        raw_plan = (
+            "not-applicable\n".encode("utf-8") if plan is None
+            else inspection_read_file(
+                plan, root=workspace, max_bytes=MAX_INSPECTION_FILE_BYTES,
+            )
+        )
+    normalized = inspection_normalized_plan(raw_plan)
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
     if mode == "accept":
         selection = None
+        prior_digest: str | None = None
         if selection_policy == "complexity":
             accepted_plan_sha256 = require_string(
                 payload,
                 "accepted_plan_sha256",
             )
-            prior_digest: str | None = None
             if memory_accepted is not None or (
                     not memory_mode and (snapshot_path.exists() or snapshot_path.is_symlink())):
                 prior_snapshot = memory_accepted if memory_mode else load_snapshot(
@@ -1787,6 +2130,26 @@ def execute(payload: dict[str, object]) -> int:
                         accepted_plan_sha256=prior_digest or NOT_APPLICABLE,
                     )
                     return 0
+        if memory_mode and supplied_comparison == "changed":
+            fields: dict[str, str] = {}
+            if selection_policy == "complexity":
+                fields["accepted_plan_sha256"] = prior_digest or NOT_APPLICABLE
+            complete_accept_revalidation(
+                workspace=workspace,
+                plan_path=configured_plan,
+                work_kind=work_kind,
+                review_context=review_context,
+                route=route,
+                route_context=route_context,
+                task=task,
+                delivery_context=delivery_context,
+                reason=(
+                    "The reviewed immutable raw plan subject differs from the "
+                    "working revision; reconcile it before acceptance."
+                ),
+                **fields,
+            )
+            return 0
         if memory_mode:
             require_open_plan_acceptance(workspace, task)
             references = acceptance_references(workspace, task, (review_context, normalized))
@@ -1831,6 +2194,7 @@ def execute(payload: dict[str, object]) -> int:
                 work_kind=work_kind,
                 normalized=normalized,
                 digest=digest,
+                raw_plan=raw_plan,
                 coder_selection=selection,
             )
         complete_route(
@@ -1861,6 +2225,17 @@ def execute(payload: dict[str, object]) -> int:
     selection_error: str | None = None
     selection_stable = True
     accepted_selection: dict[str, str] | None = None
+    if memory_mode:
+        raw_comparison = (
+            memory_status.get("raw_comparison")
+            if isinstance(memory_status, dict) else "unknown"
+        )
+    else:
+        accepted_raw_plan = accepted.get("raw_plan")
+        raw_comparison = (
+            inspection_raw_comparison(accepted_raw_plan.encode("utf-8"), raw_plan)
+            if isinstance(accepted_raw_plan, str) else "unknown"
+        )
     if selection_policy == "complexity":
         try:
             current_selection = plan_coder_selection(plan, task)
@@ -1910,7 +2285,9 @@ def execute(payload: dict[str, object]) -> int:
         accepted_digest == digest
         and accepted_path == portable_plan_path
         and selection_stable
+        and raw_comparison in {"exact", "checkbox_progress"}
     ):
+        require_open_plan_acceptance(workspace, task)
         complete_route(
             route,
             transition=require_environment(
@@ -1937,10 +2314,16 @@ def execute(payload: dict[str, object]) -> int:
         return 0
 
     change_report = (
-        "Accepted normalized plan contract changed. "
+        "Accepted plan contract requires reconciliation. "
         f"accepted_path={accepted_path!r}; current_path={portable_plan_path!r}; "
-        f"accepted_sha256={accepted_digest!r}; current_sha256={digest!r}. "
-        "Checkbox-only progress is excluded from both digests."
+        f"accepted_sha256={accepted_digest!r}; current_sha256={digest!r}; "
+        f"raw_comparison={raw_comparison!r}. "
+        + (
+            "Original legacy raw plan bytes are unavailable; the contract "
+            "cannot be declared unchanged from normalized text."
+            if raw_comparison == "unknown"
+            else "Raw plan content changed outside proven operational checkbox progress."
+        )
     )
     if selection_error is not None:
         change_report += f" Coder selection requires revalidation: {selection_error}"

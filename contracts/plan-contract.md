@@ -70,11 +70,25 @@ head/snapshot is authoritative; a local cache is only a validated locator.
 Acceptance checks expected working and accepted heads. Publish progress by
 protected compare-and-swap, never by editing immutable revisions.
 
-Normalization excludes checkbox progress and admitted formatting changes.
-Material normalized drift follows retained Plan Revalidation and independent
-review before a new acceptance. Each continuation/verification guard checks its
-fixed route; unchanged contract resumes that route. `delivery_context` is
-transport state and is excluded from plan content/digest.
+Keep historical normalization and digests for snapshot integrity. Ordinary
+checks and acceptance also compare the raw accepted, working and reviewed
+immutable revisions. Exact bytes may reuse the matching review. A changed
+revision may reuse review only when the difference is provably operational
+checkbox progress outside literal/code content; other differences return through
+retained Plan Revalidation and independent review. Ambiguous syntax is not
+assumed harmless. Each continuation/verification guard checks its fixed route;
+unchanged contract resumes that route. `delivery_context` is
+transport state (v1 or v2) and is excluded from plan content/digest. Preserve
+the exact packet, including `pr_base_branch` when present; never derive it
+from the task branch or a default branch.
+
+Expose the verified `supplied_sha256` from the existing immutable-plan resolve
+result. Acceptance binds the reviewed immutable subject and cannot substitute a
+moving working literal. Terminal preflight guards executable stable Continue,
+Verify and Fix paths, not inspection. If the accepted head is absent while the
+local cache path exists, preserve the conflict before any write. Missing
+original legacy raw bytes remain an explicit evidence gap; normalized text
+cannot reconstruct them or establish missing human consent.
 
 For enabled complexity selection, the plan contains one closed
 `coder-selection-v1` object: `schema`, `task_short_id`, `complexity`

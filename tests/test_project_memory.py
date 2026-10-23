@@ -213,11 +213,22 @@ class ProjectMemoryTests(unittest.TestCase):
                 return {"token": revision.token, "path": str(revision.path),
                         "sha256": revision.sha256}
             if operation == "resolve-plan":
-                if fields["plan_path"] != "not-applicable":
-                    self.store.plan_revision("OSM-130", fields["plan_path"])
                 revision = self.store.read("tasks/OSM-130/plan")
-                return {"working_path": str(revision.path), "working_revision": revision.token,
-                        "working_sha256": revision.sha256}
+                supplied = (
+                    revision if fields["plan_path"] == "not-applicable"
+                    else self.store.plan_revision("OSM-130", fields["plan_path"])
+                )
+                comparison = self.store.compare_plan_revisions(
+                    "OSM-130", supplied.token, revision.token,
+                )
+                return {
+                    "supplied_revision": supplied.token,
+                    "supplied_sha256": comparison["supplied_sha256"],
+                    "supplied_comparison": comparison["comparison"],
+                    "working_path": str(revision.path),
+                    "working_revision": revision.token,
+                    "working_sha256": comparison["working_sha256"],
+                }
             if operation == "accept-plan":
                 revision = self.store.accept_plan("OSM-130", fields["expected_revision"],
                                                   fields["expected_accepted"], fields["metadata"])
@@ -600,13 +611,21 @@ class ProjectMemoryTests(unittest.TestCase):
                     if operation == "accepted-head":
                         return {"accepted_snapshot": store.accepted_head("OSM-130")}
                     if operation == "resolve-plan":
-                        if fields["plan_path"] != "not-applicable":
-                            store.plan_revision("OSM-130", fields["plan_path"])
                         revision = store.read("tasks/OSM-130/plan")
+                        supplied = (
+                            revision if fields["plan_path"] == "not-applicable"
+                            else store.plan_revision("OSM-130", fields["plan_path"])
+                        )
+                        comparison = store.compare_plan_revisions(
+                            "OSM-130", supplied.token, revision.token,
+                        )
                         return {
+                            "supplied_revision": supplied.token,
+                            "supplied_sha256": comparison["supplied_sha256"],
+                            "supplied_comparison": comparison["comparison"],
                             "working_path": str(revision.path),
                             "working_revision": revision.token,
-                            "working_sha256": revision.sha256,
+                            "working_sha256": comparison["working_sha256"],
                         }
                     if operation == "check-plan":
                         status = store.check_plan(
@@ -1555,8 +1574,11 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
             installed, source, None, "resolve-plan", interface="workflow",
             native_environment=environment, plan_path=revision["path"])
         self.assertEqual(resolved.returncode, 0, resolved.stderr)
-        self.assertEqual(json.loads(resolved.stdout)["result"]["working_revision"],
-                         revision["token"])
+        resolved_result = json.loads(resolved.stdout)["result"]
+        self.assertEqual(resolved_result["working_revision"], revision["token"])
+        self.assertEqual(resolved_result["supplied_revision"], revision["token"])
+        self.assertEqual(resolved_result["supplied_sha256"], revision["sha256"])
+        self.assertEqual(resolved_result["supplied_comparison"], "exact")
         script_context = {"task_id": "task-native", "node_id": "node-accept"}
         accepted_result = self.adapter_call(
             installed, source, None, "accept-plan", interface="workflow",
