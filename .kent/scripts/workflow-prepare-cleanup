@@ -223,7 +223,22 @@ def snapshot_from_receipt(request, root, plan_contract):
         if accepted["work_kind"] not in profile["work_kinds"]:
             raise ValueError("external accepted work kind is not configured")
         return raw
-    snapshot = closed(snapshot, SNAPSHOT_KEYS, "accepted snapshot")
+    optional_snapshot_keys = {
+        "raw_sha256", "raw_plan", "coder_selection", "coder_selection_sha256",
+    }
+    if (
+        not isinstance(snapshot, dict)
+        or not SNAPSHOT_KEYS <= set(snapshot)
+        or set(snapshot) - SNAPSHOT_KEYS - optional_snapshot_keys
+    ):
+        raise ValueError(
+            "accepted snapshot must contain the legacy contract fields and only "
+            "recognized raw-plan/coder-selection extensions"
+        )
+    if ("raw_plan" in snapshot) != ("raw_sha256" in snapshot):
+        raise ValueError("accepted raw plan snapshot is incomplete")
+    if ("coder_selection" in snapshot) != ("coder_selection_sha256" in snapshot):
+        raise ValueError("accepted coder-selection snapshot is incomplete")
     if (type(snapshot["schema_version"]) is not int or snapshot["schema_version"] != 1
             or snapshot["task_short_id"] != request["task_short_id"]):
         raise ValueError("snapshot schema/task differs")
@@ -234,6 +249,17 @@ def snapshot_from_receipt(request, root, plan_contract):
     normalized = text(snapshot["normalized_plan"], "normalized plan")
     if digest(normalized.encode()) != sha(snapshot["normalized_sha256"]):
         raise ValueError("normalized plan digest differs")
+    if "raw_plan" in snapshot:
+        raw_plan = text(snapshot["raw_plan"], "accepted raw plan").encode()
+        if (
+            digest(raw_plan) != sha(snapshot["raw_sha256"])
+            or plan_contract.inspection_normalized_plan(raw_plan) != normalized
+        ):
+            raise ValueError("accepted raw plan identity or normalized digest differs")
+    if "coder_selection" in snapshot:
+        plan_contract.validate_coder_selection(snapshot["coder_selection"], request["task_short_id"])
+        if snapshot["coder_selection_sha256"] != snapshot["normalized_sha256"]:
+            raise ValueError("accepted coder selection digest differs")
     configured = text(snapshot["plan_path"], "plan path")
     plan = None
     if configured != "not-applicable":
@@ -244,7 +270,7 @@ def snapshot_from_receipt(request, root, plan_contract):
     return raw
 
 
-def event_projection(event, root, ledger):
+def event_request_projection(event, ledger):
     closed(event, EVENT_KEYS, "final ordinary event")
     if event["node_key"] != "cleanup" or event["evidence_type"] != "cleanup_preparation":
         raise ValueError("final event must identify cleanup_preparation in cleanup")
@@ -252,8 +278,71 @@ def event_projection(event, root, ledger):
     ledger.require_string(event["summary"], "summary")
     for key in ("artifacts", "checks", "decisions"):
         ledger.require_string_list(event[key], key)
+    return projection
+
+
+def event_projection(event, root, ledger):
+    projection = event_request_projection(event, ledger)
     projection["context"] = ledger.context_metrics(root, event["context"])
     return projection
+
+
+def validate_stored_event_projection(event, stored, ledger):
+    """Validate the frozen projection without reopening historical context files."""
+    projection = event_request_projection(event, ledger)
+    closed(stored, EVENT_KEYS, "stored final ordinary event projection")
+    if any(stored[key] != value for key, value in projection.items()):
+        raise ValueError("stored event projection conflicts with the frozen request")
+
+    context = closed(stored["context"], {
+        "manifest_path", "files_read", "instruction_bytes",
+        "repeated_file_count", "repeated_files", "model_calls",
+        "compaction_count", "repeated_questions", "verification_loops",
+    }, "stored event context projection")
+
+    def relative_path(value, label):
+        text(value, label)
+        candidate = Path(value)
+        if (
+            candidate.is_absolute()
+            or candidate.as_posix() != value
+            or "\\" in value
+            or "\x00" in value
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+        ):
+            raise ValueError(f"{label} is not a canonical project-relative path")
+        return value
+
+    manifest = relative_path(context["manifest_path"], "stored context manifest")
+    files = ledger.require_string_list(context["files_read"], "stored context files_read")
+    if any(relative_path(value, "stored context file") == manifest for value in files):
+        raise ValueError("stored context files_read redundantly contains its manifest")
+    repeated_files = ledger.require_string_list(
+        context["repeated_files"], "stored context repeated_files",
+    )
+    for value in repeated_files:
+        relative_path(value, "stored repeated context file")
+    seen = {manifest}
+    repeated = set()
+    for value in files:
+        if value in seen:
+            repeated.add(value)
+        else:
+            seen.add(value)
+    if (
+        type(context["instruction_bytes"]) is not int
+        or context["instruction_bytes"] < 0
+        or type(context["repeated_file_count"]) is not int
+        or context["repeated_file_count"] != len(repeated)
+        or repeated_files != sorted(repeated)
+    ):
+        raise ValueError("stored context projection metrics are inconsistent")
+    for key in (
+        "model_calls", "compaction_count", "repeated_questions",
+        "verification_loops",
+    ):
+        ledger.optional_count(context[key], f"stored context.{key}")
+    return stored
 
 
 def records_at(path, task, ledger, janitor):
@@ -275,7 +364,7 @@ def validated_sealed_report(prepared, records, runtime, task, seal_request):
         or records[-1].get("record_kind") != runtime.TERMINAL_SEAL_SCHEMA
     ):
         raise ValueError("terminal evidence seal is missing")
-    assert_final_record(records, prepared)
+    assert_final_record(records, prepared, runtime=runtime)
     marker = runtime.validate_terminal_chain(records, task_short_id=task)
     if marker["event_count"] != prepared["baseline"]["sequence"] + 2:
         raise ValueError("terminal marker event count conflicts with preparation")
@@ -408,14 +497,14 @@ def retain_terminal(root, task, ledger, janitor, runtime, records):
     }
 
 
-def assert_final_record(records, prepared):
-    ordinary = records[:-1] if records[-1].get("record_kind") == "terminal_evidence_seal_v1" else records
+def assert_final_record(records, prepared, *, runtime):
+    ordinary = records[:-1] if records[-1].get("record_kind") == runtime.TERMINAL_SEAL_SCHEMA else records
     baseline = prepared["baseline"]
     if len(ordinary) != baseline["sequence"] + 1:
         raise ValueError("final ordinary event was not appended exactly once")
     final = ordinary[-1]
     version = final.get("schema_version")
-    if type(version) is not int or version not in (1, 2):
+    if not runtime.is_ordinary_evidence_record(final) or type(version) is not int or version not in (1, 2):
         raise ValueError("final ordinary event has an unsupported identity version")
     if (final["previous_hash"] != baseline["event_hash"]
             or any(final.get(key) != value for key, value in prepared["event"].items())
@@ -454,7 +543,6 @@ def prepare(request):
     for relative in (f".kent/runtime/{task}", f"build/kent-workflow/{task}"):
         require_ignored(command, environment, relative)
     raw = snapshot_from_receipt(request, root, plan_contract)
-    projection = event_projection(request["final_event"], root, ledger)
     store_relative = f"build/kent-workflow/{task}"
     # Existing unsafe components are never repaired or chmod-normalized.
     receipt_path = safe_path(root, f"{store_relative}/cleanup-preparation.json",
@@ -471,9 +559,12 @@ def prepare(request):
             "schema_version", "request", "git_head", "event", "baseline", "state", "cleanup_report",
         }, "preparation receipt")
         if (prepared["schema_version"] != 1 or prepared["request"] != request
-                or prepared["git_head"] != head or prepared["event"] != projection
+                or prepared["git_head"] != head
                 or prepared["state"] not in {"prepared", "completed"}):
             raise ValueError("preparation receipt conflicts with frozen request")
+        projection = validate_stored_event_projection(
+            request["final_event"], prepared["event"], ledger,
+        )
         baseline = closed(prepared["baseline"], {"sequence", "event_hash"}, "ledger baseline")
         if type(baseline["sequence"]) is not int or baseline["sequence"] < 1:
             raise ValueError("preparation has an invalid ordinary ledger baseline")
@@ -482,6 +573,8 @@ def prepare(request):
             raise ValueError("unfinished preparation claims a completed report")
         if read_file(archive)[0] != raw:
             raise ValueError("archive differs from retained snapshot")
+    else:
+        projection = event_projection(request["final_event"], root, ledger)
 
     task_directory = root / ".kent/runtime" / task
     if not task_directory.exists():
@@ -522,6 +615,28 @@ def prepare(request):
     source = safe_path(root, f".kent/runtime/{task}/plan-contract.json")
     evidence_path = source.with_name("evidence-ledger.jsonl")
     records = runtime_inventory(root, task, janitor, ledger, runtime)
+    baseline = (
+        prepared["baseline"] if prepared is not None else {
+            "sequence": len(records), "event_hash": records[-1]["event_hash"],
+        }
+    )
+    retain_before_retirement = janitor._retention_declared(root) or any(
+        record.get("record_kind") in runtime.EVIDENCE_BOUNDARY_KINDS
+        for record in records
+    )
+    ledger.preflight_terminal_closure(
+        root,
+        task=task,
+        final_event=request["final_event"],
+        seal_request=seal_request,
+        baseline=baseline,
+        retention=retain_before_retirement,
+    )
+    if prepared is not None and (
+        len(records) == baseline["sequence"] + 1
+        or records[-1].get("record_kind") == runtime.TERMINAL_SEAL_SCHEMA
+    ):
+        assert_final_record(records, prepared, runtime=runtime)
     if prepared is None:
         if records[-1].get("record_kind") == runtime.TERMINAL_SEAL_SCHEMA:
             raise ValueError("an existing seal requires its preparation receipt")
@@ -586,7 +701,7 @@ def prepare(request):
                 raise ValueError("real current Kent event identities are required")
         invoke_ledger(root, task, "append", request["final_event"], environment)
         records = records_at(evidence_path, task, ledger, janitor)
-    assert_final_record(records, prepared)
+    assert_final_record(records, prepared, runtime=runtime)
     sealed = invoke_ledger(root, task, "seal", seal_request, environment)
     records = records_at(evidence_path, task, ledger, janitor)
     marker, report = validated_sealed_report(
