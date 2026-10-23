@@ -1419,6 +1419,49 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
                 self.receipt["files"] = original
         self.pin()
 
+    def test_published_source_receipt_has_no_r2_or_project_memory_fallback(self):
+        self.native_adapter_fixture()
+        self.put(
+            self.project,
+            ".kent/workflow-profile.toml",
+            '[commands]\ncheckpoint = ".kent/scripts/workflow-checkpoint"\n',
+        )
+        self.commit(self.project)
+        source_commit = self.git(self.project, "rev-parse", "HEAD").strip()
+        self.git(self.project, "update-ref", "refs/remotes/origin/main", source_commit)
+        self.receipt = {
+            "schema": "delivery-source-publication-v1",
+            "project_id": "project-test",
+            "workflow_id": "workflow-test",
+            "source_commit": source_commit,
+            "kit_commit": self.git(self.kit, "rev-parse", "HEAD").strip(),
+            "runtime_roots": [str(self.project), str(self.kit)],
+            "files": [],
+            "policy": "published_source_v1",
+            "local_inputs": [],
+        }
+        self.refresh_receipt_files()
+        self.pin()
+        self.binding_path.unlink()
+
+        result = self.inspect()
+        self.assertEqual(result["status"], "admitted")
+        self.assertFalse(self.binding_path.exists())
+        self.assertNotIn("project_memory", json.loads(self.receipt_path.read_text()))
+
+        original = json.loads(self.receipt_path.read_text())
+        for mutation in (
+            {"policy": "delivery_reliability_v1"},
+            {"schema": "delivery-runtime-publication-v1"},
+            {"project_memory": {"root": str(self.base)}},
+            {"project_id": "project-foreign"},
+        ):
+            with self.subTest(mutation=mutation):
+                self.pin(json.dumps({**original, **mutation}, sort_keys=True).encode())
+                with self.assertRaises(ValueError):
+                    self.inspect()
+        self.pin(json.dumps(original).encode())
+
     def assert_source_admission_preserves_fixture_state(self):
         def snapshot():
             result = {}

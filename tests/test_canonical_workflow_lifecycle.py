@@ -42,6 +42,70 @@ PROJECT_ID = "project-" + RETIREMENT_PROJECT_ID
 
 
 class NativeGraphTransportTests(unittest.TestCase):
+    def test_native_graph_projection_encodes_source_rows_and_defaults(self):
+        from workflowkit.graph import native_graph_projection
+
+        workflow = "123e4567-e89b-12d3-a456-426614174000"
+        source = {
+            "version": 8,
+            "nodes": [{"id": "node-1", "workflow_id": workflow, "key": "janitor",
+                       "kind": "script", "future": "preserved"}],
+            "node_groups": [],
+            "transition_groups": [{"id": "group-1", "workflow_id": workflow,
+                                   "source_node_id": "node-1", "transition_id": "run"}],
+            "edges": [
+                {"id": "edge-default", "workflow_id": workflow, "parameters": [],
+                 "assignee_selection": "configured", "thinking_selection": "configured",
+                 "context_mode": "new_session",
+                 "context_source": {"kind": "immediate_source"},
+                 "prompt_template": " \t\nRun janitor.\n ", "future": {"keep": True}},
+                {"id": "edge-explicit", "workflow_id": workflow,
+                 "assignee_selection": "previous_node", "thinking_selection": "configured",
+                 "context_mode": "continue_session",
+                 "context_source": {"kind": "selected_node", "node_key": "plan"}},
+            ],
+        }
+        original = json.loads(json.dumps(source))
+        projected = native_graph_projection(source, workflow_id=workflow)
+        self.assertEqual(source, original)
+        self.assertNotIn("workflow_id", projected["nodes"][0])
+        self.assertEqual(projected["nodes"][0]["future"], "preserved")
+        self.assertNotIn("workflow_id", projected["transition_groups"][0])
+        self.assertEqual(projected["edges"][0]["prompt_template"], "Run janitor.")
+        self.assertNotIn("parameters", projected["edges"][0])
+        for key in ("assignee_selection", "thinking_selection", "context_mode", "context_source"):
+            self.assertNotIn(key, projected["edges"][0])
+        self.assertEqual(projected["edges"][0]["future"], {"keep": True})
+        explicit = projected["edges"][1]
+        self.assertNotIn("workflow_id", explicit)
+        self.assertEqual(explicit["assignee_selection"], "previous_node")
+        self.assertNotIn("thinking_selection", explicit)
+        self.assertEqual(explicit["context_mode"], "continue_session")
+        self.assertEqual(
+            native_graph_projection(projected, workflow_id=workflow),
+            projected,
+        )
+        mismatched = json.loads(json.dumps(source))
+        mismatched["edges"][0]["workflow_id"] = "223e4567-e89b-12d3-a456-426614174000"
+        with self.assertRaisesRegex(operations.SpecError, "Workflow identity differs"):
+            native_graph_projection(mismatched, workflow_id=workflow)
+
+    def test_native_readback_is_not_source_projected(self):
+        raw = {
+            "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
+            "expected_version": 8,
+            "graph": {
+                "nodes": [{"id": "node-1", "workflow_id": "unexpected"}],
+                "edges": [{"id": "edge-1", "parameters": [],
+                           "assignee_selection": "configured"}],
+                "node_groups": [],
+                "transition_groups": [],
+            },
+        }
+        observed = operations._canonical_graph(raw, 8)
+        self.assertEqual(observed["nodes"], raw["graph"]["nodes"])
+        self.assertEqual(observed["edges"], raw["graph"]["edges"])
+
     def test_large_packet_tamper_never_releases_child(self):
         from tests.test_workflow_retirement import load_test_plan, PYTHON
         transfer = operations._transfer_guardian_stdin
@@ -519,29 +583,20 @@ def canonical_v2_plan(
         if intent in {"metadata-only", "graph-and-metadata"}
         else source_metadata
     )
-    target_graph_sha256 = canonical_sha256(full_target_graph)
+    from workflowkit.graph import native_graph_projection
+
+    review_source_graph = native_graph_projection(source_graph, workflow_id=wid)
+    review_target_graph = native_graph_projection(full_target_graph, workflow_id=wid)
+    target_graph_sha256 = canonical_sha256(review_target_graph)
     target_metadata_sha256 = canonical_sha256(full_target_metadata)
-    changed_paths = []
-    if target_graph_sha256 != source_graph_sha256:
-        if any(
-            edge.get("key") == "implement_replan"
-            and not any(
-                before.get("id") == edge.get("id")
-                for before in source_graph["edges"]
-            )
-            for edge in full_target_graph["edges"]
-        ):
-            changed_paths.append("graph.added_edge:implement_replan")
-        if (
-            operations._v2_ingress_edge(source_graph, "source graph")["prompt_template"]
-            != operations._v2_ingress_edge(full_target_graph, "target graph")["prompt_template"]
-        ):
-            changed_paths.append("graph.edges:edge-backlog-plan.prompt_template")
-        if script_path_change:
-            changed_paths.append("graph.nodes:node-script.script_path")
-    if target_metadata_sha256 != source_metadata_sha256:
-        changed_paths.append("metadata.description")
-    changed_paths.extend(["task:TASK-1", "session:SESSION-1"])
+    changed_paths = sorted(operations._v2_required_review_paths(
+        review_source_graph,
+        review_target_graph,
+        source_metadata,
+        full_target_metadata,
+        compatibility_snapshot,
+        source_admission,
+    ))
     review = {
         "schema": "canonical-workflow-compatibility-review-v1",
         "workflow_id": wid,
@@ -1281,6 +1336,40 @@ def install_v2_unresolved_graph_postimage(
     return graph_stage
 
 class CanonicalWorkflowLifecycleTest(unittest.TestCase):
+    def test_v2_plan_source_rows_are_projected_before_review_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            _, document = canonical_v2_plan(fixture)
+            item = document["workflows"][0]
+            target = item["target_graph"]
+            workflow = item["workflow_id"]
+            for collection in ("nodes", "edges", "node_groups", "transition_groups"):
+                for row in target[collection]:
+                    row["workflow_id"] = workflow
+            for edge in target["edges"]:
+                edge["assignee_selection"] = "configured"
+                edge["thinking_selection"] = "configured"
+                if edge.get("context_mode") == "new_session":
+                    edge["context_source"] = {"kind": "immediate_source"}
+                if "parameters" not in edge:
+                    edge["parameters"] = []
+            plan = write_canonical_v2_plan(fixture, document)
+            parsed = operations._validate_canonical_v2_plan(plan, verify_evidence=False)
+            parsed_item = parsed["workflows"][0]
+            projected = parsed_item["_review_target_graph"]
+            self.assertTrue(all(
+                "workflow_id" not in row
+                for collection in ("nodes", "edges", "node_groups", "transition_groups")
+                for row in projected[collection]
+            ))
+            self.assertEqual(parsed_item["target_graph"], target)
+            for edge in projected["edges"]:
+                self.assertNotEqual(edge.get("assignee_selection"), "configured")
+                self.assertNotEqual(edge.get("thinking_selection"), "configured")
+                self.assertNotEqual(edge.get("parameters"), [])
+                if edge.get("context_mode") == "new_session":
+                    self.assertNotIn("context_source", edge)
+
     def test_v2_project_fields_require_matching_native_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = make_workflow_fixture(Path(temporary))
@@ -1430,6 +1519,35 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             )["sha256"],
             "0" * 64,
         )
+        v2_admission = {
+            "schema": "delivery-source-admission-v2",
+            "receipt_ref": admitted.value["receipt_ref"],
+            "primary_workspace_id": admitted.value["primary_workspace_id"],
+            "primary_root": admitted.value["primary_root"],
+            "kit_root": admitted.value["kit_root"],
+            "source_ref": admitted.value["source_ref"],
+            "kit_ref": admitted.value["kit_ref"],
+            "ci_helper": admitted.value["ci_helper"],
+            "helper_bindings": admitted.value["helper_bindings"],
+            "binding": {
+                "kind": "r2-installed",
+                "installation_binding_sha256": admitted.value[
+                    "installation_binding_sha256"
+                ],
+            },
+            "ingress": {"kind": "script-edge", "edge_id": "edge-ingress"},
+        }
+        with mock.patch.object(operations.Path, "home", return_value=fixture.home), \
+                mock.patch.dict("os.environ", {"HOME": str(fixture.home)}):
+            admitted_v2 = REAL_ADMIT_SOURCE_ADMISSION(
+                v2_admission,
+                project_id=PROJECT_ID,
+                workflow_id=wid,
+                project_root=fixture.project,
+                kent_path=fixture.native_bin,
+            )
+        self.assertEqual(admitted_v2.value["binding"], v2_admission["binding"])
+        self.assertEqual(admitted_v2.receipt_sha256, fixture.digest)
 
     def test_future_task_checkout_at_published_pin_passes_actual_source_inspector(self) -> None:
         fixture, admitted = create_verified_source_fixture(self, PROJECT_ID, workflow_id(0))
@@ -1486,6 +1604,60 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 REAL_ADMIT_SOURCE_ADMISSION(
                     admission, project_id=PROJECT_ID, workflow_id=workflow_id(0),
                     project_root=fixture.project, kent_path=fixture.native_bin)
+
+    def test_plan_publication_admission_does_not_require_r2_binding_or_memory_profile(self):
+        wid = workflow_id(0)
+        fixture, _ = create_verified_source_fixture(self, PROJECT_ID, wid)
+        profile = fixture.project / ".kent/workflow-profile.toml"
+        profile.write_text('[commands]\ncheckpoint = ".kent/scripts/workflow-checkpoint"\n')
+        profile.chmod(0o644)
+        fixture.repin_native_sources()
+        fixture.receipt = {
+            "schema": "delivery-source-publication-v1",
+            "project_id": PROJECT_ID,
+            "workflow_id": wid,
+            "source_commit": fixture.commits[fixture.project],
+            "kit_commit": fixture.commits[fixture.kit],
+            "runtime_roots": [str(fixture.project), str(fixture.kit)],
+            "files": [],
+            "policy": "published_source_v1",
+            "local_inputs": [],
+        }
+        fixture.refresh_receipt_files()
+        fixture.pin()
+        fixture.binding_path.unlink()
+        admission = {
+            "schema": "delivery-source-admission-v2",
+            "receipt_ref": {
+                "path": str(fixture.receipt_path),
+                "sha256": fixture.digest,
+            },
+            "primary_workspace_id": "workspace-test",
+            "primary_root": str(fixture.project),
+            "kit_root": str(fixture.kit),
+            "source_ref": "refs/remotes/origin/main",
+            "kit_ref": "refs/remotes/origin/main",
+            "ci_helper": str(fixture.ci_helper),
+            "helper_bindings": [{
+                "link": str(fixture.adapter_link),
+                "target": str(fixture.adapter_target),
+            }],
+            "binding": {"kind": "plan-publication"},
+            "ingress": {"kind": "script-edge", "edge_id": "edge-source-ingress"},
+        }
+        with mock.patch.object(operations.Path, "home", return_value=fixture.home), \
+                mock.patch.dict("os.environ", {"HOME": str(fixture.home)}):
+            admitted = REAL_ADMIT_SOURCE_ADMISSION(
+                admission,
+                project_id=PROJECT_ID,
+                workflow_id=wid,
+                project_root=fixture.project,
+                kent_path=fixture.native_bin,
+            )
+        self.assertEqual(admitted.value["binding"], {"kind": "plan-publication"})
+        self.assertEqual(admitted.receipt_sha256, fixture.digest)
+        self.assertEqual(admitted.inspection["status"], "admitted")
+        self.assertFalse(fixture.binding_path.exists())
 
     def test_operations_v2_rejects_closed_local_metadata_before_inspection(self):
         fixture, admitted = create_verified_source_fixture(
@@ -2796,8 +2968,12 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             item = value["workflows"][0]
             next(edge for edge in item["target_graph"]["edges"] if edge["key"] == "implement_replan")[
                 "prompt_template"] = projected.document["graph"]["edges"][0]["prompt_template"]
+            from workflowkit.graph import native_graph_projection
+
             review = json.loads(context["review_path"].read_text())
-            review["target_graph_sha256"] = canonical_sha256(item["target_graph"])
+            review["target_graph_sha256"] = canonical_sha256(native_graph_projection(
+                item["target_graph"], workflow_id=item["workflow_id"],
+            ))
             raw = canonical_bytes(review)
             context["review_path"].write_bytes(raw)
             item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
@@ -3117,7 +3293,11 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     snapshot["native_components"] = current["compatibility_snapshot"]["native_components"]
                     review = json.loads(context["review_path"].read_text())
                     review["source_graph_sha256"] = item["source_graph_sha256"]
-                    review["target_graph_sha256"] = canonical_sha256(item["target_graph"])
+                    from workflowkit.graph import native_graph_projection
+
+                    review["target_graph_sha256"] = canonical_sha256(native_graph_projection(
+                        item["target_graph"], workflow_id=item["workflow_id"],
+                    ))
                     review["source_admission_sha256"] = canonical_sha256(admission)
                     review["compatibility_snapshot_sha256"] = canonical_sha256(snapshot)
                     review_raw = canonical_bytes(review)
@@ -3813,8 +3993,495 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     project_id=PROJECT_ID, workflow_id=workflow_id(0), project_root=Path(fixture["root"]),
                 )
 
+    def test_v2_closed_admission_union_and_exact_script_ingress(self) -> None:
+        from workflowkit.delivery import source_admission_gate
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            admission = {
+                "schema": "delivery-source-admission-v2",
+                "receipt_ref": {"path": str(root / "receipt.json"), "sha256": "a" * 64},
+                "primary_workspace_id": "workspace-test",
+                "primary_root": str(root),
+                "kit_root": str(root / "kit"),
+                "source_ref": "refs/remotes/origin/main",
+                "kit_ref": "refs/remotes/origin/main",
+                "ci_helper": str(root / "bin/kent-prepare-github-ci"),
+                "helper_bindings": [],
+                "binding": {"kind": "plan-publication"},
+                "ingress": {"kind": "script-edge", "edge_id": "edge-ingress"},
+            }
+            parsed = operations._v2_source_admission(admission, "source_admission")
+            self.assertEqual(parsed, admission)
+            for invalid in (
+                {**admission, "extra": True},
+                {**admission, "binding": {"kind": "plan-publication", "extra": True}},
+                {**admission, "ingress": {"kind": "script-edge", "edge_id": "edge-ingress",
+                                          "extra": True}},
+                {**admission, "ingress": {"kind": "start-edge", "edge_id": "edge-ingress"}},
+            ):
+                with self.subTest(invalid=invalid), self.assertRaises(PlanValidationError):
+                    operations._v2_source_admission(invalid, "source_admission")
+            r2 = {
+                **admission,
+                "binding": {
+                    "kind": "r2-installed",
+                    "installation_binding_sha256": "b" * 64,
+                },
+            }
+            self.assertEqual(
+                operations._v2_source_admission(r2, "source_admission")["binding"],
+                r2["binding"],
+            )
+
+            source_graph = {
+                "version": 3,
+                "nodes": [
+                    {"id": "node-start", "key": "backlog", "kind": "agent"},
+                    {"id": "node-current", "key": "entry", "kind": "agent"},
+                    {"id": "node-terminal", "key": "terminal", "kind": "terminal"},
+                ],
+                "node_groups": [],
+                "transition_groups": [{
+                    "id": "group-ingress", "source_node_id": "node-start",
+                    "transition_id": "ingress",
+                }],
+                "edges": [{
+                    "id": "edge-ingress", "key": "ingress",
+                    "transition_group_id": "group-ingress",
+                    "target_node_id": "node-current", "prompt_template": "Begin.",
+                }],
+            }
+            target_graph = json.loads(json.dumps(source_graph))
+            target_graph["nodes"].append({
+                "id": "node-script", "key": "new-script", "kind": "script",
+                "script_path": "scripts/new-script",
+            })
+            target_graph["edges"][0]["target_node_id"] = "node-script"
+            target_graph["transition_groups"].append({
+                "id": "group-script-out", "source_node_id": "node-script",
+                "transition_id": "done",
+            })
+            target_graph["edges"].append({
+                "id": "edge-script-out", "key": "script-out",
+                "transition_group_id": "group-script-out",
+                "target_node_id": "node-current",
+            })
+            target_graph["version"] = 4
+            runtime_refs = [{
+                "path": str(root / "scripts/new-script"),
+                "relative_path": "scripts/new-script",
+                "mode": 0o755,
+            }]
+            operations._v2_graph_compatibility(source_graph, target_graph, runtime_refs)
+
+            gate = source_admission_gate(
+                admission,
+                project_id=PROJECT_ID,
+                workflow_id=workflow_id(0),
+                project_root=str(root),
+            )
+            target_graph["edges"][0]["prompt_template"] = gate + "\n\nBegin."
+            operations._v2_source_gate_check(
+                source_graph, target_graph, admission,
+                project_id=PROJECT_ID, workflow_id=workflow_id(0), project_root=root,
+            )
+            bypass = json.loads(json.dumps(target_graph))
+            bypass["transition_groups"].append({
+                "id": "group-bypass", "source_node_id": "node-start",
+                "transition_id": "bypass",
+            })
+            bypass["edges"].append({
+                "id": "edge-bypass", "key": "bypass",
+                "transition_group_id": "group-bypass",
+                "target_node_id": "node-current",
+            })
+            with self.assertRaisesRegex(PlanValidationError, "bypasses"):
+                operations._v2_source_gate_check(
+                    source_graph, bypass, admission,
+                    project_id=PROJECT_ID, workflow_id=workflow_id(0), project_root=root,
+                )
+
+            for invalid_graph in (
+                {**target_graph, "nodes": [
+                    {**row, "kind": "agent"} if row["id"] == "node-script" else row
+                    for row in target_graph["nodes"]
+                ]},
+                {**target_graph, "nodes": [
+                    {**row, "script_path": "scripts/missing"} if row["id"] == "node-script" else row
+                    for row in target_graph["nodes"]
+                ]},
+                {
+                    **target_graph,
+                    "edges": [
+                        row for row in target_graph["edges"]
+                        if row["id"] != "edge-script-out"
+                    ],
+                },
+            ):
+                with self.subTest(invalid_graph=invalid_graph), self.assertRaises(PlanValidationError):
+                    operations._v2_graph_compatibility(
+                        source_graph, invalid_graph, runtime_refs,
+                    )
+            with self.assertRaisesRegex(PlanValidationError, "removes existing edges"):
+                operations._v2_graph_compatibility(
+                    source_graph,
+                    {
+                        **target_graph,
+                        "edges": [
+                            row for row in target_graph["edges"]
+                            if row["id"] != "edge-ingress"
+                        ],
+                    },
+                    runtime_refs,
+                )
+
+            review_paths = operations._v2_required_review_paths(
+                source_graph,
+                target_graph,
+                {"name": "before", "description": "", "execution_target": "head"},
+                {"name": "after", "description": "", "execution_target": "head"},
+                {"tasks": [{"id": "task-1", "pending_decisions": [{"id": "decision-1"}]}],
+                 "sessions": []},
+                admission,
+            )
+            self.assertTrue({
+                "graph.added_node:node-script",
+                "graph.added_edge:edge-script-out",
+                "graph.added_transition_group:group-script-out",
+                "graph.edges:edge-ingress.prompt_template",
+                "graph.edges:edge-ingress.target_node_id",
+                "source_admission.ingress",
+                "task:task-1",
+            }.issubset(review_paths))
+            approved_source = json.loads(json.dumps(source_graph))
+            approved_target = json.loads(json.dumps(target_graph))
+            approved_source["edges"][0]["requires_approval"] = True
+            approved_target["edges"][0]["requires_approval"] = False
+            authority_paths = operations._v2_required_review_paths(
+                approved_source,
+                approved_target,
+                {"name": "before", "description": "", "execution_target": "head"},
+                {"name": "after", "description": "", "execution_target": "head"},
+                {"tasks": [{"id": "task-1", "pending_decisions": [
+                    {"id": "decision-1"},
+                ]}], "sessions": []},
+            )
+            self.assertTrue({
+                "graph.edges:edge-ingress.requires_approval",
+                "authority:graph.edges:edge-ingress.requires_approval",
+                "decision:decision-1",
+            }.issubset(authority_paths))
+
+    def test_native_script_admission_reads_exact_frame_and_denies_without_effect(self) -> None:
+        from workflowkit.delivery import (
+            admit_script_source_ingress,
+            source_admission_gate,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            wid = workflow_id(0)
+            admission = {
+                "schema": "delivery-source-admission-v2",
+                "receipt_ref": {"path": str(root / "receipt.json"), "sha256": "a" * 64},
+                "primary_workspace_id": "workspace-test",
+                "primary_root": str(root),
+                "kit_root": str(root / "kit"),
+                "source_ref": "refs/remotes/origin/main",
+                "kit_ref": "refs/remotes/origin/main",
+                "ci_helper": str(root / "bin/kent-prepare-github-ci"),
+                "helper_bindings": [],
+                "binding": {"kind": "plan-publication"},
+                "ingress": {"kind": "script-edge", "edge_id": "edge-ingress"},
+            }
+            gate = source_admission_gate(
+                admission,
+                project_id=PROJECT_ID,
+                workflow_id=wid,
+                project_root=str(root),
+            )
+            detail = {
+                "summary": {
+                    "id": "task-native",
+                    "project_id": PROJECT_ID,
+                    "workflow_id": wid,
+                },
+                "source_workspace": {
+                    "root_path": str(root),
+                    "is_primary": True,
+                    "workspace_id": "workspace-test",
+                },
+                "project": {"default_workspace_id": "workspace-test"},
+                "worktree_path": None,
+                "current_scripts": [{
+                    "current_node": {
+                        "node_id": "node-script",
+                        "transition_branch_key": "ingress",
+                    },
+                    "path": "scripts/entry.py",
+                }],
+            }
+            frame_graph = {
+                "workflow_id": wid,
+                "graph": {
+                    "nodes": [
+                        {"id": "node-start", "key": "backlog", "kind": "agent"},
+                        {"id": "node-script", "key": "entry", "kind": "script",
+                         "script_path": "scripts/entry.py"},
+                        {"id": "node-next", "key": "next", "kind": "agent"},
+                    ],
+                    "node_groups": [],
+                    "transition_groups": [
+                        {"id": "group-in", "source_node_id": "node-start",
+                         "transition_id": "ingress"},
+                        {"id": "group-out", "source_node_id": "node-script",
+                         "transition_id": "done"},
+                    ],
+                    "edges": [
+                        {"id": "edge-ingress", "key": "ingress",
+                         "transition_group_id": "group-in",
+                         "target_node_id": "node-script",
+                         "prompt_template": gate + "\n\nRun script."},
+                        {"id": "edge-out", "key": "done",
+                         "transition_group_id": "group-out",
+                         "target_node_id": "node-next"},
+                    ],
+                },
+            }
+            kent = Path(sys.executable).resolve()
+            context = {
+                "task_id": "task-native",
+                "node_id": "node-script",
+                "transition_branch_key": "ingress",
+            }
+            project_read = mock.Mock(return_value=(0, (PROJECT_ID + "\n").encode(), b""))
+            native_json = mock.Mock(side_effect=[detail, frame_graph])
+            delegated = mock.Mock(return_value=object())
+            provider = mock.Mock()
+            with mock.patch.object(operations, "_run", project_read), \
+                    mock.patch.object(operations, "_kent_json", native_json), \
+                    mock.patch.object(operations, "admit_source_admission", delegated):
+                result = admit_script_source_ingress(
+                    root, context, kent_path=kent,
+                )
+                self.assertIs(result, delegated.return_value)
+                self.assertEqual(delegated.call_count, 1)
+                self.assertEqual(delegated.call_args.kwargs["project_id"], PROJECT_ID)
+                self.assertEqual(delegated.call_args.kwargs["workflow_id"], wid)
+                self.assertEqual(
+                    delegated.call_args.kwargs["workspace_path"], str(root),
+                )
+                self.assertEqual(delegated.call_args.args[0], admission)
+                provider.assert_not_called()
+
+            invalid_graphs = []
+            wrong_edge = json.loads(json.dumps(frame_graph))
+            wrong_edge["graph"]["edges"][0]["id"] = "edge-other"
+            invalid_graphs.append(wrong_edge)
+            wrong_target = json.loads(json.dumps(frame_graph))
+            wrong_target["graph"]["edges"][0]["target_node_id"] = "node-next"
+            invalid_graphs.append(wrong_target)
+            later_script = json.loads(json.dumps(frame_graph))
+            later_script["graph"]["nodes"].append({
+                "id": "node-later-script",
+                "key": "later",
+                "kind": "script",
+                "script_path": "scripts/later.py",
+            })
+            later_script["graph"]["edges"][0]["target_node_id"] = "node-later-script"
+            invalid_graphs.append(later_script)
+            bypass = json.loads(json.dumps(frame_graph))
+            bypass["graph"]["transition_groups"].append({
+                "id": "group-bypass", "source_node_id": "node-start",
+                "transition_id": "bypass",
+            })
+            bypass["graph"]["edges"].append({
+                "id": "edge-bypass", "key": "bypass",
+                "transition_group_id": "group-bypass",
+                "target_node_id": "node-next",
+            })
+            invalid_graphs.append(bypass)
+            for invalid in invalid_graphs:
+                with self.subTest(graph=invalid):
+                    with mock.patch.object(operations, "_run", project_read), \
+                            mock.patch.object(
+                                operations, "_kent_json",
+                                side_effect=[detail, invalid],
+                            ), \
+                            mock.patch.object(
+                                operations, "admit_source_admission",
+                                side_effect=AssertionError(
+                                    "admission must not be delegated"
+                                ),
+                            ) as denied, \
+                            self.assertRaises(PlanValidationError):
+                        admit_script_source_ingress(
+                            root, context, kent_path=kent,
+                        )
+                    denied.assert_not_called()
+                    provider.assert_not_called()
+
+    def test_v2_every_mutable_existing_graph_field_requires_review_disposition(self) -> None:
+        from workflowkit.graph import native_graph_projection
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            plan, value = canonical_v2_plan(
+                fixture, script_path_change=True, pending_approval=True,
+            )
+            item = value["workflows"][0]
+            workflow = read_state(fixture)["workflows"][item["workflow_id"]]
+            source_graph = {
+                "version": item["expected_version"],
+                **workflow["graph"],
+            }
+            next(
+                row for row in source_graph["edges"]
+                if row["id"] == "edge-fix-replan"
+            )["requires_approval"] = True
+            target_graph = item["target_graph"]
+            script = next(row for row in target_graph["nodes"] if row["id"] == "node-script")
+            script.update({
+                "key": "janitor-reviewed",
+                "name": "Reviewed Script",
+                "description": "Reviewed Script description",
+                "subagent_role": "not-used-by-script",
+                "prompt_template": "Script prompt template",
+                "prompt": "Script prompt",
+                "context": {"reviewed": True},
+                "parameters": [{"key": "mode", "type": "string"}],
+            })
+            edge = next(row for row in target_graph["edges"] if row["id"] == "edge-fix-replan")
+            edge.update({
+                "key": "fix_replan_reviewed",
+                "target_node_id": "node-plan",
+                "transition_group_id": "group-implement-replan",
+                "requires_approval": False,
+                "parameters": [{"key": "mode", "type": "string"}],
+                "context_mode": "continue_session",
+                "context_source": {"kind": "selected_node", "node_key": "plan"},
+                "assignee_selection": "previous_node",
+                "thinking_selection": "high",
+                "prompt_template": "Reviewed prompt template",
+                "prompt": "Reviewed prompt",
+                "description": "Reviewed edge description",
+            })
+            group = next(
+                row for row in target_graph["transition_groups"]
+                if row["id"] == "group-fix-replan"
+            )
+            group.update({
+                "transition_id": "fix_replan_reviewed",
+                "source_node_id": "node-implement",
+                "display_name": "Reviewed transition",
+                "description": "Reviewed transition description",
+            })
+
+            source_metadata = {
+                key: workflow["metadata"][key]
+                for key in ("name", "description", "execution_target")
+            }
+            projected_source = native_graph_projection(
+                source_graph, workflow_id=item["workflow_id"],
+            )
+            projected_target = native_graph_projection(
+                target_graph, workflow_id=item["workflow_id"],
+            )
+            required = operations._v2_required_review_paths(
+                projected_source,
+                projected_target,
+                source_metadata,
+                source_metadata,
+                item["compatibility_snapshot"],
+                item["source_admission"],
+            )
+            expected_fields = {
+                "nodes": (
+                    "key", "name", "description", "script_path", "subagent_role",
+                    "prompt_template", "prompt", "context", "parameters",
+                ),
+                "edges": (
+                    "key", "target_node_id", "transition_group_id", "requires_approval",
+                    "parameters", "context_mode", "context_source", "assignee_selection",
+                    "thinking_selection", "prompt_template", "prompt", "description",
+                ),
+                "transition_groups": (
+                    "transition_id", "source_node_id", "display_name", "description",
+                ),
+            }
+            field_paths = {
+                f"graph.{collection}:{identity}.{field}"
+                for collection, identity, fields in (
+                    ("nodes", "node-script", expected_fields["nodes"]),
+                    ("edges", "edge-fix-replan", expected_fields["edges"]),
+                    ("transition_groups", "group-fix-replan",
+                     expected_fields["transition_groups"]),
+                )
+                for field in fields
+            }
+            pending_decision = item["compatibility_snapshot"]["tasks"][0][
+                "pending_decisions"
+            ][0]["id"]
+            authority_paths = {
+                "authority:graph.edges:edge-fix-replan.requires_approval",
+                f"decision:{pending_decision}",
+            }
+            self.assertTrue(authority_paths.issubset(required))
+            self.assertEqual(field_paths - required, set())
+
+            review_path = Path(item["compatibility_review_ref"]["path"])
+            review = json.loads(review_path.read_text())
+            review["source_graph_sha256"] = canonical_sha256(source_graph)
+            review["target_graph_sha256"] = canonical_sha256(projected_target)
+            evidence = review["dispositions"][0]["evidence"]
+            review["dispositions"] = [
+                {"path": path, "disposition": "compatible", "evidence": evidence}
+                for path in sorted(required)
+            ]
+            item["source_graph_sha256"] = canonical_sha256(source_graph)
+            raw_review = canonical_bytes(review)
+            review_path.write_bytes(raw_review)
+            item["compatibility_review_ref"]["sha256"] = hashlib.sha256(
+                raw_review
+            ).hexdigest()
+            plan = write_canonical_v2_plan(fixture, value)
+            parsed = operations._validate_canonical_v2_plan(plan)
+            source = {
+                "workflow_id": item["workflow_id"],
+                "project_id": item["project_id"],
+                "version": item["expected_version"],
+                "graph": source_graph,
+                "metadata": source_metadata,
+                "links": item["links"],
+                "default": item["default"],
+            }
+            target_item = parsed["workflows"][0]
+            operations._validate_canonical_v2_target(
+                parsed, target_item, source, None, None,
+            )
+            for path in sorted(field_paths | authority_paths):
+                with self.subTest(path=path):
+                    accepted = review["dispositions"]
+                    review["dispositions"] = [
+                        row for row in accepted if row["path"] != path
+                    ]
+                    raw_review = canonical_bytes(review)
+                    review_path.write_bytes(raw_review)
+                    target_item["compatibility_review_ref"]["sha256"] = hashlib.sha256(
+                        raw_review
+                    ).hexdigest()
+                    with self.assertRaisesRegex(
+                        PlanValidationError,
+                        "omits a changed semantic path",
+                    ):
+                        operations._validate_canonical_v2_target(
+                            parsed, target_item, source, None, None,
+                        )
+                    review["dispositions"] = accepted
+
     def test_composed_builder_parameters_and_prompt_reviews_are_exact(self) -> None:
-        from workflowkit.graph import plan_workflow_graph
+        from workflowkit.graph import native_graph_projection, plan_workflow_graph
         from workflowkit.delivery import source_admission_gate
 
         root = Path(__file__).resolve().parents[1]
@@ -3864,6 +4531,10 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 ) + "\n\n" + ingress["prompt_template"]
                 parameters = next(edge for edge in target["edges"] if edge["key"] == "implement_replan")[
                     "parameters"]
+                replan_edge_id = next(
+                    edge["id"] for edge in target["edges"]
+                    if edge["key"] == "implement_replan"
+                )
                 self.assertEqual(len(parameters), 7 if complexity else 6)
                 operations._v2_graph_compatibility(source_graph, target, item["runtime_refs"])
                 operations._v2_source_gate_check(
@@ -3880,8 +4551,11 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     bad = json.loads(json.dumps(target))
                     next(edge for edge in bad["edges"] if edge["key"] == "implement_replan")[
                         "parameters"] = mutation
-                    with self.assertRaisesRegex(PlanValidationError, "additive route"):
-                        operations._v2_graph_compatibility(source_graph, bad, item["runtime_refs"])
+                    operations._v2_graph_compatibility(source_graph, bad, item["runtime_refs"])
+                    required = operations._v2_required_review_paths(
+                        source_graph, bad, {}, {}, {"tasks": [], "sessions":[]},
+                    )
+                    self.assertIn(f"graph.added_edge:{replan_edge_id}", required)
                 typed_source = json.loads(json.dumps(source_graph))
                 typed_target = json.loads(json.dumps(target))
                 for graph in (typed_source, typed_target):
@@ -3889,8 +4563,11 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                         "parameters"][0]["default"] = True
                 next(edge for edge in typed_target["edges"] if edge["key"] == "implement_replan")[
                     "parameters"][0]["default"] = 1
-                with self.assertRaisesRegex(PlanValidationError, "additive route"):
-                    operations._v2_graph_compatibility(typed_source, typed_target, item["runtime_refs"])
+                operations._v2_graph_compatibility(typed_source, typed_target, item["runtime_refs"])
+                required = operations._v2_required_review_paths(
+                    typed_source, typed_target, {}, {}, {"tasks": [], "sessions":[]},
+                )
+                self.assertIn(f"graph.added_edge:{replan_edge_id}", required)
                 for duplicate in (False, True):
                     bad_source = json.loads(json.dumps(source_graph))
                     fix = next(edge for edge in bad_source["edges"] if edge["key"] == "fix_replan")
@@ -3902,7 +4579,12 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                         bad_source["edges"].remove(fix)
                         bad_target = json.loads(json.dumps(target))
                         bad_target["edges"] = [edge for edge in bad_target["edges"] if edge["id"] != fix["id"]]
-                    with self.assertRaisesRegex(PlanValidationError, "additive route"):
+                    if duplicate:
+                        with self.assertRaisesRegex(PlanValidationError, "duplicate identities"):
+                            operations._v2_graph_compatibility(
+                                bad_source, bad_target, item["runtime_refs"],
+                            )
+                    else:
                         operations._v2_graph_compatibility(bad_source, bad_target, item["runtime_refs"])
 
                 source = {
@@ -3919,10 +4601,15 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 review = json.loads(review_path.read_text())
                 review.update(source_graph_sha256=item["source_graph_sha256"],
                               source_metadata_sha256=item["source_metadata_sha256"],
-                              target_graph_sha256=canonical_sha256(target),
+                              target_graph_sha256=canonical_sha256(native_graph_projection(
+                                  target, workflow_id=item["workflow_id"],
+                              )),
                               target_metadata_sha256=canonical_sha256(source["metadata"]))
                 required = operations._v2_required_review_paths(
-                    source_graph, target, source["metadata"], source["metadata"], item["compatibility_snapshot"])
+                    native_graph_projection(source_graph, workflow_id=item["workflow_id"]),
+                    native_graph_projection(target, workflow_id=item["workflow_id"]),
+                    source["metadata"], source["metadata"], item["compatibility_snapshot"],
+                )
                 evidence = review["dispositions"][0]["evidence"]
                 review["dispositions"] = [
                     {"path": path, "disposition": "compatible", "evidence": evidence} for path in required

@@ -323,23 +323,44 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
     raw, _ = read_file(receipt_path, MAX_REQUEST, private=True)
     require(hashlib.sha256(raw).hexdigest() == receipt_sha256, "source receipt digest differs")
     receipt = parse_json(raw)
+    source_only = (
+        isinstance(receipt, dict)
+        and receipt.get("schema") == "delivery-source-publication-v1"
+    )
     fields = {"schema", "project_id", "workflow_id", "source_commit", "kit_commit",
-              "runtime_roots", "files", "policy", "project_memory"}
+              "runtime_roots", "files", "policy"}
+    if source_only:
+        fields.add("local_inputs")
+    else:
+        fields.add("project_memory")
     v2 = isinstance(receipt, dict) and receipt.get("schema") == "delivery-runtime-publication-v2"
     closed(receipt, fields | ({"local_inputs"} if v2 else set()))
-    require(receipt["schema"] in ("delivery-runtime-publication-v1", "delivery-runtime-publication-v2")
-            and receipt["project_id"] == project_id and receipt["workflow_id"] == workflow_id
-            and receipt["policy"] == "delivery_reliability_v1", "source receipt binding differs")
-    memory = receipt["project_memory"]
-    closed(memory, ("root", "project_key", "project_uid", "legacy_task_ids"))
-    canonical(memory["root"])
-    key(memory["project_key"])
-    key(memory["project_uid"])
-    legacy = memory["legacy_task_ids"]
-    require(isinstance(legacy, list) and len(legacy) <= 256, "invalid legacy inventory")
-    for identity in legacy:
-        key(identity)
-    require(len(set(legacy)) == len(legacy), "duplicate legacy identity")
+    require(
+        (
+            receipt["schema"] == "delivery-source-publication-v1"
+            and receipt["policy"] == "published_source_v1"
+            if source_only
+            else receipt["schema"] in (
+                "delivery-runtime-publication-v1", "delivery-runtime-publication-v2",
+            )
+            and receipt["policy"] == "delivery_reliability_v1"
+        )
+        and receipt["project_id"] == project_id
+        and receipt["workflow_id"] == workflow_id,
+        "source receipt binding differs",
+    )
+    memory = None
+    if not source_only:
+        memory = receipt["project_memory"]
+        closed(memory, ("root", "project_key", "project_uid", "legacy_task_ids"))
+        canonical(memory["root"])
+        key(memory["project_key"])
+        key(memory["project_uid"])
+        legacy = memory["legacy_task_ids"]
+        require(isinstance(legacy, list) and len(legacy) <= 256, "invalid legacy inventory")
+        for identity in legacy:
+            key(identity)
+        require(len(set(legacy)) == len(legacy), "duplicate legacy identity")
     project_root, project_common = repository(project_root)
     kit_root, kit_common = repository(kit_root)
     primary_root, primary_common = repository(primary_root)
@@ -372,7 +393,7 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
              for root in set((primary_root, workspace_path, project_root, kit_root,
                               *(item[0] for item in admitted_roots.values())))}
     files = receipt["files"]
-    local_inputs = receipt["local_inputs"] if v2 else []
+    local_inputs = receipt.get("local_inputs", []) if (v2 or source_only) else []
     require(isinstance(files, list) and 0 < len(files) <= MAX_SOURCE_RECEIPT_FILES,
             "invalid source inventory")
     require(isinstance(local_inputs, list)
@@ -472,13 +493,15 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
                 local_inputs=locals_by_root.get(kit_root))
     profile_raw, _ = read_file(primary_root / ".kent/workflow-profile.toml")
     profile = tomllib.loads(profile_raw.decode("utf-8"))
-    require(profile.get("policies", {}).get("delivery_reliability") == "v1",
-            "delivery policy not enabled")
-    memory_config = profile.get("project_memory")
-    closed(memory_config, ("root", "project_key", "project_uid", "mode"))
-    require(memory_config["mode"] == "r2"
-            and all(memory_config[name] == memory[name] for name in ("root", "project_key", "project_uid")),
-            "cutover memory configuration differs")
+    if not source_only:
+        require(profile.get("policies", {}).get("delivery_reliability") == "v1",
+                "delivery policy not enabled")
+        memory_config = profile.get("project_memory")
+        closed(memory_config, ("root", "project_key", "project_uid", "mode"))
+        require(memory_config["mode"] == "r2"
+                and all(memory_config[name] == memory[name]
+                        for name in ("root", "project_key", "project_uid")),
+                "cutover memory configuration differs")
     for command in profile.get("commands", {}).values():
         require(isinstance(command, str), "invalid profile command")
         if command == "":

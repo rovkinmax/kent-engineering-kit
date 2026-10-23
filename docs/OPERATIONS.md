@@ -151,6 +151,35 @@ or creating a worktree. The installed entry point is
 `~/.kent/bin/kent-preflight-revision`. Its launcher selects a compatible Python;
 `KENT_ENGINEERING_KIT_PYTHON` can explicitly select an executable.
 
+### Admit a native source ingress
+
+When a reviewed Workflow carries a source-admission frame, read the complete
+`{project_id, workflow_id, source_admission}` object from the exact native
+ingress edge; do not accept a caller-supplied receipt path or identity. Before
+the current Script performs its first provider or storage effect, call the
+installed Kit delivery API with the actual execution root and native `_kent`
+context:
+
+```python
+delivery.admit_script_source_ingress(
+    ROOT,
+    _kent,
+    kent_path=qualified_kent_binary,
+)
+```
+
+Proceed only after verified admission. The closed v2 binding selects exactly
+one mode: `r2-installed` verifies the installed binding and preserves existing
+R2 task initialization, while `plan-publication` admits only the pinned
+published source closure. The latter does not initialize a Task, call
+project-memory, perform a revision write, infer legacy storage mode or create a
+`.todo` fallback. A source receipt is not human approval or permission for an
+external effect. Native identity mismatch, missing source, or changed bytes
+must stop before the effect and report the fixed blocker.
+This ingress API is only for the Script node targeted by the exact frame;
+later Script nodes must use their own qualified native/provenance contracts
+and must not pretend that the ingress frame targets them.
+
 Adapter synchronization is a separate operation:
 `./scripts/sync-project-adapters --project /path/to/project`.
 It can write Kit-managed adapters and commands, so use it only for the approved

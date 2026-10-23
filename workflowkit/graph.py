@@ -17,16 +17,43 @@ _GO_WHITE_SPACE = (
 )
 
 
-def native_graph_projection(graph: dict[str, Any]) -> dict[str, Any]:
-    """Copy a built native graph with edge prompts as Kent will persist them.
+def native_graph_projection(
+    graph: dict[str, Any],
+    *,
+    workflow_id: str | None = None,
+) -> dict[str, Any]:
+    """Encode source graph rows as Kent persists them.
 
-    Call before diffing, hashing or review. This is not readback normalization.
-    All other fields, collection order and non-string prompt values are retained.
+    Apply only to a source-built graph before diffing, hashing, or review. This
+    is not readback normalization. Native rows omit source ``workflow_id``
+    annotations, empty parameter arrays, and explicit selection/context
+    defaults. Existing row order, IDs, unknown fields, and non-default values
+    are retained.
     """
     projected = deepcopy(graph)
+    for collection in ("nodes", "edges", "node_groups", "transition_groups"):
+        for row in projected.get(collection, []):
+            if not isinstance(row, dict) or "workflow_id" not in row:
+                continue
+            if not isinstance(workflow_id, str) or row["workflow_id"] != workflow_id:
+                raise SpecError("source graph row Workflow identity differs")
+            row.pop("workflow_id")
     for edge in projected.get("edges", []):
-        if isinstance(edge, dict) and isinstance(edge.get("prompt_template"), str):
+        if not isinstance(edge, dict):
+            continue
+        if isinstance(edge.get("prompt_template"), str):
             edge["prompt_template"] = edge["prompt_template"].strip(_GO_WHITE_SPACE)
+        if edge.get("parameters") == []:
+            edge.pop("parameters")
+        for selection in ("assignee_selection", "thinking_selection"):
+            if edge.get(selection) == "configured":
+                edge.pop(selection)
+        if (
+            edge.get("context_mode") == "new_session"
+            and edge.get("context_source") == {"kind": "immediate_source"}
+        ):
+            edge.pop("context_mode")
+            edge.pop("context_source")
     return projected
 
 
@@ -166,17 +193,46 @@ def plan_workflow_graph(
     desired_graph["nodes"] = desired_nodes
     desired_graph["transition_groups"] = desired_groups
     desired_graph["edges"] = desired_edges
-    desired_graph = native_graph_projection(desired_graph)
+    native_desired_graph = native_graph_projection(
+        desired_graph,
+        workflow_id=workflow_id,
+    )
+    native_source_graph = native_graph_projection(
+        graph,
+        workflow_id=workflow_id,
+    )
+    document_graph = deepcopy(native_desired_graph)
+    projected_edges = {
+        edge.get("id"): edge
+        for edge in document_graph.get("edges", [])
+        if isinstance(edge, dict)
+    }
+    for source_edge in desired_graph["edges"]:
+        edge = projected_edges.get(source_edge.get("id"))
+        if edge is None:
+            continue
+        for selection in ("assignee_selection", "thinking_selection"):
+            if source_edge.get(selection) == "configured":
+                edge[selection] = "configured"
+        if (
+            source_edge.get("context_mode") == "new_session"
+            and source_edge.get("context_source") == {"kind": "immediate_source"}
+        ):
+            edge["context_mode"] = "new_session"
+            edge["context_source"] = {"kind": "immediate_source"}
     document = deepcopy(inspected)
     document["workflow_id"] = workflow_id
     document["expected_version"] = expected_version
-    document["graph"] = desired_graph
+    document["graph"] = document_graph
 
     actual_node_keys = set(current_nodes)
     actual_edge_keys = set(current_edges)
     return WorkflowMutationPlan(
         document=document,
-        graph_changed=_canonical_json(desired_graph) != _canonical_json(graph),
+        graph_changed=(
+            _canonical_json(native_desired_graph)
+            != _canonical_json(native_source_graph)
+        ),
         metadata_changed=metadata_changed,
         added_nodes=tuple(node.key for node in spec.nodes if node.key not in actual_node_keys),
         removed_nodes=tuple(
@@ -194,6 +250,19 @@ def plan_workflow_graph(
 
 
 def graph_matches_spec(spec: WorkflowSpec, inspected: dict[str, Any]) -> bool:
+    """Compare workflow semantics across explicit source/native default encodings.
+
+    This is not the exact readback/effect-settlement comparator; callers that
+    settle an effect must compare the raw native document without projection.
+    """
+    workflow_id = inspected.get("workflow_id")
+    graph = inspected.get("graph")
+    if isinstance(graph, dict):
+        inspected = deepcopy(inspected)
+        inspected["graph"] = native_graph_projection(
+            graph,
+            workflow_id=workflow_id if isinstance(workflow_id, str) else None,
+        )
     return not plan_workflow_graph(
         spec,
         inspected,

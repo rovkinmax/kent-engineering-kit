@@ -54,10 +54,37 @@ Any later forward restore must be compatible with task state at restore time,
 not merely reproduce an old graph.
 
 `canonical-workflow-reconcile-plan-v2` admits one task-backed/linked Workflow
-with digest-confirmed compatibility. Preserve identities, links and defaults;
-Only `implement_replan` may be added. No migration or cross-project
-atomicity. Retirement remains a separate authorized effect. Publication
-does not authorize activation.
+with digest-confirmed compatibility. Preserve Workflow, task, Session, node,
+edge and transition-group identities; do not delete rows, reassign retained
+execution, or change node kinds. A graph delta may add source-qualified Script
+nodes and the exact connected edges/groups required by their routes. Added
+Agent, Start, Join, terminal and node-group rows remain unsupported. Every
+changed existing graph field has its own reviewed path and evidence
+disposition, including keys, prompts, parameters, transition IDs, endpoints,
+execution fields and approval flags. Added rows use `graph.added_node:<id>`,
+`graph.added_edge:<id>` and `graph.added_transition_group:<id>` paths.
+
+The source-admission frame is bound to one exact native ingress edge and
+target kind. Agent and Script ingress variants are closed; the selected entry
+route must not have a sibling route that bypasses admission. A v2 frame carries
+the complete `{project_id, workflow_id, source_admission}` object. A transition
+from approval-required to no-approval additionally requires an
+`authority:graph.edges:<id>.requires_approval` disposition and dispositions
+for pending decision identities. These review requirements never consume,
+answer or invalidate a decision.
+
+Native graph source projection is applied before target hashing and review. It
+removes only validated matching Workflow annotations and source encodings of
+native defaults (configured selection, immediate-source new-session context
+and empty parameters). It is not applied to native post-effect readback.
+Admission v1 remains unchanged. Admission v2 supports either an explicit
+`r2-installed` binding or a `plan-publication` binding. The latter validates a
+closed `delivery-source-publication-v1` receipt and published source closure;
+it does not use `project_memory`, require an R2 profile binding, initialize a
+Task, or create a legacy storage fallback.
+
+No migration or cross-project atomicity is implied. Retirement remains a
+separate authorized effect. Publication does not authorize activation.
 
 Before recovery, settle an attempted effect with read-only pre/poststate
 evidence. Missing pending payload is unknown, not empty. Fresh compatible
