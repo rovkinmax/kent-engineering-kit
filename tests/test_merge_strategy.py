@@ -103,6 +103,108 @@ class MergeStrategyTest(unittest.TestCase):
         )
         self.assertEqual(result.strategy, "squash")
 
+    def test_active_pull_request_rule_restricts_merge_methods(self) -> None:
+        payload = {
+            "repository": {
+                "mergeCommitAllowed": True,
+                "squashMergeAllowed": True,
+                "rebaseMergeAllowed": True,
+            },
+            "rulesets": [
+                {
+                    "enforcement": "active",
+                    "rules": [
+                        {
+                            "type": "pull_request",
+                            "parameters": {"allowed_merge_methods": ["squash"]},
+                        },
+                    ],
+                },
+            ],
+        }
+        automatic = resolve_github_merge_strategy("auto", payload)
+        self.assertEqual(automatic.outcome, "resolved")
+        self.assertEqual(automatic.strategy, "squash")
+        self.assertEqual(automatic.candidates, ("squash",))
+
+        explicit_rebase = resolve_github_merge_strategy("rebase", payload)
+        self.assertEqual(explicit_rebase.outcome, "needs_user_action")
+        self.assertEqual(explicit_rebase.code, "explicit_strategy_incompatible")
+        self.assertIsNone(explicit_rebase.strategy)
+
+        explicit_squash = resolve_github_merge_strategy("squash", payload)
+        self.assertEqual(explicit_squash.outcome, "resolved")
+        self.assertEqual(explicit_squash.strategy, "squash")
+
+    def test_all_active_pull_request_rules_intersect_without_union(self) -> None:
+        payload = {
+            "repository": {
+                "mergeCommitAllowed": True,
+                "squashMergeAllowed": True,
+                "rebaseMergeAllowed": True,
+            },
+            "rulesets": [
+                {
+                    "enforcement": "active",
+                    "rules": [{
+                        "type": "pull_request",
+                        "parameters": {
+                            "allowed_merge_methods": ["merge", "squash"],
+                        },
+                    }],
+                },
+                {
+                    "enforcement": "active",
+                    "rules": [{
+                        "type": "pull_request",
+                        "parameters": {
+                            "allowed_merge_methods": ["squash", "rebase"],
+                        },
+                    }],
+                },
+                {
+                    "enforcement": "disabled",
+                    "rules": [{
+                        "type": "pull_request",
+                        "parameters": {"allowed_merge_methods": ["rebase"]},
+                    }],
+                },
+            ],
+        }
+        result = resolve_github_merge_strategy("auto", payload)
+        self.assertEqual(result.outcome, "resolved")
+        self.assertEqual(result.strategy, "squash")
+        self.assertEqual(result.candidates, ("squash",))
+
+    def test_disjoint_active_pull_request_rules_do_not_fall_back(self) -> None:
+        payload = {
+            "repository": {
+                "mergeCommitAllowed": True,
+                "squashMergeAllowed": True,
+                "rebaseMergeAllowed": True,
+            },
+            "rulesets": [
+                {
+                    "enforcement": "active",
+                    "rules": [{
+                        "type": "pull_request",
+                        "parameters": {"allowed_merge_methods": ["merge"]},
+                    }],
+                },
+                {
+                    "enforcement": "active",
+                    "rules": [{
+                        "type": "pull_request",
+                        "parameters": {"allowed_merge_methods": ["rebase"]},
+                    }],
+                },
+            ],
+        }
+        result = resolve_github_merge_strategy("auto", payload)
+        self.assertEqual(result.outcome, "needs_user_action")
+        self.assertEqual(result.code, "no_compatible_strategy")
+        self.assertEqual(result.candidates, ())
+
     def test_cli_returns_structured_ambiguity(self) -> None:
         result = subprocess.run(
             [

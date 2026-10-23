@@ -31,6 +31,7 @@ def resolve_merge_strategy(
     *,
     required_linear_history: bool = False,
     merge_queue_method: str | None = None,
+    allowed_methods: Sequence[str] | None = None,
 ) -> MergeStrategyResolution:
     normalized_policy = policy.strip().lower()
     if normalized_policy not in {"auto", *MERGE_STRATEGIES}:
@@ -56,6 +57,31 @@ def resolve_merge_strategy(
     if required_linear_history:
         candidates.discard("merge")
 
+    if allowed_methods is not None:
+        if isinstance(allowed_methods, (str, bytes)):
+            return blocked(
+                "invalid_pull_request_methods",
+                "Pull-request rules must provide a list of allowed merge methods.",
+            )
+        normalized_allowed = {
+            method.strip().lower()
+            for method in allowed_methods
+            if isinstance(method, str) and method.strip()
+        }
+        if len(normalized_allowed) != len(allowed_methods):
+            return blocked(
+                "invalid_pull_request_methods",
+                "Pull-request rules contain an invalid allowed merge method.",
+            )
+        unknown_allowed = normalized_allowed.difference(MERGE_STRATEGIES)
+        if unknown_allowed:
+            return blocked(
+                "invalid_pull_request_methods",
+                "Pull-request rules contain unsupported merge methods: "
+                + ", ".join(sorted(unknown_allowed)),
+            )
+        candidates.intersection_update(normalized_allowed)
+
     normalized_queue_method = None
     if merge_queue_method is not None:
         normalized_queue_method = merge_queue_method.strip().lower()
@@ -79,7 +105,7 @@ def resolve_merge_strategy(
         return blocked(
             "explicit_strategy_incompatible",
             f"Explicit {normalized_policy} policy is incompatible with "
-            "repository, branch, or merge-queue constraints.",
+            "repository, branch, pull-request, or merge-queue constraints.",
             ordered_candidates,
         )
 
@@ -139,6 +165,7 @@ def resolve_github_merge_strategy(
 
     required_linear_history = github_requires_linear_history(payload)
     queue_methods = github_merge_queue_methods(payload)
+    pull_request_methods = github_pull_request_allowed_methods(payload)
     if len(queue_methods) > 1:
         return blocked(
             "conflicting_merge_queue_methods",
@@ -152,6 +179,7 @@ def resolve_github_merge_strategy(
         enabled_methods,
         required_linear_history=required_linear_history,
         merge_queue_method=queue_method,
+        allowed_methods=pull_request_methods,
     )
 
 
@@ -193,6 +221,39 @@ def github_merge_queue_methods(payload: Mapping[str, Any]) -> set[str]:
         if isinstance(method, str) and method.strip():
             methods.add(method.strip().lower())
     return methods
+
+
+def github_pull_request_allowed_methods(
+    payload: Mapping[str, Any],
+) -> set[str] | None:
+    """Intersect the explicit method constraints from active PR rules."""
+    constraints: list[set[str]] = []
+    for rule in active_github_rules(payload):
+        rule_type = str(rule.get("type", "")).replace("-", "_").lower()
+        if rule_type not in {"pull_request", "pullrequest"}:
+            continue
+        parameters = rule.get("parameters")
+        if not isinstance(parameters, Mapping):
+            return set()
+        if "allowed_merge_methods" not in parameters:
+            continue
+        methods = parameters["allowed_merge_methods"]
+        if (
+            not isinstance(methods, Sequence)
+            or isinstance(methods, (str, bytes))
+            or any(not isinstance(method, str) or not method.strip() for method in methods)
+        ):
+            return set()
+        normalized = {method.strip().lower() for method in methods}
+        if normalized.difference(MERGE_STRATEGIES):
+            return set()
+        constraints.append(normalized)
+    if not constraints:
+        return None
+    allowed = set(MERGE_STRATEGIES)
+    for constraint in constraints:
+        allowed.intersection_update(constraint)
+    return allowed
 
 
 def active_github_rules(

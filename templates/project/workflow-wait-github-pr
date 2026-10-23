@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import stat
 import tomllib
 import time
 from typing import Any
@@ -56,6 +57,21 @@ def _canonical(runtime: Any, value: object) -> str:
     return runtime.canonical_bytes(value).decode("utf-8")
 
 
+def _retry_delay_seconds(
+    error: Exception,
+    *,
+    interval: int,
+    failure_count: int,
+) -> int:
+    delay = getattr(error, "retry_delay_seconds", None)
+    if not callable(delay):
+        return interval
+    return max(
+        interval,
+        int(delay(interval=interval, failure_count=failure_count)),
+    )
+
+
 def _profile_ci_enabled(workspace: Path) -> bool:
     path = workspace / ".kent" / "workflow-profile.toml"
     try:
@@ -72,6 +88,95 @@ def _profile_ci_enabled(workspace: Path) -> bool:
     return isinstance(capabilities, dict) and (
         capabilities.get("ci_monitoring") is True
     )
+
+
+def _delivery_protocol_profile_enabled(workspace: Path) -> bool:
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptors: list[int] = []
+    try:
+        root_fd = os.open(workspace, directory_flags)
+        descriptors.append(root_fd)
+        kent_fd = os.open(".kent", directory_flags, dir_fd=root_fd)
+        descriptors.append(kent_fd)
+        profile_fd = os.open(
+            "workflow-profile.toml",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=kent_fd,
+        )
+        with os.fdopen(profile_fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or before.st_mode & 0o7022
+                or before.st_size > 64 * 1024
+            ):
+                raise ValueError("unsafe current delivery profile")
+            raw = stream.read(64 * 1024 + 1)
+            after = os.fstat(stream.fileno())
+            if (
+                len(raw) > 64 * 1024
+                or len(raw) != before.st_size
+                or (before.st_dev, before.st_ino, before.st_size,
+                    before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise ValueError("current delivery profile changed during read")
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ValueError("current delivery profile is unavailable") from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+    try:
+        profile = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError("current delivery profile is invalid") from error
+    policies = profile.get("policies", {})
+    versions = profile.get("command_versions", {})
+    return bool(
+        isinstance(policies, dict)
+        and policies.get("delivery_reliability") == "v1"
+    ) or bool(
+        isinstance(versions, dict)
+        and (
+            versions.get("runtime_contracts") == "2.1.0"
+            or versions.get("prepare_ci") == "3.0.0"
+        )
+    )
+
+
+def _current_delivery_protocol(
+    workspace: Path,
+    payload: dict[str, object],
+) -> dict[str, object] | None:
+    if not _delivery_protocol_profile_enabled(workspace):
+        return None
+    checkpoint = _sibling("workflow-checkpoint")
+    task = payload.get("task_short_id")
+    if task is not None and not isinstance(task, str):
+        raise ValueError("task_short_id is invalid")
+    result = checkpoint.current_script_delivery_protocol(
+        workspace,
+        task=task,
+        native_context=payload.get("_kent"),
+    )
+    if result is None:
+        return None
+    if result["node_key"] != "merge_watch":
+        raise ValueError("native Script is not the current PR watcher")
+    if result["target_required"]:
+        target = payload.get("pr_base_branch")
+        if not isinstance(target, str) or not target or target != target.strip():
+            raise ValueError("pr_base_branch is required by the current graph")
+    return result
 
 
 def _contract(
@@ -158,6 +263,8 @@ def _pr_report(
     checks: list[dict[str, object]] | None = None,
     observed_cursor: str | None = None,
     error: Exception | None = None,
+    expected_pr_base_branch: str | None = None,
+    observed_base_ref_name: object = None,
 ) -> str:
     value: dict[str, object] = {
         "reason": reason,
@@ -171,6 +278,9 @@ def _pr_report(
     }
     if observed_cursor is not None:
         value["observed_feedback_cursor"] = observed_cursor
+    if expected_pr_base_branch is not None:
+        value["expected_pr_base_branch"] = expected_pr_base_branch
+        value["observed_base_ref_name"] = observed_base_ref_name
     if error is not None:
         if hasattr(error, "as_dict"):
             value["safe_error"] = error.as_dict()
@@ -224,6 +334,14 @@ def main() -> int:
     pr_url = _text(payload, "pr_url")
     branch_name = _text(payload, "branch_name")
     merge_strategy = _text(payload, "merge_strategy")
+    expected_base_branch = payload.get("pr_base_branch")
+    if expected_base_branch is not None and (
+        not isinstance(expected_base_branch, str)
+        or not expected_base_branch
+        or expected_base_branch != expected_base_branch.strip()
+        or expected_base_branch.startswith("-")
+    ):
+        raise ValueError("pr_base_branch is invalid")
     initial_head = _text(payload, "pr_head_oid")
     initial_base = _text(payload, "pr_base_oid")
     if not workspace.is_dir():
@@ -248,12 +366,15 @@ def main() -> int:
         "branch_name": branch_name,
         "merge_strategy": merge_strategy,
     }
+    if expected_base_branch is not None:
+        values["pr_base_branch"] = expected_base_branch
     if contract_text is not None:
         values["ci_contract"] = contract_text
     if report_text is not None:
         values["ci_report"] = report_text
     if "task_short_id" in payload:
         values["task_short_id"] = _text(payload, "task_short_id")
+    _current_delivery_protocol(workspace, payload)
 
     test_mode = os.environ.get("KENT_PR_WATCH_TEST_MODE") == "1"
     interval = max(
@@ -279,17 +400,40 @@ def main() -> int:
             )
             observed = watcher.observe_pr(pr_url)
             pr = observed["pr"]
-            if pr.get("headRefName") != branch_name:
-                raise observation.ObservationError("invalid_observation")
             state = str(pr.get("state") or "").upper()
             head_oid = str(pr["headRefOid"])
             base_oid = str(pr["baseRefOid"])
+            if (
+                expected_base_branch is not None
+                and pr.get("baseRefName") != expected_base_branch
+            ):
+                emit(
+                    "merge_watch_state_changed",
+                    {
+                        **values,
+                        "pr_report": _pr_report(
+                            pr=pr,
+                            reason="pr_base_branch_changed",
+                            expected_pr_base_branch=expected_base_branch,
+                            observed_base_ref_name=pr.get("baseRefName"),
+                        ),
+                    },
+                    cursor=acknowledged_text,
+                )
+                return 0
+            if pr.get("headRefName") != branch_name:
+                raise observation.ObservationError("invalid_observation")
             if state == "MERGED":
                 merged_values = {
                     "workspace_path": values["workspace_path"],
                     "pr_url": values["pr_url"],
                     "branch_name": values["branch_name"],
                     "merge_strategy": values["merge_strategy"],
+                    **(
+                        {"pr_base_branch": expected_base_branch}
+                        if expected_base_branch is not None
+                        else {}
+                    ),
                     "merge_report": _merge_report(pr),
                 }
                 emit(
@@ -414,8 +558,17 @@ def main() -> int:
             raise
         except Exception as error:
             errors += 1
-            if errors < max_errors:
-                time.sleep(interval)
+            if (
+                errors < max_errors
+                and not getattr(error, "provider_retry_unknown", False)
+            ):
+                time.sleep(
+                    _retry_delay_seconds(
+                        error,
+                        interval=interval,
+                        failure_count=errors,
+                    )
+                )
                 continue
             emit(
                 "merge_watch_state_changed",

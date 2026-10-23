@@ -205,6 +205,451 @@ class OwnedGroupSettlementTest(unittest.TestCase):
                 process.stderr.close.assert_called_once()
 
 
+class ProviderRetryMetadataTransportTest(unittest.TestCase):
+    @staticmethod
+    def response(
+        status: int,
+        *,
+        headers: dict[str, str] | None = None,
+        body: str = "",
+        completed: bool = True,
+    ) -> bytes:
+        lines = [
+            "* Request at 2026-10-22 00:00:00 +0000 UTC",
+            "* Request to https://api.github.com/graphql",
+            "> Authorization: token secret-marker",
+            "> Retry-After: 9999999999",
+            "> X-RateLimit-Remaining: 0",
+            f"< HTTP/2.0 {status} response",
+        ]
+        lines.extend(
+            f"< {name}: {value}" for name, value in (headers or {}).items()
+        )
+        lines.extend(["", body])
+        if completed:
+            lines.append("* Request took 0.001s")
+        return ("\n".join(lines) + "\n").encode()
+
+    def test_retry_after_is_extracted_and_raw_trace_is_not_exposed(self):
+        trace = self.response(
+            429,
+            headers={"Retry-After": "120"},
+            body='{"message":"SECRET provider response body"}',
+        )
+        self.assertEqual(observation._provider_retry_metadata(trace), (True, 120))
+        error = ObservationError(
+            "query_failed",
+            stderr=trace,
+            rate_limited=True,
+            retry_after_seconds=120,
+        )
+        self.assertEqual(error.retry_delay_seconds(interval=30, failure_count=1), 120)
+        safe = repr(error.as_dict())
+        self.assertNotIn("secret-marker", safe)
+        self.assertNotIn("SECRET provider response body", safe)
+        self.assertNotIn("Retry-After", safe)
+        self.assertEqual(str(error), "query_failed")
+
+    def test_primary_limit_uses_reset_and_provider_date(self):
+        trace = self.response(
+            403,
+            headers={
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": "1060",
+                "Date": "Thu, 01 Jan 1970 00:16:40 GMT",
+            },
+            body='{"message":"API rate limit exceeded"}',
+        )
+        with mock.patch.object(observation.time, "time", return_value=1000):
+            self.assertEqual(observation._provider_retry_metadata(trace), (True, 60))
+
+    def test_secondary_without_timing_uses_fallback_and_invalid_timing_fails_closed(self):
+        secondary = self.response(
+            403,
+            headers={"X-RateLimit-Remaining": "12"},
+            body='{"message":"You have exceeded a secondary rate limit."}',
+        )
+        self.assertEqual(observation._provider_retry_metadata(secondary), (True, None))
+        error = ObservationError("query_failed", rate_limited=True)
+        self.assertEqual(error.retry_delay_seconds(interval=30, failure_count=1), 60)
+        self.assertEqual(error.retry_delay_seconds(interval=30, failure_count=2), 120)
+        self.assertEqual(error.retry_delay_seconds(interval=30, failure_count=20), 3600)
+        self.assertEqual(
+            ObservationError("query_failed").retry_delay_seconds(
+                interval=30,
+                failure_count=1,
+            ),
+            30,
+        )
+
+        invalid = self.response(
+            403,
+            headers={
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": "not-an-epoch",
+                "Date": "invalid date",
+            },
+            body='{"message":"API rate limit exceeded"}',
+        )
+        self.assertEqual(observation._provider_retry_metadata(invalid), (None, None))
+
+        invalid_retry_after = self.response(
+            429,
+            headers={"Retry-After": "invalid"},
+            body='{"message":"You have exceeded a secondary rate limit."}',
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(invalid_retry_after),
+            (None, None),
+        )
+
+    def test_http_date_retry_after_is_supported(self):
+        trace = self.response(
+            429,
+            headers={"Retry-After": "Thu, 01 Jan 1970 00:17:40 GMT"},
+        )
+        with mock.patch.object(observation.time, "time", return_value=1000):
+            self.assertEqual(observation._provider_retry_metadata(trace), (True, 60))
+
+    def test_permission_403_and_successful_empty_quota_are_not_retries(self):
+        permission = self.response(
+            403,
+            headers={"X-RateLimit-Remaining": "10"},
+            body='{"message":"Resource not accessible by integration"}',
+        )
+        invalid_retry = self.response(
+            403,
+            headers={
+                "Retry-After": "invalid date",
+                "X-RateLimit-Remaining": "10",
+            },
+            body='{"message":"Resource not accessible by integration"}',
+        )
+        success = self.response(
+            200,
+            headers={
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": "9999999999",
+            },
+            body='{"data":{"viewer":{"login":"user"}}}',
+        )
+        self.assertEqual(observation._provider_retry_metadata(permission), (False, None))
+        self.assertEqual(observation._provider_retry_metadata(success), (False, None))
+
+    def test_only_final_complete_response_is_considered(self):
+        throttled_then_success = self.response(
+            429,
+            headers={"Retry-After": "120"},
+        ) + self.response(200, body='{"data":{}}')
+        success_then_throttled = self.response(200, body='{"data":{}}') + self.response(
+            429,
+            headers={"Retry-After": "120"},
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(throttled_then_success),
+            (False, None),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(success_then_throttled),
+            (True, 120),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(
+                self.response(429, headers={"Retry-After": "120"}, completed=False)
+            ),
+            (None, None),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(
+                self.response(429, headers={"Retry-After": "120"})
+                + b"x" * (16 * 1024)
+                + b"\n"
+            ),
+            (None, None),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(b"x" * (16 * 1024) + b"\n"),
+            (None, None),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(b"provider transport failed\n"),
+            (None, None),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(
+                self.response(429, headers={"Retry-After": "x" * 65})
+            ),
+            (None, None),
+        )
+
+    def test_transport_scopes_debug_to_child_and_keeps_only_typed_error(self):
+        trace = self.response(
+            429,
+            headers={"Retry-After": "120"},
+            body='{"message":"SECRET response body"}',
+        ).decode()
+        command = (
+            "import os,sys; "
+            "assert os.environ.get('GH_DEBUG') == 'api'; "
+            "sys.stderr.write(sys.argv[1]); "
+            "sys.stdout.write('secret stdout'); "
+            "sys.exit(1)"
+        )
+        with self.assertRaises(ObservationError) as raised:
+            read_json(
+                sys.executable,
+                Path.cwd(),
+                ["-c", command, trace],
+                capture_provider_retry=True,
+            )
+        error = raised.exception
+        self.assertTrue(error.rate_limited)
+        self.assertEqual(error.retry_after_seconds, 120)
+        safe = repr(error.as_dict())
+        self.assertNotIn("secret stdout", safe)
+        self.assertNotIn("SECRET response body", safe)
+        self.assertNotIn("secret-marker", safe)
+
+    def test_invalid_or_oversized_transport_never_enables_retry(self):
+        trace = self.response(
+            429,
+            headers={"Retry-After": "120"},
+            body='{"message":"API rate limit exceeded"}',
+        ).decode()
+        command = "import sys; sys.stderr.write(sys.argv[1]); sys.stdout.write('not-json')"
+        with self.assertRaises(ObservationError) as raised:
+            read_json(
+                sys.executable,
+                Path.cwd(),
+                ["-c", command, trace],
+                capture_provider_retry=True,
+            )
+        self.assertEqual(raised.exception.code, "invalid_observation")
+        self.assertFalse(raised.exception.rate_limited)
+        self.assertTrue(raised.exception.provider_retry_unknown)
+
+        with self.assertRaises(ObservationError) as raised:
+            read_json(
+                sys.executable,
+                Path.cwd(),
+                ["-c", command, trace],
+                capture_provider_retry=True,
+                limit=80,
+            )
+        self.assertEqual(raised.exception.code, "observation_limit")
+        self.assertFalse(raised.exception.rate_limited)
+        self.assertTrue(raised.exception.provider_retry_unknown)
+
+
+class ProviderRetryDelayTest(unittest.TestCase):
+    @staticmethod
+    def response(status, *, headers=None, body="", completed=True):
+        lines = [
+            "* Request at 2026-10-22 00:00:00 +0000 UTC",
+            "* Request to https://api.github.com/graphql",
+            "> Authorization: token secret-marker",
+            f"< HTTP/2.0 {status} response",
+        ]
+        lines.extend(
+            f"< {name}: {value}" for name, value in (headers or {}).items()
+        )
+        lines.extend(["", body])
+        if completed:
+            lines.append("* Request took 0.001s")
+        return ("\n".join(lines) + "\n").encode()
+
+    def test_retry_after_is_private_and_authoritative(self):
+        trace = self.response(
+            429,
+            headers={"Retry-After": "120"},
+            body='{"message":"SECRET provider response body"}',
+        )
+        self.assertEqual(observation._provider_retry_metadata(trace), (True, 120))
+        error = ObservationError(
+            "query_failed",
+            stderr=trace,
+            rate_limited=True,
+            retry_after_seconds=120,
+        )
+        self.assertEqual(error.retry_delay_seconds(interval=30, failure_count=1), 120)
+        serialized = repr(error.as_dict())
+        self.assertNotIn("secret-marker", serialized)
+        self.assertNotIn("SECRET provider response body", serialized)
+        self.assertNotIn("Retry-After", serialized)
+        self.assertEqual(str(error), "query_failed")
+
+    def test_primary_reset_and_http_date_retry_after(self):
+        reset = self.response(
+            403,
+            headers={
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": "1060",
+                "Date": "Thu, 01 Jan 1970 00:16:40 GMT",
+            },
+            body='{"message":"API rate limit exceeded"}',
+        )
+        date_retry = self.response(
+            429,
+            headers={"Retry-After": "Thu, 01 Jan 1970 00:17:40 GMT"},
+        )
+        with mock.patch.object(observation.time, "time", return_value=1000):
+            self.assertEqual(observation._provider_retry_metadata(reset), (True, 60))
+            self.assertEqual(
+                observation._provider_retry_metadata(date_retry),
+                (True, 60),
+            )
+
+    def test_secondary_fallback_and_invalid_timing_fail_closed(self):
+        secondary = self.response(
+            403,
+            headers={"X-RateLimit-Remaining": "12"},
+            body='{"message":"You have exceeded a secondary rate limit."}',
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(secondary),
+            (True, None),
+        )
+        error = ObservationError("query_failed", rate_limited=True)
+        self.assertEqual(error.retry_delay_seconds(interval=30, failure_count=1), 60)
+        self.assertEqual(error.retry_delay_seconds(interval=30, failure_count=2), 120)
+        self.assertEqual(error.retry_delay_seconds(interval=30, failure_count=20), 3600)
+        self.assertEqual(
+            ObservationError("query_failed").retry_delay_seconds(
+                interval=30,
+                failure_count=1,
+            ),
+            30,
+        )
+        invalid = self.response(
+            403,
+            headers={
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": "not-an-epoch",
+                "Date": "invalid date",
+            },
+            body='{"message":"API rate limit exceeded"}',
+        )
+        self.assertEqual(observation._provider_retry_metadata(invalid), (None, None))
+
+    def test_permission_403_and_successful_exhausted_quota_are_not_retries(self):
+        permission = self.response(
+            403,
+            headers={"X-RateLimit-Remaining": "10"},
+            body='{"message":"Resource not accessible by integration"}',
+        )
+        invalid_retry = self.response(
+            403,
+            headers={
+                "Retry-After": "invalid date",
+                "X-RateLimit-Remaining": "10",
+            },
+            body='{"message":"Resource not accessible by integration"}',
+        )
+        success = self.response(
+            200,
+            headers={"X-RateLimit-Remaining": "0"},
+            body='{"data":{"viewer":{"login":"user"}}}',
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(permission),
+            (False, None),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(success),
+            (False, None),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(invalid_retry),
+            (False, None),
+        )
+
+    def test_final_request_only_and_incomplete_or_oversized_fail_closed(self):
+        throttled_then_success = self.response(
+            429,
+            headers={"Retry-After": "120"},
+        ) + self.response(200, body='{"data":{}}')
+        success_then_throttled = self.response(
+            200,
+            body='{"data":{}}',
+        ) + self.response(429, headers={"Retry-After": "120"})
+        self.assertEqual(
+            observation._provider_retry_metadata(throttled_then_success),
+            (False, None),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(success_then_throttled),
+            (True, 120),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(
+                self.response(429, headers={"Retry-After": "120"}, completed=False)
+            ),
+            (None, None),
+        )
+        self.assertEqual(
+            observation._provider_retry_metadata(
+                self.response(429, headers={"Retry-After": "120"})
+                + b"x" * (16 * 1024)
+                + b"\n"
+            ),
+            (None, None),
+        )
+
+    def test_transport_scopes_trace_to_child_and_only_exposes_hashes(self):
+        trace = self.response(
+            429,
+            headers={"Retry-After": "120"},
+            body='{"message":"SECRET response body"}',
+        ).decode()
+        code = (
+            "import os,sys; assert os.environ.get('GH_DEBUG') == 'api'; "
+            "sys.stderr.write(sys.argv[1]); sys.stdout.write('secret stdout'); "
+            "sys.exit(1)"
+        )
+        with self.assertRaises(ObservationError) as raised:
+            read_json(
+                sys.executable,
+                Path.cwd(),
+                ["-c", code, trace],
+                capture_provider_retry=True,
+            )
+        error = raised.exception
+        self.assertTrue(error.rate_limited)
+        self.assertEqual(error.retry_after_seconds, 120)
+        serialized = repr(error.as_dict())
+        self.assertNotIn("secret stdout", serialized)
+        self.assertNotIn("SECRET response body", serialized)
+        self.assertNotIn("secret-marker", serialized)
+
+    def test_invalid_or_limited_transport_cannot_trigger_retry(self):
+        trace = self.response(
+            429,
+            headers={"Retry-After": "120"},
+            body='{"message":"API rate limit exceeded"}',
+        ).decode()
+        code = "import sys; sys.stderr.write(sys.argv[1]); sys.stdout.write('not-json')"
+        with self.assertRaises(ObservationError) as raised:
+            read_json(
+                sys.executable,
+                Path.cwd(),
+                ["-c", code, trace],
+                capture_provider_retry=True,
+            )
+        self.assertEqual(raised.exception.code, "invalid_observation")
+        self.assertFalse(raised.exception.rate_limited)
+
+        with self.assertRaises(ObservationError) as raised:
+            read_json(
+                sys.executable,
+                Path.cwd(),
+                ["-c", code, trace],
+                capture_provider_retry=True,
+                limit=80,
+            )
+        self.assertEqual(raised.exception.code, "observation_limit")
+        self.assertFalse(raised.exception.rate_limited)
+
+
 def pr(**changes):
     return {
         "url": URL, "state": "OPEN", "headRefOid": HEAD, "baseRefOid": BASE,
@@ -237,6 +682,7 @@ class FakeGitHub:
         self.threads = [thread_page()] if threads is None else threads
         self.calls = []
         self.pr_reads = 0
+        self.thread_page_index = 0
 
     def __call__(self, args):
         self.calls.append(args)
@@ -246,7 +692,9 @@ class FakeGitHub:
         if args[:2] == ["pr", "checks"]:
             return deepcopy(self.checks)
         if args[:2] == ["api", "graphql"]:
-            return deepcopy(self.threads)
+            index = min(self.thread_page_index, len(self.threads) - 1)
+            self.thread_page_index += 1
+            return deepcopy(self.threads[index])
         if any("/issues/" in arg for arg in args):
             return deepcopy(self.comments)
         if args[0] == "api":
@@ -287,6 +735,79 @@ class GitHubObservationTest(unittest.TestCase):
         fake = FakeGitHub(first=pr(statusCheckRollup=[]))
         self.assertEqual(self.observe(fake)["checks"], [])
         self.assertFalse(any(args[:2] == ["pr", "checks"] for args in fake.calls))
+
+    def test_final_rollup_change_cannot_be_paired_with_stale_checks(self):
+        cases = (
+            (
+                pr(statusCheckRollup=[]),
+                pr(statusCheckRollup=[{"name": "required", "conclusion": "FAILURE"}]),
+                [],
+            ),
+            (
+                pr(statusCheckRollup=[{"name": "required", "conclusion": "SUCCESS"}]),
+                pr(statusCheckRollup=[{"name": "required", "status": "IN_PROGRESS"}]),
+                [check()],
+            ),
+        )
+        for first, last, checks in cases:
+            with self.subTest(first=first["statusCheckRollup"], last=last["statusCheckRollup"]):
+                fake = FakeGitHub(first=first, last=last, checks=checks)
+                with self.assertRaises(ObservationError) as raised:
+                    self.observe(fake)
+                self.assertEqual(raised.exception.code, "source_changed")
+
+    def test_identical_final_rollup_keeps_stable_check_classification(self):
+        fake = FakeGitHub(
+            first=pr(statusCheckRollup=[{"name": "required", "conclusion": "SUCCESS"}]),
+            last=pr(statusCheckRollup=[{"name": "required", "conclusion": "SUCCESS"}]),
+        )
+        self.assertEqual(self.observe(fake)["checks"][0]["state"], "SUCCESS")
+
+    def test_startup_failure_pending_bucket_is_normalized_to_failure(self):
+        fake = FakeGitHub(checks=[check(
+            state="STARTUP_FAILURE",
+            bucket="pending",
+        )])
+        result = self.observe(fake)
+        self.assertEqual(result["checks"][0]["state"], "STARTUP_FAILURE")
+        self.assertEqual(result["checks"][0]["bucket"], "fail")
+
+    def test_outer_thread_pagination_sends_only_the_outer_cursor(self):
+        def node(index):
+            return {
+                "id": f"THREAD-{index}",
+                "isResolved": False,
+                "isOutdated": False,
+                "path": "app.py",
+                "subjectType": "LINE",
+                "line": index + 1,
+                "startLine": None,
+                "originalLine": index + 1,
+                "originalStartLine": None,
+                "comments": {
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                },
+            }
+
+        first = [node(index) for index in range(100)]
+        second = [node(100)]
+        fake = FakeGitHub(threads=[
+            thread_page(first, more=True, cursor="OUTER-THREADS-100"),
+            thread_page(second),
+        ])
+        result = self.observe(fake)
+        outer_queries = [
+            args for args in fake.calls
+            if args[:2] == ["api", "graphql"]
+            and not any(argument.startswith("threadId=") for argument in args)
+        ]
+        self.assertEqual(len(result["feedback_items"]), 101)
+        self.assertEqual(len(outer_queries), 2)
+        self.assertIn("endCursor=null", outer_queries[0])
+        self.assertIn("endCursor=OUTER-THREADS-100", outer_queries[1])
+        self.assertNotIn("--paginate", outer_queries[0])
+        self.assertNotIn("--slurp", outer_queries[0])
 
     def test_head_or_base_change_rejects_mixed_observation(self):
         for change in ({"headRefOid": "c" * 40}, {"baseRefOid": "d" * 40}):
@@ -442,7 +963,7 @@ class GitHubObservationTest(unittest.TestCase):
                             }
                         }
                     }
-                return [deepcopy(top_page)]
+                return deepcopy(top_page)
             if args[0] == "api":
                 return [[]]
             raise AssertionError(args)
@@ -492,7 +1013,7 @@ class GitHubObservationTest(unittest.TestCase):
                             }
                         }
                     }
-                return [thread_page([thread])]
+                return thread_page([thread])
             if args[0] == "api":
                 return [[]]
             raise AssertionError(args)
