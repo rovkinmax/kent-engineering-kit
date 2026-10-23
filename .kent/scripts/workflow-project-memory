@@ -1147,8 +1147,15 @@ def workflow_dispatch(core, request, body=None):
         current = store.read(f"tasks/{task}/plan")
         supplied = (current if request["plan_path"] == "not-applicable"
                     else store.plan_revision(task, request["plan_path"]))
-        return {"supplied_revision": supplied.token, "working_revision": current.token,
-                "working_path": str(current.path), "working_sha256": current.sha256}
+        comparison = store.compare_plan_revisions(task, supplied.token, current.token)
+        return {
+            "supplied_revision": supplied.token,
+            "supplied_sha256": comparison["supplied_sha256"],
+            "supplied_comparison": comparison["comparison"],
+            "working_revision": current.token,
+            "working_path": str(current.path),
+            "working_sha256": comparison["working_sha256"],
+        }
     if operation == "prepare-report-only":
         require_acceptance_script(core, request)
         revision = store.publish(

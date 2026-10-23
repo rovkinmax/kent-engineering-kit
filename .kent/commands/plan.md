@@ -48,6 +48,13 @@ effects. Preserve the requested endpoint and accepted effect-specific authority
 without repeated stage permissions; new scope, risk or independent judgment
 still requires a decision.
 
+When a declared route carries `delivery_context`, preserve its exact supported
+v1/v2 packet; do not put transport state in the plan digest or infer
+`pr_base_branch`. For compaction or workflow-reset lock refresh, follow
+`global/AGENTS.md`: verify the native compaction event and refreshed lock;
+the Session ID may remain unchanged, and source publication alone does not
+refresh an existing Session's locked instructions.
+
 Record actual delivery identities/results in progress evidence, not by
 rewriting the frozen preview. Installed acceptance requires installed-byte
 readback and fresh instruction loading; source tests or a merged PR alone

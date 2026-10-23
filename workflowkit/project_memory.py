@@ -20,6 +20,21 @@ KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 TOKEN = re.compile(r"[0-9a-f]{64}\Z")
 CHECKBOX = re.compile(r"^(\s*(?:(?:[-*+]|\d+[.)])\s+|#{1,6}\s+)\[)[ xX](\])",
                       re.MULTILINE)
+OPERATIONAL_CHECKBOX = re.compile(
+    r"^( {0,3}(?:[-*+]|\d+[.)]|#{1,6}) {1,4}\[)([ xX])(\])"
+)
+FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE_CLOSE = re.compile(r"^ {0,3}(`+|~+)[ \t]*$")
+HTML_BLOCK_TAG = re.compile(
+    r"^ {0,3}</?(?:address|article|aside|base|basefont|blockquote|body|caption|"
+    r"center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|"
+    r"figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|"
+    r"legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|"
+    r"p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|"
+    r"tr|track|ul)(?:[ \t/>]|$)",
+    re.IGNORECASE,
+)
+HTML_STANDALONE_TAG = re.compile(r"^ {0,3}</?[A-Za-z][^\r\n]*>[ \t]*$")
 
 
 class MemoryError(ValueError):
@@ -100,6 +115,218 @@ def _closed(value: dict[str, Any], keys: set[str], schema: str) -> None:
 def _normalized(text: str) -> str:
     text = CHECKBOX.sub(r"\1 \2", text.replace("\r\n", "\n").replace("\r", "\n"))
     return "\n".join(line.rstrip() for line in text.split("\n")).rstrip("\n") + "\n"
+
+
+def _markdown_lines(text: str) -> list[str]:
+    """Split only on CommonMark line endings, retaining their original bytes."""
+    lines: list[str] = []
+    start = 0
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] == "\r":
+            end = cursor + 1
+            if end < len(text) and text[end] == "\n":
+                end += 1
+            lines.append(text[start:end])
+            start = end
+            cursor = end
+        elif text[cursor] == "\n":
+            end = cursor + 1
+            lines.append(text[start:end])
+            start = end
+            cursor = end
+        else:
+            cursor += 1
+    if start < len(text):
+        lines.append(text[start:])
+    return lines
+
+
+def _plan_content_comparison(accepted: bytes, working: bytes) -> str:
+    """Compare exact plan bytes, allowing only proven task-checkbox progress."""
+    if accepted == working:
+        return "exact"
+    try:
+        left = accepted.decode("utf-8")
+        right = working.decode("utf-8")
+    except UnicodeError:
+        return "changed"
+
+    def positions(text: str) -> dict[int, int]:
+        lines = _markdown_lines(text)
+        bodies = [line.rstrip("\r\n") for line in lines]
+        starts: list[int] = []
+        cursor = 0
+        for line in lines:
+            starts.append(cursor)
+            cursor += len(line)
+
+        literal_lines: set[int] = set()
+        fence: tuple[str, int] | None = None
+        html_mode: str | None = None
+        html_block = False
+        directive = False
+        frontmatter = False
+        frontmatter_candidate = True
+        for index, body in enumerate(bodies):
+            if fence is not None:
+                literal_lines.add(index)
+                closing = FENCE_CLOSE.match(body)
+                if (closing and closing.group(1)[0] == fence[0]
+                        and len(closing.group(1)) >= fence[1]):
+                    fence = None
+                continue
+            opening = FENCE_OPEN.match(body)
+            if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+                literal_lines.add(index)
+                fence = (opening.group(1)[0], len(opening.group(1)))
+                continue
+
+            if directive:
+                literal_lines.add(index)
+                if re.match(r"^ {0,3}:::+[ \t]*$", body):
+                    directive = False
+                continue
+            if re.match(r"^ {0,3}:::+(?:[ \t]+.*)?$", body):
+                literal_lines.add(index)
+                directive = True
+                continue
+            if frontmatter:
+                literal_lines.add(index)
+                if body.strip() in {"---", "..."}:
+                    frontmatter = False
+                continue
+            if frontmatter_candidate and not body.strip():
+                continue
+            if frontmatter_candidate:
+                frontmatter_candidate = False
+                if body.strip() == "---":
+                    literal_lines.add(index)
+                    frontmatter = True
+                    continue
+
+            stripped = body.lstrip(" ")
+            if len(body) - len(stripped) >= 4 or body.startswith("\t"):
+                literal_lines.add(index)
+                continue
+
+            if html_mode is not None:
+                literal_lines.add(index)
+                if html_mode.lower() in body.lower():
+                    html_mode = None
+                continue
+            if html_block:
+                literal_lines.add(index)
+                if not body.strip():
+                    html_block = False
+                continue
+            if "<!--" in body:
+                literal_lines.add(index)
+                if "-->" not in body[body.index("<!--") + 4:]:
+                    html_mode = "-->"
+                continue
+            raw_tag = re.match(r"^ {0,3}<(script|style|pre|textarea)\b", body, re.IGNORECASE)
+            if raw_tag is not None:
+                literal_lines.add(index)
+                closing = f"</{raw_tag.group(1)}"
+                if closing.lower() not in body.lower():
+                    html_mode = closing
+                continue
+            if "<![CDATA[" in body:
+                literal_lines.add(index)
+                if "]]>" not in body[body.index("<![CDATA[") + 9:]:
+                    html_mode = "]]>"
+            elif "<?" in body:
+                literal_lines.add(index)
+                if "?>" not in body[body.index("<?") + 2:]:
+                    html_mode = "?>"
+            elif re.search(r"<![A-Z]", body):
+                literal_lines.add(index)
+                if ">" not in body[body.index("<!") + 2:]:
+                    html_mode = ">"
+            elif HTML_BLOCK_TAG.match(body):
+                literal_lines.add(index)
+                html_block = True
+            elif HTML_STANDALONE_TAG.match(body):
+                # Type 7 HTML blocks permit any complete standalone tag name.
+                literal_lines.add(index)
+                html_block = True
+
+        inline_spans: list[tuple[int, int]] = []
+        runs: list[tuple[int, int, int, int]] = []
+        paragraph = 0
+        for index, body in enumerate(bodies):
+            if index in literal_lines or not body.strip():
+                paragraph += 1
+                continue
+            for match in re.finditer(r"`+", body):
+                slash_count = 0
+                before = match.start() - 1
+                while before >= 0 and body[before] == "\\":
+                    slash_count += 1
+                    before -= 1
+                if slash_count % 2 == 0:
+                    runs.append((
+                        starts[index] + match.start(), len(match.group()), index,
+                        paragraph,
+                    ))
+        next_same: list[int | None] = [None] * len(runs)
+        next_by_width: dict[tuple[int, int], int] = {}
+        for run_index in range(len(runs) - 1, -1, -1):
+            _, width, _, paragraph = runs[run_index]
+            key = (paragraph, width)
+            next_same[run_index] = next_by_width.get(key)
+            next_by_width[key] = run_index
+        run_index = 0
+        while run_index < len(runs):
+            end_index = next_same[run_index]
+            if end_index is not None:
+                begin, width, _, _ = runs[run_index]
+                end = runs[end_index][0] + width
+                inline_spans.append((begin, end))
+                run_index = end_index + 1
+            else:
+                run_index += 1
+
+        result: dict[int, int] = {}
+        span_index = 0
+        for index, body in enumerate(bodies):
+            if index in literal_lines:
+                continue
+            match = OPERATIONAL_CHECKBOX.match(body)
+            if match is None:
+                continue
+            marker = starts[index] + match.start(2)
+            while (span_index < len(inline_spans)
+                   and inline_spans[span_index][1] <= marker):
+                span_index += 1
+            if (span_index < len(inline_spans)
+                    and inline_spans[span_index][0] <= marker
+                    < inline_spans[span_index][1]):
+                continue
+            result[index] = match.start(2)
+        return result
+
+    left_lines = _markdown_lines(left)
+    right_lines = _markdown_lines(right)
+    if len(left_lines) != len(right_lines):
+        return "changed"
+    left_positions, right_positions = positions(left), positions(right)
+    changed = False
+    for index, (before, after) in enumerate(zip(left_lines, right_lines)):
+        if before == after:
+            continue
+        before_position = left_positions.get(index)
+        after_position = right_positions.get(index)
+        if (before_position is None or before_position != after_position
+                or len(before) != len(after)
+                or before[before_position] not in " xX"
+                or after[after_position] not in " xX"
+                or before[:before_position] + before[before_position + 1:]
+                != after[:after_position] + after[after_position + 1:]):
+            return "changed"
+        changed = True
+    return "checkbox_progress" if changed else "changed"
 
 
 def _references(refs: Any, fields: set[str], *, digest_field: bool = False) -> None:
@@ -609,6 +836,26 @@ class ProjectMemory:
             raise MemoryError("plan locator is outside task revisions")
         return self._revision(key, candidate.parent.name)
 
+    def compare_plan_revisions(
+        self, task_key: str, supplied_revision: str, working_revision: str,
+    ) -> dict[str, str]:
+        key = self._document(f"tasks/{task_key}/plan")
+        self._task(task_key)
+        supplied = self._revision(key, supplied_revision)
+        working = self._revision(key, working_revision)
+        with self._directory(f"{key}/revisions/{supplied.token}") as supplied_fd:
+            supplied_raw = _read(supplied_fd, "content.md")
+        with self._directory(f"{key}/revisions/{working.token}") as working_fd:
+            working_raw = _read(working_fd, "content.md")
+        if (_digest(supplied_raw) != supplied.sha256
+                or _digest(working_raw) != working.sha256):
+            raise Conflict("plan revision content changed during comparison")
+        return {
+            "supplied_sha256": supplied.sha256,
+            "working_sha256": working.sha256,
+            "comparison": _plan_content_comparison(supplied_raw, working_raw),
+        }
+
     def check_plan(self, task_key: str, *, coder_selection: dict[str, Any] | None = None
                    ) -> dict[str, Any]:
         selection_digest = _selection_digest(coder_selection)
@@ -649,17 +896,25 @@ class ProjectMemory:
                 raise MemoryError("accepted coder selection mismatch")
             historical = self._revision(key, snapshot["revision_token"])
             with self._directory(f"{key}/revisions/{historical.token}") as history_fd:
-                historical_normalized = _normalized(_read(history_fd, "content.md").decode())
-            if (snapshot["raw_sha256"] != historical.sha256
+                historical_raw = _read(history_fd, "content.md")
+                historical_normalized = _normalized(historical_raw.decode())
+            if (_digest(historical_raw) != historical.sha256
+                    or snapshot["raw_sha256"] != historical.sha256
                     or snapshot["normalized_plan"] != historical_normalized
                     or snapshot["normalized_sha256"] != _digest(historical_normalized.encode())):
                 raise MemoryError("accepted snapshot content mismatch")
             with self._directory(f"{key}/revisions/{current}") as revision_fd:
-                normalized = _normalized(_read(revision_fd, "content.md").decode())
-            return {"comparison": "unchanged" if _digest(normalized.encode()) ==
-                    snapshot["normalized_sha256"] and selection_digest ==
+                working_raw = _read(revision_fd, "content.md")
+            if _digest(working_raw) != working.sha256:
+                raise Conflict("working plan changed during comparison")
+            raw_comparison = _plan_content_comparison(historical_raw, working_raw)
+            return {"comparison": "unchanged" if raw_comparison in {
+                    "exact", "checkbox_progress"} and selection_digest ==
                     snapshot["coder_selection_sha256"] else "changed",
+                    "raw_comparison": raw_comparison,
                     "working_revision": current, "working_path": str(working.path),
+                    "working_sha256": working.sha256,
+                    "accepted_raw_sha256": historical.sha256,
                     "accepted_snapshot": accepted,
                     "accepted_path": str(self.path / f"tasks/{task_key}/accepted/{accepted}.json"),
                     "accepted": snapshot}
