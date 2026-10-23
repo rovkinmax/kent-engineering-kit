@@ -1202,7 +1202,9 @@ NATIVE_MAX_SELECTED_EVENT_BYTES = 32 * 1024 * 1024
 NATIVE_MAX_DB_JSON_BYTES = 8 * 1024 * 1024
 NATIVE_MAX_DB_COMPONENT_BYTES = 32 * 1024 * 1024
 SOURCE_ADMISSION_SCHEMA = 'delivery-source-admission-v1'
+SOURCE_ADMISSION_V2_SCHEMA = 'delivery-source-admission-v2'
 SOURCE_RECEIPT_SCHEMA = 'delivery-runtime-publication-v1'
+SOURCE_ONLY_RECEIPT_SCHEMA = 'delivery-source-publication-v1'
 SOURCE_BINDING_SCHEMA = 'r2-installation-binding-v2'
 SOURCE_INSPECTION_SCHEMA = 'delivery-source-inspection-v1'
 SOURCE_RECEIPT_FILE_LIMIT = 512
@@ -1489,11 +1491,62 @@ def _source_json(raw: bytes, label: str) -> dict[str, Any]:
 def _v2_source_admission(value: Any, label: str) -> dict[str, Any] | None:
     if value is None:
         return None
-    item = _closed(value, {
-        'schema', 'receipt_ref', 'installation_binding_sha256', 'primary_workspace_id',
-        'primary_root', 'kit_root', 'source_ref', 'kit_ref', 'ci_helper', 'helper_bindings',
-    }, label)
-    if item.get('schema') != SOURCE_ADMISSION_SCHEMA:
+    schema = value.get('schema') if isinstance(value, dict) else None
+    if schema == SOURCE_ADMISSION_SCHEMA:
+        item = _closed(value, {
+            'schema', 'receipt_ref', 'installation_binding_sha256', 'primary_workspace_id',
+            'primary_root', 'kit_root', 'source_ref', 'kit_ref', 'ci_helper', 'helper_bindings',
+        }, label)
+        binding = {
+            'kind': 'r2-installed',
+            'installation_binding_sha256': _sha256(
+                _required(item, 'installation_binding_sha256', label),
+                f'{label}.installation_binding_sha256',
+            ),
+        }
+        ingress = None
+    elif schema == SOURCE_ADMISSION_V2_SCHEMA:
+        item = _closed(value, {
+            'schema', 'receipt_ref', 'primary_workspace_id', 'primary_root', 'kit_root',
+            'source_ref', 'kit_ref', 'ci_helper', 'helper_bindings', 'binding', 'ingress',
+        }, label)
+        raw_binding = _required(item, 'binding', label)
+        if raw_binding == {'kind': 'plan-publication'}:
+            binding = {'kind': 'plan-publication'}
+        else:
+            raw_binding = _closed(
+                raw_binding,
+                {'kind', 'installation_binding_sha256'},
+                f'{label}.binding',
+            )
+            if raw_binding.get('kind') != 'r2-installed':
+                raise PlanValidationError(f'{label}.binding variant is unsupported')
+            binding = {
+                'kind': 'r2-installed',
+                'installation_binding_sha256': _sha256(
+                    _required(raw_binding, 'installation_binding_sha256', f'{label}.binding'),
+                    f'{label}.binding.installation_binding_sha256',
+                ),
+            }
+        raw_ingress = _closed(
+            _required(item, 'ingress', label),
+            {'kind', 'edge_id'},
+            f'{label}.ingress',
+        )
+        ingress_kind = _string(
+            _required(raw_ingress, 'kind', f'{label}.ingress'),
+            f'{label}.ingress.kind',
+        )
+        if ingress_kind not in {'agent-edge', 'script-edge'}:
+            raise PlanValidationError(f'{label}.ingress.kind is unsupported')
+        ingress = {
+            'kind': ingress_kind,
+            'edge_id': _string(
+                _required(raw_ingress, 'edge_id', f'{label}.ingress'),
+                f'{label}.ingress.edge_id',
+            ),
+        }
+    else:
         raise PlanValidationError(f'{label}.schema is unsupported')
     receipt_ref = _closed(
         _required(item, 'receipt_ref', label),
@@ -1507,10 +1560,6 @@ def _v2_source_admission(value: Any, label: str) -> dict[str, Any] | None:
     receipt_sha256 = _sha256(
         _required(receipt_ref, 'sha256', f'{label}.receipt_ref'),
         f'{label}.receipt_ref.sha256',
-    )
-    binding_sha256 = _sha256(
-        _required(item, 'installation_binding_sha256', label),
-        f'{label}.installation_binding_sha256',
     )
     workspace_id = _string(
         _required(item, 'primary_workspace_id', label),
@@ -1552,10 +1601,9 @@ def _v2_source_admission(value: Any, label: str) -> dict[str, Any] | None:
         )
         helper_bindings.append({'link': str(link), 'target': str(target)})
     _unique([row['link'] for row in helper_bindings], f'{label}.helper_bindings')
-    return {
-        'schema': SOURCE_ADMISSION_SCHEMA,
+    result = {
+        'schema': schema,
         'receipt_ref': {'path': str(receipt_path), 'sha256': receipt_sha256},
-        'installation_binding_sha256': binding_sha256,
         'primary_workspace_id': workspace_id,
         'primary_root': str(primary_root),
         'kit_root': str(kit_root),
@@ -1563,7 +1611,14 @@ def _v2_source_admission(value: Any, label: str) -> dict[str, Any] | None:
         'kit_ref': kit_ref,
         'ci_helper': str(ci_helper),
         'helper_bindings': helper_bindings,
+        'binding': binding,
     }
+    if schema == SOURCE_ADMISSION_SCHEMA:
+        result['installation_binding_sha256'] = binding['installation_binding_sha256']
+        result.pop('binding')
+    else:
+        result['ingress'] = ingress
+    return result
 
 
 def _source_native_identity(
@@ -1659,16 +1714,122 @@ def _source_binding(
 ) -> tuple[dict[str, Any], dict[str, Any], bytes, bytes, bytes, str]:
     primary_root = _source_canonical_root(value['primary_root'], 'source_admission.primary_root')
     kit_root = _source_canonical_root(value['kit_root'], 'source_admission.kit_root')
-    if primary_root != project_root:
+    source_only = (
+        value.get('schema') == SOURCE_ADMISSION_V2_SCHEMA
+        and value.get('binding', {}).get('kind') == 'plan-publication'
+    )
+    if not source_only and primary_root != project_root:
         raise PlanValidationError('source primary root differs from the plan project root')
     native_workspace_id = _source_native_identity(
         project_id=project_id,
         project_root=project_root,
-        primary_root=primary_root,
+        primary_root=primary_root if source_only else project_root,
         kent_path=kent_path,
     )
     if native_workspace_id != value['primary_workspace_id']:
         raise PlanValidationError('source primary workspace ID differs from native readback')
+    if source_only:
+        receipt_path, receipt_raw, _ = _read_source_record(
+            value['receipt_ref']['path'],
+            label='source publication receipt',
+            maximum=SOURCE_RECEIPT_BYTES_LIMIT,
+            private=True,
+        )
+        if sha256_bytes(receipt_raw) != value['receipt_ref']['sha256']:
+            raise PlanValidationError('source publication receipt digest differs')
+        receipt = _source_json(receipt_raw, 'source publication receipt')
+        receipt = _closed(receipt, {
+            'schema', 'project_id', 'workflow_id', 'source_commit', 'kit_commit',
+            'runtime_roots', 'files', 'policy', 'local_inputs',
+        }, 'source publication receipt')
+        if (
+            receipt.get('schema') != SOURCE_ONLY_RECEIPT_SCHEMA
+            or receipt.get('project_id') != project_id
+            or receipt.get('policy') != 'published_source_v1'
+        ):
+            raise PlanValidationError('source publication receipt identity differs')
+        bootstrap_workflow_id = _uuid(
+            receipt.get('workflow_id'), 'source receipt workflow_id',
+        )
+        for name in ('source_commit', 'kit_commit'):
+            _sha1(receipt.get(name), f'source publication receipt.{name}')
+        roots = receipt.get('runtime_roots')
+        if not isinstance(roots, list) or not roots or len(roots) > MAX_LIST:
+            raise PlanValidationError('source publication runtime roots are invalid')
+        normalized_roots = [
+            _source_canonical_root(root, 'source publication runtime root')
+            for root in roots
+        ]
+        _unique([str(root) for root in normalized_roots], 'source publication runtime roots')
+        if primary_root not in normalized_roots or kit_root not in normalized_roots:
+            raise PlanValidationError('source publication roots differ from admission')
+        files = receipt.get('files')
+        local_inputs = receipt.get('local_inputs')
+        if (
+            not isinstance(files, list) or not files
+            or len(files) > SOURCE_RECEIPT_FILE_LIMIT
+            or not isinstance(local_inputs, list)
+            or len(files) + len(local_inputs) > SOURCE_RECEIPT_FILE_LIMIT
+        ):
+            raise PlanValidationError('source publication file inventory is invalid')
+        seen: set[tuple[str, str]] = set()
+        total = 0
+        for local, items in ((False, files), (True, local_inputs)):
+            for item in items:
+                item = _closed(
+                    item,
+                    {'root', 'relative_path', 'sha256', 'byte_size', 'mode'}
+                    | ({'kind'} if local else set()),
+                    'source publication entry',
+                )
+                name = item['relative_path']
+                source_root = item['root']
+                if (
+                    not isinstance(name, str) or not name or name.startswith('/')
+                    or '\\' in name or '\x00' in name
+                    or any(part in ('', '.', '..') for part in name.split('/'))
+                    or not isinstance(source_root, str) or source_root not in roots
+                ):
+                    raise PlanValidationError('source publication path is invalid')
+                _sha256(item['sha256'], 'source publication entry.sha256')
+                if (
+                    type(item['byte_size']) is not int
+                    or not 0 <= item['byte_size'] <= SOURCE_FILE_BYTES_LIMIT
+                    or type(item['mode']) is not int
+                    or not 0 <= item['mode'] <= 0o777
+                    or item['mode'] & 0o022
+                ):
+                    raise PlanValidationError('source publication metadata is invalid')
+                if (source_root, name) in seen:
+                    raise PlanValidationError('duplicate source publication entry')
+                if local and (
+                    item['kind'] != 'local-instruction'
+                    or source_root not in {str(primary_root), str(kit_root)}
+                    or not name.startswith('.kent/skills/')
+                    or not name.endswith('.md')
+                    or any(c in name for c in '*?[]')
+                    or item['mode'] & 0o111
+                    or any(other_root == source_root and (
+                        other.startswith(name + '/') or name.startswith(other + '/'))
+                        for other_root, other in seen)
+                ):
+                    raise PlanValidationError('source publication local instruction is invalid')
+                seen.add((source_root, name))
+                total += item['byte_size']
+                if total > SOURCE_TOTAL_BYTES_LIMIT:
+                    raise PlanValidationError('source publication exceeds byte limit')
+        source_binding = {
+            'project_id': project_id,
+            'receipt_path': str(receipt_path),
+            'receipt_sha256': value['receipt_ref']['sha256'],
+            'kit_root': str(kit_root),
+            'source_ref': value['source_ref'],
+            'kit_ref': value['kit_ref'],
+            'ci_helper': value['ci_helper'],
+            'helper_bindings': value['helper_bindings'],
+        }
+        return source_binding, receipt, b'', receipt_raw, b'', bootstrap_workflow_id
+
     binding_path = Path.home() / '.kent' / 'project-memory-bindings' / f'{project_id}.json'
     _, binding_raw, _ = _read_source_record(
         binding_path,
@@ -1676,7 +1837,12 @@ def _source_binding(
         maximum=SOURCE_RECEIPT_BYTES_LIMIT,
         private=True,
     )
-    if sha256_bytes(binding_raw) != value['installation_binding_sha256']:
+    binding_sha256 = (
+        value['binding']['installation_binding_sha256']
+        if value.get('schema') == SOURCE_ADMISSION_V2_SCHEMA
+        else value['installation_binding_sha256']
+    )
+    if sha256_bytes(binding_raw) != binding_sha256:
         raise PlanValidationError('native installation binding digest differs')
     binding = _source_json(binding_raw, 'native installation binding')
     binding = _closed(binding, {
@@ -1844,14 +2010,19 @@ def admit_source_admission(
     workflow_id: str,
     project_root: str | Path,
     kent_path: str | Path,
+    workspace_path: str | Path | None = None,
 ) -> VerifiedSourceAdmission:
-    """Verify native project identity, private install binding and pinned sources."""
+    """Verify native project identity, installation mode and pinned sources."""
     parsed = _v2_source_admission(admission, 'source_admission')
     if parsed is None:
         raise PlanValidationError('source admission is required')
     project_id = _native_project_id(project_id, 'source admission project_id')
     workflow_id = _uuid(workflow_id, 'source admission workflow_id')
     root = _source_canonical_root(str(project_root), 'source admission project_root')
+    workspace = (
+        root if workspace_path is None else
+        _source_canonical_root(str(workspace_path), 'source admission workspace_path')
+    )
     kent = _kent_path(str(kent_path), 'source admission kent')
     _verify_executable(kent, sha256_bytes(kent.read_bytes()))
     binding, receipt, binding_raw, receipt_raw, profile_raw, receipt_workflow_id = _source_binding(
@@ -1942,7 +2113,7 @@ def admit_source_admission(
         '--project-root', str(root),
         '--kit-root', parsed['kit_root'],
         '--primary-root', parsed['primary_root'],
-        '--workspace', str(root),
+        '--workspace', str(workspace),
         '--source-ref', parsed['source_ref'],
         '--kit-ref', parsed['kit_ref'],
         '--ci-helper', parsed['ci_helper'],
@@ -1995,7 +2166,7 @@ def admit_source_admission(
         or inspection.get('receipt_sha256') != parsed['receipt_ref']['sha256']
         or inspection.get('source_commit') != receipt.get('source_commit')
         or inspection.get('kit_commit') != receipt.get('kit_commit')
-        or inspection.get('workspace_path') != str(root)
+        or inspection.get('workspace_path') != str(workspace)
         or inspection.get('source_ref') != parsed['source_ref']
         or inspection.get('kit_ref') != parsed['kit_ref']
         or not isinstance(file_count, int)
@@ -2010,24 +2181,28 @@ def admit_source_admission(
         or inspection.get('python_cache_tag') != sys.implementation.cache_tag
     ):
         raise PlanValidationError('source inspector result differs from bound admission')
-    _, binding_after, _ = _read_source_record(
-        Path.home() / '.kent' / 'project-memory-bindings' / f'{project_id}.json',
-        label='native installation binding',
-        maximum=SOURCE_RECEIPT_BYTES_LIMIT,
-        private=True,
-    )
+    binding_after = binding_raw
+    if binding_raw:
+        _, binding_after, _ = _read_source_record(
+            Path.home() / '.kent' / 'project-memory-bindings' / f'{project_id}.json',
+            label='native installation binding',
+            maximum=SOURCE_RECEIPT_BYTES_LIMIT,
+            private=True,
+        )
     _, receipt_after, _ = _read_source_record(
         parsed['receipt_ref']['path'],
         label='source publication receipt',
         maximum=SOURCE_RECEIPT_BYTES_LIMIT,
         private=True,
     )
-    _, profile_after, _ = _read_source_record(
-        Path(parsed['primary_root']) / '.kent/workflow-profile.toml',
-        label='installed project profile',
-        maximum=SOURCE_RECEIPT_BYTES_LIMIT,
-        private=False,
-    )
+    profile_after = profile_raw
+    if profile_raw:
+        _, profile_after, _ = _read_source_record(
+            Path(parsed['primary_root']) / '.kent/workflow-profile.toml',
+            label='installed project profile',
+            maximum=SOURCE_RECEIPT_BYTES_LIMIT,
+            private=False,
+        )
     if (
         binding_after != binding_raw
         or receipt_after != receipt_raw
@@ -2050,6 +2225,225 @@ def admit_source_admission(
         inspection_raw=inspection_raw,
         receipt_files_raw=canonical_bytes(receipt_files),
         _token=_VERIFIED_SOURCE_ADMISSION_TOKEN,
+    )
+
+
+def admit_script_source_ingress(
+    root: str | Path,
+    native_context: Mapping[str, Any],
+    *,
+    kent_path: str | Path,
+) -> VerifiedSourceAdmission:
+    """Admit the closed frame on the current native Script ingress edge.
+
+    Callers provide only the genuine native Script context and configured
+    Kent executable; receipt paths and admission values are read from the
+    current native Workflow graph, never from caller arguments or environment.
+    """
+    workspace = _source_canonical_root(str(root), 'native Script workspace')
+    if (
+        not isinstance(native_context, Mapping)
+        or set(native_context) not in (
+            {'task_id', 'node_id'},
+            {'task_id', 'node_id', 'transition_branch_key'},
+        )
+    ):
+        raise PlanValidationError('native Script context fields are invalid')
+    task_id = _string(native_context.get('task_id'), 'native Script task_id')
+    node_id = _string(native_context.get('node_id'), 'native Script node_id')
+    branch_key = native_context.get('transition_branch_key')
+    if branch_key is not None:
+        branch_key = _string(branch_key, 'native Script transition_branch_key')
+    kent = _kent_path(str(kent_path), 'source admission kent')
+    _verify_executable(kent, sha256_bytes(kent.read_bytes()))
+    project_output = _run(
+        [str(kent), 'project', str(workspace)],
+        cwd=workspace,
+    )
+    if project_output[0] != 0:
+        raise PlanValidationError('native Script project identity is unavailable')
+    project_id = project_output[1].decode('utf-8', errors='replace').strip()
+    project_id = _native_project_id(project_id, 'native Script project_id')
+    detail = _kent_json(
+        kent,
+        ['task', 'show', task_id, '--project', project_id, '--json'],
+        cwd=workspace,
+    )
+    summary = detail.get('summary')
+    if (
+        not isinstance(summary, dict)
+        or _row_id(summary, 'id', 'task_id') != task_id
+        or summary.get('project_id') != project_id
+    ):
+        raise PlanValidationError('native Script Task/project identity differs')
+    workflow_id = _uuid(
+        _required(summary, 'workflow_id', 'native Script Task'),
+        'native Script Task.workflow_id',
+    )
+    source = detail.get('source_workspace')
+    project_detail = detail.get('project')
+    if (
+        not isinstance(source, dict)
+        or not isinstance(source.get('is_primary'), bool)
+        or not isinstance(project_detail, dict)
+    ):
+        raise PlanValidationError('native Script workspace identity is malformed')
+    source_root = _source_canonical_root(
+        _required(source, 'root_path', 'native Script source_workspace'),
+        'native Script source_workspace.root_path',
+    )
+    workspace_binding = detail.get('worktree_path') or str(source_root)
+    if workspace_binding != str(workspace):
+        raise PlanValidationError('native Script Task root differs from execution root')
+    workspace_id = _string(
+        _required(source, 'workspace_id', 'native Script source_workspace'),
+        'native Script source_workspace.workspace_id',
+    )
+    default_workspace_id = _string(
+        _required(project_detail, 'default_workspace_id', 'native Script project'),
+        'native Script project.default_workspace_id',
+    )
+    if (
+        source['is_primary'] is True
+        and (source_root != workspace or workspace_id != default_workspace_id)
+    ):
+        raise PlanValidationError('native Script primary workspace identity differs')
+    if (
+        source['is_primary'] is False
+        and (source_root == workspace or workspace_id == default_workspace_id)
+    ):
+        raise PlanValidationError('native Script worktree identity differs')
+    source_project_code, source_project_output, _ = _run(
+        [str(kent), 'project', str(source_root)],
+        cwd=workspace,
+    )
+    if (
+        source_project_code != 0
+        or source_project_output.decode('utf-8', errors='replace').strip() != project_id
+    ):
+        raise PlanValidationError('native Script source project identity differs')
+
+    current_scripts = detail.get('current_scripts')
+    if not isinstance(current_scripts, list) or len(current_scripts) > MAX_LIST:
+        raise PlanValidationError('native current Script inventory is unavailable')
+    current = [
+        row for row in current_scripts
+        if isinstance(row, dict)
+        and isinstance(row.get('current_node'), dict)
+        and row['current_node'].get('node_id') == node_id
+        and row['current_node'].get('transition_branch_key') == branch_key
+    ]
+    if len(current) != 1 or current[0]['current_node'].get('session_id'):
+        raise PlanValidationError('native current Script ownership is ambiguous')
+    current_path = current[0].get('path')
+    if not isinstance(current_path, str) or not current_path:
+        raise PlanValidationError('native current Script path is unavailable')
+
+    graph_result = _kent_json(
+        kent,
+        ['workflow', 'graph', 'inspect', workflow_id, '--json'],
+        cwd=workspace,
+        output_limit=CANONICAL_GRAPH_MAX_OUTPUT,
+    )
+    graph = graph_result.get('graph')
+    if (
+        graph_result.get('workflow_id') != workflow_id
+        or not isinstance(graph, dict)
+        or any(not isinstance(graph.get(name), list) for name in (
+            'nodes', 'edges', 'transition_groups',
+        ))
+    ):
+        raise PlanValidationError('native Script Workflow graph identity differs')
+    nodes = [
+        row for row in graph['nodes']
+        if isinstance(row, dict) and row.get('id', row.get('node_id')) == node_id
+    ]
+    if len(nodes) != 1 or nodes[0].get('kind') != 'script':
+        raise PlanValidationError('native Workflow does not own the current Script node')
+
+    def normalized_script_path(value: str) -> str:
+        path = Path(value)
+        if not path.is_absolute():
+            path = workspace / path
+        return os.path.normpath(str(path))
+
+    if normalized_script_path(nodes[0].get('script_path', '')) != normalized_script_path(current_path):
+        raise PlanValidationError('native Workflow Script path differs from current execution')
+
+    from .delivery import SOURCE_ADMISSION_BEGIN, SOURCE_ADMISSION_END
+
+    frames: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    marker_count = 0
+    for collection in ('nodes', 'edges', 'node_groups', 'transition_groups'):
+        rows = graph.get(collection)
+        if not isinstance(rows, list):
+            raise PlanValidationError('native Workflow graph collection is malformed')
+        for row in rows:
+            if not isinstance(row, dict):
+                raise PlanValidationError('native Workflow graph row is malformed')
+            for key in ('prompt_template', 'prompt'):
+                prompt = row.get(key)
+                if not isinstance(prompt, str):
+                    continue
+                begins = prompt.count(SOURCE_ADMISSION_BEGIN)
+                ends = prompt.count(SOURCE_ADMISSION_END)
+                marker_count += begins + ends
+                if not begins and not ends:
+                    continue
+                if collection != 'edges' or begins != 1 or ends != 1:
+                    raise PlanValidationError('native source admission frame is malformed')
+                start = prompt.find(SOURCE_ADMISSION_BEGIN) + len(SOURCE_ADMISSION_BEGIN)
+                end = prompt.find(SOURCE_ADMISSION_END)
+                if end < start or not prompt[start:end].startswith('\n'):
+                    raise PlanValidationError('native source admission frame is malformed')
+                frame_text = prompt[start + 1:end].split('\n', 1)[0]
+                if not frame_text or frame_text != frame_text.strip():
+                    raise PlanValidationError('native source admission frame is malformed')
+                frame = _source_json(frame_text.encode('utf-8'), 'native source admission frame')
+                if canonical_bytes(frame).decode('utf-8') != frame_text:
+                    raise PlanValidationError('native source admission frame is not canonical')
+                frames.append((row, frame, prompt))
+    if marker_count != 2 or len(frames) != 1:
+        raise PlanValidationError('native Workflow must contain one source admission frame')
+    ingress_edge, frame, ingress_prompt = frames[0]
+    frame = _closed(
+        frame,
+        {'project_id', 'workflow_id', 'source_admission'},
+        'native source admission frame',
+    )
+    if (
+        frame.get('project_id') != project_id
+        or frame.get('workflow_id') != workflow_id
+    ):
+        raise PlanValidationError('native source admission frame identity differs')
+    admission = _v2_source_admission(frame['source_admission'], 'source_admission')
+    if (
+        admission is None
+        or admission.get('schema') != SOURCE_ADMISSION_V2_SCHEMA
+        or admission.get('ingress', {}).get('kind') != 'script-edge'
+        or admission.get('ingress', {}).get('edge_id') != ingress_edge.get('id')
+        or ingress_edge.get('target_node_id') != node_id
+        or (branch_key is not None and ingress_edge.get('key') != branch_key)
+    ):
+        raise PlanValidationError('native source admission is not bound to this Script ingress')
+    from .delivery import source_admission_gate
+
+    expected_gate = source_admission_gate(
+        admission,
+        project_id=project_id,
+        workflow_id=workflow_id,
+        project_root=admission['primary_root'],
+    )
+    if not ingress_prompt.startswith(f'{expected_gate}\n\n'):
+        raise PlanValidationError('native Script ingress source gate differs from its frame')
+    _v2_exact_ingress_edge(graph, admission['ingress'], 'native Workflow graph')
+    return admit_source_admission(
+        frame['source_admission'],
+        project_id=project_id,
+        workflow_id=workflow_id,
+        project_root=admission['primary_root'],
+        workspace_path=str(workspace),
+        kent_path=str(kent),
     )
 
 
@@ -3979,113 +4373,221 @@ def _v2_snapshot(
     return result
 
 
+_V2_MUTABLE_GRAPH_FIELDS = {
+    'nodes': {
+        'key', 'name', 'description', 'script_path', 'subagent_role',
+        'prompt_template', 'prompt', 'context', 'parameters',
+    },
+    'edges': {
+        'key', 'target_node_id', 'transition_group_id', 'requires_approval',
+        'parameters', 'context_mode', 'context_source', 'assignee_selection',
+        'thinking_selection', 'prompt_template', 'prompt', 'description',
+    },
+    'transition_groups': {
+        'transition_id', 'source_node_id', 'display_name', 'description',
+    },
+    'node_groups': set(),
+}
+
+
+def _v2_graph_rows(
+    graph: Mapping[str, Any],
+    collection: str,
+    label: str,
+) -> dict[str, dict[str, Any]]:
+    rows = _bounded_list(graph.get(collection), f'{label}.{collection}')
+    by_id: dict[str, dict[str, Any]] = {}
+    for index, raw in enumerate(rows):
+        if not isinstance(raw, dict):
+            raise PlanValidationError(f'{label}.{collection}[{index}] must be an object')
+        identity = _string(
+            _required(raw, 'id', f'{label}.{collection}[{index}]'),
+            f'{label}.{collection}[{index}].id',
+        )
+        if identity in by_id:
+            raise PlanValidationError(f'v2 {collection} identities are duplicated')
+        by_id[identity] = raw
+    return by_id
+
+
+def _v2_field_changed(before: Mapping[str, Any], after: Mapping[str, Any], key: str) -> bool:
+    if (key in before) != (key in after):
+        return True
+    return key in before and canonical_sha256(before[key]) != canonical_sha256(after[key])
+
+
 def _v2_graph_compatibility(
     source: Mapping[str, Any],
     target: Mapping[str, Any],
     runtime_refs: Sequence[Mapping[str, Any]],
 ) -> None:
-    if set(source) != {'version', 'nodes', 'edges', 'node_groups', 'transition_groups'}:
+    graph_fields = {'version', 'nodes', 'edges', 'node_groups', 'transition_groups'}
+    if set(source) != graph_fields:
         raise PlanValidationError('v2 source graph fields are unsupported')
     if canonical_sha256(source) == canonical_sha256(target):
         return
-    if set(target) != set(source) or target.get('version') != source.get('version', 0) + 1:
+    if set(target) != graph_fields or target.get('version') != source.get('version', 0) + 1:
         raise PlanValidationError('v2 target graph revision/fields are invalid')
-    for key in ('nodes', 'edges', 'node_groups', 'transition_groups'):
-        _bounded_list(source.get(key), f'source_graph.{key}')
-        _bounded_list(target.get(key), f'target_graph.{key}')
+
+    old_rows = {
+        name: _v2_graph_rows(source, name, 'source_graph')
+        for name in ('nodes', 'edges', 'node_groups', 'transition_groups')
+    }
+    new_rows = {
+        name: _v2_graph_rows(target, name, 'target_graph')
+        for name in ('nodes', 'edges', 'node_groups', 'transition_groups')
+    }
+    added: dict[str, set[str]] = {}
     for name in ('nodes', 'edges', 'node_groups', 'transition_groups'):
-        old_rows, new_rows = source[name], target[name]
-        old_ids = [row.get('id') for row in old_rows if isinstance(row, dict)]
-        new_ids = [row.get('id') for row in new_rows if isinstance(row, dict)]
-        if len(old_ids) != len(old_rows) or len(new_ids) != len(new_rows):
-            raise PlanValidationError(f'v2 {name} entries must be objects')
-        if len(old_ids) != len(set(old_ids)) or len(new_ids) != len(set(new_ids)):
-            raise PlanValidationError(f'v2 {name} identities are duplicated')
-        old_by_id = {row['id']: row for row in old_rows}
-        new_by_id = {row['id']: row for row in new_rows}
-        added = set(new_by_id) - set(old_by_id)
-        removed = set(old_by_id) - set(new_by_id)
+        before = old_rows[name]
+        after = new_rows[name]
+        added[name] = set(after) - set(before)
+        removed = set(before) - set(after)
         if removed:
             raise PlanValidationError(f'v2 target removes existing {name}')
-        if name in {'nodes', 'node_groups'} and added:
-            raise PlanValidationError(f'v2 target adds unsupported {name}')
-        if name == 'transition_groups' and len(added) > 1:
-            raise PlanValidationError('v2 target adds more than one transition group')
-        if name == 'edges' and len(added) > 1:
-            raise PlanValidationError('v2 target adds more than one edge')
-        for identity in set(old_by_id) & set(new_by_id):
-            before = dict(old_by_id[identity])
-            after = dict(new_by_id[identity])
-            if name == 'nodes' and before != after:
-                before_script = before.pop('script_path', None)
-                after_script = after.pop('script_path', None)
-                qualified_paths = {
-                    ref['path']
+        if name == 'node_groups' and (
+            added[name] or any(
+                canonical_sha256(before[identity]) != canonical_sha256(after[identity])
+                for identity in before
+            )
+        ):
+            raise PlanValidationError('v2 target changes unsupported node_groups')
+        for identity in set(before) & set(after):
+            previous = before[identity]
+            current = after[identity]
+            changed = {
+                key for key in set(previous) | set(current)
+                if _v2_field_changed(previous, current, key)
+            }
+            if name == 'nodes' and 'kind' in changed:
+                raise PlanValidationError('v2 target cannot reassign an existing node kind')
+            unsupported = changed - _V2_MUTABLE_GRAPH_FIELDS[name]
+            if unsupported:
+                raise PlanValidationError(
+                    f'v2 target changes protected {name} fields: {sorted(unsupported)}'
+                )
+            if name == 'nodes' and 'script_path' in changed:
+                script_path = current.get('script_path')
+                qualified = {
+                    (ref.get('path'), ref.get('relative_path'))
                     for ref in runtime_refs
                     if isinstance(ref.get('path'), str)
+                    and isinstance(ref.get('relative_path'), str)
                     and isinstance(ref.get('mode'), int)
                     and not isinstance(ref.get('mode'), bool)
                     and ref['mode'] & 0o111
                 }
+                candidate = Path(script_path) if isinstance(script_path, str) else None
+                relative_candidate = (
+                    candidate.as_posix()
+                    if candidate is not None and not candidate.is_absolute()
+                    and '..' not in candidate.parts
+                    else None
+                )
                 if (
-                    before != after
-                    or old_by_id[identity].get('kind') != 'script'
-                    or new_by_id[identity].get('kind') != 'script'
-                    or not isinstance(before_script, str)
-                    or not before_script
-                    or old_by_id[identity].get('script_path') == new_by_id[identity].get('script_path')
-                    or not isinstance(after_script, str)
-                    or not Path(after_script).is_absolute()
-                    or after_script not in qualified_paths
+                    previous.get('kind') != 'script'
+                    or current.get('kind') != 'script'
+                    or not isinstance(script_path, str)
+                    or not any(
+                        script_path == absolute or script_path == relative
+                        for absolute, relative in qualified
+                    )
+                    or (not Path(script_path).is_absolute() and relative_candidate is None)
                 ):
                     raise PlanValidationError(
-                        f'v2 target changes protected {name} semantics'
+                        'v2 changed Script path is not source-qualified'
                     )
-                continue
-            for key in ('prompt_template', 'prompt'):
-                before.pop(key, None)
-                after.pop(key, None)
-            if before != after:
-                raise PlanValidationError(f'v2 target changes protected {name} semantics')
-    if not any(
-        canonical_sha256(source[name]) != canonical_sha256(target[name])
+
+    if not any(added.values()) and all(
+        canonical_sha256(source[name]) == canonical_sha256(target[name])
         for name in ('nodes', 'edges', 'node_groups', 'transition_groups')
     ):
         raise PlanValidationError('v2 graph revision contains no reviewed semantic delta')
-    nodes = {row.get('id'): row for row in target['nodes']}
-    keys = {row.get('key'): row for row in target['nodes']}
-    new_groups = [row for row in target['transition_groups'] if row['id'] not in {
-        item['id'] for item in source['transition_groups']
-    }]
-    new_edges = [row for row in target['edges'] if row['id'] not in {
-        item['id'] for item in source['edges']
-    }]
-    if not new_groups and not new_edges:
-        return
-    if len(new_groups) != 1 or len(new_edges) != 1:
-        raise PlanValidationError('v2 structural change must add exactly implement_replan')
-    group, edge = new_groups[0], new_edges[0]
-    fix_edges = [row for row in source['edges'] if row.get('key') == 'fix_replan']
-    if (
-        group.get('source_node_id') != keys.get('implement', {}).get('id')
-        or group.get('transition_id') != 'implement_replan'
-        or edge.get('key') != 'implement_replan'
-        or edge.get('transition_group_id') != group.get('id')
-        or edge.get('target_node_id') != keys.get('plan_revalidation', {}).get('id')
-        or edge.get('requires_approval') is not False
-        or edge.get('context_mode') != 'continue_session'
-        or edge.get('context_source') != {'kind': 'selected_node', 'node_key': 'plan'}
-        or keys.get('plan') is None
-        or len(fix_edges) != 1
-        or canonical_sha256(edge.get('parameters')) != canonical_sha256(fix_edges[0].get('parameters'))
-        or edge.get('assignee_selection') != 'configured'
-        or edge.get('thinking_selection') != 'configured'
-        or not isinstance(edge.get('prompt_template'), str)
-        or not edge['prompt_template'].strip()
-    ):
-        raise PlanValidationError('v2 additive route is not the approved implement_replan edge')
-    if nodes.get(edge.get('target_node_id'), {}).get('key') != 'plan_revalidation':
-        raise PlanValidationError('v2 implement_replan target identity is invalid')
+
+    executable_paths = {
+        (ref['path'], ref['relative_path'])
+        for ref in runtime_refs
+        if isinstance(ref.get('path'), str)
+        and isinstance(ref.get('mode'), int)
+        and not isinstance(ref.get('mode'), bool)
+        and ref['mode'] & 0o111
+    }
+    for identity in added['nodes']:
+        node = new_rows['nodes'][identity]
+        script_path = node.get('script_path')
+        if node.get('kind') != 'script':
+            raise PlanValidationError('v2 may add only a source-qualified Script node')
+        if not isinstance(script_path, str) or not script_path:
+            raise PlanValidationError('v2 added Script node is missing its qualified path')
+        candidate = Path(script_path)
+        relative_candidate = (
+            candidate.as_posix()
+            if not candidate.is_absolute() and '..' not in candidate.parts
+            else None
+        )
+        if (
+            candidate.as_posix() != script_path
+            or not any(
+                script_path in (absolute, relative)
+                for absolute, relative in executable_paths
+            )
+            or (not candidate.is_absolute() and relative_candidate is None)
+        ):
+            raise PlanValidationError('v2 added Script node path is not source-qualified')
+
+    for name in ('edges', 'transition_groups'):
+        for identity in added[name]:
+            row = new_rows[name][identity]
+            for key in ('key', 'transition_id', 'source_node_id', 'target_node_id',
+                        'transition_group_id'):
+                if key in row and (not isinstance(row[key], str) or not row[key]):
+                    raise PlanValidationError(f'v2 added {name} row has an invalid {key}')
+
+    node_ids = set(new_rows['nodes'])
+    group_ids = set(new_rows['transition_groups'])
+    node_keys = []
+    for node in new_rows['nodes'].values():
+        node_key = node.get('key')
+        kind = node.get('kind')
+        if not isinstance(node_key, str) or not node_key or not isinstance(kind, str) or not kind:
+            raise PlanValidationError('v2 target node has an invalid key or kind')
+        node_keys.append(node_key)
+    _unique(node_keys, 'v2 target node keys')
+    edge_keys: list[str] = []
+    group_sources: set[tuple[str, str]] = set()
+    for group in new_rows['transition_groups'].values():
+        source_node = group.get('source_node_id')
+        transition_id = group.get('transition_id')
+        if source_node not in node_ids or not isinstance(transition_id, str) or not transition_id:
+            raise PlanValidationError('v2 target transition group has an invalid source/transition')
+        pair = (source_node, transition_id)
+        if pair in group_sources:
+            raise PlanValidationError('v2 target transition groups repeat a source/transition')
+        group_sources.add(pair)
+    incoming = {identity: 0 for identity in node_ids}
+    outgoing = {identity: 0 for identity in node_ids}
+    for edge in new_rows['edges'].values():
+        edge_key = edge.get('key')
+        target_node = edge.get('target_node_id')
+        group_id = edge.get('transition_group_id')
+        if (
+            not isinstance(edge_key, str) or not edge_key
+            or target_node not in node_ids
+            or group_id not in group_ids
+        ):
+            raise PlanValidationError('v2 target edge has an invalid key or graph reference')
+        edge_keys.append(edge_key)
+        incoming[target_node] += 1
+        source_node = new_rows['transition_groups'][group_id]['source_node_id']
+        outgoing[source_node] += 1
+        if 'parameters' in edge:
+            parameters = _bounded_list(edge['parameters'], 'v2 target edge.parameters')
+            if any(not isinstance(parameter, dict) for parameter in parameters):
+                raise PlanValidationError('v2 target edge.parameters entries must be objects')
+    _unique(edge_keys, 'v2 target edge keys')
+    for identity in added['nodes']:
+        if incoming[identity] == 0 or outgoing[identity] == 0:
+            raise PlanValidationError('v2 added Script node must have connected routes')
 
 
 def _v2_ingress_edge(graph: Mapping[str, Any], label: str) -> dict[str, Any]:
@@ -4120,6 +4622,56 @@ def _v2_ingress_edge(graph: Mapping[str, Any], label: str) -> dict[str, Any]:
     return candidates[0]
 
 
+def _v2_exact_ingress_edge(
+    graph: Mapping[str, Any],
+    ingress: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    nodes = {
+        row.get('id', row.get('node_id')): row
+        for row in graph.get('nodes', [])
+        if isinstance(row, dict)
+    }
+    groups = {
+        row.get('id', row.get('transition_group_id')): row
+        for row in graph.get('transition_groups', [])
+        if isinstance(row, dict)
+    }
+    matching = [
+        row for row in graph.get('edges', [])
+        if isinstance(row, dict) and row.get('id') == ingress.get('edge_id')
+    ]
+    if len(matching) != 1:
+        raise PlanValidationError(f'{label} must contain the exact source-admission edge')
+    edge = matching[0]
+    group = groups.get(edge.get('transition_group_id'))
+    source = nodes.get(group.get('source_node_id')) if isinstance(group, dict) else None
+    target = nodes.get(edge.get('target_node_id'))
+    expected_kind = 'agent' if ingress.get('kind') == 'agent-edge' else 'script'
+    if (
+        not isinstance(source, dict)
+        or source.get('key') not in {'start', 'backlog'}
+        or not isinstance(target, dict)
+        or target.get('kind') != expected_kind
+    ):
+        raise PlanValidationError(f'{label} source-admission edge has the wrong endpoint kind')
+    # The exact admission edge must be the sole route from this entry node;
+    # otherwise a sibling transition could bypass the native frame.
+    outgoing = []
+    for candidate in graph.get('edges', []):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_group = groups.get(candidate.get('transition_group_id'))
+        if (
+            isinstance(candidate_group, dict)
+            and candidate_group.get('source_node_id') == source.get('id', source.get('node_id'))
+        ):
+            outgoing.append(candidate)
+    if len(outgoing) != 1 or outgoing[0].get('id') != ingress.get('edge_id'):
+        raise PlanValidationError(f'{label} has a route that bypasses source admission')
+    return edge
+
+
 def _v2_source_gate_check(
     source_graph: Mapping[str, Any],
     target_graph: Mapping[str, Any],
@@ -4131,8 +4683,14 @@ def _v2_source_gate_check(
 ) -> None:
     from .delivery import SOURCE_ADMISSION_BEGIN, SOURCE_ADMISSION_END, source_admission_gate
 
-    _v2_ingress_edge(source_graph, 'source graph')
-    target_ingress = _v2_ingress_edge(target_graph, 'target graph')
+    if admission.get('schema') == SOURCE_ADMISSION_V2_SCHEMA:
+        ingress = admission['ingress']
+        target_ingress = _v2_exact_ingress_edge(
+            target_graph, ingress, 'target graph',
+        )
+    else:
+        _v2_ingress_edge(source_graph, 'source graph')
+        target_ingress = _v2_ingress_edge(target_graph, 'target graph')
     target_prompt = target_ingress.get('prompt_template', target_ingress.get('prompt'))
     if not isinstance(target_prompt, str):
         raise PlanValidationError('source gate ingress prompt is absent')
@@ -4144,22 +4702,16 @@ def _v2_source_gate_check(
     )
     if not target_prompt.startswith(f'{gate}\n\n'):
         raise PlanValidationError('target ingress does not contain the exact bound source admission gate')
-    starts = sum(
-        prompt.count(SOURCE_ADMISSION_BEGIN)
+    prompts = [
+        prompt
         for collection in ('nodes', 'edges', 'node_groups', 'transition_groups')
-        for edge in target_graph.get(collection, [])
-        if isinstance(edge, dict)
-        for prompt in [edge.get('prompt_template'), edge.get('prompt')]
+        for row in target_graph.get(collection, [])
+        if isinstance(row, dict)
+        for prompt in (row.get('prompt_template'), row.get('prompt'))
         if isinstance(prompt, str)
-    )
-    ends = sum(
-        prompt.count(SOURCE_ADMISSION_END)
-        for collection in ('nodes', 'edges', 'node_groups', 'transition_groups')
-        for edge in target_graph.get(collection, [])
-        if isinstance(edge, dict)
-        for prompt in [edge.get('prompt_template'), edge.get('prompt')]
-        if isinstance(prompt, str)
-    )
+    ]
+    starts = sum(prompt.count(SOURCE_ADMISSION_BEGIN) for prompt in prompts)
+    ends = sum(prompt.count(SOURCE_ADMISSION_END) for prompt in prompts)
     if starts != 1 or ends != 1:
         raise PlanValidationError('target graph must contain exactly one source admission frame')
 
@@ -4422,7 +4974,23 @@ def _validate_canonical_v2_plan(
             ))
             if target_graph.get('version') != version + 1:
                 raise PlanValidationError('v2 target graph must advance exactly one version')
+            for collection in ('nodes', 'edges', 'node_groups', 'transition_groups'):
+                _bounded_list(
+                    _required(target_graph, collection, f'{label}.target_graph'),
+                    f'{label}.target_graph.{collection}',
+                )
+            from .graph import native_graph_projection
+            try:
+                review_target_graph = native_graph_projection(
+                    target_graph,
+                    workflow_id=item['workflow_id'],
+                )
+            except SpecError as error:
+                raise PlanValidationError(
+                    'v2 target source graph cannot be encoded for its Workflow'
+                ) from error
             item['target_graph'] = target_graph
+            item['_review_target_graph'] = review_target_graph
         elif 'target_graph' in item:
             raise PlanValidationError('v2 metadata-only plan cannot carry a graph')
         if intent in {'metadata-only', 'graph-and-metadata'}:
@@ -4474,6 +5042,7 @@ def _v2_required_review_paths(
     source_metadata: Mapping[str, Any],
     target_metadata: Mapping[str, Any],
     snapshot: Mapping[str, Any],
+    source_admission: Mapping[str, Any] | None = None,
 ) -> set[str]:
     paths = {f"task:{task['id']}" for task in snapshot['tasks']}
     paths.update(f"session:{session['id']}" for session in snapshot['sessions'])
@@ -4482,17 +5051,35 @@ def _v2_required_review_paths(
             before = {row['id']: row for row in source_graph[name]}
             after = {row['id']: row for row in target_graph[name]}
             additions = set(after) - set(before)
-            if name == 'edges' and any(after[identity].get('key') == 'implement_replan' for identity in additions):
-                paths.add('graph.added_edge:implement_replan')
+            for identity in additions:
+                path_name = {
+                    'nodes': 'node',
+                    'edges': 'edge',
+                    'node_groups': 'node_group',
+                    'transition_groups': 'transition_group',
+                }[name]
+                paths.add(f'graph.added_{path_name}:{identity}')
             for identity in set(before) & set(after):
+                for key in set(before[identity]) | set(after[identity]):
+                    if _v2_field_changed(before[identity], after[identity], key):
+                        paths.add(f'graph.{name}:{identity}.{key}')
                 if (
-                    name == 'nodes'
-                    and before[identity].get('script_path') != after[identity].get('script_path')
+                    name == 'edges'
+                    and before[identity].get('requires_approval') is True
+                    and after[identity].get('requires_approval') is False
                 ):
-                    paths.add(f'graph.nodes:{identity}.script_path')
-                for prompt_key in ('prompt_template', 'prompt'):
-                    if before[identity].get(prompt_key) != after[identity].get(prompt_key):
-                        paths.add(f'graph.{name}:{identity}.{prompt_key}')
+                    authority_path = f'authority:graph.edges:{identity}.requires_approval'
+                    paths.add(authority_path)
+                    for task in snapshot['tasks']:
+                        paths.update(
+                            f'decision:{decision["id"]}'
+                            for decision in task['pending_decisions']
+                        )
+    if (
+        isinstance(source_admission, Mapping)
+        and source_admission.get('schema') == SOURCE_ADMISSION_V2_SCHEMA
+    ):
+        paths.add('source_admission.ingress')
     for key in set(source_metadata) | set(target_metadata):
         if source_metadata.get(key) != target_metadata.get(key):
             paths.add(f'metadata.{key}')
@@ -4526,12 +5113,28 @@ def _validate_canonical_v2_target(
     ):
         raise EffectBlocked('v2 linked ownership/default state drifted')
     graph = item.get('target_graph', source['graph'])
+    from .graph import native_graph_projection
+    try:
+        source_review_graph = native_graph_projection(
+            source['graph'],
+            workflow_id=item['workflow_id'],
+        )
+        review_graph = item.get('_review_target_graph')
+        if review_graph is None:
+            review_graph = native_graph_projection(
+                graph,
+                workflow_id=item['workflow_id'],
+            )
+    except SpecError as error:
+        raise PlanValidationError(
+            'v2 Workflow graph cannot be encoded for semantic review'
+        ) from error
     metadata = item.get('target_metadata', source['metadata'])
-    _v2_graph_compatibility(source['graph'], graph, item['runtime_refs'])
+    _v2_graph_compatibility(source_review_graph, review_graph, item['runtime_refs'])
     source_admission = item['source_admission']
     if source_admission is None:
         if (
-            canonical_sha256(source['graph']) != canonical_sha256(graph)
+            canonical_sha256(source_review_graph) != canonical_sha256(review_graph)
             or metadata['execution_target'] != source['metadata']['execution_target']
         ):
             raise PlanValidationError(
@@ -4554,10 +5157,12 @@ def _validate_canonical_v2_target(
             project_root=parsed['project_root'],
         )
     source_semantics = {
-        key: source['graph'][key] for key in ('nodes', 'edges', 'node_groups', 'transition_groups')
+        key: source_review_graph[key]
+        for key in ('nodes', 'edges', 'node_groups', 'transition_groups')
     }
     target_semantics = {
-        key: graph[key] for key in ('nodes', 'edges', 'node_groups', 'transition_groups')
+        key: review_graph[key]
+        for key in ('nodes', 'edges', 'node_groups', 'transition_groups')
     }
     if (
         canonical_sha256(source_semantics) == canonical_sha256(target_semantics)
@@ -4596,7 +5201,7 @@ def _validate_canonical_v2_target(
             project_id=item['project_id'],
             source_graph_sha256=item['source_graph_sha256'],
             source_metadata_sha256=item['source_metadata_sha256'],
-            target_graph_sha256=canonical_sha256(graph),
+            target_graph_sha256=canonical_sha256(review_graph),
             target_metadata_sha256=canonical_sha256(metadata),
             snapshot=item['compatibility_snapshot'],
             runtime_refs=item['runtime_refs'],
@@ -4606,7 +5211,8 @@ def _validate_canonical_v2_target(
             ),
             native_evidence_sha256=item.get('_native_evidence_sha256'),
             required_paths=_v2_required_review_paths(
-                source['graph'], graph, source['metadata'], metadata, item['compatibility_snapshot'],
+                source_review_graph, review_graph, source['metadata'], metadata,
+                item['compatibility_snapshot'], source_admission,
             ),
         )
     if expected_spec is not None:
