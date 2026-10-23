@@ -124,7 +124,9 @@ class EvidenceAuditS5Test(GitRepositoryTest):
             previous = record["event_hash"]
             lines.append(runtime.canonical_bytes(record) + b"\n")
         raw = b"".join(lines)
-        (directory / "evidence-ledger.jsonl").write_bytes(raw)
+        path = directory / "evidence-ledger.jsonl"
+        path.write_bytes(raw)
+        path.chmod(0o600)
         return raw
 
     def seal_request(self):
@@ -270,6 +272,7 @@ class EvidenceAuditS5Test(GitRepositoryTest):
             )
         path = directory / "evidence-ledger.jsonl"
         path.write_bytes(raw)
+        path.chmod(0o600)
         with mock.patch.object(ledger, "read_json_input", return_value=self.seal_request()):
             with self.assertRaisesRegex(ValueError, "limit"):
                 ledger.seal_terminal(root, task=self.task)
@@ -521,6 +524,7 @@ class EvidenceAuditS5Test(GitRepositoryTest):
         digest = hashlib.sha256(report).hexdigest()
         artifact = directory / f"ci-report-{digest}.json"
         artifact.write_bytes(report)
+        artifact.chmod(0o600)
         resolver = mock.Mock(side_effect=[proof, proof])
         initial = resolver(root, self.task, context)
         with (
@@ -549,7 +553,9 @@ class EvidenceAuditS5Test(GitRepositoryTest):
         payload = self.script_archive_payload(root)
         report = runtime.canonical_bytes(runtime.validate_ci_archive(payload["ci_report"]))
         digest = hashlib.sha256(report).hexdigest()
-        (directory / f"ci-report-{digest}.json").write_bytes(b"conflicting orphan")
+        artifact = directory / f"ci-report-{digest}.json"
+        artifact.write_bytes(b"conflicting orphan")
+        artifact.chmod(0o600)
         resolver = mock.Mock(side_effect=[proof, proof])
         initial = resolver(root, self.task, context)
         with (
