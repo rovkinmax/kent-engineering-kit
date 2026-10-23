@@ -20,6 +20,11 @@ binding is unavailable, block only the dependent action.
   force-with-lease.
 - Resolve and preserve the configured merge method through the project
   procedure and adapter; generic mergeability does not prove rebase feasibility.
+- For current target-family workflows, establish `pr_base_branch` from the
+  applicable delivery authority and verify it against the freshly observed
+  GitHub `baseRefName` before the first handoff. Preserve it through watcher,
+  merged and Cleanup carriers; never infer it from the task branch, local
+  default or stale observation.
 - Do not broaden the diff during delivery. Recover accessible agent-owned
   bookkeeping through existing evidence interfaces; report inaccessible
   authority, contradictory proof or unsafe ownership precisely.

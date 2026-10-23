@@ -10,6 +10,11 @@ source_control = "github"
 issue_tracker = "none"
 release_topology = "none"
 
+# Optional schema-4 static extra readers for Script CI archive qualification:
+# ci_archive_reader_sources = ["src/evidence_reader.py"]
+# This is a bounded list (at most 64 unique normalized project-relative paths);
+# mandatory readers cannot be removed.
+
 [execution]
 default_target = "ask-on-first-execution"
 
@@ -53,8 +58,11 @@ smoke = ""
 # R2 project memory is synchronized as this exact paired source closure.
 # project_memory = ".kent/scripts/workflow-project-memory"
 # project_memory_core = ".kent/scripts/workflow_project_memory.py"
-# Schema 4 profiles additionally list both command keys in
-# kit_managed_commands and pin each new command at version "1.0.0".
+# Schema 4 profiles list each Kit-managed command in kit_managed_commands and
+# pin the exact version in command_versions. The current runtime family uses
+# runtime_contracts/evidence 2.1.0, checkpoint 1.1.0, prepare_ci 3.0.0,
+# wait_ci/wait_pr 4.0.0, and janitor 3.0.0. Existing schema-4 runtime 2.0.0
+# profiles retain their legacy command family.
 
 # Optional independent R2 storage binding. This absolute normalized root is
 # outside the checkout; loading a profile does not create or initialize it.

@@ -33,8 +33,10 @@ PROJECT_MEMORY_KEY_PATTERN = re.compile(
 SCHEMA4_ONLY_ROOT_KEYS = {
     "kit_managed_commands",
     "command_versions",
+    "ci_archive_reader_sources",
     "release",
 }
+MAX_CI_ARCHIVE_READER_SOURCES = 64
 RELEASE_FIELDS = {
     "topology_kind",
     "adoption_mode",
@@ -50,11 +52,23 @@ RELEASE_TOPOLOGY_ADOPTIONS = {
 }
 WORK_KIND_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
-RUNTIME_CONTRACT_VERSION = "2.0.0"
-PREPARE_CI_VERSION = "2.0.0"
-WAIT_CI_VERSION = "3.0.0"
-WAIT_PR_VERSION = "3.0.0"
+RUNTIME_CONTRACT_VERSION = "2.1.0"
+LEGACY_RUNTIME_CONTRACT_VERSION = "2.0.0"
+VERIFY_COMMAND_VERSION = "2.0.0"
+CHECKPOINT_VERSION = "1.1.0"
+PREPARE_CI_VERSION = "3.0.0"
+LEGACY_PREPARE_CI_VERSION = "2.0.0"
+JANITOR_VERSION = "3.0.0"
+LEGACY_JANITOR_VERSION = "2.0.0"
+WAIT_CI_VERSION = "4.0.0"
+LEGACY_WAIT_CI_VERSION = "3.0.0"
+WAIT_PR_VERSION = "4.0.0"
+LEGACY_WAIT_PR_VERSION = "3.0.0"
 GITHUB_OBSERVATION_VERSION = "1.0.0"
+SUPPORTED_RUNTIME_CONTRACT_VERSIONS = {
+    LEGACY_RUNTIME_CONTRACT_VERSION,
+    RUNTIME_CONTRACT_VERSION,
+}
 RUNTIME_CONTRACT_COMMANDS = {
     "runtime_contracts",
     "verify",
@@ -101,6 +115,42 @@ class ProjectMemoryProfile:
     mode: str
 
 
+def parse_ci_archive_reader_sources(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > MAX_CI_ARCHIVE_READER_SOURCES:
+        raise SpecError(
+            "ci_archive_reader_sources must be a bounded array of project-relative paths"
+        )
+    paths = []
+    total_bytes = 0
+    for index, item in enumerate(value):
+        label = f"ci_archive_reader_sources[{index}]"
+        if (
+            not isinstance(item, str)
+            or not item
+            or "\x00" in item
+            or "\\" in item
+            or item.startswith("/")
+            or PureWindowsPath(item).is_absolute()
+            or any(part in {"", ".", ".."} for part in item.split("/"))
+            or PurePosixPath(item).as_posix() != item
+            or any(character in item for character in "*?[]")
+        ):
+            raise SpecError(f"{label} is not a normalized project-relative path")
+        try:
+            size = len(item.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise SpecError(f"{label} is not valid UTF-8") from error
+        if size > 4096:
+            raise SpecError(f"{label} exceeds its path byte limit")
+        total_bytes += size
+        if total_bytes > MAX_CI_ARCHIVE_READER_SOURCES * 4096:
+            raise SpecError("ci_archive_reader_sources exceeds its byte limit")
+        paths.append(item)
+    if len(paths) != len(set(paths)):
+        raise SpecError("ci_archive_reader_sources must be unique")
+    return tuple(paths)
+
+
 @dataclass(frozen=True)
 class ProjectProfile:
     project_root: Path
@@ -117,6 +167,7 @@ class ProjectProfile:
     release_topology: str | None
     kit_managed_commands: tuple[str, ...]
     command_versions: dict[str, str]
+    ci_archive_reader_sources: tuple[str, ...]
     release: ReleaseProfile | None
     project_memory: ProjectMemoryProfile | None
     execution_default: str
@@ -219,6 +270,9 @@ class ProjectProfile:
             release_topology=release_topology,
             kit_managed_commands=kit_managed_commands,
             command_versions=command_versions,
+            ci_archive_reader_sources=parse_ci_archive_reader_sources(
+                raw.get("ci_archive_reader_sources", [])
+            ),
             release=release,
             project_memory=project_memory,
             execution_default=require_string(execution, "default_target"),
@@ -246,6 +300,7 @@ class ProjectProfile:
             raise SpecError(
                 f"unsupported profile schema {self.schema_version}; expected 3 or 4"
             )
+        parse_ci_archive_reader_sources(list(self.ci_archive_reader_sources))
         if self.schema_version == 4:
             self.validate_schema4(check_files=check_files)
         minimum_version = self.minimum_version_tuple()
@@ -593,16 +648,15 @@ class ProjectProfile:
         runtime_keys = set(self.kit_managed_commands) & (
             RUNTIME_CONTRACT_COMMANDS | MONITORING_COMMANDS | {"janitor"}
         )
+        runtime_version = self.command_versions.get("runtime_contracts")
         if "prepare_ci" in managed_commands and (
-            self.command_versions.get("prepare_ci") != PREPARE_CI_VERSION
+            self.command_versions.get("prepare_ci")
+            not in {PREPARE_CI_VERSION, LEGACY_PREPARE_CI_VERSION}
         ):
-            raise SpecError(
-                "prepare_ci adoption requires command_versions.prepare_ci = "
-                f"{PREPARE_CI_VERSION!r}"
-            )
+            raise SpecError("prepare_ci adoption has an unsupported command version")
         runtime_versions = {
             key for key, value in self.command_versions.items()
-            if key in runtime_keys and value == RUNTIME_CONTRACT_VERSION
+            if key in runtime_keys and value in SUPPORTED_RUNTIME_CONTRACT_VERSIONS
         }
         v2_adoption = "runtime_contracts" in runtime_keys
         if "prepare_ci" in managed_commands and not v2_adoption:
@@ -610,11 +664,12 @@ class ProjectProfile:
                 "prepare_ci adoption requires runtime-contract v2 support"
             )
         if v2_adoption:
-            if self.command_versions.get("runtime_contracts") != RUNTIME_CONTRACT_VERSION:
+            if runtime_version not in SUPPORTED_RUNTIME_CONTRACT_VERSIONS:
                 raise SpecError(
-                    "runtime_contracts adoption requires command_versions.runtime_contracts = "
-                    f"{RUNTIME_CONTRACT_VERSION!r}"
+                    "runtime_contracts adoption requires a supported runtime "
+                    "contract command version"
                 )
+            current_family = runtime_version == RUNTIME_CONTRACT_VERSION
             expected = set(RUNTIME_CONTRACT_COMMANDS)
             if self.capabilities.get("managed_worktrees", False):
                 expected.add("janitor")
@@ -630,15 +685,26 @@ class ProjectProfile:
                     f"{sorted(expected)!r}"
                 )
             expected_versions = {
-                **{
-                    key: RUNTIME_CONTRACT_VERSION
-                    for key in RUNTIME_CONTRACT_COMMANDS
-                },
-                "janitor": RUNTIME_CONTRACT_VERSION,
-                "wait_ci": WAIT_CI_VERSION,
-                "wait_pr": WAIT_PR_VERSION,
+                "runtime_contracts": runtime_version,
+                "verify": VERIFY_COMMAND_VERSION,
+                "evidence": (
+                    RUNTIME_CONTRACT_VERSION
+                    if current_family else LEGACY_RUNTIME_CONTRACT_VERSION
+                ),
+                "janitor": JANITOR_VERSION if current_family else LEGACY_JANITOR_VERSION,
+                "wait_ci": WAIT_CI_VERSION if current_family else LEGACY_WAIT_CI_VERSION,
+                "wait_pr": WAIT_PR_VERSION if current_family else LEGACY_WAIT_PR_VERSION,
                 OBSERVATION_COMMAND: GITHUB_OBSERVATION_VERSION,
             }
+            if "prepare_ci" in managed_commands:
+                expected_versions["prepare_ci"] = (
+                    PREPARE_CI_VERSION
+                    if current_family else LEGACY_PREPARE_CI_VERSION
+                )
+            if "checkpoint" in managed_commands:
+                expected_versions["checkpoint"] = (
+                    CHECKPOINT_VERSION if current_family else "1.0.0"
+                )
             for key in sorted(expected):
                 if self.command_versions.get(key) != expected_versions[key]:
                     raise SpecError(
@@ -646,6 +712,13 @@ class ProjectProfile:
                         f"{key!r} requires version "
                         f"{expected_versions[key]!r}"
                     )
+            if "checkpoint" in managed_commands and self.command_versions.get(
+                "checkpoint"
+            ) != expected_versions["checkpoint"]:
+                raise SpecError(
+                    "runtime-contract v2 managed command 'checkpoint' "
+                    f"requires version {expected_versions['checkpoint']!r}"
+                )
             support_parent = Path(self.command("runtime_contracts")).parent
             for key in sorted(expected):
                 if Path(self.command(key)).parent != support_parent:
@@ -656,7 +729,7 @@ class ProjectProfile:
         elif runtime_versions or runtime_keys:
             if runtime_versions:
                 raise SpecError(
-                    "command version 2.0.0 requires runtime_contracts adoption"
+                    "runtime-contract command versions require runtime_contracts adoption"
                 )
             if "runtime_contracts" in self.command_versions:
                 raise SpecError(
@@ -803,7 +876,7 @@ class ProjectProfile:
             self.schema_version == 4
             and "runtime_contracts" in self.kit_managed_commands
             and self.command_versions.get("runtime_contracts")
-            == RUNTIME_CONTRACT_VERSION
+            in SUPPORTED_RUNTIME_CONTRACT_VERSIONS
         )
 
     def source_ci_contract(self) -> bool:
@@ -811,6 +884,20 @@ class ProjectProfile:
         return (
             self.schema_version == 4
             and "prepare_ci" in self.kit_managed_commands
+            and self.command_versions.get("prepare_ci")
+            in {PREPARE_CI_VERSION, LEGACY_PREPARE_CI_VERSION}
+        )
+
+    def runtime_contracts_v2_1(self) -> bool:
+        return (
+            self.runtime_contracts_v2()
+            and self.command_versions.get("runtime_contracts")
+            == RUNTIME_CONTRACT_VERSION
+        )
+
+    def source_ci_contract_v3(self) -> bool:
+        return (
+            self.source_ci_contract()
             and self.command_versions.get("prepare_ci") == PREPARE_CI_VERSION
         )
 

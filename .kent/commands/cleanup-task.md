@@ -7,9 +7,12 @@ ambiguous effects. Follow `contracts/worktree-contract.md`; close only proven
 task-owned processes. Never delete the current root or bypass node-owned
 cleanup with a manual Task move.
 
-Before `kent worktree leave`, freeze original `workspace_path`, `branch_name`
-and the complete outgoing carrier. Run the profile's `prepare_cleanup` from
-that root. It is the sole owner of the final ordinary append and seal.
+Before `kent worktree leave`, freeze original `workspace_path`, `branch_name`,
+the exact declared `pr_base_branch` (or explicit `not-applicable` for
+non-merged cleanup), and the complete outgoing carrier. Run the profile's
+`prepare_cleanup` from that root. It is the sole owner of the final ordinary
+append and seal. When target continuity is enabled, confirm the Janitor's
+fresh PR-target check before treating merged cleanup as successful.
 Do not append standalone evidence before it, after seal or for a blocker;
 retain preflight/blocker observations in existing Task records.
 

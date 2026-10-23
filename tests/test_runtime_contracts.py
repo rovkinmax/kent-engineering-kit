@@ -92,6 +92,69 @@ class RetainedScriptReaderTest(unittest.TestCase):
 
 
 class EvidenceRecoveryViewTest(unittest.TestCase):
+    def test_typed_script_ci_archive_row_is_closed_and_chain_bound(self):
+        identity = {
+            "task_id": "native-task",
+            "task_short_id": "TASK-4",
+            "project_id": "project-123",
+            "workspace_path": "/workspace",
+            "invocation_kind": "script",
+            "node_id": "ci_prepare",
+            "transition_branch_key": None,
+        }
+        row = runtime_module.build_script_ci_archive_record(
+            task_short_id="TASK-4",
+            workspace_path="/workspace",
+            script_identity=identity,
+            report_sha256="a" * 64,
+            sequence=1,
+            previous_hash="",
+        )
+        self.assertEqual(row["schema_version"], 3)
+        self.assertEqual(
+            row["artifacts"],
+            [".kent/runtime/TASK-4/ci-report-" + "a" * 64 + ".json"],
+        )
+        self.assertEqual(
+            runtime_module.validate_script_ci_archive_record(
+                row,
+                task_short_id="TASK-4",
+                workspace_path="/workspace",
+                sequence=1,
+                previous_hash="",
+            ),
+            row,
+        )
+        self.assertFalse(runtime_module.is_ordinary_evidence_record(row))
+        self.assertEqual(
+            runtime_module.validate_evidence_view(
+                runtime_module.canonical_bytes(row) + b"\n",
+                task_short_id="TASK-4",
+            )["records"],
+            [row],
+        )
+
+        for changes in (
+            {"workspace_path": "/other"},
+            {"sequence": 2},
+            {"previous_hash": "b" * 64},
+            {"artifacts": [".kent/runtime/TASK-4/other.json"]},
+            {"script_identity": {**identity, "invocation_kind": "agent"}},
+            {"extra": "not-closed"},
+        ):
+            invalid = {**row, **changes}
+            invalid["event_hash"] = runtime_module._event_hash(
+                {key: item for key, item in invalid.items() if key != "event_hash"}
+            )
+            with self.subTest(changes=changes), self.assertRaises(RuntimeContractError):
+                runtime_module.validate_script_ci_archive_record(
+                    invalid,
+                    task_short_id="TASK-4",
+                    workspace_path="/workspace",
+                    sequence=1,
+                    previous_hash="",
+                )
+
     def test_v2_identity_and_mixed_chain(self):
         legacy = self.record()
         owner = {
@@ -511,6 +574,45 @@ class RuntimeContractTest(unittest.TestCase):
         }
         with self.assertRaises(RuntimeContractError):
             validate_delivery_context(mismatched)
+
+    def test_delivery_context_v2_binds_the_observed_pr_target_branch(self) -> None:
+        from workflowkit.runtime import DELIVERY_CONTEXT_V1_SCHEMA
+
+        historical = {
+            "schema": DELIVERY_CONTEXT_V1_SCHEMA,
+            "phase": "post_pr",
+            "pr_url": "https://github.com/owner/repository/pull/17",
+            "branch_name": "feature/TASK-17",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": "uninitialized",
+            "ci_contract": ' { "raw": "preserved" } ',
+        }
+        self.assertEqual(validate_delivery_context(historical), historical)
+
+        current = {
+            **historical,
+            "schema": runtime_module.DELIVERY_CONTEXT_SCHEMA,
+            "pr_base_branch": "release/stable",
+        }
+        self.assertEqual(validate_delivery_context(current), current)
+        self.assertEqual(
+            delivery_context_fields(
+                {"delivery_context": json.dumps(current, ensure_ascii=False)}
+            )["delivery_context"],
+            json.dumps(current, ensure_ascii=False),
+        )
+        for invalid_target in ("", "-main", " main ", "main\n"):
+            with self.subTest(target=invalid_target), self.assertRaises(
+                RuntimeContractError
+            ):
+                validate_delivery_context(
+                    {**current, "pr_base_branch": invalid_target}
+                )
+        with self.assertRaises(RuntimeContractError):
+            validate_delivery_context(
+                {key: value for key, value in current.items()
+                 if key != "pr_base_branch"}
+            )
 
     def test_delivery_context_rejects_invalid_shapes_and_duplicate_json_keys(self) -> None:
         post_pr = {

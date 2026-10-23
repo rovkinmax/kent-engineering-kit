@@ -65,6 +65,7 @@ EVIDENCE_FIXTURE_OWNER = {
     "KENT_SESSION_ID": "11111111-1111-4111-8111-111111111111",
     "KENT_STEP_ID": "22222222-2222-4222-8222-222222222222",
 }
+REAL_GIT = shutil.which("git") or "git"
 
 
 def load_template_module(path: Path, name: str):
@@ -231,6 +232,19 @@ class GitRepositoryTest(unittest.TestCase):
         return root
 
     def run_git(self, root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [REAL_GIT, "-C", str(root), *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+
+    def run_fixture_git(
+        self,
+        root: Path,
+        *args: str,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", "-C", str(root), *args],
             text=True,
@@ -2138,13 +2152,22 @@ class WorkflowVerificationDispatchTest(GitRepositoryTest):
                     if operation == "accepted-head":
                         return {"accepted_snapshot": store.accepted_head(task)}
                     if operation == "resolve-plan":
-                        if fields["plan_path"] != "not-applicable":
-                            store.plan_revision(task, fields["plan_path"])
-                        revision = store.read(f"tasks/{task}/plan")
+                        current = store.read(f"tasks/{task}/plan")
+                        supplied = (
+                            current
+                            if fields["plan_path"] == "not-applicable"
+                            else store.plan_revision(task, fields["plan_path"])
+                        )
+                        comparison = store.compare_plan_revisions(
+                            task, supplied.token, current.token,
+                        )
                         return {
-                            "working_path": str(revision.path),
-                            "working_revision": revision.token,
-                            "working_sha256": revision.sha256,
+                            "supplied_revision": supplied.token,
+                            "supplied_sha256": comparison["supplied_sha256"],
+                            "supplied_comparison": comparison["comparison"],
+                            "working_path": str(current.path),
+                            "working_revision": current.token,
+                            "working_sha256": comparison["working_sha256"],
                         }
                     if operation == "check-plan":
                         status = store.check_plan(
@@ -2427,13 +2450,22 @@ class WorkflowVerificationDispatchTest(GitRepositoryTest):
                             "sha256": revision.sha256,
                         }
                     if operation == "resolve-plan":
-                        if fields["plan_path"] != "not-applicable":
-                            store.plan_revision(task, fields["plan_path"])
-                        revision = store.read(f"tasks/{task}/plan")
+                        current = store.read(f"tasks/{task}/plan")
+                        supplied = (
+                            current
+                            if fields["plan_path"] == "not-applicable"
+                            else store.plan_revision(task, fields["plan_path"])
+                        )
+                        comparison = store.compare_plan_revisions(
+                            task, supplied.token, current.token,
+                        )
                         return {
-                            "working_path": str(revision.path),
-                            "working_revision": revision.token,
-                            "working_sha256": revision.sha256,
+                            "supplied_revision": supplied.token,
+                            "supplied_sha256": comparison["supplied_sha256"],
+                            "supplied_comparison": comparison["comparison"],
+                            "working_path": str(current.path),
+                            "working_revision": current.token,
+                            "working_sha256": comparison["working_sha256"],
                         }
                     if operation == "check-plan":
                         status = store.check_plan(
@@ -3605,6 +3637,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
                     "_kent": native, "workspace_path": str(root),
                     "branch_name": self.run_git(root, "branch", "--show-current").stdout.strip(),
                     "pr_url": "", "cleanup_mode": "no_pr",
+                    "pr_base_branch": "not-applicable",
                     "cleanup_session_id": owner["session_id"],
                     "cleanup_report": sealed["terminal_marker"], "task_short_id": "TASK-4",
                 }
@@ -4046,6 +4079,8 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.run_git(root, "add", ".")
         self.run_git(root, "commit", "-q", "-m", "Add context")
         scripts = self.install_v2_runtime_commands(root)
+        self.run_git(root, "add", ".kent/scripts")
+        self.run_git(root, "commit", "-q", "-m", "Install runtime fixtures")
         evidence = scripts / "workflow-evidence-ledger"
         payload = {
             "node_key": "implement",
@@ -4130,6 +4165,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
                     "task_short_id": "TASK-4",
                     "branch_name": "",
                     "pr_url": "",
+                    "pr_base_branch": "not-applicable",
                     "merge_report": "",
                     "cleanup_mode": "report_only",
                     "cleanup_session_id": "test-session",
@@ -4145,6 +4181,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.assertEqual(
             json.loads(janitored.stdout)["transition"],
             "task_janitor_done",
+            janitored.stdout + janitored.stderr,
         )
         runtime = root / ".kent" / "runtime"
         self.assertFalse((runtime / "TASK-4").exists())
@@ -4162,6 +4199,8 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
         self.run_git(root, "add", ".")
         self.run_git(root, "commit", "-q", "-m", "Add context")
         scripts = self.install_v2_runtime_commands(root)
+        self.run_git(root, "add", ".kent/scripts")
+        self.run_git(root, "commit", "-q", "-m", "Install runtime fixtures")
         evidence = scripts / "workflow-evidence-ledger"
         self.append(root, summary="sealed", files_read=["AGENTS.md"])
         request = {
@@ -4197,6 +4236,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
                     "task_short_id": "TASK-4",
                     "branch_name": "",
                     "pr_url": "",
+                    "pr_base_branch": "not-applicable",
                     "merge_report": "",
                     "cleanup_mode": "report_only",
                     "cleanup_session_id": "test-session",
@@ -4223,6 +4263,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
                     "task_short_id": "TASK-4",
                     "branch_name": "",
                     "pr_url": "",
+                    "pr_base_branch": "not-applicable",
                     "merge_report": "",
                     "cleanup_mode": "report_only",
                     "cleanup_session_id": "test-session",
@@ -4235,7 +4276,7 @@ class WorkflowEvidenceLedgerTest(GitRepositoryTest):
             check=False,
         )
         self.assertEqual(janitor.returncode, 0, janitor.stderr)
-        self.assertFalse(tombstone.exists())
+        self.assertFalse(tombstone.exists(), janitor.stdout + janitor.stderr)
         self.assertTrue(
             (runtime_dir / f".evidence-terminal-{hashlib.sha256(b'TASK-4').hexdigest()}").exists()
         )
@@ -6941,13 +6982,13 @@ class GitHubPrFeedbackTest(GitRepositoryTest):
             '"user":{"login":"carol"},"commit_id":"0000000000000000000000000000000000000000",'
             '"original_commit_id":"0000000000000000000000000000000000000000",'
             '"pull_request_review_thread_id":"thread-1"}]]\\n\' ;;\n'
-            '  *graphql*) printf \'[{"data":{"repository":{"pullRequest":{"reviewThreads":'
+            '  *graphql*) printf \'{"data":{"repository":{"pullRequest":{"reviewThreads":'
             '{"nodes":[{"id":"thread-1","isResolved":true,"isOutdated":false,'
             '"path":"src/app.py","line":12,"startLine":10,"originalLine":20,'
             '"originalStartLine":18,"subjectType":"LINE","comments":{"nodes":'
             '[{"id":"thread-comment-1"}],"pageInfo":{"hasNextPage":false,'
             '"endCursor":null}}}],"pageInfo":{"hasNextPage":false,'
-            '"endCursor":null}}}}}}]\\n\' ;;\n'
+            '"endCursor":null}}}}}}\\n\' ;;\n'
             '  *) printf \'[]\\n\' ;;\n'
             "esac\n"
         )
@@ -7521,12 +7562,12 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
         (root / "feedback.json").write_text(
             json.dumps(feedback or [])
         )
-        (root / "threads.json").write_text(json.dumps([{
+        (root / "threads.json").write_text(json.dumps({
             "data": {"repository": {"pullRequest": {"reviewThreads": {
                 "nodes": threads or [],
                 "pageInfo": {"hasNextPage": False, "endCursor": None},
             }}}},
-        }]))
+        }))
         (root / "pr-views").write_text("0")
         (root / "check-views").write_text("0")
         next_state = root / "next-state.json"
@@ -8067,6 +8108,10 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
                 checkpoint = root / ".kent" / "scripts" / "workflow-checkpoint"
                 checkpoint.write_text(
                     "from pathlib import Path\n"
+                    "def current_script_delivery_protocol(root, *, task, native_context):\n"
+                    f"    return {{'protocol': 'legacy', 'target_required': False, "
+                    f"'context_schema': 'workflow-delivery-context-v1', "
+                    f"'node_key': {'ci_watch' if source == CI_WATCH else 'merge_watch'!r}}}\n"
                     "def emit_producer_result(root, payload, result, producer_kind):\n"
                     "    path = Path(root) / 'capture-calls'\n"
                     "    with path.open('a') as output:\n"
@@ -8114,6 +8159,7 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
             ),
             "pr_head_oid": contract["head_oid"],
             "pr_base_oid": contract["base_oid"],
+            "pr_base_branch": "main",
             "pr_feedback_cursor": cursor,
         }
         if task is not None:
@@ -8705,6 +8751,119 @@ class GitHubDynamicWatchTest(GitRepositoryTest):
 
 
 class WorkflowJanitorTest(GitRepositoryTest):
+    def setUp(self) -> None:
+        self._git_shim_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._git_shim_temporary.cleanup)
+        shim_directory = Path(self._git_shim_temporary.name)
+        shim = shim_directory / "git"
+        shim.write_text(
+            f"""#!{sys.executable}
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+REAL_GIT = {REAL_GIT!r}
+args = sys.argv[1:]
+network_commands = {{"fetch", "ls-remote", "push"}}
+blocked_network_commands = {{
+    "clone", "pull", "submodule", "fetch-pack", "send-pack", "receive-pack",
+}}
+command_index = next(
+    (index for index, value in enumerate(args)
+     if value in network_commands | blocked_network_commands),
+    None,
+)
+if command_index is None:
+    os.execv(REAL_GIT, [REAL_GIT, *args])
+
+command = args[command_index]
+if command not in network_commands:
+    print("fixture Git shim rejected an unsupported network command", file=sys.stderr)
+    raise SystemExit(97)
+
+directory = Path.cwd()
+for index, value in enumerate(args[:-1]):
+    if value == "-C":
+        directory = Path(args[index + 1])
+try:
+    repository = subprocess.run(
+        [REAL_GIT, "-C", str(directory), "rev-parse", "--show-toplevel"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+    ).stdout.strip()
+    fetch_url = subprocess.run(
+        [REAL_GIT, "-C", repository, "remote", "get-url", "origin"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+    ).stdout.strip()
+    push_url = subprocess.run(
+        [REAL_GIT, "-C", repository, "remote", "get-url", "--push", "origin"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+    ).stdout.strip()
+    bare_remote = subprocess.run(
+        [REAL_GIT, "-C", repository, "config", "--get",
+         "kent.test.githubBareRemote"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+    ).stdout.strip()
+except (OSError, subprocess.CalledProcessError) as error:
+    print("fixture Git shim could not resolve its owned repository", file=sys.stderr)
+    raise SystemExit(97) from error
+
+github_origin = "https://github.com/example/repo.git"
+bare_path = Path(bare_remote)
+if (
+    fetch_url != github_origin
+    or push_url != github_origin
+    or not bare_path.is_absolute()
+    or not bare_path.is_dir()
+):
+    print("fixture Git shim rejected an unowned remote destination", file=sys.stderr)
+    raise SystemExit(97)
+
+destination_index = next(
+    (index for index in range(command_index + 1, len(args))
+     if not args[index].startswith("-")),
+    None,
+)
+if destination_index is None or args[destination_index] not in {{
+    "origin", github_origin,
+}}:
+    print("fixture Git shim rejected an unknown remote destination", file=sys.stderr)
+    raise SystemExit(97)
+
+bare_check = subprocess.run(
+    [REAL_GIT, "--git-dir", str(bare_path), "rev-parse", "--is-bare-repository"],
+    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+)
+if bare_check.returncode != 0 or bare_check.stdout.strip() != "true":
+    print("fixture Git shim rejected a non-bare destination", file=sys.stderr)
+    raise SystemExit(97)
+
+args[destination_index] = str(bare_path)
+completed = subprocess.run([REAL_GIT, *args], check=False)
+raise SystemExit(completed.returncode)
+"""
+        )
+        shim.chmod(0o755)
+        self._git_shim_path = shim
+        self._git_path_patch = mock.patch.dict(
+            os.environ,
+            {"PATH": f"{shim_directory}{os.pathsep}{os.environ.get('PATH', '')}"},
+        )
+        self._git_path_patch.start()
+        self.addCleanup(self._git_path_patch.stop)
+
+    def set_fixture_github_origin(self, root: Path, remote: Path) -> None:
+        self.run_git(
+            root, "config", "kent.test.githubBareRemote", str(remote.resolve()),
+        )
+        self.run_git(
+            root,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/example/repo.git",
+        )
+
     def test_delete_result_native_and_legacy_contracts(self) -> None:
         module = load_template_module(JANITOR, "janitor_delete_contract")
         for outcome in ("DELETED", "RETAINED", "NOT_REQUESTED", "NOT_APPLICABLE"):
@@ -8824,7 +8983,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "task_janitor_blocked",
                     payload,
                 )
-                self.assertIn("runtime-parent", payload["cleanup_report"])
+                self.assertIn("unknown_runtime_entry", payload["cleanup_report"])
                 self.assertIn("owner", payload["blocker_reason"].lower())
                 self.assertTrue(worktree.is_dir())
                 current = worktree.stat()
@@ -8866,11 +9025,18 @@ class WorkflowJanitorTest(GitRepositoryTest):
             worktree / ".kent" / "runtime" / "late-foreign-owner" / "opaque-state"
         )
 
-        def prepare_then_inject(workspace, task_short_id, *, cleanup_report):
+        def prepare_then_inject(
+            workspace,
+            task_short_id,
+            *,
+            cleanup_report,
+            **prepare_options,
+        ):
             result = original_prepare(
                 workspace,
                 task_short_id,
                 cleanup_report=cleanup_report,
+                **prepare_options,
             )
             foreign_file.parent.mkdir()
             foreign_file.write_bytes(foreign_bytes)
@@ -9060,7 +9226,14 @@ class WorkflowJanitorTest(GitRepositoryTest):
 
                 self.assertEqual(result_code, 0, payload)
                 self.assertEqual(payload["transition"], "task_janitor_blocked", payload)
-                self.assertIn("runtime-parent", payload["cleanup_report"])
+                expected_failure_code = {
+                    "foreign_symlink": "unknown_runtime_entry",
+                    "wrong_type": "unsafe_runtime_entry",
+                    "over_limit": "inventory_limit",
+                    "read_failure": "io_failure",
+                    "directory_identity_drift": "unsafe_runtime_entry",
+                }[case]
+                self.assertIn(expected_failure_code, payload["cleanup_report"])
                 self.assertIn("owner", payload["blocker_reason"].lower())
                 self.assertFalse(
                     native_delete_called.exists(),
@@ -10057,7 +10230,9 @@ class WorkflowJanitorTest(GitRepositoryTest):
             try:
                 self.assertEqual(len(janitor._bounded_inventory(descriptor)), 256)
                 (root / "overflow").touch()
-                with self.assertRaisesRegex(ValueError, "entry limit"):
+                with self.assertRaisesRegex(
+                    ValueError, "runtime evidence inventory exceeds a fixed limit",
+                ):
                     janitor._bounded_inventory(descriptor)
             finally:
                 os.close(descriptor)
@@ -10066,7 +10241,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             self._write_valid_runtime_file(fixture[3] / f"unknown-{index}")
         result = self.ci_cleanup(fixture)
         self.assertFalse(result[0], result)
-        self.assertIn("entry limit", result[1])
+        self.assertIn("inventory_limit", result[1])
         self.assertTrue(fixture[3].exists())
 
     def test_ci_report_reference_and_present_byte_bounds(self):
@@ -10098,13 +10273,17 @@ class WorkflowJanitorTest(GitRepositoryTest):
             stream.seek(0, os.SEEK_END)
             stream.write(b"x")
             stream.flush()
-            with self.assertRaisesRegex(ValueError, "byte limit"):
+            with self.assertRaisesRegex(
+                ValueError, "runtime evidence inventory exceeds a fixed limit",
+            ):
                 janitor._bounded_file_bytes(stream.fileno(), 64 * 1024)
             # Even a stale size observation cannot bypass the capped read.
             fields = list(os.fstat(stream.fileno()))
             fields[6] = 0
             with mock.patch.object(os, "fstat", return_value=os.stat_result(fields)), \
-                 self.assertRaisesRegex(ValueError, "byte or record limit"):
+                 self.assertRaisesRegex(
+                     ValueError, "runtime evidence inventory exceeds a fixed limit",
+                 ):
                 janitor._bounded_file_bytes(stream.fileno(), 64 * 1024)
 
     def test_ci_scoped_admission_closes_every_descriptor_on_success_and_failure(self):
@@ -10148,7 +10327,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     result,
                 )
                 if case == "unknown":
-                    self.assertIn("unknown", result[1])
+                    self.assertIn("unknown_runtime_entry", result[1])
                     self.assertTrue(active.is_dir())
                     self.assertTrue((active / "unknown").is_file())
                 self.assertEqual(opened, set())
@@ -10368,13 +10547,17 @@ class WorkflowJanitorTest(GitRepositoryTest):
             self.assertEqual(paths, sorted(set(paths)))
 
     def janitor_input(self, root: Path, **overrides: str) -> str:
+        cleanup_mode = overrides.get("cleanup_mode", "report_only")
         payload = {
             "workspace_path": str(root),
             "task_short_id": "TASK-1",
             "branch_name": "",
             "pr_url": "",
+            "pr_base_branch": (
+                "main" if cleanup_mode == "merged" else "not-applicable"
+            ),
             "merge_report": "",
-            "cleanup_mode": "report_only",
+            "cleanup_mode": cleanup_mode,
             "cleanup_session_id": "session-test",
             "cleanup_report": "Cleanup preflight passed.",
         }
@@ -10442,6 +10625,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             "origin",
             f"refs/heads/{branch}:refs/heads/{branch}",
         )
+        self.set_fixture_github_origin(root, remote)
         return remote
 
     def completed_wrapper(self, root: Path) -> Path:
@@ -10547,6 +10731,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             "origin",
             "refs/heads/TASK-1:refs/heads/TASK-1",
         )
+        self.set_fixture_github_origin(root, remote)
 
         kent_record_id = "kent-record-task-1"
         before = root / "kent-list-before.json"
@@ -10662,7 +10847,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertIn("retained restorative metadata", report)
         self.assertIn(kent_record_id, report)
         self.assertIn(str(worktree), report)
-        self.assertIn("Local branch removed: true", report)
+        self.assertIn("Local branch disposition: absent.", report)
         self.assertIn("Remote branch retained: true", report)
 
     def test_kent_topology_preflight_and_post_delete_matrix(self) -> None:
@@ -10777,7 +10962,9 @@ class WorkflowJanitorTest(GitRepositoryTest):
                         capture_output=True, check=False,
                     )
                     self.assertEqual(local.returncode == 0, not accepted)
-                    self.assertIn("refs/heads/TASK-1", self.run_git(
+                    self.assertIn("refs/heads/TASK-1", self.run_fixture_git(
+                        # The logical GitHub origin is routed to the owned bare
+                        # repository only through the fixture shim.
                         root, "ls-remote", "--heads", "origin", "refs/heads/TASK-1",
                     ).stdout)
                     if accepted and state != "absent":
@@ -10888,6 +11075,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -11082,7 +11270,9 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertEqual(local_branch.returncode, 1)
         self.assertIn(
             "refs/heads/TASK-1",
-            self.run_git(root, "ls-remote", "--heads", "origin", "refs/heads/TASK-1").stdout,
+            self.run_fixture_git(
+                root, "ls-remote", "--heads", "origin", "refs/heads/TASK-1",
+            ).stdout,
         )
 
     def test_managed_legacy_runtime_unknown_blocks_before_native_delete(self) -> None:
@@ -11118,7 +11308,8 @@ class WorkflowJanitorTest(GitRepositoryTest):
 
         self.assertEqual(code, 0, payload)
         self.assertEqual(payload["transition"], "task_janitor_blocked")
-        self.assertIn("payload.bin", payload["cleanup_report"])
+        self.assertIn("unknown_runtime_entry", payload["cleanup_report"])
+        self.assertNotIn("payload.bin", payload["cleanup_report"])
         self.assertEqual(delete_calls, [])
         self.assertEqual(unknown.read_bytes(), b"preserve\n")
         self.assertEqual(
@@ -11180,7 +11371,9 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertTrue(worktree.is_dir())
 
     def test_partial_native_retarget_refusal_stops_before_branch_cleanup(self) -> None:
-        root, worktree, scripts, _ = self.make_managed_worktree(with_v2=False)
+        root, worktree, scripts, cleanup_marker = self.make_managed_worktree(
+            with_v2=True,
+        )
         janitor = load_template_module(
             scripts / "workflow-task-janitor",
             "janitor_partial_retarget_refusal",
@@ -11208,7 +11401,9 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "state": "MERGED",
                     "headRefName": "TASK-1",
                     "headRefOid": head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
+                    "url": "https://github.com/example/repo/pull/1",
                 },
             ),
             mock.patch.object(
@@ -11234,10 +11429,6 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 return_value=(True, "runtime parent admitted"),
             ),
             mock.patch.object(
-                janitor, "_prepare_v2_managed_runtime_state",
-                return_value=(True, "terminal state prepared"),
-            ),
-            mock.patch.object(
                 janitor,
                 "delete_managed_worktree",
                 side_effect=refuse_after_partial_retarget,
@@ -11248,7 +11439,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 janitor,
                 root,
                 worktree,
-                cleanup_report="Legacy cleanup fixture.",
+                cleanup_report=cleanup_marker,
                 native_delete_called=root / "native-delete-called",
                 cleanup_mode="merged",
                 pr_url=pr_url,
@@ -11262,7 +11453,15 @@ class WorkflowJanitorTest(GitRepositoryTest):
             simulated_cleanup_target["effective_workdir"], str(root),
         )
         local_cleanup.assert_not_called()
-        remote_branch_read.assert_called_once_with(root.resolve(), "TASK-1")
+        remote_branch_read.assert_called_once()
+        self.assertEqual(
+            remote_branch_read.call_args.args,
+            (root.resolve(), "TASK-1"),
+        )
+        self.assertEqual(
+            remote_branch_read.call_args.kwargs["expected_repository"],
+            ("example", "repo"),
+        )
         self.assertTrue(worktree.is_dir())
         self.assertIn(
             str(worktree),
@@ -11274,7 +11473,9 @@ class WorkflowJanitorTest(GitRepositoryTest):
         )
         self.assertIn(
             "refs/heads/TASK-1",
-            self.run_git(root, "ls-remote", "--heads", "origin", "TASK-1").stdout,
+            self.run_fixture_git(
+                root, "ls-remote", "--heads", "origin", "TASK-1",
+            ).stdout,
         )
 
     def test_managed_completed_wrapper_without_tombstone_reports_ambiguous_evidence(
@@ -12342,11 +12543,10 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 )
                 self.assertFalse(outcome[0], outcome)
                 if case in {"tracked", "not_ignored"}:
-                    self.assertIn("tracked or not ignored", outcome[1])
+                    self.assertIn("tracked_or_not_ignored", outcome[1])
                 else:
-                    self.assertIn("fix-checkpoint.json", outcome[1])
-                    if case != "symlink":
-                        self.assertIn("runtime evidence is unsafe", outcome[1])
+                    self.assertIn("unsafe_runtime_entry", outcome[1])
+                self.assertNotIn("fix-checkpoint.json", outcome[1])
                 self.assertNotIn("unexpected runtime entries", outcome[1])
                 self.assertTrue(runtime.exists())
                 self.assertTrue(entry.exists())
@@ -12424,9 +12624,10 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 self.assertFalse(outcome[0])
                 self.assertNotIn("unexpected tombstone entries", outcome[1])
                 if case in {"tracked", "not_ignored"}:
-                    self.assertIn("tracked or not ignored", outcome[1])
+                    self.assertIn("tracked_or_not_ignored", outcome[1])
                 else:
-                    self.assertIn("fix-checkpoint.json", outcome[1])
+                    self.assertIn("unsafe_runtime_entry", outcome[1])
+                self.assertNotIn("fix-checkpoint.json", outcome[1])
                 self.assertTrue(tombstone.exists())
                 self.assertTrue(entry.exists())
 
@@ -13103,8 +13304,8 @@ class WorkflowJanitorTest(GitRepositoryTest):
                 )
                 self.assertFalse(result[0])
                 self.assertIn(
-                    "runtime evidence is unsafe" if state == "unsafe"
-                    else "tracked or not ignored",
+                    "unsafe_runtime_entry" if state == "unsafe"
+                    else "tracked_or_not_ignored",
                     result[1],
                 )
                 self.assertTrue(tombstone.exists())
@@ -13157,8 +13358,14 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["transition"], "task_janitor_blocked")
-        self.assertIn("missing branch identity", payload["cleanup_report"])
-        self.assertIn("exact current Git branch", payload["blocker_reason"])
+        self.assertIn(
+            "could not admit the exact attached branch identity",
+            payload["cleanup_report"],
+        )
+        self.assertIn(
+            "attached-branch readback exactly matching",
+            payload["blocker_reason"],
+        )
         self.assertTrue(worktree.exists())
 
     def test_exact_merged_pr_invokes_kent_worktree_deletion(self) -> None:
@@ -13180,6 +13387,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             "origin",
             "refs/heads/TASK-1:refs/heads/TASK-1",
         )
+        self.set_fixture_github_origin(root, remote)
 
         pr_state = root / "pr-state.json"
         pr_state.write_text(
@@ -13189,6 +13397,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -13247,6 +13456,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -13311,6 +13521,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -13361,7 +13572,9 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["transition"], "task_janitor_done")
-        self.assertEqual(attempts.read_text().strip(), "3")
+        # The admission lookup retries twice, then five fresh PR witnesses
+        # each perform one read before their associated cleanup effects.
+        self.assertEqual(int(attempts.read_text().strip()), 8)
         self.assertTrue(wrapper_marker.exists())
 
     def test_merged_pr_lookup_failure_returns_to_cleanup(self) -> None:
@@ -13370,6 +13583,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         worktrees.mkdir(parents=True)
         worktree = worktrees / "TASK-1"
         self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
+        self.add_origin_branch(root, worktree)
 
         attempts = root / "gh-attempts"
         fake_gh = root / "gh"
@@ -13416,8 +13630,14 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["transition"], "task_janitor_blocked")
-        self.assertIn("failed after 3 attempts", payload["cleanup_report"])
-        self.assertIn("bounded retries", payload["blocker_reason"])
+        self.assertIn(
+            "merged PR evidence lookup failed; no deletion claim is made",
+            payload["cleanup_report"],
+        )
+        self.assertIn(
+            "Provider, PR-target, or repository-route evidence",
+            payload["blocker_reason"],
+        )
         self.assertEqual(attempts.read_text().strip(), "3")
         self.assertFalse(wrapper_marker.exists())
         self.assertTrue(worktree.exists())
@@ -13429,6 +13649,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         worktree = worktrees / "TASK-1"
         self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
         head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        self.add_origin_branch(root, worktree)
 
         pr_state = root / "pr-state.json"
         pr_state.write_text(
@@ -13438,6 +13659,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -13510,6 +13732,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -13576,6 +13799,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -13636,7 +13860,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.run_git(root, "commit", "-q", "-m", "User update")
         pr_head = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
         self.add_origin_branch(root, worktree)
-        self.run_git(
+        self.run_fixture_git(
             root,
             "push",
             "-q",
@@ -13662,6 +13886,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": pr_head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -13714,6 +13939,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.run_git(root, "add", "remote-only.txt")
         self.run_git(root, "commit", "-q", "-m", "Remote only")
         pr_head = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+        self.add_origin_branch(root, worktree)
 
         pr_state = root / "pr-state.json"
         pr_state.write_text(
@@ -13723,6 +13949,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": pr_head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -13774,7 +14001,9 @@ class WorkflowJanitorTest(GitRepositoryTest):
             with self.subTest(outcome=outcome):
                 root, worktree, _, _ = self.make_managed_worktree(with_v2=False)
                 head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
-                remote = Path(self.run_git(root, "remote", "get-url", "origin").stdout.strip())
+                remote = Path(self.run_git(
+                    root, "config", "--get", "kent.test.githubBareRemote",
+                ).stdout.strip())
                 if not outcome.startswith("lease_"):
                     self.run_git(remote, "update-ref", "-d", "refs/heads/TASK-1")
                 wrapper = self.completed_wrapper(root)
@@ -13812,7 +14041,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     )
                     git.chmod(0o755)
                     environment.update(
-                        KENT_TEST_REAL_GIT=shutil.which("git"),
+                        KENT_TEST_REAL_GIT=str(self._git_shim_path),
                         PATH=str(bin_dir) + os.pathsep + environment["PATH"],
                     )
                 try:
@@ -13847,7 +14076,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                                 "lookup_error": "readback failed",
                                 "lease_lookup_error": "postcondition is unknown",
                                 "lease_retained": "remained after exact lease",
-                                "lease_failure": "deletion failed",
+                                "lease_failure": "uncertain deletion acknowledgement",
                             }[outcome],
                             payload["blocker_reason"],
                         )
@@ -13880,6 +14109,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         self.run_git(root, "worktree", "add", "-q", "-b", "TASK-1", str(worktree))
         self.run_git(worktree, "push", "-q", "-u", "origin", "TASK-1")
         head = self.run_git(worktree, "rev-parse", "HEAD").stdout.strip()
+        self.set_fixture_github_origin(root, remote)
 
         pr_state = root / "pr-state.json"
         pr_state.write_text(
@@ -13889,6 +14119,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -13968,6 +14199,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             "origin",
             f"{pr_head}:refs/heads/TASK-1",
         )
+        self.set_fixture_github_origin(root, remote)
 
         pr_state = root / "pr-state.json"
         pr_state.write_text(
@@ -13977,6 +14209,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": pr_head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }
@@ -14033,6 +14266,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
         remote = Path(remote_temporary.name)
         self.run_git(remote, "init", "--bare", "-q")
         self.run_git(root, "remote", "add", "origin", str(remote))
+        self.set_fixture_github_origin(root, remote)
         head = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
         self.run_git(root, "update-ref", "refs/remotes/origin/stale", head)
         worktrees = root / ".kent" / "worktrees"
@@ -14089,6 +14323,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
             "origin",
             "refs/heads/TASK-1:refs/heads/TASK-1",
         )
+        self.set_fixture_github_origin(root, remote)
         (root / "tracked.txt").write_text("new main state\n")
         self.run_git(root, "add", "tracked.txt")
         self.run_git(root, "commit", "-q", "-m", "Advance main")
@@ -14102,6 +14337,7 @@ class WorkflowJanitorTest(GitRepositoryTest):
                     "mergedAt": "2026-08-01T00:00:00Z",
                     "headRefName": "TASK-1",
                     "headRefOid": task_head,
+                    "baseRefName": "main",
                     "isCrossRepository": False,
                     "url": "https://github.com/example/repo/pull/1",
                 }

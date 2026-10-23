@@ -16,7 +16,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from workflowkit.delivery import UNACTIVATED_SOURCE, build_delivery_workflow
+from workflowkit.delivery import (
+    UNACTIVATED_SOURCE,
+    _PR_TARGET_CARRIER_FIELDS,
+    build_delivery_workflow,
+)
 from workflowkit.kent import spec_as_json
 from workflowkit.model import SpecError, WorkflowSpec
 from workflowkit.profile import ProjectProfile
@@ -109,9 +113,39 @@ def build_current_workflow(profile: ProjectProfile) -> WorkflowSpec:
     if profile.commands != CURRENT_COMMAND_TARGETS:
         raise SpecError("the current Kit graph requires the complete command set")
     complexity = profile.coder_selection_policy() == "complexity"
+    delivery = build_delivery_workflow(profile, 6 if complexity else 5)
+    target_carriers = [
+        edge for edge in delivery.edges
+        if edge.key != "prepare_pr_no_pr"
+        and any(
+            parameter.key in _PR_TARGET_CARRIER_FIELDS
+            for parameter in edge.parameters
+        )
+    ]
+    if not target_carriers or any(
+        not any(parameter.key == "pr_base_branch" for parameter in edge.parameters)
+        for edge in target_carriers
+    ):
+        raise SpecError("the current Kit graph requires exact PR target carriers")
+    no_pr = next(
+        (edge for edge in delivery.edges if edge.key == "prepare_pr_no_pr"),
+        None,
+    )
+    if no_pr is None or any(
+        parameter.key == "pr_base_branch" for parameter in no_pr.parameters
+    ):
+        raise SpecError("the current Kit no-PR route must omit PR target evidence")
+    if any(
+        edge.key in {
+            "ci_monitor_retry_preparation",
+            "ci_monitor_preparation_needs_user_action",
+        }
+        for edge in delivery.edges
+    ):
+        raise SpecError("the current Kit CI-off graph cannot declare source-CI recovery")
     return _add_plan_approval(
-        build_delivery_workflow(profile, 6 if complexity else 5),
-        expected_shape=(21, 56, 57) if complexity else (21, 55, 56),
+        delivery,
+        expected_shape=(21, 60, 61) if complexity else (21, 59, 60),
     )
 
 

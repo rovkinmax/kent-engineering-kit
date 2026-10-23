@@ -397,6 +397,28 @@ class ProducerTransportTests(unittest.TestCase):
             for path in build.rglob("*.json")
         }
 
+    def test_emitted_packet_limit_is_checked_after_footer_decoration(self):
+        import workflowkit.delivery as delivery
+
+        base = {
+            "result": {"commentary": "opaque bytes", "transition": "failed"},
+        }
+        locator = (
+            "build/kent-workflow/KIT-1/packets/base-"
+            + "a" * 64
+            + ".json"
+        )
+        emitted = delivery._packet_emitted(base, locator)
+        self.assertEqual(
+            json.loads(emitted)["commentary"],
+            "opaque bytes\n" + delivery.PACKET_FOOTER + locator,
+        )
+        with patch.object(delivery, "PACKET_LIMIT", len(emitted) - 1):
+            with self.assertRaisesRegex(ValueError, "producer artifact exceeds its byte limit"):
+                delivery._packet_emitted(base, locator)
+        with patch.object(delivery, "PACKET_LIMIT", len(emitted)):
+            self.assertEqual(delivery._packet_emitted(base, locator), emitted)
+
     def test_required_synthesis_rejects_go_whitespace_without_rewriting_bytes(self):
         locator, _ = self.capture()
         graph = self.review_graph()
@@ -704,6 +726,128 @@ class ProducerTransportTests(unittest.TestCase):
         self.assertEqual(outer["ci_report"], self.result["ci_report"])
         self.assertEqual(outer["pr_feedback_cursor"], cursor)
         self.assertEqual(outer["phase"], "post_pr")
+
+    def test_post_pr_v2_requires_observed_target_and_revalidates_only_that_field(self):
+        from workflowkit.runtime import canonical_bytes, make_dynamic_pr_feedback_cursor
+
+        cursor = canonical_bytes(make_dynamic_pr_feedback_cursor(
+            repository="owner/repo", pull_number=7, items=[],
+        )).decode("utf-8")
+        identity_fields = {
+            "workspace_path": str(self.root),
+            "pr_url": "https://github.com/owner/repo/pull/7",
+            "branch_name": "feat/exact",
+            "merge_strategy": "rebase",
+            "pr_feedback_cursor": cursor,
+        }
+        graph = self.graph_with_fields(
+            (
+                "workspace_path", "pr_url", "branch_name", "merge_strategy",
+                "pr_feedback_cursor", "pr_base_branch", "delivery_context",
+            ),
+            source_key="prepare_pr",
+        )
+        locator, _ = capture_producer(
+            self.root,
+            identity=self.identity,
+            producer_kind="prepare-pr",
+            inputs={},
+            result={
+                "transition": "monitor_ci",
+                **identity_fields,
+                "pr_base_branch": "main",
+            },
+        )
+        request = {
+            **self.request(locator),
+            "transition": "failed",
+            "delivery_mode": "post_pr",
+            "transition_contract_ref": transition_contract_reference(
+                self.identity,
+                self.detail(),
+                graph,
+                "failed",
+            ),
+        }
+        _, raw = self.pack(request, graph=graph)
+        completion = json.loads(raw)
+        context = json.loads(completion["delivery_context"])
+        self.assertEqual(context["schema"], "workflow-delivery-context-v2")
+        self.assertEqual(context["pr_base_branch"], "main")
+
+        previous_ci_contract = ' { "contract": "original bytes" }\n'
+        previous_ci_report = ' { "report": "original bytes" }\n'
+        prior_context = {
+            **context,
+            "ci_contract": previous_ci_contract,
+            "ci_report": previous_ci_report,
+        }
+        revalidation_graph = self.graph_with_fields(
+            (
+                "workspace_path", "pr_url", "branch_name", "merge_strategy",
+                "pr_feedback_cursor", "pr_base_branch", "delivery_context",
+                "ci_contract", "ci_report",
+            ),
+            source_key="waiting_pr",
+        )
+        revalidation_locator, _ = capture_producer(
+            self.root,
+            identity=self.identity,
+            producer_kind="retarget-observation",
+            inputs={},
+            result={
+                "transition": "state_changed",
+                **identity_fields,
+                "pr_base_branch": "release/next",
+                "delivery_context": canonical_bytes(prior_context).decode("utf-8"),
+                "ci_contract": previous_ci_contract,
+                "ci_report": previous_ci_report,
+            },
+        )
+        revalidation_request = {
+            **self.request(revalidation_locator),
+            "transition": "failed",
+            "delivery_mode": "post_pr_target_revalidated",
+            "transition_contract_ref": transition_contract_reference(
+                self.identity,
+                self.detail(),
+                revalidation_graph,
+                "failed",
+            ),
+        }
+        _, retargeted_raw = self.pack(
+            revalidation_request,
+            graph=revalidation_graph,
+        )
+        retargeted = json.loads(retargeted_raw)
+        retargeted_context = json.loads(retargeted["delivery_context"])
+        self.assertEqual(retargeted_context["pr_base_branch"], "release/next")
+        self.assertEqual(retargeted["ci_contract"], previous_ci_contract)
+        self.assertEqual(retargeted["ci_report"], previous_ci_report)
+
+        changed_packets = {
+            **revalidation_request,
+            "producer_refs": [revalidation_locator],
+        }
+        bad_locator, _ = capture_producer(
+            self.root,
+            identity=self.identity,
+            producer_kind="bad-retarget-observation",
+            inputs={},
+            result={
+                "transition": "state_changed",
+                **identity_fields,
+                "pr_base_branch": "release/next",
+                "delivery_context": canonical_bytes(prior_context).decode("utf-8"),
+                "ci_contract": "rewritten",
+                "ci_report": previous_ci_report,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "non-target producer bytes"):
+            self.pack(
+                {**changed_packets, "producer_refs": [bad_locator]},
+                graph=revalidation_graph,
+            )
 
     def test_duplicate_native_graph_identities_and_undeclared_values_fail(self):
         locator, _ = self.capture()
