@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -32,12 +34,18 @@ IDENTITY_FIELDS = ("url", "headRefOid", "baseRefOid", "headRefName", "baseRefNam
 
 class ObservationError(RuntimeError):
     def __init__(self, code: str, *, exit_code: int | None = None,
-                 stdout: bytes = b"", stderr: bytes = b"") -> None:
+                 stdout: bytes = b"", stderr: bytes = b"",
+                 rate_limited: bool = False,
+                 retry_after_seconds: int | None = None,
+                 provider_retry_unknown: bool = False) -> None:
         super().__init__(code)
         self.code = code
         self.exit_code = exit_code
         self.stdout_sha256 = hashlib.sha256(stdout).hexdigest()
         self.stderr_sha256 = hashlib.sha256(stderr).hexdigest()
+        self.rate_limited = rate_limited
+        self.retry_after_seconds = retry_after_seconds
+        self.provider_retry_unknown = provider_retry_unknown
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +54,196 @@ class ObservationError(RuntimeError):
             "stdout_sha256": self.stdout_sha256,
             "stderr_sha256": self.stderr_sha256,
         }
+
+    def retry_delay_seconds(
+        self,
+        *,
+        interval: int,
+        failure_count: int,
+    ) -> int:
+        """Honor provider throttling without changing the observer packet."""
+        if not self.rate_limited:
+            return interval
+        if self.retry_after_seconds is not None:
+            return max(interval, self.retry_after_seconds)
+        exponent = min(max(0, failure_count - 1), 6)
+        backoff = min(60 * (2**exponent), 3600)
+        return max(interval, backoff)
+
+
+_HTTP_DEBUG_STATUS = re.compile(r"^<\s*HTTP/\S+\s+(\d{3})(?:\s|$)", re.IGNORECASE)
+_HTTP_DEBUG_HEADER = re.compile(r"^<\s*([A-Za-z0-9-]+)\s*:\s*(.*?)\s*$")
+_RATE_LIMIT_BODY = re.compile(
+    r'^\s*(?:\{\s*)?"message"\s*:\s*".*(?:API rate limit exceeded|secondary rate limit|'
+    r'rate limit exceeded|abuse detection)',
+    re.IGNORECASE,
+)
+_PRIMARY_RATE_LIMIT_BODY = re.compile(
+    r'^\s*(?:\{\s*)?"message"\s*:\s*".*API rate limit exceeded',
+    re.IGNORECASE,
+)
+_SECONDARY_RATE_LIMIT_BODY = re.compile(
+    r'^\s*(?:\{\s*)?"message"\s*:\s*".*(?:secondary rate limit|abuse detection)',
+    re.IGNORECASE,
+)
+_RETRY_HEADERS = {
+    "retry-after",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+    "date",
+}
+
+
+def _http_date_timestamp(value: str | None) -> float | None:
+    if value is None or len(value) > 64:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            return None
+        return parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _provider_retry_metadata(stderr: bytes) -> tuple[bool | None, int | None]:
+    """Extract allowlisted timing from one complete final gh API response."""
+    current: dict[str, Any] | None = None
+    final_response: dict[str, Any] | None = None
+    line_count = 0
+    for raw_line in io.BytesIO(stderr):
+        line_count += 1
+        if line_count > 65536 or len(raw_line) > 16 * 1024:
+            return None, None
+        line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+        status_match = _HTTP_DEBUG_STATUS.match(line)
+        if line.startswith("< HTTP/") and status_match is None:
+            return None, None
+        if status_match is not None:
+            if current is not None:
+                return None, None
+            current = {
+                "status": int(status_match.group(1)),
+                "headers": {},
+                "headers_complete": False,
+                "complete": False,
+                "body_rate_limited": False,
+                "body_primary_rate_limited": False,
+                "body_secondary_rate_limited": False,
+            }
+            final_response = current
+            continue
+        if current is None:
+            continue
+        if not current["headers_complete"]:
+            header_match = _HTTP_DEBUG_HEADER.match(line)
+            if header_match is not None:
+                name = header_match.group(1).lower()
+                value = header_match.group(2).strip()
+                if name in _RETRY_HEADERS:
+                    if len(value) > 64:
+                        return None, None
+                    current["headers"][name] = value
+            elif not line.strip():
+                current["headers_complete"] = True
+            elif line.startswith("* Request took"):
+                current = None
+            continue
+        if line.startswith("* Request took"):
+            current["complete"] = True
+            current = None
+        else:
+            current["body_rate_limited"] = (
+                current["body_rate_limited"]
+                or _RATE_LIMIT_BODY.search(line) is not None
+            )
+            current["body_primary_rate_limited"] = (
+                current["body_primary_rate_limited"]
+                or _PRIMARY_RATE_LIMIT_BODY.search(line) is not None
+            )
+            current["body_secondary_rate_limited"] = (
+                current["body_secondary_rate_limited"]
+                or _SECONDARY_RATE_LIMIT_BODY.search(line) is not None
+            )
+
+    # Partial/unparseable output never provides retry evidence. Requiring the
+    # final response's normal request-completion marker also rejects truncation.
+    if (
+        final_response is None
+        or current is not None
+        or not final_response["headers_complete"]
+        or not final_response["complete"]
+    ):
+        return None, None
+
+    status = final_response["status"]
+    headers = final_response["headers"]
+    body_rate_limited = final_response["body_rate_limited"]
+    body_primary_rate_limited = final_response["body_primary_rate_limited"]
+    body_secondary_rate_limited = final_response["body_secondary_rate_limited"]
+    local_now = time.time()
+    provider_now = _http_date_timestamp(headers.get("date"))
+    reference_now = (
+        min(local_now, provider_now)
+        if provider_now is not None
+        else local_now
+    )
+    retry_after = headers.get("retry-after")
+    retry_after_seconds = None
+    retry_after_invalid = False
+    if retry_after is not None:
+        if re.fullmatch(r"[0-9]{1,10}", retry_after):
+            retry_after_seconds = int(retry_after)
+        else:
+            retry_after_timestamp = _http_date_timestamp(retry_after)
+            if retry_after_timestamp is None:
+                retry_after_invalid = True
+            else:
+                retry_after_seconds = max(
+                    0,
+                    int(retry_after_timestamp - reference_now + 0.999),
+                )
+    remaining = headers.get("x-ratelimit-remaining")
+    reset = headers.get("x-ratelimit-reset")
+    reset_seconds = None
+    reset_invalid = False
+    if reset is not None:
+        if re.fullmatch(r"[0-9]{1,10}", reset):
+            reset_seconds = int(reset)
+        else:
+            reset_invalid = True
+    failed_response = status >= 400 or body_rate_limited
+    primary_limit = failed_response and (
+        remaining == "0" or body_primary_rate_limited
+    )
+    secondary_limit = failed_response and body_secondary_rate_limited
+    rate_limit_signal = failed_response and (
+        status == 429 or primary_limit or secondary_limit or body_rate_limited
+    )
+    if (
+        not rate_limit_signal
+        and status >= 400
+        and retry_after_seconds is not None
+    ):
+        rate_limit_signal = True
+    if not rate_limit_signal:
+        return False, None
+    if retry_after_invalid or reset_invalid:
+        return None, None
+    if retry_after_seconds is not None:
+        return True, retry_after_seconds
+
+    if primary_limit:
+        if reset_seconds is None:
+            return None, None
+        if headers.get("date") is not None and provider_now is None:
+            return None, None
+        return True, max(0, int(reset_seconds - reference_now + 0.999))
+    if secondary_limit:
+        return True, None
+    # A bare 429 or unclassified rate-limit body does not distinguish primary
+    # reset timing from the secondary-limit fallback. Do not guess a retry time.
+    return None, None
 
 
 def _object(value: Any) -> dict[str, Any]:
@@ -156,6 +354,7 @@ def _read_transport(
     limit: int = MAX_QUERY_BYTES,
     input_bytes: bytes | None = None,
     accepted_exit_codes: tuple[int, ...] = (0,),
+    capture_provider_retry: bool = False,
 ) -> tuple[bytes, bytes]:
     if input_bytes is not None and len(input_bytes) > 1024 * 1024:
         raise ObservationError("observation_limit")
@@ -163,10 +362,15 @@ def _read_transport(
         if input_bytes is not None:
             input_stream.write(input_bytes)
             input_stream.seek(0)
+        child_env = None
+        if capture_provider_retry:
+            child_env = os.environ.copy()
+            child_env["GH_DEBUG"] = "api"
         process = subprocess.Popen(
             [executable, *args], cwd=workspace,
             stdin=input_stream if input_bytes is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+            env=child_env,
         )
     assert process.stdout is not None and process.stderr is not None
     output = {"stdout": bytearray(), "stderr": bytearray()}
@@ -209,8 +413,20 @@ def _read_transport(
         process.stderr.close()
     stdout, stderr = bytes(output["stdout"]), bytes(output["stderr"])
     if failure or process.returncode not in accepted_exit_codes:
+        retry_evidence, retry_after = (
+            _provider_retry_metadata(stderr)
+            if capture_provider_retry
+            else (False, None)
+        )
+        retry_unknown = capture_provider_retry and (
+            retry_evidence is None or failure == "observation_limit"
+        )
+        rate_limited = retry_evidence is True and not retry_unknown
         raise ObservationError(
             failure or "query_failed", exit_code=process.returncode, stdout=stdout, stderr=stderr,
+            rate_limited=rate_limited,
+            retry_after_seconds=retry_after,
+            provider_retry_unknown=retry_unknown,
         )
     return stdout, stderr
 
@@ -247,6 +463,7 @@ def read_json(
     limit: int = MAX_QUERY_BYTES,
     input_bytes: bytes | None = None,
     accepted_exit_codes: tuple[int, ...] = (0,),
+    capture_provider_retry: bool = False,
 ) -> Any:
     """Run bounded transport, then decode strict UTF-8 JSON."""
     stdout, stderr = _read_transport(
@@ -257,11 +474,17 @@ def read_json(
         limit=limit,
         input_bytes=input_bytes,
         accepted_exit_codes=accepted_exit_codes,
+        capture_provider_retry=capture_provider_retry,
     )
     try:
         return json.loads(stdout.decode("utf-8"))
     except (ValueError, UnicodeDecodeError, RecursionError) as error:
-        raise ObservationError("invalid_observation", stdout=stdout, stderr=stderr) from error
+        raise ObservationError(
+            "invalid_observation",
+            stdout=stdout,
+            stderr=stderr,
+            provider_retry_unknown=capture_provider_retry,
+        ) from error
 
 
 def _graphql_data(value: Any) -> dict[str, Any]:
@@ -358,7 +581,13 @@ class GitHubObserver:
 
     def _query(self, args: list[str]) -> Any:
         assert self.gh_bin is not None
-        return read_json(self.gh_bin, self.workspace, args, timeout=self.timeout)
+        return read_json(
+            self.gh_bin,
+            self.workspace,
+            args,
+            timeout=self.timeout,
+            capture_provider_retry=True,
+        )
 
     def read_pr(self, pr_url: str) -> dict[str, Any]:
         repository, number = parse_pr_url(pr_url)
@@ -392,6 +621,7 @@ class GitHubObserver:
                 ["pr", "checks", pr_url, "--json", CHECK_FIELDS],
                 timeout=self.timeout,
                 accepted_exit_codes=(0, 1, 8),
+                capture_provider_retry=True,
             ))
         else:
             value = _array(self.query([
@@ -401,12 +631,19 @@ class GitHubObserver:
         for item in value:
             item = _object(item)
             link = item.get("link")
+            state = _text(item.get("state"), limit=64)
+            bucket = _text(item.get("bucket"), limit=64)
+            # gh v2.97.0 leaves STARTUP_FAILURE in its default pending bucket.
+            # Preserve the actual failed state instead of reporting a false
+            # pending check or allowing the runtime validator to reject it.
+            if state.upper() == "STARTUP_FAILURE" and bucket.lower() == "pending":
+                bucket = "fail"
             rows.append({
                 "workflow_name": _optional_text(item.get("workflow"), limit=256),
                 "check_name": _text(item.get("name"), limit=256),
                 "event": _optional_text(item.get("event"), limit=256),
-                "bucket": _text(item.get("bucket"), limit=64),
-                "state": _text(item.get("state"), limit=64),
+                "bucket": bucket,
+                "state": state,
                 "link": None if link in (None, "") else _text(link),
             })
         return rows
@@ -424,21 +661,28 @@ class GitHubObserver:
 
     def _threads(self, repository: str, number: int) -> list[dict[str, Any]]:
         owner, name = repository.split("/")
-        pages = _array(self.query([
-            "api", "graphql", "--paginate", "--slurp", "-f", "query=" + THREAD_QUERY,
-            "-F", "owner=" + owner, "-F", "name=" + name,
-            "-F", "number=" + str(number), "-F", "endCursor=null",
-        ]), limit=MAX_FEEDBACK_ITEMS)
-        query_count = len(pages)
+        query_count = 0
         threads, page_cursors = [], set()
         count = 0
-        for index, page in enumerate(pages):
+        cursor: str | None = None
+        while True:
+            if query_count >= MAX_FEEDBACK_ITEMS:
+                raise ObservationError("observation_limit")
+            args = [
+                "api", "graphql", "-f", "query=" + THREAD_QUERY,
+                "-F", "owner=" + owner, "-F", "name=" + name,
+                "-F", "number=" + str(number),
+                "-F", "endCursor=" + (cursor if cursor is not None else "null"),
+            ]
+            page = self.query(args)
+            query_count += 1
             data = _graphql_data(page)
             pull = _object(_object(data.get("repository")).get("pullRequest"))
             nodes, more, cursor = _connection(pull.get("reviewThreads"))
-            if more != (index < len(pages) - 1) or (more and cursor in page_cursors):
+            if more and cursor in page_cursors:
                 raise ObservationError("incomplete_observation")
-            page_cursors.add(cursor)
+            if more:
+                page_cursors.add(cursor)
             for node in nodes:
                 node = _object(node)
                 thread_id = _text(node.get("id"), limit=256)
@@ -478,8 +722,8 @@ class GitHubObserver:
                     "original_start_line": node.get("originalStartLine"),
                     "comment_ids": sorted(comment_ids),
                 })
-        if not pages:
-            raise ObservationError("incomplete_observation")
+            if not more:
+                break
         return threads
 
     def read_feedback(self, pr_url: str) -> list[dict[str, Any]]:
@@ -520,6 +764,8 @@ class GitHubObserver:
         if last["state"] == "MERGED":
             return {"pr": last, "checks": checks, "feedback_items": feedback}
         if any(first[key] != last[key] for key in IDENTITY_FIELDS):
+            raise ObservationError("source_changed")
+        if first["statusCheckRollup"] != last["statusCheckRollup"]:
             raise ObservationError("source_changed")
         return {"pr": last, "checks": checks, "feedback_items": feedback}
 

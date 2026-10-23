@@ -49,11 +49,17 @@ import re
 import select
 import selectors
 import signal
+import shutil
+import stat
 import subprocess
+import sys
 import time
+import tomllib
+import types
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
+from . import revision as revision_contracts
 from .revision import (
     owned_process_group_exists,
 )
@@ -76,6 +82,56 @@ MAX_RUBY_OUTPUT_BYTES = 2 * 1024 * 1024
 PREPARE_TIMEOUT_SECONDS = 60.0
 MAX_PREPARATION_INPUT_BYTES = 1024 * 1024
 SHA1_HEX = set("0123456789abcdef")
+SCRIPT_CI_ARCHIVE_READER_PROOF_SCHEMA = "script-ci-archive-reader-proof-v1"
+MAX_ARCHIVE_READER_PATHS = 128
+MAX_ARCHIVE_READER_FILE_BYTES = 8 * 1024 * 1024
+MAX_ARCHIVE_READER_TOTAL_BYTES = 32 * 1024 * 1024
+MAX_RERUN_SOURCE_JOBS = 10_000
+CI_RERUN_ALLOWED_EFFECTS = frozenset({"infrastructure", "test"})
+
+_ARCHIVE_PROJECT_COMMANDS = {
+    "runtime_contracts": "workflowkit/runtime.py",
+    "evidence": "templates/project/workflow-evidence-ledger",
+    "checkpoint": "templates/project/workflow-checkpoint",
+    "janitor": "templates/project/workflow-task-janitor",
+    "plan_contract": "templates/project/workflow-plan-contract",
+    "plan_contract_accept": "templates/project/workflow-plan-contract-accept",
+    "plan_contract_continue": "templates/project/workflow-plan-contract-continue",
+    "plan_contract_fix_continue": "templates/project/workflow-plan-contract-fix-continue",
+    "plan_contract_verify": "templates/project/workflow-plan-contract-verify",
+    "prepare_ci": "templates/project/workflow-prepare-github-ci",
+    "wait_ci": "templates/project/workflow-wait-github-ci",
+    "wait_pr": "templates/project/workflow-wait-github-pr",
+    "github_observation": "workflowkit/github_observation.py",
+}
+_ARCHIVE_KIT_MODULE_PATHS = (
+    "scripts/prepare-github-ci",
+    "workflowkit/__init__.py",
+    "workflowkit/ci_contract.py",
+    "workflowkit/delivery.py",
+    "workflowkit/github_observation.py",
+    "workflowkit/runtime.py",
+    "workflowkit/revision.py",
+    "workflowkit/profile.py",
+    "workflowkit/release.py",
+    "workflowkit/model.py",
+    "workflowkit/kent.py",
+    "workflowkit/graph.py",
+)
+_ARCHIVE_KIT_TEMPLATE_PATHS = (
+    "templates/project/workflow-evidence-ledger",
+    "templates/project/workflow-checkpoint",
+    "templates/project/workflow-task-janitor",
+    "templates/project/workflow-plan-contract",
+    "templates/project/workflow-plan-contract-accept",
+    "templates/project/workflow-plan-contract-continue",
+    "templates/project/workflow-plan-contract-fix-continue",
+    "templates/project/workflow-plan-contract-verify",
+    "templates/project/workflow-prepare-github-ci",
+    "templates/project/workflow-wait-github-ci",
+    "templates/project/workflow-wait-github-pr",
+    ".kent/commands/cleanup-task.md",
+)
 
 
 class CiContractError(RuntimeError):
@@ -96,6 +152,704 @@ class BoundedCommandError(CiContractError):
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
+
+
+def _native_read_adapter(root: Path):
+    executable = shutil.which("kent")
+    if executable is None:
+        raise CiContractError("native_identity_unavailable")
+    kent = Path(executable).resolve(strict=True)
+    if not kent.is_absolute() or not kent.is_file():
+        raise CiContractError("native_identity_unavailable")
+
+    def native_read(
+        workspace_root: Path,
+        arguments: list[str],
+        *,
+        structured: bool = True,
+    ):
+        if workspace_root != root:
+            raise CiContractError("native_identity_workspace_mismatch")
+        try:
+            result = run_bounded_command(
+                [str(kent), *arguments],
+                cwd=root,
+                timeout=15.0,
+                output_limit=MAX_PREPARATION_INPUT_BYTES,
+            )
+            if result.returncode != 0:
+                raise CiContractError("native_identity_unavailable")
+            if structured:
+                value = parse_preparation_json(result.stdout)
+                if not isinstance(value, dict):
+                    raise CiContractError("native_identity_invalid")
+                return value
+            return result.stdout.decode("utf-8").strip()
+        except (OSError, UnicodeError, ValueError) as error:
+            raise CiContractError("native_identity_unavailable") from error
+
+    return native_read
+
+
+def observe_script_delivery_protocol(
+    payload: Mapping[str, Any],
+    *,
+    allow_legacy_archive_without_native_identity: bool = False,
+) -> tuple[object | None, str | None, bool, str | None, object | None]:
+    """Select current CI/target contracts from a fresh native Script graph."""
+    workspace = payload.get("workspace_path")
+    task = payload.get("task_short_id")
+    if (
+        not isinstance(workspace, str)
+        or not Path(workspace).is_absolute()
+    ):
+        raise CiContractError("input_identity_invalid")
+    root = Path(workspace).resolve()
+    profile_path = root / ".kent/workflow-profile.toml"
+    try:
+        profile_metadata = profile_path.lstat()
+    except FileNotFoundError:
+        return None, None, False, None, None
+    if not stat.S_ISREG(profile_metadata.st_mode):
+        raise CiContractError("profile_unsafe")
+    try:
+        descriptor = os.open(
+            profile_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or metadata.st_mode & 0o7022
+                or metadata.st_size > 64 * 1024
+            ):
+                raise CiContractError("profile_unsafe")
+            raw_profile = os.read(descriptor, 64 * 1024 + 1)
+            after = os.fstat(descriptor)
+            if (
+                len(raw_profile) > 64 * 1024
+                or len(raw_profile) != metadata.st_size
+                or (metadata.st_dev, metadata.st_ino, metadata.st_size,
+                    metadata.st_mtime_ns, metadata.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise CiContractError("profile_changed")
+        finally:
+            os.close(descriptor)
+        if len(raw_profile) > 64 * 1024:
+            raise CiContractError("profile_limit")
+        selected_values = tomllib.loads(raw_profile.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise CiContractError("profile_invalid") from error
+    if not isinstance(selected_values, dict):
+        raise CiContractError("profile_invalid")
+    profile_policies = selected_values.get("policies", {})
+    command_versions = selected_values.get("command_versions", {})
+    managed_commands = selected_values.get("kit_managed_commands", [])
+    if (
+        allow_legacy_archive_without_native_identity
+        and payload.get("operation") == "archive_ci_report"
+        and "_kent" not in payload
+        and selected_values.get("schema_version") == 4
+        and isinstance(profile_policies, dict)
+        and profile_policies.get("delivery_reliability") == "v1"
+        and isinstance(command_versions, dict)
+        and command_versions.get("runtime_contracts") == "2.0.0"
+        and command_versions.get("prepare_ci") == "2.0.0"
+        and isinstance(managed_commands, list)
+        and {"runtime_contracts", "prepare_ci"} <= set(managed_commands)
+    ):
+        # Existing schema-4 CI helpers use archive_ci_report without native
+        # identity. Preserve that explicit legacy boundary; a typed-version
+        # profile still takes the native Script/graph path below.
+        return None, "legacy", False, None, None
+    current_family = (
+        isinstance(profile_policies, dict)
+        and profile_policies.get("delivery_reliability") == "v1"
+    ) or (
+        isinstance(command_versions, dict)
+        and (
+            command_versions.get("runtime_contracts") == "2.1.0"
+            or command_versions.get("prepare_ci") == "3.0.0"
+        )
+    )
+    if not current_family:
+        return None, None, False, None, None
+    if (
+        str(root) != workspace
+        or Path.cwd().resolve() != root
+        or not isinstance(task, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", task)
+    ):
+        raise CiContractError("input_identity_invalid")
+    from .profile import ProjectProfile
+
+    profile = ProjectProfile.from_toml(
+        root,
+        raw_profile.decode("utf-8"),
+        source=str(profile_path),
+    )
+    native_context = payload.get("_kent")
+    if native_context is None:
+        raise CiContractError("native_script_identity_required")
+    if not isinstance(native_context, dict):
+        raise CiContractError("native_script_identity_invalid")
+    native_read = _native_read_adapter(root)
+    from . import delivery
+
+    observed = delivery.observe_script_delivery_graph(
+        root,
+        task,
+        native_context,
+        native_read=native_read,
+    )
+    protocol = delivery.prepare_ci_protocol(observed)
+    require_target = delivery.pr_base_branch_required(observed)
+    context_schema = delivery.delivery_context_schema(observed)
+    return observed, protocol, require_target, context_schema, native_read
+
+
+def _archive_relative_path(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or "\\" in value
+        or value.startswith("/")
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+        or Path(value).as_posix() != value
+    ):
+        raise CiContractError(f"{label}_invalid")
+    return value
+
+
+def _archive_project_reader_bindings(profile, *, script_key: str, script_path: str):
+    required = {
+        "runtime_contracts",
+        "evidence",
+        "checkpoint",
+        "plan_contract",
+    }
+    if profile.capability("managed_worktrees"):
+        required.add("janitor")
+    if profile.capability("pull_requests"):
+        required.add("wait_pr")
+    if profile.capability("ci_monitoring"):
+        required.add("wait_ci")
+    if profile.source_ci_contract():
+        required.add("prepare_ci")
+    if profile.command("github_observation"):
+        required.add("github_observation")
+    required.update(
+        key for key in (
+            "plan_contract_accept",
+            "plan_contract_continue",
+            "plan_contract_fix_continue",
+            "plan_contract_verify",
+        )
+        if profile.command(key)
+    )
+
+    project_to_kit: dict[str, str] = {
+        ".kent/workflow-profile.toml": "",
+    }
+
+    def bind_project_reader(project_path: str, canonical_path: str) -> None:
+        previous = project_to_kit.get(project_path)
+        if previous is not None and previous != canonical_path:
+            raise CiContractError("archive_reader_route_unknown")
+        project_to_kit[project_path] = canonical_path
+
+    managed_commands = set(profile.kit_managed_commands)
+    for key in sorted(required):
+        configured = profile.command(key)
+        if not configured:
+            raise CiContractError("archive_reader_route_unknown")
+        project_path = _archive_relative_path(
+            configured,
+            label="archive_reader_path",
+        )
+        canonical = ""
+        if key in managed_commands:
+            canonical = _ARCHIVE_PROJECT_COMMANDS.get(key, "")
+            if not canonical:
+                raise CiContractError("archive_reader_route_unknown")
+        bind_project_reader(project_path, canonical)
+
+    cleanup = profile.procedure("cleanup")
+    if not cleanup:
+        raise CiContractError("archive_reader_route_unknown")
+    cleanup_path = _archive_relative_path(cleanup, label="archive_reader_path")
+    bind_project_reader(cleanup_path, "")
+
+    configured_script = profile.command(script_key)
+    if not configured_script:
+        raise CiContractError("archive_reader_route_unknown")
+    configured_script = _archive_relative_path(
+        configured_script,
+        label="archive_reader_path",
+    )
+    selected_script = _archive_relative_path(
+        script_path,
+        label="archive_reader_path",
+    )
+    canonical_script = _ARCHIVE_PROJECT_COMMANDS.get(script_key)
+    if script_key in managed_commands and canonical_script is None:
+        raise CiContractError("archive_reader_route_unknown")
+    if configured_script == selected_script:
+        bind_project_reader(
+            configured_script,
+            canonical_script if script_key in managed_commands else "",
+        )
+    else:
+        # Some projects bind a native CI Script node to a project-owned
+        # wrapper while keeping the configured Kit command as its managed
+        # child. Admit only wrappers explicitly included in the bounded
+        # archive-reader closure; the native graph still supplies the active
+        # script identity, and the configured managed child retains parity.
+        if selected_script not in profile.ci_archive_reader_sources:
+            raise CiContractError("native_script_path_mismatch")
+        bind_project_reader(selected_script, "")
+
+    for extra in profile.ci_archive_reader_sources:
+        extra_path = _archive_relative_path(
+            extra,
+            label="archive_reader_path",
+        )
+        project_to_kit.setdefault(extra_path, "")
+    if len(project_to_kit) > MAX_ARCHIVE_READER_PATHS:
+        raise CiContractError("archive_reader_limit")
+    return project_to_kit
+
+
+def _archive_protocol_projection(graph: dict, delivery) -> dict[str, Any]:
+    definition = graph.get("graph") if isinstance(graph, dict) else None
+    if not isinstance(definition, dict):
+        raise CiContractError("native_graph_invalid")
+    nodes = definition.get("nodes")
+    groups = definition.get("transition_groups")
+    edges = definition.get("edges")
+    if (
+        not isinstance(nodes, list)
+        or len(nodes) > 4096
+        or not isinstance(groups, list)
+        or len(groups) > 8192
+        or not isinstance(edges, list)
+        or len(edges) > 16384
+    ):
+        raise CiContractError("native_graph_invalid")
+    by_id = {}
+    by_key = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise CiContractError("native_graph_invalid")
+        identifier = node.get("id")
+        key = node.get("key")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier in by_id
+            or not isinstance(key, str)
+            or not key
+            or key in by_key
+        ):
+            raise CiContractError("native_graph_invalid")
+        by_id[identifier] = node
+        by_key[key] = node
+    relevant_keys = {
+        "prepare_pr",
+        "waiting_pr",
+        "merge_watch",
+        "ci_prepare",
+        "ci_watch",
+        "ci_monitor",
+        "task_janitor",
+    }
+    relevant_ids = {
+        node["id"] for key, node in by_key.items() if key in relevant_keys
+    }
+    projected_nodes = [
+        node for key, node in by_key.items() if key in relevant_keys
+    ]
+    group_by_id = {}
+    for group in groups:
+        if not isinstance(group, dict):
+            raise CiContractError("native_graph_invalid")
+        identifier = group.get("id")
+        if not isinstance(identifier, str) or not identifier or identifier in group_by_id:
+            raise CiContractError("native_graph_invalid")
+        group_by_id[identifier] = group
+    projected_groups = [
+        group
+        for group in groups
+        if group.get("source_node_id") in relevant_ids
+    ]
+    projected_edges = [
+        edge
+        for edge in edges
+        if isinstance(edge, dict)
+        and (
+            edge.get("target_node_id") in relevant_ids
+            or group_by_id.get(edge.get("transition_group_id"), {}).get(
+                "source_node_id"
+            ) in relevant_ids
+        )
+    ]
+    if len(projected_edges) > 16384:
+        raise CiContractError("native_graph_invalid")
+    projection = {
+        "workflow_id": graph.get("workflow_id"),
+        "nodes": sorted(projected_nodes, key=lambda item: item["key"]),
+        "transition_groups": sorted(
+            projected_groups,
+            key=lambda item: item["id"],
+        ),
+        "edges": sorted(projected_edges, key=lambda item: item.get("id", "")),
+    }
+    try:
+        encoded = canonical_bytes(projection)
+    except (TypeError, ValueError) as error:
+        raise CiContractError("native_graph_invalid") from error
+    if len(encoded) > MAX_PREPARATION_INPUT_BYTES:
+        raise CiContractError("native_graph_invalid")
+    return projection
+
+
+def _read_archive_source(root: Path, path: str) -> tuple[str, bytes]:
+    candidate = root
+    parts = path.split("/")
+    for index, part in enumerate(parts):
+        candidate = candidate / part
+        try:
+            metadata = candidate.lstat()
+        except OSError as error:
+            raise CiContractError("archive_reader_missing") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise CiContractError("archive_reader_unsafe")
+        if index < len(parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            raise CiContractError("archive_reader_unsafe")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError as error:
+        raise CiContractError("archive_reader_unsafe") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or before.st_mode & 0o7022
+            or before.st_mode & 0o7000
+            or before.st_size < 0
+            or before.st_size > MAX_ARCHIVE_READER_FILE_BYTES
+        ):
+            raise CiContractError("archive_reader_unsafe")
+        raw = bytearray()
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(65536, MAX_ARCHIVE_READER_FILE_BYTES + 1 - len(raw)),
+            )
+            if not chunk:
+                break
+            raw.extend(chunk)
+            if len(raw) > MAX_ARCHIVE_READER_FILE_BYTES:
+                raise CiContractError("archive_reader_limit")
+        after = os.fstat(descriptor)
+        if (
+            len(raw) != before.st_size
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+                before.st_mode,
+                before.st_uid,
+                before.st_nlink,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+                after.st_mode,
+                after.st_uid,
+                after.st_nlink,
+            )
+        ):
+            raise CiContractError("archive_reader_changed")
+        mode = "100755" if before.st_mode & 0o111 else "100644"
+        return mode, bytes(raw)
+    finally:
+        os.close(descriptor)
+
+
+def _archive_reader_snapshot(
+    root: Path,
+    task: str,
+    native_context: dict,
+    *,
+    native_read,
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    if (
+        not root.is_absolute()
+        or root.resolve() != root
+        or not root.is_dir()
+        or not isinstance(task, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", task)
+        or not isinstance(native_context, dict)
+    ):
+        raise CiContractError("archive_reader_identity_invalid")
+    from . import delivery
+    from .profile import ProjectProfile
+
+    try:
+        with revision_contracts.source_read_budget():
+            observation = delivery.observe_script_delivery_graph(
+                root,
+                task,
+                native_context,
+                native_read=native_read,
+            )
+            profile = observation.profile
+            identity = observation.identity
+            task_detail = observation.task_detail
+            graph = observation.graph
+            if delivery.prepare_ci_protocol(observation) != "typed-v1":
+                raise CiContractError("archive_protocol_mismatch")
+            target_required = delivery.pr_base_branch_required(observation)
+            context_schema = delivery.delivery_context_schema(observation)
+            if target_required and context_schema != "workflow-delivery-context-v2":
+                raise CiContractError("archive_protocol_mismatch")
+
+            node_rows = graph.get("graph", {}).get("nodes", [])
+            current_nodes = [
+                node for node in node_rows
+                if isinstance(node, dict) and node.get("id") == identity["node_id"]
+            ]
+            if len(current_nodes) != 1:
+                raise CiContractError("native_script_identity_invalid")
+            current_node = current_nodes[0]
+            script_keys = {
+                "ci_prepare": "prepare_ci",
+                "ci_watch": "wait_ci",
+            }
+            node_key = current_node.get("key")
+            script_key = script_keys.get(node_key)
+            if current_node.get("kind") != "script" or script_key is None:
+                raise CiContractError("archive_script_route_invalid")
+
+            summary = task_detail.get("summary")
+            target = task_detail.get("execution_target")
+            commit_oid = target.get("commit_oid") if isinstance(target, dict) else None
+            if (
+                not isinstance(summary, dict)
+                or summary.get("workflow_id") != graph.get("workflow_id")
+                or not isinstance(commit_oid, str)
+                or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit_oid)
+            ):
+                raise CiContractError("archive_execution_target_invalid")
+
+            project_to_kit = _archive_project_reader_bindings(
+                profile,
+                script_key=script_key,
+                script_path=current_node.get("script_path"),
+            )
+            project_root = root.expanduser().resolve(strict=True)
+            kit_root = Path(__file__).resolve(strict=True).parents[1]
+            if (
+                not kit_root.is_absolute()
+                or Path(__file__).resolve(strict=True)
+                != kit_root / "workflowkit" / "ci_contract.py"
+            ):
+                raise CiContractError("serving_kit_identity_invalid")
+            project_git_root = Path(
+                revision_contracts.run_git(
+                    project_root,
+                    "rev-parse",
+                    "--show-toplevel",
+                ).stdout.strip()
+            ).resolve()
+            if project_git_root != project_root:
+                raise CiContractError("archive_project_root_invalid")
+            kit_git_root = Path(
+                revision_contracts.run_git(
+                    kit_root,
+                    "rev-parse",
+                    "--show-toplevel",
+                ).stdout.strip()
+            ).resolve()
+            if kit_git_root != kit_root:
+                raise CiContractError("serving_kit_root_invalid")
+            kit_commit = revision_contracts.run_git(
+                kit_root,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ).stdout.strip()
+            if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", kit_commit):
+                raise CiContractError("serving_kit_revision_invalid")
+
+            profile_path = ".kent/workflow-profile.toml"
+            project_paths = {profile_path, *project_to_kit}
+            kit_paths = set(_ARCHIVE_KIT_MODULE_PATHS)
+            kit_paths.update(_ARCHIVE_KIT_TEMPLATE_PATHS)
+            kit_paths.update(
+                canonical
+                for canonical in project_to_kit.values()
+                if canonical
+            )
+            if len(project_paths) + len(kit_paths) > MAX_ARCHIVE_READER_PATHS:
+                raise CiContractError("archive_reader_limit")
+
+            snapshots: dict[str, bytes] = {}
+            records: list[dict[str, Any]] = []
+            total_bytes = 0
+
+            def qualify_source(source_root: Path, source_commit: str, path: str, kind: str):
+                nonlocal total_bytes
+                mode, actual = _read_archive_source(source_root, path)
+                expected_mode = revision_contracts.tree_mode(
+                    source_root,
+                    source_commit,
+                    path,
+                )
+                if expected_mode not in {"100644", "100755"} or mode != expected_mode:
+                    raise CiContractError("archive_reader_mode_mismatch")
+                expected = revision_contracts.read_blob_bytes(
+                    source_root,
+                    source_commit,
+                    path,
+                    label="CI archive reader",
+                    byte_limit=MAX_ARCHIVE_READER_FILE_BYTES,
+                )
+                if actual != expected:
+                    raise CiContractError("archive_reader_source_mismatch")
+                total_bytes += len(actual)
+                if total_bytes > MAX_ARCHIVE_READER_TOTAL_BYTES:
+                    raise CiContractError("archive_reader_limit")
+                records.append({
+                    "kind": kind,
+                    "path": path,
+                    "mode": expected_mode,
+                    "size": len(actual),
+                    "sha256": _sha256(actual),
+                })
+                snapshots[f"{kind}:{path}"] = actual
+
+            for path in sorted(project_paths):
+                _archive_relative_path(path, label="archive_reader_path")
+                qualify_source(project_root, commit_oid, path, "project")
+            for path in sorted(kit_paths):
+                _archive_relative_path(path, label="archive_reader_path")
+                qualify_source(kit_root, kit_commit, path, "kit")
+
+            project_sources = {
+                path: snapshots[f"project:{path}"] for path in project_to_kit
+            }
+            for project_path, kit_path in project_to_kit.items():
+                if kit_path and project_sources[project_path] != snapshots.get(
+                    f"kit:{kit_path}"
+                ):
+                    raise CiContractError("archive_reader_family_mismatch")
+
+            raw_profile = project_sources[profile_path]
+            try:
+                selected_profile = ProjectProfile.from_toml(
+                    project_root,
+                    raw_profile.decode("utf-8"),
+                    source=f"{commit_oid}:{profile_path}",
+                    check_files=False,
+                )
+            except (UnicodeError, ValueError) as error:
+                raise CiContractError("archive_profile_invalid") from error
+            profile_projection_keys = (
+                "schema_version",
+                "kit_managed_commands",
+                "command_versions",
+                "ci_archive_reader_sources",
+                "commands",
+                "procedures",
+                "capabilities",
+                "policies",
+            )
+            if any(
+                getattr(profile, key) != getattr(selected_profile, key)
+                for key in profile_projection_keys
+            ):
+                raise CiContractError("archive_profile_changed")
+            graph_projection = _archive_protocol_projection(graph, delivery)
+            proof_inputs = {
+                "schema": SCRIPT_CI_ARCHIVE_READER_PROOF_SCHEMA,
+                "native_script_identity": identity,
+                "project_root": str(project_root),
+                "project_commit_oid": commit_oid,
+                "kit_root": str(kit_root),
+                "kit_commit_oid": kit_commit,
+                "protocol": "typed-v1",
+                "target_branch_required": target_required,
+                "delivery_context_schema": context_schema,
+                "graph_projection": graph_projection,
+                "sources": sorted(records, key=lambda row: (
+                    row["kind"], row["path"],
+                )),
+            }
+            proof_digest = _sha256(canonical_bytes(proof_inputs))
+            proof = {
+                "schema": SCRIPT_CI_ARCHIVE_READER_PROOF_SCHEMA,
+                "reader_proof_sha256": proof_digest,
+                "native_script_identity": identity,
+            }
+            return proof, snapshots
+    except CiContractError:
+        raise
+    except (
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        revision_contracts.RevisionPreflightError,
+    ) as error:
+        raise CiContractError("archive_reader_proof_failed") from error
+
+
+def resolve_script_ci_archive_readers(
+    root: Path,
+    task: str,
+    native_context: dict,
+    *,
+    native_read,
+) -> dict[str, Any]:
+    """Prove current CI archive readers against the native C and serving K."""
+    proof, _ = _archive_reader_snapshot(
+        root,
+        task,
+        native_context,
+        native_read=native_read,
+    )
+    return proof
+
+
+def _load_qualified_archive_module(name: str, path: Path, raw: bytes):
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    try:
+        exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+    except (SyntaxError, TypeError, ValueError) as error:
+        raise CiContractError("archive_reader_module_invalid") from error
+    return module
 
 
 def _sha256(value: bytes) -> str:
@@ -189,6 +943,7 @@ def unwrap_delivery_context_payload(
     flat_fields = (
         "pr_url",
         "branch_name",
+        "pr_base_branch",
         "merge_strategy",
         "pr_feedback_cursor",
         "ci_contract",
@@ -224,9 +979,204 @@ def preparation_failure(payload: Mapping[str, Any]) -> dict[str, str]:
     cursor = payload.get("pr_feedback_cursor", "uninitialized")
     if not isinstance(cursor, str):
         raise CiContractError("input_invalid")
-    return {
+    result = {
         "transition": "ci_prepare_failed", **identity, **values,
         "pr_feedback_cursor": cursor,
+    }
+    if "pr_base_branch" in payload:
+        target = payload["pr_base_branch"]
+        if (
+            not isinstance(target, str)
+            or not target
+            or target != target.strip()
+            or target.startswith("-")
+        ):
+            raise CiContractError("target_branch_invalid")
+        result["pr_base_branch"] = target
+    return result
+
+
+CI_PREPARATION_DIAGNOSTIC_SCHEMA = "workflow-ci-preparation-diagnostic-v1"
+CI_PREPARATION_DIAGNOSTIC_CODES = {
+    "archive_blocked",
+    "delivery_context_conflict",
+    "delivery_context_invalid",
+    "github_query_failed",
+    "preparation_failed",
+    "previous_ci_packet_invalid",
+    "report_identity_invalid",
+    "target_branch_changed",
+}
+CI_PREPARATION_CLASSIFICATIONS = {
+    "archive_blocked",
+    "identity_conflict",
+    "invalid_input",
+    "transient",
+}
+
+
+def _validated_resume_context(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        fields = delivery_context_fields({"delivery_context": raw})
+        context = validate_delivery_context(parse_preparation_json(fields["delivery_context"]))
+        if context["phase"] != "post_pr":
+            return None
+        repository = _repository_from_url(context["pr_url"])
+        pull_number = _dynamic_pull_number(context["pr_url"])
+        contract = None
+        if "ci_contract" in context:
+            contract = validate_ci_contract(
+                runtime_contracts.parse_canonical_json(
+                    context["ci_contract"],
+                    label="resume CI contract",
+                    max_bytes=MAX_CI_REPORT_BYTES,
+                )
+            )
+            if (
+                contract["repository"] != repository
+                or contract["pull_number"] != pull_number
+            ):
+                return None
+        if "ci_report" in context:
+            report = validate_dynamic_ci_report(
+                runtime_contracts.parse_canonical_json(
+                    context["ci_report"],
+                    label="resume CI report",
+                    max_bytes=runtime_contracts.MAX_DYNAMIC_CI_REPORT_BYTES,
+                )
+            )
+            if (
+                report["contract"]["repository"] != repository
+                or report["contract"]["pull_number"] != pull_number
+                or contract is None
+                or report["contract"] != contract
+            ):
+                return None
+        return raw
+    except (CiContractError, RuntimeContractError, TypeError, ValueError):
+        return None
+
+
+def validate_ci_preparation_diagnostic(value: object) -> dict[str, Any]:
+    """Validate the closed typed preparation-diagnostic carrier."""
+    if isinstance(value, str):
+        value = runtime_contracts.parse_canonical_json(
+            value,
+            label="CI preparation diagnostic",
+            max_bytes=MAX_CI_REPORT_BYTES,
+        )
+    if not isinstance(value, Mapping):
+        raise CiContractError("preparation_diagnostic_invalid")
+    allowed = {"schema", "code", "classification", "input_strings_sha256", "resume_context"}
+    if set(value) - allowed or set(value) - {"resume_context"} != {
+        "schema", "code", "classification", "input_strings_sha256",
+    }:
+        raise CiContractError("preparation_diagnostic_invalid")
+    if value.get("schema") != CI_PREPARATION_DIAGNOSTIC_SCHEMA:
+        raise CiContractError("preparation_diagnostic_invalid")
+    code = value.get("code")
+    classification = value.get("classification")
+    expected_classification = {
+        "archive_blocked": "archive_blocked",
+        "delivery_context_conflict": "identity_conflict",
+        "delivery_context_invalid": "invalid_input",
+        "github_query_failed": "transient",
+        "preparation_failed": "transient",
+        "previous_ci_packet_invalid": "invalid_input",
+        "report_identity_invalid": "identity_conflict",
+        "target_branch_changed": "identity_conflict",
+    }
+    if (
+        code not in CI_PREPARATION_DIAGNOSTIC_CODES
+        or classification not in CI_PREPARATION_CLASSIFICATIONS
+        or expected_classification.get(code) != classification
+    ):
+        raise CiContractError("preparation_diagnostic_invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(value.get("input_strings_sha256", ""))):
+        raise CiContractError("preparation_diagnostic_invalid")
+    result = {
+        "schema": CI_PREPARATION_DIAGNOSTIC_SCHEMA,
+        "code": code,
+        "classification": classification,
+        "input_strings_sha256": value["input_strings_sha256"],
+    }
+    if "resume_context" in value:
+        context = value["resume_context"]
+        if _validated_resume_context(context) != context:
+            raise CiContractError("preparation_diagnostic_invalid")
+        result["resume_context"] = context
+    return result
+
+
+def typed_preparation_failure(
+    original_payload: Mapping[str, Any],
+    error: BaseException,
+) -> dict[str, str]:
+    """Build a diagnosis without inventing a CI packet or accepting bad identity."""
+    workspace = original_payload.get("workspace_path")
+    task = original_payload.get("task_short_id")
+    if (
+        not isinstance(workspace, str)
+        or not Path(workspace).is_absolute()
+        or str(Path(workspace).resolve()) != workspace
+        or Path.cwd().resolve() != Path(workspace)
+        or not isinstance(task, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", task)
+    ):
+        raise CiContractError("input_identity_invalid")
+
+    error_text = str(getattr(error, "code", "") or str(error)).lower()
+    if isinstance(error, BoundedCommandError) or "github" in error_text or "query" in error_text:
+        code, classification = "github_query_failed", "transient"
+    elif "archive" in error_text:
+        code, classification = "archive_blocked", "archive_blocked"
+    elif "target_branch_changed" in error_text:
+        code, classification = "target_branch_changed", "identity_conflict"
+    elif any(word in error_text for word in ("identity", "conflict")):
+        code = (
+            "delivery_context_conflict"
+            if "delivery_context" in error_text
+            else "report_identity_invalid"
+        )
+        classification = "identity_conflict"
+    elif any(word in error_text for word in ("invalid", "packet", "contract", "report")):
+        code = (
+            "delivery_context_invalid"
+            if "delivery_context" in error_text or "target_branch" in error_text
+            else "previous_ci_packet_invalid"
+        )
+        classification = "invalid_input"
+    else:
+        code, classification = "preparation_failed", "transient"
+
+    input_strings = {
+        key: value
+        for key, value in original_payload.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+    diagnostic: dict[str, Any] = {
+        "schema": CI_PREPARATION_DIAGNOSTIC_SCHEMA,
+        "code": code,
+        "classification": classification,
+        "input_strings_sha256": _sha256(canonical_bytes(input_strings)),
+    }
+    if "delivery_context" in original_payload:
+        try:
+            unwrap_delivery_context_payload(original_payload)
+        except (CiContractError, RuntimeContractError, TypeError, ValueError):
+            resume = None
+        else:
+            resume = _validated_resume_context(original_payload["delivery_context"])
+        if resume is not None:
+            diagnostic["resume_context"] = resume
+    diagnostic = validate_ci_preparation_diagnostic(diagnostic)
+    return {
+        "transition": "ci_prepare_failed",
+        "workspace_path": workspace,
+        "task_short_id": task,
+        "ci_preparation_diagnostic": canonical_bytes(diagnostic).decode("utf-8"),
     }
 
 
@@ -564,6 +1514,106 @@ def archive_ci_report(root: Path, task: str, report: Mapping[str, Any]) -> str:
         # is archived merely because another event used the same run identity.
         raise CiContractError("report_archive_conflict")
     return artifact
+
+
+def archive_script_ci_report(
+    payload: Mapping[str, Any],
+    *,
+    evidence_command: str,
+) -> str:
+    """Qualify source readers, then archive through the in-process ledger API."""
+    identity = validate_preparation_identity(payload)
+    root = Path(identity["workspace_path"])
+    if (
+        root.resolve() != root
+        or not root.is_dir()
+        or Path.cwd().resolve() != root
+    ):
+        raise CiContractError("archive_blocked")
+    task = identity["task_short_id"]
+    try:
+        raw_report = payload["ci_report"]
+        if not isinstance(raw_report, str):
+            raise ValueError("report is not text")
+        report = validate_dynamic_ci_report(parse_preparation_json(raw_report))
+        repository = _repository_from_url(identity["pr_url"])
+        pull_number = _dynamic_pull_number(identity["pr_url"])
+        if (
+            report["contract"]["repository"] != repository
+            or report["contract"]["pull_number"] != pull_number
+        ):
+            raise ValueError("report identity does not match PR")
+        native_context = payload["_kent"]
+        if not isinstance(native_context, dict):
+            raise ValueError("native Script context is unavailable")
+        if evidence_command != ".kent/scripts/workflow-evidence-ledger":
+            raise ValueError("profile evidence command is not the fixed ledger helper")
+        native_read = _native_read_adapter(root)
+        initial_proof, source_snapshots = _archive_reader_snapshot(
+            root,
+            task,
+            native_context,
+            native_read=native_read,
+        )
+        ledger_relative = evidence_command
+        runtime_relative = ".kent/scripts/workflow_runtime_contracts.py"
+        ledger_source = source_snapshots.get(f"project:{ledger_relative}")
+        runtime_source = source_snapshots.get(f"project:{runtime_relative}")
+        if ledger_source is None or runtime_source is None:
+            raise ValueError("qualified ledger/runtime sources are unavailable")
+        helper = root / ledger_relative
+        runtime_helper = root / runtime_relative
+        runtime_module = _load_qualified_archive_module(
+            "kent_qualified_workflow_runtime_contracts",
+            runtime_helper,
+            runtime_source,
+        )
+        ledger_module = _load_qualified_archive_module(
+            "kent_qualified_workflow_evidence_ledger",
+            helper,
+            ledger_source,
+        )
+        ledger_module._runtime_module = lambda: runtime_module
+        request = {
+            "schema": "script-ci-archive-request-v1",
+            "workspace_path": str(root),
+            "task_short_id": task,
+            "ci_report": report,
+            "native_context": native_context,
+        }
+        def bound_reader_resolver(callback_root, callback_task, callback_context):
+            if (
+                Path(callback_root) != root
+                or callback_task != task
+                or callback_context != native_context
+            ):
+                raise CiContractError("archive_reader_identity_changed")
+            return resolve_script_ci_archive_readers(
+                root,
+                task,
+                native_context,
+                native_read=native_read,
+            )
+
+        result = ledger_module.archive_script_ci_report(
+            root,
+            task=task,
+            _payload=request,
+            _reader_resolver=bound_reader_resolver,
+            _initial_reader_proof=initial_proof,
+        )
+        if not isinstance(result, dict) or set(result) != {"ci_report_artifact"}:
+            raise ValueError("native Script report archive result is invalid")
+        artifact = result["ci_report_artifact"]
+        expected = (
+            f".kent/runtime/{task}/ci-report-"
+            f"{_sha256(canonical_bytes(report))}.json"
+        )
+        if artifact != expected:
+            raise ValueError("native Script report artifact locator is invalid")
+        return artifact
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise CiContractError("archive_blocked") from error
 
 
 def _ruby_normalizer() -> str:
@@ -904,10 +1954,116 @@ def normalize_github_workflow(
     return value
 
 
+def qualify_ci_rerun_effect_closure(
+    workflow: Mapping[str, Any],
+    selected_job: str,
+    *,
+    effects_by_job: Mapping[str, Sequence[str]],
+) -> dict[str, list[str]]:
+    """Return a rerun's full dependent-job effect closure, failing closed.
+
+    ``effects_by_job`` must come from first-party effect qualification of this
+    exact normalized workflow source. Job names are never used as effect proof.
+    Only jobs explicitly classified as tests or infrastructure are eligible;
+    an absent classification or any other effect blocks the entire rerun.
+    """
+    if (
+        not isinstance(workflow, Mapping)
+        or workflow.get("schema") != "normalized_github_workflow_source_v1"
+        or not isinstance(selected_job, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", selected_job) is None
+        or not isinstance(effects_by_job, Mapping)
+    ):
+        raise CiContractError("rerun_source_invalid")
+    rows = workflow.get("jobs")
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or len(rows) > MAX_RERUN_SOURCE_JOBS
+    ):
+        raise CiContractError("rerun_source_invalid")
+
+    dependencies: dict[str, tuple[str, ...]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise CiContractError("rerun_source_invalid")
+        key = row.get("job_key")
+        needs = row.get("needs")
+        if (
+            not isinstance(key, str)
+            or re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", key) is None
+            or key in dependencies
+            or not isinstance(needs, list)
+            or any(
+                not isinstance(item, str)
+                or re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", item) is None
+                for item in needs
+            )
+            or len(needs) != len(set(needs))
+            or key in needs
+        ):
+            raise CiContractError("rerun_dependency_invalid")
+        dependencies[key] = tuple(needs)
+    if selected_job not in dependencies or any(
+        dependency not in dependencies
+        for values in dependencies.values()
+        for dependency in values
+    ):
+        raise CiContractError("rerun_dependency_invalid")
+
+    dependents = {key: [] for key in dependencies}
+    remaining = {}
+    for key, needs in dependencies.items():
+        remaining[key] = len(needs)
+        for dependency in needs:
+            dependents[dependency].append(key)
+    ready = [key for key, count in remaining.items() if count == 0]
+    visited_count = 0
+    while ready:
+        key = ready.pop()
+        visited_count += 1
+        for dependent in dependents[key]:
+            remaining[dependent] -= 1
+            if remaining[dependent] == 0:
+                ready.append(dependent)
+    if visited_count != len(dependencies):
+        raise CiContractError("rerun_dependency_invalid")
+
+    closure = {selected_job}
+    pending = [selected_job]
+    while pending:
+        key = pending.pop()
+        for dependent in dependents[key]:
+            if dependent not in closure:
+                closure.add(dependent)
+                pending.append(dependent)
+
+    if set(effects_by_job) != closure:
+        raise CiContractError("rerun_effect_unknown")
+    effects: set[str] = set()
+    for key in closure:
+        declared = effects_by_job[key]
+        if (
+            not isinstance(declared, (list, tuple, set, frozenset))
+            or not declared
+            or any(not isinstance(item, str) for item in declared)
+            or len(declared) != len(set(declared))
+        ):
+            raise CiContractError("rerun_effect_unknown")
+        if not set(declared) <= CI_RERUN_ALLOWED_EFFECTS:
+            raise CiContractError("rerun_effect_forbidden")
+        effects.update(declared)
+    return {
+        "jobs": sorted(closure),
+        "effects": sorted(effects),
+    }
+
+
 def prepare_ci_payload(
     payload: Mapping[str, Any],
     *,
     gh_bin: str | None = None,
+    report_archiver=None,
 ) -> dict[str, Any]:
     payload = unwrap_delivery_context_payload(payload)
     validate_preparation_identity(payload)
@@ -916,7 +2072,11 @@ def prepare_ci_payload(
     ):
         if key in payload and not isinstance(payload[key], str):
             raise CiContractError("input_invalid")
-    return _prepare_ci_payload(payload, gh_bin=gh_bin)
+    return _prepare_ci_payload(
+        payload,
+        gh_bin=gh_bin,
+        report_archiver=report_archiver,
+    )
 
 
 def _dynamic_pull_number(pr_url: str) -> int:
@@ -1014,6 +2174,7 @@ def _dynamic_prepare_result(
     payload: Mapping[str, Any],
     contract: Mapping[str, Any],
     cursor: str,
+    pr_base_branch: str | None = None,
     merge_report: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -1022,6 +2183,8 @@ def _dynamic_prepare_result(
         "pr_url": str(payload["pr_url"]),
         "branch_name": str(payload["branch_name"]),
     }
+    if pr_base_branch is not None:
+        result["pr_base_branch"] = pr_base_branch
     if merge_report is not None:
         result["merge_report"] = merge_report
         return result
@@ -1037,14 +2200,31 @@ def _dynamic_prepare_result(
 
 
 def _prepare_ci_payload(
-    payload: Mapping[str, Any], *, gh_bin: str | None = None,
+    payload: Mapping[str, Any],
+    *,
+    gh_bin: str | None = None,
+    report_archiver=None,
 ) -> dict[str, Any]:
+    archive_report = report_archiver or archive_ci_report
     workspace = Path(payload["workspace_path"]).resolve()
     pr_url = payload["pr_url"]
     repository = _repository_from_url(pr_url)
     pull_number = _dynamic_pull_number(pr_url)
+    expected_base_branch = payload.get("pr_base_branch")
+    if expected_base_branch is not None and (
+        not isinstance(expected_base_branch, str)
+        or not expected_base_branch
+        or expected_base_branch != expected_base_branch.strip()
+        or expected_base_branch.startswith("-")
+    ):
+        raise CiContractError("target_branch_invalid")
     first = read_pull_request(workspace, pr_url, gh_bin=gh_bin)
     _validate_pr_metadata(first, payload)
+    if (
+        expected_base_branch is not None
+        and first["baseRefName"] != expected_base_branch
+    ):
+        raise CiContractError("target_branch_changed")
     head = first["headRefOid"]
     target = first["baseRefOid"]
     contract = _dynamic_contract(
@@ -1060,20 +2240,26 @@ def _prepare_ci_payload(
     )
     if str(first.get("state") or "").upper() == "MERGED":
         if previous_report is not None:
-            archive_ci_report(workspace, payload["task_short_id"], previous_report)
+            archive_report(workspace, payload["task_short_id"], previous_report)
         return _dynamic_prepare_result(
             transition="ci_prepare_pr_merged",
             workspace=workspace,
             payload=payload,
             contract=contract,
             cursor=cursor,
+            pr_base_branch=expected_base_branch,
             merge_report=json.dumps(first, sort_keys=True),
         )
     second = read_pull_request(workspace, pr_url, gh_bin=gh_bin)
     _validate_pr_metadata(second, payload)
+    if (
+        expected_base_branch is not None
+        and second["baseRefName"] != expected_base_branch
+    ):
+        raise CiContractError("target_branch_changed")
     if second["state"] == "MERGED":
         if previous_report is not None:
-            archive_ci_report(workspace, payload["task_short_id"], previous_report)
+            archive_report(workspace, payload["task_short_id"], previous_report)
         contract = _dynamic_contract(
             repository=repository,
             pull_number=pull_number,
@@ -1086,6 +2272,7 @@ def _prepare_ci_payload(
             payload=payload,
             contract=contract,
             cursor=cursor,
+            pr_base_branch=expected_base_branch,
             merge_report=json.dumps(second, sort_keys=True),
         )
     if (
@@ -1105,7 +2292,7 @@ def _prepare_ci_payload(
             and previous_report["contract"] == contract
         )
     if previous_report is not None:
-        archive_ci_report(workspace, payload["task_short_id"], previous_report)
+        archive_report(workspace, payload["task_short_id"], previous_report)
     result = _dynamic_prepare_result(
         transition=(
             "ci_prepare_ready_retry" if same_cycle else "ci_prepare_ready_initial"
@@ -1114,6 +2301,7 @@ def _prepare_ci_payload(
         payload=payload,
         contract=contract,
         cursor=cursor,
+        pr_base_branch=expected_base_branch,
     )
     if same_cycle:
         result["ci_report"] = str(payload["ci_report"])
@@ -1122,9 +2310,11 @@ def _prepare_ci_payload(
 
 __all__ = [
     "BoundedCommandError",
+    "CI_RERUN_ALLOWED_EFFECTS",
     "CiContractError",
     "normalize_github_workflow",
     "prepare_ci_payload",
+    "qualify_ci_rerun_effect_closure",
     "read_pull_request",
     "run_bounded_command",
 ]

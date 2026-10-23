@@ -16,55 +16,174 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from workflowkit.ci_contract import (
-    CiContractError, prepare_ci_payload, preparation_failure, read_preparation_input,
-    archive_ci_report, parse_preparation_json, validate_preparation_identity,
+    CiContractError,
+    archive_ci_report,
+    archive_script_ci_report,
+    observe_script_delivery_protocol,
+    parse_preparation_json,
+    prepare_ci_payload,
+    preparation_failure,
+    read_preparation_input,
+    typed_preparation_failure,
     unwrap_delivery_context_payload,
+    validate_preparation_identity,
 )
 
 
 def main() -> int:
-    payload: dict[str, object] = {}
     original_payload: dict[str, object] = {}
     try:
-        payload = read_preparation_input(sys.stdin.buffer)
-        original_payload = dict(payload)
-        payload = unwrap_delivery_context_payload(payload)
-        if payload.get("operation") == "archive_ci_report":
-            validate_preparation_identity(payload)
-            from workflowkit.runtime import validate_dynamic_ci_report
-
-            report = validate_dynamic_ci_report(
-                parse_preparation_json(payload["ci_report"])
-            )
-            repository = payload["pr_url"].split("/pull/")[0].removeprefix(
-                "https://github.com/"
-            )
-            pull_number = int(payload["pr_url"].rsplit("/", 1)[1])
-            contract = report["contract"]
-            if (
-                contract["repository"] != repository
-                or contract["pull_number"] != pull_number
-            ):
-                raise CiContractError("report_identity_invalid")
-            artifact = archive_ci_report(
-                Path(payload["workspace_path"]).resolve(), payload["task_short_id"], report,
-            )
-            print(json.dumps({"ci_report_artifact": artifact}))
-            return 0
-        if "operation" in payload:
-            raise CiContractError("input_invalid")
-        output = prepare_ci_payload(payload)
+        original_payload = read_preparation_input(sys.stdin.buffer)
     except (RuntimeError, OSError, ValueError, KeyError, TypeError):
-        # No raw source, Ruby exception, Git stderr, or authenticated response
-        # enters Script stdout/stderr. Invalid identity cannot invent a route.
-        if "operation" in payload:
+        print('{"error":"ci_prepare_input_invalid"}')
+        return 2
+
+    operation = original_payload.get("operation")
+    try:
+        # This native Script/Task/graph check precedes lifecycle unwrapping and
+        # every new typed result. Legacy profiles retain the old wire path.
+        observed, protocol, target_required, context_schema, _native_read = (
+            observe_script_delivery_protocol(
+                original_payload,
+                allow_legacy_archive_without_native_identity=(
+                    operation == "archive_ci_report"
+                ),
+            )
+        )
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+        print(
+            '{"error":"ci_report_archive_failed"}'
+            if operation is not None
+            else '{"error":"ci_prepare_input_invalid"}'
+        )
+        return 2
+
+    typed_protocol = protocol == "typed-v1"
+    if operation is not None:
+        try:
+            payload = unwrap_delivery_context_payload(original_payload)
+            if operation == "archive_script_ci_report":
+                if not typed_protocol or observed is None:
+                    raise CiContractError("archive_protocol_mismatch")
+                validate_preparation_identity(payload)
+                profile = observed.profile
+                artifact = archive_script_ci_report(
+                    payload,
+                    evidence_command=profile.command("evidence"),
+                )
+                print(json.dumps({"ci_report_artifact": artifact}))
+                return 0
+            if operation == "archive_ci_report":
+                if typed_protocol:
+                    raise CiContractError("archive_protocol_mismatch")
+                if observed is not None:
+                    identity = observed.identity
+                    current_nodes = [
+                        node for node in observed.graph["graph"]["nodes"]
+                        if node.get("id") == identity["node_id"]
+                    ]
+                    if (
+                        protocol != "legacy"
+                        or len(current_nodes) != 1
+                        or current_nodes[0].get("key")
+                        not in {"ci_prepare", "ci_watch"}
+                    ):
+                        raise CiContractError("archive_protocol_mismatch")
+                validate_preparation_identity(payload)
+                from workflowkit.runtime import validate_dynamic_ci_report
+
+                report = validate_dynamic_ci_report(
+                    parse_preparation_json(payload["ci_report"])
+                )
+                repository = payload["pr_url"].split("/pull/")[0].removeprefix(
+                    "https://github.com/"
+                )
+                pull_number = int(payload["pr_url"].rsplit("/", 1)[1])
+                contract = report["contract"]
+                if (
+                    contract["repository"] != repository
+                    or contract["pull_number"] != pull_number
+                ):
+                    raise CiContractError("report_identity_invalid")
+                artifact = archive_ci_report(
+                    Path(payload["workspace_path"]).resolve(),
+                    payload["task_short_id"],
+                    report,
+                )
+                print(json.dumps({"ci_report_artifact": artifact}))
+                return 0
+        except (RuntimeError, OSError, ValueError, KeyError, TypeError):
             print('{"error":"ci_report_archive_failed"}')
             return 2
+
+    if typed_protocol:
         try:
-            output = preparation_failure(payload)
-        except (CiContractError, ValueError):
+            if observed is None:
+                raise CiContractError("native_script_identity_required")
+            identity = observed.identity
+            current_nodes = [
+                node for node in observed.graph["graph"]["nodes"]
+                if node.get("id") == identity["node_id"]
+            ]
+            if len(current_nodes) != 1 or current_nodes[0].get("key") != "ci_prepare":
+                raise CiContractError("native_script_route_invalid")
+        except (RuntimeError, KeyError, TypeError, ValueError):
             print('{"error":"ci_prepare_input_invalid"}')
             return 2
+
+    try:
+        payload = unwrap_delivery_context_payload(original_payload)
+        validate_preparation_identity(payload)
+        if target_required:
+            target = payload.get("pr_base_branch")
+            if (
+                not isinstance(target, str)
+                or not target
+                or target != target.strip()
+                or target.startswith("-")
+            ):
+                raise CiContractError("target_branch_invalid")
+        if typed_protocol:
+            assert observed is not None
+
+            def typed_archiver(workspace, task, report):
+                archive_payload = {
+                    **payload,
+                    "workspace_path": str(workspace),
+                    "task_short_id": task,
+                    "ci_report": json.dumps(
+                        report,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "_kent": original_payload.get("_kent"),
+                }
+                return archive_script_ci_report(
+                    archive_payload,
+                    evidence_command=observed.profile.command("evidence"),
+                )
+
+            output = prepare_ci_payload(
+                payload,
+                report_archiver=typed_archiver,
+            )
+        else:
+            output = prepare_ci_payload(payload)
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError) as error:
+        if typed_protocol:
+            try:
+                output = typed_preparation_failure(original_payload, error)
+            except (CiContractError, OSError, ValueError, TypeError):
+                print('{"error":"ci_prepare_input_invalid"}')
+                return 2
+        else:
+            try:
+                output = preparation_failure(payload)
+            except (CiContractError, OSError, ValueError, TypeError):
+                print('{"error":"ci_prepare_input_invalid"}')
+                return 2
+
     encoded = (json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8")
     workspace = Path.cwd().resolve()
     profile_path = workspace / ".kent/workflow-profile.toml"

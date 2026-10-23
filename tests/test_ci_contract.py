@@ -44,7 +44,10 @@ class CiContractTest(unittest.TestCase):
             scripts = root / ".kent/scripts"
             scripts.mkdir(parents=True)
             (root / ".kent/workflow-profile.toml").write_text(
-                '[policies]\ndelivery_reliability = "v1"\n')
+                # Keep this producer-capture fixture on the legacy wire
+                # contract; current reliability profiles require native
+                # Script/graph identity before CI preparation.
+                '[policies]\ndelivery_reliability = "legacy"\n')
             (scripts / "workflow-checkpoint").write_text(
                 "import json\n"
                 "def emit_producer_result(root, payload, result, producer_kind):\n"
@@ -655,6 +658,11 @@ class CiContractTest(unittest.TestCase):
             (workspace / ".gitignore").write_text("/.kent/runtime/\n")
             (workspace / ".kent/context").mkdir(parents=True)
             (workspace / ".kent/context/delivery.md").write_text("# Delivery\n")
+            # An old helper/graph uses the legacy archive operation without
+            # native Script context. A schema-3 profile remains on that path.
+            (workspace / ".kent/workflow-profile.toml").write_bytes(
+                (ROOT / "contracts/project-profile.example.toml").read_bytes()
+            )
             (workspace / "README.md").write_text("test\n")
             subprocess.run(["git", "add", "."], cwd=workspace, check=True)
             subprocess.run(
@@ -1140,8 +1148,8 @@ jobs:
                 "    print(json.dumps(rows))\n"
                 "    sys.exit(8 if any(row['bucket'] == 'pending' for row in rows) else 1)\n"
                 "elif args[:2] == ['api', 'graphql']:\n"
-                "    print(json.dumps([{'data': {'repository': {'pullRequest': "
-                "{'reviewThreads': {'nodes': [], 'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}}]))\n"
+                "    print(json.dumps({'data': {'repository': {'pullRequest': "
+                "{'reviewThreads': {'nodes': [], 'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}}))\n"
                 "elif args[:1] == ['api']:\n"
                 "    print(json.dumps([json.loads((root / 'comments.json').read_text()) "
                 "if any('issues/' in arg for arg in args) else []]))\n"

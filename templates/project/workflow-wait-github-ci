@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import stat
 import time
 import tomllib
 from typing import Any
@@ -51,8 +52,112 @@ def _text(payload: dict[str, object], key: str) -> str:
     return value.strip()
 
 
+def _delivery_protocol_profile_enabled(workspace: Path) -> bool:
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptors: list[int] = []
+    try:
+        root_fd = os.open(workspace, directory_flags)
+        descriptors.append(root_fd)
+        kent_fd = os.open(".kent", directory_flags, dir_fd=root_fd)
+        descriptors.append(kent_fd)
+        profile_fd = os.open(
+            "workflow-profile.toml",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=kent_fd,
+        )
+        with os.fdopen(profile_fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or before.st_mode & 0o7022
+                or before.st_size > 64 * 1024
+            ):
+                raise ValueError("unsafe current delivery profile")
+            raw = stream.read(64 * 1024 + 1)
+            after = os.fstat(stream.fileno())
+            if (
+                len(raw) > 64 * 1024
+                or len(raw) != before.st_size
+                or (before.st_dev, before.st_ino, before.st_size,
+                    before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise ValueError("current delivery profile changed during read")
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ValueError("current delivery profile is unavailable") from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+    try:
+        profile = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError("current delivery profile is invalid") from error
+    policies = profile.get("policies", {})
+    versions = profile.get("command_versions", {})
+    return bool(
+        isinstance(policies, dict)
+        and policies.get("delivery_reliability") == "v1"
+    ) or bool(
+        isinstance(versions, dict)
+        and (
+            versions.get("runtime_contracts") == "2.1.0"
+            or versions.get("prepare_ci") == "3.0.0"
+        )
+    )
+
+
+def _current_delivery_protocol(
+    workspace: Path,
+    payload: dict[str, object],
+) -> dict[str, object] | None:
+    if not _delivery_protocol_profile_enabled(workspace):
+        return None
+    checkpoint = _sibling("workflow-checkpoint")
+    task = payload.get("task_short_id")
+    if task is not None and not isinstance(task, str):
+        raise ValueError("task_short_id is invalid")
+    result = checkpoint.current_script_delivery_protocol(
+        workspace,
+        task=task,
+        native_context=payload.get("_kent"),
+    )
+    if result is None:
+        return None
+    if result["node_key"] != "ci_watch":
+        raise ValueError("native Script is not the current CI watcher")
+    if result["target_required"]:
+        target = payload.get("pr_base_branch")
+        if not isinstance(target, str) or not target or target != target.strip():
+            raise ValueError("pr_base_branch is required by the current graph")
+    return result
+
+
 def _canonical(runtime: Any, value: object) -> str:
     return runtime.canonical_bytes(value).decode("utf-8")
+
+
+def _retry_delay_seconds(
+    error: Exception,
+    *,
+    interval: int,
+    failure_count: int,
+) -> int:
+    delay = getattr(error, "retry_delay_seconds", None)
+    if not callable(delay):
+        return interval
+    return max(
+        interval,
+        int(delay(interval=interval, failure_count=failure_count)),
+    )
 
 
 def _contract(runtime: Any, payload: dict[str, object]) -> tuple[dict[str, Any], str]:
@@ -189,6 +294,9 @@ def _archive(
     observation: Any,
     values: dict[str, object],
     report: dict[str, Any],
+    *,
+    typed_script_archive: bool = False,
+    native_context: object = None,
 ) -> None:
     task = values.get("task_short_id")
     if not isinstance(task, str) or not task:
@@ -199,9 +307,15 @@ def _archive(
             tool = str(Path.home() / ".kent/bin/kent-prepare-github-ci")
         request = {
             **values,
-            "operation": "archive_ci_report",
+            "operation": (
+                "archive_script_ci_report"
+                if typed_script_archive
+                else "archive_ci_report"
+            ),
             "ci_report": _canonical(runtime_contracts(), report),
         }
+        if isinstance(native_context, dict):
+            request["_kent"] = native_context
         result = observation.read_json(
             tool,
             Path(str(values["workspace_path"])),
@@ -213,9 +327,24 @@ def _archive(
                 sort_keys=True,
             ).encode("utf-8"),
         )
-        if not isinstance(result, dict) or not isinstance(
-            result.get("ci_report_artifact"),
-            str,
+        if (
+            not isinstance(result, dict)
+            or (
+                set(result) != {"ci_report_artifact"}
+                if typed_script_archive
+                else "ci_report_artifact" not in result
+            )
+            or not isinstance(result.get("ci_report_artifact"), str)
+        ):
+            raise _TechnicalFailure("ci_report_archive_failed")
+        task = values.get("task_short_id")
+        if typed_script_archive and (
+            not isinstance(task, str)
+            or result["ci_report_artifact"]
+            != (
+                f".kent/runtime/{task}/ci-report-"
+                f"{runtime_contracts().canonical_sha256(report)}.json"
+            )
         ):
             raise _TechnicalFailure("ci_report_archive_failed")
     except _TechnicalFailure:
@@ -287,6 +416,14 @@ def main() -> int:
     pr_url = _text(payload, "pr_url")
     branch_name = _text(payload, "branch_name")
     merge_strategy = _text(payload, "merge_strategy")
+    expected_base_branch = payload.get("pr_base_branch")
+    if expected_base_branch is not None and (
+        not isinstance(expected_base_branch, str)
+        or not expected_base_branch
+        or expected_base_branch != expected_base_branch.strip()
+        or expected_base_branch.startswith("-")
+    ):
+        raise ValueError("pr_base_branch is invalid")
     if not workspace.is_dir():
         raise ValueError("workspace does not exist: {}".format(workspace))
     if merge_strategy not in {"merge", "squash", "rebase"}:
@@ -310,10 +447,27 @@ def main() -> int:
         "merge_strategy": merge_strategy,
         "ci_contract": contract_text,
     }
+    if expected_base_branch is not None:
+        values["pr_base_branch"] = expected_base_branch
     if previous is not None:
         values["ci_report"] = _canonical(runtime, previous)
     if "task_short_id" in payload:
         values["task_short_id"] = _text(payload, "task_short_id")
+    delivery_protocol = _current_delivery_protocol(workspace, payload)
+    typed_script_archive = bool(
+        delivery_protocol is not None
+        and delivery_protocol.get("protocol") == "typed-v1"
+    )
+    native_context = payload.get("_kent")
+
+    def archive_report(report: dict[str, Any]) -> None:
+        _archive(
+            observation,
+            values,
+            report,
+            typed_script_archive=typed_script_archive,
+            native_context=native_context,
+        )
 
     test_mode = os.environ.get("KENT_CI_WATCH_TEST_MODE") == "1"
     interval = max(
@@ -341,6 +495,32 @@ def main() -> int:
             pr = observed["pr"]
             head_oid = str(pr["headRefOid"])
             base_oid = str(pr["baseRefOid"])
+            if (
+                expected_base_branch is not None
+                and pr.get("baseRefName") != expected_base_branch
+            ):
+                emit(
+                    "ci_watch_state_changed",
+                    {
+                        **values,
+                        "pr_report": json.dumps(
+                            {
+                                "reason": "pr_base_branch_changed",
+                                "expected_pr_base_branch": expected_base_branch,
+                                "observed_base_ref_name": pr.get("baseRefName"),
+                                "state": pr.get("state"),
+                                "headRefOid": head_oid,
+                                "baseRefOid": base_oid,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        "pr_head_oid": head_oid,
+                        "pr_base_oid": base_oid,
+                    },
+                    cursor=acknowledged_text,
+                )
+                return 0
             if pr.get("headRefName") != branch_name:
                 raise observation.ObservationError("invalid_observation")
             if pr["state"] == "MERGED":
@@ -350,6 +530,11 @@ def main() -> int:
                         "workspace_path": values["workspace_path"],
                         "pr_url": values["pr_url"],
                         "branch_name": values["branch_name"],
+                        **(
+                            {"pr_base_branch": expected_base_branch}
+                            if expected_base_branch is not None
+                            else {}
+                        ),
                         "merge_report": _merge_report(pr),
                     },
                 )
@@ -421,7 +606,7 @@ def main() -> int:
                     base_oid=base_oid,
                     classification=classification,
                 )
-                _archive(observation, values, report)
+                archive_report(report)
                 emit(
                     "ci_watch_failed",
                     values,
@@ -477,7 +662,7 @@ def main() -> int:
                         else "pull_request_feedback_changed"
                     )
                 )
-                _archive(observation, values, report)
+                archive_report(report)
                 report_values = {
                     **values,
                     "pr_report": json.dumps(
@@ -508,7 +693,7 @@ def main() -> int:
                 )
                 return 0
             if classification["state"] == "failed":
-                _archive(observation, values, report)
+                archive_report(report)
                 emit(
                     "ci_watch_failed",
                     values,
@@ -517,7 +702,7 @@ def main() -> int:
                 )
                 return 0
             if classification["state"] in {"green", "not_required"}:
-                _archive(observation, values, report)
+                archive_report(report)
                 emit(
                     "ci_watch_passed",
                     values,
@@ -546,8 +731,17 @@ def main() -> int:
                     cursor=acknowledged_text,
                 )
                 return 0
-            if errors < max_errors:
-                time.sleep(interval)
+            if (
+                errors < max_errors
+                and not getattr(error, "provider_retry_unknown", False)
+            ):
+                time.sleep(
+                    _retry_delay_seconds(
+                        error,
+                        interval=interval,
+                        failure_count=errors,
+                    )
+                )
                 continue
             report = _append(
                 runtime,
@@ -558,7 +752,7 @@ def main() -> int:
                 error=error,
                 watcher_exit_code=getattr(error, "exit_code", None),
             )
-            _archive(observation, values, report)
+            archive_report(report)
             emit(
                 "ci_watch_failed",
                 values,
