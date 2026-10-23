@@ -1014,14 +1014,20 @@ def _manifest_fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int
         info.st_nlink,
     )
 
-def _kent_pages(kent: Path, args: Sequence[str], *, cwd: Path) -> list[dict[str, Any]]:
+def _kent_pages(
+    kent: Path,
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    row_keys: Sequence[str] = ('items', 'workflows', 'tasks', 'sessions'),
+) -> list[dict[str, Any]]:
     pages: list[dict[str, Any]] = []
     offset = 0
     total = 0
     while True:
         page = _kent_json(kent, [*args, '--offset', str(offset), '--limit', '100', '--json'], cwd=cwd)
         pages.append(page)
-        rows = next((page[key] for key in ('items', 'workflows', 'tasks', 'sessions') if key in page), None)
+        rows = next((page[key] for key in row_keys if key in page), None)
         if not isinstance(rows, list) or any((not isinstance(row, dict) for row in rows)):
             raise OperationError('Kent pagination returned invalid rows')
         total += len(rows)
@@ -1627,6 +1633,7 @@ def _source_native_identity(
     project_root: Path,
     primary_root: Path,
     kent_path: Path,
+    source_only: bool = False,
 ) -> str:
     projects = [row for row in _project_rows(kent_path, project_root) if row['id'] == project_id]
     if len(projects) != 1:
@@ -1646,6 +1653,42 @@ def _source_native_identity(
     )
     if code != 0 or output.decode('utf-8', errors='replace').strip() != project_id:
         raise PlanValidationError('native project readback differs from source admission')
+    if source_only:
+        pages = _kent_pages(
+            kent_path, ['project', 'workspaces', '--project', project_id],
+            cwd=project_root, row_keys=('workspaces',),
+        )
+        offset = 0
+        for page in pages:
+            if (
+                page.get('project_id') != project_id
+                or type(page.get('offset')) is not int
+                or page['offset'] != offset
+            ):
+                raise PlanValidationError('native workspace catalog project/offset differs')
+            offset += len(page['workspaces'])
+        rows = _page_rows(pages, ('workspaces',))
+        workspace_ids: list[str] = []
+        primary_ids: list[str] = []
+        for row in rows:
+            workspace_id = _string(row.get('workspace_id'), 'native workspace ID')
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,255}', workspace_id):
+                raise PlanValidationError('native workspace ID is malformed')
+            workspace_ids.append(workspace_id)
+            if not isinstance(row.get('is_default'), bool):
+                raise PlanValidationError('native workspace default evidence is malformed')
+            root = _source_canonical_path(row.get('root_path'), 'native workspace root')
+            if row['is_default']:
+                root = _source_canonical_root(str(root), 'native default workspace root')
+                if root != primary_root:
+                    raise PlanValidationError('native default workspace root differs')
+                primary_ids.append(workspace_id)
+            elif root == primary_root:
+                raise PlanValidationError('native primary workspace identity is ambiguous')
+        _unique(workspace_ids, 'native workspace inventory')
+        if len(primary_ids) != 1:
+            raise PlanValidationError('native primary workspace identity is unavailable or ambiguous')
+        return primary_ids[0]
     pages = _kent_pages(kent_path, ['task', 'list', '--project', project_id], cwd=project_root)
     rows = _page_rows(pages, ('items', 'tasks'))
     task_ids = [_row_id(row, 'id', 'task_id') for row in rows]
@@ -1725,6 +1768,7 @@ def _source_binding(
         project_root=project_root,
         primary_root=primary_root if source_only else project_root,
         kent_path=kent_path,
+        source_only=source_only,
     )
     if native_workspace_id != value['primary_workspace_id']:
         raise PlanValidationError('source primary workspace ID differs from native readback')
