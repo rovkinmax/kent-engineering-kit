@@ -119,6 +119,13 @@ def _sha256(value: Any, label: str) -> str:
 def _uuid(value: Any, label: str) -> str:
     return _digest(value, label, UUID_RE).lower()
 
+def _native_uuid(value: Any, label: str) -> str:
+    # Validate the original input: _uuid accepts other versions and case.
+    return _digest(
+        value, label,
+        r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+    )
+
 def _native_project_id(value: Any, label: str) -> str:
     value = _string(value, label)
     if not value.startswith('project-'):
@@ -837,11 +844,29 @@ def run_effect(journal: OperationJournal, *, effect_key: str, command: Sequence[
             sha256_bytes(stderr), guardian.pid, child_pid)
     effects[effect_key]['result'] = {'returncode': result.returncode, 'stdout_sha256': result.stdout_sha256,
             'stderr_sha256': result.stderr_sha256}
+    if result.returncode != 0:
+        # The operation journal is private (0600 in a protected directory).
+        # Capture only bounded command output, never environment or stdin.
+        # Old hash-only entries remain untouched and cannot recover lost text.
+        effects[effect_key]['result']['diagnostics'] = {
+            'schema': 'kit-effect-failure-diagnostics-v1',
+            'stdout': _failure_output(stdout),
+            'stderr': _failure_output(stderr),
+        }
     effects[effect_key]['status'] = 'unresolved'
     journal.persist({**journal.state, 'effects': effects})
     settlement = _settle_effect(journal, effect_key, current_sha256(), preimage_sha256, postimage_sha256)
     return EffectResult(result.command_digest, result.returncode, result.stdout_sha256, result.stderr_sha256,
             result.guardian_pid, result.child_pid, settlement)
+
+def _failure_output(raw: bytes) -> dict[str, Any]:
+    limit = 16 * 1024
+    return {
+        'base64': base64.b64encode(raw[:limit]).decode('ascii'),
+        'truncated': len(raw) > limit,
+        'captured_bytes': len(raw),
+        'capture_limit_reached': len(raw) == MAX_OUTPUT,
+    }
 
 def _pid_alive(pid: int | None) -> bool:
     if not isinstance(pid, int) or pid <= 0:
@@ -4444,10 +4469,30 @@ def _v2_graph_rows(
     for index, raw in enumerate(rows):
         if not isinstance(raw, dict):
             raise PlanValidationError(f'{label}.{collection}[{index}] must be an object')
-        identity = _string(
+        identity = _native_uuid(
             _required(raw, 'id', f'{label}.{collection}[{index}]'),
             f'{label}.{collection}[{index}].id',
         )
+        for field in (
+            'workflow_id', 'group_id', 'node_group_id', 'source_node_id',
+            'target_node_id', 'transition_group_id', 'join_node_id',
+        ):
+            if field in raw and (raw[field] is not None or field not in {'group_id', 'node_group_id'}):
+                _native_uuid(raw[field], f'{label}.{collection}[{index}].{field}')
+        context = raw.get('context_source')
+        if isinstance(context, dict) and 'node_id' in context:
+            _native_uuid(context['node_id'], f'{label}.{collection}[{index}].context_source.node_id')
+        if 'join_input_providers' in raw:
+            for provider_index, provider in enumerate(_bounded_list(
+                raw['join_input_providers'], f'{label}.{collection}[{index}].join_input_providers',
+            )):
+                provider_label = f'{label}.{collection}[{index}].join_input_providers[{provider_index}]'
+                if not isinstance(provider, dict):
+                    raise PlanValidationError(f'{provider_label} must be an object')
+                _native_uuid(
+                    _required(provider, 'provider_edge_id', provider_label),
+                    f'{provider_label}.provider_edge_id',
+                )
         if identity in by_id:
             raise PlanValidationError(f'v2 {collection} identities are duplicated')
         by_id[identity] = raw
@@ -4468,11 +4513,6 @@ def _v2_graph_compatibility(
     graph_fields = {'version', 'nodes', 'edges', 'node_groups', 'transition_groups'}
     if set(source) != graph_fields:
         raise PlanValidationError('v2 source graph fields are unsupported')
-    if canonical_sha256(source) == canonical_sha256(target):
-        return
-    if set(target) != graph_fields or target.get('version') != source.get('version', 0) + 1:
-        raise PlanValidationError('v2 target graph revision/fields are invalid')
-
     old_rows = {
         name: _v2_graph_rows(source, name, 'source_graph')
         for name in ('nodes', 'edges', 'node_groups', 'transition_groups')
@@ -4481,6 +4521,10 @@ def _v2_graph_compatibility(
         name: _v2_graph_rows(target, name, 'target_graph')
         for name in ('nodes', 'edges', 'node_groups', 'transition_groups')
     }
+    if canonical_sha256(source) == canonical_sha256(target):
+        return
+    if set(target) != graph_fields or target.get('version') != source.get('version', 0) + 1:
+        raise PlanValidationError('v2 target graph revision/fields are invalid')
     added: dict[str, set[str]] = {}
     for name in ('nodes', 'edges', 'node_groups', 'transition_groups'):
         before = old_rows[name]
@@ -4927,7 +4971,7 @@ def _validate_canonical_v2_plan(
             'anchors', 'compatibility_snapshot', 'runtime_refs', 'compatibility_review_ref',
             'source_admission',
         }, label))
-        item['workflow_id'] = _uuid(_required(item, 'workflow_id', label), f'{label}.workflow_id')
+        item['workflow_id'] = _native_uuid(_required(item, 'workflow_id', label), f'{label}.workflow_id')
         item['project_id'] = _native_project_id(_required(item, 'project_id', label), f'{label}.project_id')
         if native_descriptor is not None:
             item['_native_evidence_sha256'] = canonical_sha256(native_descriptor)
@@ -4977,7 +5021,7 @@ def _validate_canonical_v2_plan(
                 'project_id': _native_project_id(
                     _required(link, 'project_id', link_label), f'{link_label}.project_id',
                 ),
-                'workflow_id': _uuid(
+                'workflow_id': _native_uuid(
                     _required(link, 'workflow_id', link_label), f'{link_label}.workflow_id',
                 ),
                 'is_default': _required(link, 'is_default', link_label),
@@ -4994,7 +5038,7 @@ def _validate_canonical_v2_plan(
             raise PlanValidationError('v2 plan must preserve one explicit existing project link')
         item['links'] = links
         default_value = item['default']
-        item['default'] = _uuid(default_value, f'{label}.default') if default_value is not None else None
+        item['default'] = _native_uuid(default_value, f'{label}.default') if default_value is not None else None
         if item['default'] != (item['workflow_id'] if links[0]['is_default'] else None):
             raise PlanValidationError('v2 default does not match its existing project link')
         anchors = []
@@ -5004,7 +5048,7 @@ def _validate_canonical_v2_plan(
             anchor_label = f'{label}.anchors[{anchor_index}]'
             anchor = _closed(raw_anchor, {'id', 'kind'}, anchor_label)
             anchors.append({
-                'id': _string(_required(anchor, 'id', anchor_label), f'{anchor_label}.id'),
+                'id': _native_uuid(_required(anchor, 'id', anchor_label), f'{anchor_label}.id'),
                 'kind': _string(_required(anchor, 'kind', anchor_label), f'{anchor_label}.kind'),
             })
         anchors.sort(key=lambda row: row['id'])
@@ -5019,12 +5063,12 @@ def _validate_canonical_v2_plan(
             if target_graph.get('version') != version + 1:
                 raise PlanValidationError('v2 target graph must advance exactly one version')
             for collection in ('nodes', 'edges', 'node_groups', 'transition_groups'):
-                _bounded_list(
-                    _required(target_graph, collection, f'{label}.target_graph'),
-                    f'{label}.target_graph.{collection}',
-                )
-            from .graph import native_graph_projection
+                _v2_graph_rows(target_graph, collection, f'{label}.target_graph')
+            from .graph import native_graph_postimage, native_graph_projection
             try:
+                target_graph = native_graph_postimage(
+                    target_graph, workflow_id=item['workflow_id'],
+                )
                 review_target_graph = native_graph_projection(
                     target_graph,
                     workflow_id=item['workflow_id'],
@@ -5139,7 +5183,7 @@ def _validate_canonical_v2_target(
     *,
     verify_evidence: bool = True,
 ) -> dict[str, Any]:
-    if expected_workflow_id is not None and _uuid(
+    if expected_workflow_id is not None and _native_uuid(
         expected_workflow_id, 'expected_workflow_id',
     ) != item['workflow_id']:
         raise PlanValidationError('compatibility plan Workflow UUID differs from the selector')
@@ -5187,11 +5231,27 @@ def _validate_canonical_v2_target(
     else:
         if (
             metadata['execution_target'] != source['metadata']['execution_target']
-            and item['intent'] != 'graph-and-metadata'
+            and item['intent'] not in {'graph-and-metadata', 'metadata-only'}
         ):
             raise PlanValidationError(
                 'execution-target changes require graph-and-metadata with source admission'
             )
+        if (
+            item['intent'] == 'metadata-only'
+            and metadata['execution_target'] != source['metadata']['execution_target']
+        ):
+            # Completion of an already saved graph is admitted only through
+            # its exact v2 ingress and reverified published closure. It must
+            # not smuggle a graph edit through a metadata-only operation.
+            if (
+                source_admission.get('schema') != SOURCE_ADMISSION_V2_SCHEMA
+                or canonical_sha256(graph) != canonical_sha256(source['graph'])
+                or metadata['name'] != source['metadata']['name']
+                or metadata['description'] != source['metadata']['description']
+            ):
+                raise PlanValidationError(
+                    'metadata-only selector completion requires the exact admitted v2 graph'
+                )
         _v2_source_gate_check(
             source['graph'],
             graph,
@@ -5245,7 +5305,7 @@ def _validate_canonical_v2_target(
             project_id=item['project_id'],
             source_graph_sha256=item['source_graph_sha256'],
             source_metadata_sha256=item['source_metadata_sha256'],
-            target_graph_sha256=canonical_sha256(review_graph),
+            target_graph_sha256=canonical_sha256(graph),
             target_metadata_sha256=canonical_sha256(metadata),
             snapshot=item['compatibility_snapshot'],
             runtime_refs=item['runtime_refs'],
