@@ -4788,7 +4788,7 @@ def _v2_source_gate_check(
         workflow_id=workflow_id,
         project_root=str(project_root),
     )
-    if not target_prompt.startswith(f'{gate}\n\n'):
+    if target_prompt != gate and not target_prompt.startswith(f'{gate}\n\n'):
         raise PlanValidationError('target ingress does not contain the exact bound source admission gate')
     prompts = [
         prompt

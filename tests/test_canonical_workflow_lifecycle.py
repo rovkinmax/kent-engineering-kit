@@ -47,6 +47,37 @@ def workflow_id(index: int) -> str:
 
 
 class NativeGraphTransportTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("KENT_NATIVE_SOURCE_GATE_REQUEST"), "private gate request not supplied")
+    def test_captured_puber_gate_only_ingress_survives_native_encoding(self):
+        from workflowkit.delivery import source_admission_gate
+        from workflowkit.graph import native_graph_postimage
+
+        raw = Path(os.environ["KENT_NATIVE_SOURCE_GATE_REQUEST"]).read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            "9704afcc9bb28264aaa83d7af523b558aa316179c96977dcf4997eef8d6fccd0",
+        )
+        request = json.loads(raw)
+        gate = source_admission_gate(
+            request["source_admission"], project_id=request["project_id"],
+            workflow_id=request["workflow_id"], project_root=request["project_root"],
+        )
+        target = request["target_graph"]
+        ingress = operations._v2_exact_ingress_edge(
+            target, request["source_admission"]["ingress"], "captured Puber",
+        )
+        self.assertEqual(ingress["prompt_template"], gate + "\n\n")
+        encoded = native_graph_postimage(target, workflow_id=request["workflow_id"])
+        encoded_ingress = operations._v2_exact_ingress_edge(
+            encoded, request["source_admission"]["ingress"], "encoded Puber",
+        )
+        self.assertEqual(encoded_ingress["prompt_template"], gate)
+        operations._v2_source_gate_check(
+            request["source_graph"], encoded, request["source_admission"],
+            project_id=request["project_id"], workflow_id=request["workflow_id"],
+            project_root=Path(request["project_root"]),
+        )
+
     def test_exact_native_encoder_materializes_omitted_source_defaults(self):
         from workflowkit.graph import native_graph_postimage
         workflow = "c3150bf8-b900-4c87-bdf6-a1a47c74927c"
@@ -4345,6 +4376,53 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     source_graph, graph, item["source_admission"],
                     project_id=PROJECT_ID, workflow_id=workflow_id(0), project_root=Path(fixture["root"]),
                 )
+
+    def test_source_gate_accepts_exact_native_frame_without_loosening_suffix_boundary(self):
+        from workflowkit.delivery import SOURCE_ADMISSION_END, source_admission_gate
+        from workflowkit.graph import native_graph_postimage
+
+        for schema in ("delivery-source-admission-v1", "delivery-source-admission-v2"):
+            with self.subTest(schema=schema), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_workflow_fixture(Path(temporary))
+                _, value = canonical_v2_plan(fixture)
+                item = value["workflows"][0]
+                source = {"version": item["expected_version"],
+                          **read_state(fixture)["workflows"][workflow_id(0)]["graph"]}
+                target = item["target_graph"]
+                ingress = operations._v2_ingress_edge(target, "fixture")
+                admission = item["source_admission"]
+                if schema.endswith("-v2"):
+                    admission["schema"] = schema
+                    admission["binding"] = {
+                        "kind": "r2-installed",
+                        "installation_binding_sha256": admission.pop("installation_binding_sha256"),
+                    }
+                    admission["ingress"] = {"kind": "agent-edge", "edge_id": ingress["id"]}
+                gate = source_admission_gate(
+                    admission, project_id=PROJECT_ID, workflow_id=item["workflow_id"],
+                    project_root=str(fixture["root"]),
+                )
+                for prompt in (gate + "\n\n", gate + "\n\nReviewed ingress body."):
+                    ingress["prompt_template"] = prompt
+                    encoded = native_graph_postimage(target, workflow_id=item["workflow_id"])
+                    operations._v2_source_gate_check(
+                        source, encoded, admission, project_id=PROJECT_ID,
+                        workflow_id=item["workflow_id"], project_root=Path(fixture["root"]),
+                    )
+                for prompt in (
+                    gate + "Unseparated suffix", gate + "\nSingle newline suffix",
+                    gate.replace(SOURCE_ADMISSION_END, ""),
+                    gate.replace(admission["receipt_ref"]["sha256"], "0" * 64, 1),
+                    gate + "\n\n" + gate,
+                ):
+                    with self.subTest(prompt=prompt[-40:]):
+                        ingress["prompt_template"] = prompt
+                        with self.assertRaises(PlanValidationError):
+                            operations._v2_source_gate_check(
+                                source, native_graph_postimage(target, workflow_id=item["workflow_id"]),
+                                admission, project_id=PROJECT_ID, workflow_id=item["workflow_id"],
+                                project_root=Path(fixture["root"]),
+                            )
 
     def test_v2_closed_admission_union_and_exact_script_ingress(self) -> None:
         from workflowkit.delivery import source_admission_gate
