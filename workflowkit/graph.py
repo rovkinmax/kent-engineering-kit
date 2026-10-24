@@ -22,13 +22,13 @@ def native_graph_projection(
     *,
     workflow_id: str | None = None,
 ) -> dict[str, Any]:
-    """Encode source graph rows as Kent persists them.
+    """Project source rows for semantic review, not exact native readback.
 
-    Apply only to a source-built graph before diffing, hashing, or review. This
-    is not readback normalization. Native rows omit source ``workflow_id``
-    annotations, empty parameter arrays, and explicit selection/context
-    defaults. Existing row order, IDs, unknown fields, and non-default values
-    are retained.
+    This semantic comparison omits matching source ``workflow_id`` annotations,
+    empty parameter arrays, and explicit selection/context defaults. Native
+    readback retains those defaults, so this is neither a wire encoder nor
+    readback normalization. Row order, IDs, unknown fields and non-default
+    values are retained.
     """
     projected = deepcopy(graph)
     for collection in ("nodes", "edges", "node_groups", "transition_groups"):
@@ -55,6 +55,60 @@ def native_graph_projection(
             edge.pop("context_mode")
             edge.pop("context_source")
     return projected
+
+
+def native_graph_postimage(
+    graph: dict[str, Any],
+    *,
+    workflow_id: str,
+) -> dict[str, Any]:
+    """Encode a source graph for the native wire and exact expected postimage.
+
+    Unlike the semantic projection, materialize configured selection and
+    new-session/immediate-source defaults. In particular, Kent 2.10's CLI
+    requires explicit context_mode even when the source projection omits it.
+    Never apply this to actual readback.
+    """
+    encoded = deepcopy(graph)
+    for collection in ("nodes", "edges", "node_groups", "transition_groups"):
+        for row in encoded.get(collection, []):
+            if "workflow_id" in row:
+                if row["workflow_id"] != workflow_id:
+                    raise SpecError("source graph row Workflow identity differs")
+                row.pop("workflow_id")
+    for edge in encoded.get("edges", []):
+        for selection in ("assignee_selection", "thinking_selection"):
+            value = edge.get(selection, "configured")
+            if not isinstance(value, str):
+                raise SpecError(f"source edge {selection} must be a string")
+            edge[selection] = value.strip(_GO_WHITE_SPACE) or "configured"
+        # This is the source projection's known default, not a claim that the
+        # native CLI accepts an omitted context enum (it rejects that input).
+        mode = edge.get("context_mode", "new_session")
+        if not isinstance(mode, str) or mode.strip(_GO_WHITE_SPACE) not in {
+            "new_session", "continue_session", "compact_and_continue_session",
+        }:
+            raise SpecError("source edge context_mode is unsupported")
+        edge["context_mode"] = mode.strip(_GO_WHITE_SPACE)
+        context = edge.setdefault("context_source", {"kind": "immediate_source"})
+        if not isinstance(context, dict):
+            raise SpecError("source edge context_source must be an object")
+        kind = context.get("kind", "immediate_source")
+        if not isinstance(kind, str):
+            raise SpecError("source edge context_source.kind must be a string")
+        context["kind"] = kind.strip(_GO_WHITE_SPACE) or "immediate_source"
+        for parameter in edge.get("parameters", []):
+            purpose = parameter.get("purpose", "ordinary")
+            if not isinstance(purpose, str):
+                raise SpecError("source edge parameter purpose must be a string")
+            parameter["purpose"] = purpose.strip(_GO_WHITE_SPACE) or "ordinary"
+        if isinstance(edge.get("prompt_template"), str):
+            edge["prompt_template"] = edge["prompt_template"].strip(_GO_WHITE_SPACE)
+            if not edge["prompt_template"]:
+                edge.pop("prompt_template")
+        if edge.get("parameters") == []:
+            edge.pop("parameters")
+    return encoded
 
 
 @dataclass(frozen=True)

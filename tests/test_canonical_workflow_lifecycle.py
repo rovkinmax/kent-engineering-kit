@@ -33,7 +33,7 @@ from tests.test_workflow_retirement import (
     make_workflow_fixture as make_base_workflow_fixture,
     read_log,
     read_state,
-    workflow_id,
+    workflow_id as legacy_workflow_id,
     write_state,
 )
 from tests import test_delivery_source_admission as source_admission
@@ -41,25 +41,183 @@ from tests import test_delivery_source_admission as source_admission
 PROJECT_ID = "project-" + RETIREMENT_PROJECT_ID
 
 
+def workflow_id(index: int) -> str:
+    """Use canonical UUIDv4 native identities in this protocol test suite."""
+    return f"123e4567-e89b-42d3-a456-{426614174000 + index:012d}"
+
+
 class NativeGraphTransportTests(unittest.TestCase):
+    def test_exact_native_encoder_materializes_omitted_source_defaults(self):
+        from workflowkit.graph import native_graph_postimage
+        workflow = "c3150bf8-b900-4c87-bdf6-a1a47c74927c"
+        source = {
+            "version": 10, "nodes": [], "node_groups": [], "transition_groups": [],
+            "edges": [{"id": workflow, "parameters": [{"key": "input", "description": "Input"}]}],
+        }
+        self.assertEqual(native_graph_postimage(source, workflow_id=workflow)["edges"], [{
+            "id": workflow, "assignee_selection": "configured", "thinking_selection": "configured",
+            "context_mode": "new_session", "context_source": {"kind": "immediate_source"},
+            "parameters": [{"key": "input", "description": "Input", "purpose": "ordinary"}],
+        }])
+        for invalid in ("", "invented", None):
+            source["edges"][0]["context_mode"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaises(operations.SpecError):
+                native_graph_postimage(source, workflow_id=workflow)
+        source["edges"][0].update({
+            "assignee_selection": "previous_node", "thinking_selection": "previous_node",
+            "context_mode": "compact_and_continue_session",
+            "context_source": {"kind": "previous_target"},
+            "parameters": [{"key": "target", "description": "Target", "purpose": "target_assignee"}],
+        })
+        self.assertEqual(
+            native_graph_postimage(source, workflow_id=workflow)["edges"], source["edges"],
+        )
+
+    @unittest.skipUnless(os.environ.get("KENT_NATIVE_POSTIMAGE_CAPTURE"), "private native capture not supplied")
+    def test_captured_release_and_puber_native_defaults_roundtrip_in_full(self):
+        from workflowkit.graph import native_graph_postimage, native_graph_projection
+        root = Path(os.environ["KENT_NATIVE_POSTIMAGE_CAPTURE"]).parent / "d29-final-admission-20261024"
+        for member, version, expected_edges in (("appsome-release", 9, 54), ("puber-release", 96, 51)):
+            with self.subTest(member=member):
+                captured = json.loads((root / f"native-{member}-d29.json").read_bytes())
+                actual = {"version": captured["expected_version"], **captured["graph"]}
+                self.assertEqual(actual["version"], version)
+                self.assertEqual(len(actual["edges"]), expected_edges)
+                source = native_graph_projection(actual, workflow_id=captured["workflow_id"])
+                self.assertTrue(any("context_mode" not in edge for edge in source["edges"]))
+                # Compare every row/field, not merely the default field subset.
+                self.assertEqual(
+                    native_graph_postimage(source, workflow_id=captured["workflow_id"]), actual,
+                )
+
+    @unittest.skipUnless(os.environ.get("KENT_NATIVE_POSTIMAGE_CAPTURE"), "private native capture not supplied")
+    def test_full_captured_slack_native_postimage(self):
+        """Optional read-only qualification against the original private capture."""
+        from workflowkit.graph import native_graph_postimage, native_graph_projection
+
+        captured = json.loads(Path(os.environ["KENT_NATIVE_POSTIMAGE_CAPTURE"]).read_bytes())
+        original = captured["original_plan"]
+        source_raw = Path(original["path"]).read_bytes()
+        self.assertEqual(hashlib.sha256(source_raw).hexdigest(), original["sha256"])
+        item = json.loads(source_raw)["workflows"][0]
+        source = item["target_graph"]
+        actual = captured["actual"]["graph"]
+        self.assertEqual(item["workflow_id"], captured["actual"]["workflow_id"])
+        self.assertEqual(sum(e.get("prompt_template") == "" for e in source["edges"]), 23)
+        self.assertEqual(sum(e.get("assignee_selection") == "configured" for e in actual["edges"]), 42)
+        self.assertEqual(sum(e.get("context_mode") == "new_session" for e in actual["edges"]), 27)
+        self.assertEqual(
+            native_graph_postimage(source, workflow_id=item["workflow_id"]), actual,
+        )
+        self.assertNotEqual(native_graph_projection(source, workflow_id=item["workflow_id"]), actual)
+        self.assertEqual(
+            canonical_sha256(actual),
+            "8c26ad4c1419d155cfdfdd3c842336ea20959090e35ec9c8f9f79b3ee9e7d8e2",
+        )
+
+    def test_native_identity_is_original_canonical_uuid4(self):
+        valid = "c3150bf8-b900-4c87-bdf6-a1a47c74927c"
+        for identity in (valid.upper(), str(uuid.uuid5(uuid.NAMESPACE_URL, "edge")),
+                         "not-a-native-id", valid.replace("-4c87-", "-1c87-")):
+            with self.subTest(identity=identity), self.assertRaises(PlanValidationError):
+                operations._v2_graph_rows({"edges": [{"id": identity}]}, "edges", "target")
+        self.assertEqual(
+            list(operations._v2_graph_rows({"edges": [{"id": valid}]}, "edges", "target")),
+            [valid],
+        )
+        for field in ("workflow_id", "transition_group_id", "target_node_id", "group_id"):
+            with self.subTest(field=field), self.assertRaises(PlanValidationError):
+                operations._v2_graph_rows(
+                    {"edges": [{"id": valid, field: str(uuid.uuid5(uuid.NAMESPACE_URL, field))}]},
+                    "edges", "target",
+                )
+        row = {
+            "id": valid, "context_source": {"kind": "selected_node", "node_key": "plan", "node_id": valid},
+            "join_input_providers": [{"input_name": "input", "provider_edge_id": valid}],
+        }
+        self.assertEqual(operations._v2_graph_rows({"nodes": [row]}, "nodes", "target"), {valid: row})
+
+    def test_exact_native_postimage_is_distinct_from_semantic_projection(self):
+        from workflowkit.graph import native_graph_postimage, native_graph_projection
+
+        workflow = "c3150bf8-b900-4c87-bdf6-a1a47c74927c"
+        source = {
+            "version": 11,
+            "nodes": [{"id": workflow, "workflow_id": workflow, "future": "keep"}],
+            "node_groups": [], "transition_groups": [],
+            "edges": [{
+                "id": workflow, "workflow_id": workflow, "prompt_template": "",
+                "parameters": [], "assignee_selection": "configured",
+                "thinking_selection": "configured", "context_mode": "new_session",
+                "context_source": {"kind": "immediate_source"}, "future": {"keep": True},
+            }],
+        }
+        original = json.loads(json.dumps(source))
+        expected = {
+            "version": 11, "nodes": [{"id": workflow, "future": "keep"}],
+            "node_groups": [], "transition_groups": [],
+            "edges": [{
+                "id": workflow, "assignee_selection": "configured",
+                "thinking_selection": "configured", "context_mode": "new_session",
+                "context_source": {"kind": "immediate_source"}, "future": {"keep": True},
+            }],
+        }
+        self.assertEqual(native_graph_postimage(source, workflow_id=workflow), expected)
+        self.assertNotEqual(native_graph_projection(source, workflow_id=workflow), expected)
+        self.assertEqual(source, original)
+
+    def test_failed_effect_keeps_bounded_private_exact_diagnostics(self):
+        from tests.test_workflow_retirement import load_test_plan, PYTHON
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with OperationJournal(root / "state", "effect-test", load_test_plan(root)) as journal:
+                journal.persist({"phase": "in_progress", "effects": {}})
+                result = operations.run_effect(
+                    journal, effect_key="failed", command=[PYTHON, "-c",
+                        "import sys; sys.stdout.buffer.write(b'error\\xff'); "
+                        "sys.stderr.buffer.write(b'e'*20000); sys.exit(7)"],
+                    cwd=root, preimage_sha256="a" * 64, postimage_sha256="b" * 64,
+                    current_sha256=lambda: "a" * 64,
+                )
+                self.assertEqual(result.returncode, 7)
+                self.assertEqual(result.settlement, "preimage")
+                saved = journal.state["effects"]["failed"]["result"]
+                import base64
+                diagnostics = saved["diagnostics"]
+                self.assertEqual(base64.b64decode(diagnostics["stdout"]["base64"]), b"error\xff")
+                self.assertFalse(diagnostics["stdout"]["truncated"])
+                self.assertEqual(len(base64.b64decode(diagnostics["stderr"]["base64"])), 16384)
+                self.assertTrue(diagnostics["stderr"]["truncated"])
+                self.assertEqual(saved["stderr_sha256"], hashlib.sha256(b"e" * 20000).hexdigest())
+                self.assertEqual(stat.S_IMODE(journal.path.stat().st_mode), 0o600)
+
+    def test_failure_output_reports_capture_limit_honestly(self):
+        import base64
+        output = operations._failure_output(b"x" * operations.MAX_OUTPUT)
+        self.assertTrue(output["capture_limit_reached"])
+        self.assertTrue(output["truncated"])
+        self.assertEqual(output["captured_bytes"], operations.MAX_OUTPUT)
+        self.assertEqual(len(base64.b64decode(output["base64"])), 16384)
+
     def test_native_graph_projection_encodes_source_rows_and_defaults(self):
         from workflowkit.graph import native_graph_projection
 
         workflow = "123e4567-e89b-12d3-a456-426614174000"
         source = {
             "version": 8,
-            "nodes": [{"id": "node-1", "workflow_id": workflow, "key": "janitor",
+            "nodes": [{"id": "f4d02953-01dd-4918-b9a9-fab7701b9bec", "workflow_id": workflow, "key": "janitor",
                        "kind": "script", "future": "preserved"}],
             "node_groups": [],
-            "transition_groups": [{"id": "group-1", "workflow_id": workflow,
-                                   "source_node_id": "node-1", "transition_id": "run"}],
+            "transition_groups": [{"id": "3d9953f1-20c4-4ad2-acae-32f4a429576a", "workflow_id": workflow,
+                                   "source_node_id": "f4d02953-01dd-4918-b9a9-fab7701b9bec", "transition_id": "run"}],
             "edges": [
-                {"id": "edge-default", "workflow_id": workflow, "parameters": [],
+                {"id": "87e4a2a8-d512-4bc9-8fc5-a21a2eb77b02", "workflow_id": workflow, "parameters": [],
                  "assignee_selection": "configured", "thinking_selection": "configured",
                  "context_mode": "new_session",
                  "context_source": {"kind": "immediate_source"},
                  "prompt_template": " \t\nRun janitor.\n ", "future": {"keep": True}},
-                {"id": "edge-explicit", "workflow_id": workflow,
+                {"id": "ae821784-4abb-4fa2-941f-d37e84be55ad", "workflow_id": workflow,
                  "assignee_selection": "previous_node", "thinking_selection": "configured",
                  "context_mode": "continue_session",
                  "context_source": {"kind": "selected_node", "node_key": "plan"}},
@@ -95,8 +253,8 @@ class NativeGraphTransportTests(unittest.TestCase):
             "workflow_id": "123e4567-e89b-12d3-a456-426614174000",
             "expected_version": 8,
             "graph": {
-                "nodes": [{"id": "node-1", "workflow_id": "unexpected"}],
-                "edges": [{"id": "edge-1", "parameters": [],
+                "nodes": [{"id": "f4d02953-01dd-4918-b9a9-fab7701b9bec", "workflow_id": "unexpected"}],
+                "edges": [{"id": "1aadda4e-41db-4f3b-87ef-7c3ad916a724", "parameters": [],
                            "assignee_selection": "configured"}],
                 "node_groups": [],
                 "transition_groups": [],
@@ -309,6 +467,8 @@ def synthetic_verified_source_admission(
 def make_workflow_fixture(root: Path) -> dict:
     fixture = make_base_workflow_fixture(root)
     state = read_state(fixture)
+    # Adapt the imported legacy inventory without changing its shared fixture.
+    state = json.loads(json.dumps(state).replace(legacy_workflow_id(0), workflow_id(0)))
     state["project_id"] = PROJECT_ID
     write_state(fixture, state)
     return fixture
@@ -331,36 +491,36 @@ def canonical_v2_plan(
     wid = workflow_id(0)
     workflow = state["workflows"][wid]
     workflow["graph"]["nodes"] = [
-        {"id": "node-backlog", "key": "backlog", "kind": "agent"},
-        {"id": "node-terminal", "key": "terminal", "kind": "terminal"},
-        {"id": "node-implement", "key": "implement", "kind": "agent"},
-        {"id": "node-plan", "key": "plan", "kind": "agent"},
-        {"id": "node-fix", "key": "fix", "kind": "agent"},
+        {"id": "85142bca-99b5-4f0b-b364-f5296df95187", "key": "backlog", "kind": "agent"},
+        {"id": "90e31940-4c84-466e-8e72-26f53c2f36f4", "key": "terminal", "kind": "terminal"},
+        {"id": "7d280478-d98b-4462-9ae6-f58bf0d5a8d0", "key": "implement", "kind": "agent"},
+        {"id": "8bda2875-9d3e-40e4-886c-25bb48f5f3aa", "key": "plan", "kind": "agent"},
+        {"id": "4963546f-c7fe-490b-aadb-ae4aaacedb67", "key": "fix", "kind": "agent"},
         {
-            "id": "node-plan-revalidation",
+            "id": "0b234cff-2952-438d-be39-83d1165dbbe0",
             "key": "plan_revalidation",
             "kind": "agent",
         },
     ]
     if script_path_change:
         workflow["graph"]["nodes"].append({
-            "id": "node-script",
+            "id": "39fa54f4-f723-491e-a278-ba8547f7ba06",
             "key": "janitor",
             "kind": "script",
             "script_path": ".kent/scripts/old-janitor",
         })
-    if not any(edge.get("id") == "edge-backlog-plan" for edge in workflow["graph"]["edges"]):
+    if not any(edge.get("id") == "bfabd30b-f1b3-4fec-92cc-b6b4af71b845" for edge in workflow["graph"]["edges"]):
         workflow["graph"]["transition_groups"].append({
-            "id": "group-backlog-plan",
-            "source_node_id": "node-backlog",
+            "id": "7660f06c-c962-4d80-9c3d-b4ea45a15a21",
+            "source_node_id": "85142bca-99b5-4f0b-b364-f5296df95187",
             "transition_id": "backlog_plan",
             "description": "Start planning.",
         })
         workflow["graph"]["edges"].append({
-            "id": "edge-backlog-plan",
+            "id": "bfabd30b-f1b3-4fec-92cc-b6b4af71b845",
             "key": "backlog_plan",
-            "transition_group_id": "group-backlog-plan",
-            "target_node_id": "node-plan",
+            "transition_group_id": "7660f06c-c962-4d80-9c3d-b4ea45a15a21",
+            "target_node_id": "8bda2875-9d3e-40e4-886c-25bb48f5f3aa",
             "assignee_selection": "configured",
             "thinking_selection": "configured",
             "requires_approval": False,
@@ -370,18 +530,18 @@ def canonical_v2_plan(
         })
     if not any(edge.get("key") == "fix_replan" for edge in workflow["graph"]["edges"]):
         workflow["graph"]["transition_groups"].append({
-            "id": "group-fix-replan", "source_node_id": "node-fix",
+            "id": "c60a77d2-3672-49fc-8aea-fe5c37f0110a", "source_node_id": "4963546f-c7fe-490b-aadb-ae4aaacedb67",
             "transition_id": "fix_replan",
         })
         workflow["graph"]["edges"].append({
-            "id": "edge-fix-replan", "key": "fix_replan",
-            "transition_group_id": "group-fix-replan",
-            "target_node_id": "node-plan-revalidation",
+            "id": "9c264349-da25-4402-adb6-53780bd0b7fd", "key": "fix_replan",
+            "transition_group_id": "c60a77d2-3672-49fc-8aea-fe5c37f0110a",
+            "target_node_id": "0b234cff-2952-438d-be39-83d1165dbbe0",
             "parameters": [], "prompt_template": "Revalidate after a fix.",
         })
     detail = workflow["details"]["TASK-1"]
     detail["live_sessions"] = []
-    detail["current_nodes"] = [{"node_id": "node-terminal"}]
+    detail["current_nodes"] = [{"node_id": "90e31940-4c84-466e-8e72-26f53c2f36f4"}]
     detail["current_scripts"] = []
     detail["pending_approvals"] = (
         [{"id": "approval-1", "proposal": {"transition": "plan_revalidation"}}]
@@ -400,16 +560,16 @@ def canonical_v2_plan(
     target_graph["version"] += 1
     if not any(edge.get("key") == "implement_replan" for edge in source_graph["edges"]):
         target_graph["transition_groups"].append({
-            "id": "group-implement-replan",
-            "source_node_id": "node-implement",
+            "id": "c6a3f68e-7629-404a-8153-2d5f0e32ff0d",
+            "source_node_id": "7d280478-d98b-4462-9ae6-f58bf0d5a8d0",
             "transition_id": "implement_replan",
             "description": "Return to plan revalidation.",
         })
         target_graph["edges"].append({
-            "id": "edge-implement-replan",
+            "id": "045627f4-054e-46bc-9576-17a2d934d58a",
             "key": "implement_replan",
-            "transition_group_id": "group-implement-replan",
-            "target_node_id": "node-plan-revalidation",
+            "transition_group_id": "c6a3f68e-7629-404a-8153-2d5f0e32ff0d",
+            "target_node_id": "0b234cff-2952-438d-be39-83d1165dbbe0",
             "assignee_selection": "configured",
             "thinking_selection": "configured",
             "requires_approval": False,
@@ -570,7 +730,7 @@ def canonical_v2_plan(
     }
     runtime_refs = [runtime_ref]
     if script_path_change and intent in {"graph-only", "graph-and-metadata"}:
-        next(node for node in target_graph["nodes"] if node["id"] == "node-script")[
+        next(node for node in target_graph["nodes"] if node["id"] == "39fa54f4-f723-491e-a278-ba8547f7ba06")[
             "script_path"
         ] = str(runtime_file)
     source_graph_sha256 = canonical_sha256(source_graph)
@@ -583,11 +743,14 @@ def canonical_v2_plan(
         if intent in {"metadata-only", "graph-and-metadata"}
         else source_metadata
     )
-    from workflowkit.graph import native_graph_projection
+    from workflowkit.graph import native_graph_postimage, native_graph_projection
 
     review_source_graph = native_graph_projection(source_graph, workflow_id=wid)
     review_target_graph = native_graph_projection(full_target_graph, workflow_id=wid)
-    target_graph_sha256 = canonical_sha256(review_target_graph)
+    target_graph_sha256 = canonical_sha256(
+        native_graph_postimage(full_target_graph, workflow_id=wid)
+        if intent != "metadata-only" else full_target_graph
+    )
     target_metadata_sha256 = canonical_sha256(full_target_metadata)
     changed_paths = sorted(operations._v2_required_review_paths(
         review_source_graph,
@@ -641,7 +804,7 @@ def canonical_v2_plan(
             {"project_id": PROJECT_ID, "workflow_id": wid, "is_default": True}
         ],
         "default": wid,
-        "anchors": [{"id": "node-terminal", "kind": "terminal"}],
+        "anchors": [{"id": "90e31940-4c84-466e-8e72-26f53c2f36f4", "kind": "terminal"}],
         "compatibility_snapshot": compatibility_snapshot,
         "runtime_refs": runtime_refs,
         "compatibility_review_ref": {
@@ -745,7 +908,7 @@ def make_native_persistence(
                 if index == 0 or (with_questions and index in (4, 5))
                 else {"kind": "doing", "native_state": "waiting"}
             )
-            node_id = "node-terminal" if terminal else "node-backlog"
+            node_id = "90e31940-4c84-466e-8e72-26f53c2f36f4" if terminal else "85142bca-99b5-4f0b-b364-f5296df95187"
             count = (
                 detailed_counts[index]
                 if index < len(detailed_counts)
@@ -949,7 +1112,7 @@ def make_native_persistence(
             transition = {
                 "workflow_id": workflow_id(0),
                 "id": transition_group["id"],
-                "source_node_id": "node-backlog",
+                "source_node_id": "85142bca-99b5-4f0b-b364-f5296df95187",
                 "transition_id": "backlog_plan",
                 "commentary": f"Reviewed native approval {index + 1}",
             }
@@ -958,7 +1121,7 @@ def make_native_persistence(
                 (
                     approval_id,
                     task_id,
-                    "node-backlog",
+                    "85142bca-99b5-4f0b-b364-f5296df95187",
                     "backlog_plan",
                     workflow["version"],
                     canonical_bytes(transition).decode("utf-8"),
@@ -967,7 +1130,7 @@ def make_native_persistence(
                 ),
             )
             target = {
-                "node_id": "node-plan",
+                "node_id": "8bda2875-9d3e-40e4-886c-25bb48f5f3aa",
                 "node_kind": "agent",
                 "entered_by_edge_id": edge["id"],
             }
@@ -1336,6 +1499,183 @@ def install_v2_unresolved_graph_postimage(
     return graph_stage
 
 class CanonicalWorkflowLifecycleTest(unittest.TestCase):
+    def test_invalid_original_native_ids_and_references_never_dispatch(self):
+        for invalid in (str(uuid.uuid5(uuid.NAMESPACE_URL, "native-edge")),
+                        "C3150BF8-B900-4C87-BDF6-A1A47C74927C"):
+            for field in ("id", "target_node_id", "transition_group_id", "workflow_id"):
+                with self.subTest(invalid=invalid, field=field), tempfile.TemporaryDirectory() as temporary:
+                    fixture = make_workflow_fixture(Path(temporary))
+                    _, value = canonical_v2_plan(fixture)
+                    value["workflows"][0]["target_graph"]["edges"][0][field] = invalid
+                    plan = write_canonical_v2_plan(fixture, value)
+                    with mock.patch.object(operations, "run_effect", side_effect=AssertionError("dispatch")):
+                        with self.assertRaises(PlanValidationError):
+                            reconcile_canonical_workflows(plan, mode="prepare")
+                    self.assertEqual(graph_apply_rows(fixture), [])
+                    self.assertFalse((Path(value["state_dir"]) / "canonical-workflow-reconcile.journal.json").exists())
+
+    def test_invalid_nested_native_references_never_dispatch(self):
+        for invalid in (str(uuid.uuid5(uuid.NAMESPACE_URL, "native-reference")),
+                        "C3150BF8-B900-4C87-BDF6-A1A47C74927C"):
+            for nested in ("context_source.node_id", "join_input_providers.provider_edge_id"):
+                with self.subTest(invalid=invalid, nested=nested), tempfile.TemporaryDirectory() as temporary:
+                    fixture = make_workflow_fixture(Path(temporary))
+                    _, value = canonical_v2_plan(fixture)
+                    graph = value["workflows"][0]["target_graph"]
+                    if nested == "context_source.node_id":
+                        graph["edges"][0]["context_source"]["node_id"] = invalid
+                    else:
+                        graph["nodes"][0]["join_input_providers"] = [{
+                            "input_name": "input", "provider_edge_id": invalid,
+                        }]
+                    plan = write_canonical_v2_plan(fixture, value)
+                    with self.assertRaisesRegex(PlanValidationError, "invalid digest"):
+                        operations._validate_canonical_v2_plan(plan, verify_evidence=False)
+                    with mock.patch.object(operations, "run_effect", side_effect=AssertionError("dispatch")):
+                        with self.assertRaises(PlanValidationError):
+                            reconcile_canonical_workflows(plan, mode="prepare")
+                    self.assertEqual(graph_apply_rows(fixture), [])
+                    self.assertFalse((Path(value["state_dir"]) / "canonical-workflow-reconcile.journal.json").exists())
+
+    def metadata_completion_plan(self, fixture):
+        """Model the saved graph separately from its remaining selector."""
+        from workflowkit.delivery import SOURCE_ADMISSION_END, source_admission_gate
+        from workflowkit.graph import native_graph_postimage, native_graph_projection
+
+        _, initial = canonical_v2_plan(fixture, pending_approval=True)
+        initial_item = initial["workflows"][0]
+        admission = initial_item["source_admission"]
+        admission["schema"] = "delivery-source-admission-v2"
+        admission["binding"] = {
+            "kind": "r2-installed",
+            "installation_binding_sha256": admission.pop("installation_binding_sha256"),
+        }
+        ingress = operations._v2_ingress_edge(initial_item["target_graph"], "fixture")
+        admission["ingress"] = {"kind": "agent-edge", "edge_id": ingress["id"]}
+        suffix = ingress["prompt_template"].split(SOURCE_ADMISSION_END + "\n\n", 1)[1]
+        ingress["prompt_template"] = source_admission_gate(
+            admission, project_id=PROJECT_ID, workflow_id=initial_item["workflow_id"],
+            project_root=str(fixture["root"]),
+        ) + "\n\n" + suffix
+        state = read_state(fixture)
+        workflow = state["workflows"][initial_item["workflow_id"]]
+        saved = native_graph_postimage(
+            initial_item["target_graph"], workflow_id=initial_item["workflow_id"],
+        )
+        workflow["version"] = saved["version"]
+        workflow["graph"] = {key: saved[key] for key in (
+            "nodes", "edges", "node_groups", "transition_groups",
+        )}
+        write_state(fixture, state)
+        _, value = canonical_v2_plan(
+            fixture, intent="metadata-only", pending_approval=True,
+            source_admission_enabled=False,
+            metadata={**workflow["metadata"], "execution_target": "default-branch"},
+            name="selector-completion.json",
+        )
+        item = value["workflows"][0]
+        item["source_admission"] = admission
+        review_path = Path(item["compatibility_review_ref"]["path"])
+        review = json.loads(review_path.read_bytes())
+        review["source_admission_sha256"] = canonical_sha256(admission)
+        projected = native_graph_projection(saved, workflow_id=item["workflow_id"])
+        required = operations._v2_required_review_paths(
+            projected, projected, workflow["metadata"], item["target_metadata"],
+            item["compatibility_snapshot"], admission,
+        )
+        evidence = review["dispositions"][0]["evidence"]
+        review["dispositions"] = [
+            {"path": path, "disposition": "compatible", "evidence": evidence}
+            for path in sorted(required)
+        ]
+        raw = canonical_bytes(review)
+        review_path.write_bytes(raw)
+        item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        return write_canonical_v2_plan(fixture, value, name="selector-completion.json"), value
+
+    def test_metadata_only_completion_readmits_exact_saved_frame_without_graph_save(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            plan, _ = self.metadata_completion_plan(fixture)
+            before = read_state(fixture)["workflows"][workflow_id(0)]
+            with mock.patch.object(
+                operations, "admit_source_admission",
+                side_effect=synthetic_verified_source_admission,
+            ) as admission:
+                prepared = reconcile_canonical_workflows(plan, mode="prepare")
+                self.assertEqual(prepared["phase"], "prepared")
+                report = reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+                self.assertGreaterEqual(admission.call_count, 2)
+            self.assertEqual(report["phase"], "complete")
+            after = read_state(fixture)["workflows"][workflow_id(0)]
+            self.assertEqual(after["graph"], before["graph"])
+            self.assertEqual(after["details"], before["details"])
+            self.assertEqual(graph_apply_rows(fixture), [])
+            self.assertEqual(after["metadata"]["execution_target"], "default-branch")
+
+    def test_metadata_only_completion_rejects_unadmitted_or_drifted_actual_state(self):
+        for mutation in ("missing-frame", "wrong-frame", "wrong-ingress", "extra-route",
+                         "closure", "owner", "pending", "graph-payload", "metadata"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                fixture = make_workflow_fixture(Path(temporary))
+                _, value = self.metadata_completion_plan(fixture)
+                item = value["workflows"][0]
+                state = read_state(fixture)
+                workflow = state["workflows"][workflow_id(0)]
+                graph = workflow["graph"]
+                ingress = operations._v2_ingress_edge(graph, "fixture")
+                if mutation == "missing-frame":
+                    ingress["prompt_template"] = "Unadmitted."
+                elif mutation == "wrong-frame":
+                    ingress["prompt_template"] = ingress["prompt_template"].replace(
+                        "refs/remotes/origin/main", "refs/remotes/origin/other",
+                    )
+                elif mutation == "wrong-ingress":
+                    item["source_admission"]["ingress"]["edge_id"] = str(uuid.uuid4())
+                elif mutation == "extra-route":
+                    graph["edges"].append({**ingress, "id": str(uuid.uuid4())})
+                elif mutation == "closure":
+                    Path(item["source_admission"]["receipt_ref"]["path"]).write_bytes(b"drift")
+                elif mutation == "owner":
+                    workflow["default"] = False
+                elif mutation == "pending":
+                    workflow["details"]["TASK-1"]["pending_approvals"].append({"id": "foreign"})
+                elif mutation == "graph-payload":
+                    item["target_graph"] = {"version": workflow["version"] + 1, **graph}
+                elif mutation == "metadata":
+                    item["target_metadata"]["description"] = "Smuggled change."
+                if mutation in {"missing-frame", "wrong-frame", "extra-route"}:
+                    # Refresh the raw preimage hash to prove rejection is by
+                    # actual ingress qualification, not an incidental digest.
+                    item["source_graph_sha256"] = canonical_sha256({
+                        "version": workflow["version"], **graph,
+                    })
+                write_state(fixture, state)
+                plan = write_canonical_v2_plan(fixture, value)
+                with mock.patch.object(
+                    operations, "admit_source_admission",
+                    # Exercise independent admission refusal; real closure
+                    # validation has its own end-to-end source-admission suite.
+                    side_effect=(
+                        EffectBlocked("published closure changed")
+                        if mutation == "closure" else synthetic_verified_source_admission
+                    ),
+                ), self.assertRaises((PlanValidationError, EffectBlocked)):
+                    reconcile_canonical_workflows(plan, mode="prepare")
+                self.assertEqual(graph_apply_rows(fixture), [])
+                self.assertFalse(any(row[:2] == ["workflow", "update"] for row in read_log(fixture)))
+
+    def test_metadata_only_completion_refuses_closure_drift_after_prepare(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            plan, _ = self.metadata_completion_plan(fixture)
+            reconcile_canonical_workflows(plan, mode="prepare")
+            with mock.patch.object(
+                operations, "admit_source_admission", side_effect=EffectBlocked("closure drift"),
+            ), self.assertRaises(EffectBlocked):
+                reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+            self.assertFalse(any(row[:2] == ["workflow", "update"] for row in read_log(fixture)))
+
     def test_v2_plan_source_rows_are_projected_before_review_hashing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = make_workflow_fixture(Path(temporary))
@@ -1362,7 +1702,10 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 for collection in ("nodes", "edges", "node_groups", "transition_groups")
                 for row in projected[collection]
             ))
-            self.assertEqual(parsed_item["target_graph"], target)
+            from workflowkit.graph import native_graph_postimage
+            self.assertEqual(
+                parsed_item["target_graph"], native_graph_postimage(target, workflow_id=workflow),
+            )
             for edge in projected["edges"]:
                 self.assertNotEqual(edge.get("assignee_selection"), "configured")
                 self.assertNotEqual(edge.get("thinking_selection"), "configured")
@@ -1535,7 +1878,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     "installation_binding_sha256"
                 ],
             },
-            "ingress": {"kind": "script-edge", "edge_id": "edge-ingress"},
+            "ingress": {"kind": "script-edge", "edge_id": "000d0e6b-58b4-435a-a9f9-cb32f7d420ab"},
         }
         with mock.patch.object(operations.Path, "home", return_value=fixture.home), \
                 mock.patch.dict("os.environ", {"HOME": str(fixture.home)}):
@@ -1650,7 +1993,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 "target": str(fixture.adapter_target),
             }],
             "binding": {"kind": "plan-publication"},
-            "ingress": {"kind": "script-edge", "edge_id": "edge-source-ingress"},
+            "ingress": {"kind": "script-edge", "edge_id": "40be9965-3a5f-4917-b466-7f0958f0fa89"},
         }
         with mock.patch.object(operations.Path, "home", return_value=fixture.home), \
                 mock.patch.dict("os.environ", {"HOME": str(fixture.home)}):
@@ -2975,10 +3318,10 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             item = value["workflows"][0]
             next(edge for edge in item["target_graph"]["edges"] if edge["key"] == "implement_replan")[
                 "prompt_template"] = projected.document["graph"]["edges"][0]["prompt_template"]
-            from workflowkit.graph import native_graph_projection
+            from workflowkit.graph import native_graph_postimage
 
             review = json.loads(context["review_path"].read_text())
-            review["target_graph_sha256"] = canonical_sha256(native_graph_projection(
+            review["target_graph_sha256"] = canonical_sha256(native_graph_postimage(
                 item["target_graph"], workflow_id=item["workflow_id"],
             ))
             raw = canonical_bytes(review)
@@ -2991,7 +3334,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)["phase"], "complete")
                 parsed = operations._validate_canonical_v2_plan(plan)
                 actual = operations._canonical_v2_owned_read(parsed, parsed["workflows"][0])
-            self.assertEqual(actual["graph"], item["target_graph"])
+            self.assertEqual(actual["graph"], parsed["workflows"][0]["target_graph"])
             self.assertEqual(len(graph_apply_rows(fixture)), 1)
             expected = operations._canonical_v2_owned(actual)
             for drift in ("prompt", "metadata", "version"):
@@ -3281,7 +3624,10 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     value = plan.value
                     item = value["workflows"][0]
                     item["expected_version"] = 17
-                    item["source_graph_sha256"] = canonical_sha256(item["target_graph"])
+                    from workflowkit.graph import native_graph_postimage
+                    item["source_graph_sha256"] = canonical_sha256(native_graph_postimage(
+                        item["target_graph"], workflow_id=item["workflow_id"],
+                    ))
                     item["target_graph"]["version"] = 18
                     from workflowkit.delivery import SOURCE_ADMISSION_END, source_admission_gate
                     admission = item["source_admission"]
@@ -3300,9 +3646,9 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     snapshot["native_components"] = current["compatibility_snapshot"]["native_components"]
                     review = json.loads(context["review_path"].read_text())
                     review["source_graph_sha256"] = item["source_graph_sha256"]
-                    from workflowkit.graph import native_graph_projection
+                    from workflowkit.graph import native_graph_postimage
 
-                    review["target_graph_sha256"] = canonical_sha256(native_graph_projection(
+                    review["target_graph_sha256"] = canonical_sha256(native_graph_postimage(
                         item["target_graph"], workflow_id=item["workflow_id"],
                     ))
                     review["source_admission_sha256"] = canonical_sha256(admission)
@@ -3565,7 +3911,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 if row["id"] == "TASK-1"
             )
             self.assertFalse(task["terminal"])
-            self.assertEqual(task["current_nodes"], ["node-backlog"])
+            self.assertEqual(task["current_nodes"], ["85142bca-99b5-4f0b-b364-f5296df95187"])
             self.assertEqual(task["pending_decisions"], [])
             self.assertEqual(
                 observed["compatibility_snapshot"]["native_components"]["approvals"],
@@ -3716,7 +4062,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 )
 
             context["connection"].execute(
-                "UPDATE task_current_nodes SET node_id='node-backlog' WHERE task_id='TASK-14'"
+                "UPDATE task_current_nodes SET node_id='85142bca-99b5-4f0b-b364-f5296df95187' WHERE task_id='TASK-14'"
             )
             context["connection"].commit()
             with native_observer_patches(context):
@@ -3976,8 +4322,8 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     ),
                 )),
                 "hidden-extra-marker": changed(lambda graph: graph["edges"][1].update(prompt=expected)),
-                "node-extra-marker": changed(lambda graph: graph["nodes"][0].update(prompt=expected)),
-                "group-extra-marker": changed(lambda graph: graph["transition_groups"][0].update(prompt=expected)),
+                "3805a1a5-d036-492b-8564-e772d71b8f5a": changed(lambda graph: graph["nodes"][0].update(prompt=expected)),
+                "aab2d276-bae8-4a6c-ab53-20f4b1c4423f": changed(lambda graph: graph["transition_groups"][0].update(prompt=expected)),
             }
             for name, graph in cases.items():
                 with self.subTest(name=name), self.assertRaises(PlanValidationError):
@@ -4016,16 +4362,16 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 "ci_helper": str(root / "bin/kent-prepare-github-ci"),
                 "helper_bindings": [],
                 "binding": {"kind": "plan-publication"},
-                "ingress": {"kind": "script-edge", "edge_id": "edge-ingress"},
+                "ingress": {"kind": "script-edge", "edge_id": "000d0e6b-58b4-435a-a9f9-cb32f7d420ab"},
             }
             parsed = operations._v2_source_admission(admission, "source_admission")
             self.assertEqual(parsed, admission)
             for invalid in (
                 {**admission, "extra": True},
                 {**admission, "binding": {"kind": "plan-publication", "extra": True}},
-                {**admission, "ingress": {"kind": "script-edge", "edge_id": "edge-ingress",
+                {**admission, "ingress": {"kind": "script-edge", "edge_id": "000d0e6b-58b4-435a-a9f9-cb32f7d420ab",
                                           "extra": True}},
-                {**admission, "ingress": {"kind": "start-edge", "edge_id": "edge-ingress"}},
+                {**admission, "ingress": {"kind": "start-edge", "edge_id": "000d0e6b-58b4-435a-a9f9-cb32f7d420ab"}},
             ):
                 with self.subTest(invalid=invalid), self.assertRaises(PlanValidationError):
                     operations._v2_source_admission(invalid, "source_admission")
@@ -4044,35 +4390,35 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             source_graph = {
                 "version": 3,
                 "nodes": [
-                    {"id": "node-start", "key": "backlog", "kind": "agent"},
-                    {"id": "node-current", "key": "entry", "kind": "agent"},
-                    {"id": "node-terminal", "key": "terminal", "kind": "terminal"},
+                    {"id": "6a736520-a86d-47e4-9312-01f09452d6f8", "key": "backlog", "kind": "agent"},
+                    {"id": "fd12cf94-4cac-4f01-87f0-8f7739927d74", "key": "entry", "kind": "agent"},
+                    {"id": "90e31940-4c84-466e-8e72-26f53c2f36f4", "key": "terminal", "kind": "terminal"},
                 ],
                 "node_groups": [],
                 "transition_groups": [{
-                    "id": "group-ingress", "source_node_id": "node-start",
+                    "id": "e6eae46e-32a1-4caa-a82f-07a21ff739e8", "source_node_id": "6a736520-a86d-47e4-9312-01f09452d6f8",
                     "transition_id": "ingress",
                 }],
                 "edges": [{
-                    "id": "edge-ingress", "key": "ingress",
-                    "transition_group_id": "group-ingress",
-                    "target_node_id": "node-current", "prompt_template": "Begin.",
+                    "id": "000d0e6b-58b4-435a-a9f9-cb32f7d420ab", "key": "ingress",
+                    "transition_group_id": "e6eae46e-32a1-4caa-a82f-07a21ff739e8",
+                    "target_node_id": "fd12cf94-4cac-4f01-87f0-8f7739927d74", "prompt_template": "Begin.",
                 }],
             }
             target_graph = json.loads(json.dumps(source_graph))
             target_graph["nodes"].append({
-                "id": "node-script", "key": "new-script", "kind": "script",
+                "id": "39fa54f4-f723-491e-a278-ba8547f7ba06", "key": "new-script", "kind": "script",
                 "script_path": "scripts/new-script",
             })
-            target_graph["edges"][0]["target_node_id"] = "node-script"
+            target_graph["edges"][0]["target_node_id"] = "39fa54f4-f723-491e-a278-ba8547f7ba06"
             target_graph["transition_groups"].append({
-                "id": "group-script-out", "source_node_id": "node-script",
+                "id": "b2c8811e-7901-4d0c-b3fd-fb901f31a089", "source_node_id": "39fa54f4-f723-491e-a278-ba8547f7ba06",
                 "transition_id": "done",
             })
             target_graph["edges"].append({
-                "id": "edge-script-out", "key": "script-out",
-                "transition_group_id": "group-script-out",
-                "target_node_id": "node-current",
+                "id": "51bcad13-8afc-4be8-b3c6-57a244431c18", "key": "script-out",
+                "transition_group_id": "b2c8811e-7901-4d0c-b3fd-fb901f31a089",
+                "target_node_id": "fd12cf94-4cac-4f01-87f0-8f7739927d74",
             })
             target_graph["version"] = 4
             runtime_refs = [{
@@ -4095,13 +4441,13 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             )
             bypass = json.loads(json.dumps(target_graph))
             bypass["transition_groups"].append({
-                "id": "group-bypass", "source_node_id": "node-start",
+                "id": "e64c0988-f90a-4f65-aa51-0de1f6176394", "source_node_id": "6a736520-a86d-47e4-9312-01f09452d6f8",
                 "transition_id": "bypass",
             })
             bypass["edges"].append({
-                "id": "edge-bypass", "key": "bypass",
-                "transition_group_id": "group-bypass",
-                "target_node_id": "node-current",
+                "id": "33e7a1f0-cf9b-4746-8e02-a1bd9c8cd667", "key": "bypass",
+                "transition_group_id": "e64c0988-f90a-4f65-aa51-0de1f6176394",
+                "target_node_id": "fd12cf94-4cac-4f01-87f0-8f7739927d74",
             })
             with self.assertRaisesRegex(PlanValidationError, "bypasses"):
                 operations._v2_source_gate_check(
@@ -4111,18 +4457,18 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
             for invalid_graph in (
                 {**target_graph, "nodes": [
-                    {**row, "kind": "agent"} if row["id"] == "node-script" else row
+                    {**row, "kind": "agent"} if row["id"] == "39fa54f4-f723-491e-a278-ba8547f7ba06" else row
                     for row in target_graph["nodes"]
                 ]},
                 {**target_graph, "nodes": [
-                    {**row, "script_path": "scripts/missing"} if row["id"] == "node-script" else row
+                    {**row, "script_path": "scripts/missing"} if row["id"] == "39fa54f4-f723-491e-a278-ba8547f7ba06" else row
                     for row in target_graph["nodes"]
                 ]},
                 {
                     **target_graph,
                     "edges": [
                         row for row in target_graph["edges"]
-                        if row["id"] != "edge-script-out"
+                        if row["id"] != "51bcad13-8afc-4be8-b3c6-57a244431c18"
                     ],
                 },
             ):
@@ -4137,7 +4483,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                         **target_graph,
                         "edges": [
                             row for row in target_graph["edges"]
-                            if row["id"] != "edge-ingress"
+                            if row["id"] != "000d0e6b-58b4-435a-a9f9-cb32f7d420ab"
                         ],
                     },
                     runtime_refs,
@@ -4153,11 +4499,11 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 admission,
             )
             self.assertTrue({
-                "graph.added_node:node-script",
-                "graph.added_edge:edge-script-out",
-                "graph.added_transition_group:group-script-out",
-                "graph.edges:edge-ingress.prompt_template",
-                "graph.edges:edge-ingress.target_node_id",
+                "graph.added_node:39fa54f4-f723-491e-a278-ba8547f7ba06",
+                "graph.added_edge:51bcad13-8afc-4be8-b3c6-57a244431c18",
+                "graph.added_transition_group:b2c8811e-7901-4d0c-b3fd-fb901f31a089",
+                "graph.edges:000d0e6b-58b4-435a-a9f9-cb32f7d420ab.prompt_template",
+                "graph.edges:000d0e6b-58b4-435a-a9f9-cb32f7d420ab.target_node_id",
                 "source_admission.ingress",
                 "task:task-1",
             }.issubset(review_paths))
@@ -4175,8 +4521,8 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 ]}], "sessions": []},
             )
             self.assertTrue({
-                "graph.edges:edge-ingress.requires_approval",
-                "authority:graph.edges:edge-ingress.requires_approval",
+                "graph.edges:000d0e6b-58b4-435a-a9f9-cb32f7d420ab.requires_approval",
+                "authority:graph.edges:000d0e6b-58b4-435a-a9f9-cb32f7d420ab.requires_approval",
                 "decision:decision-1",
             }.issubset(authority_paths))
 
@@ -4200,7 +4546,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 "ci_helper": str(root / "bin/kent-prepare-github-ci"),
                 "helper_bindings": [],
                 "binding": {"kind": "plan-publication"},
-                "ingress": {"kind": "script-edge", "edge_id": "edge-ingress"},
+                "ingress": {"kind": "script-edge", "edge_id": "000d0e6b-58b4-435a-a9f9-cb32f7d420ab"},
             }
             gate = source_admission_gate(
                 admission,
@@ -4223,7 +4569,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 "worktree_path": None,
                 "current_scripts": [{
                     "current_node": {
-                        "node_id": "node-script",
+                        "node_id": "39fa54f4-f723-491e-a278-ba8547f7ba06",
                         "transition_branch_key": "ingress",
                     },
                     "path": "scripts/entry.py",
@@ -4233,33 +4579,33 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 "workflow_id": wid,
                 "graph": {
                     "nodes": [
-                        {"id": "node-start", "key": "backlog", "kind": "agent"},
-                        {"id": "node-script", "key": "entry", "kind": "script",
+                        {"id": "6a736520-a86d-47e4-9312-01f09452d6f8", "key": "backlog", "kind": "agent"},
+                        {"id": "39fa54f4-f723-491e-a278-ba8547f7ba06", "key": "entry", "kind": "script",
                          "script_path": "scripts/entry.py"},
-                        {"id": "node-next", "key": "next", "kind": "agent"},
+                        {"id": "7037a77d-c256-42d8-b649-563a192670d6", "key": "next", "kind": "agent"},
                     ],
                     "node_groups": [],
                     "transition_groups": [
-                        {"id": "group-in", "source_node_id": "node-start",
+                        {"id": "01222959-c666-41be-94e5-ad30d49f05fe", "source_node_id": "6a736520-a86d-47e4-9312-01f09452d6f8",
                          "transition_id": "ingress"},
-                        {"id": "group-out", "source_node_id": "node-script",
+                        {"id": "983af8f5-cafb-484d-9813-a93ed967d886", "source_node_id": "39fa54f4-f723-491e-a278-ba8547f7ba06",
                          "transition_id": "done"},
                     ],
                     "edges": [
-                        {"id": "edge-ingress", "key": "ingress",
-                         "transition_group_id": "group-in",
-                         "target_node_id": "node-script",
+                        {"id": "000d0e6b-58b4-435a-a9f9-cb32f7d420ab", "key": "ingress",
+                         "transition_group_id": "01222959-c666-41be-94e5-ad30d49f05fe",
+                         "target_node_id": "39fa54f4-f723-491e-a278-ba8547f7ba06",
                          "prompt_template": gate + "\n\nRun script."},
-                        {"id": "edge-out", "key": "done",
-                         "transition_group_id": "group-out",
-                         "target_node_id": "node-next"},
+                        {"id": "910b91eb-688b-4890-835b-e897f16b82b0", "key": "done",
+                         "transition_group_id": "983af8f5-cafb-484d-9813-a93ed967d886",
+                         "target_node_id": "7037a77d-c256-42d8-b649-563a192670d6"},
                     ],
                 },
             }
             kent = Path(sys.executable).resolve()
             context = {
                 "task_id": "task-native",
-                "node_id": "node-script",
+                "node_id": "39fa54f4-f723-491e-a278-ba8547f7ba06",
                 "transition_branch_key": "ingress",
             }
             project_read = mock.Mock(return_value=(0, (PROJECT_ID + "\n").encode(), b""))
@@ -4284,29 +4630,29 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
 
             invalid_graphs = []
             wrong_edge = json.loads(json.dumps(frame_graph))
-            wrong_edge["graph"]["edges"][0]["id"] = "edge-other"
+            wrong_edge["graph"]["edges"][0]["id"] = "0f9e86ff-97fd-4c71-9264-82e4ded41473"
             invalid_graphs.append(wrong_edge)
             wrong_target = json.loads(json.dumps(frame_graph))
-            wrong_target["graph"]["edges"][0]["target_node_id"] = "node-next"
+            wrong_target["graph"]["edges"][0]["target_node_id"] = "7037a77d-c256-42d8-b649-563a192670d6"
             invalid_graphs.append(wrong_target)
             later_script = json.loads(json.dumps(frame_graph))
             later_script["graph"]["nodes"].append({
-                "id": "node-later-script",
+                "id": "3c0b265c-c6b1-4404-96b5-7f3fb162b84f",
                 "key": "later",
                 "kind": "script",
                 "script_path": "scripts/later.py",
             })
-            later_script["graph"]["edges"][0]["target_node_id"] = "node-later-script"
+            later_script["graph"]["edges"][0]["target_node_id"] = "3c0b265c-c6b1-4404-96b5-7f3fb162b84f"
             invalid_graphs.append(later_script)
             bypass = json.loads(json.dumps(frame_graph))
             bypass["graph"]["transition_groups"].append({
-                "id": "group-bypass", "source_node_id": "node-start",
+                "id": "e64c0988-f90a-4f65-aa51-0de1f6176394", "source_node_id": "6a736520-a86d-47e4-9312-01f09452d6f8",
                 "transition_id": "bypass",
             })
             bypass["graph"]["edges"].append({
-                "id": "edge-bypass", "key": "bypass",
-                "transition_group_id": "group-bypass",
-                "target_node_id": "node-next",
+                "id": "33e7a1f0-cf9b-4746-8e02-a1bd9c8cd667", "key": "bypass",
+                "transition_group_id": "e64c0988-f90a-4f65-aa51-0de1f6176394",
+                "target_node_id": "7037a77d-c256-42d8-b649-563a192670d6",
             })
             invalid_graphs.append(bypass)
             for invalid in invalid_graphs:
@@ -4345,10 +4691,10 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             }
             next(
                 row for row in source_graph["edges"]
-                if row["id"] == "edge-fix-replan"
+                if row["id"] == "9c264349-da25-4402-adb6-53780bd0b7fd"
             )["requires_approval"] = True
             target_graph = item["target_graph"]
-            script = next(row for row in target_graph["nodes"] if row["id"] == "node-script")
+            script = next(row for row in target_graph["nodes"] if row["id"] == "39fa54f4-f723-491e-a278-ba8547f7ba06")
             script.update({
                 "key": "janitor-reviewed",
                 "name": "Reviewed Script",
@@ -4359,11 +4705,11 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 "context": {"reviewed": True},
                 "parameters": [{"key": "mode", "type": "string"}],
             })
-            edge = next(row for row in target_graph["edges"] if row["id"] == "edge-fix-replan")
+            edge = next(row for row in target_graph["edges"] if row["id"] == "9c264349-da25-4402-adb6-53780bd0b7fd")
             edge.update({
                 "key": "fix_replan_reviewed",
-                "target_node_id": "node-plan",
-                "transition_group_id": "group-implement-replan",
+                "target_node_id": "8bda2875-9d3e-40e4-886c-25bb48f5f3aa",
+                "transition_group_id": "c6a3f68e-7629-404a-8153-2d5f0e32ff0d",
                 "requires_approval": False,
                 "parameters": [{"key": "mode", "type": "string"}],
                 "context_mode": "continue_session",
@@ -4376,11 +4722,11 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             })
             group = next(
                 row for row in target_graph["transition_groups"]
-                if row["id"] == "group-fix-replan"
+                if row["id"] == "c60a77d2-3672-49fc-8aea-fe5c37f0110a"
             )
             group.update({
                 "transition_id": "fix_replan_reviewed",
-                "source_node_id": "node-implement",
+                "source_node_id": "7d280478-d98b-4462-9ae6-f58bf0d5a8d0",
                 "display_name": "Reviewed transition",
                 "description": "Reviewed transition description",
             })
@@ -4420,9 +4766,9 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             field_paths = {
                 f"graph.{collection}:{identity}.{field}"
                 for collection, identity, fields in (
-                    ("nodes", "node-script", expected_fields["nodes"]),
-                    ("edges", "edge-fix-replan", expected_fields["edges"]),
-                    ("transition_groups", "group-fix-replan",
+                    ("nodes", "39fa54f4-f723-491e-a278-ba8547f7ba06", expected_fields["nodes"]),
+                    ("edges", "9c264349-da25-4402-adb6-53780bd0b7fd", expected_fields["edges"]),
+                    ("transition_groups", "c60a77d2-3672-49fc-8aea-fe5c37f0110a",
                      expected_fields["transition_groups"]),
                 )
                 for field in fields
@@ -4431,7 +4777,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 "pending_decisions"
             ][0]["id"]
             authority_paths = {
-                "authority:graph.edges:edge-fix-replan.requires_approval",
+                "authority:graph.edges:9c264349-da25-4402-adb6-53780bd0b7fd.requires_approval",
                 f"decision:{pending_decision}",
             }
             self.assertTrue(authority_paths.issubset(required))
@@ -4440,7 +4786,10 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             review_path = Path(item["compatibility_review_ref"]["path"])
             review = json.loads(review_path.read_text())
             review["source_graph_sha256"] = canonical_sha256(source_graph)
-            review["target_graph_sha256"] = canonical_sha256(projected_target)
+            from workflowkit.graph import native_graph_postimage
+            review["target_graph_sha256"] = canonical_sha256(native_graph_postimage(
+                target_graph, workflow_id=item["workflow_id"],
+            ))
             evidence = review["dispositions"][0]["evidence"]
             review["dispositions"] = [
                 {"path": path, "disposition": "compatible", "evidence": evidence}
@@ -4488,7 +4837,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     review["dispositions"] = accepted
 
     def test_composed_builder_parameters_and_prompt_reviews_are_exact(self) -> None:
-        from workflowkit.graph import native_graph_projection, plan_workflow_graph
+        from workflowkit.graph import native_graph_postimage, native_graph_projection, plan_workflow_graph
         from workflowkit.delivery import source_admission_gate
 
         root = Path(__file__).resolve().parents[1]
@@ -4579,9 +4928,9 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     bad_source = json.loads(json.dumps(source_graph))
                     fix = next(edge for edge in bad_source["edges"] if edge["key"] == "fix_replan")
                     if duplicate:
-                        bad_source["edges"].append({**fix, "id": "duplicate-fix"})
+                        bad_source["edges"].append({**fix, "id": "f7b7744f-bc88-443b-bfde-f43c9c401bab"})
                         bad_target = json.loads(json.dumps(target))
-                        bad_target["edges"].append({**fix, "id": "duplicate-fix"})
+                        bad_target["edges"].append({**fix, "id": "f7b7744f-bc88-443b-bfde-f43c9c401bab"})
                     else:
                         bad_source["edges"].remove(fix)
                         bad_target = json.loads(json.dumps(target))
@@ -4608,7 +4957,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 review = json.loads(review_path.read_text())
                 review.update(source_graph_sha256=item["source_graph_sha256"],
                               source_metadata_sha256=item["source_metadata_sha256"],
-                              target_graph_sha256=canonical_sha256(native_graph_projection(
+                              target_graph_sha256=canonical_sha256(native_graph_postimage(
                                   target, workflow_id=item["workflow_id"],
                               )),
                               target_metadata_sha256=canonical_sha256(source["metadata"]))
@@ -4664,10 +5013,10 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 {"name": "Workflow", "description": "", "execution_target": "default-branch"},
                 item["compatibility_snapshot"],
             )
-            self.assertIn("graph.nodes:node-script.script_path", required)
+            self.assertIn("graph.nodes:39fa54f4-f723-491e-a278-ba8547f7ba06.script_path", required)
 
             unqualified = json.loads(json.dumps(target_graph))
-            next(node for node in unqualified["nodes"] if node["id"] == "node-script")[
+            next(node for node in unqualified["nodes"] if node["id"] == "39fa54f4-f723-491e-a278-ba8547f7ba06")[
                 "script_path"
             ] = str(Path(fixture["root"]) / "unqualified-helper")
             with self.assertRaises(PlanValidationError):
@@ -4677,7 +5026,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     item["runtime_refs"],
                 )
             changed_semantics = json.loads(json.dumps(target_graph))
-            next(node for node in changed_semantics["nodes"] if node["id"] == "node-script")[
+            next(node for node in changed_semantics["nodes"] if node["id"] == "39fa54f4-f723-491e-a278-ba8547f7ba06")[
                 "display_name"
             ] = "Not only a script path change"
             with self.assertRaises(PlanValidationError):
@@ -4695,7 +5044,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             )
             live = read_state(fixture)["workflows"][workflow_id(0)]["graph"]
             self.assertEqual(
-                next(node for node in live["nodes"] if node["id"] == "node-script")[
+                next(node for node in live["nodes"] if node["id"] == "39fa54f4-f723-491e-a278-ba8547f7ba06")[
                     "script_path"
                 ],
                 target_graph["nodes"][-1]["script_path"],
@@ -4786,7 +5135,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             review = json.loads(review_path.read_bytes())
             review["dispositions"] = [
                 row for row in review["dispositions"]
-                if row["path"] != "graph.nodes:node-script.script_path"
+                if row["path"] != "graph.nodes:39fa54f4-f723-491e-a278-ba8547f7ba06.script_path"
             ]
             review_raw = canonical_bytes(review)
             review_path.write_bytes(review_raw)
@@ -5017,7 +5366,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             detail = workflow["details"]["TASK-1"]
             detail["status"] = active
             detail["summary"].update({"status": active, "done": False})
-            detail["current_nodes"] = [{"node_id": "node-implement"}]
+            detail["current_nodes"] = [{"node_id": "7d280478-d98b-4462-9ae6-f58bf0d5a8d0"}]
             detail.pop("pending_approvals")
             write_state(fixture, state)
 
@@ -5040,7 +5389,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 else:
                     detail["current_scripts"] = [{
                         "path": ".kent/scripts/example",
-                        "current_node": {"node_id": "node-implement"},
+                        "current_node": {"node_id": "7d280478-d98b-4462-9ae6-f58bf0d5a8d0"},
                     }]
                 write_state(fixture, state)
 
@@ -5103,11 +5452,11 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                         "status": "doing",
                         "native_state": "waiting",
                         "terminal": False,
-                        "current_nodes": ["node-backlog"],
+                        "current_nodes": ["85142bca-99b5-4f0b-b364-f5296df95187"],
                     })
                     detail.update({
                         "status": active,
-                        "current_nodes": [{"node_id": "node-backlog"}],
+                        "current_nodes": [{"node_id": "85142bca-99b5-4f0b-b364-f5296df95187"}],
                     })
                     detail["summary"].update({"status": active, "done": False})
                 review_path = Path(item["compatibility_review_ref"]["path"])
@@ -5210,7 +5559,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             plan, value = canonical_v2_plan(fixture)
             value["workflows"][0]["target_graph"]["edges"][0][
                 "target_node_id"
-            ] = "node-terminal"
+            ] = "90e31940-4c84-466e-8e72-26f53c2f36f4"
             raw = canonical_bytes(value)
             plan_path = Path(fixture["root"]) / "canonical-plan-v2.json"
             plan_path.write_bytes(raw)
@@ -5239,7 +5588,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 '        detail = workflow["details"]["TASK-1"]\n'
                 '        detail["summary"]["done"] = False\n'
                 '        detail["status"] = task_status\n'
-                '        detail["current_nodes"] = [{"node_id": "node-implement"}]\n'
+                '        detail["current_nodes"] = [{"node_id": "7d280478-d98b-4462-9ae6-f58bf0d5a8d0"}]\n'
                 '        save()\n'
                 '        import time\n'
                 '        time.sleep(2)\n'
@@ -5347,7 +5696,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             detail = workflow["details"]["TASK-1"]
             detail["summary"]["done"] = False
             detail["status"] = task_status
-            detail["current_nodes"] = [{"node_id": "node-implement"}]
+            detail["current_nodes"] = [{"node_id": "7d280478-d98b-4462-9ae6-f58bf0d5a8d0"}]
             write_state(fixture, state)
 
             report = reconcile_canonical_workflows(
@@ -5462,7 +5811,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             workflow["details"]["TASK-1"]["summary"]["done"] = False
             workflow["details"]["TASK-1"]["status"] = status
             workflow["details"]["TASK-1"]["current_nodes"] = [
-                {"node_id": "node-implement"}
+                {"node_id": "7d280478-d98b-4462-9ae6-f58bf0d5a8d0"}
             ]
             write_state(fixture, state)
             reverse, _ = canonical_v2_plan(
