@@ -21,6 +21,25 @@ import workflowkit.operations as operations
 
 
 class SourceOnlyNativeIdentityTests(unittest.TestCase):
+    def test_explicit_receipt_owner_is_a_closed_uuid_binding(self):
+        from tests.test_canonical_workflow_lifecycle import synthetic_source_admission
+
+        value = synthetic_source_admission(self.root)
+        value["schema"] = operations.SOURCE_ADMISSION_V2_SCHEMA
+        value["binding"] = {
+            "kind": "r2-installed",
+            "installation_binding_sha256": value.pop("installation_binding_sha256"),
+            "receipt_workflow_id": FIXTURE_WORKFLOW,
+        }
+        value["ingress"] = {"kind": "agent-edge", "edge_id": "start"}
+        parsed = operations._v2_source_admission(value, "source_admission")
+        self.assertEqual(parsed["binding"]["receipt_workflow_id"], FIXTURE_WORKFLOW)
+        for owner in ("", "not-a-uuid", None, FIXTURE_WORKFLOW.upper()):
+            with self.subTest(owner=owner), self.assertRaises(operations.PlanValidationError):
+                operations._v2_source_admission({
+                    **value, "binding": {**value["binding"], "receipt_workflow_id": owner},
+                }, "source_admission")
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -1213,6 +1232,112 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
                    "--primary-root", str(self.primary), "--workspace", str(self.project),
                    "--source-ref", "refs/remotes/origin/main",
                    "--kit-ref", "refs/remotes/origin/main", "--ci-helper", str(self.helper), *extra]
+
+    def test_qualified_runtime_binding_requires_published_bootstrap_source(self):
+        original_kit_commit = self.commits[self.kit]
+        profile_path = self.project / ".kent/workflow-profile.toml"
+        profile = profile_path.read_text()
+        profile = profile.replace(
+            "[policies]\n",
+            (
+                'kit_managed_commands = ["kit_runtime_loader"]\n'
+                "\n[command_versions]\n"
+                'kit_runtime_loader = "1.0.0"\n'
+                "\n[policies]\n"
+            ),
+        ).replace(
+            'checkpoint = ".kent/scripts/workflow-checkpoint"\n',
+            (
+                'checkpoint = ".kent/scripts/workflow-checkpoint"\n'
+                'kit_runtime_loader = ".kent/scripts/workflow_kit_runtime.py"\n'
+            ),
+        )
+        profile = (
+            f'kit_runtime = {{ schema_version = 1, root = "{self.kit}", '
+            f'commit = "{original_kit_commit}", '
+            'publication_ref = "refs/remotes/origin/main" }\n'
+            + profile
+        )
+        profile_path.write_text(profile)
+        runtime_source = '"""Published Kit runtime fixture."""\n'
+        self.put(
+            self.project,
+            ".kent/scripts/workflow_kit_runtime.py",
+            runtime_source,
+            0o755,
+        )
+        self.commit(self.project)
+        self.commits[self.project] = self.git(
+            self.project, "rev-parse", "HEAD",
+        ).strip()
+        self.git(
+            self.project,
+            "update-ref",
+            "refs/remotes/origin/main",
+            self.commits[self.project],
+        )
+        self.receipt["source_commit"] = self.commits[self.project]
+        self.refresh_receipt_files()
+        self.pin()
+
+        with self.assertRaisesRegex(
+            self.module.SourceAdmissionError,
+            "qualified Kit runtime source is absent",
+        ):
+            self.inspect()
+
+        self.put(
+            self.kit,
+            "workflowkit/kit_runtime.py",
+            runtime_source,
+        )
+        self.commit(self.kit)
+        self.commits[self.kit] = self.git(self.kit, "rev-parse", "HEAD").strip()
+        self.git(
+            self.kit,
+            "update-ref",
+            "refs/remotes/origin/main",
+            self.commits[self.kit],
+        )
+        profile_path.write_text(
+            profile.replace(original_kit_commit, self.commits[self.kit])
+        )
+        self.commit(self.project)
+        self.commits[self.project] = self.git(
+            self.project, "rev-parse", "HEAD",
+        ).strip()
+        self.git(
+            self.project,
+            "update-ref",
+            "refs/remotes/origin/main",
+            self.commits[self.project],
+        )
+        self.receipt["source_commit"] = self.commits[self.project]
+        self.receipt["kit_commit"] = self.commits[self.kit]
+        self.refresh_receipt_files()
+        self.pin()
+
+        admitted = self.inspect()
+        self.assertEqual(admitted["status"], "admitted")
+
+    def test_explicit_null_kit_runtime_binding_is_rejected(self):
+        parse_profile = self.module.tomllib.loads
+
+        def parsed_with_null_binding(raw):
+            profile = parse_profile(raw)
+            profile["kit_runtime"] = None
+            return profile
+
+        with mock.patch.object(
+            self.module.tomllib,
+            "loads",
+            side_effect=parsed_with_null_binding,
+        ):
+            with self.assertRaisesRegex(
+                self.module.SourceAdmissionError,
+                "invalid Kit runtime binding",
+            ):
+                self.inspect()
 
     def test_published_closure_and_cli_are_read_only(self):
         before = {root: self.git(root, "status", "--porcelain") for root in (self.project, self.kit)}

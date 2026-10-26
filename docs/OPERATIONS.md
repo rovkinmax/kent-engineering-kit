@@ -168,6 +168,15 @@ delivery.admit_script_source_ingress(
 )
 ```
 
+For prompt-free Script targets, create the retained document with
+`workflowkit.operations.create_script_ingress_reference` in an existing
+private persistent rollout directory. Put its returned canonical reference in
+the exact ingress transition group's description and leave the Script edge
+prompt absent. The operator and runtime both validate the private document;
+never replace it in place. Its retention and exclusive legacy compatibility
+rules are defined in the
+[update compatibility contract](../contracts/workflow-update-compatibility.md).
+
 Proceed only after verified admission. The closed v2 binding selects exactly
 one mode: `r2-installed` verifies the installed binding and preserves existing
 R2 task initialization, while `plan-publication` admits only the pinned

@@ -27,6 +27,15 @@ PROJECT_MEMORY_COMMAND_VERSIONS = {
     "project_memory": "1.0.0",
     "project_memory_core": "1.0.0",
 }
+KIT_RUNTIME_COMMAND = "kit_runtime_loader"
+KIT_RUNTIME_COMMAND_PATH = ".kent/scripts/workflow_kit_runtime.py"
+KIT_RUNTIME_COMMAND_VERSION = "1.0.0"
+KIT_RUNTIME_SOURCE_BINDING_COMMAND = "kit_runtime_source_binding"
+KIT_RUNTIME_SOURCE_BINDING_PATH = ".kent/scripts/workflow_sdk_source_binding.py"
+KIT_RUNTIME_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+KIT_RUNTIME_REF_PATTERN = re.compile(
+    r"^refs/(?:remotes|tags)/[A-Za-z0-9._/-]+$"
+)
 PROJECT_MEMORY_KEY_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 )
@@ -129,6 +138,61 @@ class ProjectMemoryProfile:
     mode: str
 
 
+@dataclass(frozen=True)
+class KitRuntimeProfile:
+    schema_version: int
+    root: str
+    commit: str
+    publication_ref: str
+
+
+def kit_runtime_profile(value: Any) -> KitRuntimeProfile:
+    label = "kit_runtime"
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version", "root", "commit", "publication_ref",
+    }:
+        raise SpecError(
+            f"{label} must contain exactly schema_version, root, commit, "
+            "and publication_ref"
+        )
+    schema_version = value["schema_version"]
+    root = value["root"]
+    commit = value["commit"]
+    publication_ref = value["publication_ref"]
+    if type(schema_version) is not int or schema_version != 1:
+        raise SpecError(f"{label}.schema_version must be 1")
+    if (
+        not isinstance(root, str)
+        or not root
+        or "\x00" in root
+        or not Path(root).is_absolute()
+        or str(Path(root)) != root
+        or ".." in Path(root).parts
+    ):
+        raise SpecError(f"{label}.root must be a canonical absolute path")
+    if (
+        not isinstance(commit, str)
+        or KIT_RUNTIME_COMMIT_PATTERN.fullmatch(commit) is None
+    ):
+        raise SpecError(f"{label}.commit must be a full lowercase Git commit")
+    if (
+        not isinstance(publication_ref, str)
+        or KIT_RUNTIME_REF_PATTERN.fullmatch(publication_ref) is None
+        or publication_ref.endswith("/HEAD")
+        or any(part in {"", ".", ".."} for part in publication_ref.split("/"))
+        or publication_ref.endswith(".lock")
+    ):
+        raise SpecError(
+            f"{label}.publication_ref must be a full remote-tracking or tag ref"
+        )
+    return KitRuntimeProfile(
+        schema_version=schema_version,
+        root=root,
+        commit=commit,
+        publication_ref=publication_ref,
+    )
+
+
 def parse_ci_archive_reader_sources(value: Any) -> tuple[str, ...]:
     if not isinstance(value, list) or len(value) > MAX_CI_ARCHIVE_READER_SOURCES:
         raise SpecError(
@@ -184,6 +248,7 @@ class ProjectProfile:
     ci_archive_reader_sources: tuple[str, ...]
     release: ReleaseProfile | None
     project_memory: ProjectMemoryProfile | None
+    kit_runtime: KitRuntimeProfile | None
     execution_default: str
     execution_overrides: dict[str, str]
     policies: dict[str, str]
@@ -261,6 +326,11 @@ class ProjectProfile:
             if "project_memory" in raw
             else None
         )
+        selected_kit_runtime = (
+            kit_runtime_profile(raw["kit_runtime"])
+            if "kit_runtime" in raw
+            else None
+        )
         capabilities = bool_table(
             require_table(raw, "capabilities"),
             "capabilities",
@@ -289,6 +359,7 @@ class ProjectProfile:
             ),
             release=release,
             project_memory=project_memory,
+            kit_runtime=selected_kit_runtime,
             execution_default=require_string(execution, "default_target"),
             execution_overrides=string_table(
                 execution.get("overrides", {}),
@@ -315,6 +386,7 @@ class ProjectProfile:
                 f"unsupported profile schema {self.schema_version}; expected 3 or 4"
             )
         parse_ci_archive_reader_sources(list(self.ci_archive_reader_sources))
+        self.validate_kit_runtime()
         if self.schema_version == 4:
             self.validate_schema4(check_files=check_files)
         minimum_version = self.minimum_version_tuple()
@@ -658,6 +730,21 @@ class ProjectProfile:
                     f"command_versions.{key} must use numeric "
                     "major.minor.patch format"
                 )
+        if self.kit_runtime is not None:
+            if self.schema_version != 4:
+                raise SpecError("kit_runtime binding requires profile schema 4")
+            if KIT_RUNTIME_COMMAND not in managed_commands:
+                raise SpecError(
+                    "kit_runtime binding requires the managed "
+                    "'kit_runtime_loader' command"
+                )
+            if (
+                self.command_versions.get(KIT_RUNTIME_COMMAND)
+                != KIT_RUNTIME_COMMAND_VERSION
+            ):
+                raise SpecError(
+                    "kit_runtime_loader requires command version 1.0.0"
+                )
 
         runtime_keys = set(self.kit_managed_commands) & (
             RUNTIME_CONTRACT_COMMANDS | MONITORING_COMMANDS | {"janitor"}
@@ -951,6 +1038,27 @@ class ProjectProfile:
 
     def command(self, key: str) -> str:
         return self.commands.get(key, "").strip()
+
+    def validate_kit_runtime(self) -> None:
+        if self.kit_runtime is None:
+            if self.command(KIT_RUNTIME_SOURCE_BINDING_COMMAND):
+                raise SpecError(
+                    "kit_runtime_source_binding requires a kit_runtime binding"
+                )
+            return
+        if self.schema_version != 4:
+            raise SpecError("kit_runtime binding requires profile schema 4")
+        if self.command(KIT_RUNTIME_COMMAND) != KIT_RUNTIME_COMMAND_PATH:
+            raise SpecError(
+                "kit_runtime binding requires commands.kit_runtime_loader to be "
+                f"{KIT_RUNTIME_COMMAND_PATH!r}"
+            )
+        source_binding_command = self.command(KIT_RUNTIME_SOURCE_BINDING_COMMAND)
+        if source_binding_command not in ("", KIT_RUNTIME_SOURCE_BINDING_PATH):
+            raise SpecError(
+                "kit_runtime_source_binding must use the fixed project adapter "
+                f"path {KIT_RUNTIME_SOURCE_BINDING_PATH!r}"
+            )
 
     def procedure(self, key: str) -> str:
         return self.procedures.get(key, "").strip()

@@ -1519,6 +1519,83 @@ def _source_json(raw: bytes, label: str) -> dict[str, Any]:
     return value
 
 
+SCRIPT_INGRESS_REF_SCHEMA = 'delivery-script-ingress-ref-v1'
+
+
+def create_script_ingress_reference(
+    path: Path, admission: Mapping[str, Any], *, project_id: str, workflow_id: str,
+) -> str:
+    """Create a retained immutable carrier in an existing private rollout directory."""
+    parsed = _v2_source_admission(dict(admission), 'Script source admission')
+    if parsed is None or parsed.get('ingress', {}).get('kind') != 'script-edge':
+        raise PlanValidationError('Script carrier requires script-edge admission')
+    path = _source_canonical_path(str(path), 'Script ingress document')
+    parent = _source_canonical_root(str(path.parent), 'Script ingress directory')
+    info = parent.stat()
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise PlanValidationError('Script ingress directory must be owner-only mode0700')
+    raw = canonical_bytes({
+        'project_id': project_id, 'workflow_id': workflow_id,
+        'source_admission': parsed,
+    })
+    if len(raw) > 1024 * 1024:
+        raise PlanValidationError('Script ingress document exceeds its bound')
+    description = canonical_bytes({
+        'schema': SCRIPT_INGRESS_REF_SCHEMA, 'path': str(path),
+        'sha256': sha256_bytes(raw),
+    }).decode('utf-8')
+    if len(description) > 1000:
+        raise PlanValidationError('Script ingress reference exceeds its bound')
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0),
+        0o600,
+    )
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError('Script ingress document write made no progress')
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(parent)
+    read_script_ingress_reference(description)
+    return description
+
+
+def read_script_ingress_reference(description: str) -> dict[str, Any]:
+    """Resolve the compact native carrier through the private record boundary."""
+    if not isinstance(description, str) or len(description) > 1000:
+        raise PlanValidationError('Script ingress reference exceeds its bound')
+    reference = _closed(
+        _source_json(description.encode('utf-8'), 'Script ingress reference'),
+        {'schema', 'path', 'sha256'},
+        'Script ingress reference',
+    )
+    if (
+        reference.get('schema') != SCRIPT_INGRESS_REF_SCHEMA
+        or canonical_bytes(reference).decode('utf-8') != description
+    ):
+        raise PlanValidationError('Script ingress reference is not canonical')
+    expected = _sha256(reference.get('sha256'), 'Script ingress reference.sha256')
+    _, raw, _ = _read_source_record(
+        reference.get('path'), label='Script ingress document',
+        maximum=1024 * 1024, private=True,
+    )
+    if sha256_bytes(raw) != expected:
+        raise PlanValidationError('Script ingress document digest drifted')
+    frame = _closed(
+        _source_json(raw, 'Script ingress document'),
+        {'project_id', 'workflow_id', 'source_admission'},
+        'Script ingress document',
+    )
+    if canonical_bytes(frame) != raw:
+        raise PlanValidationError('Script ingress document is not canonical')
+    return frame
+
+
 def _v2_source_admission(value: Any, label: str) -> dict[str, Any] | None:
     if value is None:
         return None
@@ -1547,7 +1624,7 @@ def _v2_source_admission(value: Any, label: str) -> dict[str, Any] | None:
         else:
             raw_binding = _closed(
                 raw_binding,
-                {'kind', 'installation_binding_sha256'},
+                {'kind', 'installation_binding_sha256', 'receipt_workflow_id'},
                 f'{label}.binding',
             )
             if raw_binding.get('kind') != 'r2-installed':
@@ -1559,6 +1636,13 @@ def _v2_source_admission(value: Any, label: str) -> dict[str, Any] | None:
                     f'{label}.binding.installation_binding_sha256',
                 ),
             }
+            if 'receipt_workflow_id' in raw_binding:
+                binding['receipt_workflow_id'] = _uuid(
+                    raw_binding['receipt_workflow_id'],
+                    f'{label}.binding.receipt_workflow_id',
+                )
+                if binding['receipt_workflow_id'] != raw_binding['receipt_workflow_id']:
+                    raise PlanValidationError(f'{label}.binding receipt owner must be canonical')
         raw_ingress = _closed(
             _required(item, 'ingress', label),
             {'kind', 'edge_id'},
@@ -2100,7 +2184,8 @@ def admit_source_admission(
         project_root=root,
         kent_path=kent,
     )
-    if receipt_workflow_id != workflow_id:
+    expected_receipt_owner = parsed.get('binding', {}).get('receipt_workflow_id', workflow_id)
+    if receipt_workflow_id != expected_receipt_owner:
         raise PlanValidationError('source publication receipt Workflow differs')
     if parsed['receipt_ref']['path'] != binding['receipt_path']:
         raise PlanValidationError('source publication receipt path differs from native binding')
@@ -2178,7 +2263,7 @@ def admit_source_admission(
         '--receipt', parsed['receipt_ref']['path'],
         '--receipt-sha256', parsed['receipt_ref']['sha256'],
         '--project-id', project_id,
-        '--workflow-id', workflow_id,
+        '--workflow-id', expected_receipt_owner,
         '--project-root', str(root),
         '--kit-root', parsed['kit_root'],
         '--primary-root', parsed['primary_root'],
@@ -2231,7 +2316,7 @@ def admit_source_admission(
         inspection.get('schema') != SOURCE_INSPECTION_SCHEMA
         or inspection.get('status') != 'admitted'
         or inspection.get('project_id') != project_id
-        or inspection.get('workflow_id') != workflow_id
+        or inspection.get('workflow_id') != expected_receipt_owner
         or inspection.get('receipt_sha256') != parsed['receipt_ref']['sha256']
         or inspection.get('source_commit') != receipt.get('source_commit')
         or inspection.get('kit_commit') != receipt.get('kit_commit')
@@ -2472,7 +2557,27 @@ def admit_script_source_ingress(
                 if canonical_bytes(frame).decode('utf-8') != frame_text:
                     raise PlanValidationError('native source admission frame is not canonical')
                 frames.append((row, frame, prompt))
-    if marker_count != 2 or len(frames) != 1:
+    references = [
+        row for row in graph['transition_groups']
+        if SCRIPT_INGRESS_REF_SCHEMA in str(row.get('description', ''))
+    ]
+    compact = bool(references)
+    if compact:
+        if len(references) != 1 or marker_count or frames:
+            raise PlanValidationError('native Workflow has ambiguous source admission carriers')
+        group = references[0]
+        frame = read_script_ingress_reference(group['description'])
+        matching_edges = [
+            row for row in graph['edges']
+            if row.get('transition_group_id') == group.get('id')
+        ]
+        if len(matching_edges) != 1:
+            raise PlanValidationError('Script ingress reference must own exactly one edge')
+        ingress_edge = matching_edges[0]
+        if ingress_edge.get('prompt_template') or ingress_edge.get('prompt'):
+            raise PlanValidationError('compact Script ingress cannot contain a prompt')
+        frames.append((ingress_edge, frame, ''))
+    elif marker_count != 2 or len(frames) != 1:
         raise PlanValidationError('native Workflow must contain one source admission frame')
     ingress_edge, frame, ingress_prompt = frames[0]
     frame = _closed(
@@ -2503,7 +2608,7 @@ def admit_script_source_ingress(
         workflow_id=workflow_id,
         project_root=admission['primary_root'],
     )
-    if not ingress_prompt.startswith(f'{expected_gate}\n\n'):
+    if not compact and not ingress_prompt.startswith(f'{expected_gate}\n\n'):
         raise PlanValidationError('native Script ingress source gate differs from its frame')
     _v2_exact_ingress_edge(graph, admission['ingress'], 'native Workflow graph')
     return admit_source_admission(
@@ -3630,12 +3735,57 @@ def _native_execution_bindings(
     }
 
 
+def _native_parameters_description_compatible(frozen: Any, current: Any) -> bool:
+    # Unknown representations remain exact-only. No parameter or field may be
+    # added, removed, renamed or reordered through the description exception.
+    if canonical_bytes(frozen) == canonical_bytes(current):
+        return True
+    if not isinstance(frozen, list) or not isinstance(current, list) or len(frozen) != len(current):
+        return False
+    for before, after in zip(frozen, current):
+        if (
+            not isinstance(before, dict) or not isinstance(after, dict)
+            or set(before) != set(after)
+            or not isinstance(before.get('key'), str)
+            or not isinstance(before.get('purpose'), str)
+            or not isinstance(before.get('description'), str)
+            or not isinstance(after.get('description'), str)
+            or canonical_bytes({key: value for key, value in before.items() if key != 'description'})
+            != canonical_bytes({key: value for key, value in after.items() if key != 'description'})
+        ):
+            return False
+    return True
+
+
+def _native_parameter_description_changed(frozen: Any, target: Any) -> bool:
+    # Target semantic edits have their own graph dispositions. Also retain a
+    # decision disposition when a description changes alongside another field.
+    if not isinstance(frozen, list) or not isinstance(target, list):
+        return False
+    descriptions: dict[str, set[str]] = {}
+    for parameter in target:
+        if (
+            isinstance(parameter, dict) and isinstance(parameter.get('key'), str)
+            and isinstance(parameter.get('description'), str)
+        ):
+            descriptions.setdefault(parameter['key'], set()).add(parameter['description'])
+    return any(
+        isinstance(parameter, dict) and isinstance(parameter.get('key'), str)
+        and isinstance(parameter.get('description'), str)
+        and bool(descriptions.get(parameter['key'], set()) - {parameter['description']})
+        for parameter in frozen
+    )
+
+
 def _native_approval_payload(
     approval: Mapping[str, Any],
     branches: Sequence[Mapping[str, Any]],
     task_nodes: Sequence[Mapping[str, Any]],
     workflow_id: str,
     graph: Mapping[str, Any],
+    *,
+    affected_decisions: set[str] | None = None,
+    target_graph: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     # The version and prompt bytes belong to the frozen decision, not the
     # current graph. Its exact raw fingerprint is checked against the reviewed
@@ -3714,7 +3864,10 @@ def _native_approval_payload(
             and graph_edge_keys.issubset(edge)
             and extra_edge_keys.issubset({'input_bindings', 'output_requirements'})
             and all(
-                edge.get(key) == value
+                (
+                    _native_parameters_description_compatible(edge.get(key), value)
+                    if key == 'parameters' else edge.get(key) == value
+                )
                 for key, value in graph_edges[0].items()
                 if key not in prompt_keys
             )
@@ -3741,6 +3894,19 @@ def _native_approval_payload(
             }
         ):
             raise EffectBlocked('native pending Approval branch differs from the reviewed Workflow context')
+        if affected_decisions is not None:
+            target_edges = [
+                row for row in (target_graph or graph).get('edges', [])
+                if isinstance(row, Mapping) and row.get('id') == edge.get('id')
+            ]
+            if (
+                edge.get('parameters') != graph_edges[0].get('parameters')
+                or any(
+                    _native_parameter_description_changed(edge.get('parameters'), row.get('parameters'))
+                    for row in target_edges
+                )
+            ):
+                affected_decisions.add(approval['id'])
         normalized_branches.append(dict(branch))
     normalized_branches.sort(key=lambda row: row['transition_branch_key'])
     if len({
@@ -3757,6 +3923,8 @@ def _native_observe(
     task_facts: Sequence[Mapping[str, Any]],
     raw_details: Mapping[str, Mapping[str, Any]],
     cli_sessions: Sequence[Mapping[str, Any]],
+    *,
+    affected_decisions: set[str] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     descriptor = parsed.get('native_evidence')
     if not isinstance(descriptor, Mapping):
@@ -3973,6 +4141,8 @@ def _native_observe(
                 nodes_by_task[task_id],
                 item['workflow_id'],
                 live['graph'],
+                affected_decisions=affected_decisions,
+                target_graph=item.get('target_graph', live['graph']),
             )
             digest = canonical_sha256(envelope)
             approvals_by_task[task_id].append({
@@ -4760,6 +4930,54 @@ def _v2_exact_ingress_edge(
     return edge
 
 
+def render_source_ingress_candidate(
+    capture: dict[str, Any], *, ingress: dict[str, Any],
+    admission: VerifiedSourceAdmission, reviewed_prefix: str,
+    reviewed_prefix_sha256: str, qualified_target: dict[str, str],
+) -> dict[str, Any]:
+    """Qualify the target and render a complete source-only native candidate.
+
+    The returned graph/policy are inputs to ordinary canonical reconciliation,
+    not authority to apply a graph or update its native execution selector.
+    """
+    from .delivery import render_source_ingress
+
+    if not isinstance(admission, VerifiedSourceAdmission):
+        raise PlanValidationError('candidate rendering requires VerifiedSourceAdmission')
+    if (
+        not isinstance(qualified_target, dict)
+        or set(qualified_target) != {'commit_oid', 'tree_oid'}
+    ):
+        raise PlanValidationError('candidate target must bind exact commit and tree')
+    commit = _sha1(qualified_target['commit_oid'], 'candidate target commit')
+    tree = _sha1(qualified_target['tree_oid'], 'candidate target tree')
+    if admission.inspection.get('source_commit') != commit:
+        raise PlanValidationError('candidate target differs from the admitted source commit')
+    root = Path(admission.primary_root)
+    if _git(root, 'rev-parse', f'{commit}^{{tree}}').strip() != tree:
+        raise PlanValidationError('candidate Git tree differs from the qualified target')
+    profile = tomllib.loads((root / '.kent/workflow-profile.toml').read_text())
+    if (
+        profile.get('project_memory', {}).get('mode') == 'r2'
+        and admission.value.get('binding', {}).get('kind') != 'r2-installed'
+    ):
+        raise PlanValidationError('R2-required final candidate needs r2-installed admission')
+    try:
+        result = render_source_ingress(
+            capture, ingress=ingress, admission=admission,
+            reviewed_prefix=reviewed_prefix, reviewed_prefix_sha256=reviewed_prefix_sha256,
+            qualified_target=qualified_target,
+        )
+        _v2_source_gate_check(
+            capture['graph'], result['graph'], admission.value,
+            project_id=admission.project_id, workflow_id=admission.workflow_id,
+            project_root=Path(admission.project_root),
+        )
+    except ValueError as error:
+        raise PlanValidationError(str(error)) from error
+    return result
+
+
 def _v2_source_gate_check(
     source_graph: Mapping[str, Any],
     target_graph: Mapping[str, Any],
@@ -4779,6 +4997,35 @@ def _v2_source_gate_check(
     else:
         _v2_ingress_edge(source_graph, 'source graph')
         target_ingress = _v2_ingress_edge(target_graph, 'target graph')
+    references = [
+        row for row in target_graph.get('transition_groups', [])
+        if SCRIPT_INGRESS_REF_SCHEMA in str(row.get('description', ''))
+    ]
+    if references:
+        if (
+            admission.get('ingress', {}).get('kind') != 'script-edge'
+            or len(references) != 1
+            or references[0].get('id') != target_ingress.get('transition_group_id')
+            or target_ingress.get('prompt_template')
+            or target_ingress.get('prompt')
+        ):
+            raise PlanValidationError('target Script ingress reference is ambiguous')
+        frame = read_script_ingress_reference(references[0]['description'])
+        if frame != {
+            'project_id': project_id,
+            'workflow_id': workflow_id,
+            'source_admission': dict(admission),
+        }:
+            raise PlanValidationError('target Script ingress document differs from reviewed admission')
+        for collection in ('nodes', 'edges', 'node_groups', 'transition_groups'):
+            for row in target_graph.get(collection, []):
+                for key in ('prompt_template', 'prompt'):
+                    prompt = row.get(key)
+                    if isinstance(prompt, str) and (
+                        SOURCE_ADMISSION_BEGIN in prompt or SOURCE_ADMISSION_END in prompt
+                    ):
+                        raise PlanValidationError('target graph contains dual admission carriers')
+        return
     target_prompt = target_ingress.get('prompt_template', target_ingress.get('prompt'))
     if not isinstance(target_prompt, str):
         raise PlanValidationError('source gate ingress prompt is absent')
@@ -5182,6 +5429,7 @@ def _validate_canonical_v2_target(
     expected_spec: Any = None,
     *,
     verify_evidence: bool = True,
+    affected_decisions: set[str] | None = None,
 ) -> dict[str, Any]:
     if expected_workflow_id is not None and _native_uuid(
         expected_workflow_id, 'expected_workflow_id',
@@ -5260,6 +5508,16 @@ def _validate_canonical_v2_target(
             workflow_id=item['workflow_id'],
             project_root=parsed['project_root'],
         )
+        from .delivery import validate_initial_source_selector
+        try:
+            initial = validate_initial_source_selector(graph, metadata['execution_target'])
+            if initial is not None and _git(
+                Path(source_admission['primary_root']), 'rev-parse',
+                f"{initial['commit_oid']}^{{tree}}",
+            ).strip() != initial['tree_oid']:
+                raise PlanValidationError('qualified initial Git tree differs from its commit')
+        except ValueError as error:
+            raise PlanValidationError(str(error)) from error
     source_semantics = {
         key: source_review_graph[key]
         for key in ('nodes', 'edges', 'node_groups', 'transition_groups')
@@ -5317,7 +5575,7 @@ def _validate_canonical_v2_target(
             required_paths=_v2_required_review_paths(
                 source_review_graph, review_graph, source['metadata'], metadata,
                 item['compatibility_snapshot'], source_admission,
-            ),
+            ) | {f'decision:{identity}' for identity in (affected_decisions or ())},
         )
     if expected_spec is not None:
         from .graph import graph_matches_spec
@@ -5725,7 +5983,9 @@ def _canonical_progress(parsed: Mapping[str, Any], item: Mapping[str, Any], prep
         stages.append(_canonical_stage(parsed, item, 'metadata', current, target))
     return stages
 
-def _canonical_v2_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, Any]:
+def _canonical_v2_read(
+    parsed: Mapping[str, Any], item: Mapping[str, Any], *, affected_decisions: set[str] | None = None,
+) -> dict[str, Any]:
     native_mode = isinstance(parsed.get('native_evidence'), Mapping)
     live = _canonical_read(parsed, item, include_raw_task_details=True)
     list_facts = [
@@ -5858,6 +6118,7 @@ def _canonical_v2_read(parsed: Mapping[str, Any], item: Mapping[str, Any]) -> di
             tasks,
             raw_details,
             sessions,
+            affected_decisions=affected_decisions,
         )
     live['compatibility_snapshot'] = {
         'schema': CANONICAL_V2_SNAPSHOT_SCHEMA,
@@ -5970,7 +6231,7 @@ def _canonical_v2_gate(item: Mapping[str, Any], snapshot: Mapping[str, Any], exp
 
 def _canonical_v2_plan_check(parsed: Mapping[str, Any], item: Mapping[str, Any], preimage: Mapping[str, Any],
         *, expected_workflow_id: str | None, expected_spec: Any,
-        verify_evidence: bool=True) -> None:
+        verify_evidence: bool=True, affected_decisions: set[str] | None = None) -> None:
     snapshot = item['compatibility_snapshot']
     if verify_evidence:
         try:
@@ -5992,6 +6253,7 @@ def _canonical_v2_plan_check(parsed: Mapping[str, Any], item: Mapping[str, Any],
         expected_workflow_id,
         expected_spec,
         verify_evidence=verify_evidence,
+        affected_decisions=affected_decisions,
     )
     if verify_evidence:
         try:
@@ -6046,11 +6308,24 @@ def _admit_v2_source(
     inspection = verified.inspection
     if (
         inspection.get('project_id') != item['project_id']
-        or inspection.get('workflow_id') != item['workflow_id']
+        or inspection.get('workflow_id') != admission.get('binding', {}).get(
+            'receipt_workflow_id', item['workflow_id'],
+        )
         or inspection.get('workspace_path') != str(parsed['project_root'])
         or inspection.get('status') != 'admitted'
     ):
         raise EffectBlocked('v2 source inspection result identity differs')
+    # The shared replacement marker is a qualified initial pin, not merely a
+    # selector/tree consistency assertion. Recheck it against the fresh source
+    # admission at the final canonical boundary, including graph-only updates.
+    from .delivery import validate_initial_source_selector
+    try:
+        validate_initial_source_selector(
+            item.get('target_graph', {}),
+            'ref:' + str(inspection.get('source_commit', '')),
+        )
+    except ValueError as error:
+        raise EffectBlocked('qualified initial target differs from admitted source commit') from error
     return {
         'source_admission_sha256': verified.source_admission_sha256,
         'receipt_sha256': verified.receipt_sha256,
@@ -6148,10 +6423,12 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
         if mode == 'prepare':
             if journal.state is not None:
                 raise JournalError('canonical v2 prepare refuses an existing journal')
-            live = _canonical_v2_read(parsed, item)
+            affected_decisions: set[str] = set()
+            live = _canonical_v2_read(parsed, item, affected_decisions=affected_decisions)
             _canonical_v2_gate(item, live, item['expected_version'])
             _canonical_v2_plan_check(
                 parsed, item, live, expected_workflow_id=expected_workflow_id, expected_spec=expected_spec,
+                affected_decisions=affected_decisions,
             )
             admission_result = _admit_v2_source(parsed, item)
             progress = _canonical_v2_progress(parsed, item, live)
@@ -6255,7 +6532,8 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                     return {**_canonical_report(plan, 'in_progress', journal), 'settled': settled}
             else:
                 _require_native_execution_bindings(parsed, item)
-                live = _canonical_v2_read(parsed, item)
+                affected_decisions = set()
+                live = _canonical_v2_read(parsed, item, affected_decisions=affected_decisions)
                 live_owned_sha = canonical_sha256(_canonical_v2_owned(live))
                 _canonical_v2_gate(
                     item, live, stage['before']['version'],
@@ -6269,6 +6547,7 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                     preimage,
                     expected_workflow_id=expected_workflow_id,
                     expected_spec=expected_spec,
+                    affected_decisions=affected_decisions,
                 )
                 admission_result = _admit_v2_source(parsed, item)
                 journal.persist(_journal_source_admission(
@@ -6279,13 +6558,18 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
                 if isinstance(parsed.get('native_evidence'), Mapping):
                     # Re-read all mutable native evidence after static plan/source
                     # checks and immediately before recording the new effect.
-                    fresh = _canonical_v2_read(parsed, item)
+                    affected_decisions = set()
+                    fresh = _canonical_v2_read(parsed, item, affected_decisions=affected_decisions)
                     _canonical_v2_gate(
                         item, fresh, stage['before']['version'],
                         expected_execution_target=stage['before']['metadata']['execution_target'],
                     )
                     if canonical_sha256(_canonical_v2_owned(fresh)) != before_sha:
                         raise EffectBlocked('v2 effect-owned state drifted before native dispatch')
+                    _canonical_v2_plan_check(
+                        parsed, item, preimage, expected_workflow_id=expected_workflow_id,
+                        expected_spec=expected_spec, affected_decisions=affected_decisions,
+                    )
                 current = lambda: canonical_sha256(_canonical_v2_owned(
                     _canonical_v2_owned_read(parsed, item)
                     if isinstance(parsed.get('native_evidence'), Mapping)
@@ -6294,8 +6578,18 @@ def _reconcile_canonical_workflows_v2(plan: LoadedPlan, *, mode: str, confirm: b
             def process_pre_release() -> None:
                 if not isinstance(parsed.get('native_evidence'), Mapping):
                     return
-                if current() != before_sha:
+                affected: set[str] = set()
+                fresh = _canonical_v2_read(parsed, item, affected_decisions=affected)
+                _canonical_v2_gate(
+                    item, fresh, stage['before']['version'],
+                    expected_execution_target=stage['before']['metadata']['execution_target'],
+                )
+                if canonical_sha256(_canonical_v2_owned(fresh)) != before_sha:
                     raise EffectBlocked('native effect-owned Workflow changed before process release')
+                _canonical_v2_plan_check(
+                    parsed, item, preimage, expected_workflow_id=expected_workflow_id,
+                    expected_spec=expected_spec, affected_decisions=affected,
+                )
                 _native_process_binding(parsed, parsed['native_evidence'], item['project_id'])
 
             settled = _settle_or_run(

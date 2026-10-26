@@ -1,10 +1,37 @@
 # Workflow Contract
 
+## CI recovery before first observation
+
+Source-CI recovery routes `ci_watch_source_changed`, `ci_watch_state_changed`,
+`ci_watch_diagnose`, `ci_monitor_needs_user_action`, and
+`waiting_pr_needs_user_action` carry the existing closed `delivery_context`
+instead of requiring a flat `ci_report`. Preserve their other carriers and
+approvals. Use context v2 for target-bound families and v1 for their compatible
+legacy family. A post-PR context includes exact PR identity, acknowledged cursor
+and only actually produced CI packet strings. Omit `ci_report` until produced;
+empty strings, null, placeholder reports and fabricated attempts are invalid.
+
+The watcher constructs recovery context from its latest previous report, not
+only its entry values. A provider refusal before a query adds no observation
+attempt or archive. Prompts validate context and all flat/nested equality before
+acting, without referencing undeclared report parameters. The qualified packer
+in preserve mode can restore exact existing nested report bytes for a later
+report-required route; absence cannot satisfy that route. Retry, attention and
+preparation remain available before the first report. Green/watch-merge still
+requires actual current evidence; confirmed merge retains its merge-proof route.
+Feedback acknowledgement preserves CI packet bytes and inherited retry limits.
+
 Platform-neutral generator contract. Projects supply build, test, runtime,
 source-control, issue-tracker and release procedures. Nodes receive their
 role, edge prompt, context manifest and selected procedures rather than this
 entire maintainer contract. [Global governance](../global/AGENTS.md#authority-and-decisions)
 owns Kit/workflow change approval.
+
+Script source admission uses the exact native ingress binding defined by
+[update compatibility](workflow-update-compatibility.md). Prompt-free native
+Script edges carry only the compact immutable document reference in their
+transition group's description, not an Agent prompt or new business parameter.
+Runtime qualification precedes provider or storage effects.
 
 ## Lifecycle
 
@@ -393,6 +420,29 @@ Scheduled/partial/unknown outcomes preserve state and return to capable Cleanup,
 not an automatic destructive retry. See [worktree contract](worktree-contract.md).
 
 ## Project adapter boundary
+
+### Product CI boundary
+
+Product build, test and release commands own product policy and must work
+without Kent orchestration graphs, profiles, instructions, native state or a
+user-installed Kit. Kent adapters call product commands and validate their
+results; product commands do not call back into Kent. Keep one authoritative
+product policy and reference it from orchestration instructions.
+
+Separate product verification from orchestration verification without dropping
+coverage. Product CI success is not proof of Kent graph correctness: verify
+the exact generator output, source bindings and adapter contracts before
+delivering or adopting orchestration changes. Inspect transitive imports,
+test entrypoints and document scans, not only CI YAML paths.
+
+Preserve product release safeguards, permissions, provenance, artifact
+contracts and retry/reconciliation rules when moving ownership. A shared
+dependency boundary does not require a universal release implementation.
+For the Engineering Kit itself, workflow generators, templates, graphs and
+self-development fixtures are the product: their checkout-local tests remain
+in product CI. Installed-state checks are a separate explicit operation.
+
+### Project-owned adapters
 
 Projects supply contract/profile, executable verification, phase procedures,
 context manifests, optional idempotent setup and required runtime/delivery/

@@ -34,6 +34,7 @@ bash -n "$repo_root/templates/project/workflow-plan-contract-fix-continue"
 bash -n "$repo_root/templates/project/workflow-plan-contract-verify"
 python3 -m py_compile \
   "$repo_root/workflowkit/ci_contract.py" \
+  "$repo_root/workflowkit/kit_runtime.py" \
   "$repo_root/workflowkit/delivery.py" \
   "$repo_root/workflowkit/profile.py" \
   "$repo_root/workflowkit/revision.py" \

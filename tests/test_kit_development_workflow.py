@@ -225,6 +225,28 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
                 kit.build_published_current_workflow(
                     replace(profile, project_root=fixture.kit), admitted)
 
+    def test_r2_final_builder_rejects_plan_publication_before_source_render(self):
+        from tests.test_canonical_workflow_lifecycle import (
+            create_verified_source_fixture, synthetic_verified_source_admission,
+        )
+        fixture, admitted = create_verified_source_fixture(
+            self, "project-135413f9-2454-4d04-969e-3831b1527f18",
+            "4e7cea43-54f5-4662-8d5d-c8db3d816c74",
+        )
+        value = admitted.value
+        value["schema"] = "delivery-source-admission-v2"
+        value.pop("installation_binding_sha256")
+        value["binding"] = {"kind": "plan-publication"}
+        value["ingress"] = {"kind": "agent-edge", "edge_id": "entry"}
+        source_only = synthetic_verified_source_admission(
+            value, project_id=admitted.project_id, workflow_id=admitted.workflow_id,
+            project_root=fixture.project, kent_path=fixture.native_bin,
+        )
+        with mock.patch.object(kit, "build_current_workflow") as render:
+            with self.assertRaisesRegex(SpecError, "r2-installed"):
+                kit.build_published_current_workflow(kit.profile_at(ROOT), source_only)
+            render.assert_not_called()
+
 
     def fixture(self) -> Path:
         temporary = tempfile.TemporaryDirectory()

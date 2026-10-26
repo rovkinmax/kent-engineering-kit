@@ -68,6 +68,8 @@ class TargetBranchContinuityTest(unittest.TestCase):
         max_errors: int = 1,
         interval_seconds: int = 30,
         sleep_calls=None,
+        runtime_module=runtime,
+        native_protocol=None,
     ):
         from workflowkit.github_observation import provider_retry_constraint
 
@@ -91,9 +93,15 @@ class TargetBranchContinuityTest(unittest.TestCase):
             parse_pr_url=lambda _url: ("owner/repository", 17),
             provider_retry_constraint=provider_retry_constraint,
         )
+        checkpoint = types.SimpleNamespace(
+            current_script_delivery_protocol=lambda *_args, **_kwargs: native_protocol,
+            require_github_provider_read=lambda *_args: None,
+            is_github_provider_read_blocked=lambda _error: False,
+        )
         with (
-            mock.patch.object(module, "runtime_contracts", return_value=runtime),
+            mock.patch.object(module, "runtime_contracts", return_value=runtime_module),
             mock.patch.object(module, "github_observation", return_value=observation),
+            mock.patch.object(module, "_sibling", return_value=checkpoint),
             mock.patch.object(module.sys, "stdin", io.StringIO(json.dumps(payload))),
             mock.patch.object(
                 module.sys,
@@ -162,6 +170,80 @@ class TargetBranchContinuityTest(unittest.TestCase):
                     diagnostic["observed_base_ref_name"],
                     "release",
                 )
+
+    def test_first_observation_recovery_has_context_without_fake_report(self) -> None:
+        (self.workspace / ".kent/workflow-profile.toml").write_text(
+            'schema_version=4\nkit_managed_commands=["runtime_contracts","prepare_ci"]\n'
+            '[command_versions]\nruntime_contracts="2.0.0"\nprepare_ci="2.0.0"\n'
+            '[capabilities]\nci_monitoring=true\n'
+        )
+        for reason in ("retarget", "head", "base"):
+            with self.subTest(reason=reason):
+                pr = self._pr(state="OPEN", base_name="release" if reason == "retarget" else "main")
+                if reason in {"head", "base"}:
+                    pr["headRefOid" if reason == "head" else "baseRefOid"] = "d" * 40
+                result = self._run("workflow-wait-github-ci", self._payload(with_ci=True), pr)
+                context = runtime.validate_delivery_context(json.loads(result["delivery_context"]))
+                self.assertEqual(context["schema"], "workflow-delivery-context-v1")
+                self.assertNotIn("pr_base_branch", context)
+                self.assertEqual(result["pr_base_branch"], "main")
+                self.assertEqual(context["pr_feedback_cursor"], "uninitialized")
+                self.assertNotIn("ci_report", context)
+                self.assertNotIn("ci_report", result)
+
+    def test_native_source_ci_schema_is_not_inferred_from_flat_target(self) -> None:
+        (self.workspace / ".kent/workflow-profile.toml").write_text(
+            '[command_versions]\nruntime_contracts="2.2.0"\nprepare_ci="3.1.0"\n'
+            '[capabilities]\nci_monitoring=true\n'
+        )
+        for schema in ("workflow-delivery-context-v1", "workflow-delivery-context-v2"):
+            with self.subTest(schema=schema):
+                result = self._run(
+                    "workflow-wait-github-ci", self._payload(with_ci=True),
+                    self._pr(state="OPEN", base_name="release"),
+                    native_protocol={
+                        "protocol": "typed-v1", "node_key": "ci_watch",
+                        "identity": {"task_id": "native-task"}, "target_required": True,
+                        "context_schema": schema,
+                    },
+                )
+                context = runtime.validate_delivery_context(json.loads(result["delivery_context"]))
+                self.assertEqual(context["schema"], schema)
+                self.assertEqual("pr_base_branch" in context, schema.endswith("-v2"))
+                self.assertEqual(result["pr_base_branch"], "main")
+
+    def test_non_source_ci_family_keeps_flat_recovery_stdout(self) -> None:
+        result = self._run(
+            "workflow-wait-github-ci", self._payload(with_ci=True),
+            self._pr(state="OPEN", base_name="release"),
+        )
+        self.assertNotIn("delivery_context", result)
+        self.assertNotIn("ci_report", result)
+
+    def test_legacy_source_ci_with_actual_v1_only_runtime(self) -> None:
+        path = os.environ.get("KENT_LEGACY_CI_RUNTIME")
+        if not path:
+            self.skipTest("explicit legacy source-CI runtime binding is unavailable")
+        legacy = load_template(Path(path), "actual_legacy_ci_runtime")
+        (self.workspace / ".kent/workflow-profile.toml").write_text(
+            'schema_version=4\nkit_managed_commands=["runtime_contracts","prepare_ci"]\n'
+            '[command_versions]\nruntime_contracts="2.0.0"\nprepare_ci="2.0.0"\n'
+            '[capabilities]\nci_monitoring=true\n'
+        )
+        result = self._run(
+            "workflow-wait-github-ci", self._payload(with_ci=True),
+            self._pr(state="OPEN", base_name="release"), runtime_module=legacy,
+        )
+        context = legacy.validate_delivery_context(json.loads(result["delivery_context"]))
+        self.assertEqual(context["schema"], "workflow-delivery-context-v1")
+        self.assertNotIn("pr_base_branch", context)
+        self.assertEqual(result["pr_base_branch"], "main")
+        self.assertNotIn("ci_report", context)
+        # This is a genuinely older consumer, not the modern dual-schema parser.
+        with self.assertRaises(ValueError):
+            legacy.validate_delivery_context({
+                **context, "schema": "workflow-delivery-context-v2", "pr_base_branch": "main",
+            })
 
     def test_matching_target_is_preserved_on_merged_output(self) -> None:
         for script, with_ci, transition in (
@@ -2335,7 +2417,7 @@ class ProviderRetryWaiterTest(unittest.TestCase):
             "identity": identity,
             "node_key": node_key,
             "target_required": True,
-            "context_schema": "delivery-context-v2",
+            "context_schema": "workflow-delivery-context-v2",
         }
         max_errors = 2 if scenario == "local_block" else 1
         if scenario == "unknown_terminal":
@@ -2453,14 +2535,13 @@ class ProviderRetryWaiterTest(unittest.TestCase):
                             outcome["result"]["transition"],
                             "ci_watch_failed",
                         )
-                        self.assertEqual(
-                            outcome["result"]["ci_report"],
-                            outcome["report_text"],
-                        )
+                        self.assertNotIn("ci_report", outcome["result"])
+                        context = json.loads(outcome["result"]["delivery_context"])
+                        self.assertEqual(context["ci_report"], outcome["report_text"])
                         self.assertEqual(
                             len(
                                 json.loads(
-                                    outcome["result"]["ci_report"]
+                                    context["ci_report"]
                                 )["attempts"]
                             ),
                             len(

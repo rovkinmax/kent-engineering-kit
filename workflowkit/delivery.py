@@ -12,6 +12,7 @@ import shlex
 import stat
 import time
 import unicodedata
+import uuid
 
 from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
 from .profile import ProjectProfile
@@ -485,13 +486,23 @@ def _source_admission_gate_v2(
     if binding == {"kind": "plan-publication"}:
         pass
     elif (
-        set(binding) == {"kind", "installation_binding_sha256"}
+        set(binding) in (
+            {"kind", "installation_binding_sha256"},
+            {"kind", "installation_binding_sha256", "receipt_workflow_id"},
+        )
         and binding.get("kind") == "r2-installed"
         and isinstance(binding.get("installation_binding_sha256"), str)
     ):
         pass
     else:
         raise ValueError("source admission v2 binding variant is invalid")
+    if "receipt_workflow_id" in binding:
+        try:
+            owner = str(uuid.UUID(binding["receipt_workflow_id"]))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ValueError("source admission receipt owner is invalid") from error
+        if owner != binding["receipt_workflow_id"]:
+            raise ValueError("source admission receipt owner is invalid")
     if (
         set(ingress) != {"kind", "edge_id"}
         or ingress.get("kind") not in {"agent-edge", "script-edge"}
@@ -534,7 +545,8 @@ def _source_admission_gate_v2(
     command = [
         "python3", str(Path(admission["kit_root"]) / "scripts/inspect-delivery-source"),
         "--receipt", receipt["path"], "--receipt-sha256", receipt["sha256"],
-        "--project-id", project_id, "--workflow-id", workflow_id,
+        "--project-id", project_id,
+        "--workflow-id", binding.get("receipt_workflow_id", workflow_id),
         "--project-root", project_root, "--kit-root", admission["kit_root"],
         "--primary-root", admission["primary_root"],
         "--source-ref", admission["source_ref"], "--kit-ref", admission["kit_ref"],
@@ -544,10 +556,16 @@ def _source_admission_gate_v2(
         command.extend(("--installed-helper", helper["link"], helper["target"]))
     invocation = shlex.join(command) + ' --workspace "$(git rev-parse --show-toplevel)"'
     if binding["kind"] == "r2-installed":
-        ingress_guidance = """For an admitted R2 Task, first use the qualified
-installed project-memory adapter's initialize-task interface with the actual
-Git root and inherited native Session identity. Select task-fixed mode before
-source inspection; preserve inventoried legacy Tasks unchanged."""
+        ingress_guidance = """Use the trusted installed project-memory entrypoint
+with the actual Git root and inherited native Session identity. It verifies
+native identity and the installed binding/profile, then selects task-fixed mode.
+For R2, it admits the pinned source before any initialize-task write or
+project-local helper/document access. Only then initialize a new R2 Task, or
+resolve its existing binding. An exact interrupted initialization may retry.
+Inventoried legacy Tasks retain their original infrastructure and accepted
+contracts; do not impose the current R2 closure on their historical checkout.
+The outer frame identifies the target Workflow/ingress; receipt_workflow_id,
+when present, identifies only the installed receipt owner."""
     else:
         ingress_guidance = """This is a plan-publication source admission only.
 Do not initialize an R2 Task, call project-memory, perform a CAS write, or
@@ -556,6 +574,11 @@ create a legacy fallback."""
 {frame_text}
 Published source admission comes before project-local helpers. At first
 storage ingress, use the exact mode bound by source_admission.binding.
+Before initialization or project-local access, inspect the actual native Task
+and complete graph through trusted Kent interfaces. Require the exact outer
+project/target Workflow, source Workspace and bound ingress edge/node, matching
+Task/graph versions and genuine current Agent Session or native Script ownership
+as applicable. The receipt owner never substitutes the target Workflow.
 {ingress_guidance}
 For the admitted source, run the exact read-only guard:
 
@@ -567,7 +590,8 @@ Proceed only on verified admission. A receipt proves byte closure, not Task
 approval, reader compatibility or permission for an external effect. Missing
 identity, source drift or incompatible retained readers requires preserving
 state and reporting the concrete gap. Do not fetch, provision, select another
-baseline or create a .todo fallback. This check is procedural, not an engine
+baseline or create a .todo fallback to bypass admission. This does not prohibit
+later explicitly authorized Workflow operations. This check is procedural, not an engine
 sandbox or a reservation against subsequent source changes.
 {SOURCE_ADMISSION_END}"""
 
@@ -579,6 +603,174 @@ def packet_json(value: object) -> bytes:
     if len(raw) > PACKET_LIMIT:
         raise ValueError("producer artifact exceeds its byte limit")
     return raw
+
+
+QUALIFIED_INITIAL_SOURCE = "KENT_QUALIFIED_INITIAL_SOURCE_V1 "
+
+
+def validate_initial_source_selector(graph: dict, execution_target: str) -> dict | None:
+    """Check only the qualified initial header emitted by this renderer."""
+    found = []
+    for collection in ("nodes", "edges", "node_groups", "transition_groups"):
+        for row in graph.get(collection, []):
+            for field in ("prompt", "prompt_template"):
+                prompt = row.get(field)
+                if not isinstance(prompt, str):
+                    continue
+                for line in prompt.splitlines():
+                    if line.startswith(QUALIFIED_INITIAL_SOURCE):
+                        found.append(line[len(QUALIFIED_INITIAL_SOURCE):])
+    if not found:
+        return  # Historical headers and head/default-branch policies are unchanged.
+    if len(found) != 1:
+        raise ValueError("qualified initial source header is duplicated")
+    target = packet_decode(found[0].encode("utf-8"))
+    if (
+        not isinstance(target, dict)
+        or set(target) != {"commit_oid", "tree_oid"}
+        or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value)
+               for value in target.values())
+        or not isinstance(execution_target, str)
+        or target["commit_oid"] != execution_target.removeprefix("ref:")
+    ):
+        raise ValueError("qualified initial commit/tree and execution selector disagree")
+    return target
+
+
+def render_source_ingress(
+    capture: dict, *, ingress: dict, admission: object,
+    reviewed_prefix: str, reviewed_prefix_sha256: str, qualified_target: dict,
+) -> dict:
+    """Pure complete-candidate transform; replace one reviewed authority prefix.
+
+    Native/source/target qualification is the caller's responsibility. This
+    function performs no native, Git, storage, installation or publication I/O.
+    """
+    from .operations import VerifiedSourceAdmission, PlanValidationError, _v2_exact_ingress_edge
+
+    if not isinstance(admission, VerifiedSourceAdmission):
+        raise ValueError("ingress rendering requires VerifiedSourceAdmission")
+    value = admission.value
+    if (
+        value.get("schema") != "delivery-source-admission-v2"
+        or value.get("ingress") != ingress
+        or ingress.get("kind") != "agent-edge"
+        or hashlib.sha256(packet_json(value)).hexdigest() != admission.source_admission_sha256
+        or admission.gate != source_admission_gate(
+            value, project_id=admission.project_id, workflow_id=admission.workflow_id,
+            project_root=admission.project_root,
+        )
+    ):
+        raise ValueError("verified admission does not bind the exact ingress")
+    if (
+        not isinstance(capture, dict)
+        or set(capture) != {
+            "workflow_id", "expected_version", "graph", "execution_target_policy",
+        }
+        or capture["workflow_id"] != admission.workflow_id
+        or type(capture["expected_version"]) is not int
+        or capture["expected_version"] < 0
+        or not isinstance(capture["execution_target_policy"], dict)
+        or not isinstance(capture["graph"], dict)
+        or set(capture["graph"]) != {"nodes", "edges", "node_groups", "transition_groups"}
+        or not isinstance(qualified_target, dict)
+        or set(qualified_target) != {"commit_oid", "tree_oid"}
+        or any(not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{40}", v)
+               for v in qualified_target.values())
+        or not isinstance(reviewed_prefix, str) or not reviewed_prefix
+        or len(reviewed_prefix.encode("utf-8")) > 128 * 1024
+        or hashlib.sha256(reviewed_prefix.encode("utf-8")).hexdigest() != reviewed_prefix_sha256
+    ):
+        raise ValueError("ingress capture, reviewed prefix or qualified target is invalid")
+    raw = packet_json(capture)
+    result = packet_decode(raw)
+    graph = result["graph"]
+    if any(not isinstance(rows, list) or len(rows) > 4096
+           or any(not isinstance(row, dict) for row in rows)
+           for rows in graph.values()):
+        raise ValueError("ingress graph collections are invalid")
+    identities = [row.get("id") for rows in graph.values() for row in rows]
+    if (
+        any(not isinstance(identity, str) or not identity for identity in identities)
+        or len(identities) != len(set(identities))
+    ):
+        raise ValueError("ingress graph identities are absent or duplicated")
+    try:
+        edge = _v2_exact_ingress_edge(graph, ingress, "ingress candidate")
+    except PlanValidationError as error:
+        raise ValueError(str(error)) from error
+    prompt = edge.get("prompt_template")
+    # Retain the initial native ownership/root guard as well as byte closure.
+    # A receipt alone is not proof that this Session owns this Task ingress.
+    node = next(row for row in graph["nodes"] if row["id"] == edge["target_node_id"])
+    parents = re.findall(r"^Managed Task parent: (.+)$", reviewed_prefix, re.MULTILINE)
+    if len(parents) > 1 or (parents and (
+        not parents[0].startswith("/") or ".." in Path(parents[0]).parts
+    )):
+        raise ValueError("reviewed managed Task parent is invalid")
+    parent_guard = (
+        f"Require the canonical Task worktree strictly below {parents[0]}; "
+        "never use the primary, source-cohort or artifact root. "
+        if parents else ""
+    )
+    prefix = (
+        admission.gate + "\n\n" + QUALIFIED_INITIAL_SOURCE
+        + packet_json(qualified_target).decode("utf-8")
+        + f"\nExpected native project: {admission.project_id}\n"
+        f"Expected target Workflow: {admission.workflow_id}\n"
+        f"Expected source Workspace: {admission.primary_workspace_id}\n"
+        f"Expected ingress node: {node['id']}\n"
+        "Before project-local helpers/documents, independently inspect the actual "
+        "Task and complete native graph through trusted Kent interfaces. Require "
+        "Task short_id={{.TaskShortId}}, project_id, workflow_id and source_workspace_id "
+        "to equal these bindings; require the exact expected current node and genuine "
+        "inherited Session ownership. Require native graph version to match the Task's "
+        "Workflow version and the expected node kind/ingress edge. Do not replace native "
+        "Session/Step identity. Read exact Session worktree status and require its "
+        "workspace identity, canonical Task worktree_path, actual Git root and effective "
+        "working directory to agree, with no availability or worktree problems. "
+        + parent_guard
+        + "At this initial ingress, verify the resolved native execution target and "
+        "actual HEAD/HEAD^{tree} against the exact commit/tree above before local "
+        "helpers or documents. Require exact tracked/index contents and no unexpected "
+        "nonignored untracked source; ignored setup output is not source qualification. "
+        "On identity/source uncertainty preserve state and use the existing recovery "
+        "route with the concrete gap; do not reset, retarget or weaken admission. "
+        "This is an initial admission, not a permanent HEAD "
+        "pin; later authorized Task commits preserve their accepted baseline.\n\n"
+    )
+    if not isinstance(prompt, str):
+        raise ValueError("exact ingress prompt is absent")
+    if prompt.startswith(prefix):
+        suffix = prompt[len(prefix):]
+        validate_initial_source_selector(graph, result["execution_target_policy"].get("custom_ref"))
+    elif prompt.startswith(reviewed_prefix):
+        suffix = prompt[len(reviewed_prefix):]
+    else:
+        raise ValueError("ingress authority prefix differs from the reviewed preimage")
+    # No hidden frame, duplicate marker or leftover commit/tree authority.
+    for collection, rows in graph.items():
+        for row in rows:
+            for key in ("prompt", "prompt_template"):
+                text = suffix if row is edge and key == "prompt_template" else row.get(key, "")
+                if not isinstance(text, str):
+                    continue
+                if any(marker in text for marker in (
+                    SOURCE_ADMISSION_BEGIN, SOURCE_ADMISSION_END, QUALIFIED_INITIAL_SOURCE,
+                )):
+                    raise ValueError("duplicate source authority outside the exact prefix")
+                if row is edge and key == "prompt_template" and re.search(
+                    r"Qualified initial (?:commit|Git tree):|commit_oid=[0-9a-f]{40}|HEAD=[0-9a-f]{40}",
+                    text,
+                ):
+                    raise ValueError("contradictory initial commit/tree authority remains")
+    edge["prompt_template"] = prefix + suffix
+    result["execution_target_policy"] = {
+        "mode": "custom_ref", "custom_ref": qualified_target["commit_oid"],
+    }
+    validate_initial_source_selector(graph, qualified_target["commit_oid"])
+    packet_json(result)
+    return result
 
 
 def packet_decode(raw: bytes) -> dict:
@@ -1102,15 +1294,26 @@ def _historical_provider_failure(producer: dict) -> bool:
         try:
             from .runtime import (
                 parse_canonical_json, validate_dynamic_ci_report,
+                validate_delivery_context,
             )
 
+            if "delivery_context" in result:
+                context = validate_delivery_context(packet_decode(
+                    result["delivery_context"].encode("utf-8")
+                ))
+                if context["phase"] != "post_pr":
+                    return True
+                nested = context.get("ci_report")
+                if raw is not None and raw != nested:
+                    return True
+                raw = nested
             report = validate_dynamic_ci_report(
                 parse_canonical_json(
                     raw, label="historical CI provider report",
                     max_bytes=65536,
                 )
             )
-        except (TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError):
             return True
         return report["attempts"][-1]["reason"] in {
             "query_failed", "query_timeout", "incomplete_observation",
@@ -1700,6 +1903,20 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
         # Outputs override inputs within one actual producer invocation. Across
         # producers there is no implicit latest choice or conflict precedence.
         fields = {**producer["inputs"], **producer["result"]}
+        if "delivery_context" in producer["result"]:
+            from .runtime import validate_delivery_context
+            produced_context = validate_delivery_context(packet_decode(
+                producer["result"]["delivery_context"].encode("utf-8")
+            ))
+            if produced_context["phase"] == "post_pr":
+                for key in (
+                    "pr_url", "branch_name", "pr_base_branch", "merge_strategy",
+                    "pr_feedback_cursor", "ci_contract", "ci_report",
+                ):
+                    if key in producer["result"]:
+                        continue  # The exact flat/nested equality check follows.
+                    if key in produced_context:
+                        fields[key] = produced_context[key]
         for key, value in fields.items():
             if key in {"transition", "commentary"}:
                 continue
@@ -1711,6 +1928,37 @@ def pack_delivery(root: Path, request: dict, *, identity: dict,
             if key in sources and sources[key] != value:
                 raise ValueError("producer references disagree on exact field bytes")
             sources[key] = value
+    # Expand only validated producer-owned context. A nested real report is
+    # usable by later report-required routes; absence never synthesizes one.
+    if "delivery_context" in sources:
+        from .runtime import validate_delivery_context, delivery_context_fields
+        context = validate_delivery_context(
+            packet_decode(sources["delivery_context"].encode("utf-8"))
+        )
+        delivery_context_fields(sources)
+        if context["phase"] == "post_pr":
+            for key in (
+                "pr_url", "branch_name", "pr_base_branch", "merge_strategy",
+                "pr_feedback_cursor", "ci_contract", "ci_report",
+            ):
+                if key not in context:
+                    continue
+                if (
+                    key == "pr_base_branch"
+                    and request["delivery_mode"] == "post_pr_target_revalidated"
+                ):
+                    continue
+                if (
+                    key == "pr_feedback_cursor"
+                    and feedback_decision is not None
+                    and feedback_decision["decision"] == "acknowledge_all_reported_feedback"
+                ):
+                    continue
+                if key in sources and sources[key] != context[key]:
+                    if request["delivery_mode"] == "post_pr_target_revalidated":
+                        raise ValueError("target revalidation changed non-target producer bytes")
+                    raise ValueError("flat and nested post_pr producer identity disagree")
+                sources[key] = context[key]
     for key in ("ci_contract", "ci_report", "delivery_context"):
         if key in values and (key not in sources or values[key] != sources[key]):
             raise ValueError("packet values require exact producer-owned bytes")
@@ -4484,6 +4732,21 @@ re-lock another writer."""
                 )
             updated_edges.append(edge)
         edges = updated_edges
+    if source_ci and delivery_context_enabled:
+        recovery_keys = {
+            "ci_watch_source_changed", "ci_watch_state_changed", "ci_watch_diagnose",
+            "ci_monitor_needs_user_action", "waiting_pr_needs_user_action",
+        }
+        edges = [
+            replace(
+                edge,
+                parameters=tuple(p for p in edge.parameters if p.key != "ci_report")
+                + (() if any(p.key == "delivery_context" for p in edge.parameters)
+                   else (DELIVERY_CONTEXT,)),
+                prompt=ci_recovery_prompt(edge.prompt) if edge.prompt else edge.prompt,
+            ) if edge.key in recovery_keys else edge
+            for edge in edges
+        ]
     edges = qualify_transition_keys(edges)
     spec = WorkflowSpec(
         name=profile.workflow_name("delivery", version),
@@ -6278,14 +6541,42 @@ Only the deterministic PR watcher resets invalid cursors to `uninitialized`
 with `pull_request_feedback_invalid`."""
 
 
+def ci_recovery_prompt(prompt: str) -> str:
+    """Adapt only envelope-bearing recovery entries, not real-report routes."""
+    prompt = prompt.replace(
+        "{{.Params.ci_report}}",
+        "(read ci_report only when present in the validated recovery context)",
+    )
+    return prompt + """
+
+Recovery delivery context: {{.Params.delivery_context}}
+Validate the closed delivery_context with the runtime adapter and compare every
+supplied flat PR/CI field with its nested value before acting. A missing
+ci_report means no report has been produced, not green CI or a task failure.
+Preserve absent packets as absent. Recovery, attention and deterministic
+preparation remain available without a report; do not invent a report or ask
+for human approval merely because the first observation has not happened.
+For needs_user_action preserve this context. For report-required routes use
+the qualified delivery packer in preserve mode with original producer_refs;
+it extracts only an existing report with exact bytes. Green/watch_merge
+requires real current evidence; confirmed merge still uses the existing
+merge-proof route. Preserve acknowledged feedback and inherited retry limits.
+"""
+
+
 def ci_prompt(profile: ProjectProfile) -> str:
     source_ci = profile.source_ci_contract() and profile.capability("ci_monitoring")
     source_ci_v3 = source_ci and profile.source_ci_contract_v3()
     delivery_fix_handoff = (
         """\n\nFor `needs_changes`, pack the latest observed PR identity, cursor,
 and any produced CI packets in `delivery_context`; preserve packet bytes and
-omit unproduced fields. Keep `needs_user_action` on its existing flat
-self-recovery contract."""
+omit unproduced fields."""
+        + (
+            "\nFor `needs_user_action`, preserve the validated `delivery_context` "
+            "and its optional packets; no report is required."
+            if source_ci else
+            "\nKeep `needs_user_action` on its existing flat self-recovery contract."
+        )
         if _delivery_context_enabled(profile)
         else ""
     )
@@ -6445,7 +6736,8 @@ and omit unproduced fields."""
             "\nFor source-contract `ci_required`, provide only "
             "`workspace_path`, `task_short_id={{.TaskShortId}}`, and the updated "
             "`delivery_context`; the producer unwraps those observed values. "
-            "Keep `needs_user_action` on its existing flat self-recovery contract."
+            "For `needs_user_action`, preserve the validated `delivery_context` "
+            "and only actually produced CI packets."
             if source_ci
             else "\nKeep non-source-contract `ci_required` and "
             "`needs_user_action` on their existing flat contracts."
