@@ -102,6 +102,7 @@ _ARCHIVE_PROJECT_COMMANDS = {
     "plan_contract_fix_continue": "templates/project/workflow-plan-contract-fix-continue",
     "plan_contract_verify": "templates/project/workflow-plan-contract-verify",
     "prepare_ci": "templates/project/workflow-prepare-github-ci",
+    "kit_runtime_loader": "workflowkit/kit_runtime.py",
     "wait_ci": "templates/project/workflow-wait-github-ci",
     "wait_pr": "templates/project/workflow-wait-github-pr",
     "github_observation": "workflowkit/github_observation.py",
@@ -344,6 +345,8 @@ def _archive_project_reader_bindings(profile, *, script_key: str, script_path: s
         required.add("wait_ci")
     if profile.source_ci_contract():
         required.add("prepare_ci")
+    if profile.kit_runtime is not None:
+        required.add("kit_runtime_loader")
     if profile.command("github_observation"):
         required.add("github_observation")
     required.update(

@@ -43,7 +43,8 @@ PROJECT_FILES = {"AGENTS.md", ".gitignore", ".kent/workflow-profile.toml",
 KIT_REQUIRED = {"scripts/inspect-delivery-source", "scripts/prepare-github-ci",
                 *(f"workflowkit/{name}.py" for name in (
                     "__init__", "ci_contract", "delivery", "runtime", "profile",
-                    "model", "release", "revision", "kent", "graph", "project_memory"))}
+                    "model", "release", "revision", "kent", "graph", "project_memory",
+                ))}
 
 
 class SourceAdmissionError(ValueError):
@@ -493,6 +494,52 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
                 local_inputs=locals_by_root.get(kit_root))
     profile_raw, _ = read_file(primary_root / ".kent/workflow-profile.toml")
     profile = tomllib.loads(profile_raw.decode("utf-8"))
+    kit_runtime_present = "kit_runtime" in profile
+    kit_runtime = profile.get("kit_runtime")
+    if kit_runtime_present:
+        require(
+            isinstance(kit_runtime, dict),
+            "invalid Kit runtime binding",
+        )
+        require(
+            "workflowkit/kit_runtime.py" in kit_tree,
+            "qualified Kit runtime source is absent from the published cohort",
+        )
+        runtime_entry = kit_tree["workflowkit/kit_runtime.py"]
+        require(
+            runtime_entry[0] in ("100644", "100755") and runtime_entry[1] == "blob",
+            "qualified Kit runtime source is not a regular published module",
+        )
+        runtime_source = git(kit_root, "cat-file", "blob", runtime_entry[2])
+        runtime_copy, runtime_mode = read_file(
+            primary_root / ".kent/scripts/workflow_kit_runtime.py",
+        )
+        require(
+            runtime_copy == runtime_source and runtime_mode & 0o100,
+            "managed project Kit runtime bootstrap differs from published source",
+        )
+        closed(kit_runtime, ("schema_version", "root", "commit", "publication_ref"))
+        commands = profile.get("commands")
+        managed = profile.get("kit_managed_commands")
+        versions = profile.get("command_versions")
+        require(
+            type(kit_runtime["schema_version"]) is int
+            and kit_runtime["schema_version"] == 1
+            and kit_runtime["root"] == str(kit_root)
+            and kit_runtime["commit"] == receipt["kit_commit"]
+            and kit_runtime["publication_ref"] == kit_ref
+            and isinstance(commands, dict)
+            and commands.get("kit_runtime_loader")
+            == ".kent/scripts/workflow_kit_runtime.py",
+            "project Kit runtime binding differs from native source admission",
+        )
+        require(
+            isinstance(managed, list)
+            and "kit_runtime_loader" in managed
+            and isinstance(versions, dict)
+            and versions.get("kit_runtime_loader") == "1.0.0",
+            "project Kit runtime binding differs from native source admission",
+        )
     if not source_only:
         require(profile.get("policies", {}).get("delivery_reliability") == "v1",
                 "delivery policy not enabled")

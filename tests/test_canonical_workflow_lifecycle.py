@@ -366,6 +366,7 @@ def create_verified_source_fixture(
     workflow_id_value: str,
     *,
     local_instruction: bool = False,
+    receipt_workflow_id: str | None = None,
 ) -> tuple[source_admission.DeliverySourceAdmissionTests, operations.VerifiedSourceAdmission]:
     """Create an offline native/install/source fixture and verify it end to end."""
     fixture = source_admission.DeliverySourceAdmissionTests(
@@ -378,7 +379,7 @@ def create_verified_source_fixture(
         fixture.add_local_instruction()
 
     fixture.receipt["project_id"] = project_id
-    fixture.receipt["workflow_id"] = workflow_id_value
+    fixture.receipt["workflow_id"] = receipt_workflow_id or workflow_id_value
     fixture.pin()
     fixture.installation_binding["project_id"] = project_id
     fixture.installation_binding["receipt_sha256"] = fixture.digest
@@ -417,6 +418,14 @@ def create_verified_source_fixture(
             "target": str(fixture.adapter_target),
         }],
     }
+    if receipt_workflow_id is not None:
+        admission["schema"] = operations.SOURCE_ADMISSION_V2_SCHEMA
+        admission["binding"] = {
+            "kind": "r2-installed",
+            "installation_binding_sha256": admission.pop("installation_binding_sha256"),
+            "receipt_workflow_id": receipt_workflow_id,
+        }
+        admission["ingress"] = {"kind": "agent-edge", "edge_id": "entry"}
     with mock.patch.object(operations.Path, "home", return_value=fixture.home), \
             mock.patch.dict("os.environ", {"HOME": str(fixture.home)}):
         admitted = REAL_ADMIT_SOURCE_ADMISSION(
@@ -517,6 +526,7 @@ def canonical_v2_plan(
     script_path_change: bool = False,
     source_admission_enabled: bool = True,
     name: str = "canonical-plan-v2.json",
+    approval_parameter_description: str | None = None,
 ) -> tuple[operations.LoadedPlan, dict]:
     state = read_state(fixture)
     wid = workflow_id(0)
@@ -570,6 +580,12 @@ def canonical_v2_plan(
             "target_node_id": "0b234cff-2952-438d-be39-83d1165dbbe0",
             "parameters": [], "prompt_template": "Revalidate after a fix.",
         })
+    if approval_parameter_description is not None:
+        edge = next(row for row in workflow["graph"]["edges"] if row["key"] == "backlog_plan")
+        edge["parameters"] = [
+            {"key": "delivery_context", "purpose": "ordinary", "description": approval_parameter_description},
+            {"key": "other", "purpose": "ordinary", "description": "Unchanged"},
+        ]
     detail = workflow["details"]["TASK-1"]
     detail["live_sessions"] = []
     detail["current_nodes"] = [{"node_id": "90e31940-4c84-466e-8e72-26f53c2f36f4"}]
@@ -1311,6 +1327,7 @@ def native_canonical_v2_plan(
     synchronize_effects: bool = False,
     with_questions: bool = False,
     with_bindings: bool = False,
+    approval_descriptions: tuple[str, str, str] | None = None,
 ) -> tuple[operations.LoadedPlan, dict, dict]:
     if synchronize_effects:
         # Install before canonical_v2_plan binds the executable digest. Only
@@ -1355,7 +1372,10 @@ def native_canonical_v2_plan(
                 edge["prompt_template"] = edge["prompt_template"].strip({whitespace!r})
 ''', 1)
         kent.write_text(source)
-    plan, value = canonical_v2_plan(fixture, intent=intent)
+    plan, value = canonical_v2_plan(
+        fixture, intent=intent,
+        approval_parameter_description=approval_descriptions[1] if approval_descriptions else None,
+    )
     home, database, sessions_root, connection, sessions, _, question_input = make_native_persistence(
         fixture,
         production_shape=production_shape,
@@ -1364,6 +1384,37 @@ def native_canonical_v2_plan(
         with_questions=with_questions,
     )
     testcase.addCleanup(connection.close)
+    if approval_descriptions is not None:
+        for identity, raw in connection.execute(
+            "SELECT approval_id,effective_edge_configuration_json FROM task_pending_approval_branches"
+        ).fetchall():
+            edge = json.loads(raw)
+            edge["parameters"][0]["description"] = approval_descriptions[0]
+            connection.execute(
+                "UPDATE task_pending_approval_branches SET effective_edge_configuration_json=? WHERE approval_id=?",
+                (canonical_bytes(edge).decode("utf-8"), identity),
+            )
+            delivery_context = '{"schema":"workflow-delivery-context-v1","phase":"pre_pr"}'
+            materialized = json.loads(connection.execute(
+                "SELECT materialized_values_json FROM task_pending_approvals WHERE id=?", (identity,),
+            ).fetchone()[0])
+            materialized["delivery_context"] = delivery_context
+            connection.execute(
+                "UPDATE task_pending_approvals SET materialized_values_json=? WHERE id=?",
+                (canonical_bytes(materialized).decode("utf-8"), identity),
+            )
+            target = json.loads(connection.execute(
+                "SELECT target_snapshot_json FROM task_pending_approval_branches WHERE approval_id=?", (identity,),
+            ).fetchone()[0])
+            target["current_input_values"] = {"delivery_context": delivery_context}
+            connection.execute(
+                "UPDATE task_pending_approval_branches SET target_snapshot_json=? WHERE approval_id=?",
+                (canonical_bytes(target).decode("utf-8"), identity),
+            )
+        connection.commit()
+        edge = next(row for row in value["workflows"][0]["target_graph"]["edges"]
+                    if row["key"] == "backlog_plan")
+        edge["parameters"][0]["description"] = approval_descriptions[2]
     descriptor = {
         "schema": operations.NATIVE_EVIDENCE_SCHEMA,
         "database_path": str(database),
@@ -1451,6 +1502,22 @@ def native_canonical_v2_plan(
     value["native_evidence"] = descriptor
     review_path = Path(item["compatibility_review_ref"]["path"])
     review = json.loads(review_path.read_text())
+    if approval_descriptions is not None:
+        from workflowkit.graph import native_graph_postimage, native_graph_projection
+        target = native_graph_postimage(item["target_graph"], workflow_id=item["workflow_id"])
+        review["target_graph_sha256"] = canonical_sha256(target)
+        source = read_state(fixture)["workflows"][workflow_id(0)]
+        required = operations._v2_required_review_paths(
+            native_graph_projection(source["graph"], workflow_id=item["workflow_id"]),
+            native_graph_projection(target, workflow_id=item["workflow_id"]),
+            source["metadata"], item.get("target_metadata", source["metadata"]), snapshot,
+            item["source_admission"],
+        )
+        existing = {row["path"] for row in review["dispositions"]}
+        for path in sorted(required - existing):
+            review["dispositions"].append({
+                "path": path, "disposition": "compatible", "evidence": history_refs,
+            })
     review["compatibility_snapshot_sha256"] = canonical_sha256(snapshot)
     review["native_evidence_sha256"] = canonical_sha256(descriptor)
     dispositions = {row["path"] for row in review["dispositions"]}
@@ -1477,6 +1544,33 @@ def native_canonical_v2_plan(
     native_plan = write_canonical_v2_plan(fixture, value)
     context["review_path"] = review_path
     return native_plan, context, observed
+
+
+def review_native_description_decisions(fixture: dict, plan: operations.LoadedPlan, context: dict,
+                                       identities: set[str] | None = None) -> operations.LoadedPlan:
+    value = plan.value
+    item = value["workflows"][0]
+    review = json.loads(context["review_path"].read_bytes())
+    evidence_path = Path(fixture["root"]) / "description-compatibility.txt"
+    evidence_path.write_text(
+        "Frozen delivery_context remains v1. The v1/v2 description expands the future contract, not this decision. "
+        "The exact materialized payload and retained producer remain v1; future consumers accept those v1 bytes. "
+        "No conversion, replacement, or permission to produce v2 is inferred.\n"
+        + json.dumps(context["connection"].execute(
+            "SELECT id,materialized_values_json FROM task_pending_approvals ORDER BY id",
+        ).fetchall())
+    )
+    evidence = {"path": str(evidence_path), "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest()}
+    for task in item["compatibility_snapshot"]["tasks"]:
+        for decision in task["pending_decisions"]:
+            if identities is None or decision["id"] in identities:
+                review["dispositions"].append({
+                    "path": f"decision:{decision['id']}", "disposition": "compatible", "evidence": [evidence],
+                })
+    raw = canonical_bytes(review)
+    context["review_path"].write_bytes(raw)
+    item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+    return write_canonical_v2_plan(fixture, value)
 
 
 def install_v2_unresolved_graph_postimage(
@@ -1530,6 +1624,225 @@ def install_v2_unresolved_graph_postimage(
     return graph_stage
 
 class CanonicalWorkflowLifecycleTest(unittest.TestCase):
+    def test_captured_slack_and_puber_use_complete_candidate_facade(self):
+        capture_root = os.environ.get("KENT_INGRESS_CAPTURE_ROOT")
+        if not capture_root:
+            self.skipTest("explicit read-only audit snapshot binding is unavailable")
+        for wid, project in (
+            ("a2dbdf14-8b03-4451-8eb1-db77a4f8b532", "project-0295d918-95a8-47b4-b96e-ab700d586232"),
+            ("7061fc98-aae5-4468-9d89-fa28bfe30c72", "project-6c1b6c4e-c8e2-4170-b9f7-a7d9c4602176"),
+        ):
+            with self.subTest(workflow=wid):
+                native = json.loads((Path(capture_root) / f"{wid}.json").read_bytes())
+                graph = {
+                    name: native.get(name, [])
+                    for name in ("nodes", "node_groups", "transition_groups", "edges")
+                }
+                edge = next(row for row in graph["edges"] if row["key"] == "start_plan")
+                old_prefix, body = edge["prompt_template"].split("Plan {{.TaskShortId}}:", 1)
+                old_commit = old_prefix.split("Qualified initial commit: ", 1)[1].splitlines()[0]
+                self.assertNotEqual(old_commit, native["workflow"]["execution_target_policy"]["custom_ref"])
+                fixture, admitted = create_verified_source_fixture(
+                    self, project, wid, receipt_workflow_id=wid,
+                )
+                value = admitted.value
+                value["ingress"]["edge_id"] = edge["id"]
+                with mock.patch.object(operations.Path, "home", return_value=fixture.home), \
+                        mock.patch.dict(os.environ, {"HOME": str(fixture.home)}):
+                    admitted = REAL_ADMIT_SOURCE_ADMISSION(
+                        value, project_id=project, workflow_id=wid,
+                        project_root=fixture.project, kent_path=fixture.native_bin,
+                    )
+                capture = {
+                    "workflow_id": wid, "expected_version": native["workflow"]["version"],
+                    "graph": graph, "execution_target_policy": native["workflow"]["execution_target_policy"],
+                }
+                target = {
+                    "commit_oid": fixture.commits[fixture.project],
+                    "tree_oid": fixture.git(fixture.project, "rev-parse", "HEAD^{tree}").strip(),
+                }
+                arguments = dict(
+                    ingress=value["ingress"], admission=admitted,
+                    reviewed_prefix=old_prefix,
+                    reviewed_prefix_sha256=hashlib.sha256(old_prefix.encode()).hexdigest(),
+                    qualified_target=target,
+                )
+                before = canonical_bytes(capture)
+                candidate = operations.render_source_ingress_candidate(capture, **arguments)
+                self.assertEqual(canonical_bytes(capture), before)
+                self.assertEqual(
+                    operations.render_source_ingress_candidate(candidate, **arguments), candidate,
+                )
+                updated = next(row for row in candidate["graph"]["edges"] if row["id"] == edge["id"])
+                self.assertTrue(updated["prompt_template"].endswith("Plan {{.TaskShortId}}:" + body))
+                expected = json.loads(before)
+                expected["execution_target_policy"] = candidate["execution_target_policy"]
+                next(row for row in expected["graph"]["edges"] if row["id"] == edge["id"])[
+                    "prompt_template"
+                ] = updated["prompt_template"]
+                self.assertEqual(expected, candidate)
+                with self.assertRaises(PlanValidationError):
+                    operations.render_source_ingress_candidate(
+                        capture, **{**arguments, "qualified_target": {**target, "tree_oid": "f" * 40}},
+                    )
+                from workflowkit.delivery import validate_initial_source_selector
+                validate_initial_source_selector(candidate["graph"], "ref:" + target["commit_oid"])
+                self.assertIn("Expected ingress node:", updated["prompt_template"])
+                self.assertIn("genuine inherited Session ownership", updated["prompt_template"])
+                with self.assertRaises(ValueError):
+                    validate_initial_source_selector(candidate["graph"], old_commit)
+                # A second existing commit/tree is internally consistent but
+                # is not the freshly admitted published source.
+                fixture.put(fixture.project, "product.txt", "next product revision\n")
+                fixture.commit(fixture.project)
+                other = {
+                    "commit_oid": fixture.git(fixture.project, "rev-parse", "HEAD").strip(),
+                    "tree_oid": fixture.git(fixture.project, "rev-parse", "HEAD^{tree}").strip(),
+                }
+                self.assertNotEqual(other["commit_oid"], target["commit_oid"])
+                forged = json.loads(canonical_bytes(candidate))
+                next(row for row in forged["graph"]["edges"] if row["id"] == edge["id"])[
+                    "prompt_template"
+                ] = updated["prompt_template"].replace(
+                    canonical_bytes(target).decode(), canonical_bytes(other).decode(),
+                )
+                with mock.patch.object(operations, "admit_source_admission", return_value=admitted):
+                    with self.assertRaisesRegex(EffectBlocked, "admitted source commit"):
+                        operations._admit_v2_source({
+                            "project_root": fixture.project, "kent": fixture.native_bin,
+                        }, {
+                            "project_id": project, "workflow_id": wid,
+                            "source_admission": admitted.value, "target_graph": forged["graph"],
+                        })
+
+    def test_bounded_ingress_renderer_preserves_body_and_rejects_unreviewed_prefix(self):
+        fixture, admission = create_verified_source_fixture(self, PROJECT_ID, workflow_id(0))
+        value = admission.value
+        value["schema"] = operations.SOURCE_ADMISSION_V2_SCHEMA
+        value["binding"] = {
+            "kind": "r2-installed",
+            "installation_binding_sha256": value.pop("installation_binding_sha256"),
+        }
+        value["ingress"] = {"kind": "agent-edge", "edge_id": "entry"}
+        verified = synthetic_verified_source_admission(
+            value, project_id=PROJECT_ID, workflow_id=workflow_id(0),
+            project_root=fixture.project, kent_path=fixture.native_bin,
+        )
+        old = "INITIAL SOURCE ADMISSION\nQualified initial commit: " + "b" * 40 + "\n\n"
+        capture = {
+            "workflow_id": workflow_id(0), "expected_version": 13,
+            "execution_target_policy": {"mode": "custom_ref", "custom_ref": "c" * 40},
+            "graph": {
+                "nodes": [{"id": "start", "key": "backlog", "kind": "agent"},
+                          {"id": "plan", "key": "plan", "kind": "agent"}],
+                "node_groups": [],
+                "transition_groups": [{"id": "group", "source_node_id": "start"}],
+                "edges": [{
+                    "id": "entry", "key": "start_plan", "transition_group_id": "group",
+                    "target_node_id": "plan", "requires_approval": True,
+                    "context_mode": "continue_session",
+                    "parameters": [{"key": "carrier"}],
+                    "prompt_template": old + "Plan body remains byte exact.\n",
+                }],
+            },
+        }
+        from workflowkit.delivery import render_source_ingress
+        arguments = dict(
+            ingress=value["ingress"], admission=verified, reviewed_prefix=old,
+            reviewed_prefix_sha256=hashlib.sha256(old.encode()).hexdigest(),
+            qualified_target={"commit_oid": "d" * 40, "tree_oid": "e" * 40},
+        )
+        before = canonical_bytes(capture)
+        after = render_source_ingress(capture, **arguments)
+        self.assertEqual(canonical_bytes(capture), before)
+        self.assertEqual(after["execution_target_policy"]["custom_ref"], "d" * 40)
+        self.assertEqual(after["graph"]["edges"][0]["requires_approval"], True)
+        self.assertTrue(after["graph"]["edges"][0]["prompt_template"].endswith(
+            "Plan body remains byte exact.\n"))
+        self.assertEqual(render_source_ingress(after, **arguments), after)
+        for change in (
+            {"reviewed_prefix_sha256": "0" * 64},
+            {"reviewed_prefix": "different"},
+            {"qualified_target": {"commit_oid": "wrong", "tree_oid": "e" * 40}},
+            {"ingress": {"kind": "agent-edge", "edge_id": "foreign"}},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                render_source_ingress(capture, **{**arguments, **change})
+        bypass = json.loads(before)
+        bypass["graph"]["edges"].append({
+            **bypass["graph"]["edges"][0], "id": "bypass",
+        })
+        with self.assertRaises(ValueError):
+            render_source_ingress(bypass, **arguments)
+        script_value = verified.value
+        script_value["ingress"]["kind"] = "script-edge"
+        script_admission = synthetic_verified_source_admission(
+            script_value, project_id=PROJECT_ID, workflow_id=workflow_id(0),
+            project_root=fixture.project, kent_path=fixture.native_bin,
+        )
+        with self.assertRaisesRegex(ValueError, "exact ingress"):
+            render_source_ingress(capture, **{
+                **arguments, "ingress": script_value["ingress"], "admission": script_admission,
+            })
+        from workflowkit.delivery import SOURCE_ADMISSION_END
+        for text in (SOURCE_ADMISSION_END, "Qualified initial Git tree: " + "f" * 40):
+            altered = json.loads(before)
+            altered["graph"]["edges"][0]["prompt_template"] += text
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                render_source_ingress(altered, **arguments)
+        altered = json.loads(canonical_bytes(after))
+        altered["execution_target_policy"]["custom_ref"] = "f" * 40
+        with self.assertRaises(ValueError):
+            render_source_ingress(altered, **arguments)
+
+    def test_one_installation_admits_explicit_receipt_owner_for_another_workflow(self):
+        target, owner = workflow_id(0), workflow_id(1)
+        fixture, verified = create_verified_source_fixture(
+            self, PROJECT_ID, target, receipt_workflow_id=owner,
+        )
+        self.assertEqual(verified.workflow_id, target)
+        self.assertEqual(verified.inspection["workflow_id"], owner)
+        from workflowkit.delivery import source_admission_gate
+        self.assertIn(f'"workflow_id":"{target}"', verified.gate)
+        self.assertIn(f"--workflow-id {owner}", verified.gate)
+        with mock.patch.object(operations, "admit_source_admission", return_value=verified):
+            result = operations._admit_v2_source({
+                "project_root": fixture.project, "kent": fixture.native_bin,
+            }, {
+                "project_id": PROJECT_ID, "workflow_id": target,
+                "source_admission": verified.value,
+            })
+            self.assertEqual(result["inspection"]["workflow_id"], owner)
+        with mock.patch.object(operations.Path, "home", return_value=fixture.home), \
+                mock.patch.dict(os.environ, {"HOME": str(fixture.home)}):
+            def inspect(value):
+                return REAL_ADMIT_SOURCE_ADMISSION(
+                    value, project_id=PROJECT_ID, workflow_id=target,
+                    project_root=fixture.project, kent_path=fixture.native_bin,
+                )
+            for selected in (target, None):
+                value = verified.value
+                if selected is None:
+                    value["binding"].pop("receipt_workflow_id")
+                else:
+                    value["binding"]["receipt_workflow_id"] = selected
+                with self.subTest(owner=selected), self.assertRaises(PlanValidationError):
+                    inspect(value)
+            value = verified.value
+            value["binding"]["unknown"] = owner
+            with self.assertRaises(PlanValidationError):
+                inspect(value)
+            self.assertEqual(
+                verified.gate, source_admission_gate(
+                    verified.value, project_id=PROJECT_ID, workflow_id=target,
+                    project_root=str(fixture.project),
+                ),
+            )
+            profile = fixture.project / ".kent/workflow-profile.toml"
+            profile.write_text(profile.read_text() + "\n# stale installed profile\n")
+            with self.assertRaises(PlanValidationError):
+                inspect(verified.value)
+
     def test_invalid_original_native_ids_and_references_never_dispatch(self):
         for invalid in (str(uuid.uuid5(uuid.NAMESPACE_URL, "native-edge")),
                         "C3150BF8-B900-4C87-BDF6-A1A47C74927C"):
@@ -2910,6 +3223,40 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
         self.assertEqual(len(four_approvals), 4)
         self.assertEqual(len({row["record_sha256"] for row in four_approvals}), 4)
 
+        frozen_edge = json.loads(branch["effective_edge_configuration_json"])
+        frozen_edge["parameters"] = [
+            {"key": "delivery_context", "purpose": "ordinary", "description": "v1"},
+        ]
+        branch["effective_edge_configuration_json"] = canonical_bytes(frozen_edge).decode("utf-8")
+        graph_edge["parameters"] = [
+            {"key": "delivery_context", "purpose": "ordinary", "description": "v1/v2"},
+        ]
+        affected: set[str] = set()
+        envelope = operations._native_approval_payload(
+            approval, [branch], nodes, workflow_id_value, workflow_graph, affected_decisions=affected,
+        )
+        self.assertEqual(affected, {approval["id"]})
+        self.assertEqual(envelope, {"approval": approval, "branches": [branch]})
+        baseline = digest(approval, branch)
+        for column, source in (
+            ("transition_snapshot_json", approval), ("materialized_values_json", approval),
+            ("target_snapshot_json", branch), ("effective_edge_configuration_json", branch),
+            ("context_source_resolution_json", branch),
+        ):
+            changed_approval, changed_branch = dict(approval), dict(branch)
+            (changed_approval if source is approval else changed_branch)[column] = " " + source[column]
+            self.assertNotEqual(digest(changed_approval, changed_branch), baseline, column)
+        # A target's other semantic edits must not conceal its description edit.
+        graph_edge["parameters"][0]["description"] = "v1"
+        target_graph = json.loads(json.dumps(workflow_graph))
+        target_graph["edges"][0]["parameters"][0].update(description="v1/v2", purpose="target_assignee")
+        affected.clear()
+        operations._native_approval_payload(
+            approval, [branch], nodes, workflow_id_value, workflow_graph,
+            affected_decisions=affected, target_graph=target_graph,
+        )
+        self.assertEqual(affected, {approval["id"]})
+
     def test_native_process_adapters_bind_executable_and_database_descriptors(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
             root = Path(temporary) / "persistence"
@@ -3701,6 +4048,196 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                         connection.execute("SELECT DISTINCT workflow_version FROM task_pending_approvals").fetchall(),
                         [(16,)],
                     )
+
+    def test_native_frozen_parameter_description_drift_is_readable_but_requires_decision_review(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            plan, context, observed = native_canonical_v2_plan(
+                fixture, self, production_shape=True, with_approvals=True, synchronize_effects=True,
+                approval_descriptions=("workflow-delivery-context-v1", "workflow-delivery-context-v1/v2",
+                                       "workflow-delivery-context-v1/v2"),
+            )
+            self.assertEqual(len(observed["compatibility_snapshot"]["native_components"]["approvals"]), 4)
+            with native_observer_patches(context), mock.patch.object(operations, "_settle_or_run") as dispatch:
+                with self.assertRaisesRegex(PlanValidationError, "omits a changed semantic path"):
+                    reconcile_canonical_workflows(plan, mode="prepare")
+                dispatch.assert_not_called()
+
+    def test_native_parameter_description_exception_is_strict_and_exact_only_for_unknown_shapes(self) -> None:
+        frozen = [
+            {"key": "delivery_context", "purpose": "ordinary", "description": "v1", "extra": {"a": 1}},
+            {"key": "other", "purpose": "ordinary", "description": "Unchanged"},
+        ]
+        changed = json.loads(json.dumps(frozen))
+        changed[0]["description"] = "v1/v2"
+        self.assertTrue(operations._native_parameters_description_compatible(frozen, changed))
+        invalid = []
+        for key, value in (("key", "renamed"), ("purpose", "target_assignee"), ("extra", {}),
+                           ("extra", {"a": True})):
+            row = json.loads(json.dumps(changed))
+            row[0][key] = value
+            invalid.append(row)
+        for value in (None, 1, {}, []):
+            row = json.loads(json.dumps(changed))
+            row[0]["description"] = value
+            invalid.append(row)
+        missing = json.loads(json.dumps(changed))
+        del missing[0]["description"]
+        added = json.loads(json.dumps(changed))
+        added[0]["unknown"] = None
+        invalid.extend((missing, added, changed[::-1], changed[:1], changed + [changed[0]], {}, None))
+        for row in invalid:
+            with self.subTest(row=row):
+                self.assertFalse(operations._native_parameters_description_compatible(frozen, row))
+        for unknown in ({}, None, {"input": "v1"}, [{"key": "input"}]):
+            self.assertTrue(operations._native_parameters_description_compatible(unknown, unknown))
+        self.assertFalse(operations._native_parameters_description_compatible({"input": "v1"}, {"input": "v2"}))
+        missing = json.loads(json.dumps(frozen))
+        del missing[1]["description"]
+        changed = json.loads(json.dumps(missing))
+        changed[0]["description"] = "v1/v2"
+        self.assertFalse(operations._native_parameters_description_compatible(missing, changed))
+        for key in ("key", "purpose"):
+            unknown = json.loads(json.dumps(frozen))
+            del unknown[0][key]
+            changed = json.loads(json.dumps(unknown))
+            changed[0]["description"] = "v1/v2"
+            self.assertFalse(operations._native_parameters_description_compatible(unknown, changed))
+
+    def test_native_description_review_covers_frozen_current_target_without_changing_approvals(self) -> None:
+        for descriptions in (("v1", "v1/v2", "v1/v2"), ("v1", "v1", "v1/v2"),
+                             ("v1", "v1/v2", "v1"), ("v1", "v1", "v1")):
+            with self.subTest(descriptions=descriptions), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+                fixture = make_workflow_fixture(Path(temporary))
+                plan, context, observed = native_canonical_v2_plan(
+                    fixture, self, production_shape=True, with_approvals=True, synchronize_effects=True,
+                    intent="graph-and-metadata", approval_descriptions=descriptions,
+                )
+                tables = ("task_pending_approvals", "task_pending_approval_branches", "task_current_nodes")
+                before = [context["connection"].execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall()
+                          for table in tables]
+                parsed = operations._validate_canonical_v2_plan(plan)
+                affected: set[str] = set()
+                with native_observer_patches(context):
+                    live = operations._canonical_v2_read(parsed, parsed["workflows"][0], affected_decisions=affected)
+                    self.assertEqual(live, observed)
+                    if len(set(descriptions)) > 1:
+                        self.assertEqual(len(affected), 4)
+                        with self.assertRaisesRegex(PlanValidationError, "omits a changed semantic path"):
+                            reconcile_canonical_workflows(plan, mode="prepare")
+                        plan = review_native_description_decisions(fixture, plan, context)
+                    else:
+                        self.assertEqual(affected, set())
+                    self.assertEqual(reconcile_canonical_workflows(plan, mode="prepare")["phase"], "prepared")
+                    self.assertEqual(reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)["phase"],
+                                     "complete")
+                    current = operations._canonical_v2_read(parsed, parsed["workflows"][0])
+                self.assertEqual(current["compatibility_snapshot"]["native_components"]["approvals"],
+                                 observed["compatibility_snapshot"]["native_components"]["approvals"])
+                for table, rows in zip(tables, before):
+                    self.assertEqual(context["connection"].execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall(),
+                                     rows)
+                self.assertEqual(len(graph_apply_rows(fixture)), 1)
+
+    def test_native_description_review_is_only_required_for_affected_decisions(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(
+                fixture, self, production_shape=True, with_approvals=True,
+                approval_descriptions=("v1", "v1/v2", "v1/v2"),
+            )
+            connection = context["connection"]
+            identity, raw = connection.execute(
+                "SELECT approval_id,effective_edge_configuration_json FROM task_pending_approval_branches "
+                "ORDER BY approval_id LIMIT 1"
+            ).fetchone()
+            # Three frozen decisions already describe the expanded contract.
+            edge = json.loads(raw)
+            edge["parameters"][0]["description"] = "v1/v2"
+            connection.execute(
+                "UPDATE task_pending_approval_branches SET effective_edge_configuration_json=? WHERE approval_id!=?",
+                (canonical_bytes(edge).decode("utf-8"), identity),
+            )
+            connection.commit()
+            parsed = operations._validate_canonical_v2_plan(plan)
+            affected: set[str] = set()
+            with native_observer_patches(context):
+                observed = operations._canonical_v2_read(parsed, parsed["workflows"][0], affected_decisions=affected)
+            self.assertEqual(affected, {identity})
+            value = plan.value
+            item = value["workflows"][0]
+            for task in item["compatibility_snapshot"]["tasks"]:
+                live_task = next(row for row in observed["compatibility_snapshot"]["tasks"] if row["id"] == task["id"])
+                task["pending_decisions"] = live_task["pending_decisions"]
+            item["compatibility_snapshot"]["native_components"] = observed["compatibility_snapshot"]["native_components"]
+            review = json.loads(context["review_path"].read_bytes())
+            review["compatibility_snapshot_sha256"] = canonical_sha256(item["compatibility_snapshot"])
+            raw = canonical_bytes(review)
+            context["review_path"].write_bytes(raw)
+            item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+            plan = review_native_description_decisions(
+                fixture, write_canonical_v2_plan(fixture, value), context, {identity},
+            )
+            with native_observer_patches(context):
+                self.assertEqual(reconcile_canonical_workflows(plan, mode="prepare")["phase"], "prepared")
+
+    def test_native_description_drift_after_prepare_and_during_admission_blocks_dispatch(self) -> None:
+        for timing in ("after-prepare", "during-admission"):
+            with self.subTest(timing=timing), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+                fixture = make_workflow_fixture(Path(temporary))
+                plan, context, _ = native_canonical_v2_plan(
+                    fixture, self, production_shape=True, with_approvals=True, synchronize_effects=True,
+                    approval_descriptions=("v1", "v1", "v1"),
+                )
+                def drift():
+                    connection = context["connection"]
+                    for identity, raw in connection.execute(
+                        "SELECT approval_id,effective_edge_configuration_json FROM task_pending_approval_branches"
+                    ).fetchall():
+                        edge = json.loads(raw)
+                        edge["parameters"][0]["description"] = "v1/v2"
+                        connection.execute(
+                            "UPDATE task_pending_approval_branches SET effective_edge_configuration_json=? "
+                            "WHERE approval_id=?", (canonical_bytes(edge).decode("utf-8"), identity),
+                        )
+                    connection.commit()
+                admit = operations._admit_v2_source
+                def admit_then_drift(*args, **kwargs):
+                    result = admit(*args, **kwargs)
+                    drift()
+                    return result
+                with native_observer_patches(context):
+                    reconcile_canonical_workflows(plan, mode="prepare")
+                    if timing == "after-prepare":
+                        drift()
+                    with mock.patch.object(operations, "_admit_v2_source", side_effect=admit_then_drift):
+                        with mock.patch.object(operations, "_settle_or_run") as dispatch:
+                            with self.assertRaisesRegex(EffectBlocked, "inventory drifted"):
+                                reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+                            dispatch.assert_not_called()
+                self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_native_description_settlement_does_not_require_review_or_replay(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            plan, context, _ = native_canonical_v2_plan(
+                fixture, self, production_shape=True, with_approvals=True, synchronize_effects=True,
+                approval_descriptions=("v1", "v1/v2", "v1/v2"),
+            )
+            plan = review_native_description_decisions(fixture, plan, context)
+            with native_observer_patches(context):
+                reconcile_canonical_workflows(plan, mode="prepare")
+                install_v2_unresolved_graph_postimage(fixture, plan)
+                context["connection"].execute("UPDATE workflows SET version=2")
+                context["connection"].commit()
+                context["review_path"].unlink()
+                with mock.patch.object(operations, "_canonical_v2_plan_check",
+                                       side_effect=AssertionError("settlement must not require review")):
+                    report = reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+                self.assertEqual(report["settled"], "postimage")
+                self.assertEqual(reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)["phase"],
+                                 "complete")
+            self.assertEqual(graph_apply_rows(fixture), [])
 
     def test_native_frozen_approval_drift_blocks_before_dispatch(self) -> None:
         changes = [
@@ -4706,7 +5243,68 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 self.assertEqual(delegated.call_args.args[0], admission)
                 provider.assert_not_called()
 
-            invalid_graphs = []
+            document = root / "ingress.json"
+            root.chmod(0o700)
+            description = operations.create_script_ingress_reference(
+                document, admission, project_id=PROJECT_ID, workflow_id=wid,
+            )
+            with self.assertRaises(FileExistsError):
+                operations.create_script_ingress_reference(
+                    document, admission, project_id=PROJECT_ID, workflow_id=wid,
+                )
+            compact_graph = json.loads(json.dumps(frame_graph))
+            compact_graph["graph"]["edges"][0].pop("prompt_template")
+            compact_graph["graph"]["transition_groups"][0]["description"] = description
+            from workflowkit.graph import native_graph_postimage
+            encoded = native_graph_postimage(compact_graph["graph"], workflow_id=wid)
+            self.assertNotIn("prompt_template", encoded["edges"][0])
+            self.assertEqual(encoded["transition_groups"][0]["description"], description)
+            operations._v2_source_gate_check(
+                frame_graph["graph"], encoded, admission,
+                project_id=PROJECT_ID, workflow_id=wid, project_root=root,
+            )
+            with mock.patch.object(operations, "_run", project_read), \
+                    mock.patch.object(operations, "_kent_json", side_effect=[detail, compact_graph]), \
+                    mock.patch.object(operations, "admit_source_admission", delegated):
+                self.assertIs(admit_script_source_ingress(root, context, kent_path=kent),
+                              delegated.return_value)
+            operations._v2_source_gate_check(
+                frame_graph["graph"], compact_graph["graph"], admission,
+                project_id=PROJECT_ID, workflow_id=wid, project_root=root,
+            )
+            description = compact_graph["graph"]["transition_groups"][0]["description"]
+            with self.assertRaises(PlanValidationError):
+                operations.read_script_ingress_reference(description + " ")
+            document.chmod(0o644)
+            with self.assertRaises(PlanValidationError):
+                operations.read_script_ingress_reference(description)
+            document.chmod(0o600)
+            document.write_bytes(b"{}")
+            with self.assertRaises(PlanValidationError):
+                operations.read_script_ingress_reference(description)
+            document.write_bytes(canonical_bytes({
+                "project_id": PROJECT_ID, "workflow_id": wid,
+                "source_admission": admission,
+            }))
+            alias = root / "linked-ingress.json"
+            os.link(document, alias)
+            with self.assertRaises(PlanValidationError):
+                operations.read_script_ingress_reference(description)
+            alias.unlink()
+            alias.symlink_to(document)
+            linked_reference = json.loads(description)
+            linked_reference["path"] = str(alias)
+            with self.assertRaises(PlanValidationError):
+                operations.read_script_ingress_reference(canonical_bytes(linked_reference).decode())
+            foreign = dict(admission, kit_root=str(root / "foreign-kit"))
+            with self.assertRaises(PlanValidationError):
+                operations._v2_source_gate_check(
+                    frame_graph["graph"], compact_graph["graph"], foreign,
+                    project_id=PROJECT_ID, workflow_id=wid, project_root=root,
+                )
+            dual = json.loads(json.dumps(compact_graph))
+            dual["graph"]["edges"][0]["prompt_template"] = gate
+            invalid_graphs = [dual]
             wrong_edge = json.loads(json.dumps(frame_graph))
             wrong_edge["graph"]["edges"][0]["id"] = "0f9e86ff-97fd-4c71-9264-82e4ded41473"
             invalid_graphs.append(wrong_edge)

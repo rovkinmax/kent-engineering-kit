@@ -118,6 +118,10 @@ COMMAND_TEMPLATES = {
         REPO_ROOT / "workflowkit" / "project_memory.py",
         "1.0.0",
     ),
+    "kit_runtime_loader": CommandTemplate(
+        REPO_ROOT / "workflowkit" / "kit_runtime.py",
+        "1.0.0",
+    ),
 }
 V2_COMMANDS = {
     "runtime_contracts",

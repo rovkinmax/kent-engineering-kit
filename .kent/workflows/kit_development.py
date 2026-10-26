@@ -161,6 +161,10 @@ def build_published_current_workflow(profile: ProjectProfile, admission) -> Work
 
     if not isinstance(admission, VerifiedSourceAdmission):
         raise SpecError("published rendering requires VerifiedSourceAdmission")
+    if admission.value.get("schema") == "delivery-source-admission-v2" and (
+        admission.value.get("binding", {}).get("kind") != "r2-installed"
+    ):
+        raise SpecError("the R2-required Kit final graph needs r2-installed admission")
     if (Path(admission.project_root) != profile.project_root.resolve()
             or admission.project_id != "project-135413f9-2454-4d04-969e-3831b1527f18"
             or admission.workflow_id != "4e7cea43-54f5-4662-8d5d-c8db3d816c74"

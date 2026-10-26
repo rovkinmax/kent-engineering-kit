@@ -1205,7 +1205,9 @@ jobs:
                 transport("ci_prepare_ready_initial", prepared),
             )
             self.assertEqual(green["transition"], "ci_watch_failed", green)
-            report = runtime.validate_dynamic_ci_report(json.loads(green["ci_report"]))
+            self.assertNotIn("ci_report", green)
+            context = runtime.validate_delivery_context(json.loads(green["delivery_context"]))
+            report = runtime.validate_dynamic_ci_report(json.loads(context["ci_report"]))
             self.assertEqual(report["schema"], "github-ci-report-v3")
             self.assertEqual(report["attempts"][-1]["reason"], "failed")
             self.assertEqual(len(report["attempts"][-1]["checks"]), 2)

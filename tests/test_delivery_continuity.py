@@ -901,6 +901,80 @@ class DeliveryPackingCommandTests(unittest.TestCase):
         self.assertEqual(preserved["ci_contract"], ci_contract)
         self.assertEqual(preserved["ci_report"], ci_report)
 
+        recovery, _ = capture_producer(
+            root, identity=identity, producer_kind="wait-ci",
+            inputs={"ci_report": '{"report":"previous observation"}'},
+            result={
+                "transition": "ci_watch_failed", "workspace_path": str(root),
+                "task_short_id": identity["task_short_id"], "delivery_context": prior_raw,
+                **{key: value for key, value in flat.items() if key != "ci_report"},
+            },
+        )
+        with patch.object(ProjectProfile, "from_toml", return_value=profile):
+            _, recovery_raw = pack_delivery(
+                root, {**request, "producer_refs": [recovery]}, identity=identity,
+                task_detail=detail, graph=graph,
+            )
+        self.assertEqual(json.loads(recovery_raw)["delivery_context"], prior_raw)
+
+        from workflowkit.delivery import require_github_provider_read
+        from workflowkit.runtime import build_dynamic_ci_report, canonical_sha256
+
+        contract = {
+            "schema": "github-ci-contract-v1", "repository": "owner/repo",
+            "pull_number": 7, "head_oid": "a" * 40, "base_oid": "b" * 40,
+            "require_ci": True,
+        }
+        checks = [{
+            "workflow_name": "CI", "check_name": "test", "event": "",
+            "bucket": "fail", "state": "FAILURE", "link": None,
+        }]
+        report = build_dynamic_ci_report(contract=contract, attempts=[{
+            "sequence": 1, "head_oid": "a" * 40, "base_oid": "b" * 40,
+            "retry": None, "checks": checks, "check_count": 1,
+            "checks_sha256": canonical_sha256(checks), "reason": "failed",
+            "watcher_exit_code": 1, "error": None,
+        }])
+        ordinary_context = canonical_bytes({
+            **prior_context, "ci_report": canonical_bytes(report).decode("utf-8"),
+        }).decode("utf-8")
+        ordinary, _ = capture_producer(
+            root, identity=identity, producer_kind="wait-ci", inputs={},
+            result={
+                "transition": "ci_watch_failed", "workspace_path": str(root),
+                "task_short_id": identity["task_short_id"],
+                "delivery_context": ordinary_context,
+            },
+        )
+        with patch.object(ProjectProfile, "from_toml", return_value=profile):
+            packed, ordinary_raw = pack_delivery(
+                root, {**request, "producer_refs": [ordinary]}, identity=identity,
+                task_detail=detail, graph=graph,
+            )
+        self.assertEqual(json.loads(ordinary_raw)["delivery_context"], ordinary_context)
+        require_github_provider_read(root, [ordinary], identity)
+        require_github_provider_read(root, [packed], identity)
+        from workflowkit.delivery import _historical_provider_failure
+
+        for invalid_result in (
+            {"transition": "ci_watch_failed"},
+            {"transition": "ci_watch_failed", "delivery_context": "broken"},
+            {
+                "transition": "ci_watch_failed", "delivery_context": ordinary_context,
+                "ci_report": "conflicting flat report",
+            },
+            {
+                "transition": "ci_watch_failed",
+                "delivery_context": canonical_bytes({
+                    **prior_context, "ci_report": "corrupt",
+                }).decode("utf-8"),
+            },
+        ):
+            with self.subTest(invalid_result=invalid_result):
+                self.assertTrue(_historical_provider_failure({
+                    "producer_kind": "wait-ci", "result": invalid_result,
+                }))
+
         inconsistent, _ = capture_producer(
             root,
             identity=identity,
@@ -1958,7 +2032,7 @@ class ScriptProducerIdentityTests(unittest.TestCase):
         def execute_source(source_loader, module):
             original_exec_module(source_loader, module)
             if Path(source_loader.path).resolve() == checkpoint_path.resolve():
-                module.delivery_module = lambda: delivery
+                module.delivery_module = lambda *_args: delivery
                 module.delivery_native_read = self.read
                 checkpoint_modules.append(module)
 
@@ -2304,6 +2378,16 @@ class ScriptProducerIdentityTests(unittest.TestCase):
 
 
 class DeliveryContinuityTest(unittest.TestCase):
+    def test_delivery_context_rejects_non_string_schema(self):
+        from workflowkit.runtime import RuntimeContractError, validate_delivery_context
+
+        for schema in ([], {}, None, 1, True):
+            with self.subTest(schema=schema):
+                with self.assertRaisesRegex(
+                    RuntimeContractError, "unsupported delivery context schema",
+                ):
+                    validate_delivery_context({"schema": schema, "phase": "pre_pr"})
+
     def test_revalidation_preserves_retained_owner_and_authority(self) -> None:
         profiles = {
             "runtime-v2-with-ci": runtime_v2_profile(ci=True, source_ci=True),
@@ -2723,10 +2807,7 @@ class DeliveryContinuityTest(unittest.TestCase):
         )
         flat_observation_edges = {
             "ci_prepare_failed",
-            "ci_watch_diagnose",
             "ci_watch_waiting_pr",
-            "ci_watch_state_changed",
-            "waiting_pr_needs_user_action",
         }
         scoped_prior_key = "verification_dispatch_fanout_verify"
         dispatch = edges["dispatch_deterministic_verify"]
@@ -2756,7 +2837,7 @@ class DeliveryContinuityTest(unittest.TestCase):
             gate.prompt or "",
         )
 
-    def test_observer_recovery_loops_keep_flat_delivery_contracts(self) -> None:
+    def test_source_ci_recovery_loops_preserve_optional_report_context(self) -> None:
         source_profile = runtime_v2_profile(ci=True, source_ci=True)
         source_edges = edge_map(source_profile)
         ci_prompt = source_edges["ci_watch_diagnose"].prompt or ""
@@ -2768,8 +2849,7 @@ class DeliveryContinuityTest(unittest.TestCase):
 
         self.assertIn("For `ci_monitor_needs_changes`, pack", ci_prompt)
         self.assertIn(
-            "Keep `ci_monitor_needs_user_action` on its existing flat "
-            "self-recovery contract.",
+            "For `ci_monitor_needs_user_action`, preserve the validated `delivery_context`",
             ci_prompt_compact,
         )
         self.assertIn(
@@ -2777,19 +2857,19 @@ class DeliveryContinuityTest(unittest.TestCase):
             waiting_prompt,
         )
         self.assertIn(
-            "Keep `waiting_pr_needs_user_action` on its existing flat "
-            "self-recovery contract.",
+            "For `waiting_pr_needs_user_action`, preserve the validated `delivery_context`",
             waiting_prompt_compact,
         )
         for key in (
             "ci_monitor_needs_user_action",
             "waiting_pr_needs_user_action",
         ):
-            self.assertNotIn(
+            self.assertIn(
                 "delivery_context",
                 {parameter.key for parameter in source_edges[key].parameters},
                 key,
             )
+            self.assertNotIn("ci_report", {p.key for p in source_edges[key].parameters})
 
         non_source_profile = ProjectProfile.from_toml(
             REPO_ROOT,

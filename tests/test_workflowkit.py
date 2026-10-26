@@ -4894,6 +4894,107 @@ class WorkflowKitTest(unittest.TestCase):
             {node.key for node in build_delivery_workflow(profile, 1).nodes},
         )
 
+    def test_schema_four_kit_runtime_binding_is_closed_and_versioned(self) -> None:
+        def add_runtime(contents: str) -> str:
+            contents = contents.replace(
+                "schema_version = 4\n",
+                (
+                    "schema_version = 4\n"
+                    'kit_runtime = { schema_version = 1, '
+                    'root = "/opt/kent-engineering-kit", '
+                    f'commit = "{"a" * 40}", '
+                    'publication_ref = "refs/remotes/origin/main" }\n'
+                ),
+                1,
+            )
+            contents = contents.replace(
+                'kit_managed_commands = ["dispatch"]',
+                'kit_managed_commands = ["dispatch", "kit_runtime_loader"]',
+                1,
+            )
+            contents = contents.replace(
+                "[commands]\n",
+                (
+                    "[commands]\n"
+                    'kit_runtime_loader = '
+                    '".kent/scripts/workflow_kit_runtime.py"\n'
+                ),
+                1,
+            )
+            return contents.replace(
+                'dispatch = "1.0.0"\n',
+                'dispatch = "1.0.0"\nkit_runtime_loader = "1.0.0"\n',
+                1,
+            )
+
+        profile = self.load_schema4_profile(add_runtime)
+        self.assertEqual(
+            profile.kit_runtime.root,
+            "/opt/kent-engineering-kit",
+        )
+        self.assertEqual(profile.kit_runtime.commit, "a" * 40)
+        self.assertEqual(
+            profile.kit_runtime.publication_ref,
+            "refs/remotes/origin/main",
+        )
+        self.assertEqual(
+            profile.command_versions["kit_runtime_loader"],
+            "1.0.0",
+        )
+
+        invalid_overrides = (
+            (
+                "publication ref",
+                lambda contents: add_runtime(contents).replace(
+                    "refs/remotes/origin/main",
+                    "refs/heads/main",
+                ),
+            ),
+            (
+                "loader command",
+                lambda contents: add_runtime(contents).replace(
+                    ".kent/scripts/workflow_kit_runtime.py",
+                    ".kent/scripts/other.py",
+                ),
+            ),
+            (
+                "loader version",
+                lambda contents: add_runtime(contents).replace(
+                    'kit_runtime_loader = "1.0.0"',
+                    'kit_runtime_loader = "2.0.0"',
+                ),
+            ),
+            (
+                "loader ownership",
+                lambda contents: add_runtime(contents).replace(
+                    'kit_managed_commands = ["dispatch", "kit_runtime_loader"]',
+                    'kit_managed_commands = ["dispatch"]',
+                ),
+            ),
+        )
+        for label, transform in invalid_overrides:
+            with self.subTest(label=label), self.assertRaises(SpecError):
+                self.load_schema4_profile(transform)
+
+        adapter_only = EXAMPLE_PROFILE.read_text().replace(
+            "[commands]\n",
+            (
+                "[commands]\n"
+                'kit_runtime_source_binding = '
+                '".kent/scripts/workflow_sdk_source_binding.py"\n'
+            ),
+            1,
+        )
+        with self.assertRaisesRegex(
+            SpecError,
+            "requires a kit_runtime binding",
+        ):
+            ProjectProfile.from_toml(
+                REPO_ROOT,
+                adapter_only,
+                check_files=False,
+            )
+
     def test_optional_project_memory_profile_is_closed_and_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -5232,10 +5333,13 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertIn("{{.Params.pr_feedback_cursor}}", prompts)
         self.assertIn("deterministic PR watcher", prompts)
         self.assertIn("pull_request_feedback_invalid", prompts)
-        for key in ("ci_prepare_failed", "ci_monitor_needs_user_action"):
+        for key in ("ci_prepare_failed",):
             self.assertTrue({
                 "task_short_id", "ci_report", "ci_contract",
             } <= {parameter.key for parameter in by_key[key].parameters}, key)
+        recovery_fields = {p.key for p in by_key["ci_monitor_needs_user_action"].parameters}
+        self.assertTrue({"task_short_id", "delivery_context", "ci_contract"} <= recovery_fields)
+        self.assertNotIn("ci_report", recovery_fields)
         self.assertEqual(
             tuple(parameter.key for parameter in by_key["ci_monitor_fix"].parameters),
             ("workspace_path", "fix_context", "delivery_context"),

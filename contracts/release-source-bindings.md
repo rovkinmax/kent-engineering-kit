@@ -34,8 +34,11 @@ helper reports the supplied object ID, resolved tree ID, and commit ID when the
 selector is a commit. It never falls back to `HEAD`, the index, or working-tree
 bytes.
 
-CI supplies its explicitly selected checked-out commit, for example
-`--ref "$GITHUB_SHA"`; the project owns checkout/event policy.
+An orchestration/source-validation CI job supplies its explicitly selected
+checked-out commit, for example `--ref "$GITHUB_SHA"`; the project owns
+checkout/event policy. This example does not make Kent source-binding checks
+a dependency of product CI; follow the
+[product CI boundary](workflow-contract.md#product-ci-boundary).
 
 The optional kind map is itself read as a regular blob from the same selected
 tree. Its closed JSON form is:

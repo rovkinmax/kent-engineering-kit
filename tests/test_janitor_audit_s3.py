@@ -35,6 +35,40 @@ class JanitorAuditS3Test(unittest.TestCase):
     def janitor(self, name: str):
         return load_template_module(JANITOR_SOURCE, name)
 
+    def test_explicit_runtime_handle_is_retained_without_requalification(self) -> None:
+        module = self.janitor("janitor_explicit_runtime")
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve() / "absent"
+            qualified = SimpleNamespace(
+                native_authorized=True, project_root=workspace,
+                source_root=Path(directory).resolve(),
+            )
+            checkpoint = mock.Mock()
+            checkpoint.qualified_kit_runtime.side_effect = AssertionError(
+                "supplied handle must not be requalified"
+            )
+            payload = json.loads(self.fixtures.janitor_input(
+                workspace, branch_name="TASK-1", cleanup_mode="no_pr",
+                pr_base_branch="not-applicable", cleanup_report="opaque",
+            ))
+            output = io.StringIO()
+            with (
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))),
+                mock.patch.object(sys, "stdout", output),
+            ):
+                self.assertEqual(module.main(
+                    qualified=qualified, checkpoint=checkpoint,
+                ), 0)
+            self.assertIs(module._QUALIFIED_KIT_RUNTIME, qualified)
+            checkpoint.qualified_kit_runtime.assert_not_called()
+            checkpoint.kit_module.assert_called_once_with(
+                "runtime", project_root=workspace, qualified=qualified,
+            )
+            self.assertEqual(json.loads(output.getvalue())["transition"],
+                             "task_janitor_blocked")
+            with self.assertRaisesRegex(ValueError, "supplied together"):
+                module.main(qualified=qualified)
+
     def test_complete_keeps_the_original_terminal_marker_final(self) -> None:
         root, _, scripts, marker = self.fixtures.make_managed_worktree(with_v2=True)
         janitor = load_template_module(
