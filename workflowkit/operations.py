@@ -3873,6 +3873,24 @@ def _native_approval_payload(
             )
             and all(edge[key] is None for key in extra_edge_keys)
         )
+        expected_context = None
+        if edge.get('context_mode') == 'new_session':
+            if target.get('node_kind') == 'agent':
+                expected_context = {
+                    'active_source': {'kind': 'deferred_self'},
+                    'target_session': {'kind': 'create'},
+                }
+        elif edge.get('context_mode') in {'continue_session', 'compact_and_continue_session'}:
+            expected_context = {
+                'active_source': {
+                    'kind': 'exact',
+                    'session_id': approval.get('source_session_id'),
+                },
+                'target_session': {
+                    'kind': 'reuse',
+                    'session_id': approval.get('source_session_id'),
+                },
+            }
         if (
             branch.get('transition_branch_key') != transition.get('transition_id')
             or len(graph_edges) != 1
@@ -3883,15 +3901,7 @@ def _native_approval_payload(
             or target.get('node_id') != edge.get('target_node_id')
             or len(graph_nodes) != 1
             or target.get('node_kind') != graph_nodes[0].get('kind')
-            or set(context) != {'active_source', 'target_session'}
-            or context.get('active_source') != {
-                'kind': 'exact',
-                'session_id': approval.get('source_session_id'),
-            }
-            or context.get('target_session') != {
-                'kind': 'reuse',
-                'session_id': approval.get('source_session_id'),
-            }
+            or context != expected_context
         ):
             raise EffectBlocked('native pending Approval branch differs from the reviewed Workflow context')
         if affected_decisions is not None:

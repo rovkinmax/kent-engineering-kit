@@ -527,6 +527,8 @@ def canonical_v2_plan(
     source_admission_enabled: bool = True,
     name: str = "canonical-plan-v2.json",
     approval_parameter_description: str | None = None,
+    approval_context_mode: str | None = None,
+    prefix_only: bool = False,
 ) -> tuple[operations.LoadedPlan, dict]:
     state = read_state(fixture)
     wid = workflow_id(0)
@@ -586,6 +588,10 @@ def canonical_v2_plan(
             {"key": "delivery_context", "purpose": "ordinary", "description": approval_parameter_description},
             {"key": "other", "purpose": "ordinary", "description": "Unchanged"},
         ]
+    if approval_context_mode is not None:
+        edge = next(row for row in workflow["graph"]["edges"] if row["key"] == "backlog_plan")
+        edge["context_mode"] = approval_context_mode
+        edge["context_source"] = {"kind": "immediate_source"}
     detail = workflow["details"]["TASK-1"]
     detail["live_sessions"] = []
     detail["current_nodes"] = [{"node_id": "90e31940-4c84-466e-8e72-26f53c2f36f4"}]
@@ -605,7 +611,7 @@ def canonical_v2_plan(
     }
     target_graph = json.loads(json.dumps(source_graph))
     target_graph["version"] += 1
-    if not any(edge.get("key") == "implement_replan" for edge in source_graph["edges"]):
+    if not prefix_only and not any(edge.get("key") == "implement_replan" for edge in source_graph["edges"]):
         target_graph["transition_groups"].append({
             "id": "c6a3f68e-7629-404a-8153-2d5f0e32ff0d",
             "source_node_id": "7d280478-d98b-4462-9ae6-f58bf0d5a8d0",
@@ -1182,10 +1188,17 @@ def make_native_persistence(
                 "entered_by_edge_id": edge["id"],
             }
             effective_edge = {**edge, "workflow_id": workflow_id(0)}
-            context = {
-                "active_source": {"kind": "exact", "session_id": None},
-                "target_session": {"kind": "reuse", "session_id": None},
-            }
+            # Materialize the native representation for the actual edge mode.
+            if edge["context_mode"] == "new_session":
+                context = {
+                    "active_source": {"kind": "deferred_self"},
+                    "target_session": {"kind": "create"},
+                }
+            else:
+                context = {
+                    "active_source": {"kind": "exact", "session_id": None},
+                    "target_session": {"kind": "reuse", "session_id": None},
+                }
             connection.execute(
                 "INSERT INTO task_pending_approval_branches VALUES (?, ?, ?, ?, ?)",
                 (
@@ -1328,6 +1341,8 @@ def native_canonical_v2_plan(
     with_questions: bool = False,
     with_bindings: bool = False,
     approval_descriptions: tuple[str, str, str] | None = None,
+    approval_context_mode: str = "new_session",
+    prefix_only: bool = False,
 ) -> tuple[operations.LoadedPlan, dict, dict]:
     if synchronize_effects:
         # Install before canonical_v2_plan binds the executable digest. Only
@@ -1375,6 +1390,8 @@ def native_canonical_v2_plan(
     plan, value = canonical_v2_plan(
         fixture, intent=intent,
         approval_parameter_description=approval_descriptions[1] if approval_descriptions else None,
+        approval_context_mode=approval_context_mode if with_approvals else None,
+        prefix_only=prefix_only,
     )
     home, database, sessions_root, connection, sessions, _, question_input = make_native_persistence(
         fixture,
@@ -3032,7 +3049,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             "assignee_selection": "configured",
             "thinking_selection": "configured",
             "requires_approval": True,
-            "context_mode": "reuse",
+            "context_mode": "continue_session",
             "context_source": {"kind": "current_session"},
             "parameters": {},
             "prompt_template": "Resume the same node.",
@@ -3256,6 +3273,170 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             affected_decisions=affected, target_graph=target_graph,
         )
         self.assertEqual(affected, {approval["id"]})
+
+    def test_native_approval_context_dispatch_is_closed_and_raw_bound(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            _, context, _ = native_canonical_v2_plan(
+                fixture, self, production_shape=True, with_approvals=True,
+            )
+            connection = context["connection"]
+            connection.row_factory = sqlite3.Row
+            original_approval = dict(connection.execute(
+                "SELECT * FROM task_pending_approvals ORDER BY id LIMIT 1",
+            ).fetchone())
+            original_branch = dict(connection.execute(
+                "SELECT * FROM task_pending_approval_branches WHERE approval_id=?",
+                (original_approval["id"],),
+            ).fetchone())
+            original_nodes = [dict(row) for row in connection.execute(
+                "SELECT * FROM task_current_nodes WHERE task_id=?",
+                (original_approval["source_task_id"],),
+            )]
+            original_graph = read_state(fixture)["workflows"][workflow_id(0)]["graph"]
+            for mode in ("new_session", "continue_session", "compact_and_continue_session"):
+                for session_id in (None, "44444444-4444-4444-8444-444444444444"):
+                    with self.subTest(mode=mode, session_id=session_id):
+                        approval = {**original_approval, "source_session_id": session_id}
+                        nodes = [{**row, "session_id": session_id} for row in original_nodes]
+                        graph = json.loads(json.dumps(original_graph))
+                        edge = next(row for row in graph["edges"] if row["key"] == "backlog_plan")
+                        edge["context_mode"] = mode
+                        frozen_edge = {
+                            **json.loads(original_branch["effective_edge_configuration_json"]),
+                            "context_mode": mode,
+                        }
+                        reuse = {
+                            "active_source": {"kind": "exact", "session_id": session_id},
+                            "target_session": {"kind": "reuse", "session_id": session_id},
+                        }
+                        create = {
+                            "active_source": {"kind": "deferred_self"},
+                            "target_session": {"kind": "create"},
+                        }
+                        resolved = create if mode == "new_session" else reuse
+                        branch = {
+                            **original_branch,
+                            "effective_edge_configuration_json": json.dumps(frozen_edge),
+                            "context_source_resolution_json": json.dumps(resolved),
+                        }
+
+                        def payload(current_approval=approval, current_branch=branch,
+                                    current_graph=graph, current_nodes=nodes):
+                            return operations._native_approval_payload(
+                                current_approval, [current_branch], current_nodes, workflow_id(0), current_graph,
+                            )
+
+                        envelope = payload()
+                        self.assertEqual(envelope, {"approval": approval, "branches": [branch]})
+                        baseline = canonical_sha256(envelope)
+                        self.assertNotEqual(
+                            canonical_sha256(payload({**approval, "workflow_version": approval["workflow_version"] + 1})),
+                            baseline,
+                        )
+                        for column, source in (
+                            ("transition_snapshot_json", approval), ("materialized_values_json", approval),
+                            ("target_snapshot_json", branch), ("effective_edge_configuration_json", branch),
+                            ("context_source_resolution_json", branch),
+                        ):
+                            changed_approval, changed_branch = dict(approval), dict(branch)
+                            changed = changed_approval if source is approval else changed_branch
+                            changed[column] = " " + source[column]
+                            self.assertNotEqual(
+                                canonical_sha256(payload(changed_approval, changed_branch)), baseline, column,
+                            )
+                            semantic = json.loads(source[column])
+                            if column == "context_source_resolution_json":
+                                # Every semantic context change is either another
+                                # closed mode or invalid, never silently normalized.
+                                semantic["active_source"]["unexpected"] = True
+                            elif column == "effective_edge_configuration_json":
+                                semantic["prompt_template"] = "Changed frozen prompt bytes."
+                            else:
+                                semantic["fixture_semantic_change"] = True
+                            changed[column] = json.dumps(semantic)
+                            if column == "context_source_resolution_json":
+                                with self.assertRaises(EffectBlocked):
+                                    payload(changed_approval, changed_branch)
+                            else:
+                                self.assertNotEqual(
+                                    canonical_sha256(payload(changed_approval, changed_branch)), baseline, column,
+                                )
+
+                        invalid_contexts = [
+                            reuse if mode == "new_session" else create,
+                            {"active_source": reuse["active_source"], "target_session": create["target_session"]},
+                            {"active_source": create["active_source"], "target_session": reuse["target_session"]},
+                            {**resolved, "extra": None},
+                            {"active_source": resolved["active_source"]},
+                            {"target_session": resolved["target_session"]},
+                        ]
+                        for key in ("active_source", "target_session"):
+                            invalid_contexts.extend([
+                                {**resolved, key: {**resolved[key], "extra": None}},
+                                {**resolved, key: {**resolved[key], "session_id": "foreign-session"}},
+                                {**resolved, key: {"kind": "unknown"}},
+                            ])
+                            if mode == "new_session":
+                                invalid_contexts.append({**resolved, key: {**resolved[key], "session_id": None}})
+                        for invalid in invalid_contexts:
+                            with self.subTest(invalid_context=invalid), self.assertRaises(EffectBlocked):
+                                payload(current_branch={
+                                    **branch, "context_source_resolution_json": json.dumps(invalid),
+                                })
+                        for bad_mode in (None, "", "reuse", "unknown", " new_session"):
+                            bad_graph = json.loads(json.dumps(graph))
+                            next(row for row in bad_graph["edges"] if row["id"] == edge["id"])[
+                                "context_mode"] = bad_mode
+                            with self.subTest(bad_mode=bad_mode), self.assertRaises(EffectBlocked):
+                                payload(current_graph=bad_graph, current_branch={
+                                    **branch, "effective_edge_configuration_json": json.dumps({
+                                        **frozen_edge, "context_mode": bad_mode,
+                                    }),
+                                })
+                        other_mode = "continue_session" if mode == "new_session" else "new_session"
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_branch={
+                                **branch, "effective_edge_configuration_json": json.dumps({
+                                    **frozen_edge, "context_mode": other_mode,
+                                }),
+                            })
+                        bad_graph = json.loads(json.dumps(graph))
+                        next(row for row in bad_graph["edges"] if row["id"] == edge["id"])[
+                            "context_mode"] = other_mode
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_graph=bad_graph)
+                        for column, key, value in (
+                            ("effective_edge_configuration_json", "id", "foreign-edge"),
+                            ("effective_edge_configuration_json", "workflow_id", workflow_id(1)),
+                            ("effective_edge_configuration_json", "target_node_id", "foreign-node"),
+                            ("effective_edge_configuration_json", "transition_group_id", "foreign-group"),
+                            ("target_snapshot_json", "node_id", "foreign-node"),
+                            ("target_snapshot_json", "entered_by_edge_id", "foreign-edge"),
+                            ("target_snapshot_json", "node_kind", "script"),
+                        ):
+                            invalid = {**json.loads(branch[column]), key: value}
+                            with self.subTest(column=column, key=key), self.assertRaises(EffectBlocked):
+                                payload(current_branch={**branch, column: json.dumps(invalid)})
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_branch={**branch, "transition_branch_key": "foreign-transition"})
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_approval={**approval, "source_node_id": "foreign-source"})
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_approval={**approval, "source_transition_branch_key": "foreign-branch"})
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_approval={**approval, "source_session_id": "foreign-session"})
+                        if mode == "new_session":
+                            target = json.loads(branch["target_snapshot_json"])
+                            bad_graph = json.loads(json.dumps(graph))
+                            next(row for row in bad_graph["nodes"] if row["id"] == target["node_id"])[
+                                "kind"] = "script"
+                            with self.assertRaises(EffectBlocked):
+                                payload(current_graph=bad_graph)
+                            with self.assertRaises(EffectBlocked):
+                                payload(current_graph=bad_graph, current_branch={
+                                    **branch, "target_snapshot_json": json.dumps({**target, "node_kind": "script"}),
+                                })
 
     def test_native_process_adapters_bind_executable_and_database_descriptors(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
@@ -3950,8 +4131,13 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 self.assertEqual(item["compatibility_snapshot"]["native_components"], components)
 
     def test_native_frozen_approvals_survive_real_graph_and_metadata_effects(self) -> None:
-        for intent in ("graph-only", "graph-and-metadata"):
-            with self.subTest(intent=intent), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+        cases = [
+            (intent, mode)
+            for intent in ("graph-only", "graph-and-metadata")
+            for mode in ("new_session", "continue_session", "compact_and_continue_session")
+        ]
+        for intent, mode in cases:
+            with self.subTest(intent=intent, mode=mode), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
                 fixture = make_workflow_fixture(Path(temporary))
                 state = read_state(fixture)
                 state["workflows"][workflow_id(0)]["version"] = 16
@@ -3959,8 +4145,21 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 plan, context, observed = native_canonical_v2_plan(
                     fixture, self, production_shape=True, with_approvals=True,
                     intent=intent, synchronize_effects=True,
+                    approval_context_mode=mode, prefix_only=True,
                 )
                 connection = context["connection"]
+                source_workflow = read_state(fixture)["workflows"][workflow_id(0)]
+                source_graph = {"version": source_workflow["version"], **source_workflow["graph"]}
+                # The only graph content change is the reviewed ingress prefix.
+                target = json.loads(json.dumps(plan.value["workflows"][0]["target_graph"]))
+                source_ingress = operations._v2_ingress_edge(source_graph, "fixture source")
+                target_ingress = operations._v2_ingress_edge(target, "fixture target")
+                self.assertTrue(target_ingress["prompt_template"].endswith(
+                    "\n\n" + source_ingress["prompt_template"],
+                ))
+                target_ingress["prompt_template"] = source_ingress["prompt_template"]
+                target["version"] = source_graph["version"]
+                self.assertEqual(target, source_graph)
                 before = [
                     connection.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall()
                     for table in ("task_pending_approvals", "task_pending_approval_branches")

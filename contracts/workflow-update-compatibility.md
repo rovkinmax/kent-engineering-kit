@@ -88,6 +88,15 @@ remain exact-only. It does not classify the difference as cosmetic or safe.
 All five original raw JSON columns, including description bytes and whitespace,
 remain bound to the approval envelope and fingerprint without normalization.
 
+Native approval context dispatch is closed and bound to matching frozen/current
+edge mode and target kind. A `new_session` edge targeting an Agent requires
+exactly `target_session={"kind":"create"}` and
+`active_source={"kind":"deferred_self"}`, without Session IDs or extra keys.
+`continue_session` and `compact_and_continue_session` retain exact-source and
+same-Session reuse. Cross-pairs and reuse for `new_session` are rejected.
+This representation support does not consume pending decisions or establish
+compatibility, installation authority, or runtime cohort qualification.
+
 Observation collects affected decision identities only in the current call
 chain, comparing frozen/current/target descriptions; it adds no persisted
 snapshot, plan or review schema. Each affected decision requires an existing
