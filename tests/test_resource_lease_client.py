@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import runpy
@@ -9,9 +10,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +35,7 @@ import json, os, pathlib, sys, time
 args = sys.argv[1:]
 if args[:2] == ["task", "show"]:
     print(json.dumps({"summary":{"id":args[2],"done":False},
-                      "status":{"kind":"doing","native_state":"active"}}))
+                      "status":{"kind":"running","native_state":"active"}}))
     raise SystemExit
 if args[:2] == ["task", "sessions"]:
     state = pathlib.Path(os.environ["NATIVE_STATE"]).read_text().strip()
@@ -202,7 +207,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
     def test_native_pagination_and_unknown_status_fail_closed(self):
         binding = {"project": "/project", "task": TASK, "session": SESSION}
         detail = {"summary": {"id": TASK, "done": False},
-                  "status": {"kind": "doing", "native_state": "active"}}
+                  "status": {"kind": "running", "native_state": "active"}}
         first = {"task_id": TASK, "items": [], "next_offset": 100}
         last = {"task_id": TASK, "items": [{"session_id": SESSION, "status": "running"}],
                 "next_offset": None}
@@ -219,6 +224,65 @@ class ResourceLeaseClientTests(unittest.TestCase):
         binding = {"project": "/project", "task": TASK, "session": SESSION}
         with (patch.object(client, "capture", return_value={"summary": [], "status": {}}),
               self.assertRaisesRegex(client.Error, "not observably active")):
+            client.native_active(binding)
+
+    def test_current_native_schema_and_ineligible_tasks_before_acquisition(self):
+        binding = {"project": "/project", "task": TASK, "session": SESSION}
+        detail = {"summary": {"id": TASK, "done": False},
+                  "status": {"kind": "running", "native_state": "active"}}
+        page = {"task_id": TASK, "items": [{"session_id": SESSION, "status": "running"}],
+                "next_offset": None}
+        with patch.object(client, "capture", side_effect=[detail, page]) as capture:
+            client.native_active(binding)
+        self.assertEqual(capture.call_count, 2)
+        self.assertEqual(capture.call_args_list[0].args[0],
+                         ["kent", "task", "show", TASK, "--project", "/project", "--json"])
+        self.assertEqual(capture.call_args_list[1].args[0],
+                         ["kent", "task", "sessions", TASK, "--project", "/project",
+                          "--offset", "0", "--limit", "100", "--json"])
+        rejected = [
+            dict(detail, status={"kind": kind, "native_state": "active"})
+            for kind in ("doing", "waiting_question", "waiting_approval", "queued", "backlog",
+                         "interrupted", "done", "active", "unknown")
+        ]
+        rejected += [
+            dict(detail, summary={"id": TASK, "done": True}),
+            dict(detail, summary={"id": "task-33333333-3333-4333-8333-333333333333", "done": False}),
+        ]
+        rejected += [
+            dict(detail, status={"kind": "running", "native_state": state})
+            for state in ("interrupted", "completed", "unknown", None)
+        ]
+        args = SimpleNamespace(task=TASK, session=SESSION, project="/project",
+                               config=str(self.config), profile="smoke.persistent",
+                               run_dir=str(self.runs / "rejected"))
+        for value in rejected:
+            with self.subTest(value=value):
+                with (patch.object(client, "capture", return_value=value) as capture,
+                      self.assertRaisesRegex(client.Error, "not observably active")):
+                    client.start(args)
+                self.assertEqual(capture.call_count, 1)
+                self.assertFalse(self.runs.exists())
+                self.assertFalse((self.pool / "calls").exists())
+
+    def test_current_native_schema_still_requires_exact_running_session(self):
+        binding = {"project": "/project", "task": TASK, "session": SESSION}
+        detail = {"summary": {"id": TASK, "done": False},
+                  "status": {"kind": "running", "native_state": "active"}}
+        matching = {"session_id": SESSION, "status": "running"}
+        inventories = [[], [dict(matching, session_id="other")], [matching, matching]]
+        inventories += [[dict(matching, status=state)]
+                        for state in ("question", "waiting", "idle", "interrupted", "done", "unknown")]
+        for items in inventories:
+            page = {"task_id": TASK, "items": items, "next_offset": None}
+            with (self.subTest(items=items),
+                  patch.object(client, "capture", side_effect=[detail, page]) as capture,
+                  self.assertRaises(client.Error)):
+                client.native_active(binding)
+            self.assertEqual(capture.call_count, 2)
+        with (patch.object(client, "capture", side_effect=[
+                detail, {"task_id": "other", "items": [matching], "next_offset": None}]),
+              self.assertRaisesRegex(client.Error, "invalid native Session inventory")):
             client.native_active(binding)
 
     def test_renewal_stops_on_owner_failure_without_release(self):
@@ -265,6 +329,299 @@ class ResourceLeaseClientTests(unittest.TestCase):
         self.assertEqual(len(list(self.runs.iterdir())), 65)
         self.assertTrue(unknown.exists())
         self.assertFalse((self.runs / "0").exists())
+
+    def prepare_args(self, name, *, config=None, runs=None):
+        return SimpleNamespace(config=str(config or self.config), profile="ui.clean",
+                               owner="test-command", run_dir=str(((runs or self.runs) / name).resolve()))
+
+    def stop_case(self, mode, *, cleanup_fails=False, marker_fails=False, status_fails=False,
+                  finish_status_fails_once=False):
+        args = self.prepare_args(f"stop-{mode}-{cleanup_fails}-{marker_fails}-{status_fails}")
+        args.command, args.env = ["--", "never-executed"], []
+        run = Path(args.run_dir)
+        secret = "must-not-leak-stop-exception"
+        actions, signals, waits = [], [], []
+        original_tick, original_write = client.Renewal.tick, client.write
+        finish_status_failed = False
+
+        class Child:
+            pid = 411000001
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                if mode == "timeout":
+                    raise subprocess.TimeoutExpired([secret], timeout)
+                self.returncode = -signal.SIGTERM
+                return self.returncode
+
+        child = Child()
+
+        def fake_capture(command, **_kwargs):
+            action = command[3]
+            self.assertIn(action, ("acquire", "release"))
+            actions.append(action)
+            value = {"owner": args.owner, "capability": "clean", "state": "active",
+                     "cleanup_pending": False, "quarantined": False,
+                     "endpoint": {"adb_serial": "never-used"}, "expires_in": 30,
+                     "expires_at": time.monotonic() + 30}
+            if action == "release":
+                expected_stop = {"confirmed": "confirmed", "not_started": "not_started"}.get(
+                    mode, "unconfirmed")
+                self.assertEqual(client.read(run / "status.json")["command_stop"], expected_stop)
+                if cleanup_fails:
+                    raise client.Error("diagnostic resource cleanup not confirmed")
+                value.update(state="completed", endpoint=None)
+            original_write(run / "receipt.json", value)
+            return value
+
+        def interrupt(renewal):
+            if renewal.value is not None:
+                renewal.next_record = 0
+                original_tick(renewal)
+                self.assertEqual(client.read(run / "status.json")["command_stop"], "unconfirmed")
+                raise client.Error("diagnostic consumer interruption")
+            return original_tick(renewal)
+
+        def killpg(pid, number):
+            self.assertEqual(pid, child.pid)
+            signals.append(number)
+            if mode == "oserror":
+                raise OSError(secret)
+
+        def failing_write(path, value):
+            nonlocal finish_status_failed
+            if path.name == "command-stop-uncertain.json" and marker_fails:
+                raise OSError(secret)
+            if path.name == "status.json" and value["phase"] == "failed" and status_fails:
+                raise OSError(secret)
+            if (finish_status_fails_once and not finish_status_failed and path.name == "status.json"
+                    and value["phase"] == "failed" and value.get("lease", {}).get("state") == "completed"):
+                finish_status_failed = True
+                raise OSError(secret)
+            return original_write(path, value)
+
+        stderr = io.StringIO()
+        with (patch.object(client, "capture", side_effect=fake_capture),
+              patch.object(client.subprocess, "Popen", return_value=child,
+                           side_effect=OSError("diagnostic command not started")
+                           if mode == "not_started" else None),
+              patch.object(client.os, "killpg", side_effect=killpg),
+              patch.object(client.Renewal, "tick", interrupt),
+              patch.object(client, "write", side_effect=failing_write),
+              redirect_stderr(stderr)):
+            result = client.run_command(args)
+        self.assertEqual(result, 1)
+        self.assertEqual(actions, ["acquire", "release"])
+        self.assertNotIn(secret, stderr.getvalue())
+        self.assertTrue((run / "receipt.json").exists())
+        if mode == "timeout":
+            self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL])
+            self.assertEqual(waits, [5, 5])
+        return run, client.read(run / "status.json"), stderr.getvalue()
+
+    def assert_retained_after_prune(self, run):
+        for index in range(65):
+            completed = self.runs / f"newer-{index}"
+            completed.mkdir(mode=0o700, exist_ok=True)
+            client.write(completed / "status.json", {
+                "phase": "finished", "updated_at": time.monotonic() + index,
+                "lease": {"state": "completed", "cleanup_pending": False, "quarantined": False},
+            })
+        client.prune(self.runs)
+        self.assertTrue((run / "receipt.json").exists())
+        self.assertTrue((run / "status.json").exists())
+        self.assertEqual(len(list(self.runs.glob("newer-*"))), 64)
+
+    def test_uncertain_command_stop_retains_cleanup_result_and_diagnostics(self):
+        for mode in ("oserror", "timeout"):
+            with self.subTest(mode=mode):
+                run, status, stderr = self.stop_case(mode)
+                self.assertEqual(status["phase"], "failed")
+                self.assertEqual(status["command_stop"], "unconfirmed")
+                self.assertEqual(status["lease"]["state"], "completed")
+                self.assertFalse(status["lease"]["cleanup_pending"])
+                self.assertIn("command stop is uncertain", status["error"])
+                self.assertIn("command stop is uncertain", stderr)
+                marker = run / "command-stop-uncertain.json"
+                self.assertEqual(client.read(marker), {
+                    "schema": 1, "reason": "wait_timeout" if mode == "timeout" else "signal_error"})
+                self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+                retried = self.invoke("finish", "--run-dir", str(run))
+                self.assertEqual(retried.returncode, 1, retried.stderr)
+                self.assertIn("command stop is uncertain", retried.stderr)
+                self.assertEqual(client.read(run / "status.json")["lease"]["state"], "completed")
+                self.assertTrue(marker.exists())
+                self.assert_retained_after_prune(run)
+
+    def test_uncertain_command_and_resource_cleanup_failures_both_survive(self):
+        run, status, _stderr = self.stop_case("oserror", cleanup_fails=True)
+        self.assertEqual(status["phase"], "failed")
+        self.assertIn("command stop is uncertain", status["error"])
+        self.assertIn("cleanup failed", status["error"])
+        self.assertIn("resource cleanup not confirmed", status["error"])
+        self.assertNotEqual(status["lease"]["state"], "completed")
+        self.assert_retained_after_prune(run)
+
+    def test_uncertainty_marker_write_failure_cannot_be_erased_by_finish(self):
+        for status_fails in (False, True):
+            with self.subTest(status_fails=status_fails):
+                run, status, stderr = self.stop_case(
+                    "oserror", marker_fails=True, status_fails=status_fails)
+                self.assertFalse((run / "command-stop-uncertain.json").exists())
+                self.assertEqual(status["command_stop"], "unconfirmed")
+                self.assertNotEqual(status["phase"], "finished")
+                self.assertIn("uncertainty marker persistence failed", stderr)
+                # This goes through a fresh adapter process, not retained memory.
+                retried = self.invoke("finish", "--run-dir", str(run))
+                self.assertEqual(retried.returncode, 1, retried.stderr)
+                after = client.read(run / "status.json")
+                self.assertEqual(after["phase"], "failed")
+                self.assertEqual(after["command_stop"], "unconfirmed")
+                self.assertEqual(after["lease"]["state"], "completed")
+                self.assert_retained_after_prune(run)
+
+    def test_confirmed_command_stop_remains_finished(self):
+        _run, status, stderr = self.stop_case("confirmed")
+        self.assertEqual(status["phase"], "finished")
+        self.assertEqual(status["command_stop"], "confirmed")
+        self.assertEqual(status["lease"]["state"], "completed")
+        self.assertNotIn("command stop is uncertain", stderr)
+
+    def test_finish_status_write_failure_preserves_confirmed_resource_cleanup(self):
+        run, status, stderr = self.stop_case("oserror", finish_status_fails_once=True)
+        self.assertEqual(status["phase"], "failed")
+        self.assertEqual(status["command_stop"], "unconfirmed")
+        self.assertEqual(status["lease"]["state"], "completed")
+        self.assertFalse(status["lease"]["cleanup_pending"])
+        self.assertIn("finish status persistence failed", status["error"])
+        self.assertIn("resource cleanup is confirmed", stderr)
+        self.assert_retained_after_prune(run)
+
+    def test_command_not_started_is_distinct_from_unknown_stop(self):
+        run, status, stderr = self.stop_case("not_started")
+        self.assertEqual(status["phase"], "finished")
+        self.assertEqual(status["command_stop"], "not_started")
+        self.assertEqual(status["lease"]["state"], "completed")
+        self.assertFalse((run / "command-stop-uncertain.json").exists())
+        self.assertIn("diagnostic command not started", stderr)
+        self.assertNotIn("command stop is uncertain", stderr)
+
+    def seed_runs(self, count, *, finished=False):
+        self.runs.mkdir(mode=0o700, exist_ok=True)
+        for index in range(count):
+            run = self.runs / f"{'finished' if finished else 'failed'}-{index}"
+            run.mkdir(mode=0o700)
+            client.write(run / "status.json", {
+                "phase": "finished" if finished else "failed", "updated_at": index,
+                "lease": {"state": "completed", "cleanup_pending": False, "quarantined": False}
+                if finished else None, "error": None if finished else "preserved unknown outcome",
+            })
+
+    def test_concurrent_admission_uses_independent_root_lock_handles(self):
+        self.seed_runs(255)
+        first, second = self.prepare_args("first"), self.prepare_args("second")
+        first_at_mkdir, allow_first, second_contended = (threading.Event() for _ in range(3))
+        original_mkdir, original_flock = Path.mkdir, client.fcntl.flock
+        handles = set()
+
+        def mkdir(path, *args, **kwargs):
+            if path == Path(first.run_dir):
+                first_at_mkdir.set()
+                if not allow_first.wait(5):
+                    raise AssertionError("first admission was not released")
+            return original_mkdir(path, *args, **kwargs)
+
+        def flock(fd, flags):
+            handles.add(fd)
+            try:
+                return original_flock(fd, flags)
+            except BlockingIOError:
+                second_contended.set()
+                raise
+
+        with (patch.object(Path, "mkdir", mkdir),
+              patch.object(client.fcntl, "flock", side_effect=flock),
+              ThreadPoolExecutor(max_workers=2) as executor):
+            first_future = executor.submit(client.prepare, first)
+            try:
+                self.assertTrue(first_at_mkdir.wait(5), "first admission did not reach reservation")
+                second_future = executor.submit(client.prepare, second)
+                self.assertTrue(second_contended.wait(5), "independent flock handle did not contend")
+            finally:
+                allow_first.set()
+            self.assertEqual(first_future.result(timeout=5).run, Path(first.run_dir))
+            with self.assertRaisesRegex(client.Error, "retention limit"):
+                second_future.result(timeout=5)
+        self.assertGreaterEqual(len(handles), 2)
+        self.assertEqual(len([path for path in self.runs.iterdir()
+                              if path.name != "admission.lock"]), 256)
+        self.assertEqual(len(list(self.runs.glob("failed-*"))), 255)
+        self.assertEqual(client.prepare(first).run, Path(first.run_dir))
+        with self.assertRaisesRegex(client.Error, "retention limit"):
+            client.prepare(second)
+        self.assertEqual((self.runs / "admission.lock").stat().st_mode & 0o777, 0o600)
+
+    def test_admission_counts_unknown_entries_but_not_lock_metadata(self):
+        self.seed_runs(255)
+        client.write(self.runs / "unknown-entry", {})
+        args = self.prepare_args("new")
+        with self.assertRaisesRegex(client.Error, "retention limit"):
+            client.prepare(args)
+        self.assertFalse(Path(args.run_dir).exists())
+        self.assertTrue((self.runs / "unknown-entry").exists())
+
+    def test_pruning_preserves_failed_runs_and_opens_exactly_one_slot(self):
+        self.seed_runs(191)
+        self.seed_runs(65, finished=True)
+        client.prepare(self.prepare_args("new"))
+        self.assertEqual(len(list(self.runs.glob("failed-*"))), 191)
+        self.assertEqual(len(list(self.runs.glob("finished-*"))), 64)
+        self.assertEqual(len([path for path in self.runs.iterdir()
+                              if path.name != "admission.lock"]), 256)
+
+    def test_admission_lock_wait_is_bounded_without_reservation(self):
+        self.runs.mkdir(mode=0o700)
+        args = self.prepare_args("blocked")
+        with client.admission_lock(self.runs):
+            with (patch.object(client, "CLI_TIMEOUT", 0.02),
+                  self.assertRaisesRegex(client.Busy, "admission lock timed out")):
+                client.prepare(args)
+        self.assertFalse(Path(args.run_dir).exists())
+
+    def test_unsafe_admission_locks_fail_closed(self):
+        for kind in ("symlink", "directory", "public", "fifo"):
+            with self.subTest(kind=kind):
+                runs = self.root / f"runs-{kind}"
+                runs.mkdir(mode=0o700)
+                lock = runs / "admission.lock"
+                if kind == "symlink":
+                    target = self.root / "lock-target"
+                    client.write(target, {"untouched": True})
+                    lock.symlink_to(target)
+                elif kind == "directory":
+                    lock.mkdir(mode=0o700)
+                elif kind == "fifo":
+                    os.mkfifo(lock, mode=0o600)
+                else:
+                    client.write(lock, {})
+                    lock.chmod(0o644)
+                config = self.root / f"config-{kind}.json"
+                client.write(config, dict(client.read(self.config), runs_directory=str(runs)))
+                args = self.prepare_args("rejected", runs=runs, config=config)
+                with self.assertRaises((client.Error, OSError)):
+                    client.prepare(args)
+                self.assertFalse(Path(args.run_dir).exists())
+                if kind == "symlink":
+                    self.assertEqual(client.read(target), {"untouched": True})
+
+    def test_admission_lock_path_is_not_a_consumer_run(self):
+        with self.assertRaisesRegex(client.Error, "direct child"):
+            client.prepare(self.prepare_args("admission.lock"))
+        self.assertFalse((self.runs / "admission.lock").exists())
 
     def test_queue_cancellation_uses_original_receipt(self):
         args = type("Args", (), {"config": str(self.config), "profile": "ui.clean",
@@ -344,9 +701,18 @@ class ResourceLeaseClientTests(unittest.TestCase):
         self.assertTrue(marker.exists(), "the bounded command must finish itself")
         time.sleep(0.7)
         self.assertEqual(self.calls().count("renew"), before)
-        run = next(self.runs.iterdir())
+        run = next(path for path in self.runs.iterdir() if path.is_dir())
         lease = client.load(run)
-        self.addCleanup(lease.finish)
+
+        def cleanup_unknown_command():
+            with self.assertRaisesRegex(client.CommandStopUncertain, "command stop is uncertain"):
+                lease.finish()
+            status = client.read(run / "status.json")
+            self.assertEqual(status["phase"], "failed")
+            self.assertEqual(status["command_stop"], "unconfirmed")
+            self.assertEqual(status["lease"]["state"], "completed")
+
+        self.addCleanup(cleanup_unknown_command)
         self.assertEqual(lease.cli("inspect")["state"], "expired")
         # The descendant survived wrapper death until its own bounded exit.
         self.assertNotIn("release", self.calls())

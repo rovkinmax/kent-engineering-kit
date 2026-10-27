@@ -36,6 +36,16 @@ class Busy(Error):
     pass
 
 
+class CommandStopUncertain(Error):
+    pass
+
+
+class FinishStatusUncertain(Error):
+    def __init__(self, lease):
+        super().__init__("resource cleanup is confirmed; finish status persistence failed")
+        self.lease = lease
+
+
 def interrupted(_number, _frame):
     global STOP
     STOP = True
@@ -100,6 +110,27 @@ def lock(run: Path):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise Busy("helper is already running") from error
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def admission_lock(root: Path):
+    path = root / "admission.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        private(path)
+        deadline = time.monotonic() + CLI_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as error:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Busy("run admission lock timed out") from error
+                time.sleep(min(0.1, remaining))
         yield
     finally:
         os.close(fd)
@@ -198,7 +229,7 @@ def native_active(binding):
     summary, status = detail.get("summary", {}), detail.get("status", {})
     if (not isinstance(summary, dict) or not isinstance(status, dict)
             or summary.get("id") != task or summary.get("done") is not False
-            or status.get("kind") != "doing"
+            or status.get("kind") != "running"
             or status.get("native_state") not in {"active", "waiting", "waiting_ask", "waiting_approval"}):
         raise Error("native Task is not observably active")
     offset = 0
@@ -244,9 +275,30 @@ class Lease:
             raise Error("CLI returned a different lease binding")
         return value
 
-    def record(self, phase, *, lease=None, error=None):
+    def record(self, phase, *, lease=None, error=None, command_stop=None):
+        try:
+            previous = read(self.run / "status.json")
+        except FileNotFoundError:
+            previous = {}
+        if command_stop is None:
+            command_stop = previous.get("command_stop")
+        marker = self.run / "command-stop-uncertain.json"
+        if marker.exists() or marker.is_symlink():
+            command_stop = "unconfirmed"
+        if command_stop not in (None, "confirmed", "not_started"):
+            if phase == "finished":
+                phase = "failed"
+                error = error or previous.get("error")
+            if phase == "failed":
+                message = "command stop is uncertain"
+                if not error:
+                    error = message
+                elif not error.startswith(message):
+                    error = f"{message}; {error}"
         value = {"phase": phase, "updated_at": time.monotonic(),
                  "run_directory": str(self.run), "lease": lease, "error": error}
+        if command_stop is not None:
+            value["command_stop"] = command_stop
         write(self.run / "status.json", value)
         return value
 
@@ -254,15 +306,22 @@ class Lease:
         if not (self.run / "receipt.json").exists():
             # The CLI writes its receipt before registration. With the helper
             # lock held and acquire child reaped, no receipt means no request.
-            return self.record("finished", lease={
+            value = {
                 "state": "cancelled", "cleanup_pending": False, "quarantined": False,
                 "endpoint": None, "request_created": False,
-            })
-        value = self.cli("cancel" if cancel else "release", timeout=CLEANUP_TIMEOUT + 5)
-        if (value.get("state") not in {"completed", "cancelled", "expired"}
-                or value.get("cleanup_pending") is not False or value.get("quarantined") is not False):
-            raise Error("resource cleanup is not confirmed")
-        return self.record("finished", lease=value)
+            }
+        else:
+            value = self.cli("cancel" if cancel else "release", timeout=CLEANUP_TIMEOUT + 5)
+            if (value.get("state") not in {"completed", "cancelled", "expired"}
+                    or value.get("cleanup_pending") is not False or value.get("quarantined") is not False):
+                raise Error("resource cleanup is not confirmed")
+        try:
+            status = self.record("finished", lease=value)
+        except (Error, OSError, ValueError) as error:
+            raise FinishStatusUncertain(value) from error
+        if status["phase"] != "finished":
+            raise CommandStopUncertain(status["error"])
+        return status
 
 
 def active(value):
@@ -280,21 +339,33 @@ def prune(root):
     completed = []
     allowed = {"binding.json", "status.json", "receipt.json", "helper.lock",
                "finish.json", "launched.json", "stop-renewal.json"}
+
+    def finished(run):
+        status = read(run / "status.json")
+        value = status.get("lease") or {}
+        marker = run / "command-stop-uncertain.json"
+        if (status.get("phase") == "finished"
+                and status.get("command_stop") in (None, "confirmed", "not_started")
+                and not (marker.exists() or marker.is_symlink())
+                and value.get("state") in {"completed", "cancelled", "expired"}
+                and value.get("cleanup_pending") is False
+                and value.get("quarantined") is False):
+            return status
+        return None
+
     for run in root.iterdir():
         try:
             private(run, directory=True)
-            status = read(run / "status.json")
-            value = status.get("lease") or {}
-            if (status.get("phase") == "finished"
-                    and value.get("state") in {"completed", "cancelled", "expired"}
-                    and value.get("cleanup_pending") is False
-                    and value.get("quarantined") is False):
+            status = finished(run)
+            if status is not None:
                 completed.append((status["updated_at"], run))
         except (Error, OSError, ValueError, KeyError, TypeError):
             continue
     for _updated, run in sorted(completed)[:-64]:
         try:
             with lock(run):
+                if finished(run) is None:
+                    continue
                 files = list(run.iterdir())
                 if any(path.name not in allowed for path in files):
                     continue
@@ -313,24 +384,26 @@ def prepare(args, binding=None):
         raise Error("requested profile is not configured")
     root = Path(config["runs_directory"])
     mkdir(root)
-    prune(root)
     run = absolute(args.run_dir, "run directory") if getattr(args, "run_dir", None) else root / uuid.uuid4().hex
-    if run.parent != root:
-        raise Error("run directory must be a direct child of runs_directory")
+    if run.parent != root or run.name == "admission.lock":
+        raise Error("run directory must be a non-reserved direct child of runs_directory")
     metadata = {"schema": 1, "config": config, "profile": args.profile,
                 "capability": config["profiles"][args.profile],
                 "owner": args.owner if binding is None else f"smoke:{binding['task']}:{binding['session']}",
                 "binding": binding}
-    try:
-        if sum(1 for _ in root.iterdir()) >= MAX_RUNS and not run.exists():
-            raise Error("consumer run retention limit reached; inspect completed records")
-        run.mkdir(mode=0o700)
-    except FileExistsError:
-        private(run, directory=True)
-        if read(run / "binding.json") != metadata:
-            raise Error("existing run has a different immutable binding")
-    else:
-        write(run / "binding.json", metadata)
+    with admission_lock(root):
+        prune(root)
+        try:
+            count = sum(path.name != "admission.lock" for path in root.iterdir())
+            if count >= MAX_RUNS and not run.exists():
+                raise Error("consumer run retention limit reached; inspect completed records")
+            run.mkdir(mode=0o700)
+        except FileExistsError:
+            private(run, directory=True)
+            if read(run / "binding.json") != metadata:
+                raise Error("existing run has a different immutable binding")
+        else:
+            write(run / "binding.json", metadata)
     return Lease(run, metadata)
 
 
@@ -408,6 +481,9 @@ def run_command(args):
                     raise Error(f"conflicting inherited {variable}")
                 environment[variable] = endpoint
             environment["RESOURCE_LEASE_RUN_DIRECTORY"] = str(lease.run)
+            # Write ahead of launching: even failed uncertainty-marker/status
+            # writes must leave retry/pruning unable to claim a confirmed stop.
+            lease.record("active", lease=value, command_stop="unconfirmed")
             child = subprocess.Popen(command, env=environment, start_new_session=True)
             while child.poll() is None:
                 renewal.tick()
@@ -419,17 +495,49 @@ def run_command(args):
             failure = str(error)
             print(f"resource-lease-client: {failure}", file=sys.stderr)
         finally:
-            if child is not None:
+            if child is None:
+                try:
+                    lease.record("active", lease=renewal.value, command_stop="not_started")
+                except (Error, OSError, ValueError):
+                    message = "command non-start confirmation persistence failed"
+                    failure = f"{failure}; {message}" if failure else message
+                    print(f"resource-lease-client: {failure}", file=sys.stderr)
+            else:
                 try:
                     stop_child(child, group=True)
                 except (OSError, subprocess.TimeoutExpired) as error:
-                    failure = f"command stop is uncertain: {error}"
+                    reason = "wait_timeout" if isinstance(error, subprocess.TimeoutExpired) else "signal_error"
+                    failure = f"command stop is uncertain ({reason})"
+                    try:
+                        write(lease.run / "command-stop-uncertain.json", {"schema": 1, "reason": reason})
+                    except (Error, OSError, ValueError):
+                        failure += "; uncertainty marker persistence failed"
+                    try:
+                        lease.record("failed", lease=renewal.value, error=failure)
+                    except (Error, OSError, ValueError):
+                        failure += "; command status persistence failed"
                     print(f"resource-lease-client: {failure}", file=sys.stderr)
+                else:
+                    try:
+                        lease.record("active", lease=renewal.value, command_stop="confirmed")
+                    except (Error, OSError, ValueError):
+                        failure = "command stop confirmation persistence failed"
+                        print(f"resource-lease-client: {failure}", file=sys.stderr)
             try:
                 lease.finish(cancel=not acquired)
+            except CommandStopUncertain as error:
+                failure = failure or str(error)
+                print(f"resource-lease-client: {error}", file=sys.stderr)
             except (Error, OSError, ValueError) as error:
-                failure = f"cleanup failed: {error}"
-                lease.record("failed", error=failure)
+                if isinstance(error, FinishStatusUncertain):
+                    cleanup_error, cleanup_value = str(error), error.lease
+                else:
+                    cleanup_error, cleanup_value = f"cleanup failed: {error}", renewal.value
+                failure = f"{failure}; {cleanup_error}" if failure else cleanup_error
+                try:
+                    lease.record("failed", lease=cleanup_value, error=failure)
+                except (Error, OSError, ValueError):
+                    failure += "; cleanup status persistence failed"
                 print(f"resource-lease-client: {failure}", file=sys.stderr)
         print(json.dumps({"command_exit": child.returncode if child else None,
                           "consumer_error": failure, "run_directory": str(lease.run)}),
