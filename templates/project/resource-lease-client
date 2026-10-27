@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""Cooperative command/Session renewal over an independently installed CLI."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import math
+import os
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+MAX_BYTES = 262144
+MAX_RUNS = 256
+CLI_TIMEOUT = 10.0
+ACQUIRE_TIMEOUT = 300.0
+CLEANUP_TIMEOUT = 120.0
+HEARTBEAT_MAX_AGE = 30.0
+STOP = False
+
+
+class Error(ValueError):
+    pass
+
+
+class Busy(Error):
+    pass
+
+
+def interrupted(_number, _frame):
+    global STOP
+    STOP = True
+
+
+def private(path: Path, *, directory=False):
+    info = path.lstat()
+    if (stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+            or not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))):
+        raise Error(f"not an owner-private {'directory' if directory else 'file'}: {path}")
+
+
+def mkdir(path: Path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    private(path, directory=True)
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise Error("duplicate JSON field")
+        value[key] = item
+    return value
+
+
+def read(path: Path):
+    private(path)
+    with path.open("rb") as stream:
+        data = stream.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise Error("JSON record exceeds size limit")
+    value = json.loads(data, object_pairs_hook=unique_object)
+    if not isinstance(value, dict):
+        raise Error("expected a JSON object")
+    return value
+
+
+def write(path: Path, value):
+    data = (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
+    if len(data) > MAX_BYTES:
+        raise Error("JSON record exceeds size limit")
+    temporary = path.with_name(f".{path.name}-{uuid.uuid4().hex}")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def lock(run: Path):
+    fd = os.open(run / "helper.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        private(run / "helper.lock")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise Busy("helper is already running") from error
+        yield
+    finally:
+        os.close(fd)
+
+
+def stop_child(child, *, group=False):
+    if child.poll() is not None:
+        return
+    try:
+        if group:
+            os.killpg(child.pid, signal.SIGTERM)
+        else:
+            child.terminate()
+    except ProcessLookupError:
+        child.wait(timeout=5)
+        return
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        if group:
+            os.killpg(child.pid, signal.SIGKILL)
+        else:
+            child.kill()
+        child.wait(timeout=5)
+
+
+def capture(command, *, timeout=CLI_TIMEOUT, tick=None):
+    """Bound both output streams while retaining only owned child handles."""
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = {child.stdout: bytearray(), child.stderr: bytearray()}
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream in output:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ)
+            while selector.get_map() or child.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise Error(f"{Path(command[0]).name} timed out")
+                if tick:
+                    tick()
+                for key, _events in selector.select(0.1):
+                    data = os.read(key.fd, 65536)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                    else:
+                        output[key.fileobj].extend(data)
+                        if sum(map(len, output.values())) > MAX_BYTES:
+                            raise Error("command output exceeds size limit")
+            if child.wait() != 0:
+                # CLI stderr is diagnostic only; do not copy arbitrary tool
+                # responses (which may include secrets) into evidence.
+                raise Error(f"{Path(command[0]).name} failed with exit {child.returncode}")
+            value = json.loads(output[child.stdout], object_pairs_hook=unique_object)
+            if not isinstance(value, dict):
+                raise Error("command returned a non-object result")
+            return value
+    finally:
+        stop_child(child)
+        for stream in output:
+            stream.close()
+
+
+def absolute(value, label):
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise Error(f"{label} must be an absolute path")
+    return Path(value).resolve()
+
+
+def configuration(path):
+    value = read(Path(path))
+    if (set(value) != {"schema", "executable", "pool", "runs_directory", "profiles"}
+            or type(value["schema"]) is not int or value["schema"] != 1):
+        raise Error("unsupported resource client configuration")
+    for key in ("executable", "pool", "runs_directory"):
+        value[key] = str(absolute(value[key], key))
+    if not os.access(value["executable"], os.X_OK):
+        raise Error("configured resource-lease executable is unavailable")
+    profiles = value["profiles"]
+    if (not isinstance(profiles, dict) or not profiles
+            or any(not isinstance(k, str) or not isinstance(v, str) or not k or not v
+                   for k, v in profiles.items())):
+        raise Error("profiles must map explicit names to capabilities")
+    return value
+
+
+def native_active(binding):
+    task, session, project = (binding[key] for key in ("task", "session", "project"))
+    deadline = time.monotonic() + CLI_TIMEOUT
+    def observe(command):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Error("native observation timed out")
+        return capture(command, timeout=remaining)
+    detail = observe(["kent", "task", "show", task, "--project", project, "--json"])
+    summary, status = detail.get("summary", {}), detail.get("status", {})
+    if (not isinstance(summary, dict) or not isinstance(status, dict)
+            or summary.get("id") != task or summary.get("done") is not False
+            or status.get("kind") != "doing"
+            or status.get("native_state") not in {"active", "waiting", "waiting_ask", "waiting_approval"}):
+        raise Error("native Task is not observably active")
+    offset = 0
+    for _page in range(100):
+        page = observe(["kent", "task", "sessions", task, "--project", project,
+                        "--offset", str(offset), "--limit", "100", "--json"])
+        if page.get("task_id") != task or not isinstance(page.get("items"), list):
+            raise Error("invalid native Session inventory")
+        matches = [row for row in page["items"] if isinstance(row, dict)
+                   and row.get("session_id") == session]
+        if matches:
+            if len(matches) != 1 or matches[0].get("status") != "running":
+                raise Error("native Session is not running")
+            return
+        following = page.get("next_offset")
+        if following is None:
+            break
+        if type(following) is not int or following <= offset:
+            raise Error("invalid native Session pagination")
+        offset = following
+    raise Error("native Session is missing from bounded inventory")
+
+
+@dataclass
+class Lease:
+    run: Path
+    metadata: dict
+
+    @property
+    def config(self):
+        return self.metadata["config"]
+
+    def cli(self, action, *, timeout=CLI_TIMEOUT, tick=None):
+        command = [self.config["executable"], "--root", self.config["pool"], action,
+                   "--owner", self.metadata["owner"], "--lease", str(self.run / "receipt.json")]
+        if action == "acquire":
+            command += ["--capability", self.metadata["capability"], "--wait", str(ACQUIRE_TIMEOUT)]
+        elif action in {"cancel", "release"}:
+            command += ["--wait", str(CLEANUP_TIMEOUT)]
+        value = capture(command, timeout=timeout, tick=tick)
+        if (value.get("owner") != self.metadata["owner"]
+                or value.get("capability") != self.metadata["capability"]):
+            raise Error("CLI returned a different lease binding")
+        return value
+
+    def record(self, phase, *, lease=None, error=None):
+        value = {"phase": phase, "updated_at": time.monotonic(),
+                 "run_directory": str(self.run), "lease": lease, "error": error}
+        write(self.run / "status.json", value)
+        return value
+
+    def finish(self, cancel=False):
+        if not (self.run / "receipt.json").exists():
+            # The CLI writes its receipt before registration. With the helper
+            # lock held and acquire child reaped, no receipt means no request.
+            return self.record("finished", lease={
+                "state": "cancelled", "cleanup_pending": False, "quarantined": False,
+                "endpoint": None, "request_created": False,
+            })
+        value = self.cli("cancel" if cancel else "release", timeout=CLEANUP_TIMEOUT + 5)
+        if (value.get("state") not in {"completed", "cancelled", "expired"}
+                or value.get("cleanup_pending") is not False or value.get("quarantined") is not False):
+            raise Error("resource cleanup is not confirmed")
+        return self.record("finished", lease=value)
+
+
+def active(value):
+    remaining = value.get("expires_in")
+    if (value.get("state") != "active" or not isinstance(value.get("endpoint"), dict)
+            or not value["endpoint"] or isinstance(remaining, bool)
+            or not isinstance(remaining, (float, int)) or not math.isfinite(remaining)
+            or remaining <= 0 or value.get("quarantined") is not False):
+        raise Error("lease is not active")
+    return min(10.0, remaining / 3)
+
+
+def prune(root):
+    """Bound proven-finished records; retain all unknown/failed evidence."""
+    completed = []
+    allowed = {"binding.json", "status.json", "receipt.json", "helper.lock",
+               "finish.json", "launched.json", "stop-renewal.json"}
+    for run in root.iterdir():
+        try:
+            private(run, directory=True)
+            status = read(run / "status.json")
+            value = status.get("lease") or {}
+            if (status.get("phase") == "finished"
+                    and value.get("state") in {"completed", "cancelled", "expired"}
+                    and value.get("cleanup_pending") is False
+                    and value.get("quarantined") is False):
+                completed.append((status["updated_at"], run))
+        except (Error, OSError, ValueError, KeyError, TypeError):
+            continue
+    for _updated, run in sorted(completed)[:-64]:
+        try:
+            with lock(run):
+                files = list(run.iterdir())
+                if any(path.name not in allowed for path in files):
+                    continue
+                for path in files:
+                    private(path)
+                for path in files:
+                    path.unlink()
+                run.rmdir()
+        except (Error, OSError):
+            continue
+
+
+def prepare(args, binding=None):
+    config = configuration(args.config)
+    if args.profile not in config["profiles"]:
+        raise Error("requested profile is not configured")
+    root = Path(config["runs_directory"])
+    mkdir(root)
+    prune(root)
+    run = absolute(args.run_dir, "run directory") if getattr(args, "run_dir", None) else root / uuid.uuid4().hex
+    if run.parent != root:
+        raise Error("run directory must be a direct child of runs_directory")
+    metadata = {"schema": 1, "config": config, "profile": args.profile,
+                "capability": config["profiles"][args.profile],
+                "owner": args.owner if binding is None else f"smoke:{binding['task']}:{binding['session']}",
+                "binding": binding}
+    try:
+        if sum(1 for _ in root.iterdir()) >= MAX_RUNS and not run.exists():
+            raise Error("consumer run retention limit reached; inspect completed records")
+        run.mkdir(mode=0o700)
+    except FileExistsError:
+        private(run, directory=True)
+        if read(run / "binding.json") != metadata:
+            raise Error("existing run has a different immutable binding")
+    else:
+        write(run / "binding.json", metadata)
+    return Lease(run, metadata)
+
+
+def load(run):
+    run = Path(run).absolute()
+    private(run, directory=True)
+    run = run.resolve()
+    metadata = read(run / "binding.json")
+    if (type(metadata.get("schema")) is not int or metadata["schema"] != 1
+            or run.parent != Path(metadata["config"]["runs_directory"])):
+        raise Error("invalid consumer run binding")
+    return Lease(run, metadata)
+
+
+class Renewal:
+    def __init__(self, lease):
+        self.lease = lease
+        self.next_native = 0.0
+        self.next_record = 0.0
+        self.next_renew = 0.0
+        self.value = None
+        self.phase = "acquiring"
+
+    def tick(self):
+        now = time.monotonic()
+        if STOP or (self.lease.run / "finish.json").exists():
+            raise InterruptedError("consumer stopped")
+        if (self.lease.run / "stop-renewal.json").exists():
+            raise Error("renewal was permanently stopped")
+        binding = self.lease.metadata["binding"]
+        if binding and now >= self.next_native:
+            native_active(binding)
+            self.next_native = time.monotonic() + (
+                active(self.value) if self.value is not None else 10
+            )
+        if self.value is not None and now >= self.next_renew:
+            self.value = self.lease.cli("renew")
+            self.next_renew = time.monotonic() + active(self.value)
+        if now >= self.next_record:
+            self.lease.record(self.phase, lease=self.value)
+            self.next_record = time.monotonic() + 1
+
+    def acquire(self):
+        self.tick()
+        self.value = self.lease.cli("acquire", timeout=ACQUIRE_TIMEOUT + 5, tick=self.tick)
+        self.next_renew = time.monotonic() + active(self.value)
+        self.phase = "active"
+        self.lease.record(self.phase, lease=self.value)
+        return self.value
+
+
+def run_command(args):
+    command = args.command[1:] if args.command and args.command[0] == "--" else args.command
+    if not command:
+        raise Error("a command is required")
+    lease = prepare(args)
+    child = None
+    acquired = False
+    failure = None
+    result = 1
+    with lock(lease.run):
+        renewal = Renewal(lease)
+        try:
+            value = renewal.acquire()
+            acquired = True
+            environment = os.environ.copy()
+            for mapping in args.env:
+                variable, separator, key = mapping.partition("=")
+                if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable):
+                    raise Error("expected --env VARIABLE=endpoint_key")
+                endpoint = value["endpoint"].get(key)
+                if not isinstance(endpoint, str) or not endpoint:
+                    raise Error("required endpoint field is unavailable")
+                if variable in environment and environment[variable] != endpoint:
+                    raise Error(f"conflicting inherited {variable}")
+                environment[variable] = endpoint
+            environment["RESOURCE_LEASE_RUN_DIRECTORY"] = str(lease.run)
+            child = subprocess.Popen(command, env=environment, start_new_session=True)
+            while child.poll() is None:
+                renewal.tick()
+                time.sleep(0.1)
+            # A final authoritative check prevents success after silent lease loss.
+            active(lease.cli("inspect"))
+            result = child.returncode
+        except (Error, OSError, ValueError, InterruptedError) as error:
+            failure = str(error)
+            print(f"resource-lease-client: {failure}", file=sys.stderr)
+        finally:
+            if child is not None:
+                try:
+                    stop_child(child, group=True)
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    failure = f"command stop is uncertain: {error}"
+                    print(f"resource-lease-client: {failure}", file=sys.stderr)
+            try:
+                lease.finish(cancel=not acquired)
+            except (Error, OSError, ValueError) as error:
+                failure = f"cleanup failed: {error}"
+                lease.record("failed", error=failure)
+                print(f"resource-lease-client: {failure}", file=sys.stderr)
+        print(json.dumps({"command_exit": child.returncode if child else None,
+                          "consumer_error": failure, "run_directory": str(lease.run)}),
+              file=sys.stderr)
+        return result if failure is None else 1
+
+
+def serve(run):
+    lease = load(run)
+    with lock(lease.run):
+        if (lease.run / "status.json").exists():
+            raise Error("a stopped helper cannot be restarted")
+        renewal = Renewal(lease)
+        try:
+            renewal.acquire()
+            while True:
+                renewal.tick()
+                time.sleep(0.1)
+        except InterruptedError:
+            try:
+                lease.finish(cancel=renewal.value is None)
+            except (Error, OSError, ValueError) as error:
+                lease.record("failed", error=str(error))
+                return 1
+        except (Error, OSError, ValueError) as error:
+            # Unknown observation is not proof device effects drained.
+            # Stop renewal; the existing service TTL remains the fallback.
+            lease.record("stopped", lease=renewal.value, error=str(error))
+            return 1
+    return 0
+
+
+def check(run):
+    lease = load(run)
+    if (lease.run / "stop-renewal.json").exists():
+        raise Error("renewal was permanently stopped")
+    value = read(lease.run / "status.json")
+    age = time.monotonic() - value["updated_at"]
+    if value.get("phase") != "active" or not 0 <= age <= HEARTBEAT_MAX_AGE:
+        raise Error("helper is not observably active")
+    try:
+        with lock(lease.run):
+            raise Error("helper is no longer running")
+    except Busy:
+        pass
+    try:
+        native_active(lease.metadata["binding"])
+        current = lease.cli("inspect")
+        active(current)
+    except (Error, OSError, ValueError):
+        write(lease.run / "stop-renewal.json", {"schema": 1})
+        raise
+    value["lease"] = current
+    value["endpoint"] = current["endpoint"]
+    return value
+
+
+def start(args):
+    task = args.task
+    if not task.startswith("task-") or str(uuid.UUID(task[5:])) != task[5:]:
+        raise Error("expected canonical native task-UUID")
+    if str(uuid.UUID(args.session)) != args.session:
+        raise Error("expected canonical Session UUID")
+    binding = {"project": args.project, "task": task, "session": args.session}
+    native_active(binding)
+    lease = prepare(args, binding)
+    if (lease.run / "status.json").exists():
+        return check(lease.run)
+    # Serialize launch admission separately from the long-lived helper lock.
+    with lock(lease.run):
+        if (lease.run / "launched.json").exists():
+            raise Error("helper startup outcome is unknown; inspect the original run")
+        write(lease.run / "launched.json", {"schema": 1})
+    child = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "_serve", "--run-dir", str(lease.run)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + ACQUIRE_TIMEOUT + 10
+    while time.monotonic() < deadline:
+        if (lease.run / "status.json").exists():
+            value = read(lease.run / "status.json")
+            if value.get("phase") == "active":
+                return check(lease.run)
+            if value.get("phase") in {"stopped", "failed", "finished"}:
+                raise Error(value.get("error") or "helper stopped")
+        if STOP:
+            write(lease.run / "finish.json", {"schema": 1})
+            raise Error("startup interrupted; inspect original run cleanup")
+        if child.poll() is not None:
+            raise Error("helper exited before readiness; inspect original run")
+        time.sleep(0.1)
+    raise Error("helper readiness timed out; inspect original run before retry")
+
+
+def finish(run):
+    lease = load(run)
+    write(lease.run / "finish.json", {"schema": 1})
+    deadline = time.monotonic() + CLEANUP_TIMEOUT + CLI_TIMEOUT + 10
+    while time.monotonic() < deadline:
+        try:
+            with lock(lease.run):
+                return lease.finish(cancel=not (lease.run / "receipt.json").exists())
+        except Busy:
+            pass
+        value = read(lease.run / "status.json")
+        if value.get("phase") == "finished":
+            return value
+        if value.get("phase") == "failed":
+            raise Error(value.get("error") or "helper cleanup failed")
+        time.sleep(0.1)
+    raise Error("helper cleanup timed out")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    for name in ("run", "start"):
+        command = commands.add_parser(name)
+        command.add_argument("--config", required=True)
+        command.add_argument("--profile", required=True)
+        if name == "run":
+            command.add_argument("--owner", required=True)
+            command.add_argument("--env", action="append", default=[])
+            command.add_argument("command", nargs=argparse.REMAINDER)
+        else:
+            for key in ("run-dir", "project", "task", "session"):
+                command.add_argument(f"--{key}", required=True)
+    for name in ("check", "finish", "_serve"):
+        command = commands.add_parser(name)
+        command.add_argument("--run-dir", required=True)
+    args = parser.parse_args()
+    for number in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(number, interrupted)
+    try:
+        if args.action == "run":
+            return run_command(args)
+        if args.action == "_serve":
+            return serve(args.run_dir)
+        result = (start(args) if args.action == "start" else
+                  check(args.run_dir) if args.action == "check" else finish(args.run_dir))
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except (Error, OSError, ValueError, KeyError, TypeError) as error:
+        print(f"resource-lease-client: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

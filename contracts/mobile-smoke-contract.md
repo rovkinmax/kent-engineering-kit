@@ -3,6 +3,17 @@
 Projects load this contract conditionally from their runtime procedure and
 supply platform targeting, installation, login, resource and evidence adapters.
 
+## Opt-in standalone resource leases
+
+Projects may opt into the separate
+[resource-lease integration](resource-lease-integration.md) for newly managed
+pool devices. This does not replace the legacy lock protocol for existing
+consumers or permit mixing legacy devices into the new pool. The project
+procedure chooses one protocol explicitly and retains that binding through
+checkpoint, all device operations and cleanup. Existing retained runs finish
+under their original protocol. New consumers require compatible freshly loaded
+instructions, the pinned CLI and project configuration.
+
 ## Installation And App-Data Safety
 
 Distinguish a fresh task binary, preservation-only replacement and destructive
