@@ -19,6 +19,7 @@ from workflowkit.ci_contract import (
     CiContractError,
     archive_ci_report,
     archive_script_ci_report,
+    archive_script_ci_report_admitted,
     observe_script_delivery_protocol,
     parse_preparation_json,
     prepare_ci_payload,
@@ -32,7 +33,7 @@ from workflowkit.ci_contract import (
 from workflowkit.github_observation import provider_retry_constraint
 
 
-def main() -> int:
+def main(arguments=()) -> int:
     original_payload: dict[str, object] = {}
     try:
         original_payload = read_preparation_input(sys.stdin.buffer)
@@ -42,6 +43,16 @@ def main() -> int:
 
     operation = original_payload.get("operation")
     try:
+        if list(arguments) not in ([], ["--admitted-reader-source"]):
+            raise CiContractError("dispatch_invalid")
+        admitted = list(arguments) == ["--admitted-reader-source"]
+        if (
+            ("operation" in original_payload and operation not in {
+                "archive_ci_report", "archive_script_ci_report", "archive_script_ci_report_v2",
+            })
+            or (admitted and "operation" in original_payload)
+        ):
+            raise CiContractError("dispatch_invalid")
         # This native Script/Task/graph check precedes lifecycle unwrapping and
         # every new typed result. Legacy profiles retain the old wire path.
         observed, protocol, target_required, context_schema, _native_read = (
@@ -61,16 +72,37 @@ def main() -> int:
         return 2
 
     typed_protocol = protocol == "typed-v1"
+    if admitted:
+        try:
+            if not typed_protocol or observed is None:
+                raise CiContractError("archive_protocol_mismatch")
+            nodes = observed.graph.get("graph", {}).get("nodes", [])
+            if not any(
+                node.get("id") == observed.identity["node_id"] and node.get("key") == "ci_prepare"
+                for node in nodes if isinstance(node, dict)
+            ):
+                raise CiContractError("archive_script_route_invalid")
+            from workflowkit.ci_contract import resolve_script_ci_archive_readers_admitted
+            identity_payload = unwrap_delivery_context_payload(original_payload)
+            resolve_script_ci_archive_readers_admitted(
+                Path(identity_payload["workspace_path"]), identity_payload["task_short_id"],
+                original_payload.get("_kent"), native_read=_native_read,
+            )
+        except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+            print('{"error":"ci_prepare_input_invalid"}')
+            return 2
     github_retry_constraint = None
     if operation is not None:
         try:
             payload = unwrap_delivery_context_payload(original_payload)
-            if operation == "archive_script_ci_report":
+            if operation in {"archive_script_ci_report", "archive_script_ci_report_v2"}:
                 if not typed_protocol or observed is None:
                     raise CiContractError("archive_protocol_mismatch")
                 validate_preparation_identity(payload)
                 profile = observed.profile
-                artifact = archive_script_ci_report(
+                archiver = (archive_script_ci_report_admitted
+                            if operation == "archive_script_ci_report_v2" else archive_script_ci_report)
+                artifact = archiver(
                     payload,
                     evidence_command=profile.command("evidence"),
                 )
@@ -167,7 +199,8 @@ def main() -> int:
                     ),
                     "_kent": original_payload.get("_kent"),
                 }
-                return archive_script_ci_report(
+                archiver = archive_script_ci_report_admitted if admitted else archive_script_ci_report
+                return archiver(
                     archive_payload,
                     evidence_command=observed.profile.command("evidence"),
                 )
@@ -233,4 +266,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

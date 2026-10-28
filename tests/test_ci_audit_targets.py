@@ -854,6 +854,430 @@ class TargetBranchContinuityTest(unittest.TestCase):
         self.assertEqual(diagnostic["classification"], "invalid_input")
 
 
+class AdmittedNativeArchiveVerticalTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("KENT_TEST_ARCHIVE_FULLSIZE") == "1",
+                         "opt-in full-size archive resource measurement")
+    def test_fullsize_app_archive_cycle(self):
+        self.test_app_global_prepare_watch_archive_with_retained_product_baseline(full_size=True)
+
+    def test_app_global_prepare_watch_archive_with_retained_product_baseline(self, full_size=False):
+        import time
+        started = time.monotonic()
+        from workflowkit import operations, delivery
+        from workflowkit.profile import ProjectProfile
+        from tests.test_canonical_workflow_lifecycle import create_verified_source_fixture
+        from tests.test_delivery_continuity import runtime_v2_profile
+
+        project_id = "project-22222222-2222-4222-8222-222222222222"
+        workflow_id = "11111111-1111-4111-8111-111111111111"
+        fixture, _ = create_verified_source_fixture(
+            self, project_id, workflow_id, receipt_workflow_id=workflow_id,
+        )
+        # Published disposable donor contains the full dirty candidate, not HEAD.
+        for source in (ROOT / "workflowkit").glob("*.py"):
+            fixture.put(fixture.kit, "workflowkit/" + source.name, source.read_text())
+        for relative in set(ci_contract._ARCHIVE_KIT_MODULE_PATHS) | set(ci_contract._ARCHIVE_KIT_TEMPLATE_PATHS):
+            source = ROOT / relative
+            fixture.put(fixture.kit, relative, source.read_text(), source.stat().st_mode & 0o777)
+
+        with mock.patch.object(ProjectProfile, "from_toml", wraps=ProjectProfile.from_toml) as parse:
+            runtime_v2_profile(ci=True, source_ci=True, current_family=True)
+            contents = parse.call_args.args[1]
+        contents = contents.replace(
+            "kit_managed_commands = [",
+            'kit_managed_commands = ["project_memory", "project_memory_core", ',
+        ).replace(
+            "[command_versions]\n",
+            '[command_versions]\nproject_memory = "1.0.0"\nproject_memory_core = "1.0.0"\n',
+        ).replace(
+            "[commands]\n",
+            '[commands]\nproject_memory = ".kent/scripts/workflow-project-memory"\n'
+            'project_memory_core = ".kent/scripts/workflow_project_memory.py"\n',
+        ).replace(
+            'cleanup = ""', 'cleanup = ".kent/commands/cleanup-task.md"',
+        )
+        contents += (
+            "\n[project_memory]\n"
+            f"root = {json.dumps(str(fixture.base / 'memory'))}\n"
+            'project_key = "fixture"\nproject_uid = "project-uid"\nmode = "r2"\n'
+        )
+        fixture.put(fixture.project, ".kent/workflow-profile.toml", contents)
+        profile = ProjectProfile.from_toml(fixture.project, contents, check_files=False)
+        self.assertIsNone(profile.kit_runtime)
+        bindings = ci_contract._archive_project_reader_bindings(
+            profile, script_key="prepare_ci", script_path=profile.command("prepare_ci"),
+        )
+        for relative, canonical in bindings.items():
+            if relative == ".kent/workflow-profile.toml":
+                continue
+            if relative == profile.command("checkpoint"):
+                canonical = "templates/project/workflow-checkpoint"
+            raw = (ROOT / canonical).read_text() if canonical else "# project reader\n"
+            fixture.put(fixture.project, relative, raw, 0o755 if relative.startswith(".kent/scripts/") else 0o644)
+        # Preserve actual R2 siblings rather than project-owned placeholder files.
+        for name in ("workflow-project-memory", "workflow_project_memory.py"):
+            donor = ROOT / ("templates/project/" + name if name == "workflow-project-memory"
+                            else "workflowkit/project_memory.py")
+            fixture.put(fixture.project, ".kent/scripts/" + name, donor.read_text(),
+                        0o755 if name == "workflow-project-memory" else 0o644)
+        # Non-reader procedures are inert owned fixture inputs, still covered by C.
+        configured = list(profile.context_manifests.values())
+        configured += [path for kind in profile.work_kinds.values()
+                       for path in (kind.plan, kind.implement)]
+        configured += [profile.release.spec_path, profile.release.snapshot_path,
+                       profile.release.builder_path]
+        for relative in configured:
+            if relative and not (fixture.project / relative).exists():
+                fixture.put(fixture.project, relative, "# fixture document\n",
+                            0o755 if relative.endswith(".sh") else 0o644)
+        for relative in profile.commands.values():
+            if relative and not (fixture.project / relative).exists():
+                fixture.put(fixture.project, relative, "#!/bin/sh\nexit 0\n", 0o755)
+        initial_script = ".kent/scripts/fixture-source-ingress"
+        fixture.put(fixture.project, initial_script, "#!/bin/sh\nexit 0\n", 0o755)
+        if full_size:
+            sources = []
+            for root in (fixture.project, fixture.kit):
+                for source in root.rglob("*"):
+                    relative = source.relative_to(root).as_posix()
+                    if fixture.module.infrastructure(relative, root == fixture.kit) and source.is_file():
+                        sources.append(source)
+            missing = 449 - len(sources)
+            remaining_bytes = 19_841_831 - sum(source.stat().st_size for source in sources)
+            self.assertGreater(missing, 0)
+            self.assertGreater(remaining_bytes, 0)
+            for index in range(missing):
+                size = remaining_bytes // (missing - index)
+                fixture.put(fixture.project, f".kent/scripts/archive-capacity/source-{index:03}.txt",
+                            "x" * size)
+                remaining_bytes -= size
+        fixture.repin_native_sources()
+        inspector = fixture.module
+        fixture.receipt["files"] = [
+            item for item in fixture.receipt["files"]
+            if inspector.infrastructure(item["relative_path"], item["root"] == str(fixture.kit))
+        ]
+        fixture.use_content_policy()
+        if full_size:
+            self.assertEqual(len(fixture.receipt["files"]), 449)
+            self.assertEqual(sum(item["byte_size"] for item in fixture.receipt["files"]), 19_841_831)
+        fixture.installation_binding["receipt_sha256"] = fixture.digest
+        fixture.write_installation_binding()
+        fixture.rewrite_product_history(fixture.project)
+        self.assertNotEqual(fixture.git(fixture.project, "rev-parse", "HEAD").strip(),
+                            fixture.receipt["source_commit"])
+        admission = dict(fixture.source_admission)
+        admission["receipt_ref"] = {**admission["receipt_ref"], "sha256": fixture.digest}
+        admission["binding"] = {
+            **admission["binding"],
+            "installation_binding_sha256": hashlib.sha256(fixture.binding_path.read_bytes()).hexdigest(),
+        }
+        admission["ingress"] = {"kind": "script-edge", "edge_id": "fixture-ingress-edge"}
+        frame = {"project_id": project_id, "workflow_id": workflow_id, "source_admission": admission}
+        frame_raw = runtime.canonical_bytes(frame)
+        frame_path = fixture.evidence / "archive-source-frame.json"
+        frame_path.write_bytes(frame_raw)
+        frame_path.chmod(0o600)
+        reference = runtime.canonical_bytes({
+            "schema": operations.SCRIPT_INGRESS_REF_SCHEMA, "path": str(frame_path),
+            "sha256": hashlib.sha256(frame_raw).hexdigest(),
+        }).decode()
+        spec = delivery.build_delivery_workflow(profile, 1)
+        node_ids = {node.key: "native-" + node.key for node in spec.nodes}
+        groups, edges, nodes = {}, [], []
+        for node in spec.nodes:
+            row = {"id": node_ids[node.key], "key": node.key, "kind": node.kind}
+            if node.script_path is not None:
+                row["script_path"] = node.script_path
+            nodes.append(row)
+        for index, edge in enumerate(spec.edges):
+            key = (edge.source, edge.transition)
+            group = groups.setdefault(key, "group-" + "-".join(key))
+            edges.append({
+                "id": f"edge-{index}", "transition_group_id": group,
+                "target_node_id": node_ids[edge.target],
+                "parameters": [{"key": parameter.key} for parameter in edge.parameters],
+            })
+        graph = {"workflow_id": workflow_id, "expected_version": 1, "graph": {
+            "nodes": nodes + [
+                {"id": "fixture-start", "key": "start", "kind": "agent"},
+                {"id": "fixture-ingress", "key": "fixture_ingress", "kind": "script",
+                 "script_path": initial_script},
+            ], "node_groups": [], "edges": edges + [{
+                "id": "fixture-ingress-edge", "transition_group_id": "fixture-ingress-group",
+                "target_node_id": "fixture-ingress", "parameters": [], "prompt_template": "",
+            }], "transition_groups": [
+                {"id": identifier, "source_node_id": node_ids[source], "transition_id": transition}
+                for (source, transition), identifier in groups.items()
+            ] + [{"id": "fixture-ingress-group", "source_node_id": "fixture-start",
+                  "transition_id": "fixture_ingress", "description": reference}],
+        }}
+        graph_path = fixture.base / "archive-graph.json"
+        graph_path.write_text(json.dumps(graph))
+        task = fixture.native_task
+        task["summary"].update(id="task-archive", short_id="OSM-138",
+                               project_id=project_id, workflow_id=workflow_id)
+        task["execution_target"] = {"commit_oid": "6c8bf4b72bdc5b5a2787dba85e0df8a793404a19"}
+        task["current_nodes"], task["live_sessions"] = [], []
+
+        def select_node(key):
+            script = profile.command("prepare_ci" if key == "ci_prepare" else "wait_ci")
+            task["current_scripts"] = [{
+                "current_node": {"node_id": node_ids[key], "transition_branch_key": None},
+                "path": script,
+            }]
+            fixture.write_fake_kent(task)
+            source = fixture.native_bin.read_text().replace("project-test", project_id)
+            source = source.replace(
+                "args[4] != '--limit' or args[6] != '--offset'",
+                "args[4] != '--offset' or args[6] != '--limit'",
+            ).replace("limit, offset = int(args[5]), int(args[7])",
+                      "offset, limit = int(args[5]), int(args[7])")
+            source = source.replace("import json, sys", "import json, sys, pathlib")
+            source = source.replace("print(json.dumps(graph))",
+                                    f"print(pathlib.Path({str(graph_path)!r}).read_text())")
+            fixture.native_bin.write_text(source)
+            fixture.native_bin.chmod(0o700)
+            return {"task_id": task["summary"]["id"], "node_id": node_ids[key]}
+
+        pr_url = "https://github.com/owner/repository/pull/17"
+        pr = {"url": pr_url, "state": "OPEN", "headRefName": "OSM-138",
+              "baseRefName": "main", "headRefOid": "a" * 40, "baseRefOid": "b" * 40,
+              "mergedAt": None, "mergeCommit": None, "reviewDecision": "APPROVED",
+              "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+              "statusCheckRollup": [{"name": "unit"}]}
+        gh = fixture.bin / "gh"
+        gh.write_text(
+            f"#!{sys.executable}\nimport json, sys\nargs = sys.argv[1:]\n"
+            f"pr = {pr!r}\n"
+            "if args[:2] == ['pr', 'view']: print(json.dumps(pr))\n"
+            "elif args[:2] == ['pr', 'checks']: print(json.dumps(["
+            "{'name':'unit','workflow':'Build','event':'pull_request',"
+            "'bucket':'pass','state':'SUCCESS','link':None}]))\n"
+            "elif args[:2] == ['api', 'graphql']: print(json.dumps({'data': {'repository':"
+            "{'pullRequest': {'reviewThreads': {'nodes': [], 'pageInfo':"
+            "{'hasNextPage':False,'endCursor':None}}}}}}))\n"
+            "elif args and args[0] == 'api': print('[[]]')\n"
+            "else: raise SystemExit(2)\n"
+        )
+        gh.chmod(0o755)
+        env = {**os.environ, "HOME": str(fixture.home),
+               "PATH": str(fixture.bin) + os.pathsep + os.environ.get("PATH", ""),
+               "KENT_GH_BIN": str(gh), "KENT_CI_WATCH_TEST_MODE": "1",
+               "KENT_CI_WATCH_INTERVAL_SECONDS": "0", "KENT_CI_WATCH_MAX_POLLS": "1"}
+        env.pop("KENT_SESSION_ID", None)
+        env.pop("KENT_STEP_ID", None)
+        # Earlier product nodes own runtime initialization; archive must not
+        # silently manufacture a missing Task ledger/lock.
+        task_runtime = fixture.project / ".kent/runtime/OSM-138"
+        task_runtime.mkdir(parents=True, mode=0o700)
+        (task_runtime / "evidence-ledger.jsonl").write_bytes(b"")
+        (task_runtime / "evidence-ledger.jsonl").chmod(0o600)
+
+        def run_helper(command, payload):
+            result = subprocess.run(
+                [str(command)], cwd=fixture.project, input=json.dumps(payload),
+                text=True, capture_output=True, timeout=180, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return json.loads(result.stdout)
+
+        context = select_node("ci_prepare")
+        payload = {"workspace_path": str(fixture.project), "task_short_id": "OSM-138",
+                   "pr_url": pr_url, "branch_name": "OSM-138", "pr_base_branch": "main",
+                   "merge_strategy": "squash", "pr_feedback_cursor": "uninitialized",
+                   "_kent": context}
+        prepared = run_helper(fixture.project / profile.command("prepare_ci"), payload)
+        self.assertIn("transition", prepared)
+        context = select_node("ci_watch")
+        watched = run_helper(fixture.project / profile.command("wait_ci"), {**prepared, "_kent": context})
+        self.assertIn("transition", watched)
+        ledger_path = fixture.project / ".kent/runtime/OSM-138/evidence-ledger.jsonl"
+        records = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+        archives = [row for row in records if row.get("record_kind") == runtime.SCRIPT_CI_ARCHIVE_RECORD_KIND]
+        self.assertTrue(archives)
+        # Schema3 rows keep historical producer identity; v2 is only the gate.
+        self.assertTrue(all("kit_commit_oid" not in row for row in archives))
+        report_path = fixture.project / archives[-1]["artifacts"][0]
+        archive_request = {
+            **payload, "_kent": context, "operation": "archive_script_ci_report_v2",
+            "ci_report": report_path.read_text(),
+        }
+        before = ledger_path.read_bytes()
+        for _ in range(2):
+            result = run_helper(fixture.kit / "scripts/prepare-github-ci", archive_request)
+            self.assertEqual(result["ci_report_artifact"], archives[-1]["artifacts"][0])
+            self.assertEqual(ledger_path.read_bytes(), before)
+        def blocked(request):
+            result = subprocess.run(
+                [str(fixture.kit / "scripts/prepare-github-ci")],
+                cwd=fixture.project, input=json.dumps(request), text=True,
+                capture_output=True, timeout=120, env=env,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(ledger_path.read_bytes(), before)
+
+        blocked({**archive_request, "_kent": {**context, "node_id": "foreign-script"}})
+        for source in (
+            fixture.receipt_path,
+            frame_path,
+            fixture.project / ".kent/workflow-profile.toml",
+            fixture.project / profile.procedure("cleanup"),
+            fixture.project / profile.command("wait_ci"),
+            fixture.kit / "workflowkit/operations.py",
+            fixture.kit / "workflowkit/kit_runtime.py",
+            fixture.kit / "scripts/prepare-github-ci",
+        ):
+            original = source.read_bytes()
+            with self.subTest(drift=source.name):
+                try:
+                    source.write_bytes(original + b"\n# owned fixture drift\n")
+                    blocked(archive_request)
+                finally:
+                    source.write_bytes(original)
+        # An imported dependency absent from C's exact receipt inventory cannot
+        # be smuggled in by adding an otherwise valid source file.
+        foreign_reader = fixture.project / ".kent/scripts/uncovered-reader.py"
+        foreign_reader.write_text("# uncovered source\n")
+        try:
+            blocked(archive_request)
+        finally:
+            foreign_reader.unlink()
+        # Mutate the real admission carrier only after the real Task lock has
+        # been acquired. No source/native resolver is mocked by this race probe.
+        original_frame = frame_path.read_bytes()
+        probe = (
+            "import json,sys\nfrom pathlib import Path\n"
+            f"sys.path.insert(0, {str(fixture.kit)!r})\n"
+            "from workflowkit import ci_contract\n"
+            "load = ci_contract._load_qualified_archive_module\n"
+            "def instrument(name,path,raw):\n"
+            " module = load(name,path,raw)\n"
+            " if Path(path).name == 'workflow-evidence-ledger':\n"
+            "  opening = module._open_runtime_fds\n"
+            "  def under_lock(*args,**kwargs):\n"
+            "   result = opening(*args,**kwargs)\n"
+            f"   frame = Path({str(frame_path)!r})\n"
+            "   frame.write_bytes(frame.read_bytes() + b' ')\n"
+            "   return result\n"
+            "  module._open_runtime_fds = under_lock\n"
+            " return module\n"
+            "ci_contract._load_qualified_archive_module = instrument\n"
+            "ci_contract.archive_script_ci_report_admitted(json.load(sys.stdin),"
+            " evidence_command='.kent/scripts/workflow-evidence-ledger')\n"
+        )
+        try:
+            race = subprocess.run(
+                [sys.executable, "-B", "-c", probe],
+                cwd=fixture.project, input=json.dumps(archive_request),
+                text=True, capture_output=True, timeout=120, env=env,
+            )
+            self.assertNotEqual(race.returncode, 0, race.stdout)
+            self.assertIn("archive_blocked", race.stderr)
+            self.assertNotEqual(frame_path.read_bytes(), original_frame)
+            self.assertEqual(ledger_path.read_bytes(), before)
+        finally:
+            frame_path.write_bytes(original_frame)
+        # Real preparation reset callback archives the prior report without
+        # changing its original watcher record or inventing a provider result.
+        context = select_node("ci_prepare")
+        gh.write_text(gh.read_text().replace("'a" + "a" * 39 + "'", "'d" + "d" * 39 + "'"))
+        previous_report = json.loads(report_path.read_text())
+        reset = run_helper(fixture.project / profile.command("prepare_ci"), {
+            **payload, "_kent": context,
+            "ci_contract": runtime.canonical_bytes(previous_report["contract"]).decode(),
+            "ci_report": report_path.read_text(),
+        })
+        self.assertIn("transition", reset)
+        rows = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+        self.assertEqual(rows[0], archives[0])
+        self.assertEqual(len(rows), len(archives) + 1)
+        self.assertEqual(rows[-1]["script_identity"]["node_id"], node_ids["ci_prepare"])
+
+        # Finish the actual schema3 archive chain through the existing ordinary
+        # final event, terminal seal and primary Janitor runtime cleanup boundary.
+        from tests.test_workflow_runtime import EVIDENCE_FIXTURE_OWNER
+        owner_env = {**env, **EVIDENCE_FIXTURE_OWNER}
+        task["current_scripts"] = []
+        task["current_nodes"] = [{
+            "node_id": "fixture-cleanup",
+            "session_id": EVIDENCE_FIXTURE_OWNER["KENT_SESSION_ID"],
+        }]
+        fixture.write_fake_kent(task)
+        fixture.native_bin.write_text(fixture.native_bin.read_text().replace("project-test", project_id))
+        fixture.native_bin.chmod(0o700)
+        ledger_command = fixture.project / profile.command("evidence")
+        redaction = fixture.project / "build/redaction.json"
+        redaction.parent.mkdir(exist_ok=True)
+        redaction.write_bytes(b'{"status":"passed"}')
+        redaction.chmod(0o600)
+        redaction_digest = hashlib.sha256(redaction.read_bytes()).hexdigest()
+        final_event = {
+            "node_key": "cleanup", "evidence_type": "verification",
+            "summary": "Owned archive vertical final event.", "checks": ["archive vertical"],
+            "artifacts": [str(redaction.relative_to(fixture.project))], "context": {
+                "manifest_path": ".kent/context/delivery.md", "files_read": [],
+                "model_calls": 0, "compaction_count": 0,
+            },
+        }
+        final = subprocess.run(
+            [str(ledger_command), "append", "--task", "OSM-138", "--workspace", str(fixture.project)],
+            cwd=fixture.project, input=json.dumps(final_event), text=True,
+            capture_output=True, timeout=30, env=owner_env,
+        )
+        self.assertEqual(final.returncode, 0, final.stderr)
+        sealed = subprocess.run(
+            [str(ledger_command), "seal", "--task", "OSM-138", "--workspace", str(fixture.project)],
+            cwd=fixture.project, input=json.dumps({
+                "schema": "terminal-evidence-seal-request-v1",
+                "operation_report_digests": [],
+                "redaction": {"status": "passed", "report_sha256": redaction_digest},
+                "retention_class": "cleanup_report_only",
+            }), text=True, capture_output=True, timeout=30, env=owner_env,
+        )
+        self.assertEqual(sealed.returncode, 0, sealed.stderr)
+        marker = json.loads(sealed.stdout)["terminal_marker"]
+        retention = subprocess.run(
+            [str(ledger_command), "retain-evidence", "--task", "OSM-138",
+             "--workspace", str(fixture.project)],
+            cwd=fixture.project, text=True, capture_output=True, timeout=30, env=owner_env,
+        )
+        self.assertEqual(retention.returncode, 0, retention.stderr)
+        retention_preview = json.loads(retention.stdout)
+        retained = subprocess.run(
+            [str(ledger_command), "retain-evidence", "--task", "OSM-138",
+             "--workspace", str(fixture.project),
+             "--confirm", retention_preview["receipt"]["bundle_sha256"]],
+            cwd=fixture.project, text=True, capture_output=True, timeout=30, env=owner_env,
+        )
+        self.assertEqual(retained.returncode, 0, retained.stderr)
+        janitor = load_template(fixture.project / profile.command("janitor"), "admitted_vertical_janitor")
+        errors = []
+        previous_trace = sys.gettrace()
+        def cleanup_trace(frame, event, arg):
+            if event == "exception" and frame.f_code.co_filename == janitor.__file__:
+                errors.append((frame.f_lineno, repr(arg[1])))
+            return cleanup_trace
+        try:
+            sys.settrace(cleanup_trace)
+            with mock.patch.dict(os.environ, owner_env, clear=True):
+                cleaned = janitor._remove_v2_runtime_state(
+                    fixture.project, "OSM-138", cleanup_report=marker,
+                )
+        finally:
+            sys.settrace(previous_trace)
+        self.assertTrue(cleaned[0], (cleaned, errors[-12:]))
+        self.assertFalse(task_runtime.exists())
+        if full_size:
+            print(json.dumps({
+                "measurement": "admitted-app-archive-cycle",
+                "receipt_files": len(fixture.receipt["files"]),
+                "receipt_bytes": sum(item["byte_size"] for item in fixture.receipt["files"]),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "limits_raised": False,
+            }, sort_keys=True))
+
+
 class ProviderRetryCiPreparationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -1527,7 +1951,7 @@ class ArchiveReaderSnapshotTest(unittest.TestCase):
             check=True,
         )
 
-    def _snapshot(self):
+    def _snapshot(self, *, admitted=False):
         from workflowkit import delivery
         from workflowkit.profile import ProjectProfile
 
@@ -1572,7 +1996,40 @@ class ArchiveReaderSnapshotTest(unittest.TestCase):
                 "TASK-17",
                 native_context,
                 native_read=mock.Mock(),
+                admitted=admitted,
             )
+
+    def test_admitted_snapshot_uses_C_not_native_A_and_binds_fresh_proof(self):
+        from workflowkit import operations, kit_runtime
+        source_commit = self._git(self.project, "rev-parse", "HEAD")
+        kit_commit = self._git(self.kit, "rev-parse", "HEAD")
+        native_a = self.observation.task_detail["execution_target"]["commit_oid"]
+        # A remains independently selected; only admitted C contains new readers.
+        self.observation.task_detail["execution_target"]["commit_oid"] = "a" * 40
+        source = {
+            "baseline_commit": "a" * 40,
+            "source_commit": source_commit,
+            "kit_binding": {"root": str(self.kit), "commit": kit_commit},
+            "source_admission": {"primary_root": str(self.project)},
+            "receipt_sha256": "1" * 64,
+        }
+        with (
+            mock.patch.object(operations, "resolve_script_reader_source",
+                              return_value=types.SimpleNamespace(value=source)) as resolve,
+            mock.patch.object(kit_runtime, "_native_executable", return_value=Path("/fixture/kent")),
+        ):
+            first, _ = self._snapshot(admitted=True)
+            self.assertEqual(first["schema"], "script-ci-archive-reader-proof-v2")
+            source["receipt_sha256"] = "2" * 64
+            second, _ = self._snapshot(admitted=True)
+            self.assertNotEqual(first["reader_proof_sha256"], second["reader_proof_sha256"])
+            self.assertEqual(resolve.call_count, 2)
+            source["kit_binding"]["commit"] = "b" * 40
+            with self.assertRaisesRegex(ci_contract.CiContractError, "cohort"):
+                self._snapshot(admitted=True)
+        with self.assertRaises(ci_contract.CiContractError):
+            self._snapshot()
+        self.observation.task_detail["execution_target"]["commit_oid"] = native_a
 
     def test_snapshot_binds_selected_project_and_serving_kit_source_bytes(self) -> None:
         proof, snapshots = self._snapshot()

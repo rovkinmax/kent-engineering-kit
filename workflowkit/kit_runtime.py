@@ -1918,6 +1918,56 @@ def qualified_kit_runtime(
     )
 
 
+@dataclass(frozen=True)
+class VerifiedCiCommand:
+    path: Path
+    arguments: tuple[str, ...]
+
+    def __reduce__(self):
+        raise TypeError("qualified commands are invocation-local")
+
+
+def admitted_ci_command(project_root, native_context, *, operation):
+    """Qualify the entire serving archive cohort before dispatching its CLI."""
+    if operation not in {None, "archive_script_ci_report_v2", "archive_script_ci_report", "archive_ci_report"}:
+        raise KitRuntimeError("unsupported admitted CI operation")
+    from . import ci_contract
+
+    root = _canonical_directory(project_root, "CI project root")
+    context_task = native_context.get("task_id") if isinstance(native_context, Mapping) else None
+    if not isinstance(context_task, str):
+        raise KitRuntimeError("native Script context is unavailable")
+    executable = _native_executable()
+    project_id = _native_project_id(executable, root)
+    task = _task_from_script_context(executable, root, project_id, native_context)
+    graph = _native_graph(executable, root, task["workflow_id"])
+    _validate_script_owner(task, graph, root)
+    node = _graph_node(graph["graph"], task["current_node_id"])
+    if operation is None and node.get("key") != "ci_prepare":
+        raise KitRuntimeError("prepare dispatch requires its native Script node")
+    resolver = (
+        ci_contract.resolve_script_ci_archive_readers_admitted
+        if operation in {None, "archive_script_ci_report_v2"}
+        else ci_contract.resolve_script_ci_archive_readers
+    )
+    resolver(
+        root, task["short_id"], dict(native_context),
+        native_read=ci_contract._native_read_adapter(root),
+    )
+    source_root = Path(__file__).resolve(strict=True).parents[1]
+    # Loaded resolver dependencies must originate in the same qualified K;
+    # the snapshot above checks their current bytes against its immutable Git.
+    for name, module in tuple(sys.modules.items()):
+        if name == "workflowkit" or name.startswith("workflowkit."):
+            origin = getattr(module, "__file__", None)
+            if not isinstance(origin, str) or not Path(origin).resolve().is_relative_to(source_root):
+                raise KitRuntimeError("CI module escaped its qualified cohort")
+    return VerifiedCiCommand(
+        source_root / "scripts/prepare-github-ci",
+        ("--admitted-reader-source",) if operation is None else (),
+    )
+
+
 def kit_module(
     name: str,
     project_root: str | os.PathLike[str] | None = None,
