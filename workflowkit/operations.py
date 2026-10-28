@@ -3382,6 +3382,85 @@ def admit_script_source_ingress(
     )
 
 
+@dataclass(frozen=True, init=False)
+class VerifiedScriptReaderSource:
+    """Invocation-local proof; callers cannot select the infrastructure source."""
+
+    admission: VerifiedSourceAdmission
+    _raw: bytes
+
+    def __init__(self, admission, raw, *, _token):
+        if _token is not _VERIFIED_SOURCE_ADMISSION_TOKEN:
+            raise TypeError("reader source requires fresh native admission")
+        object.__setattr__(self, "admission", admission)
+        object.__setattr__(self, "_raw", bytes(raw))
+
+    @property
+    def value(self):
+        return json.loads(self._raw)
+
+    def __reduce__(self):
+        raise TypeError("reader source proofs are invocation-local")
+
+
+def resolve_script_reader_source(workspace, native_context, *, kent_path):
+    """Resolve A/C/K from fresh native ownership and graph-bound admission."""
+    from . import kit_runtime as bootstrap
+
+    root = bootstrap._canonical_directory(workspace, "Script workspace")
+    executable = _kent_path(str(kent_path), "reader source kent")
+    project_id = bootstrap._native_project_id(executable, root)
+    task = bootstrap._task_from_script_context(executable, root, project_id, native_context)
+    graph = bootstrap._native_graph(executable, root, task["workflow_id"])
+    bootstrap._validate_script_owner(task, graph, root)
+    ingress = _source_publication_carrier(
+        graph["graph"], project_id, task["workflow_id"],
+    )
+    admission = ingress["admission"]
+    source = task["source_workspace"]
+    if (
+        source.get("workspace_id") != admission["primary_workspace_id"]
+        or source.get("root_path") != admission["primary_root"]
+    ):
+        raise PlanValidationError("native reader source workspace differs")
+    _receipt, binding = bootstrap._read_source_receipt(
+        admission, project_id=project_id,
+        workflow_id=bootstrap._source_receipt_workflow_id(admission, task["workflow_id"]),
+    )
+    bootstrap._qualify_git_cohort(binding)
+    if task["current_node_id"] == ingress["ingress_node_id"]:
+        verified = admit_script_source_ingress(root, native_context, kent_path=executable)
+    else:
+        verified = admit_source_admission(
+            admission, project_id=project_id, workflow_id=task["workflow_id"],
+            project_root=admission["primary_root"], workspace_path=root,
+            kent_path=executable,
+        )
+    if (
+        verified.value != admission
+        or verified.kit_root != binding.root
+        or verified.receipt_sha256 != admission["receipt_ref"]["sha256"]
+        or verified.value.get("kit_ref") != binding.publication_ref
+    ):
+        raise PlanValidationError("native reader admission differs")
+    target = task["detail"].get("execution_target")
+    baseline = target.get("commit_oid") if isinstance(target, dict) else None
+    if not isinstance(baseline, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", baseline):
+        raise PlanValidationError("native reader baseline unavailable")
+    return VerifiedScriptReaderSource(verified, canonical_bytes({
+        "baseline_commit": baseline,
+        "kit_binding": binding.as_dict(),
+        "native_context": dict(native_context),
+        "task_id": task["task_id"],
+        "workflow_id": task["workflow_id"],
+        "workspace_path": str(root),
+        "admission_sha256": verified.source_admission_sha256,
+        "receipt_sha256": verified.receipt_sha256,
+        "source_commit": _receipt["source_commit"],
+        "source_admission": admission,
+    }), _token=_VERIFIED_SOURCE_ADMISSION_TOKEN)
+
+
 def _v2_ref_list(
     value: Any,
     label: str,

@@ -108,6 +108,9 @@ _ARCHIVE_PROJECT_COMMANDS = {
     "github_observation": "workflowkit/github_observation.py",
 }
 _ARCHIVE_KIT_MODULE_PATHS = (
+    "workflowkit/operations.py",
+    "workflowkit/kit_runtime.py",
+    "scripts/inspect-delivery-source",
     "scripts/prepare-github-ci",
     "workflowkit/__init__.py",
     "workflowkit/ci_contract.py",
@@ -606,6 +609,7 @@ def _archive_reader_snapshot(
     native_context: dict,
     *,
     native_read,
+    admitted=False,
 ) -> tuple[dict[str, Any], dict[str, bytes]]:
     if (
         not root.is_absolute()
@@ -706,6 +710,27 @@ def _archive_reader_snapshot(
             if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", kit_commit):
                 raise CiContractError("serving_kit_revision_invalid")
 
+            reader_source = None
+            project_source_root = project_root
+            project_source_commit = commit_oid
+            proof_schema = SCRIPT_CI_ARCHIVE_READER_PROOF_SCHEMA
+            if admitted:
+                from .operations import resolve_script_reader_source
+                from .kit_runtime import _native_executable
+                reader_source = resolve_script_reader_source(
+                    root, native_context, kent_path=_native_executable(),
+                ).value
+                binding = reader_source["kit_binding"]
+                if (
+                    binding["root"] != str(kit_root)
+                    or binding["commit"] != kit_commit
+                    or reader_source["baseline_commit"] != commit_oid
+                ):
+                    raise CiContractError("archive_source_cohort_mismatch")
+                project_source_root = Path(reader_source["source_admission"]["primary_root"])
+                project_source_commit = reader_source["source_commit"]
+                proof_schema = "script-ci-archive-reader-proof-v2"
+
             profile_path = ".kent/workflow-profile.toml"
             project_paths = {profile_path, *project_to_kit}
             kit_paths = set(_ARCHIVE_KIT_MODULE_PATHS)
@@ -725,15 +750,16 @@ def _archive_reader_snapshot(
             def qualify_source(source_root: Path, source_commit: str, path: str, kind: str):
                 nonlocal total_bytes
                 mode, actual = _read_archive_source(source_root, path)
+                git_source_root = project_source_root if kind == "project" else source_root
                 expected_mode = revision_contracts.tree_mode(
-                    source_root,
+                    git_source_root,
                     source_commit,
                     path,
                 )
                 if expected_mode not in {"100644", "100755"} or mode != expected_mode:
                     raise CiContractError("archive_reader_mode_mismatch")
                 expected = revision_contracts.read_blob_bytes(
-                    source_root,
+                    git_source_root,
                     source_commit,
                     path,
                     label="CI archive reader",
@@ -755,7 +781,7 @@ def _archive_reader_snapshot(
 
             for path in sorted(project_paths):
                 _archive_relative_path(path, label="archive_reader_path")
-                qualify_source(project_root, commit_oid, path, "project")
+                qualify_source(project_root, project_source_commit, path, "project")
             for path in sorted(kit_paths):
                 _archive_relative_path(path, label="archive_reader_path")
                 qualify_source(kit_root, kit_commit, path, "kit")
@@ -796,7 +822,7 @@ def _archive_reader_snapshot(
                 raise CiContractError("archive_profile_changed")
             graph_projection = _archive_protocol_projection(graph, delivery)
             proof_inputs = {
-                "schema": SCRIPT_CI_ARCHIVE_READER_PROOF_SCHEMA,
+                "schema": proof_schema,
                 "native_script_identity": identity,
                 "project_root": str(project_root),
                 "project_commit_oid": commit_oid,
@@ -810,9 +836,11 @@ def _archive_reader_snapshot(
                     row["kind"], row["path"],
                 )),
             }
+            if admitted:
+                proof_inputs["reader_source"] = reader_source
             proof_digest = _sha256(canonical_bytes(proof_inputs))
             proof = {
-                "schema": SCRIPT_CI_ARCHIVE_READER_PROOF_SCHEMA,
+                "schema": proof_schema,
                 "reader_proof_sha256": proof_digest,
                 "native_script_identity": identity,
             }
@@ -844,6 +872,12 @@ def resolve_script_ci_archive_readers(
         native_read=native_read,
     )
     return proof
+
+
+def resolve_script_ci_archive_readers_admitted(root, task, native_context, *, native_read):
+    return _archive_reader_snapshot(
+        root, task, native_context, native_read=native_read, admitted=True,
+    )[0]
 
 
 def _load_qualified_archive_module(name: str, path: Path, raw: bytes):
@@ -1629,6 +1663,15 @@ def archive_script_ci_report(
     *,
     evidence_command: str,
 ) -> str:
+    return _archive_script_ci_report(payload, evidence_command=evidence_command, admitted=False)
+
+
+def archive_script_ci_report_admitted(payload: Mapping[str, Any], *, evidence_command: str) -> str:
+    """Archive using freshly admitted infrastructure C/K, preserving native A."""
+    return _archive_script_ci_report(payload, evidence_command=evidence_command, admitted=True)
+
+
+def _archive_script_ci_report(payload, *, evidence_command, admitted):
     """Qualify source readers, then archive through the in-process ledger API."""
     identity = validate_preparation_identity(payload)
     root = Path(identity["workspace_path"])
@@ -1662,6 +1705,7 @@ def archive_script_ci_report(
             task,
             native_context,
             native_read=native_read,
+            admitted=admitted,
         )
         ledger_relative = evidence_command
         runtime_relative = ".kent/scripts/workflow_runtime_contracts.py"
@@ -1696,12 +1740,17 @@ def archive_script_ci_report(
                 or callback_context != native_context
             ):
                 raise CiContractError("archive_reader_identity_changed")
-            return resolve_script_ci_archive_readers(
+            if not admitted:
+                return resolve_script_ci_archive_readers(
+                    root, task, native_context, native_read=native_read,
+                )
+            return _archive_reader_snapshot(
                 root,
                 task,
                 native_context,
                 native_read=native_read,
-            )
+                admitted=admitted,
+            )[0]
 
         result = ledger_module.archive_script_ci_report(
             root,

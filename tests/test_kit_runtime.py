@@ -24,6 +24,162 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class KitRuntimeBindingTest(unittest.TestCase):
+    def test_explicit_v1_command_keeps_v1_source_policy(self):
+        from workflowkit import ci_contract
+        context = {"task_id": "task-1", "node_id": "node-1"}
+        root = REPO_ROOT.resolve()
+        with (
+            mock.patch.object(kit_runtime, "_native_executable", return_value=Path("/fixture/kent")),
+            mock.patch.object(kit_runtime, "_native_project_id", return_value="project-test"),
+            mock.patch.object(kit_runtime, "_task_from_script_context",
+                              return_value={"short_id": "TASK-1", "workflow_id": "wf",
+                                            "current_node_id": "node-1"}),
+            mock.patch.object(kit_runtime, "_native_graph", return_value={"graph": {"nodes": [
+                {"id": "node-1", "kind": "script", "key": "ci_watch"},
+            ]}}),
+            mock.patch.object(kit_runtime, "_validate_script_owner"),
+            mock.patch.object(ci_contract, "_native_read_adapter", return_value=mock.Mock()),
+            mock.patch.object(ci_contract, "resolve_script_ci_archive_readers") as v1,
+            mock.patch.object(ci_contract, "resolve_script_ci_archive_readers_admitted") as v2,
+        ):
+            command = kit_runtime.admitted_ci_command(
+                root, context, operation="archive_script_ci_report",
+            )
+            self.assertEqual(command.arguments, ())
+            v1.assert_called_once()
+            v2.assert_not_called()
+
+    def test_current_wrapper_blocks_invalid_context_before_override_helper(self, baseline=False):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            project = base / "project"
+            scripts = project / ".kent/scripts"
+            scripts.mkdir(parents=True)
+            for name in ("workflow-checkpoint", "workflow-prepare-github-ci"):
+                if baseline:
+                    (scripts / name).write_bytes(subprocess.check_output(
+                        ["git", "show", "c4d89d9ccea33251af9ef78e0d97f78879da6176:templates/project/" + name],
+                        cwd=REPO_ROOT,
+                    ))
+                else:
+                    shutil.copyfile(REPO_ROOT / "templates/project" / name, scripts / name)
+                (scripts / name).chmod(0o755)
+            profile = project / ".kent/workflow-profile.toml"
+            profile.write_text(
+                'schema_version = 4\n[policies]\ndelivery_reliability = "v1"\n'
+            )
+            marker = base / "helper-called"
+            helper = base / "unqualified-helper"
+            helper.write_text(f"#!/bin/sh\ntouch {marker}\n")
+            helper.chmod(0o755)
+            home = base / "home"
+            link = home / ".kent/bin/kent-prepare-github-ci"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(REPO_ROOT / "scripts/prepare-github-ci")
+            binary = base / "bin"
+            binary.mkdir()
+            kent = binary / "kent"
+            kent.write_text("#!/bin/sh\nexit 1\n")
+            kent.chmod(0o755)
+            env = {**os.environ, "HOME": str(home),
+                   "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
+                   "KENT_PREPARE_GITHUB_CI_BIN": str(helper)}
+            original = profile.read_bytes()
+            for context in ("absent", None, {}, {"task_id": "foreign", "node_id": "foreign"}):
+                for foreign_workspace in (False, True):
+                    with self.subTest(context=context, foreign_workspace=foreign_workspace):
+                        payload = {"workspace_path": str(base if foreign_workspace else project),
+                                   "task_short_id": "TASK-17"}
+                        if context != "absent":
+                            payload["_kent"] = context
+                        result = subprocess.run(
+                            ["bash", str(scripts / "workflow-prepare-github-ci")],
+                            input=json.dumps(payload).encode(), env=env,
+                            capture_output=True, timeout=20,
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse(marker.exists())
+            for contents, mode in (
+                (b"malformed [", 0o644), (original, 0o666),
+                (b"schema_version = 99\n", 0o644),
+                (b'schema_version = 4\n[policies]\ndelivery_reliability = "unknown"\n', 0o644),
+            ):
+                profile.write_bytes(contents)
+                profile.chmod(mode)
+                result = subprocess.run(
+                    ["bash", str(scripts / "workflow-prepare-github-ci")],
+                    input=json.dumps({"workspace_path": str(project)}).encode(),
+                    env=env, capture_output=True, timeout=20,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(marker.exists())
+            profile.chmod(0o644)
+            result = subprocess.run(
+                ["bash", str(scripts / "workflow-prepare-github-ci"), "--unknown"],
+                input=b"{}", env=env, capture_output=True, timeout=20,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"unsupported arguments", result.stderr)
+            self.assertFalse(marker.exists())
+            profile.write_text(
+                'schema_version = 4\nkit_managed_commands = ["runtime_contracts", "prepare_ci"]\n'
+                '[policies]\ndelivery_reliability = "v1"\n'
+                '[command_versions]\nruntime_contracts = "2.0.0"\nprepare_ci = "2.0.0"\n'
+            )
+            for with_context in (True, False):
+                request = {"operation": "archive_ci_report", "workspace_path": str(project)}
+                if with_context:
+                    request["_kent"] = None
+                result = subprocess.run(
+                    ["bash", str(scripts / "workflow-prepare-github-ci")],
+                    input=json.dumps(request).encode(), env=env, capture_output=True, timeout=20,
+                )
+                self.assertEqual(result.returncode == 0, not with_context)
+                self.assertEqual(marker.exists(), not with_context)
+
+    def test_new_v2_operation_and_malformed_exception_never_reach_legacy_helper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary).resolve()
+            scripts = project / ".kent/scripts"
+            scripts.mkdir(parents=True)
+            for name in ("workflow-checkpoint", "workflow-prepare-github-ci"):
+                shutil.copyfile(REPO_ROOT / "templates/project" / name, scripts / name)
+                (scripts / name).chmod(0o755)
+            marker = project / "helper-called"
+            helper = project / "fake-helper"
+            helper.write_text(f"#!/bin/sh\ntouch {marker}\n")
+            helper.chmod(0o755)
+            env = {**os.environ, "KENT_PREPARE_GITHUB_CI_BIN": str(helper)}
+            profile = project / ".kent/workflow-profile.toml"
+            for contents, operation in (
+                (None, "archive_script_ci_report_v2"),
+                ("schema_version = 3\n", "archive_script_ci_report_v2"),
+                ('schema_version = 4\nkit_managed_commands = {runtime_contracts = true, prepare_ci = true}\n'
+                 '[policies]\ndelivery_reliability = "v1"\n[command_versions]\n'
+                 'runtime_contracts = "2.0.0"\nprepare_ci = "2.0.0"\n', "archive_ci_report"),
+            ):
+                if contents is not None:
+                    profile.write_text(contents)
+                payload = {"operation": operation, "workspace_path": str(project)}
+                with self.subTest(contents=contents, facade="wrapper"):
+                    result = subprocess.run(
+                        [str(scripts / "workflow-prepare-github-ci")], cwd=project,
+                        input=json.dumps(payload), text=True, capture_output=True, env=env, timeout=20,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(marker.exists())
+                with self.subTest(contents=contents, facade="checkpoint"):
+                    checkpoint = self.load_checkpoint_template("reject_v2_legacy_dispatch")
+                    with (
+                        mock.patch.dict(os.environ, env),
+                        mock.patch.object(checkpoint.sys, "stdin", SimpleNamespace(
+                            buffer=io.BytesIO(json.dumps(payload).encode()),
+                        )),
+                        mock.patch.object(checkpoint.subprocess, "run") as dispatch,
+                    ):
+                        self.assertEqual(checkpoint.prepare_github_ci_command(project), 2)
+                        dispatch.assert_not_called()
+
     def load_checkpoint_template(self, name: str):
         checkpoint_path = REPO_ROOT / "templates/project/workflow-checkpoint"
         loader = importlib.machinery.SourceFileLoader(name, str(checkpoint_path))
@@ -34,6 +190,28 @@ class KitRuntimeBindingTest(unittest.TestCase):
         checkpoint = importlib.util.module_from_spec(spec)
         loader.exec_module(checkpoint)
         return checkpoint
+
+    def test_v2_observed_legacy_protocol_never_dispatches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            payload = {"operation": "archive_script_ci_report_v2",
+                       "workspace_path": str(root), "_kent": {"task_id": "native-task"}}
+            checkpoint = self.load_checkpoint_template("v2_observed_legacy")
+            for protocol in ("legacy", None):
+                with (
+                    self.subTest(protocol=protocol),
+                    mock.patch.object(checkpoint, "kit_module", return_value=SimpleNamespace(
+                        observe_script_delivery_protocol=lambda payload: (object(), protocol),
+                    )),
+                    mock.patch.object(checkpoint.sys, "stdin", SimpleNamespace(
+                        buffer=io.BytesIO(json.dumps(payload).encode()),
+                    )),
+                    mock.patch.object(checkpoint, "_prepare_ci_legacy_cli") as helper,
+                    mock.patch.object(checkpoint.subprocess, "run") as dispatch,
+                ):
+                    self.assertEqual(checkpoint.prepare_github_ci_command(root), 2)
+                    helper.assert_not_called()
+                    dispatch.assert_not_called()
 
     def test_missing_profile_preserves_legacy_loader_behavior(self) -> None:
         from workflowkit import delivery
@@ -321,7 +499,7 @@ class KitRuntimeBindingTest(unittest.TestCase):
             scripts = project / ".kent/scripts"
             scripts.mkdir(parents=True)
             (project / ".kent/workflow-profile.toml").write_text(
-                "kit_runtime = {}\n"
+                "schema_version = 4\nkit_runtime = {}\n"
             )
             selected_cli = kit_root / "scripts/prepare-github-ci"
             selected_cli.parent.mkdir(parents=True)
@@ -334,6 +512,11 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 project_root=project,
                 source_root=kit_root,
                 binding=binding,
+                module=lambda name: SimpleNamespace(
+                    observe_script_delivery_protocol=mock.Mock(
+                        return_value=(object(), "typed-v1", False, None, None),
+                    ),
+                ),
             )
             bootstrap = SimpleNamespace(
                 _git_blob=mock.Mock(return_value=(cli_bytes, 0o755)),
@@ -352,7 +535,8 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 mock.patch.object(
                     checkpoint,
                     "_runtime_profile",
-                    return_value={"kit_runtime": {}},
+                    return_value={"schema_version": 4, "kit_runtime": {},
+                                  "command_versions": {"prepare_ci": "3.1.0"}},
                 ),
                 mock.patch.object(
                     checkpoint,
@@ -365,6 +549,9 @@ class KitRuntimeBindingTest(unittest.TestCase):
                     return_value=qualified,
                 ) as qualify,
                 mock.patch.object(checkpoint.sys, "stdin", stdin),
+                mock.patch.object(checkpoint, "admitted_ci_command",
+                                  return_value=SimpleNamespace(path=selected_cli,
+                                                              arguments=("--admitted-reader-source",))),
                 mock.patch.object(
                     checkpoint.subprocess,
                     "run",
@@ -383,7 +570,7 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 source_binding=native_context,
             )
             run.assert_called_once_with(
-                [sys.executable, "-B", str(selected_cli)],
+                [str(selected_cli), "--admitted-reader-source"],
                 cwd=project,
                 input=raw,
                 check=False,
@@ -406,7 +593,7 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 mock.patch.object(
                     checkpoint,
                     "_runtime_profile",
-                    return_value={},
+                    return_value={"schema_version": 4},
                 ),
                 mock.patch.object(
                     checkpoint,
@@ -414,13 +601,19 @@ class KitRuntimeBindingTest(unittest.TestCase):
                     return_value=selected,
                 ),
                 mock.patch.object(checkpoint.os, "execv") as legacy_exec,
+                mock.patch.object(checkpoint.sys, "stdin", SimpleNamespace(
+                    buffer=io.BytesIO(json.dumps({"workspace_path": str(project)}).encode()),
+                )),
+                mock.patch.object(checkpoint.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 0)) as run,
                 mock.patch.dict(
                     os.environ,
                     {"KENT_PREPARE_GITHUB_CI_BIN": selected},
                 ),
             ):
                 self.assertEqual(checkpoint.prepare_github_ci_command(project), 0)
-            legacy_exec.assert_called_once_with(selected, [selected])
+            legacy_exec.assert_not_called()
+            self.assertEqual(run.call_args.args[0], [selected])
 
     def test_prepare_ci_wrapper_does_not_fall_back_after_opt_in_failure(self) -> None:
         checkpoint = self.load_checkpoint_template(
@@ -473,7 +666,7 @@ class KitRuntimeBindingTest(unittest.TestCase):
             scripts = project / ".kent/scripts"
             scripts.mkdir(parents=True)
             (project / ".kent/workflow-profile.toml").write_text(
-                "kit_runtime = {}\n"
+                "schema_version = 4\nkit_runtime = {}\n"
             )
             wrapper = scripts / "workflow-prepare-github-ci"
             wrapper.write_bytes(wrapper_source)
@@ -486,7 +679,7 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 "    return 23\n"
             )
             input_bytes = (
-                b'{"operation":"archive","workspace_path":"'
+                b'{"operation":"archive_ci_report","workspace_path":"'
                 + str(project).encode()
                 + b'"}\n'
             )
@@ -1208,7 +1401,19 @@ class KitRuntimeBindingTest(unittest.TestCase):
         self.test_puber_runtime_qualifies_real_r2_source_admission_without_session(
             source_only=True, later_agent=True)
 
-    def test_puber_runtime_qualifies_real_r2_source_admission_without_session(self, content_policy=False, source_only=False, agent=False, later_agent=False) -> None:
+    def test_app_reader_rejects_agent_prefix_drift(self):
+        self.test_puber_runtime_qualifies_real_r2_source_admission_without_session(
+            source_only=True, agent=True, app_reader=True)
+
+    def test_app_global_reader_source_uses_native_A_and_admitted_C_without_opt_in(self):
+        self.test_puber_runtime_qualifies_real_r2_source_admission_without_session(
+            content_policy=True, app_reader=True,
+        )
+        self.test_puber_runtime_qualifies_real_r2_source_admission_without_session(
+            source_only=True, app_reader=True,
+        )
+
+    def test_puber_runtime_qualifies_real_r2_source_admission_without_session(self, content_policy=False, source_only=False, agent=False, later_agent=False, app_reader=False) -> None:
         from tests.test_canonical_workflow_lifecycle import (
             create_verified_source_fixture,
         )
@@ -1266,6 +1471,8 @@ class KitRuntimeBindingTest(unittest.TestCase):
             f'commit = "{kit_commit}"\n'
             'publication_ref = "refs/remotes/origin/main"\n'
         )
+        if app_reader:
+            profile = profile.split("\n[kit_runtime]\n", 1)[0] + "\n"
         fixture.put(
             fixture.project,
             ".kent/workflow-profile.toml",
@@ -1377,12 +1584,14 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 admission, project_id=project_id, workflow_id=workflow_id, project_root=str(fixture.project))
         if later_agent:
             graph["graph"]["nodes"][2]["kind"] = "agent"
+        if agent and app_reader:
+            graph["graph"]["nodes"][2]["kind"] = "script"
         graph_path = fixture.base / "script-graph.json"
         graph_path.write_text(json.dumps(graph))
         task_path = fixture.base / "script-task.json"
 
         def write_task(node_id: str, script_path: str) -> None:
-            agent_context = agent or (later_agent and node_id == later_node)
+            agent_context = (agent and not (app_reader and node_id == later_node)) or (later_agent and node_id == later_node)
             task_path.write_text(json.dumps({
                 "summary": {
                     "id": task_id,
@@ -1397,6 +1606,9 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 },
                 "project": {"default_workspace_id": "workspace-test"},
                 "worktree_path": str(fixture.project),
+                "execution_target": {
+                    "commit_oid": "6c8bf4b72bdc5b5a2787dba85e0df8a793404a19",
+                },
                 "current_nodes": ([{"node_id": node_id, "session_id": "6c724730-01ea-49e7-a2b1-a64d7fbe3ba1"}] if agent_context else []),
                 "live_sessions": [],
                 "current_scripts": [] if agent_context else [{
@@ -1455,7 +1667,7 @@ class KitRuntimeBindingTest(unittest.TestCase):
             from pathlib import Path
 
             project = Path(sys.argv[1])
-            task_id, node_id, workflow_id, project_id, is_agent = sys.argv[2:]
+            task_id, node_id, workflow_id, project_id, is_agent, reader_root = sys.argv[2:]
             is_agent = is_agent == "1"
             bootstrap_path = project / ".kent/scripts/workflow_kit_runtime.py"
             loader = importlib.machinery.SourceFileLoader(
@@ -1466,6 +1678,32 @@ class KitRuntimeBindingTest(unittest.TestCase):
             sys.modules[loader.name] = bootstrap
             loader.exec_module(bootstrap)
             context = {"task_id": task_id, "node_id": node_id}
+            if reader_root:
+                sys.path.insert(0, reader_root)
+                from workflowkit import operations
+                reader = operations.resolve_script_reader_source(
+                    project, context, kent_path=Path(shutil.which("kent")).resolve(),
+                )
+                assert reader.value["baseline_commit"] == "6c8bf4b72bdc5b5a2787dba85e0df8a793404a19"
+                assert reader.value["source_commit"] != reader.value["baseline_commit"]
+                assert "[kit_runtime]" not in (project / ".kent/workflow-profile.toml").read_text()
+                import pickle
+                try:
+                    pickle.dumps(reader)
+                except TypeError:
+                    pass
+                else:
+                    raise AssertionError("reader proof escaped invocation")
+                print(json.dumps({
+                    "native_authorized": True, "source_root": reader_root,
+                    "operations_path": operations.__file__,
+                    "project_id": reader.admission.project_id,
+                    "workflow_id": reader.admission.workflow_id,
+                    "primary_root": reader.admission.primary_root,
+                    "kit_root": reader.admission.kit_root,
+                    "receipt_sha256": reader.admission.receipt_sha256,
+                }))
+                raise SystemExit(0)
             qualified = bootstrap.qualified_kit_runtime(
                 project, source_binding=None if is_agent else context
             )
@@ -1519,7 +1757,7 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 for key, value in os.environ.items()
                 if key != "KENT_SESSION_ID"
             }
-            run_is_agent = agent or (later_agent and node_id == later_node)
+            run_is_agent = (agent and not (app_reader and node_id == later_node)) or (later_agent and node_id == later_node)
             if run_is_agent:
                 env["KENT_SESSION_ID"] = "6c724730-01ea-49e7-a2b1-a64d7fbe3ba1"
             env["HOME"] = str(fixture.home)
@@ -1539,6 +1777,7 @@ class KitRuntimeBindingTest(unittest.TestCase):
                     workflow_id,
                     project_id,
                     "1" if run_is_agent else "0",
+                    str(fixture.kit) if app_reader else "",
                 ],
                 cwd=fixture.project,
                 env=env,
@@ -1553,6 +1792,8 @@ class KitRuntimeBindingTest(unittest.TestCase):
             (later_node, later_script_path),
         ):
             with self.subTest(node=node_id):
+                if app_reader and agent and node_id == initial_node:
+                    continue
                 admitted = run_node(node_id, script_path)
                 self.assertEqual(admitted.returncode, 0, admitted.stderr)
                 result = json.loads(admitted.stdout)
@@ -1570,6 +1811,15 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 self.assertEqual(result["receipt_sha256"], fixture.digest)
 
         original_receipt = fixture.receipt_path.read_bytes()
+        if app_reader and agent:
+            original_graph = graph_path.read_bytes()
+            graph["graph"]["edges"][0]["prompt_template"] = graph["graph"]["edges"][0]["prompt_template"].replace(
+                "KENT_SOURCE_ADMISSION_V1_END", "untrusted instruction\nKENT_SOURCE_ADMISSION_V1_END", 1)
+            graph_path.write_text(json.dumps(graph))
+            prefix_drift = run_node(later_node, later_script_path)
+            self.assertNotEqual(prefix_drift.returncode, 0, prefix_drift.stdout)
+            graph_path.write_bytes(original_graph)
+            return
         fixture.receipt_path.write_bytes(original_receipt + b" ")
         fixture.receipt_path.chmod(0o600)
         receipt_drift = run_node(initial_node, initial_script_path)

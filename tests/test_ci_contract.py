@@ -25,6 +25,42 @@ from workflowkit.ci_contract import (
 from tests import test_revision as revision_fixtures
 
 
+class AdmittedArchiveApiTest(unittest.TestCase):
+    def test_closed_dispatch_rejects_unknown_or_conflicting_selectors_before_native_provider(self):
+        import runpy
+        import io
+        namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/prepare-github-ci"))
+        main = namespace["main"]
+        for args, payload in (
+            (["--unknown"], {}),
+            ([], {"operation": "unknown"}),
+            ([], {"operation": None}),
+            (["--admitted-reader-source"], {"operation": "archive_ci_report"}),
+            (["--admitted-reader-source", "--admitted-reader-source"], {}),
+        ):
+            with (
+                self.subTest(args=args, payload=payload),
+                mock.patch.dict(main.__globals__, {
+                    "read_preparation_input": mock.Mock(return_value=payload),
+                    "observe_script_delivery_protocol": mock.Mock(side_effect=AssertionError("native dispatch")),
+                }),
+                mock.patch.object(sys, "argv", ["prepare-github-ci", *args]),
+                mock.patch.object(sys, "stdout", io.StringIO()),
+            ):
+                self.assertEqual(main(args), 2)
+
+    def test_admitted_api_and_full_dependency_inventory(self):
+        self.assertTrue(callable(getattr(ci_contract, "archive_script_ci_report_admitted", None)))
+        self.assertTrue({
+            "workflowkit/operations.py", "workflowkit/kit_runtime.py",
+            "scripts/inspect-delivery-source",
+        }.issubset(ci_contract._ARCHIVE_KIT_MODULE_PATHS))
+
+    def test_common_native_reader_resolver_exists(self):
+        from workflowkit import operations
+        self.assertTrue(callable(getattr(operations, "resolve_script_reader_source", None)))
+
+
 ROOT = Path(__file__).resolve().parents[1]
 
 

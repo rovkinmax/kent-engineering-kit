@@ -168,6 +168,29 @@ Stdin cannot supply reader proof, graph identity or a deployment receipt.
 Schema-1/2 evidence and the legacy CI archive path remain readable without
 rewriting historical bytes.
 
+The admitted reader generation is an explicit invocation policy, not a new
+ledger schema. `archive_script_ci_report_admitted` and the closed CLI operation
+`archive_script_ci_report_v2` derive infrastructure source C and serving Kit K
+from fresh native Script ownership, the Workflow admission frame and its
+verified publication receipt. The native product execution target A is
+preserved; it need not contain the new infrastructure readers. Managed reader
+bytes match both C and canonical K; project-owned readers and procedures match
+C. The proof covers the complete shared dependency inventory, profile and graph.
+It is recomputed under the Task lock and any drift blocks the append. This is
+cooperative freshness, not an atomic lock of native Kent state.
+
+Canonical preparation explicitly requests `--admitted-reader-source` only after
+same-K predispatch qualification. Archive operations never receive that flag.
+Unknown/conflicting selectors fail before helper/provider work. Direct
+operation-less CLI calls and `archive_script_ci_report` retain their v1 policy;
+failed v2 qualification never falls back to v1. Current-family wrappers require
+native context even without `[kit_runtime]`; environment overrides cannot
+replace the admitted CLI. Only the existing exact schema4/managed2.0.0 legacy
+archive exception permits no native context in a reliability-v1 profile.
+
+Invocation proof-v2 does not attribute historical schema3 rows to C/K, rewrite
+producer ancestry, retarget a Task, or authorize publication/installation.
+
 Retention selects an existing verified v1 receipt or exact `.preparing-HASH`
 publication before constructing a new v2 receipt. It preserves the original
 confirm/hash, including when preparation stopped before `receipt.json`.
