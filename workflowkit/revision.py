@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from contextlib import contextmanager
 from contextvars import ContextVar
+import codecs
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -30,6 +32,12 @@ from .runtime import (
     RuntimeExternalRoot,
     SelectedRuntimeSourceInputs,
     _make_selected_runtime_source_inputs,
+    _require_proven_inputs,
+    _make_verified_source_captures,
+    VerifiedSourceObservation,
+    SourceResourceBudgetExceeded as _RuntimeSourceResourceBudgetExceeded,
+    canonical_bytes,
+    _canonical_byte_chunks,
 )
 
 
@@ -43,13 +51,81 @@ SOURCE_READ_TIMEOUT_SECONDS = 60.0
 SOURCE_READ_TOTAL_BYTES = 32 * 1024 * 1024
 
 
+@dataclass(frozen=True)
+class SourceReadPolicy:
+    physical_bytes: int = SOURCE_READ_TOTAL_BYTES
+    timeout_seconds: float = SOURCE_READ_TIMEOUT_SECONDS
+    chunk_bytes: int = 65536
+    header_bytes: int = 4096
+    stderr_bytes: int = 65536
+    metadata_bytes: int = 4 * 1024 * 1024
+    descriptor_records: int = 4096
+    document_bytes: int = 8 * 1024 * 1024
+    command_seconds: float = GIT_COMMAND_TIMEOUT_SECONDS
+
+    def __post_init__(self):
+        import math
+        for key, value in asdict(self).items():
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0
+                    or (key not in ("timeout_seconds", "command_seconds") and type(value) is not int)):
+                raise ValueError("source read policy must contain finite positive limits")
+
+
 @dataclass
-class _SourceReadBudget:
+class SourceReadBudget:
+    policy: SourceReadPolicy
     deadline: float
     remaining_bytes: int
+    physical_bytes: int = 0
+    logical_bytes: int = 0
+    metadata_bytes: int = 0
+    records: int = 0
+    active_processes: int = 0
+    peak_processes: int = 0
+    peak_chunk_bytes: int = 0
+    _blob_facts: dict = field(default_factory=dict, repr=False)
+    _commit_trees: dict = field(default_factory=dict, repr=False)
+    _tree_facts: dict = field(default_factory=dict, repr=False)
+
+    def check(self):
+        if (not math.isfinite(self.deadline) or type(self.remaining_bytes) is not int
+                or not 0 <= self.remaining_bytes <= self.policy.physical_bytes):
+            raise SourceResourceBudgetExceeded("source read accounting capacity is invalid")
+        if time.monotonic() >= self.deadline:
+            raise SourceResourceBudgetExceeded("source read timed out")
+
+    def charge(self, count):
+        self.check()
+        self.physical_bytes += count
+        self.remaining_bytes -= count
+        if self.remaining_bytes < 0:
+            raise SourceResourceBudgetExceeded("source read physical output exceeded limit")
+
+    def metadata(self, value, *, records=0):
+        self.check()
+        self.records += records
+        if self.records > self.policy.descriptor_records:
+            raise SourceResourceBudgetExceeded("source read metadata/descriptor capacity exceeded")
+        for chunk in _canonical_byte_chunks(value):
+            self.metadata_bytes += len(chunk)
+            if self.metadata_bytes > self.policy.metadata_bytes:
+                raise SourceResourceBudgetExceeded("source read metadata/descriptor capacity exceeded")
+
+    @contextmanager
+    def process(self):
+        self.check()
+        if self.active_processes:
+            raise SourceResourceBudgetExceeded("source read process concurrency exceeded")
+        self.active_processes += 1
+        self.peak_processes = max(self.peak_processes, self.active_processes)
+        try:
+            yield
+        finally:
+            self.active_processes -= 1
 
 
-_SOURCE_READ_BUDGET: ContextVar[_SourceReadBudget | None] = ContextVar(
+_SOURCE_READ_BUDGET: ContextVar[SourceReadBudget | None] = ContextVar(
     "revision_source_read_budget", default=None,
 )
 
@@ -80,22 +156,40 @@ def selected_git_command(root: Path, *args: str) -> list[str]:
 
 
 @contextmanager
-def source_read_budget():
+def source_read_budget(policy=None):
     """One cumulative budget for the selected-revision read, including preflight."""
-    if _SOURCE_READ_BUDGET.get() is not None:
-        yield
+    active = _SOURCE_READ_BUDGET.get()
+    if active is not None:
+        if policy is not None and policy is not active:
+            raise ValueError("cannot replace an active source read budget")
+        active.check()
+        yield active
+        active.check()
         return
-    token = _SOURCE_READ_BUDGET.set(_SourceReadBudget(
-        time.monotonic() + SOURCE_READ_TIMEOUT_SECONDS, SOURCE_READ_TOTAL_BYTES,
-    ))
+    if policy is None:
+        policy = SourceReadPolicy(physical_bytes=SOURCE_READ_TOTAL_BYTES,
+                                  timeout_seconds=SOURCE_READ_TIMEOUT_SECONDS)
+    if isinstance(policy, SourceReadBudget):
+        budget = policy
+    elif isinstance(policy, SourceReadPolicy):
+        budget = SourceReadBudget(policy, time.monotonic() + policy.timeout_seconds, policy.physical_bytes)
+    else:
+        raise ValueError("source read budget requires a trusted finite policy")
+    budget.check()
+    token = _SOURCE_READ_BUDGET.set(budget)
     try:
-        yield
+        yield budget
+        budget.check()
     finally:
         _SOURCE_READ_BUDGET.reset(token)
 
 
 class RevisionPreflightError(RuntimeError):
     """Raised when a Git revision cannot satisfy a project workflow profile."""
+
+
+class SourceResourceBudgetExceeded(_RuntimeSourceResourceBudgetExceeded, RevisionPreflightError):
+    """Distinct capacity error retaining legacy revision-reader catch compatibility."""
 
 
 @dataclass(frozen=True)
@@ -151,8 +245,10 @@ class _TreeEntry:
 def preflight_project_revision(
     project_root: Path,
     revision: str,
+    *,
+    budget=None,
 ) -> RevisionPreflightResult:
-    with source_read_budget():
+    with source_read_budget(budget):
         return _preflight_project_revision(project_root, revision)
 
 
@@ -252,6 +348,7 @@ def _preflight_project_revision(
         requested_ref,
         requirements,
         strict_modes=True,
+        materialize_paths={profile.release.snapshot_path},
     )
     manifest_bytes = read_blob_bytes(
         root,
@@ -295,14 +392,9 @@ def _preflight_project_revision(
             f"{uncovered}"
         )
     for path in sorted(all_paths):
-        if path not in blobs:
-            blobs[path] = read_blob_bytes(
-                root,
-                commit_oid,
-                path,
-                label="selected source",
-            )
-        decode_text(blobs[path], path)
+        if path not in checked_by_path or path not in requirements:
+            entry = tree_entry(root, commit_oid, path)
+            _stream_blob(root, entry, _SOURCE_READ_BUDGET.get(), textual=True)
 
     snapshot_path = profile.release.snapshot_path
     snapshot_bytes = blobs[snapshot_path]
@@ -321,7 +413,8 @@ def _preflight_project_revision(
         source_manifest_raw_blob_sha256=digest(manifest_bytes),
         snapshot_raw_blob_sha256=digest(snapshot_bytes),
         builder_raw_blob_sha256=(
-            digest(blobs[profile.release.builder_path])
+            _stream_blob(root, tree_entry(root, commit_oid, profile.release.builder_path),
+                         _SOURCE_READ_BUDGET.get(), textual=True)[1]
             if profile.release.builder_path
             else None
         ),
@@ -490,6 +583,7 @@ def check_requirements(
     *,
     strict_modes: bool,
     decode_textual: bool = True,
+    materialize_paths=(),
 ) -> tuple[tuple[CheckedRevisionPath, ...], dict[str, bytes]]:
     checked: list[CheckedRevisionPath] = []
     blobs: dict[str, bytes] = {}
@@ -522,10 +616,16 @@ def check_requirements(
                 f"{path} for {labels} is not executable at {requested_ref} "
                 f"({entry.mode})"
             )
-        raw = read_blob_bytes(root, commit_oid, path, label=path)
-        if decode_textual:
-            decode_text(raw, path)
-        blobs[path] = raw
+        budget = _SOURCE_READ_BUDGET.get()
+        if path in materialize_paths:
+            raw = read_blob_bytes(root, commit_oid, path, label=path,
+                                  byte_limit=budget.policy.document_bytes)
+            if decode_textual:
+                decode_text(raw, path)
+            blobs[path] = raw
+        else:
+            _stream_blob(root, entry, budget, textual=decode_textual)
+        budget.metadata({"path": path, "mode": entry.mode}, records=1)
         checked.append(
             CheckedRevisionPath(
                 path=path,
@@ -624,6 +724,7 @@ def expand_manifest_additions(
                 f"{path} ({entry.mode})"
             )
         files.add(path)
+        _SOURCE_READ_BUDGET.get().metadata({"path": path, "mode": entry.mode}, records=1)
         checked[path] = CheckedRevisionPath(
             path=path,
             labels=("source_manifest.additional_paths",),
@@ -713,6 +814,7 @@ def visit_tree(
                 f"{requested_ref}: {path} ({entry.mode}, {entry.object_kind})"
             )
         leaves.append((path, entry.mode))
+        _SOURCE_READ_BUDGET.get().metadata({"path": path, "mode": entry.mode}, records=1)
 
 
 def tree_entry(
@@ -720,6 +822,32 @@ def tree_entry(
     commit_oid: str,
     path: str,
 ) -> _TreeEntry | None:
+    budget = _SOURCE_READ_BUDGET.get()
+    if budget is not None and re.fullmatch(r"[0-9a-f]{40}", commit_oid):
+        root_key = str(Path(root).resolve())
+        commit_key = (root_key, commit_oid)
+        tree_oid = budget._commit_trees.get(commit_key)
+        if tree_oid is None:
+            tree_oid = run_git(root, "rev-parse", "--verify", f"{commit_oid}^{{tree}}").stdout.strip()
+            if not re.fullmatch(r"[0-9a-f]{40}", tree_oid):
+                raise RevisionPreflightError("selected commit has invalid tree OID")
+            budget.metadata({"repository_root": root_key, "commit": commit_oid, "tree": tree_oid})
+            budget._commit_trees[commit_key] = tree_oid
+        components = path.split("/")
+        if not components or any(part in ("", ".", "..") for part in components):
+            raise RevisionPreflightError("selected path is not normalized")
+        for index, component in enumerate(components):
+            # Independently bind every component to this exact immutable tree.
+            entries = {entry.path: entry for entry in tree_entries(root, tree_oid)}
+            entry = entries.get(component)
+            if entry is None:
+                return None
+            if index == len(components) - 1:
+                return _TreeEntry(entry.mode, entry.object_kind, entry.object_id, path)
+            if entry.mode != TREE_MODE or entry.object_kind != "tree":
+                return None
+            tree_oid = entry.object_id
+        return None
     result = run_git_bytes(
         root,
         "ls-tree",
@@ -759,6 +887,13 @@ def tree_entry(
 
 
 def tree_entries(root: Path, tree_oid: str) -> tuple[_TreeEntry, ...]:
+    budget = _SOURCE_READ_BUDGET.get()
+    cache_key = (str(Path(root).resolve()), tree_oid)
+    immutable = re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", tree_oid) is not None
+    if budget is not None and immutable:
+        budget.check()
+        if cache_key in budget._tree_facts:
+            return budget._tree_facts[cache_key]
     result = run_git_bytes(
         root,
         "ls-tree",
@@ -785,8 +920,34 @@ def tree_entries(root: Path, tree_oid: str) -> tuple[_TreeEntry, ...]:
             raise RevisionPreflightError(
                 f"cannot parse Git tree entry for tree {tree_oid}: {error}"
             ) from error
+        if (not path or path in (".", "..") or "/" in path or "\x00" in path
+                or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", object_id)
+                or (mode, object_kind) not in {("040000", "tree"), ("100644", "blob"),
+                                               ("100755", "blob"), ("120000", "blob"),
+                                               ("160000", "commit")}):
+            raise RevisionPreflightError("invalid immutable Git tree metadata")
+        if budget is not None:
+            budget.metadata({"repository_root": cache_key[0], "tree": tree_oid, "path": path,
+                             "mode": mode, "kind": object_kind, "oid": object_id}, records=1)
         entries.append(_TreeEntry(mode, object_kind, object_id, path))
-    return tuple(sorted(entries, key=lambda item: item.path))
+    if immutable:
+        def raw_entry(entry):
+            return (entry.mode.lstrip("0").encode("ascii") + b" " + entry.path.encode("utf-8")
+                    + b"\0" + bytes.fromhex(entry.object_id))
+        size = sum(len(raw_entry(entry)) for entry in entries)
+        algorithm = hashlib.sha1 if len(tree_oid) == 40 else hashlib.sha256
+        tree_hash = algorithm(b"tree " + str(size).encode("ascii") + b"\0")
+        for entry in entries:
+            tree_hash.update(raw_entry(entry))
+        if tree_hash.hexdigest() != tree_oid:
+            raise RevisionPreflightError("Git tree metadata does not match immutable OID")
+    entries = tuple(sorted(entries, key=lambda item: item.path))
+    if len({entry.path for entry in entries}) != len(entries):
+        raise RevisionPreflightError("duplicate immutable Git tree entry")
+    if budget is not None and immutable:
+        budget.check()
+        budget._tree_facts[cache_key] = entries
+    return entries
 
 
 def digest(raw: bytes) -> str:
@@ -820,9 +981,14 @@ def read_blob_bytes(
     except ValueError as error:
         raise RevisionPreflightError("invalid Git blob size") from error
     budget = _SOURCE_READ_BUDGET.get()
-    if size < 0 or size > byte_limit or (
-        budget is not None and size > budget.remaining_bytes
-    ):
+    if budget is not None:
+        budget.check()
+        if size > budget.policy.document_bytes:
+            raise SourceResourceBudgetExceeded("source parsed document byte limit exceeded")
+        byte_limit = min(byte_limit, budget.policy.document_bytes)
+        if size > budget.remaining_bytes:
+            raise SourceResourceBudgetExceeded("source blob exceeds remaining physical byte limit")
+    if size < 0 or size > byte_limit:
         raise RevisionPreflightError("source blob exceeds byte limit")
     result = _run_git_bounded(
         root,
@@ -838,6 +1004,156 @@ def read_blob_bytes(
             f"{label} not found at {commit_oid}: {path}: {detail}"
         )
     return result.stdout
+
+
+def _stream_blob(root, entry, budget, *, textual=False):
+    """Validated OID-only raw protocol; never paths or batch control syntax."""
+    if (entry.mode not in ALLOWED_FILE_MODES or entry.object_kind != "blob"
+            or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", entry.object_id)):
+        raise RevisionPreflightError("stream requires a regular selected Git blob")
+    cache_key = (str(Path(root).resolve()), entry.object_id)
+    budget.check()
+    cached = budget._blob_facts.get(cache_key)
+    if cached is not None and (not textual or cached[2]):
+        return cached[:2]
+    header = _run_git_bounded(root, "cat-file", "-s", entry.object_id,
+                              check=True, output_limit=budget.policy.header_bytes).stdout
+    if not re.fullmatch(rb"(?:0|[1-9][0-9]*)\n", header):
+        raise RevisionPreflightError("invalid Git blob size frame")
+    advertised = int(header)
+    digestor = hashlib.sha256()
+    object_hash = hashlib.sha1 if len(entry.object_id) == 40 else hashlib.sha256
+    object_digest = object_hash(b"blob " + str(advertised).encode("ascii") + b"\0")
+    decoder = codecs.getincrementaldecoder("utf-8")("strict") if textual else None
+    count = 0
+    with budget.process():
+        deadline = min(budget.deadline, time.monotonic() + budget.policy.command_seconds)
+        process = subprocess.Popen(selected_git_command(root, "cat-file", "blob", entry.object_id),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=selected_git_environment(), start_new_session=True)
+        selector = selectors.DefaultSelector()
+        stderr = bytearray()
+        try:
+            selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+            while selector.get_map():
+                budget.check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SourceResourceBudgetExceeded("source streaming command timed out")
+                events = selector.select(remaining)
+                if not events:
+                    raise SourceResourceBudgetExceeded("source streaming command timed out")
+                for key, _ in events:
+                    raw = os.read(key.fileobj.fileno(), budget.policy.chunk_bytes)
+                    if not raw:
+                        selector.unregister(key.fileobj)
+                        continue
+                    budget.charge(len(raw))
+                    budget.peak_chunk_bytes = max(budget.peak_chunk_bytes, len(raw))
+                    if key.data == "stderr":
+                        if len(stderr) + len(raw) > budget.policy.stderr_bytes:
+                            raise SourceResourceBudgetExceeded("source streaming stderr capacity exceeded")
+                        stderr.extend(raw)
+                    else:
+                        count += len(raw)
+                        if count > advertised:
+                            raise RevisionPreflightError("Git blob has trailing payload")
+                        digestor.update(raw)
+                        object_digest.update(raw)
+                        if decoder:
+                            decoder.decode(raw)
+            try:
+                process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as error:
+                raise SourceResourceBudgetExceeded("source streaming command timed out after EOF") from error
+            if process.returncode or count != advertised:
+                raise RevisionPreflightError("Git blob failed or was truncated")
+            if object_digest.hexdigest() != entry.object_id:
+                raise RevisionPreflightError("Git blob bytes do not match selected OID")
+            if decoder:
+                decoder.decode(b"", final=True)
+            budget.check()
+            if owned_process_group_exists(process.pid):
+                raise RevisionPreflightError("Git stream left owned descendants")
+        except UnicodeDecodeError as error:
+            raise RevisionPreflightError(f"{entry.path} must be valid UTF-8") from error
+        finally:
+            selector.close()
+            _terminate_git_process(process, process.pid)
+            process.stdout.close()
+            process.stderr.close()
+    result = (count, digestor.hexdigest(), textual)
+    budget.metadata({"repository_root": cache_key[0], "oid": entry.object_id,
+                     "byte_count": count, "sha256": result[1], "utf8": textual})
+    budget.check()
+    budget._blob_facts[cache_key] = result
+    return result[:2]
+
+
+def verify_runtime_source_captures(root, selected_inputs, *, budget=None):
+    """Seal only complete immutable path/mode/OID/digest observations."""
+    inputs = _require_proven_inputs(selected_inputs)
+    root = Path(root).expanduser().resolve()
+    with source_read_budget(budget) as accounting:
+        if len(inputs.external_roots) > accounting.policy.descriptor_records - accounting.records:
+            raise SourceResourceBudgetExceeded("source read descriptor capacity exceeded")
+        accounting.metadata(inputs.as_dict(), records=len(inputs.external_roots))
+        if run_git(root, "rev-parse", "--verify", f"{inputs.project_commit}^{{commit}}").stdout.strip() != (
+            inputs.project_commit
+        ):
+            raise RevisionPreflightError("capture commit differs")
+        cache = {}
+        observations = []
+        builder_path = None
+        for descriptor in inputs.external_roots:
+            if descriptor.kind == "builder-sha256":
+                expected = _external_source_digest(descriptor.key)
+                if builder_path is None:
+                    if tree_mode(root, inputs.project_commit, PROFILE_PATH) not in ALLOWED_FILE_MODES:
+                        raise RevisionPreflightError("selected builder profile must be regular")
+                    raw = read_blob_bytes(root, inputs.project_commit, PROFILE_PATH,
+                                          label="selected builder profile",
+                                          byte_limit=accounting.policy.document_bytes)
+                    profile = ProjectProfile.from_toml(root, decode_text(raw, PROFILE_PATH), check_files=False)
+                    if profile.release is None or not profile.release.builder_path:
+                        raise RevisionPreflightError("selected builder profile has no builder_path")
+                    builder_path = profile.release.builder_path
+                path = builder_path
+            elif descriptor.kind == "source-sha256":
+                path, separator, encoded = descriptor.key.partition("=")
+                if not separator:
+                    raise RevisionPreflightError("source capture descriptor must be path=digest")
+                expected = _external_source_digest(encoded)
+            else:
+                raise RevisionPreflightError("unsupported runtime external capture kind")
+            path = normalize_project_path(path, "external capture")
+            entry = tree_entry(root, inputs.project_commit, path)
+            if entry is None or entry.mode not in ALLOWED_FILE_MODES or entry.object_kind != "blob":
+                raise RevisionPreflightError("external capture must be a regular Git blob")
+            if entry.object_id not in cache:
+                cache[entry.object_id] = _stream_blob(root, entry, accounting)
+            size, actual = cache[entry.object_id]
+            if actual != expected:
+                raise RevisionPreflightError("runtime external capture digest mismatch")
+            accounting.logical_bytes += size
+            row = VerifiedSourceObservation(descriptor.kind, descriptor.key, path, entry.mode,
+                                            entry.object_id, size, actual)
+            accounting.metadata(row.__dict__)
+            observations.append(row)
+        # Include the eventual compact output in operation-wide accounting before
+        # the COMPLETE-only factory. No partial proof escapes on late exhaustion.
+        accounting.metadata({
+            "runtime_source_envelope": {
+                "schema": "runtime-source-envelope-v2", "project_name": inputs.project_name,
+                "repository": inputs.repository, "topology_kind": inputs.topology_kind,
+                "project_commit": inputs.project_commit, "source_preview_sha256": inputs.source_preview_sha256,
+                "artifact_digests": dict(inputs.artifact_digests), "external_roots": [
+                    {"kind": row.kind, "key": row.key, "byte_count": row.byte_count, "sha256": row.sha256}
+                    for row in observations]},
+            "runtime_source_envelope_digest": "0" * 64, "project_commit": inputs.project_commit})
+        accounting.check()
+        return _make_verified_source_captures(inputs, observations)
 
 
 def collect_runtime_external_captures(
@@ -1002,16 +1318,21 @@ def _run_git_bounded(
     check: bool,
     output_limit: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    with source_read_budget() as budget, budget.process():
+        return _run_git_bounded_impl(root, *args, check=check, output_limit=output_limit)
+
+
+def _run_git_bounded_impl(root, *args, check, output_limit=None):
     budget = _SOURCE_READ_BUDGET.get()
     now = time.monotonic()
     deadline = min(
-        now + GIT_COMMAND_TIMEOUT_SECONDS,
+        now + min(GIT_COMMAND_TIMEOUT_SECONDS, budget.policy.command_seconds),
         budget.deadline if budget is not None else float("inf"),
     )
     if deadline <= now:
-        raise RevisionPreflightError("source read timed out")
+        raise SourceResourceBudgetExceeded("source read timed out")
     if budget is not None and budget.remaining_bytes <= 0:
-        raise RevisionPreflightError("source read output exceeded limit")
+        raise SourceResourceBudgetExceeded("source read output exceeded limit")
     output_limit = min(
         GIT_COMMAND_OUTPUT_BYTES,
         output_limit if output_limit is not None else GIT_COMMAND_OUTPUT_BYTES,
@@ -1043,18 +1364,16 @@ def _run_git_bounded(
                 failure = "timed out"
                 break
             for key, _ in events:
-                data = os.read(key.fileobj.fileno(), 65536)
+                data = os.read(key.fileobj.fileno(), budget.policy.chunk_bytes)
                 if not data:
                     selector.unregister(key.fileobj)
                     continue
                 buffer = outputs[key.data]
-                if len(buffer) + len(data) > output_limit or (
-                    budget is not None and len(data) > budget.remaining_bytes
-                ):
+                budget.charge(len(data))
+                bound = min(output_limit, budget.policy.stderr_bytes) if key.data == "stderr" else output_limit
+                if len(buffer) + len(data) > bound:
                     failure = "output exceeded limit"
                     break
-                if budget is not None:
-                    budget.remaining_bytes -= len(data)
                 buffer.extend(data)
             if failure:
                 break
@@ -1069,7 +1388,7 @@ def _run_git_bounded(
         _terminate_git_process(process, process_group_id)
         process.stdout.close()
         process.stderr.close()
-        raise RevisionPreflightError(
+        raise SourceResourceBudgetExceeded(
             f"git {' '.join(args)} {failure}"
         )
     try:
@@ -1078,7 +1397,7 @@ def _run_git_bounded(
         _terminate_git_process(process, process_group_id)
         process.stdout.close()
         process.stderr.close()
-        raise RevisionPreflightError(
+        raise SourceResourceBudgetExceeded(
             f"git {' '.join(args)} timed out"
         )
     stdout = bytes(outputs["stdout"])

@@ -38,7 +38,10 @@ from .release import (
     validate_qualification_job_sources,
     validate_required_job_sources,
 )
-from .revision import preflight_project_revision
+from .revision import (
+    preflight_project_revision, source_read_budget, SourceReadPolicy, SourceReadBudget,
+    verify_runtime_source_captures,
+)
 from .runtime import (
     RuntimeContractError,
     RuntimeAuthorityBinding,
@@ -51,6 +54,10 @@ from .runtime import (
     canonical_bytes as runtime_canonical_bytes,
     canonical_sha256 as runtime_canonical_sha256,
     capture_runtime_source_envelope,
+    capture_runtime_source_envelope_verified,
+    capture_runtime_authority_binding_verified,
+    VerifiedSourceCaptures,
+    SourceResourceBudgetExceeded,
     capture_runtime_authority_binding,
     capture_runtime_execution_context,
     classify_verification_report,
@@ -100,6 +107,14 @@ __all__ = [
     "canonical_bytes",
     "canonicalize_publication_operation",
     "preflight_project_revision",
+    "source_read_budget",
+    "SourceReadPolicy",
+    "SourceReadBudget",
+    "SourceResourceBudgetExceeded",
+    "VerifiedSourceCaptures",
+    "verify_runtime_source_captures",
+    "capture_runtime_source_envelope_verified",
+    "capture_runtime_authority_binding_verified",
     "render_approval_summary",
     "render_release_preview",
     "RuntimeContractError",
