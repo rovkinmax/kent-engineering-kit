@@ -3880,6 +3880,27 @@ def _native_approval_payload(
                     'active_source': {'kind': 'deferred_self'},
                     'target_session': {'kind': 'create'},
                 }
+            elif target.get('node_kind') == 'script':
+                source_nodes = [
+                    row for row in graph.get('nodes', [])
+                    if isinstance(row, Mapping) and row.get('id', row.get('node_id')) == source_node
+                ]
+                source_session = approval.get('source_session_id')
+                if (
+                    len(source_nodes) != 1
+                    or source_nodes[0].get('kind') != 'agent'
+                    or not isinstance(source_session, str)
+                    or re.fullmatch(
+                        r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',
+                        source_session,
+                    ) is None
+                    or matching_nodes[0].get('session_id') != source_session
+                ):
+                    raise EffectBlocked('native Script Approval source Agent Session is not corroborated')
+                expected_context = {
+                    'active_source': {'kind': 'exact', 'session_id': source_session},
+                    'target_session': {'kind': 'no_agent'},
+                }
         elif edge.get('context_mode') in {'continue_session', 'compact_and_continue_session'}:
             expected_context = {
                 'active_source': {

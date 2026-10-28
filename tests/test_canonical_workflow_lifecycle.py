@@ -3274,6 +3274,107 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(affected, {approval["id"]})
 
+    def test_native_script_approval_context_is_closed_and_raw_bound(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            _, context, _ = native_canonical_v2_plan(
+                fixture, self, production_shape=True, with_approvals=True,
+            )
+            connection = context["connection"]
+            connection.row_factory = sqlite3.Row
+            approval = dict(connection.execute(
+                "SELECT * FROM task_pending_approvals ORDER BY id LIMIT 1",
+            ).fetchone())
+            branch = dict(connection.execute(
+                "SELECT * FROM task_pending_approval_branches WHERE approval_id=?",
+                (approval["id"],),
+            ).fetchone())
+            nodes = [dict(row) for row in connection.execute(
+                "SELECT * FROM task_current_nodes WHERE task_id=?", (approval["source_task_id"],),
+            )]
+            graph = read_state(fixture)["workflows"][workflow_id(0)]["graph"]
+            session = "44444444-4444-4444-8444-444444444444"
+            approval["source_session_id"] = session
+            for node in nodes:
+                node["session_id"] = session
+            target = json.loads(branch["target_snapshot_json"])
+            target["node_kind"] = "script"
+            branch["target_snapshot_json"] = json.dumps(target)
+            next(row for row in graph["nodes"] if row["id"] == target["node_id"])["kind"] = "script"
+            resolved = {
+                "active_source": {"kind": "exact", "session_id": session},
+                "target_session": {"kind": "no_agent"},
+            }
+            branch["context_source_resolution_json"] = json.dumps(resolved)
+
+            def payload(a=approval, b=branch, n=nodes, g=graph):
+                return operations._native_approval_payload(a, [b], n, workflow_id(0), g)
+
+            envelope = payload()
+            self.assertEqual(envelope, {"approval": approval, "branches": [branch]})
+            baseline = canonical_sha256(envelope)
+            for column, source in (
+                ("transition_snapshot_json", approval), ("materialized_values_json", approval),
+                ("target_snapshot_json", branch), ("effective_edge_configuration_json", branch),
+                ("context_source_resolution_json", branch),
+            ):
+                a, b = dict(approval), dict(branch)
+                (a if source is approval else b)[column] = " " + source[column]
+                self.assertNotEqual(canonical_sha256(payload(a, b)), baseline, column)
+            invalid = [
+                {}, {**resolved, "extra": None},
+                {"active_source": resolved["active_source"]},
+                {"target_session": resolved["target_session"]},
+            ]
+            for key in resolved:
+                for value in (None, [], "no_agent", {"kind": "unknown"},
+                              {**resolved[key], "extra": None},
+                              {**resolved[key], "session_id": None},
+                              {**resolved[key], "session_id": "foreign-session"}):
+                    invalid.append({**resolved, key: value})
+            invalid.extend([
+                {"active_source": {"kind": "deferred_self"}, "target_session": {"kind": "create"}},
+                {**resolved, "target_session": {"kind": "reuse", "session_id": session}},
+            ])
+            for value in invalid:
+                with self.subTest(context=value), self.assertRaises(EffectBlocked):
+                    payload(b={**branch, "context_source_resolution_json": json.dumps(value)})
+            for session_value in (None, "", 123, "foreign-session"):
+                with self.subTest(session=session_value), self.assertRaises(EffectBlocked):
+                    payload(a={**approval, "source_session_id": session_value})
+            with self.assertRaises(EffectBlocked):
+                payload(n=[{**row, "session_id": None} for row in nodes])
+            with self.assertRaises(EffectBlocked):
+                payload(n=[])
+            for invalid_session in (None, "", "not-a-session", 123):
+                with self.subTest(corroborated_invalid_session=invalid_session), self.assertRaises(EffectBlocked):
+                    payload(
+                        a={**approval, "source_session_id": invalid_session},
+                        n=[{**row, "session_id": invalid_session} for row in nodes],
+                        b={**branch, "context_source_resolution_json": json.dumps({
+                            **resolved, "active_source": {"kind": "exact", "session_id": invalid_session},
+                        })},
+                    )
+            for node_id in (approval["source_node_id"], target["node_id"]):
+                for kind in ("unknown", "script" if node_id == approval["source_node_id"] else "agent"):
+                    changed = json.loads(json.dumps(graph))
+                    next(row for row in changed["nodes"] if row["id"] == node_id)["kind"] = kind
+                    with self.subTest(node=node_id, kind=kind), self.assertRaises(EffectBlocked):
+                        payload(g=changed)
+            for column, key, value in (
+                ("effective_edge_configuration_json", "context_mode", "continue_session"),
+                ("effective_edge_configuration_json", "id", "foreign-edge"),
+                ("target_snapshot_json", "node_kind", "agent"),
+                ("target_snapshot_json", "entered_by_edge_id", "foreign-edge"),
+            ):
+                with self.subTest(column=column, key=key), self.assertRaises(EffectBlocked):
+                    payload(b={**branch, column: json.dumps({**json.loads(branch[column]), key: value})})
+            changed = json.loads(json.dumps(graph))
+            next(row for row in changed["edges"] if row["id"] == json.loads(
+                branch["effective_edge_configuration_json"])["id"])["context_mode"] = "continue_session"
+            with self.assertRaises(EffectBlocked):
+                payload(g=changed)
+
     def test_native_approval_context_dispatch_is_closed_and_raw_bound(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
             fixture = make_workflow_fixture(Path(temporary))
