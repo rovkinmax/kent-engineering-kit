@@ -94,6 +94,14 @@ exactly `target_session={"kind":"create"}` and
 `active_source={"kind":"deferred_self"}`, without Session IDs or extra keys.
 `continue_session` and `compact_and_continue_session` retain exact-source and
 same-Session reuse. Cross-pairs and reuse for `new_session` are rejected.
+For the corroborated Agent-source to Script-target `new_session` case, native
+2.11 instead freezes `target_session: {"kind": "no_agent"}` and
+`active_source: {"kind": "exact", "session_id": "<source Session>"}`.
+The observer requires a unique current Task source node, its matching nonempty
+Session, and an independently identified Agent source in the current graph.
+Other source kinds remain unsupported for this variant. Exact closed context
+equality rejects additional keys, foreign Sessions and Agent/Script cross-pairs.
+All five original raw JSON strings remain unchanged in the fingerprint.
 This representation support does not consume pending decisions or establish
 compatibility, installation authority, or runtime cohort qualification.
 

@@ -432,6 +432,12 @@ def native_snapshot(
 
 
 class ReleaseSpecTest(unittest.TestCase):
+    def test_verified_capture_api_exports_are_explicit_and_legacy_remains(self):
+        for name in ("verify_runtime_source_captures", "capture_runtime_source_envelope_verified",
+                     "capture_runtime_authority_binding_verified", "source_read_budget",
+                     "capture_runtime_source_envelope", "capture_runtime_authority_binding"):
+            self.assertTrue(callable(getattr(workflowkit, name)))
+
     def _runtime_inputs(
         self,
         *,

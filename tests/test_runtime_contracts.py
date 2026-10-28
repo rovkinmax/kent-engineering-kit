@@ -8,6 +8,33 @@ from pathlib import Path
 import tracemalloc
 from types import MappingProxyType
 import unittest
+
+
+class StreamingWireTests(unittest.TestCase):
+    def test_v2_closed_wire_accepts_large_logical_payload_and_rejects_invalid_records(self):
+        from workflowkit import runtime
+        value = {
+            "schema": "runtime-source-envelope-v2", "project_name": "fixture",
+            "repository": "owner/repo", "topology_kind": "fixture", "project_commit": "a" * 40,
+            "source_preview_sha256": "b" * 64, "artifact_digests": {
+                key: "c" * 64 for key in ("spec_raw_blob_sha256", "source_manifest_raw_blob_sha256",
+                                         "snapshot_raw_blob_sha256")},
+            "external_roots": [{"kind": "source-sha256", "key": "a", "byte_count": 100000000,
+                                "sha256": "d" * 64}],
+        }
+        self.assertEqual(runtime.validate_runtime_source_envelope(value), value)
+        with self.assertRaises(runtime.RuntimeContractError):
+            runtime.validate_runtime_source_envelope({**value, "schema": "runtime-source-envelope-v1"})
+        for change in ({"byte_count": True}, {"byte_count": -1}, {"unknown": 1}, {"sha256": "bad"}):
+            with self.assertRaises(runtime.RuntimeContractError):
+                runtime.validate_runtime_source_envelope(
+                    {**value, "external_roots": [{**value["external_roots"][0], **change}]})
+        with self.assertRaises(runtime.SourceResourceBudgetExceeded):
+            runtime.validate_runtime_source_envelope(
+                {**value, "external_roots": value["external_roots"] * 4097})
+        with self.assertRaises(runtime.SourceResourceBudgetExceeded):
+            runtime.validate_runtime_source_envelope({**value, "project_name": "x" * (4 * 1024 * 1024)})
+
 from unittest import mock
 
 import workflowkit.runtime as runtime_module

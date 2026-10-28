@@ -12,6 +12,13 @@ tests, architecture rules, and release procedures.
 
 [Get started](#get-started) · [Operations guide](docs/OPERATIONS.md) · [Project setup](prompts/project-bootstrap.md)
 
+## Streaming source capture
+
+Explicit, complete selected-Git observations support envelope-v2 without
+retaining aggregate payloads. Eager v1 APIs and managed protocol 2.2.0 remain
+unchanged. See [the capture contract](contracts/runtime-source-capture.md) for
+the explicit API, shared finite budgets and independent downstream limits.
+
 ## What it helps you do
 
 | When you need to… | The Kit provides… |

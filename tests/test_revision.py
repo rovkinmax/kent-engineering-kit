@@ -733,7 +733,7 @@ class RevisionPreflightTest(unittest.TestCase):
     def test_preflight_budget_covers_all_selected_revision_reads(self) -> None:
         root = self.create_project(schema4=True)
         with mock.patch.object(revision_module, "SOURCE_READ_TOTAL_BYTES", 256):
-            with self.assertRaisesRegex(RevisionPreflightError, "limit"):
+            with self.assertRaisesRegex(revision_module.SourceResourceBudgetExceeded, "limit"):
                 preflight_project_revision(root, "HEAD")
         clock = [0.0]
         original = revision_module._run_git_bounded
@@ -746,7 +746,7 @@ class RevisionPreflightTest(unittest.TestCase):
             mock.patch.object(revision_module, "SOURCE_READ_TIMEOUT_SECONDS", 2.5),
             mock.patch.object(revision_module.time, "monotonic", side_effect=lambda: clock[0]),
             mock.patch.object(revision_module, "_run_git_bounded", side_effect=advancing_read),
-            self.assertRaisesRegex(RevisionPreflightError, "timed out"),
+            self.assertRaisesRegex(revision_module.SourceResourceBudgetExceeded, "timed out"),
         ):
             preflight_project_revision(root, "HEAD")
         # The context is reset after either failure; it cannot poison retries.
@@ -786,7 +786,7 @@ class RevisionPreflightTest(unittest.TestCase):
                 {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
             ):
                 with self.assertRaisesRegex(
-                    RevisionPreflightError,
+                    revision_module.SourceResourceBudgetExceeded,
                     "output exceeded limit",
                 ):
                     run_git_bytes(root, "overflow")
@@ -795,7 +795,7 @@ class RevisionPreflightTest(unittest.TestCase):
                     0.1,
                 ):
                     with self.assertRaisesRegex(
-                        RevisionPreflightError,
+                        revision_module.SourceResourceBudgetExceeded,
                         "timed out",
                     ):
                         run_git_bytes(root, "hang")
