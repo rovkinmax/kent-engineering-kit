@@ -214,7 +214,7 @@ def repository(root):
     return root, canonical(common)
 
 
-def publication(root, commit, ref):
+def publication(root, commit, ref, *, content=False):
     require(isinstance(commit, str) and OID.fullmatch(commit), "full published commit required")
     require(isinstance(ref, str) and ref.startswith(("refs/remotes/", "refs/tags/"))
             and not ref.endswith("/HEAD"), "full publication ref required")
@@ -222,7 +222,8 @@ def publication(root, commit, ref):
     tip = git(root, "rev-parse", "--verify", ref + "^{commit}").decode().strip()
     require(OID.fullmatch(tip), "publication ref missing")
     git(root, "merge-base", "--is-ancestor", commit, tip)
-    git(root, "merge-base", "--is-ancestor", commit, "HEAD")
+    if not content:
+        git(root, "merge-base", "--is-ancestor", commit, "HEAD")
     return tip
 
 
@@ -266,10 +267,12 @@ def live_inventory(root, *, kit=False):
 
 def verify_copy(root, expected, published_tree, *, kit=False, local_inputs=None):
     local_inputs = local_inputs or {}
-    require(live_inventory(root, kit=kit) == set(expected) | set(local_inputs),
+    extras = {name for name in expected if not infrastructure(name, kit)}
+    live_extras = {name for name in extras if os.path.lexists(root / name)}
+    require(live_inventory(root, kit=kit) | live_extras == set(expected) | set(local_inputs),
             "infrastructure inventory differs")
     head_tree = tree(root, "HEAD")
-    require({name: item for name, item in head_tree.items() if infrastructure(name, kit)}
+    require({name: item for name, item in head_tree.items() if infrastructure(name, kit) or name in extras}
             == {name: published_tree[name] for name in expected},
             "committed infrastructure differs")
     index = {}
@@ -278,7 +281,7 @@ def verify_copy(root, expected, published_tree, *, kit=False, local_inputs=None)
             continue
         metadata, name = entry.split(b"\t", 1)
         path = name.decode("utf-8")
-        if infrastructure(path, kit):
+        if infrastructure(path, kit) or path in extras:
             mode, oid, stage = metadata.decode("ascii").split()
             require(stage == "0", "unmerged infrastructure index")
             index[path] = (mode, "blob", oid)
@@ -296,6 +299,123 @@ def verify_copy(root, expected, published_tree, *, kit=False, local_inputs=None)
         require(len(raw) == item["byte_size"] and mode == item["mode"]
                 and hashlib.sha256(raw).hexdigest() == item["sha256"],
                 "local instruction bytes or mode differ")
+
+
+def content_roles(project_root, primary_root, workspace_path, kit_root,
+                  source_commit, kit_commit, targets):
+    """Assign roles only from native-bound roots and declared trusted targets."""
+    project_root, project_common = repository(project_root)
+    kit_root, kit_common = repository(kit_root)
+    products = {project_root, repository(primary_root)[0], repository(workspace_path)[0]}
+    require(all(repository(root)[1] == project_common for root in products),
+            "foreign project repository")
+    executables = {kit_root: (kit_common, kit_commit)}
+    for target in targets:
+        target = canonical(target)
+        root, common = repository(git(target.parent, "rev-parse", "--show-toplevel").decode().strip())
+        require(target.is_relative_to(root), "helper target outside repository")
+        require(common in (kit_common, project_common), "foreign helper repository")
+        pin = kit_commit if common == kit_common else source_commit
+        require(root not in executables or executables[root] == (common, pin),
+                "conflicting executable root pins")
+        executables[root] = (common, pin)
+    return products, executables
+
+
+def validate_runtime_v3_receipt(receipt, primary, kit_root):
+    """Closed metadata validation before importing or invoking publication code.
+
+    Kept identical in the inspector, bootstrap, adapter and operations readers.
+    This validates declarations only; it is not source admission or authority.
+    """
+    def check(ok):
+        if not ok:
+            raise ValueError("invalid v3 publication metadata")
+
+    def identity(value):
+        check(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", value))
+
+    def root(value):
+        check(isinstance(value, str) and "\x00" not in value
+              and Path(value).is_absolute() and str(Path(value)) == value
+              and ".." not in Path(value).parts and str(Path(value).resolve()) == value)
+
+    check(isinstance(receipt, dict) and set(receipt) == {
+        "schema", "policy", "project_id", "workflow_id", "source_commit", "kit_commit",
+        "runtime_roots", "files", "local_inputs", "project_memory",
+    })
+    check(receipt["schema"] == "delivery-runtime-publication-v3"
+          and receipt["policy"] == "delivery_reliability_project_content_v1")
+    identity(receipt["project_id"])
+    identity(receipt["workflow_id"])
+    for name in ("source_commit", "kit_commit"):
+        check(isinstance(receipt[name], str) and re.fullmatch(r"[0-9a-f]{40}", receipt[name]))
+    roots = receipt["runtime_roots"]
+    check(isinstance(roots, list) and 0 < len(roots) <= 256)
+    for value in roots:
+        root(value)
+    check(len(set(roots)) == len(roots) and str(primary) in roots and str(kit_root) in roots)
+    files, local_inputs = receipt["files"], receipt["local_inputs"]
+    check(isinstance(files, list) and isinstance(local_inputs, list)
+          and 0 < len(files) and len(files) + len(local_inputs) <= 512)
+    seen = set()
+    total = 0
+    for local, items in ((False, files), (True, local_inputs)):
+        for item in items:
+            check(isinstance(item, dict) and set(item) == {
+                "root", "relative_path", "sha256", "byte_size", "mode",
+            } | ({"kind"} if local else set()))
+            name, source_root = item["relative_path"], item["root"]
+            check(isinstance(source_root, str) and source_root in roots
+                  and isinstance(name, str) and name and not name.startswith("/")
+                  and "\\" not in name and "\x00" not in name
+                  and all(part not in ("", ".", "..") for part in name.split("/")))
+            check(not name.startswith((".kent/runtime/", ".kent/retained-evidence/", "build/")))
+            check(isinstance(item["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                  and type(item["byte_size"]) is int and 0 <= item["byte_size"] <= 8 * 1024 * 1024
+                  and type(item["mode"]) is int and 0 <= item["mode"] <= 0o777
+                  and not item["mode"] & 0o022)
+            check(not any(other_root == source_root and (
+                other == name or other.startswith(name + "/") or name.startswith(other + "/"))
+                for other_root, other in seen))
+            if local:
+                check(item["kind"] == "local-instruction" and source_root in {str(primary), str(kit_root)}
+                      and name.startswith(".kent/skills/") and name.endswith(".md")
+                      and not any(c in name for c in "*?[]") and not item["mode"] & 0o111)
+            seen.add((source_root, name))
+            total += item["byte_size"]
+            check(total <= 32 * 1024 * 1024)
+    memory = receipt["project_memory"]
+    check(isinstance(memory, dict) and set(memory) == {
+        "root", "project_key", "project_uid", "legacy_task_ids",
+    })
+    root(memory["root"])
+    identity(memory["project_key"])
+    identity(memory["project_uid"])
+    legacy = memory["legacy_task_ids"]
+    check(isinstance(legacy, list) and len(legacy) <= 256)
+    for value in legacy:
+        identity(value)
+    check(len(set(legacy)) == len(legacy))
+    return len(files) + len(local_inputs)
+
+
+def validate_source_v2_receipt(receipt, primary, kit_root):
+    """Validate source-only content declarations, without granting R2 identity."""
+    if (not isinstance(receipt, dict) or set(receipt) != {
+        "schema", "policy", "project_id", "workflow_id", "source_commit", "kit_commit",
+        "runtime_roots", "files", "local_inputs",
+    } or receipt["schema"] != "delivery-source-publication-v2"
+            or receipt["policy"] != "published_source_project_content_v1"):
+        raise ValueError("invalid source-only v2 publication metadata")
+    # Reuse the bounded structural checks only. No synthetic admission or native
+    # identity is constructed, returned or used to access project memory.
+    return validate_runtime_v3_receipt({
+        **receipt, "schema": "delivery-runtime-publication-v3",
+        "policy": "delivery_reliability_project_content_v1",
+        "project_memory": {"root": str(primary), "project_key": "metadata-only",
+                           "project_uid": "metadata-only", "legacy_task_ids": []},
+    }, primary, kit_root)
 
 
 def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
@@ -324,9 +444,16 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
     raw, _ = read_file(receipt_path, MAX_REQUEST, private=True)
     require(hashlib.sha256(raw).hexdigest() == receipt_sha256, "source receipt digest differs")
     receipt = parse_json(raw)
+    source_v2 = isinstance(receipt, dict) and receipt.get("schema") == "delivery-source-publication-v2"
+    runtime_v3 = isinstance(receipt, dict) and receipt.get("schema") == "delivery-runtime-publication-v3"
+    v3 = runtime_v3 or source_v2
+    if source_v2:
+        validate_source_v2_receipt(receipt, primary_root, kit_root)
+    if runtime_v3:
+        validate_runtime_v3_receipt(receipt, primary_root, kit_root)
     source_only = (
         isinstance(receipt, dict)
-        and receipt.get("schema") == "delivery-source-publication-v1"
+        and receipt.get("schema") in ("delivery-source-publication-v1", "delivery-source-publication-v2")
     )
     fields = {"schema", "project_id", "workflow_id", "source_commit", "kit_commit",
               "runtime_roots", "files", "policy"}
@@ -334,17 +461,19 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
         fields.add("local_inputs")
     else:
         fields.add("project_memory")
-    v2 = isinstance(receipt, dict) and receipt.get("schema") == "delivery-runtime-publication-v2"
+    v2 = isinstance(receipt, dict) and receipt.get("schema") in (
+        "delivery-runtime-publication-v2", "delivery-runtime-publication-v3",
+    )
     closed(receipt, fields | ({"local_inputs"} if v2 else set()))
     require(
         (
-            receipt["schema"] == "delivery-source-publication-v1"
-            and receipt["policy"] == "published_source_v1"
+            receipt["schema"] in ("delivery-source-publication-v1", "delivery-source-publication-v2")
+            and receipt["policy"] == ("published_source_project_content_v1" if source_v2 else "published_source_v1")
             if source_only
             else receipt["schema"] in (
-                "delivery-runtime-publication-v1", "delivery-runtime-publication-v2",
+                "delivery-runtime-publication-v1", "delivery-runtime-publication-v2", "delivery-runtime-publication-v3",
             )
-            and receipt["policy"] == "delivery_reliability_v1"
+            and receipt["policy"] == ("delivery_reliability_project_content_v1" if v3 else "delivery_reliability_v1")
         )
         and receipt["project_id"] == project_id
         and receipt["workflow_id"] == workflow_id,
@@ -367,14 +496,39 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
     primary_root, primary_common = repository(primary_root)
     workspace_path, workspace_common = repository(workspace_path)
     require(primary_common == project_common == workspace_common, "foreign project repository")
-    project_tip = publication(project_root, receipt["source_commit"], source_ref)
-    kit_tip = publication(kit_root, receipt["kit_commit"], kit_ref)
-    for root in (primary_root, workspace_path):
-        git(root, "merge-base", "--is-ancestor", receipt["source_commit"], "HEAD")
-    # Primary is an activation source, not an unfinished product worktree.
-    for root in set((primary_root, kit_root)):
-        require(not git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
-                        "--ignore-submodules=none"), "primary source is dirty")
+    # Resolve helper roles from trusted bindings, never from receipt claims.
+    helpers = {str(ci_helper): str(kit_root / "scripts/prepare-github-ci")}
+    if helper_bindings is not None:
+        require(isinstance(helper_bindings, dict) and len(helper_bindings) <= 64,
+                "invalid installed helper inventory")
+        require(str(ci_helper) not in helper_bindings, "duplicate CI helper binding")
+        helpers.update(helper_bindings)
+
+    def resolve_helpers():
+        targets = {}
+        for helper, value in helpers.items():
+            path = Path(helper)
+            require(path.is_absolute() and ".." not in path.parts, "helper must be absolute")
+            parent = canonical(path.parent)
+            parent_info, info = parent.stat(), path.lstat()
+            require(parent_info.st_uid == os.getuid() and not parent_info.st_mode & 0o7022
+                    and info.st_uid == os.getuid() and info.st_nlink == 1
+                    and not info.st_mode & 0o7000
+                    and (stat.S_ISLNK(info.st_mode) or stat.S_ISREG(info.st_mode)),
+                    "unsafe installed helper binding")
+            target = canonical(value)
+            require(path.resolve(strict=True) == target, "installed helper target differs")
+            targets[helper] = target
+        return targets
+
+    trusted_targets = resolve_helpers() if v3 else {}
+    product_roots = {project_root, primary_root, workspace_path}
+    executable_roots = {kit_root: (kit_common, receipt["kit_commit"])}
+    if v3:
+        product_roots, executable_roots = content_roles(
+            project_root, primary_root, workspace_path, kit_root,
+            receipt["source_commit"], receipt["kit_commit"], trusted_targets.values(),
+        )
     roots = receipt["runtime_roots"]
     require(isinstance(roots, list) and 0 < len(roots) <= MAX_FILES, "invalid runtime roots")
     require(all(isinstance(root, str) for root in roots)
@@ -383,16 +537,37 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
     for value in roots:
         root, common = repository(value)
         require(common in (project_common, kit_common), "foreign runtime repository")
-        # If Kit is itself the project, both commits must describe the same tree
-        # for the shared root; checked below through the two closure projections.
-        commit = receipt["kit_commit"] if root == kit_root or common != project_common else receipt["source_commit"]
-        git(root, "merge-base", "--is-ancestor", commit, "HEAD")
-        admitted_roots[str(root)] = (root, commit, tree(root, commit))
+        if v3:
+            require(root in product_roots or root in executable_roots, "untrusted runtime root role")
+        commit = (executable_roots[root][1] if v3 and root in executable_roots else
+                  receipt["kit_commit"] if root == kit_root or common != project_common
+                  else receipt["source_commit"])
+        admitted_roots[str(root)] = (root, commit, None)
     require(str(project_root) in admitted_roots and str(kit_root) in admitted_roots,
             "runtime roots omit project or Kit")
+    observed_roots = set((*product_roots, *executable_roots,
+                          *(item[0] for item in admitted_roots.values())))
+    # v3's interval starts BEFORE publication/ancestry/clean/tree checks.
     heads = {root: git(root, "rev-parse", "--verify", "HEAD").decode().strip()
-             for root in set((primary_root, workspace_path, project_root, kit_root,
-                              *(item[0] for item in admitted_roots.values())))}
+             for root in observed_roots} if v3 else {}
+    project_tip = publication(project_root, receipt["source_commit"], source_ref, content=v3)
+    kit_tip = publication(kit_root, receipt["kit_commit"], kit_ref, content=v3)
+    if not v3:
+        for root in (primary_root, workspace_path):
+            git(root, "merge-base", "--is-ancestor", receipt["source_commit"], "HEAD")
+    clean_roots = {primary_root, kit_root} | (set(executable_roots) if v3 else set())
+    for root in clean_roots:
+        if v3 and root in executable_roots:
+            require(heads[root] == executable_roots[root][1], "executable root HEAD differs")
+        require(not git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                        "--ignore-submodules=none"), "primary source is dirty")
+    for value, (root, commit, _) in list(admitted_roots.items()):
+        if not v3:
+            git(root, "merge-base", "--is-ancestor", commit, "HEAD")
+        admitted_roots[value] = (root, commit, tree(root, commit))
+    if not v3:
+        heads = {root: git(root, "rev-parse", "--verify", "HEAD").decode().strip()
+                 for root in observed_roots}
     files = receipt["files"]
     local_inputs = receipt.get("local_inputs", []) if (v2 or source_only) else []
     require(isinstance(files, list) and 0 < len(files) <= MAX_SOURCE_RECEIPT_FILES,
@@ -466,13 +641,17 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
     project_tree = tree(project_root, receipt["source_commit"])
     kit_tree = tree(kit_root, receipt["kit_commit"])
     projections = []
-    for root, source_tree, is_kit in ((project_root, project_tree, False), (kit_root, kit_tree, True)):
+    projection_roots = ((project_root, project_tree, v3 and project_common == kit_common),
+                        (kit_root, kit_tree, True))
+    for root, source_tree, is_kit in projection_roots:
         required = {name for name in source_tree if infrastructure(name, is_kit)}
         if is_kit:
             require(KIT_REQUIRED <= required, "published Kit helper/module closure incomplete")
         else:
             require({"AGENTS.md", ".kent/workflow-profile.toml", ".kent/project-contract.md"} <= required,
                     "published project contract incomplete")
+        if source_v2:
+            required |= {name for (item_root, name) in inventory if item_root == str(root)}
         expected = {}
         for name in required:
             item = inventory.get((str(root), name))
@@ -487,11 +666,32 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
                 == {name: item for name, item in kit_tree.items() if infrastructure(name, True)},
                 "shared project/Kit infrastructure publication differs")
         project_expected.update(projections[1][1])
+    if source_v2:
+        # Root-qualified declarations on any bound product copy contribute the
+        # common project extra projection. Helper-only extras stay root-local.
+        for (value, name), item in inventory.items():
+            if Path(value) in product_roots and not infrastructure(name, project_is_kit):
+                require(name in project_tree, "project extra is not published in project source")
+                previous = project_expected.get(name)
+                require(previous is None or (
+                    previous["sha256"], previous["byte_size"], bool(previous["mode"] & 0o100)
+                ) == (item["sha256"], item["byte_size"], bool(item["mode"] & 0o100)),
+                        "conflicting project extra projection")
+                project_expected[name] = item
     for root in set((project_root, primary_root, workspace_path)):
         verify_copy(root, project_expected, project_tree, kit=project_is_kit,
                     local_inputs=locals_by_root.get(root))
     verify_copy(kit_root, projections[1][1], kit_tree, kit=True,
                 local_inputs=locals_by_root.get(kit_root))
+    if v3:
+        for value, (root, commit, source_tree) in admitted_roots.items():
+            is_kit = repository(root)[1] == kit_common
+            required = {name for name in source_tree if infrastructure(name, is_kit)}
+            expected = {name: item for (item_root, name), item in inventory.items() if item_root == value}
+            if source_v2:
+                required |= set(expected)
+            require(set(expected) == required, "runtime root projection incomplete")
+            verify_copy(root, expected, source_tree, kit=is_kit, local_inputs=locals_by_root.get(root))
     profile_raw, _ = read_file(primary_root / ".kent/workflow-profile.toml")
     profile = tomllib.loads(profile_raw.decode("utf-8"))
     kit_runtime_present = "kit_runtime" in profile
@@ -555,12 +755,6 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
             continue
         relative(command)
         require(command in project_expected, "profile helper outside source closure")
-    helpers = {str(ci_helper): str(kit_root / "scripts/prepare-github-ci")}
-    if helper_bindings is not None:
-        require(isinstance(helper_bindings, dict) and len(helper_bindings) <= 64,
-                "invalid installed helper inventory")
-        require(str(ci_helper) not in helper_bindings, "duplicate CI helper binding")
-        helpers.update(helper_bindings)
     def check_helpers():
         for helper, target_value in helpers.items():
             path = Path(helper)
@@ -582,11 +776,6 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
     # Recheck cooperative freshness after all reads; cannot reserve subsequent
     # execution or defend against an attacker changing and restoring bytes.
     require(read_file(receipt_path, MAX_REQUEST, private=True)[0] == raw, "receipt changed")
-    require(publication(project_root, receipt["source_commit"], source_ref) == project_tip
-            and publication(kit_root, receipt["kit_commit"], kit_ref) == kit_tip, "publication ref changed")
-    for root, head in heads.items():
-        require(git(root, "rev-parse", "--verify", "HEAD").decode().strip() == head,
-                "source HEAD changed")
     for root in set((project_root, primary_root, workspace_path)):
         verify_copy(root, project_expected, project_tree, kit=project_is_kit,
                     local_inputs=locals_by_root.get(root))
@@ -596,12 +785,23 @@ def inspect_source(*, receipt_path, receipt_sha256, project_id, workflow_id,
         current, mode = read_file(Path(root) / name)
         require(hashlib.sha256(current).hexdigest() == item["sha256"] and mode == item["mode"],
                 "runtime source changed")
-    for root in set((primary_root, kit_root)):
+    for root in clean_roots:
         require(not git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
                         "--ignore-submodules=none"), "primary source changed")
     for path, identity in local_identities.items():
         require(local_identity(path) == identity, "local instruction identity changed")
     check_helpers()
+    if v3:
+        for value, (root, commit, source_tree) in admitted_roots.items():
+            is_kit = repository(root)[1] == kit_common
+            expected = {name: item for (item_root, name), item in inventory.items() if item_root == value}
+            verify_copy(root, expected, source_tree, kit=is_kit, local_inputs=locals_by_root.get(root))
+        require(read_file(receipt_path, MAX_REQUEST, private=True)[0] == raw, "receipt changed")
+    require(publication(project_root, receipt["source_commit"], source_ref, content=v3) == project_tip
+            and publication(kit_root, receipt["kit_commit"], kit_ref, content=v3) == kit_tip, "publication ref changed")
+    for root, head in heads.items():
+        require(git(root, "rev-parse", "--verify", "HEAD").decode().strip() == head,
+                "source HEAD changed")
     return {"schema": "delivery-source-inspection-v1", "status": "admitted",
             "project_id": project_id, "workflow_id": workflow_id,
             "receipt_sha256": receipt_sha256, "source_commit": receipt["source_commit"],

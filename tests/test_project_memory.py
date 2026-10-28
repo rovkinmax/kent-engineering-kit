@@ -92,6 +92,56 @@ class ProjectMemoryTests(unittest.TestCase):
             validate(receipt | {"files": [entry | {"byte_size": 8 * 1024 * 1024,
                       "relative_path": f"file-{i}"} for i in range(4)]}, "/primary", "/kit")
 
+    def test_v3_bootstrap_readers_share_closed_metadata_validation(self):
+        from workflowkit import operations, kit_runtime
+        import importlib.machinery
+        import importlib.util
+        root = Path(__file__).resolve().parents[1]
+        adapter = runpy.run_path(str(root / "templates/project/workflow-project-memory"))
+        loader = importlib.machinery.SourceFileLoader("v3_inspector_metadata", str(root / "scripts/inspect-delivery-source"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        inspector = importlib.util.module_from_spec(spec)
+        loader.exec_module(inspector)
+        validators = (operations.validate_runtime_v3_receipt, kit_runtime.validate_runtime_v3_receipt,
+                      inspector.validate_runtime_v3_receipt, adapter["publication_inventory"])
+        entry = {"root": "/primary", "relative_path": "AGENTS.md", "sha256": "a" * 64,
+                 "byte_size": 1, "mode": 0o600}
+        local = {**entry, "kind": "local-instruction", "relative_path": ".kent/skills/private/x.md"}
+        receipt = {"schema": "delivery-runtime-publication-v3",
+                   "policy": "delivery_reliability_project_content_v1", "project_id": "project-test",
+                   "workflow_id": "workflow-test", "source_commit": "a" * 40, "kit_commit": "b" * 40,
+                   "runtime_roots": ["/primary", "/kit"], "files": [entry], "local_inputs": [local],
+                   "project_memory": {"root": "/memory", "project_key": "fixture", "project_uid": "uid",
+                                      "legacy_task_ids": ["old-task"]}}
+        invalids = [
+            {**receipt, "policy": "delivery_reliability_v1"},
+            {key: value for key, value in receipt.items() if key != "local_inputs"},
+            {**receipt, "unknown": True}, {**receipt, "source_commit": "bad"},
+            {**receipt, "runtime_roots": ["/primary", "/kit", "/primary"]},
+            {**receipt, "project_memory": {**receipt["project_memory"], "legacy_task_ids": ["old", "old"]}},
+            {**receipt, "project_memory": {**receipt["project_memory"], "extra": True}},
+            {**receipt, "files": [entry, entry]},
+            {**receipt, "files": [{**entry, "byte_size": True}]},
+            {**receipt, "files": [{**entry, "mode": 0o4644}]},
+            {**receipt, "files": [{**entry, "relative_path": "AGENTS.md\0bad"}]},
+        ]
+        for change in ({"kind": "module"}, {"root": "/task"}, {"sha256": "bad"},
+                       {"relative_path": ".kent/skills/../x.md"}, {"mode": 0o700},
+                       {"byte_size": True}, {"extra": True}):
+            invalids.append({**receipt, "local_inputs": [{**local, **change}]})
+        for validate in validators:
+            self.assertEqual(validate(receipt, "/primary", "/kit"), 2)
+            for invalid in invalids:
+                with self.subTest(reader=validate.__module__, invalid=invalid), self.assertRaises(ValueError):
+                    validate(invalid, "/primary", "/kit")
+        import ast
+        copies = [ast.dump(ast.parse(Path(path).read_text()).body[next(
+            i for i, node in enumerate(ast.parse(Path(path).read_text()).body)
+            if isinstance(node, ast.FunctionDef) and node.name == "validate_runtime_v3_receipt")])
+            for path in (root / "workflowkit/operations.py", root / "workflowkit/kit_runtime.py",
+                         root / "scripts/inspect-delivery-source", root / "templates/project/workflow-project-memory")]
+        self.assertTrue(all(value == copies[0] for value in copies))
+
     def test_native_adapter_v2_private_instruction_both_validators(self):
         installed, source, environment = self.native_adapter_fixture()
         ignore = source / ".gitignore"
@@ -1136,7 +1186,7 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
 
     def adapter_fixture(self, *, seed_standalone=True, legacy_task_ids=(),
                         task_id="task-native", short_id="OSM-130",
-                        workflow_id="workflow-native", legacy_mode=False):
+                        workflow_id="workflow-native", legacy_mode=False, adapter_source=None):
         """Build a disposable attached project and Kit with a complete v2 source pin."""
         base = Path(self.temp.name).resolve()
         project = base / "project"
@@ -1185,6 +1235,10 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
             "#!/usr/bin/env python3\n# Disposable graph-owned acceptance command.\n", 0o755)
         put(project, ".kent/scripts/workflow-project-memory",
             (repository / "templates/project/workflow-project-memory").read_text(), 0o755)
+        if adapter_source is not None:
+            if not isinstance(adapter_source, bytes):
+                raise TypeError("adapter_source must be bytes")
+            (project / ".kent/scripts/workflow-project-memory").write_bytes(adapter_source)
         shutil.copyfile(repository / "workflowkit/project_memory.py",
                         project / ".kent/scripts/workflow_project_memory.py")
 
@@ -1396,10 +1450,10 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
         self.installation_binding_path.chmod(0o600)
 
     def native_adapter_fixture(self, *, legacy_task_ids=(), task_id="task-native",
-                               short_id="OSM-130", script=False, legacy=False):
+                               short_id="OSM-130", script=False, legacy=False, adapter_source=None):
         installed, source, _, _ = self.adapter_fixture(
             seed_standalone=False, legacy_task_ids=legacy_task_ids,
-            task_id=task_id, short_id=short_id, legacy_mode=legacy)
+            task_id=task_id, short_id=short_id, legacy_mode=legacy, adapter_source=adapter_source)
         if script:
             self.native_task["current_scripts"] = [{
                 "current_node": {"node_id": "node-script", "transition_branch_key": None},

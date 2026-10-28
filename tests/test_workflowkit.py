@@ -141,6 +141,25 @@ def schema4_with_managed_adapter(contents: str) -> str:
     )
 
 
+class PublicationCandidateApiTests(unittest.TestCase):
+    def test_candidate_apis_have_closed_keyword_only_inputs(self):
+        import inspect
+        from workflowkit import operations
+        expected = {
+            "prepare_runtime_publication_v3": {
+                "output_path", "predecessor_binding_ref", "predecessor_receipt_ref", "project_id",
+                "receipt_workflow_id", "primary_root", "primary_workspace_id", "source_commit", "source_ref",
+                "kit_root", "kit_commit", "kit_ref", "ci_helper", "helper_bindings"},
+
+        }
+        for name, fields in expected.items():
+            signature = inspect.signature(getattr(operations, name))
+            self.assertEqual(set(signature.parameters), fields)
+            self.assertTrue(all(parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                                and parameter.default is inspect.Parameter.empty
+                                for parameter in signature.parameters.values()))
+
+
 class WorkflowKitTest(unittest.TestCase):
     def test_script_source_ingress_public_api_delegates_exactly(self) -> None:
         import workflowkit.delivery as delivery

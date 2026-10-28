@@ -1007,13 +1007,17 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         arguments.update(overrides)
         return self.module.inspect_source(**arguments)
 
-    def native_adapter_fixture(self, *, legacy_task_ids=("old-task",)):
+    def native_adapter_fixture(self, *, legacy_task_ids=("old-task",), adapter_source=None):
         """Install disposable project/Kit copies with pinned native admission."""
         for root in (self.project, self.kit):
             self.put(root, ".kent/scripts/workflow-project-memory",
                      ADAPTER_TEMPLATE.read_text(), 0o755)
             shutil.copyfile(MEMORY_CORE, root / ".kent/scripts/workflow_project_memory.py")
             (root / ".kent/scripts/workflow_project_memory.py").chmod(0o644)
+        if adapter_source is not None:
+            if not isinstance(adapter_source, bytes):
+                raise TypeError("adapter_source must be bytes")
+            (self.project / ".kent/scripts/workflow-project-memory").write_bytes(adapter_source)
         self.put(self.kit, ".kent/workflow-profile.toml",
                  '[commands]\njanitor = ".kent/scripts/workflow-task-janitor"\n'
                  'runtime_contracts = ".kent/scripts/workflow_runtime_contracts.py"\n')
@@ -1232,6 +1236,583 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
                    "--primary-root", str(self.primary), "--workspace", str(self.project),
                    "--source-ref", "refs/remotes/origin/main",
                    "--kit-ref", "refs/remotes/origin/main", "--ci-helper", str(self.helper), *extra]
+
+    def test_source_only_v2_never_enters_runtime_storage_reader(self):
+        import runpy
+        adapter = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-project-memory"))
+        source = {"schema": "delivery-source-publication-v2", "policy": "published_source_project_content_v1",
+                  "project_id": "fixture", "workflow_id": "workflow", "source_commit": "a" * 40,
+                  "kit_commit": "b" * 40, "runtime_roots": ["/primary", "/kit"],
+                  "files": [{"root": "/primary", "relative_path": "AGENTS.md", "sha256": "a" * 64,
+                             "byte_size": 1, "mode": 0o600}], "local_inputs": []}
+        from workflowkit import operations, kit_runtime
+        for validate in (operations.validate_source_v2_receipt, kit_runtime.validate_source_v2_receipt):
+            self.assertEqual(validate(source, "/primary", "/kit"), 1)
+            for change in ({"policy": "published_source_v1"}, {"project_memory": {}},
+                           {"local_inputs": None}, {"runtime_roots": ["/primary", "/kit", "/kit"]}):
+                with self.assertRaises(ValueError):
+                    validate({**source, **change}, "/primary", "/kit")
+        with self.assertRaises(ValueError):
+            adapter["publication_inventory"](source, "/primary", "/kit")
+
+    def test_source_v2_candidate_api_has_closed_keyword_only_inputs(self):
+        import inspect
+        signature = inspect.signature(operations.prepare_source_publication_v2)
+        self.assertEqual(set(signature.parameters), {
+            "output_path", "provenance_output_path", "predecessor_capture_ref", "predecessor_receipt_ref",
+            "project_id", "workflow_id", "primary_workspace_id", "project_root", "primary_root",
+            "source_commit", "source_ref", "kit_root", "kit_commit", "kit_ref", "ci_helper",
+            "helper_bindings", "additional_published_paths",
+        })
+        self.assertTrue(all(parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                            and parameter.default is inspect.Parameter.empty
+                            for parameter in signature.parameters.values()))
+
+    def test_source_v2_content_policy_accepts_rewritten_product(self):
+        self.receipt.pop("project_memory")
+        self.receipt.update(schema="delivery-source-publication-v2",
+                            policy="published_source_project_content_v1", local_inputs=[])
+        self.pin()
+        self.rewrite_product_history(self.project)
+        self.assertEqual(self.inspect()["status"], "admitted")
+
+    def use_content_policy(self):
+        self.receipt.update(schema="delivery-runtime-publication-v3",
+                            policy="delivery_reliability_project_content_v1", local_inputs=[])
+        self.pin()
+
+    def rewrite_product_history(self, root):
+        tree_oid = self.git(root, "rev-parse", "HEAD^{tree}").strip()
+        commit = subprocess.run(
+            ["git", "-C", str(root), "commit-tree", tree_oid], input="rewritten product history\n",
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.git(root, "reset", "--hard", commit)
+
+    def test_v3_rewritten_product_history_admits_exact_infrastructure(self):
+        self.use_content_policy()
+        self.rewrite_product_history(self.project)
+        self.assertEqual(self.inspect()["status"], "admitted")
+
+    def test_v3_task_and_primary_rewrites_are_independent(self):
+        self.use_content_policy()
+        task = self.base / "task"
+        self.git(self.project, "worktree", "add", "-qb", "task", str(task))
+        self.rewrite_product_history(task)
+        self.assertEqual(self.inspect(workspace_path=task)["status"], "admitted")
+        self.rewrite_product_history(self.project)
+        self.assertEqual(self.inspect(workspace_path=task)["status"], "admitted")
+
+    def test_v3_old_policy_stays_ancestry_bound(self):
+        self.rewrite_product_history(self.project)
+        with self.assertRaises(ValueError):
+            self.inspect()
+
+    def test_v3_publication_anchor_survives_release_branch_deletion_only_if_explicit(self):
+        self.use_content_policy()
+        self.git(self.project, "update-ref", "refs/tags/durable-infrastructure", self.receipt["source_commit"])
+        self.rewrite_product_history(self.project)
+        self.git(self.project, "update-ref", "-d", "refs/remotes/origin/main")
+        with self.assertRaises(ValueError):
+            self.inspect()
+        self.assertEqual(self.inspect(source_ref="refs/tags/durable-infrastructure")["status"], "admitted")
+        self.git(self.project, "update-ref", "refs/remotes/origin/main",
+                 self.git(self.project, "rev-parse", "HEAD").strip())
+        with self.assertRaises(ValueError):
+            self.inspect()
+
+    def test_v3_runtime_kit_cannot_advance_same_content_head(self):
+        self.use_content_policy()
+        self.git(self.kit, "commit", "--allow-empty", "-qm", "same content new HEAD")
+        with self.assertRaisesRegex(ValueError, "executable root HEAD differs"):
+            self.inspect()
+
+    def test_v3_unknown_same_repository_alias_has_no_role(self):
+        self.use_content_policy()
+        alias = self.base / "untrusted-alias"
+        self.git(self.project, "worktree", "add", "-qb", "alias", str(alias))
+        self.receipt["runtime_roots"].append(str(alias))
+        self.pin()
+        with self.assertRaisesRegex(ValueError, "untrusted runtime root role"):
+            self.inspect()
+
+    def test_v3_helper_roots_require_complete_projection(self):
+        self.use_content_policy()
+        alias = self.base / "kit-helper"
+        self.git(self.kit, "worktree", "add", "-qb", "helper", str(alias))
+        helper = self.helper.parent / "extra"
+        helper.symlink_to(alias / "scripts/prepare-github-ci")
+        self.receipt["runtime_roots"].append(str(alias))
+        rows = [dict(item, root=str(alias), mode=(alias / item["relative_path"]).stat().st_mode & 0o777)
+                for item in self.receipt["files"]
+                if item["root"] == str(self.kit)]
+        self.receipt["files"].extend(rows)
+        self.pin()
+        bindings = {str(helper): str(alias / "scripts/prepare-github-ci")}
+        self.assertEqual(self.inspect(helper_bindings=bindings)["status"], "admitted")
+        self.put(alias, "workflowkit/ignored-extra.py", "# ignored addition\n")
+        with self.assertRaises(ValueError):
+            self.inspect(helper_bindings=bindings)
+
+    def test_v3_early_and_late_same_content_head_races_fail(self):
+        self.use_content_policy()
+        real_git = self.module.git
+        for trigger in ("merge-base", "ls-files"):
+            changed = False
+            original = self.git(self.project, "rev-parse", "HEAD").strip()
+            def racing_git(root, *arguments, **kwargs):
+                nonlocal changed
+                if root == self.project and arguments[0] == trigger and not changed:
+                    changed = True
+                    self.git(self.project, "commit", "--allow-empty", "-qm", "same infrastructure race")
+                return real_git(root, *arguments, **kwargs)
+            with self.subTest(trigger=trigger), mock.patch.object(self.module, "git", side_effect=racing_git):
+                with self.assertRaisesRegex(ValueError, "source HEAD changed"):
+                    self.inspect()
+            self.assertTrue(changed)
+            self.git(self.project, "reset", "--hard", original)
+
+    def test_v3_task_head_index_files_modes_and_ignored_additions_fail(self):
+        self.use_content_policy()
+        task = self.base / "task"
+        self.git(self.project, "worktree", "add", "-qb", "task", str(task))
+        path = task / ".kent/scripts/workflow-checkpoint"
+        original = path.read_bytes()
+        for drift in ("file", "index", "head", "mode", "ignored-extra", "unmerged"):
+            with self.subTest(drift=drift):
+                if drift == "mode":
+                    path.chmod(0o644)
+                elif drift == "ignored-extra":
+                    self.put(task, ".kent/scripts/__extra.py", "# extra\n")
+                elif drift == "unmerged":
+                    oid = self.git(task, "rev-parse", "HEAD:AGENTS.md").strip()
+                    subprocess.run(["git", "-C", str(task), "update-index", "--index-info"],
+                                   input=f"100644 {oid} 1\tAGENTS.md\n", text=True, check=True)
+                else:
+                    path.write_bytes(original + b"# changed\n")
+                    if drift in ("index", "head"):
+                        self.git(task, "add", ".")
+                    if drift == "head":
+                        self.git(task, "commit", "-qm", "changed infrastructure")
+                with self.assertRaises(ValueError):
+                    self.inspect(workspace_path=task)
+                self.git(task, "reset", "--hard", self.receipt["source_commit"])
+                self.git(task, "clean", "-fdx")
+
+    def source_producer_fixture(self, *, script=False, project_id=None, publication_workflow=FIXTURE_WORKFLOW):
+        runtime = self.producer_fixture(project_id=project_id)
+        self.receipt["workflow_id"] = publication_workflow
+        self.receipt.pop("project_memory")
+        self.receipt.update(schema="delivery-source-publication-v1", policy="published_source_v1", local_inputs=[])
+        self.pin()
+        ids = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222",
+               "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"]
+        self.old_source_admission = {
+            "schema": "delivery-source-admission-v2",
+            "receipt_ref": {"path": str(self.receipt_path), "sha256": self.digest},
+            "binding": {"kind": "plan-publication"}, "ingress": {
+                "kind": "script-edge" if script else "agent-edge", "edge_id": ids[2]},
+            "primary_workspace_id": "workspace-test", "primary_root": str(self.project),
+            "kit_root": str(self.kit), "source_ref": runtime["source_ref"], "kit_ref": runtime["kit_ref"],
+            "ci_helper": str(self.ci_helper), "helper_bindings": runtime["helper_bindings"],
+        }
+        from workflowkit.delivery import source_admission_gate
+        graph = {"version": 1, "nodes": [
+            {"id": ids[0], "key": "start", "kind": "agent"},
+            {"id": ids[1], "key": "plan", "kind": "script" if script else "agent"}],
+            "node_groups": [], "edges": [{"id": ids[2], "key": "start_plan", "target_node_id": ids[1],
+                                          "transition_group_id": ids[3], "prompt_template": ""}],
+            "transition_groups": [{"id": ids[3], "source_node_id": ids[0]}]}
+        if script:
+            graph["nodes"][1]["script_path"] = ".kent/scripts/workflow-checkpoint"
+            graph["transition_groups"][0]["description"] = operations.create_script_ingress_reference(
+                self.evidence / "predecessor-frame.json", self.old_source_admission,
+                project_id=self.producer_project_id, workflow_id=publication_workflow)
+        else:
+            graph["edges"][0]["prompt_template"] = source_admission_gate(
+                self.old_source_admission, project_id=self.producer_project_id,
+                workflow_id=publication_workflow, project_root=str(self.project))
+        self.source_capture = {"workflow_id": publication_workflow, "project_id": self.producer_project_id,
+                               "version": 1, "metadata": {"name": "Fixture", "description": "",
+                               "execution_target": "head"}, "graph": graph, "links": [{
+                                   "project_id": self.producer_project_id, "workflow_id": publication_workflow,
+                                   "is_default": True}], "default": publication_workflow, "valid": True}
+        capture_path = self.evidence / "capture.json"
+        capture_raw = operations.canonical_bytes(self.source_capture)
+        capture_path.write_bytes(capture_raw)
+        capture_path.chmod(0o600)
+        return {key: runtime[key] for key in ("output_path", "project_id", "primary_root",
+                "primary_workspace_id", "source_commit", "source_ref", "kit_root", "kit_commit",
+                "kit_ref", "ci_helper", "helper_bindings")} | {
+                    "workflow_id": publication_workflow, "project_root": str(self.project),
+                    "provenance_output_path": str(self.evidence / "provenance.json"),
+                    "predecessor_capture_ref": {"path": str(capture_path),
+                                                "sha256": hashlib.sha256(capture_raw).hexdigest()},
+                    "predecessor_receipt_ref": self.old_source_admission["receipt_ref"],
+                    "additional_published_paths": []}
+
+    def produce_source(self, arguments):
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), mock.patch.object(
+            operations, "__file__", str(self.kit / "workflowkit/operations.py"),
+        ), mock.patch.object(operations, "_kent_json", side_effect=AssertionError("producer made native call")):
+            return operations.prepare_source_publication_v2(**arguments)
+
+    def test_source_v2_producer_agent_capture_is_candidate_only_without_old_admission(self):
+        arguments = self.source_producer_fixture()
+        self.rewrite_product_history(self.project)
+        candidate = self.produce_source(arguments)
+        self.assertEqual(set(candidate), {"receipt_ref", "provenance_ref"})
+        for ref in candidate.values():
+            self.assertEqual(Path(ref["path"]).stat().st_mode & 0o777, 0o600)
+            self.assertEqual(hashlib.sha256(Path(ref["path"]).read_bytes()).hexdigest(), ref["sha256"])
+        self.assertEqual(self.inspect(
+            receipt_path=candidate["receipt_ref"]["path"], receipt_sha256=candidate["receipt_ref"]["sha256"],
+            project_id=self.producer_project_id, workflow_id=FIXTURE_WORKFLOW, ci_helper=self.ci_helper,
+            helper_bindings={str(self.adapter_link): str(self.adapter_target)})["status"], "admitted")
+        self.assertEqual(self.receipt_path.read_bytes(), json.dumps(self.receipt).encode())
+
+    def test_source_v2_producer_rejects_retained_mode_changes_and_undeclared_extra(self):
+        arguments = self.source_producer_fixture()
+        (self.project / "AGENTS.md").chmod(0o600)
+        with self.assertRaisesRegex(operations.PlanValidationError, "retained publication mode changed"):
+            self.produce_source(arguments)
+        self.assertFalse(Path(arguments["output_path"]).exists())
+        (self.project / "AGENTS.md").chmod(0o644)
+        arguments["additional_published_paths"] = [{"root": str(self.kit), "relative_path": "product.txt"}]
+        with self.assertRaisesRegex(ValueError, "not published"):
+            self.produce_source(arguments)
+
+    def test_source_v2_producer_partial_output_failure_reports_unadmitted_artifacts(self):
+        arguments = self.source_producer_fixture()
+        actual = operations._exclusive_publication_output
+        calls = 0
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("fixture second output failure")
+            return actual(*args, **kwargs)
+        with mock.patch.object(operations, "_exclusive_publication_output", side_effect=fail_second):
+            with self.assertRaisesRegex(operations.EffectBlocked, "unadmitted"):
+                self.produce_source(arguments)
+        self.assertTrue(Path(arguments["output_path"]).exists())
+        self.assertFalse(Path(arguments["provenance_output_path"]).exists())
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.produce_source(arguments)
+
+    def test_source_v2_extra_classification_never_executes_mutated_inspector(self):
+        arguments = self.source_producer_fixture()
+        actual = operations._qualified_publication_inspector
+        marker = self.base / "untrusted-execution"
+        def mutate_after_qualification(*args):
+            result = actual(*args)
+            inspector = self.kit / "scripts/inspect-delivery-source"
+            inspector.write_text(inspector.read_text() + f"\nopen({str(marker)!r}, 'w').close()\n")
+            return result
+        with mock.patch.object(operations, "_qualified_publication_inspector", side_effect=mutate_after_qualification):
+            with self.assertRaises(ValueError):
+                self.produce_source(arguments)
+        self.assertFalse(marker.exists(), "unqualified inspector bytes executed")
+
+    def test_source_extra_pure_classification_matches_inspector(self):
+        names = set(self.module.PROJECT_FILES) | {"product.txt", "AGENTS.md.extra"}
+        for prefix in self.module.PROJECT_PREFIXES + self.module.KIT_PREFIXES:
+            names.update({prefix + "file", prefix + "__pycache__/file", prefix.rstrip("/")})
+        for root, kit in ((str(self.kit), True), (str(self.project), False)):
+            receipt = {"runtime_roots": [root], "files": [
+                {"root": root, "relative_path": name} for name in names]}
+            expected = {name for name in names if not self.module.infrastructure(name, kit)}
+            self.assertEqual({name for _, name in operations._source_publication_extras(
+                receipt, str(self.kit))}, expected)
+
+    def test_source_v2_monotonic_coverage_preserves_root_and_mode(self):
+        arguments = self.source_producer_fixture()
+        arguments["additional_published_paths"] = [{"root": str(self.project), "relative_path": "product.txt"}]
+        candidate = self.produce_source(arguments)
+        result = json.loads(Path(candidate["receipt_ref"]["path"]).read_bytes())
+        extra = next(item for item in result["files"] if item["relative_path"] == "product.txt")
+        with mock.patch.object(operations, "__file__", str(self.kit / "workflowkit/operations.py")):
+            self.assertEqual(operations._source_publication_coverage(
+                result, result, str(self.kit), str(self.kit), []), set())
+            for changed in (
+                {**result, "files": [item for item in result["files"] if item is not extra]},
+                {**result, "files": [({**item, "root": str(self.kit)} if item is extra else item)
+                                     for item in result["files"]]},
+                {**result, "files": [({**item, "mode": 0o600} if item is extra else item)
+                                     for item in result["files"]]},
+            ):
+                with self.subTest(changed=changed), self.assertRaises(operations.PlanValidationError):
+                    operations._source_publication_coverage(result, changed, str(self.kit), str(self.kit), [])
+
+    def test_source_v2_offline_capture_rejects_closed_identity_and_carrier_errors(self):
+        arguments = self.source_producer_fixture()
+        original = json.loads(json.dumps(self.source_capture))
+        capture_path = Path(arguments["predecessor_capture_ref"]["path"])
+        for mutation in ("missing", "unknown", "invalid", "version", "owner", "dual", "bypass", "prefix"):
+            capture = json.loads(json.dumps(original))
+            if mutation == "missing":
+                del capture["default"]
+            elif mutation == "unknown":
+                capture["unknown"] = True
+            elif mutation == "invalid":
+                capture["valid"] = 1
+            elif mutation == "version":
+                capture["graph"]["version"] += 1
+            elif mutation == "owner":
+                capture["workflow_id"] = "11111111-1111-4111-8111-111111111111"
+            elif mutation == "dual":
+                capture["graph"]["edges"][0]["prompt"] = capture["graph"]["edges"][0]["prompt_template"]
+            elif mutation == "bypass":
+                edge = {**capture["graph"]["edges"][0], "id": "55555555-5555-4555-8555-555555555555",
+                        "key": "bypass", "prompt_template": ""}
+                capture["graph"]["edges"].append(edge)
+            else:
+                capture["graph"]["edges"][0]["prompt_template"] = capture["graph"]["edges"][0][
+                    "prompt_template"].replace("Published source admission", "Altered admission")
+            raw = operations.canonical_bytes(capture)
+            capture_path.write_bytes(raw)
+            ref = {"path": str(capture_path), "sha256": hashlib.sha256(raw).hexdigest()}
+            with self.subTest(mutation=mutation), self.assertRaises((ValueError, operations.OperationError)):
+                self.produce_source({**arguments, "predecessor_capture_ref": ref})
+            self.assertFalse(Path(arguments["output_path"]).exists())
+
+    def test_v3_primary_helper_alias_is_executable_not_product_role(self):
+        self.use_content_policy()
+        alias = self.helper.parent / "project-helper"
+        alias.symlink_to(self.project / ".kent/scripts/workflow-checkpoint")
+        bindings = {str(alias): str(self.project / ".kent/scripts/workflow-checkpoint")}
+        self.assertEqual(self.inspect(helper_bindings=bindings)["status"], "admitted")
+        self.git(self.project, "commit", "--allow-empty", "-qm", "same product content")
+        with self.assertRaisesRegex(ValueError, "executable root HEAD differs"):
+            self.inspect(helper_bindings=bindings)
+
+    def test_source_v2_predecessor_git_objects_are_not_required(self):
+        arguments = self.source_producer_fixture()
+        self.receipt["source_commit"] = "e" * 40
+        self.pin()
+        self.old_source_admission["receipt_ref"]["sha256"] = self.digest
+        arguments["predecessor_receipt_ref"] = dict(self.old_source_admission["receipt_ref"])
+        from workflowkit.delivery import source_admission_gate
+        self.source_capture["graph"]["edges"][0]["prompt_template"] = source_admission_gate(
+            self.old_source_admission, project_id=self.producer_project_id, workflow_id=FIXTURE_WORKFLOW,
+            project_root=str(self.project))
+        raw = operations.canonical_bytes(self.source_capture)
+        Path(arguments["predecessor_capture_ref"]["path"]).write_bytes(raw)
+        arguments["predecessor_capture_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        self.assertEqual(set(self.produce_source(arguments)), {"receipt_ref", "provenance_ref"})
+
+    def test_source_v2_producer_detects_same_bytes_local_instruction_replacement(self):
+        arguments = self.source_producer_fixture()
+        local_path = self.add_local_instruction()
+        self.receipt.update(schema="delivery-source-publication-v1", policy="published_source_v1")
+        self.pin()
+        self.old_source_admission["receipt_ref"]["sha256"] = self.digest
+        arguments["source_commit"] = self.receipt["source_commit"]
+        arguments["predecessor_receipt_ref"] = dict(self.old_source_admission["receipt_ref"])
+        from workflowkit.delivery import source_admission_gate
+        self.source_capture["graph"]["edges"][0]["prompt_template"] = source_admission_gate(
+            self.old_source_admission, project_id=self.producer_project_id, workflow_id=FIXTURE_WORKFLOW,
+            project_root=str(self.project))
+        raw = operations.canonical_bytes(self.source_capture)
+        Path(arguments["predecessor_capture_ref"]["path"]).write_bytes(raw)
+        arguments["predecessor_capture_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        actual = operations._exclusive_publication_output
+        def replace_after_write(*args, **kwargs):
+            result = actual(*args, **kwargs)
+            replacement = local_path.with_name("replacement.md")
+            replacement.write_bytes(local_path.read_bytes())
+            replacement.chmod(0o600)
+            replacement.replace(local_path)
+            return result
+        with mock.patch.object(operations, "_exclusive_publication_output", side_effect=replace_after_write):
+            with self.assertRaisesRegex(operations.EffectBlocked, "unadmitted") as caught:
+                self.produce_source(arguments)
+        self.assertIn("local instruction identity changed", str(caught.exception.__cause__))
+        self.assertTrue(Path(arguments["output_path"]).exists())
+
+    def test_source_v2_producer_compact_script_capture_and_exclusive_outputs(self):
+        arguments = self.source_producer_fixture(script=True)
+        self.assertEqual(set(self.produce_source(arguments)), {"receipt_ref", "provenance_ref"})
+        with self.assertRaises(ValueError):
+            self.produce_source(arguments)
+
+    def test_source_v2_producer_projects_primary_extra_to_other_product_copy(self):
+        arguments = self.source_producer_fixture()
+        task = self.base / "producer-task"
+        self.git(self.project, "worktree", "add", "-qb", "producer-task", str(task))
+        arguments["project_root"] = str(task)
+        arguments["additional_published_paths"] = [{"root": str(self.project), "relative_path": "product.txt"}]
+        path = task / "product.txt"
+        original = path.read_bytes()
+        for drift in ("file", "index", "head"):
+            with self.subTest(drift=drift):
+                arguments["output_path"] = str(self.evidence / f"candidate-{drift}.json")
+                arguments["provenance_output_path"] = str(self.evidence / f"provenance-{drift}.json")
+                path.write_text("extra drift\n")
+                if drift in ("index", "head"):
+                    self.git(task, "add", "product.txt")
+                if drift == "head":
+                    self.git(task, "commit", "-qm", "extra drift")
+                with self.assertRaises(ValueError):
+                    self.produce_source(arguments)
+                self.git(task, "restore", "--source", arguments["source_commit"], "--staged", "--worktree", "product.txt")
+                self.git(task, "switch", "--detach", arguments["source_commit"])
+                path.write_bytes(original)
+        arguments["output_path"] = str(self.evidence / "candidate-clean.json")
+        arguments["provenance_output_path"] = str(self.evidence / "provenance-clean.json")
+        candidate = self.produce_source(arguments)
+        receipt = json.loads(Path(candidate["receipt_ref"]["path"]).read_bytes())
+        self.assertEqual([item["root"] for item in receipt["files"]
+                          if item["relative_path"] == "product.txt"], [str(self.project)])
+        arguments["output_path"] = str(self.evidence / "candidate-late.json")
+        arguments["provenance_output_path"] = str(self.evidence / "provenance-late.json")
+        actual = operations._exclusive_publication_output
+        def drift_after_write(*args, **kwargs):
+            result = actual(*args, **kwargs)
+            path.write_text("late extra drift\n")
+            return result
+        with mock.patch.object(operations, "_exclusive_publication_output", side_effect=drift_after_write):
+            with self.assertRaises(operations.EffectBlocked):
+                self.produce_source(arguments)
+
+    def test_source_v2_extras_project_to_task_head_index_and_files(self):
+        arguments = self.source_producer_fixture()
+        arguments["additional_published_paths"] = [{"root": str(self.project), "relative_path": "product.txt"}]
+        candidate = self.produce_source(arguments)
+        task = self.base / "task"
+        self.git(self.project, "worktree", "add", "-qb", "task", str(task))
+        overrides = dict(receipt_path=candidate["receipt_ref"]["path"],
+                         receipt_sha256=candidate["receipt_ref"]["sha256"], project_id=self.producer_project_id,
+                         workflow_id=FIXTURE_WORKFLOW, ci_helper=self.ci_helper,
+                         helper_bindings={str(self.adapter_link): str(self.adapter_target)}, workspace_path=task)
+        (task / "product.txt").chmod(0o600)
+        self.assertEqual(self.inspect(**overrides)["status"], "admitted")
+        path = task / "product.txt"
+        for drift in ("file", "index", "head"):
+            path.write_text("extra drift\n")
+            if drift in ("index", "head"):
+                self.git(task, "add", "product.txt")
+            if drift == "head":
+                self.git(task, "commit", "-qm", "extra drift")
+            with self.subTest(drift=drift), self.assertRaises(ValueError):
+                self.inspect(**overrides)
+            self.git(task, "reset", "--hard", arguments["source_commit"])
+
+    def producer_fixture(self, *, project_id=None):
+        self.native_adapter_fixture()
+        for source in (REPO_ROOT / "workflowkit").glob("*.py"):
+            shutil.copyfile(source, self.kit / "workflowkit" / source.name)
+        self.repin_native_sources()
+        self.producer_project_id = project_id or "project-22222222-2222-4222-8222-222222222222"
+        self.binding_path = self.binding_dir / (self.producer_project_id + ".json")
+        self.installation_binding["project_id"] = self.producer_project_id
+        self.receipt["project_id"] = self.producer_project_id
+        self.receipt["workflow_id"] = FIXTURE_WORKFLOW
+        self.pin()
+        self.installation_binding["receipt_sha256"] = self.digest
+        self.write_installation_binding()
+        return dict(
+            output_path=str(self.evidence / "candidate.json"),
+            predecessor_binding_ref={"path": str(self.binding_path),
+                                     "sha256": hashlib.sha256(self.binding_path.read_bytes()).hexdigest()},
+            predecessor_receipt_ref={"path": str(self.receipt_path), "sha256": self.digest},
+            project_id=self.producer_project_id, receipt_workflow_id=FIXTURE_WORKFLOW,
+            primary_root=str(self.project), primary_workspace_id="workspace-test",
+            source_commit=self.receipt["source_commit"], source_ref="refs/remotes/origin/main",
+            kit_root=str(self.kit), kit_commit=self.receipt["kit_commit"], kit_ref="refs/remotes/origin/main",
+            ci_helper=str(self.ci_helper), helper_bindings=self.installation_binding["helper_bindings"],
+        )
+
+    def produce(self, arguments):
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), mock.patch.object(
+            operations, "__file__", str(self.kit / "workflowkit/operations.py"),
+        ):
+            return operations.prepare_runtime_publication_v3(**arguments)
+
+    def test_v3_producer_is_candidate_only_and_preserves_private_modes(self):
+        arguments = self.producer_fixture()
+        (self.project / "AGENTS.md").chmod(0o600)
+        (self.project / ".kent/scripts/workflow-checkpoint").chmod(0o700)
+        before = self.binding_path.read_bytes(), self.receipt_path.read_bytes()
+        candidate = self.produce(arguments)
+        self.assertEqual(set(candidate), {"path", "sha256", "byte_size"})
+        result = json.loads(Path(candidate["path"]).read_bytes())
+        self.assertEqual(result["schema"], "delivery-runtime-publication-v3")
+        self.assertEqual(result["project_memory"], self.receipt["project_memory"])
+        modes = {item["relative_path"]: item["mode"] for item in result["files"]
+                 if item["root"] == str(self.project)}
+        self.assertEqual(modes["AGENTS.md"], 0o600)
+        self.assertEqual(modes[".kent/scripts/workflow-checkpoint"], 0o700)
+        self.assertEqual(Path(candidate["path"]).stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.binding_path.read_bytes(), self.receipt_path.read_bytes()), before)
+        self.assertEqual(self.inspect(receipt_path=candidate["path"], receipt_sha256=candidate["sha256"],
+                                      project_id=self.producer_project_id,
+                                      workflow_id=FIXTURE_WORKFLOW, ci_helper=self.ci_helper,
+                                      helper_bindings={str(self.adapter_link): str(self.adapter_target)})["status"],
+                         "admitted")
+        with self.assertRaises(FileExistsError):
+            self.produce(arguments)
+
+    def test_v3_producer_rejects_preimage_owner_and_memory_rebinding(self):
+        arguments = self.producer_fixture()
+        for change in (
+            {"predecessor_binding_ref": {**arguments["predecessor_binding_ref"], "sha256": "0" * 64}},
+            {"predecessor_receipt_ref": {**arguments["predecessor_receipt_ref"], "sha256": "0" * 64}},
+            {"receipt_workflow_id": "11111111-1111-4111-8111-111111111111"},
+            {"primary_workspace_id": "another-workspace"},
+        ):
+            with self.subTest(change=change), self.assertRaises((ValueError, operations.PlanValidationError)):
+                self.produce({**arguments, **change})
+            self.assertFalse(Path(arguments["output_path"]).exists())
+
+    def test_v3_producer_accepts_rewritten_primary_without_old_admission(self):
+        arguments = self.producer_fixture()
+        self.rewrite_product_history(self.project)
+        self.assertEqual(self.produce(arguments)["path"], arguments["output_path"])
+
+    def test_v3_producer_postcreation_predecessor_drift_leaves_unadmitted_file(self):
+        arguments = self.producer_fixture()
+        real_fsync = operations.os.fsync
+        changed = False
+        def fsync(descriptor):
+            nonlocal changed
+            real_fsync(descriptor)
+            if not changed and Path(arguments["output_path"]).exists():
+                changed = True
+                self.binding_path.write_bytes(self.binding_path.read_bytes() + b" ")
+        with mock.patch.object(operations.os, "fsync", side_effect=fsync):
+            with self.assertRaisesRegex(ValueError, "predecessor changed"):
+                self.produce(arguments)
+        self.assertTrue(Path(arguments["output_path"]).exists())
+
+    def test_v3_producer_detects_same_bytes_local_instruction_replacement(self):
+        arguments = self.producer_fixture()
+        local_path = self.add_local_instruction()
+        self.installation_binding["receipt_sha256"] = self.digest
+        self.write_installation_binding()
+        arguments.update(
+            source_commit=self.receipt["source_commit"],
+            predecessor_receipt_ref={"path": str(self.receipt_path), "sha256": self.digest},
+            predecessor_binding_ref={"path": str(self.binding_path),
+                                     "sha256": hashlib.sha256(self.binding_path.read_bytes()).hexdigest()})
+        fsync = operations.os.fsync
+        changed = False
+        def replace_after_write(descriptor):
+            nonlocal changed
+            fsync(descriptor)
+            if not changed and Path(arguments["output_path"]).exists():
+                changed = True
+                replacement = local_path.with_name("replacement.md")
+                replacement.write_bytes(local_path.read_bytes())
+                replacement.chmod(0o600)
+                replacement.replace(local_path)
+        with mock.patch.object(operations.os, "fsync", side_effect=replace_after_write):
+            with self.assertRaisesRegex(ValueError, "local instruction identity changed"):
+                self.produce(arguments)
+
+    def test_v3_candidate_producer_api_exists(self):
+        self.assertTrue(callable(getattr(operations, "prepare_runtime_publication_v3", None)))
 
     def test_qualified_runtime_binding_requires_published_bootstrap_source(self):
         original_kit_commit = self.commits[self.kit]
@@ -1681,7 +2262,7 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         self.commit(self.project)
         self.inspect()
 
-    def test_kit_self_development_shared_root_and_product_only_published_descendant(self):
+    def test_kit_self_development_shared_root_and_product_only_published_descendant(self, content_policy=False):
         for relative in ("AGENTS.md", ".kent/workflow-profile.toml",
                          ".kent/project-contract.md", ".kent/scripts/workflow-checkpoint"):
             source = self.project / relative
@@ -1704,7 +2285,22 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
                 "sha256": hashlib.sha256(raw).hexdigest(), "byte_size": len(raw),
                 "mode": stat.S_IMODE(path.stat().st_mode)})
         self.pin()
+        if content_policy:
+            self.use_content_policy()
         self.inspect(project_root=self.kit, primary_root=self.kit, workspace_path=self.kit)
+        if content_policy:
+            task = self.base / "kit-task"
+            self.git(self.kit, "worktree", "add", "-qb", "task", str(task))
+            self.rewrite_product_history(task)
+            self.inspect(project_root=self.kit, primary_root=self.kit, workspace_path=task)
+            self.put(task, "workflowkit/delivery.py", "# committed closure drift\n")
+            self.commit(task)
+            with self.assertRaises(ValueError):
+                self.inspect(project_root=self.kit, primary_root=self.kit, workspace_path=task)
+
+
+    def test_v3_kit_self_development_full_closure_and_distinct_source_pin(self):
+        self.test_kit_self_development_shared_root_and_product_only_published_descendant(content_policy=True)
 
     def test_dirty_product_task_worktree_and_mutable_ignored_evidence_pass(self):
         task = self.base / "task"

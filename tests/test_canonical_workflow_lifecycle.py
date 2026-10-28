@@ -46,6 +46,374 @@ def workflow_id(index: int) -> str:
     return f"123e4567-e89b-42d3-a456-{426614174000 + index:012d}"
 
 
+class SourcePublicationProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        fixture = source_admission.DeliverySourceAdmissionTests("test_published_closure_and_cli_are_read_only")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.fixture = fixture
+        arguments = fixture.source_producer_fixture(project_id=PROJECT_ID, publication_workflow=workflow_id(0))
+        self.arguments = arguments
+        self.candidate = fixture.produce_source(arguments)
+        self.source = fixture.source_capture
+        self.admission = {**fixture.old_source_admission,
+                          "receipt_ref": {key: self.candidate["receipt_ref"][key] for key in ("path", "sha256")}}
+        from workflowkit.delivery import source_admission_gate
+        self.target = json.loads(json.dumps(self.source["graph"]))
+        self.target["version"] += 1
+        self.target["edges"][0]["prompt_template"] = source_admission_gate(
+            self.admission, project_id=fixture.producer_project_id, workflow_id=self.source["workflow_id"],
+            project_root=str(fixture.project))
+        self.review_path = fixture.evidence / "publication-review.json"
+        self.review = {"dispositions": [{"path": "source_admission.publication_provenance",
+                                         "disposition": "compatible", "evidence": [{key: self.candidate[
+                                             "provenance_ref"][key] for key in ("path", "sha256")}]}]}
+        self.item = {"project_id": fixture.producer_project_id, "workflow_id": self.source["workflow_id"],
+                     "expected_version": self.source["version"], "source_admission": self.admission,
+                     "source_graph_sha256": canonical_sha256(self.source["graph"]),
+                     "source_metadata_sha256": canonical_sha256(self.source["metadata"]),
+                     "links": self.source["links"], "default": self.source["default"]}
+        self.write_review()
+
+    def write_review(self):
+        raw = canonical_bytes(self.review)
+        self.review_path.write_bytes(raw)
+        self.review_path.chmod(0o600)
+        self.item["compatibility_review_ref"] = {"path": str(self.review_path), "sha256": hashlib.sha256(raw).hexdigest()}
+
+    def gate(self, source=None, target=None):
+        return operations._source_publication_provenance(
+            self.item, self.source if source is None else source, self.target if target is None else target)
+
+    def lifecycle_plan(self, *, native=False, intent="graph-and-metadata", affected=False):
+        """Real typed provenance through the fake native multistage executor.
+
+        Source admission itself is separately exercised against real disposable
+        Git sources; this lane isolates native stage/settlement behavior.
+        """
+        fixture = make_workflow_fixture(self.fixture.project)
+        if native:
+            plan, self.native_context, self.native_observed = native_canonical_v2_plan(
+                fixture, self, production_shape=True, with_approvals=True,
+                synchronize_effects=True, intent=intent, prefix_only=True,
+                approval_context_mode="new_session",
+                approval_descriptions=("v1", "v1/v2", "v1/v2") if affected else None,
+            )
+            value = plan.value
+        else:
+            _, value = canonical_v2_plan(fixture, intent=intent, source_admission_enabled=False)
+        item = value["workflows"][0]
+        state = read_state(fixture)
+        workflow = state["workflows"][workflow_id(0)]
+        source_graph = {"version": workflow["version"], **workflow["graph"]}
+        source_edge = operations._v2_ingress_edge(source_graph, "lifecycle source")
+        self.fixture.old_source_admission["ingress"]["edge_id"] = source_edge["id"]
+        self.admission["ingress"] = dict(self.fixture.old_source_admission["ingress"])
+        from workflowkit.delivery import source_admission_gate
+        source_edge["prompt_template"] = source_admission_gate(
+            self.fixture.old_source_admission, project_id=PROJECT_ID, workflow_id=workflow_id(0),
+            project_root=str(self.fixture.project)) + "\n\nOriginal Plan body."
+        workflow["graph"] = {key: source_graph[key] for key in ("nodes", "edges", "node_groups", "transition_groups")}
+        write_state(fixture, state)
+        target_edge = operations._v2_ingress_edge(item["target_graph"], "lifecycle target")
+        target_edge["prompt_template"] = source_admission_gate(
+            self.admission, project_id=PROJECT_ID, workflow_id=workflow_id(0),
+            project_root=str(self.fixture.project)) + "\n\nOriginal Plan body."
+        item["source_admission"] = self.admission
+        item["source_graph_sha256"] = canonical_sha256(source_graph)
+        self.source = {"workflow_id": workflow_id(0), "project_id": PROJECT_ID, "version": workflow["version"],
+                       "metadata": workflow["metadata"], "graph": source_graph,
+                       "links": item["links"], "default": item["default"], "valid": True}
+        capture_path = Path(self.arguments["predecessor_capture_ref"]["path"])
+        capture_raw = canonical_bytes(self.source)
+        capture_path.write_bytes(capture_raw)
+        packet_path = Path(self.candidate["provenance_ref"]["path"])
+        packet = json.loads(packet_path.read_bytes())
+        packet["predecessor_capture_ref"]["sha256"] = hashlib.sha256(capture_raw).hexdigest()
+        packet_raw = canonical_bytes(packet)
+        packet_path.write_bytes(packet_raw)
+        packet_ref = {"path": str(packet_path), "sha256": hashlib.sha256(packet_raw).hexdigest()}
+        review_path = Path(item["compatibility_review_ref"]["path"])
+        review = json.loads(review_path.read_bytes())
+        review["source_graph_sha256"] = item["source_graph_sha256"]
+        review["source_admission_sha256"] = canonical_sha256(self.admission)
+        from workflowkit.graph import native_graph_postimage, native_graph_projection
+        review["target_graph_sha256"] = canonical_sha256(native_graph_postimage(
+            item["target_graph"], workflow_id=workflow_id(0)))
+        evidence = review["dispositions"][0]["evidence"]
+        paths = operations._v2_required_review_paths(
+            native_graph_projection(source_graph, workflow_id=workflow_id(0)),
+            native_graph_projection(item["target_graph"], workflow_id=workflow_id(0)),
+            workflow["metadata"], item.get("target_metadata", workflow["metadata"]),
+            item["compatibility_snapshot"], self.admission)
+        review["dispositions"] = [{"path": path, "disposition": "compatible", "evidence": evidence}
+                                  for path in sorted(paths)] + [{
+            "path": "source_admission.publication_provenance", "disposition": "compatible", "evidence": [packet_ref]}]
+        raw = canonical_bytes(review)
+        review_path.write_bytes(raw)
+        item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        return fixture, write_canonical_v2_plan(fixture, value)
+
+    def test_combined_native_graph_only_approvals_and_content_introduction(self):
+        self._combined_native_approvals_and_content_introduction("graph-only", False)
+
+    def test_combined_native_graph_metadata_affected_approvals_and_content_introduction(self):
+        self._combined_native_approvals_and_content_introduction("graph-and-metadata", True)
+
+    def _combined_native_approvals_and_content_introduction(self, intent, affected):
+        for intent, affected in ((intent, affected),):
+            with self.subTest(intent=intent, affected=affected):
+                fixture, plan = self.lifecycle_plan(native=True, intent=intent, affected=affected)
+                context = self.native_context
+                connection = context["connection"]
+                tables = ("task_pending_approvals", "task_pending_approval_branches")
+                before = [connection.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall()
+                          for table in tables]
+                self.assertEqual(len(before[0]), 4)
+                source = self.source["graph"]
+                target = json.loads(json.dumps(plan.value["workflows"][0]["target_graph"]))
+                operations._v2_ingress_edge(target, "combined target")["prompt_template"] = (
+                    operations._v2_ingress_edge(source, "combined source")["prompt_template"])
+                target["version"] = source["version"]
+                self.assertEqual(target, source)
+                with native_observer_patches(context), mock.patch.object(
+                    operations, "admit_source_admission", side_effect=synthetic_verified_source_admission,
+                ):
+                    if affected:
+                        with self.assertRaisesRegex(PlanValidationError, "omits a changed semantic path"):
+                            reconcile_canonical_workflows(plan, mode="prepare")
+                        plan = review_native_description_decisions(fixture, plan, context)
+                    value = plan.value
+                    item = value["workflows"][0]
+                    review_path = Path(item["compatibility_review_ref"]["path"])
+                    valid = json.loads(review_path.read_bytes())
+                    for missing in ("source_admission.publication_provenance", "decision:"):
+                        if missing == "decision:" and not affected:
+                            continue
+                        review = {**valid, "dispositions": [
+                            row for row in valid["dispositions"] if not row["path"].startswith(missing)]}
+                        raw = canonical_bytes(review)
+                        review_path.write_bytes(raw)
+                        item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+                        invalid = write_canonical_v2_plan(fixture, value, name="missing-disposition.json")
+                        with self.assertRaises(PlanValidationError):
+                            reconcile_canonical_workflows(invalid, mode="prepare")
+                        self.assertEqual(graph_apply_rows(fixture), [])
+                    raw = canonical_bytes(valid)
+                    review_path.write_bytes(raw)
+                    item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+                    plan = write_canonical_v2_plan(fixture, value)
+                    reconcile_canonical_workflows(plan, mode="prepare")
+                    self.assertEqual(reconcile_canonical_workflows(
+                        plan, mode="apply", confirm=plan.sha256)["phase"], "complete")
+                    parsed = operations._validate_canonical_v2_plan(plan)
+                    observed = operations._canonical_v2_read(parsed, parsed["workflows"][0])
+                self.assertEqual(observed["compatibility_snapshot"]["native_components"]["approvals"],
+                                 self.native_observed["compatibility_snapshot"]["native_components"]["approvals"])
+                for table, rows in zip(tables, before):
+                    self.assertEqual(connection.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall(), rows)
+                self.assertEqual(len(graph_apply_rows(fixture)), 1)
+
+    def test_combined_native_settlement_precedes_missing_provenance_gate(self):
+        fixture, plan = self.lifecycle_plan(native=True, affected=True)
+        context = self.native_context
+        plan = review_native_description_decisions(fixture, plan, context)
+        connection = context["connection"]
+        before = connection.execute("SELECT * FROM task_pending_approvals ORDER BY id").fetchall()
+        with native_observer_patches(context), mock.patch.object(
+            operations, "admit_source_admission", side_effect=synthetic_verified_source_admission,
+        ):
+            reconcile_canonical_workflows(plan, mode="prepare")
+            stage = install_v2_unresolved_graph_postimage(fixture, plan)
+            connection.execute("UPDATE workflows SET version=?", (stage["after"]["version"],))
+            connection.commit()
+            Path(self.candidate["provenance_ref"]["path"]).unlink()
+            settled = reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+            self.assertEqual(settled["settled"], "postimage")
+            with self.assertRaises(PlanValidationError):
+                reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+        with OperationJournal(Path(plan.value["state_dir"]), "canonical-workflow-reconcile", plan) as journal:
+            self.assertEqual(journal.state["effects"][f"apply:{workflow_id(0)}:graph"]["status"], "verified")
+            self.assertNotIn(f"apply:{workflow_id(0)}:metadata", journal.state["effects"])
+        self.assertEqual(connection.execute("SELECT * FROM task_pending_approvals ORDER BY id").fetchall(), before)
+        self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_introduction_runs_graph_and_metadata_against_stage_before(self):
+        fixture, plan = self.lifecycle_plan()
+        with mock.patch.object(operations, "admit_source_admission", side_effect=synthetic_verified_source_admission):
+            self.assertEqual(reconcile_canonical_workflows(plan, mode="prepare")["phase"], "prepared")
+            result = reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+        self.assertEqual(result["phase"], "complete")
+        self.assertEqual(len(graph_apply_rows(fixture)), 1)
+        self.assertEqual(read_state(fixture)["workflows"][workflow_id(0)]["metadata"]["description"],
+                         plan.value["workflows"][0]["target_metadata"]["description"])
+
+    def test_graph_only_introduction_then_metadata_and_graph_reuse_need_no_packet(self):
+        fixture, combined = self.lifecycle_plan()
+        value = combined.value
+        item = value["workflows"][0]
+        item["intent"] = "graph-only"
+        del item["target_metadata"]
+        review_path = Path(item["compatibility_review_ref"]["path"])
+        review = json.loads(review_path.read_bytes())
+        review["target_metadata_sha256"] = item["source_metadata_sha256"]
+        raw = canonical_bytes(review)
+        review_path.write_bytes(raw)
+        item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        plan = write_canonical_v2_plan(fixture, value, name="graph-introduction.json")
+        with mock.patch.object(operations, "admit_source_admission", side_effect=synthetic_verified_source_admission):
+            reconcile_canonical_workflows(plan, mode="prepare")
+            self.assertEqual(reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)["phase"], "complete")
+        Path(self.candidate["provenance_ref"]["path"]).unlink()
+        for intent in ("metadata-only", "graph-only"):
+            metadata = {**read_state(fixture)["workflows"][workflow_id(0)]["metadata"],
+                        "description": "Independent metadata with unchanged installed admission"}
+            _, value = canonical_v2_plan(fixture, intent=intent, source_admission_enabled=False,
+                                         metadata=metadata, name=f"reuse-{intent}.json")
+            item = value["workflows"][0]
+            item["source_admission"] = self.admission
+            if intent == "graph-only":
+                # A genuinely unrelated graph-only update, not an empty plan.
+                item["target_graph"]["nodes"][2]["description"] = "Unrelated node description"
+            review_path = Path(item["compatibility_review_ref"]["path"])
+            review = json.loads(review_path.read_bytes())
+            review["source_admission_sha256"] = canonical_sha256(self.admission)
+            state = read_state(fixture)["workflows"][workflow_id(0)]
+            source_graph = {"version": state["version"], **state["graph"]}
+            target_graph = item.get("target_graph", source_graph)
+            from workflowkit.graph import native_graph_postimage, native_graph_projection
+            review["target_graph_sha256"] = canonical_sha256(
+                native_graph_postimage(target_graph, workflow_id=workflow_id(0))
+                if intent == "graph-only" else source_graph)
+            paths = operations._v2_required_review_paths(
+                native_graph_projection(source_graph, workflow_id=workflow_id(0)),
+                native_graph_projection(target_graph, workflow_id=workflow_id(0)), state["metadata"],
+                item.get("target_metadata", state["metadata"]), item["compatibility_snapshot"], self.admission)
+            evidence = review["dispositions"][0]["evidence"]
+            review["dispositions"] = [{"path": path, "disposition": "compatible", "evidence": evidence}
+                                      for path in sorted(paths)]
+            raw = canonical_bytes(review)
+            review_path.write_bytes(raw)
+            item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+            plan = write_canonical_v2_plan(fixture, value, name=f"reuse-{intent}.json")
+            with self.subTest(intent=intent), mock.patch.object(
+                operations, "admit_source_admission", side_effect=synthetic_verified_source_admission,
+            ), mock.patch.object(operations, "prepare_source_publication_v2", side_effect=AssertionError("producer reran")):
+                reconcile_canonical_workflows(plan, mode="prepare")
+                self.assertEqual(reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)["phase"], "complete")
+
+    def test_external_drift_between_introduction_stages_fails_stage_before(self):
+        fixture, plan = self.lifecycle_plan()
+        original = operations._settle_or_run
+        def drift_after_graph(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kwargs["effect_key"].endswith(":graph"):
+                state = read_state(fixture)
+                state["workflows"][workflow_id(0)]["metadata"]["description"] = "external drift"
+                write_state(fixture, state)
+            return result
+        with mock.patch.object(operations, "admit_source_admission", side_effect=synthetic_verified_source_admission):
+            reconcile_canonical_workflows(plan, mode="prepare")
+            with mock.patch.object(operations, "_settle_or_run", side_effect=drift_after_graph):
+                with self.assertRaises(EffectBlocked):
+                    reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+        self.assertEqual(len(graph_apply_rows(fixture)), 1)
+        self.assertFalse(any(row[:2] == ["workflow", "update"] for row in read_log(fixture)))
+
+    def test_missing_actual_packet_after_attempt_allows_settlement_but_not_next_effect(self):
+        fixture, plan = self.lifecycle_plan()
+        with mock.patch.object(operations, "admit_source_admission", side_effect=synthetic_verified_source_admission):
+            reconcile_canonical_workflows(plan, mode="prepare")
+            install_v2_unresolved_graph_postimage(fixture, plan)
+            Path(self.candidate["provenance_ref"]["path"]).unlink()
+        child = subprocess.run(
+            [sys.executable, "-B", "-c", (
+                "import sys\n"
+                "from tests.test_canonical_workflow_lifecycle import synthetic_verified_source_admission\n"
+                "import workflowkit.operations as operations\n"
+                "operations.admit_source_admission = synthetic_verified_source_admission\n"
+                "plan = operations.load_plan(sys.argv[1], schema='canonical-workflow-reconcile-plan-v2', "
+                "expected_sha256=sys.argv[2])\n"
+                "operations.reconcile_canonical_workflows(plan, mode='apply', confirm=plan.sha256)\n"
+            ), str(self.fixture.project / "canonical-plan-v2.json"), plan.sha256],
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+            cwd=self.fixture.project, capture_output=True, text=True, timeout=60,
+        )
+        self.assertNotEqual(child.returncode, 0)
+        self.assertIn("publication provenance", child.stderr)
+        with OperationJournal(Path(plan.value["state_dir"]), "canonical-workflow-reconcile", plan) as journal:
+            graph_key, metadata_key = (f"apply:{workflow_id(0)}:{name}" for name in ("graph", "metadata"))
+            self.assertEqual(journal.state["effects"][graph_key]["status"], "verified")
+            self.assertNotIn(metadata_key, journal.state["effects"])
+        self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_dispatch_rejects_observed_receipt_digest_drift_before_policy_selection(self):
+        path = Path(self.admission["receipt_ref"]["path"])
+        original = path.read_bytes()
+        for raw in (b"not json", canonical_bytes({"schema": "delivery-source-publication-v1"})):
+            with self.subTest(raw=raw):
+                path.write_bytes(raw)
+                with self.assertRaises(PlanValidationError):
+                    self.gate()
+                path.write_bytes(original)
+
+    def test_dispatch_digest_mismatch_blocks_native_effect_even_if_next_read_restores_v2(self):
+        fixture, plan = self.lifecycle_plan()
+        actual = operations._read_source_record
+        def dispatch_drift(*args, **kwargs):
+            path, raw, mode = actual(*args, **kwargs)
+            if kwargs.get("label") == "source policy dispatch":
+                raw = canonical_bytes({"schema": "delivery-source-publication-v1"})
+            return path, raw, mode
+        with mock.patch.object(operations, "_read_source_record", side_effect=dispatch_drift), mock.patch.object(
+            operations, "admit_source_admission", side_effect=synthetic_verified_source_admission,
+        ):
+            with self.assertRaisesRegex(PlanValidationError, "dispatch receipt digest"):
+                reconcile_canonical_workflows(plan, mode="prepare")
+        self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_introduction_requires_typed_packet_and_exact_owned_capture(self):
+        self.assertTrue(self.gate())
+        self.review["dispositions"] = []
+        self.write_review()
+        with self.assertRaisesRegex(PlanValidationError, "typed publication provenance"):
+            self.gate()
+
+    def test_capture_a_cannot_be_reused_for_plan_b(self):
+        other = json.loads(json.dumps(self.source))
+        other["metadata"]["description"] = "independently changed capture B"
+        self.item["source_metadata_sha256"] = canonical_sha256(other["metadata"])
+        with self.assertRaisesRegex(PlanValidationError, "immutable plan preimage"):
+            self.gate(source=other)
+
+    def test_full_installed_carrier_reuse_needs_no_producer_or_packet(self):
+        installed = {**self.source, "version": self.target["version"], "graph": self.target}
+        self.review_path.unlink()
+        Path(self.candidate["provenance_ref"]["path"]).unlink()
+        self.assertFalse(self.gate(source=installed))
+        unrelated = json.loads(json.dumps(self.target))
+        unrelated["version"] += 1
+        unrelated["nodes"][1]["description"] = "unrelated graph update"
+        self.assertFalse(self.gate(source=installed, target=unrelated))
+
+    def test_changed_carrier_cannot_select_reuse_by_same_receipt(self):
+        installed = {**self.source, "graph": json.loads(json.dumps(self.target))}
+        installed["graph"]["edges"][0]["prompt_template"] += " altered noncanonical prefix"
+        with self.assertRaises(PlanValidationError):
+            self.gate(source=installed)
+
+    def test_candidate_packet_substitution_fails_even_after_resigning_review(self):
+        packet_path = Path(self.candidate["provenance_ref"]["path"])
+        packet = json.loads(packet_path.read_bytes())
+        packet["candidate_receipt_ref"]["sha256"] = "f" * 64
+        raw = canonical_bytes(packet)
+        packet_path.write_bytes(raw)
+        self.review["dispositions"][0]["evidence"][0]["sha256"] = hashlib.sha256(raw).hexdigest()
+        self.write_review()
+        with self.assertRaisesRegex(PlanValidationError, "frame/receipt identity"):
+            self.gate()
+
+
 class NativeGraphTransportTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("KENT_NATIVE_SOURCE_GATE_REQUEST"), "private gate request not supplied")
     def test_captured_puber_gate_only_ingress_survives_native_encoding(self):
@@ -6597,7 +6965,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 self.assertEqual(journal.state["members"][0]["status"], "graph_verified")
 
     def test_v2_settles_attempted_graph_before_missing_evidence_blocks_next_effect(self) -> None:
-        for missing in ("runtime", "review", "receipt"):
+        for missing in ("runtime", "review", "receipt", "provenance"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temporary:
                 fixture = make_workflow_fixture(Path(temporary))
                 plan, _ = canonical_v2_plan(
@@ -6611,8 +6979,12 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     Path(item["runtime_refs"][0]["path"]).unlink()
                 elif missing == "review":
                     Path(item["compatibility_review_ref"]["path"]).unlink()
-                else:
+                elif missing == "receipt":
                     Path(item["source_admission"]["receipt_ref"]["path"]).unlink()
+                else:
+                    # An unavailable typed packet is a new-effect gate, never a
+                    # reason to skip observational settlement of an old attempt.
+                    pass
 
                 admission_calls = []
 
@@ -6624,13 +6996,20 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     operations,
                     "admit_source_admission",
                     side_effect=refuse_fresh_admission,
-                ) as admission:
+                ) as admission, mock.patch.object(
+                    operations, "_source_publication_provenance",
+                    side_effect=(PlanValidationError("source publication packet is unavailable")
+                                 if missing == "provenance" else
+                                 lambda *_args: False),
+                ) as provenance:
                     with self.assertRaises((PlanValidationError, EffectBlocked)):
                         reconcile_canonical_workflows(
                             plan,
                             mode="apply",
                             confirm=plan.sha256,
                         )
+                if missing == "provenance":
+                    self.assertEqual(provenance.call_count, 1)
                 self.assertEqual(admission.call_count, 1 if missing == "receipt" else 0)
                 self.assertEqual(len(admission_calls), admission.call_count)
                 self.assertEqual(graph_apply_rows(fixture), [])
