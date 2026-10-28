@@ -272,3 +272,46 @@ notes as current installation state.
 | Worktree ownership and cleanup | [Worktree contract](../contracts/worktree-contract.md), [task-owned cleanup](../contracts/workflow-contract.md#task-owned-cleanup) |
 | Release source checks and publication | [Release contract](../contracts/workflow-contract.md#release-sourcepublication), [source bindings](../contracts/release-source-bindings.md) |
 | Model, tool and delegation settings | [Managed configuration](../config/subagents.toml) |
+
+### Content-policy publication candidates (not installation)
+
+Use the qualified Kit Python API, not a new CLI or installer framework:
+
+- `operations.prepare_runtime_publication_v3(...)` prepares one closed runtime-v3
+  receipt candidate from exact installed predecessor binding and receipt refs.
+- `operations.prepare_source_publication_v2(...)` prepares source-only-v2 receipt
+  and provenance candidates from a closed canonical owned predecessor capture
+  and its exact receipt ref. `additional_published_paths` contains additions
+  only, as root/relative-path records. Retained extras and permissions remain.
+
+Both APIs require named explicit project/root/workspace/commit/publication-ref/
+CI-helper/helper-declaration inputs. The executing producer must be the selected
+clean exact-pinned Kit. Old checkout ancestry or successful old admission is not
+required. New publication inventory comes from immutable Git blobs, with safe
+actual filesystem permissions; do not chmod copies or refresh a receipt after
+intended drift. Existing publication refs are read, not fetched or rewritten.
+
+Provide absent output paths in existing owned mode0700 directories. Candidates
+are exclusively created mode0600, fsynced, read back and freshness-checked.
+Preserve a partial artifact as **unadmitted** after failure; do not overwrite,
+install or silently retry it. The returned path/hash/size references prove
+candidate integrity only, not native ownership, current approval or activation.
+Source-only capture integrity likewise does not authenticate a native preimage.
+
+For a source-only content-policy introduction, carry the typed provenance packet
+as the single evidence reference of review disposition
+`source_admission.publication_provenance`. Canonical preparation/new-effect gates
+bind it to the original owned plan preimage and candidate target; later stages
+compare live state to their own expected before-state. A different capture/plan
+requires fresh preparation/review, even if candidate bytes happen to match.
+Unchanged complete installed carriers may be reused by a subsequent independent
+plan without rerunning the producer. Read-only settlement can still classify an
+attempted effect when a packet disappears; the next new effect remains blocked.
+
+See `contracts/workflow-update-compatibility.md` for exact policy/version,
+role/projection, freshness, extra-coverage and provenance rules. Old runtime-v1/
+v2 and source-only-v1 receipts keep their original ancestry checks. The new
+source-only receipt never authorizes R2 storage. Source success does not install
+new readers, refresh retained frames, change global aliases or prove a consumer
+cohort compatible. Publication/adoption and forward-qualified rollback are
+separate decisions; restarting Kent is not a substitute for compatibility.

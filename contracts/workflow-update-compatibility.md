@@ -88,6 +88,15 @@ remain exact-only. It does not classify the difference as cosmetic or safe.
 All five original raw JSON columns, including description bytes and whitespace,
 remain bound to the approval envelope and fingerprint without normalization.
 
+Native approval context dispatch is closed and bound to matching frozen/current
+edge mode and target kind. A `new_session` edge targeting an Agent requires
+exactly `target_session={"kind":"create"}` and
+`active_source={"kind":"deferred_self"}`, without Session IDs or extra keys.
+`continue_session` and `compact_and_continue_session` retain exact-source and
+same-Session reuse. Cross-pairs and reuse for `new_session` are rejected.
+This representation support does not consume pending decisions or establish
+compatibility, installation authority, or runtime cohort qualification.
+
 Observation collects affected decision identities only in the current call
 chain, comparing frozen/current/target descriptions; it adds no persisted
 snapshot, plan or review schema. Each affected decision requires an existing
@@ -178,3 +187,112 @@ admission is required before a new effect; missing mutable bookkeeping does
 not prevent reporting an independently proven settled result. A forward
 restore must satisfy current source admission and compatibility, not merely
 reproduce previously approved bytes.
+
+## Explicit content publication policies
+
+`delivery-runtime-publication-v3` pairs only with
+`delivery_reliability_project_content_v1`. It has exactly runtime-v2 fields,
+including required `local_inputs` (empty is valid). Runtime-v1/v2 retain their
+ancestry-bound semantics. Source-only-v1 also retains its original semantics.
+Unknown schema/policy pairs, missing/extra fields and invalid nested metadata
+fail before a new-policy runtime handle or effect. Admission-v2, binding-v2,
+inspection-v1, profile reliability-v1 and receipt ownership remain unchanged.
+
+Published commits must remain reachable from explicit local publication refs.
+Immutable Git blobs, tree modes and the complete infrastructure inventory remain
+source identity. The content policy removes only published-commit-to-product-HEAD
+ancestry: HEAD, stage-zero index and safe filesystem bytes/executable identity
+must all match the complete published infrastructure projection. Primary stays
+clean. This proves infrastructure, not product equivalence, approval, compatible
+retained execution or permission to rebase. Rewritten publication branches need
+retained immutable published anchors.
+
+Roles come from native-bound project/primary/workspace roots and exact trusted
+helper targets, not receipt root claims or a shared Git common directory alone.
+Executable roles override product roles. Kit/helper Kit roots must be clean at
+exact `kit_commit` with full Kit closure; separate project helper roots must be
+clean at exact `source_commit` with full project closure. Every helper root has
+its complete projection, including ignored infrastructure additions. Untrusted
+aliases, foreign repositories and conflicting pins fail. Other bound product
+copies may have rewritten history but require the full project projection. Kit
+self-development projects require full Kit projection and unchanged source/Kit
+projection equivalence, including separate task copies.
+
+After safe receipt/root/helper resolution, observe each root HEAD once before
+publication/ancestry/clean/tree checks. Observe publication tips, check immutable
+commit ancestry against those tips, verify all copies, declarations and helpers,
+repeat content/clean/helper/receipt checks, then compare final HEADs/refs. Same
+content with a changed HEAD fails. This is cooperative freshness, not atomic
+filesystem isolation, change-and-restore detection or a reservation after return.
+Agent bootstrap requires full native source admission for the new policy after
+exact Kit qualification. Initial Scripts retain strict Script-ingress admission;
+later Scripts and Agents use the same bound frame with genuine native ownership.
+No fabricated Script context substitutes for an Agent Session.
+
+`operations.prepare_runtime_publication_v3` accepts only named closed publication
+inputs and explicit installed binding/receipt preimage references. It preserves
+receipt owner, full project-memory declaration, ordered legacy IDs and local
+instructions. Prior profile identity must agree with binding, receipt and the
+published prior profile blob; new R2 identity cannot be rebound. It does not need
+successful old admission or old checkout ancestry. Inventory hashes/sizes and
+executable identity come from published Git blobs; exact declared permissions
+come from safe matching filesystem copies (0600/0644 and 0700/0755 are distinct).
+It never chmods. Proposed helper declarations do not qualify actual aliases.
+An exclusive 0600 candidate in an existing owned 0700 directory is fsynced,
+read back and freshness-checked. Drift leaves an unadmitted private candidate.
+The result is only path/hash/size, never installation or VerifiedSourceAdmission.
+
+## Source-only content provenance
+
+`delivery-source-publication-v2` pairs only with
+`published_source_project_content_v1`. It has exactly source-only-v1 fields,
+including required local inputs, without R2 memory, bindings or legacy inventory.
+It uses the same content roles/freshness rules and requires full admission before
+a new-policy Agent handle. It is not accepted by R2 storage adapters.
+
+`operations.prepare_source_publication_v2` consumes explicit digest-bound private
+canonical `_canonical_v2_owned` capture and predecessor receipt references. The
+closed capture binds project/Workflow/version, metadata, full graph, links,
+default and strictly true validation. One pure canonical Agent prefix or one
+safe compact Script reference must own the sole ingress. Dual/malformed carriers
+and bypasses fail. Capture integrity is not native authentication. Offline
+preparation performs no native call, old admission, graph/frame construction or
+R2/helper/binding effect. Two exclusive 0600 outputs in existing owned 0700
+directories contain the receipt candidate and closed
+`delivery-source-publication-provenance-v1` packet. Partial failures retain only
+unadmitted private artifacts; retries cannot overwrite them.
+
+Extra coverage is root-qualified: preserve every predecessor extra plus explicit
+additions, without deletion/replacement/implicit root remapping. Recover prior
+coverage from the digest-bound receipt, not an old Git tree or directory scan.
+New hashes/bytes come from new published Git blobs. Project extras project to
+every bound product copy in HEAD/index/files, including the task workspace;
+helper extras remain bound to their exact root. Retained declared permissions
+and local instructions cannot change. Other product copies may have safe
+private umask permissions with identical bytes and owner executable identity.
+
+Introducing or replacing the full admission/carrier requires a compatibility
+review disposition `source_admission.publication_provenance` whose one evidence
+reference is the typed packet. The packet binds predecessor capture/receipt,
+candidate receipt and explicit additions. At preparation and repeated new-effect
+checks, validate packet/candidate/target references, monotonic coverage and the
+capture against the immutable original plan/journal preimage, including IDs,
+version, graph, metadata, links and default. Independently compare actual native
+state with current `stage.before`; do not compare it to the original capture
+after an earlier legitimate stage. Introduction remains introduction throughout
+that prepared plan, even after its first stage installs the carrier.
+
+Reuse needs no producer/reissued receipt only when the complete closed frame,
+receipt path/hash, carrier kind and canonical Agent prefix or exact compact
+reference already exist unchanged in the sole actual source ingress and target.
+Derive reuse from validated structures, never a caller flag or digest alone.
+Fresh native/source admission, reviews, compatibility and effect gates remain.
+A subsequent independent plan may reuse the installed carrier; an old approval
+does not become consent to new behavior. Read-only settlement of a previously
+attempted/ambiguous effect observes state without requiring the packet, retries
+or replay. A missing/changed packet blocks the next new effect, not settlement.
+
+These are source contracts only. Publication, installation, consumer pins,
+bootstrap copies, receipts/bindings/frames, shared helper aliases and adoption
+require a separately reviewed exact-cohort rollout. Existing task identity and
+immutable task baselines remain fixed; current-cohort coupling remains open.

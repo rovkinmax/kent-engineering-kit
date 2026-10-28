@@ -1857,6 +1857,751 @@ def _source_native_identity(
     raise PlanValidationError('native primary workspace identity is unavailable or ambiguous')
 
 
+def validate_runtime_v3_receipt(receipt, primary, kit_root):
+    """Closed metadata validation before importing or invoking publication code.
+
+    Kept identical in the inspector, bootstrap, adapter and operations readers.
+    This validates declarations only; it is not source admission or authority.
+    """
+    def check(ok):
+        if not ok:
+            raise ValueError("invalid v3 publication metadata")
+
+    def identity(value):
+        check(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", value))
+
+    def root(value):
+        check(isinstance(value, str) and "\x00" not in value
+              and Path(value).is_absolute() and str(Path(value)) == value
+              and ".." not in Path(value).parts and str(Path(value).resolve()) == value)
+
+    check(isinstance(receipt, dict) and set(receipt) == {
+        "schema", "policy", "project_id", "workflow_id", "source_commit", "kit_commit",
+        "runtime_roots", "files", "local_inputs", "project_memory",
+    })
+    check(receipt["schema"] == "delivery-runtime-publication-v3"
+          and receipt["policy"] == "delivery_reliability_project_content_v1")
+    identity(receipt["project_id"])
+    identity(receipt["workflow_id"])
+    for name in ("source_commit", "kit_commit"):
+        check(isinstance(receipt[name], str) and re.fullmatch(r"[0-9a-f]{40}", receipt[name]))
+    roots = receipt["runtime_roots"]
+    check(isinstance(roots, list) and 0 < len(roots) <= 256)
+    for value in roots:
+        root(value)
+    check(len(set(roots)) == len(roots) and str(primary) in roots and str(kit_root) in roots)
+    files, local_inputs = receipt["files"], receipt["local_inputs"]
+    check(isinstance(files, list) and isinstance(local_inputs, list)
+          and 0 < len(files) and len(files) + len(local_inputs) <= 512)
+    seen = set()
+    total = 0
+    for local, items in ((False, files), (True, local_inputs)):
+        for item in items:
+            check(isinstance(item, dict) and set(item) == {
+                "root", "relative_path", "sha256", "byte_size", "mode",
+            } | ({"kind"} if local else set()))
+            name, source_root = item["relative_path"], item["root"]
+            check(isinstance(source_root, str) and source_root in roots
+                  and isinstance(name, str) and name and not name.startswith("/")
+                  and "\\" not in name and "\x00" not in name
+                  and all(part not in ("", ".", "..") for part in name.split("/")))
+            check(not name.startswith((".kent/runtime/", ".kent/retained-evidence/", "build/")))
+            check(isinstance(item["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                  and type(item["byte_size"]) is int and 0 <= item["byte_size"] <= 8 * 1024 * 1024
+                  and type(item["mode"]) is int and 0 <= item["mode"] <= 0o777
+                  and not item["mode"] & 0o022)
+            check(not any(other_root == source_root and (
+                other == name or other.startswith(name + "/") or name.startswith(other + "/"))
+                for other_root, other in seen))
+            if local:
+                check(item["kind"] == "local-instruction" and source_root in {str(primary), str(kit_root)}
+                      and name.startswith(".kent/skills/") and name.endswith(".md")
+                      and not any(c in name for c in "*?[]") and not item["mode"] & 0o111)
+            seen.add((source_root, name))
+            total += item["byte_size"]
+            check(total <= 32 * 1024 * 1024)
+    memory = receipt["project_memory"]
+    check(isinstance(memory, dict) and set(memory) == {
+        "root", "project_key", "project_uid", "legacy_task_ids",
+    })
+    root(memory["root"])
+    identity(memory["project_key"])
+    identity(memory["project_uid"])
+    legacy = memory["legacy_task_ids"]
+    check(isinstance(legacy, list) and len(legacy) <= 256)
+    for value in legacy:
+        identity(value)
+    check(len(set(legacy)) == len(legacy))
+    return len(files) + len(local_inputs)
+
+
+def validate_source_v2_receipt(receipt, primary, kit_root):
+    """Validate source-only content declarations, without granting R2 identity."""
+    if (not isinstance(receipt, dict) or set(receipt) != {
+        "schema", "policy", "project_id", "workflow_id", "source_commit", "kit_commit",
+        "runtime_roots", "files", "local_inputs",
+    } or receipt["schema"] != "delivery-source-publication-v2"
+            or receipt["policy"] != "published_source_project_content_v1"):
+        raise ValueError("invalid source-only v2 publication metadata")
+    # Reuse the bounded structural checks only. No synthetic admission or native
+    # identity is constructed, returned or used to access project memory.
+    return validate_runtime_v3_receipt({
+        **receipt, "schema": "delivery-runtime-publication-v3",
+        "policy": "delivery_reliability_project_content_v1",
+        "project_memory": {"root": str(primary), "project_key": "metadata-only",
+                           "project_uid": "metadata-only", "legacy_task_ids": []},
+    }, primary, kit_root)
+
+
+def prepare_runtime_publication_v3(
+    *, output_path, predecessor_binding_ref, predecessor_receipt_ref,
+    project_id, receipt_workflow_id, primary_root, primary_workspace_id,
+    source_commit, source_ref, kit_root, kit_commit, kit_ref, ci_helper,
+    helper_bindings,
+):
+    """Prepare an unadmitted private candidate; never install or admit it.
+
+    The producer must execute from the exact qualified Kit it is publishing.
+    Predecessor identity is an explicit installed preimage, not a proposed rebind.
+    Helper declarations may precede alias installation; admission still resolves
+    every actual alias. No old checkout ancestry or old inspector is required.
+    """
+    project_id = _native_project_id(project_id, 'publication project_id')
+    receipt_workflow_id = _uuid(receipt_workflow_id, 'publication receipt owner')
+    primary_workspace_id = _string(primary_workspace_id, 'publication workspace identity')
+    primary = _source_canonical_root(str(primary_root), 'publication primary root')
+    kit = _source_canonical_root(str(kit_root), 'publication Kit root')
+    source_commit = _sha1(source_commit, 'publication source commit')
+    kit_commit = _sha1(kit_commit, 'publication Kit commit')
+    # Do not load a validator from an arbitrary candidate root.
+    if Path(__file__).resolve().parents[1] != kit:
+        raise PlanValidationError('producer must execute from the selected qualified Kit')
+    from .kit_runtime import KIT_RUNTIME_BINDING_SCHEMA, KitRuntimeBinding, _qualify_git_cohort, _git_blob
+    initial_heads = {root: _git(root, 'rev-parse', '--verify', 'HEAD').strip()
+                     for root in {primary, kit}}
+    _qualify_git_cohort(KitRuntimeBinding(
+        schema=KIT_RUNTIME_BINDING_SCHEMA, root=str(kit), commit=kit_commit,
+        publication_ref=kit_ref,
+    ))
+    _, inspector_raw, _ = _read_source_record(
+        kit / 'scripts/inspect-delivery-source', label='publication inspector',
+        maximum=SOURCE_FILE_BYTES_LIMIT, private=False,
+    )
+    if inspector_raw != _git_blob(kit, kit_commit, 'scripts/inspect-delivery-source')[0]:
+        raise PlanValidationError('producer inspector differs from its qualified Git source')
+    namespace = {'__name__': 'qualified_publication_inspector',
+                 '__file__': str(kit / 'scripts/inspect-delivery-source')}
+    bytecode_policy = sys.dont_write_bytecode
+    try:
+        exec(compile(inspector_raw, namespace['__file__'], 'exec'), namespace)
+    finally:
+        sys.dont_write_bytecode = bytecode_policy
+    # All following inventory/Git/mode checks use this exact Kit's implementation.
+    read, git_read = namespace['read_file'], namespace['git']
+    canonical, repository = namespace['canonical'], namespace['repository']
+    tree, predicate = namespace['tree'], namespace['infrastructure']
+    verify_copy = namespace['verify_copy']
+    require = namespace['require']
+    binding_path = Path.home() / '.kent/project-memory-bindings' / f'{project_id}.json'
+
+    def preimage(ref, expected_path=None):
+        require(isinstance(ref, dict) and set(ref) == {'path', 'sha256'}, 'invalid predecessor ref')
+        path = canonical(ref['path'])
+        require(expected_path is None or path == expected_path, 'predecessor path differs')
+        _sha256(ref['sha256'], 'predecessor digest')
+        raw = read(path, SOURCE_RECEIPT_BYTES_LIMIT, private=True)[0]
+        require(sha256_bytes(raw) == ref['sha256'], 'predecessor digest differs')
+        return path, raw, namespace['parse_json'](raw)
+
+    _, binding_raw, binding = preimage(predecessor_binding_ref, binding_path)
+    namespace['closed'](binding, {
+        'schema', 'project_id', 'primary_root', 'primary_workspace_id', 'profile_sha256',
+        'receipt_path', 'receipt_sha256', 'kit_root', 'source_ref', 'kit_ref',
+        'ci_helper', 'helper_bindings',
+    })
+    require(binding['schema'] == SOURCE_BINDING_SCHEMA
+            and binding['project_id'] == project_id and binding['primary_root'] == str(primary)
+            and binding['primary_workspace_id'] == primary_workspace_id,
+            'predecessor installation identity differs')
+    _sha256(binding['profile_sha256'], 'predecessor profile digest')
+    canonical(binding['kit_root'])
+    require(predecessor_receipt_ref == {
+        'path': binding['receipt_path'], 'sha256': binding['receipt_sha256'],
+    }, 'predecessor receipt differs from installed binding')
+    _, receipt_raw, prior = preimage(predecessor_receipt_ref)
+    prior_schema = prior.get('schema') if isinstance(prior, dict) else None
+    require(prior_schema in ('delivery-runtime-publication-v1', 'delivery-runtime-publication-v2',
+                             'delivery-runtime-publication-v3'), 'unsupported predecessor receipt')
+    namespace['closed'](prior, {
+        'schema', 'policy', 'project_id', 'workflow_id', 'source_commit', 'kit_commit',
+        'runtime_roots', 'files', 'project_memory',
+    } | ({'local_inputs'} if prior_schema != 'delivery-runtime-publication-v1' else set()))
+    require(prior['policy'] == ('delivery_reliability_project_content_v1'
+            if prior_schema == 'delivery-runtime-publication-v3' else 'delivery_reliability_v1'),
+            'predecessor policy differs')
+    require(prior['project_id'] == project_id and prior['workflow_id'] == receipt_workflow_id,
+            'predecessor receipt owner differs')
+    normalized_prior = {**prior, 'schema': 'delivery-runtime-publication-v3',
+                        'policy': 'delivery_reliability_project_content_v1',
+                        'local_inputs': prior.get('local_inputs', [])}
+    validate_runtime_v3_receipt(normalized_prior, primary, binding['kit_root'])
+    primary, project_common = repository(primary)
+    kit, kit_common = repository(kit)
+    # Prior profile must be bound simultaneously by binding, receipt and Git.
+    old_tree = tree(primary, prior['source_commit'])
+    old_profile = old_tree.get('.kent/workflow-profile.toml')
+    require(old_profile is not None and old_profile[:2] == ('100644', 'blob'),
+            'predecessor profile is not a published regular blob')
+    old_raw = git_read(primary, 'cat-file', 'blob', old_profile[2])
+    old_entries = [item for item in prior['files'] if item['root'] == str(primary)
+                   and item['relative_path'] == '.kent/workflow-profile.toml']
+    require(len(old_entries) == 1 and sha256_bytes(old_raw) == binding['profile_sha256']
+            and sha256_bytes(old_raw) == old_entries[0]['sha256']
+            and len(old_raw) == old_entries[0]['byte_size']
+            and not old_entries[0]['mode'] & 0o100, 'predecessor profile binding differs')
+    old_config = tomllib.loads(old_raw.decode('utf-8')).get('project_memory')
+    memory = prior['project_memory']
+    expected_memory = {name: memory[name] for name in ('root', 'project_key', 'project_uid')}
+    require(old_config == {**expected_memory, 'mode': 'r2'}, 'predecessor memory identity differs')
+    require(isinstance(helper_bindings, list) and len(helper_bindings) <= 64,
+            'invalid candidate helper bindings')
+
+    def helper_declarations(rows):
+        seen = set()
+        targets = []
+        for row in rows:
+            namespace['closed'](row, ('link', 'target'))
+            # Links may not resolve to the proposed target yet.
+            link = Path(row['link']) if isinstance(row['link'], str) else Path('.')
+            require(link.is_absolute() and str(link) == row['link'] and '..' not in link.parts,
+                    'invalid candidate helper link')
+            canonical(link.parent)
+            require(str(link) not in seen, 'duplicate candidate helper link')
+            seen.add(str(link))
+            targets.append(canonical(row['target']))
+        return seen, targets
+
+    # Also close the predecessor declaration; it is not an alias authorization.
+    require(isinstance(binding['helper_bindings'], list) and len(binding['helper_bindings']) <= 64,
+            'invalid predecessor helper declarations')
+    prior_links, _ = helper_declarations(binding['helper_bindings'])
+    require(binding['ci_helper'] not in prior_links, 'duplicate predecessor CI helper')
+    namespace['key'](primary_workspace_id)
+    for ref in (binding['source_ref'], binding['kit_ref']):
+        require(isinstance(ref, str) and ref.startswith(('refs/remotes/', 'refs/tags/'))
+                and not ref.endswith('/HEAD'), 'invalid predecessor publication ref')
+        git_read(primary, 'check-ref-format', ref)
+    links, targets = helper_declarations(helper_bindings)
+    # Validate the closed mandatory declaration without dereferencing it.
+    ci_links, _ = helper_declarations([{'link': ci_helper,
+                                      'target': str(kit / 'scripts/prepare-github-ci')}])
+    require(not links & ci_links, 'duplicate candidate CI helper')
+    targets.append(kit / 'scripts/prepare-github-ci')
+    products, executable_roles = namespace['content_roles'](
+        primary, primary, primary, kit, source_commit, kit_commit, targets,
+    )
+    roots = {root: (source_commit, project_common == kit_common) for root in products}
+    for root, (common, commit) in executable_roles.items():
+        roots[root] = (commit, common == kit_common)
+    executable_roots = set(executable_roles)
+    heads = {root: git_read(root, 'rev-parse', '--verify', 'HEAD').decode().strip() for root in roots}
+    tips = (namespace['publication'](primary, source_commit, source_ref, content=True),
+            namespace['publication'](kit, kit_commit, kit_ref, content=True))
+    result = {
+        'schema': 'delivery-runtime-publication-v3',
+        'policy': 'delivery_reliability_project_content_v1',
+        'project_id': project_id, 'workflow_id': receipt_workflow_id,
+        'source_commit': source_commit, 'kit_commit': kit_commit,
+        'runtime_roots': sorted(str(root) for root in roots), 'files': [],
+        'project_memory': memory, 'local_inputs': prior.get('local_inputs', []),
+    }
+    require(all(heads[root] == head for root, head in initial_heads.items()),
+            'candidate source HEAD changed')
+    local_identities = {Path(item['root']) / item['relative_path']:
+                        namespace['local_identity'](Path(item['root']) / item['relative_path'])
+                        for item in result['local_inputs']}
+    projections = []
+    source_bytes = 0
+    for root, (commit, is_kit) in sorted(roots.items()):
+        source_tree = tree(root, commit)
+        expected = {}
+        for name, (mode, kind, oid) in sorted(source_tree.items()):
+            if not predicate(name, is_kit):
+                continue
+            require(mode in ('100644', '100755') and kind == 'blob', 'nonregular published source')
+            require(len(result['files']) + len(result['local_inputs']) < SOURCE_RECEIPT_FILE_LIMIT,
+                    'candidate source file limit exceeded')
+            blob = git_read(root, 'cat-file', 'blob', oid, maximum=SOURCE_FILE_BYTES_LIMIT)
+            source_bytes += len(blob)
+            require(source_bytes <= SOURCE_TOTAL_BYTES_LIMIT, 'candidate source byte limit exceeded')
+            current, actual_mode = read(root / name)
+            require(current == blob and bool(actual_mode & 0o100) == (mode == '100755'),
+                    'candidate filesystem differs from published source')
+            item = {'root': str(root), 'relative_path': name, 'sha256': sha256_bytes(blob),
+                    'byte_size': len(blob), 'mode': actual_mode}
+            expected[name] = item
+            result['files'].append(item)
+        required = namespace['KIT_REQUIRED'] if is_kit else {
+            'AGENTS.md', '.kent/workflow-profile.toml', '.kent/project-contract.md',
+        }
+        require(required <= set(expected), 'candidate publication closure incomplete')
+        projections.append((root, expected, source_tree, is_kit))
+    validate_runtime_v3_receipt(result, primary, kit)
+    if project_common == kit_common:
+        require({name: item for name, item in tree(primary, source_commit).items() if predicate(name, True)}
+                == {name: item for name, item in tree(kit, kit_commit).items() if predicate(name, True)},
+                'shared project/Kit infrastructure publication differs')
+    new_profile_raw = read(primary / '.kent/workflow-profile.toml')[0]
+    new_profile = tomllib.loads(new_profile_raw.decode('utf-8'))
+    require(new_profile.get('project_memory') == {**expected_memory, 'mode': 'r2'}
+            and new_profile.get('policies', {}).get('delivery_reliability') == 'v1',
+            'candidate memory or policy identity differs')
+    primary_names = next(expected for root, expected, _, _ in projections if root == primary)
+    for command in new_profile.get('commands', {}).values():
+        require(isinstance(command, str) and (not command or command in primary_names),
+                'candidate profile helper outside source closure')
+    qualified_targets = {str(Path(item['root']) / item['relative_path']): item for item in result['files']}
+    require(all(str(target) in qualified_targets and qualified_targets[str(target)]['mode'] & 0o100
+                for target in targets), 'candidate helper not qualified executable')
+
+    def freshness():
+        require(read(binding_path, SOURCE_RECEIPT_BYTES_LIMIT, private=True)[0] == binding_raw
+                and read(predecessor_receipt_ref['path'], SOURCE_RECEIPT_BYTES_LIMIT,
+                         private=True)[0] == receipt_raw, 'predecessor changed during preparation')
+        for root, expected, source_tree, is_kit in projections:
+            locals_here = {item['relative_path']: item for item in result['local_inputs']
+                           if item['root'] == str(root)}
+            verify_copy(root, expected, source_tree, kit=is_kit, local_inputs=locals_here)
+            for name, item in expected.items():
+                require(read(root / name)[1] == item['mode'], 'candidate source mode changed')
+            if root in executable_roots:
+                require(heads[root] == roots[root][0], 'candidate executable HEAD differs')
+            require(not git_read(root, 'status', '--porcelain=v1', '-z', '--untracked-files=all',
+                                 '--ignore-submodules=none'), 'candidate source is dirty')
+        require(all(namespace['local_identity'](path) == identity for path, identity in local_identities.items()),
+                'local instruction identity changed')
+        require((namespace['publication'](primary, source_commit, source_ref, content=True),
+                 namespace['publication'](kit, kit_commit, kit_ref, content=True)) == tips,
+                'candidate publication ref changed')
+        require(all(git_read(root, 'rev-parse', '--verify', 'HEAD').decode().strip() == head
+                    for root, head in heads.items()), 'candidate source HEAD changed')
+
+    freshness()
+    raw = json.dumps(result, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+    require(len(raw) <= SOURCE_RECEIPT_BYTES_LIMIT, 'candidate receipt exceeds limit')
+    output = canonical(output_path)
+    # Existing private owner directory only; no provisioning and no overwrite.
+    parent = output.parent
+    info = parent.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o700, 'candidate directory must be private 0700')
+    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(directory)
+        require((opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino), 'candidate directory changed')
+        descriptor = os.open(output.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+        try:
+            with os.fdopen(descriptor, 'wb', closefd=False) as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(directory)
+        require(read(output, SOURCE_RECEIPT_BYTES_LIMIT, private=True) == (raw, 0o600),
+                'candidate readback differs')
+        freshness()
+    finally:
+        os.close(directory)
+    return {'path': str(output), 'sha256': sha256_bytes(raw), 'byte_size': len(raw)}
+
+
+def _publication_reference(ref, label, *, canonical_json=False):
+    if not isinstance(ref, dict) or set(ref) != {'path', 'sha256'}:
+        raise PlanValidationError(f'{label} reference fields are not closed')
+    _sha256(ref['sha256'], f'{label} digest')
+    path, raw, _ = _read_source_record(
+        ref['path'], label=label, maximum=SOURCE_RECEIPT_BYTES_LIMIT, private=True,
+    )
+    if sha256_bytes(raw) != ref['sha256']:
+        raise PlanValidationError(f'{label} digest differs')
+    value = _source_json(raw, label)
+    if canonical_json and canonical_bytes(value) != raw:
+        raise PlanValidationError(f'{label} is not canonical JSON')
+    return path, raw, value
+
+
+def _source_publication_capture(ref):
+    """Read an integrity-bound owned snapshot, not authenticated native evidence."""
+    _, raw, capture = _publication_reference(ref, 'predecessor capture', canonical_json=True)
+    fields = {'workflow_id', 'project_id', 'version', 'metadata', 'graph', 'links', 'default', 'valid'}
+    if set(capture) != fields or capture['valid'] is not True:
+        raise PlanValidationError('predecessor capture fields/validation differ')
+    _uuid(capture['workflow_id'], 'capture workflow_id')
+    _native_project_id(capture['project_id'], 'capture project_id')
+    version = capture['version']
+    if type(version) is not int or version < 0:
+        raise PlanValidationError('predecessor capture version is invalid')
+    metadata = capture['metadata']
+    if not isinstance(metadata, dict) or set(metadata) != {'name', 'description', 'execution_target'}:
+        raise PlanValidationError('predecessor capture metadata is not closed')
+    _string(metadata['name'], 'capture name')
+    _string(metadata['description'], 'capture description', nonempty=False)
+    try:
+        validate_execution_target(metadata['execution_target'])
+    except (ValueError, TypeError) as error:
+        raise PlanValidationError('predecessor capture execution target is invalid') from error
+    graph = capture['graph']
+    if (not isinstance(graph, dict) or set(graph) != {
+        'version', 'nodes', 'edges', 'node_groups', 'transition_groups',
+    } or type(graph['version']) is not int or graph['version'] != version):
+        raise PlanValidationError('predecessor capture graph/version is not closed')
+    rows = {name: _v2_graph_rows(graph, name, 'predecessor capture')
+            for name in ('nodes', 'edges', 'node_groups', 'transition_groups')}
+    from .graph import native_graph_projection
+    try:
+        native_graph_projection(graph, workflow_id=capture['workflow_id'])
+    except SpecError as error:
+        raise PlanValidationError('predecessor capture graph rows are invalid') from error
+    nodes, groups = rows['nodes'], rows['transition_groups']
+    for group in groups.values():
+        if group.get('source_node_id') not in nodes:
+            raise PlanValidationError('predecessor capture group source is absent')
+    for edge in rows['edges'].values():
+        if edge.get('target_node_id') not in nodes or edge.get('transition_group_id') not in groups:
+            raise PlanValidationError('predecessor capture edge reference is absent')
+    for name in ('nodes', 'edges'):
+        keys = [_string(row.get('key'), f'capture {name} key') for row in rows[name].values()]
+        _unique(keys, f'capture {name} keys')
+    links = capture['links']
+    if not isinstance(links, list) or len(links) != 1:
+        raise PlanValidationError('predecessor capture must own exactly one project link')
+    link = links[0]
+    if (not isinstance(link, dict) or set(link) != {'project_id', 'workflow_id', 'is_default'}
+            or link['project_id'] != capture['project_id'] or link['workflow_id'] != capture['workflow_id']
+            or type(link['is_default']) is not bool
+            or capture['default'] != (capture['workflow_id'] if link['is_default'] else None)):
+        raise PlanValidationError('predecessor capture link/default differs')
+    ingress = _source_publication_carrier(capture['graph'], capture['project_id'], capture['workflow_id'])
+    return capture, ingress, raw
+
+
+def _source_publication_carrier(graph, project_id, workflow_id):
+    from .kit_runtime import _read_source_ingress_graph, KitRuntimeError
+    try:
+        result = _read_source_ingress_graph(
+            {'graph': graph}, project_id=project_id, workflow_id=workflow_id,
+        )
+    except (ValueError, KitRuntimeError) as error:
+        raise PlanValidationError('source publication carrier is invalid') from error
+    admission = _v2_source_admission(result['admission'], 'source publication admission')
+    if admission != result['admission']:
+        raise PlanValidationError('source publication admission is not canonical')
+    from .delivery import source_admission_gate
+    if result['carrier']['kind'] == 'agent-edge' and result['carrier']['prefix'] != source_admission_gate(
+        admission, project_id=project_id, workflow_id=workflow_id, project_root=admission['primary_root'],
+    ):
+        raise PlanValidationError('source publication Agent prefix is not canonical')
+    return result
+
+
+def _qualified_publication_inspector(kit, commit, ref):
+    # The API executes only from its selected exact-pinned producer Kit. Never
+    # import arbitrary candidate checkout code or rely on an old inspector.
+    if Path(__file__).resolve().parents[1] != kit:
+        raise PlanValidationError('producer must execute from the selected qualified Kit')
+    from .kit_runtime import KIT_RUNTIME_BINDING_SCHEMA, KitRuntimeBinding, _qualify_git_cohort, _git_blob
+    _qualify_git_cohort(KitRuntimeBinding(KIT_RUNTIME_BINDING_SCHEMA, str(kit), commit, ref))
+    _, raw, _ = _read_source_record(kit / 'scripts/inspect-delivery-source',
+                                   label='qualified publication inspector',
+                                   maximum=SOURCE_FILE_BYTES_LIMIT, private=False)
+    if raw != _git_blob(kit, commit, 'scripts/inspect-delivery-source')[0]:
+        raise PlanValidationError('producer inspector differs from its qualified Git source')
+    namespace = {'__name__': 'qualified_publication_inspector',
+                 '__file__': str(kit / 'scripts/inspect-delivery-source')}
+    bytecode_policy = sys.dont_write_bytecode
+    try:
+        exec(compile(raw, namespace['__file__'], 'exec'), namespace)
+    finally:
+        sys.dont_write_bytecode = bytecode_policy
+    return namespace
+
+
+def _exclusive_publication_output(output_path, raw, inspector):
+    output = inspector['canonical'](output_path)
+    require = inspector['require']
+    require(len(raw) <= SOURCE_RECEIPT_BYTES_LIMIT, 'publication output exceeds limit')
+    parent = output.parent
+    info = parent.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o700, 'publication directory must be owned private 0700')
+    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(directory)
+        require((opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino), 'publication directory changed')
+        descriptor = os.open(output.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+        try:
+            with os.fdopen(descriptor, 'wb', closefd=False) as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(directory)
+        require(inspector['read_file'](output, SOURCE_RECEIPT_BYTES_LIMIT, private=True) == (raw, 0o600),
+                'publication output readback differs')
+    finally:
+        os.close(directory)
+    return {'path': str(output), 'sha256': sha256_bytes(raw), 'byte_size': len(raw)}
+
+
+def _source_publication_extras(receipt, kit_root):
+    """Recover root-qualified coverage from declarations, never the old Git tree."""
+    # Kit surfaces are a superset of project surfaces. The exact Kit root is
+    # known from the old frame. Retained other roots are classified using the
+    # current trusted role only when the repository is still available.
+    def kit_role(root):
+        if root == kit_root:
+            return True
+        try:
+            return _git(Path(root), 'rev-parse', '--path-format=absolute', '--git-common-dir').strip() == _git(
+                Path(kit_root), 'rev-parse', '--path-format=absolute', '--git-common-dir',
+            ).strip()
+        except OperationError:
+            return False
+    # Pure executing-module predicate: never reload executable checkout bytes
+    # while classifying declarations, including at the canonical provenance gate.
+    def infrastructure(name, kit):
+        if '__pycache__' in Path(name).parts:
+            return False
+        return (name in {'AGENTS.md', '.gitignore', '.kent/workflow-profile.toml',
+                         '.kent/project-contract.md'}
+                or name.startswith(('.kent/scripts/', '.kent/commands/', '.kent/context/',
+                                    '.kent/skills/', '.kent/workflows/'))
+                or (kit and name.startswith(('scripts/', 'workflowkit/', 'templates/', 'agents/',
+                                             'global/', 'prompts/', 'skills/', 'adapters/', 'contracts/'))))
+    roles = {root: kit_role(root) for root in receipt['runtime_roots']}
+    return {(item['root'], item['relative_path']): item for item in receipt['files']
+            if not infrastructure(item['relative_path'], roles[item['root']])}
+
+
+def _source_publication_coverage(prior, candidate, old_kit_root, new_kit_root, additions):
+    """Check monotonic root-qualified extras and immutable retained permissions."""
+    if not isinstance(additions, list) or len(additions) > SOURCE_RECEIPT_FILE_LIMIT:
+        raise PlanValidationError('additional published paths exceed bound')
+    added = set()
+    for row in additions:
+        if not isinstance(row, dict) or set(row) != {'root', 'relative_path'}:
+            raise PlanValidationError('additional published path is not closed')
+        root = str(_source_canonical_path(row['root'], 'additional source root'))
+        name = row['relative_path']
+        if (not isinstance(name, str) or not name or name.startswith('/') or '\\' in name or '\x00' in name
+                or any(part in ('', '.', '..') for part in name.split('/'))):
+            raise PlanValidationError('additional published path is invalid')
+        identity = (root, name)
+        if identity in added:
+            raise PlanValidationError('duplicate additional published path')
+        added.add(identity)
+    old_extras = _source_publication_extras(prior, old_kit_root)
+    new_extras = _source_publication_extras(candidate, new_kit_root)
+    if added & set(old_extras) or set(new_extras) != set(old_extras) | added:
+        raise PlanValidationError('source publication extra coverage is not monotonic')
+    previous = {(item['root'], item['relative_path']): item for item in prior['files']}
+    for item in candidate['files']:
+        identity = (item['root'], item['relative_path'])
+        if identity in previous and previous[identity]['mode'] != item['mode']:
+            raise PlanValidationError('retained publication mode changed')
+    if candidate['local_inputs'] != prior['local_inputs']:
+        raise PlanValidationError('source publication local instructions changed')
+    return added
+
+
+def prepare_source_publication_v2(
+    *, output_path, provenance_output_path, predecessor_capture_ref, predecessor_receipt_ref,
+    project_id, workflow_id, primary_workspace_id, project_root, primary_root,
+    source_commit, source_ref, kit_root, kit_commit, kit_ref, ci_helper,
+    helper_bindings, additional_published_paths,
+):
+    """Prepare two unadmitted candidates from an integrity-bound predecessor.
+
+    No native calls, R2 effects, graph/frame creation or old admission occurs.
+    A self-consistent capture is not native authentication: the later typed
+    canonical gate must compare it to the actual immutable plan preimage.
+    """
+    project_id = _native_project_id(project_id, 'publication project_id')
+    workflow_id = _uuid(workflow_id, 'publication workflow_id')
+    primary = _source_canonical_root(str(primary_root), 'publication primary root')
+    project = _source_canonical_root(str(project_root), 'publication project root')
+    kit = _source_canonical_root(str(kit_root), 'publication Kit root')
+    source_commit = _sha1(source_commit, 'publication source commit')
+    kit_commit = _sha1(kit_commit, 'publication Kit commit')
+    initial_heads = {root: _git(root, 'rev-parse', '--verify', 'HEAD').strip() for root in {primary, project, kit}}
+    inspector = _qualified_publication_inspector(kit, kit_commit, kit_ref)
+    require = inspector['require']
+    capture, ingress, capture_raw = _source_publication_capture(predecessor_capture_ref)
+    prior_frame = ingress['admission']
+    require(capture['project_id'] == project_id and capture['workflow_id'] == workflow_id
+            and prior_frame['binding'] == {'kind': 'plan-publication'}
+            and prior_frame['primary_root'] == str(primary)
+            and prior_frame['primary_workspace_id'] == primary_workspace_id,
+            'predecessor capture/frame identity differs')
+    require(prior_frame['receipt_ref'] == predecessor_receipt_ref,
+            'predecessor frame receipt differs')
+    _, receipt_raw, prior = _publication_reference(predecessor_receipt_ref, 'predecessor source receipt')
+    schema = prior.get('schema')
+    require(schema in ('delivery-source-publication-v1', 'delivery-source-publication-v2'),
+            'unsupported source predecessor receipt')
+    require(prior.get('policy') == ('published_source_v1' if schema.endswith('v1')
+                                  else 'published_source_project_content_v1'),
+            'source predecessor policy differs')
+    validate_source_v2_receipt({**prior, 'schema': 'delivery-source-publication-v2',
+                               'policy': 'published_source_project_content_v1'},
+                              primary, prior_frame['kit_root'])
+    require(set(prior) == {'schema', 'policy', 'project_id', 'workflow_id', 'source_commit',
+                          'kit_commit', 'runtime_roots', 'files', 'local_inputs'},
+            'source predecessor fields are not closed')
+    require(prior['project_id'] == project_id and prior['workflow_id'] == workflow_id,
+            'source predecessor owner differs')
+    # Use the same closed admission declaration parser, without inventing a new
+    # frame or invoking its native/storage effects. Proposed aliases need not
+    # resolve yet, but every declared target is inventoried below.
+    declaration = _v2_source_admission({
+        **prior_frame, 'kit_root': str(kit), 'source_ref': source_ref, 'kit_ref': kit_ref,
+        'ci_helper': ci_helper, 'helper_bindings': helper_bindings,
+    }, 'candidate source declarations')
+    targets = [Path(row['target']) for row in declaration['helper_bindings']]
+    targets.append(kit / 'scripts/prepare-github-ci')
+    require(ci_helper not in {row['link'] for row in declaration['helper_bindings']},
+            'duplicate candidate CI helper')
+    products, executables = inspector['content_roles'](
+        project, primary, project, kit, source_commit, kit_commit, targets,
+    )
+    roots = products | set(executables)
+    heads = {root: inspector['git'](root, 'rev-parse', '--verify', 'HEAD').decode().strip() for root in roots}
+    require(all(heads[root] == head for root, head in initial_heads.items()), 'publication HEAD changed')
+    tips = (inspector['publication'](project, source_commit, source_ref, content=True),
+            inspector['publication'](kit, kit_commit, kit_ref, content=True))
+    kit_common = inspector['repository'](kit)[1]
+    old_extras = _source_publication_extras(prior, prior_frame['kit_root'])
+    additions = []
+    require(isinstance(additional_published_paths, list)
+            and len(additional_published_paths) <= SOURCE_RECEIPT_FILE_LIMIT, 'invalid additional source inventory')
+    for row in additional_published_paths:
+        inspector['closed'](row, ('root', 'relative_path'))
+        root, name = inspector['canonical'](row['root']), inspector['relative'](row['relative_path'])
+        require(root in roots, 'additional source root has no trusted role')
+        additions.append({'root': str(root), 'relative_path': name})
+    extras = set(old_extras) | {(row['root'], row['relative_path']) for row in additions}
+    require(all(Path(root) in roots for root, _ in extras), 'retained extra root cannot be remapped')
+    result = {'schema': 'delivery-source-publication-v2', 'policy': 'published_source_project_content_v1',
+              'project_id': project_id, 'workflow_id': workflow_id, 'source_commit': source_commit,
+              'kit_commit': kit_commit, 'runtime_roots': sorted(str(root) for root in roots),
+              'files': [], 'local_inputs': prior['local_inputs']}
+    local_identities = {Path(item['root']) / item['relative_path']:
+                        inspector['local_identity'](Path(item['root']) / item['relative_path'])
+                        for item in result['local_inputs']}
+    projections = []
+    total = 0
+    for root in sorted(roots):
+        is_kit = inspector['repository'](root)[1] == kit_common
+        commit = executables[root][1] if root in executables else source_commit
+        source_tree = inspector['tree'](root, commit)
+        required = {name for name in source_tree if inspector['infrastructure'](name, is_kit)}
+        required |= {name for value, name in extras if value == str(root)}
+        minimal = inspector['KIT_REQUIRED'] if is_kit else {
+            'AGENTS.md', '.kent/workflow-profile.toml', '.kent/project-contract.md',
+        }
+        require(minimal <= required, 'source publication closure incomplete')
+        expected = {}
+        for name in sorted(required):
+            require(name in source_tree, 'source publication extra is not published')
+            mode, kind, oid = source_tree[name]
+            require(kind == 'blob' and mode in ('100644', '100755'), 'source publication is not a regular blob')
+            require(len(result['files']) + len(result['local_inputs']) < SOURCE_RECEIPT_FILE_LIMIT,
+                    'source publication file limit exceeded')
+            blob = inspector['git'](root, 'cat-file', 'blob', oid, maximum=SOURCE_FILE_BYTES_LIMIT)
+            current, actual_mode = inspector['read_file'](root / name)
+            require(current == blob and bool(actual_mode & 0o100) == (mode == '100755'),
+                    'source publication filesystem differs')
+            total += len(blob)
+            require(total <= SOURCE_TOTAL_BYTES_LIMIT, 'source publication byte limit exceeded')
+            item = {'root': str(root), 'relative_path': name, 'sha256': sha256_bytes(blob),
+                    'byte_size': len(blob), 'mode': actual_mode}
+            expected[name] = item
+            result['files'].append(item)
+        projections.append((root, expected, source_tree, is_kit))
+    validate_source_v2_receipt(result, primary, kit)
+    _source_publication_coverage(prior, result, prior_frame['kit_root'], str(kit), additions)
+    # Product extras are declared root-locally, but admission projects their
+    # union onto every product copy. Keep the receipt declarations unchanged.
+    product_extras = {
+        name for value, name in extras if Path(value) in products
+    }
+    projected_extras = {
+        item['relative_path']: item for item in result['files']
+        if Path(item['root']) in products and item['relative_path'] in product_extras
+    }
+    for root, expected, _, _ in projections:
+        if root in products:
+            for name, item in projected_extras.items():
+                expected.setdefault(name, item)
+    # Preserve source/Kit projection equivalence for self-development.
+    if inspector['repository'](project)[1] == kit_common:
+        require({name: item for name, item in inspector['tree'](project, source_commit).items()
+                 if inspector['infrastructure'](name, True)}
+                == {name: item for name, item in inspector['tree'](kit, kit_commit).items()
+                    if inspector['infrastructure'](name, True)}, 'shared source/Kit publication differs')
+    qualified_targets = {str(Path(item['root']) / item['relative_path']): item for item in result['files']}
+    require(all(str(target) in qualified_targets and qualified_targets[str(target)]['mode'] & 0o100
+                for target in targets), 'source helper target is not a qualified executable')
+    profile = tomllib.loads(inspector['read_file'](primary / '.kent/workflow-profile.toml')[0].decode('utf-8'))
+    primary_names = next(expected for root, expected, _, _ in projections if root == primary)
+    require(all(isinstance(command, str) and (not command or command in primary_names)
+                for command in profile.get('commands', {}).values()), 'profile helper outside source closure')
+
+    def freshness():
+        require(_publication_reference(predecessor_capture_ref, 'predecessor capture')[1] == capture_raw
+                and _publication_reference(predecessor_receipt_ref, 'predecessor source receipt')[1] == receipt_raw,
+                'source publication predecessor changed')
+        for root, expected, source_tree, is_kit in projections:
+            local = {item['relative_path']: item for item in result['local_inputs'] if item['root'] == str(root)}
+            inspector['verify_copy'](root, expected, source_tree, kit=is_kit, local_inputs=local)
+            for name, item in expected.items():
+                if item['root'] == str(root):
+                    require(inspector['read_file'](root / name)[1] == item['mode'], 'source publication mode changed')
+            if root == primary or root in executables:
+                require(not inspector['git'](root, 'status', '--porcelain=v1', '-z', '--untracked-files=all',
+                                             '--ignore-submodules=none'), 'source publication root is dirty')
+            if root in executables:
+                require(heads[root] == executables[root][1], 'source executable root HEAD differs')
+        require(all(inspector['local_identity'](path) == identity for path, identity in local_identities.items()),
+                'local instruction identity changed')
+        require((inspector['publication'](project, source_commit, source_ref, content=True),
+                 inspector['publication'](kit, kit_commit, kit_ref, content=True)) == tips,
+                'source publication ref changed')
+        require(all(inspector['git'](root, 'rev-parse', '--verify', 'HEAD').decode().strip() == head
+                    for root, head in heads.items()), 'source publication HEAD changed')
+
+    freshness()
+    output, provenance_output = inspector['canonical'](output_path), inspector['canonical'](provenance_output_path)
+    require(output != provenance_output and not os.path.lexists(output) and not os.path.lexists(provenance_output),
+            'source publication output already exists or overlaps')
+    receipt_ref = _exclusive_publication_output(output, canonical_bytes(result), inspector)
+    try:
+        packet = {'schema': 'delivery-source-publication-provenance-v1',
+                  'predecessor_capture_ref': predecessor_capture_ref,
+                  'predecessor_receipt_ref': predecessor_receipt_ref,
+                  'candidate_receipt_ref': {key: receipt_ref[key] for key in ('path', 'sha256')},
+                  'additional_published_paths': additions}
+        provenance_ref = _exclusive_publication_output(provenance_output, canonical_bytes(packet), inspector)
+        freshness()
+    except Exception as error:
+        raise EffectBlocked('source publication failed; partial private candidates remain unadmitted') from error
+    return {'receipt_ref': receipt_ref, 'provenance_ref': provenance_ref}
+
+
 def _source_binding(
     value: Mapping[str, Any],
     *,
@@ -1891,14 +2636,20 @@ def _source_binding(
         if sha256_bytes(receipt_raw) != value['receipt_ref']['sha256']:
             raise PlanValidationError('source publication receipt digest differs')
         receipt = _source_json(receipt_raw, 'source publication receipt')
+        source_v2 = receipt.get('schema') == 'delivery-source-publication-v2'
+        if source_v2:
+            try:
+                validate_source_v2_receipt(receipt, primary_root, kit_root)
+            except ValueError as error:
+                raise PlanValidationError('invalid source-only v2 publication metadata') from error
         receipt = _closed(receipt, {
             'schema', 'project_id', 'workflow_id', 'source_commit', 'kit_commit',
             'runtime_roots', 'files', 'policy', 'local_inputs',
         }, 'source publication receipt')
         if (
-            receipt.get('schema') != SOURCE_ONLY_RECEIPT_SCHEMA
+            receipt.get('schema') not in (SOURCE_ONLY_RECEIPT_SCHEMA, 'delivery-source-publication-v2')
             or receipt.get('project_id') != project_id
-            or receipt.get('policy') != 'published_source_v1'
+            or receipt.get('policy') != ('published_source_project_content_v1' if source_v2 else 'published_source_v1')
         ):
             raise PlanValidationError('source publication receipt identity differs')
         bootstrap_workflow_id = _uuid(
@@ -2077,15 +2828,25 @@ def _source_binding(
     if sha256_bytes(receipt_raw) != value['receipt_ref']['sha256']:
         raise PlanValidationError('source publication receipt digest differs')
     receipt = _source_json(receipt_raw, 'source publication receipt')
-    v2 = receipt.get('schema') == 'delivery-runtime-publication-v2'
+    v3 = receipt.get('schema') == 'delivery-runtime-publication-v3'
+    if v3:
+        try:
+            validate_runtime_v3_receipt(receipt, primary_root, kit_root)
+        except ValueError as error:
+            raise PlanValidationError('invalid v3 publication metadata') from error
+    v2 = receipt.get('schema') in ('delivery-runtime-publication-v2', 'delivery-runtime-publication-v3')
     receipt = _closed(receipt, {
         'schema', 'project_id', 'workflow_id', 'source_commit', 'kit_commit',
         'runtime_roots', 'files', 'policy', 'project_memory',
     } | ({'local_inputs'} if v2 else set()), 'source publication receipt')
     if (
-        receipt.get('schema') not in (SOURCE_RECEIPT_SCHEMA, 'delivery-runtime-publication-v2')
+        receipt.get('schema') not in (
+            SOURCE_RECEIPT_SCHEMA, 'delivery-runtime-publication-v2', 'delivery-runtime-publication-v3',
+        )
         or receipt.get('project_id') != project_id
-        or receipt.get('policy') != 'delivery_reliability_v1'
+        or receipt.get('policy') != (
+            'delivery_reliability_project_content_v1' if v3 else 'delivery_reliability_v1'
+        )
     ):
         raise PlanValidationError('source publication receipt identity differs')
     bootstrap_workflow_id = _uuid(receipt.get('workflow_id'), 'source receipt workflow_id')
@@ -3873,6 +4634,24 @@ def _native_approval_payload(
             )
             and all(edge[key] is None for key in extra_edge_keys)
         )
+        expected_context = None
+        if edge.get('context_mode') == 'new_session':
+            if target.get('node_kind') == 'agent':
+                expected_context = {
+                    'active_source': {'kind': 'deferred_self'},
+                    'target_session': {'kind': 'create'},
+                }
+        elif edge.get('context_mode') in {'continue_session', 'compact_and_continue_session'}:
+            expected_context = {
+                'active_source': {
+                    'kind': 'exact',
+                    'session_id': approval.get('source_session_id'),
+                },
+                'target_session': {
+                    'kind': 'reuse',
+                    'session_id': approval.get('source_session_id'),
+                },
+            }
         if (
             branch.get('transition_branch_key') != transition.get('transition_id')
             or len(graph_edges) != 1
@@ -3883,15 +4662,7 @@ def _native_approval_payload(
             or target.get('node_id') != edge.get('target_node_id')
             or len(graph_nodes) != 1
             or target.get('node_kind') != graph_nodes[0].get('kind')
-            or set(context) != {'active_source', 'target_session'}
-            or context.get('active_source') != {
-                'kind': 'exact',
-                'session_id': approval.get('source_session_id'),
-            }
-            or context.get('target_session') != {
-                'kind': 'reuse',
-                'session_id': approval.get('source_session_id'),
-            }
+            or context != expected_context
         ):
             raise EffectBlocked('native pending Approval branch differs from the reviewed Workflow context')
         if affected_decisions is not None:
@@ -5421,6 +6192,103 @@ def _v2_required_review_paths(
     return paths
 
 
+def _source_publication_provenance(item, source, target_graph):
+    """Bind new content-policy introduction to the immutable owned preimage.
+
+    Reuse is derived from the complete carrier/frame, not a caller flag or
+    receipt hash. Repeated stage gates keep comparing to this original source;
+    native stage.before freshness is independently enforced by reconciliation.
+    Settlement never calls this new-effect gate.
+    """
+    admission = item['source_admission']
+    if admission.get('binding') != {'kind': 'plan-publication'}:
+        return False
+    # Policy dispatch is not admission. Old branches keep their original reader
+    # order and validation; malformed/old bytes still face full admission before
+    # effects. Only an explicit new schema enters this additional typed gate.
+    _, candidate_raw, _ = _read_source_record(
+        admission['receipt_ref']['path'], label='source policy dispatch',
+        maximum=SOURCE_RECEIPT_BYTES_LIMIT, private=False,
+    )
+    if sha256_bytes(candidate_raw) != admission['receipt_ref']['sha256']:
+        raise PlanValidationError('source policy dispatch receipt digest differs')
+    try:
+        candidate = _source_json(candidate_raw, 'source policy dispatch')
+    except PlanValidationError:
+        return False
+    if candidate.get('schema') != 'delivery-source-publication-v2':
+        return False
+    _, _, candidate = _publication_reference(admission['receipt_ref'], 'source candidate receipt')
+    validate_source_v2_receipt(candidate, admission['primary_root'], admission['kit_root'])
+    if (candidate['project_id'] != item['project_id'] or candidate['workflow_id'] != item['workflow_id']
+            or admission['binding'] != {'kind': 'plan-publication'}):
+        raise PlanValidationError('source-only content receipt owner/binding differs')
+    target_carrier = _source_publication_carrier(target_graph, item['project_id'], item['workflow_id'])
+    if target_carrier['admission'] != admission:
+        raise PlanValidationError('source content target carrier differs from admission')
+    # Do not swallow a malformed/dual existing carrier as absence. Only a graph
+    # with no markers/references has no source admission to reuse.
+    from .delivery import SOURCE_ADMISSION_BEGIN, SOURCE_ADMISSION_END
+    has_carrier = any(
+        marker in str(row.get(key, ''))
+        for collection in ('nodes', 'edges', 'node_groups', 'transition_groups')
+        for row in source['graph'].get(collection, [])
+        for key in ('prompt_template', 'prompt', 'description')
+        for marker in (SOURCE_ADMISSION_BEGIN, SOURCE_ADMISSION_END, SCRIPT_INGRESS_REF_SCHEMA)
+    )
+    old_carrier = (_source_publication_carrier(source['graph'], item['project_id'], item['workflow_id'])
+                   if has_carrier else None)
+    if (old_carrier is not None and old_carrier['frame'] == target_carrier['frame']
+            and old_carrier['carrier'] == target_carrier['carrier']):
+        return False
+    _, review_raw = _read_reference(item['compatibility_review_ref'], 'compatibility_review_ref')
+    review = _source_json(review_raw, 'source publication review')
+    if canonical_bytes(review) != review_raw:
+        raise PlanValidationError('source publication review is not canonical')
+    dispositions = review.get('dispositions')
+    if not isinstance(dispositions, list):
+        raise PlanValidationError('source publication review dispositions are invalid')
+    rows = [row for row in dispositions if isinstance(row, dict)
+            and row.get('path') == 'source_admission.publication_provenance']
+    if len(rows) != 1 or rows[0].get('disposition') != 'compatible':
+        raise PlanValidationError('new source admission requires typed publication provenance disposition')
+    evidence = rows[0].get('evidence')
+    if not isinstance(evidence, list) or len(evidence) != 1:
+        raise PlanValidationError('source publication provenance requires one exact packet reference')
+    _, _, packet = _publication_reference(evidence[0], 'publication provenance', canonical_json=True)
+    if set(packet) != {'schema', 'predecessor_capture_ref', 'predecessor_receipt_ref',
+                       'candidate_receipt_ref', 'additional_published_paths'} or packet.get('schema') != \
+            'delivery-source-publication-provenance-v1':
+        raise PlanValidationError('source publication provenance packet is not closed')
+    capture, predecessor, _ = _source_publication_capture(packet['predecessor_capture_ref'])
+    if (canonical_sha256(capture) != canonical_sha256(_canonical_v2_owned(source))
+            or capture['project_id'] != item['project_id'] or capture['workflow_id'] != item['workflow_id']
+            or capture['version'] != item['expected_version']
+            or canonical_sha256(capture['graph']) != item['source_graph_sha256']
+            or canonical_sha256(capture['metadata']) != item['source_metadata_sha256']
+            or capture['links'] != item['links'] or capture['default'] != item['default']):
+        raise PlanValidationError('publication provenance capture differs from immutable plan preimage')
+    if (predecessor['admission']['binding'] != {'kind': 'plan-publication'}
+            or predecessor['admission']['receipt_ref'] != packet['predecessor_receipt_ref']
+            or packet['candidate_receipt_ref'] != admission['receipt_ref']
+            or predecessor['admission']['primary_root'] != admission['primary_root']
+            or predecessor['admission']['primary_workspace_id'] != admission['primary_workspace_id']):
+        raise PlanValidationError('publication provenance frame/receipt identity differs')
+    _, _, prior = _publication_reference(packet['predecessor_receipt_ref'], 'predecessor source receipt')
+    schema = prior.get('schema')
+    if (schema not in ('delivery-source-publication-v1', 'delivery-source-publication-v2')
+            or prior.get('policy') != ('published_source_v1' if schema.endswith('v1')
+                                      else 'published_source_project_content_v1')
+            or prior.get('project_id') != item['project_id'] or prior.get('workflow_id') != item['workflow_id']):
+        raise PlanValidationError('publication provenance predecessor owner/policy differs')
+    validate_source_v2_receipt({**prior, 'schema': 'delivery-source-publication-v2',
+                               'policy': 'published_source_project_content_v1'},
+                              admission['primary_root'], predecessor['admission']['kit_root'])
+    _source_publication_coverage(prior, candidate, predecessor['admission']['kit_root'],
+                                 admission['kit_root'], packet['additional_published_paths'])
+    return True
+
+
 def _validate_canonical_v2_target(
     parsed: Mapping[str, Any],
     item: Mapping[str, Any],
@@ -5518,6 +6386,9 @@ def _validate_canonical_v2_target(
                 raise PlanValidationError('qualified initial Git tree differs from its commit')
         except ValueError as error:
             raise PlanValidationError(str(error)) from error
+    publication_introduction = False
+    if source_admission is not None:
+        publication_introduction = _source_publication_provenance(item, source, graph)
     source_semantics = {
         key: source_review_graph[key]
         for key in ('nodes', 'edges', 'node_groups', 'transition_groups')
@@ -5575,7 +6446,8 @@ def _validate_canonical_v2_target(
             required_paths=_v2_required_review_paths(
                 source_review_graph, review_graph, source['metadata'], metadata,
                 item['compatibility_snapshot'], source_admission,
-            ) | {f'decision:{identity}' for identity in (affected_decisions or ())},
+            ) | {f'decision:{identity}' for identity in (affected_decisions or ())}
+              | ({'source_admission.publication_provenance'} if publication_introduction else set()),
         )
     if expected_spec is not None:
         from .graph import graph_matches_spec

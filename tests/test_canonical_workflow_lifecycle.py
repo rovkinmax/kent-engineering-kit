@@ -46,6 +46,374 @@ def workflow_id(index: int) -> str:
     return f"123e4567-e89b-42d3-a456-{426614174000 + index:012d}"
 
 
+class SourcePublicationProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        fixture = source_admission.DeliverySourceAdmissionTests("test_published_closure_and_cli_are_read_only")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.fixture = fixture
+        arguments = fixture.source_producer_fixture(project_id=PROJECT_ID, publication_workflow=workflow_id(0))
+        self.arguments = arguments
+        self.candidate = fixture.produce_source(arguments)
+        self.source = fixture.source_capture
+        self.admission = {**fixture.old_source_admission,
+                          "receipt_ref": {key: self.candidate["receipt_ref"][key] for key in ("path", "sha256")}}
+        from workflowkit.delivery import source_admission_gate
+        self.target = json.loads(json.dumps(self.source["graph"]))
+        self.target["version"] += 1
+        self.target["edges"][0]["prompt_template"] = source_admission_gate(
+            self.admission, project_id=fixture.producer_project_id, workflow_id=self.source["workflow_id"],
+            project_root=str(fixture.project))
+        self.review_path = fixture.evidence / "publication-review.json"
+        self.review = {"dispositions": [{"path": "source_admission.publication_provenance",
+                                         "disposition": "compatible", "evidence": [{key: self.candidate[
+                                             "provenance_ref"][key] for key in ("path", "sha256")}]}]}
+        self.item = {"project_id": fixture.producer_project_id, "workflow_id": self.source["workflow_id"],
+                     "expected_version": self.source["version"], "source_admission": self.admission,
+                     "source_graph_sha256": canonical_sha256(self.source["graph"]),
+                     "source_metadata_sha256": canonical_sha256(self.source["metadata"]),
+                     "links": self.source["links"], "default": self.source["default"]}
+        self.write_review()
+
+    def write_review(self):
+        raw = canonical_bytes(self.review)
+        self.review_path.write_bytes(raw)
+        self.review_path.chmod(0o600)
+        self.item["compatibility_review_ref"] = {"path": str(self.review_path), "sha256": hashlib.sha256(raw).hexdigest()}
+
+    def gate(self, source=None, target=None):
+        return operations._source_publication_provenance(
+            self.item, self.source if source is None else source, self.target if target is None else target)
+
+    def lifecycle_plan(self, *, native=False, intent="graph-and-metadata", affected=False):
+        """Real typed provenance through the fake native multistage executor.
+
+        Source admission itself is separately exercised against real disposable
+        Git sources; this lane isolates native stage/settlement behavior.
+        """
+        fixture = make_workflow_fixture(self.fixture.project)
+        if native:
+            plan, self.native_context, self.native_observed = native_canonical_v2_plan(
+                fixture, self, production_shape=True, with_approvals=True,
+                synchronize_effects=True, intent=intent, prefix_only=True,
+                approval_context_mode="new_session",
+                approval_descriptions=("v1", "v1/v2", "v1/v2") if affected else None,
+            )
+            value = plan.value
+        else:
+            _, value = canonical_v2_plan(fixture, intent=intent, source_admission_enabled=False)
+        item = value["workflows"][0]
+        state = read_state(fixture)
+        workflow = state["workflows"][workflow_id(0)]
+        source_graph = {"version": workflow["version"], **workflow["graph"]}
+        source_edge = operations._v2_ingress_edge(source_graph, "lifecycle source")
+        self.fixture.old_source_admission["ingress"]["edge_id"] = source_edge["id"]
+        self.admission["ingress"] = dict(self.fixture.old_source_admission["ingress"])
+        from workflowkit.delivery import source_admission_gate
+        source_edge["prompt_template"] = source_admission_gate(
+            self.fixture.old_source_admission, project_id=PROJECT_ID, workflow_id=workflow_id(0),
+            project_root=str(self.fixture.project)) + "\n\nOriginal Plan body."
+        workflow["graph"] = {key: source_graph[key] for key in ("nodes", "edges", "node_groups", "transition_groups")}
+        write_state(fixture, state)
+        target_edge = operations._v2_ingress_edge(item["target_graph"], "lifecycle target")
+        target_edge["prompt_template"] = source_admission_gate(
+            self.admission, project_id=PROJECT_ID, workflow_id=workflow_id(0),
+            project_root=str(self.fixture.project)) + "\n\nOriginal Plan body."
+        item["source_admission"] = self.admission
+        item["source_graph_sha256"] = canonical_sha256(source_graph)
+        self.source = {"workflow_id": workflow_id(0), "project_id": PROJECT_ID, "version": workflow["version"],
+                       "metadata": workflow["metadata"], "graph": source_graph,
+                       "links": item["links"], "default": item["default"], "valid": True}
+        capture_path = Path(self.arguments["predecessor_capture_ref"]["path"])
+        capture_raw = canonical_bytes(self.source)
+        capture_path.write_bytes(capture_raw)
+        packet_path = Path(self.candidate["provenance_ref"]["path"])
+        packet = json.loads(packet_path.read_bytes())
+        packet["predecessor_capture_ref"]["sha256"] = hashlib.sha256(capture_raw).hexdigest()
+        packet_raw = canonical_bytes(packet)
+        packet_path.write_bytes(packet_raw)
+        packet_ref = {"path": str(packet_path), "sha256": hashlib.sha256(packet_raw).hexdigest()}
+        review_path = Path(item["compatibility_review_ref"]["path"])
+        review = json.loads(review_path.read_bytes())
+        review["source_graph_sha256"] = item["source_graph_sha256"]
+        review["source_admission_sha256"] = canonical_sha256(self.admission)
+        from workflowkit.graph import native_graph_postimage, native_graph_projection
+        review["target_graph_sha256"] = canonical_sha256(native_graph_postimage(
+            item["target_graph"], workflow_id=workflow_id(0)))
+        evidence = review["dispositions"][0]["evidence"]
+        paths = operations._v2_required_review_paths(
+            native_graph_projection(source_graph, workflow_id=workflow_id(0)),
+            native_graph_projection(item["target_graph"], workflow_id=workflow_id(0)),
+            workflow["metadata"], item.get("target_metadata", workflow["metadata"]),
+            item["compatibility_snapshot"], self.admission)
+        review["dispositions"] = [{"path": path, "disposition": "compatible", "evidence": evidence}
+                                  for path in sorted(paths)] + [{
+            "path": "source_admission.publication_provenance", "disposition": "compatible", "evidence": [packet_ref]}]
+        raw = canonical_bytes(review)
+        review_path.write_bytes(raw)
+        item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        return fixture, write_canonical_v2_plan(fixture, value)
+
+    def test_combined_native_graph_only_approvals_and_content_introduction(self):
+        self._combined_native_approvals_and_content_introduction("graph-only", False)
+
+    def test_combined_native_graph_metadata_affected_approvals_and_content_introduction(self):
+        self._combined_native_approvals_and_content_introduction("graph-and-metadata", True)
+
+    def _combined_native_approvals_and_content_introduction(self, intent, affected):
+        for intent, affected in ((intent, affected),):
+            with self.subTest(intent=intent, affected=affected):
+                fixture, plan = self.lifecycle_plan(native=True, intent=intent, affected=affected)
+                context = self.native_context
+                connection = context["connection"]
+                tables = ("task_pending_approvals", "task_pending_approval_branches")
+                before = [connection.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall()
+                          for table in tables]
+                self.assertEqual(len(before[0]), 4)
+                source = self.source["graph"]
+                target = json.loads(json.dumps(plan.value["workflows"][0]["target_graph"]))
+                operations._v2_ingress_edge(target, "combined target")["prompt_template"] = (
+                    operations._v2_ingress_edge(source, "combined source")["prompt_template"])
+                target["version"] = source["version"]
+                self.assertEqual(target, source)
+                with native_observer_patches(context), mock.patch.object(
+                    operations, "admit_source_admission", side_effect=synthetic_verified_source_admission,
+                ):
+                    if affected:
+                        with self.assertRaisesRegex(PlanValidationError, "omits a changed semantic path"):
+                            reconcile_canonical_workflows(plan, mode="prepare")
+                        plan = review_native_description_decisions(fixture, plan, context)
+                    value = plan.value
+                    item = value["workflows"][0]
+                    review_path = Path(item["compatibility_review_ref"]["path"])
+                    valid = json.loads(review_path.read_bytes())
+                    for missing in ("source_admission.publication_provenance", "decision:"):
+                        if missing == "decision:" and not affected:
+                            continue
+                        review = {**valid, "dispositions": [
+                            row for row in valid["dispositions"] if not row["path"].startswith(missing)]}
+                        raw = canonical_bytes(review)
+                        review_path.write_bytes(raw)
+                        item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+                        invalid = write_canonical_v2_plan(fixture, value, name="missing-disposition.json")
+                        with self.assertRaises(PlanValidationError):
+                            reconcile_canonical_workflows(invalid, mode="prepare")
+                        self.assertEqual(graph_apply_rows(fixture), [])
+                    raw = canonical_bytes(valid)
+                    review_path.write_bytes(raw)
+                    item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+                    plan = write_canonical_v2_plan(fixture, value)
+                    reconcile_canonical_workflows(plan, mode="prepare")
+                    self.assertEqual(reconcile_canonical_workflows(
+                        plan, mode="apply", confirm=plan.sha256)["phase"], "complete")
+                    parsed = operations._validate_canonical_v2_plan(plan)
+                    observed = operations._canonical_v2_read(parsed, parsed["workflows"][0])
+                self.assertEqual(observed["compatibility_snapshot"]["native_components"]["approvals"],
+                                 self.native_observed["compatibility_snapshot"]["native_components"]["approvals"])
+                for table, rows in zip(tables, before):
+                    self.assertEqual(connection.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall(), rows)
+                self.assertEqual(len(graph_apply_rows(fixture)), 1)
+
+    def test_combined_native_settlement_precedes_missing_provenance_gate(self):
+        fixture, plan = self.lifecycle_plan(native=True, affected=True)
+        context = self.native_context
+        plan = review_native_description_decisions(fixture, plan, context)
+        connection = context["connection"]
+        before = connection.execute("SELECT * FROM task_pending_approvals ORDER BY id").fetchall()
+        with native_observer_patches(context), mock.patch.object(
+            operations, "admit_source_admission", side_effect=synthetic_verified_source_admission,
+        ):
+            reconcile_canonical_workflows(plan, mode="prepare")
+            stage = install_v2_unresolved_graph_postimage(fixture, plan)
+            connection.execute("UPDATE workflows SET version=?", (stage["after"]["version"],))
+            connection.commit()
+            Path(self.candidate["provenance_ref"]["path"]).unlink()
+            settled = reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+            self.assertEqual(settled["settled"], "postimage")
+            with self.assertRaises(PlanValidationError):
+                reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+        with OperationJournal(Path(plan.value["state_dir"]), "canonical-workflow-reconcile", plan) as journal:
+            self.assertEqual(journal.state["effects"][f"apply:{workflow_id(0)}:graph"]["status"], "verified")
+            self.assertNotIn(f"apply:{workflow_id(0)}:metadata", journal.state["effects"])
+        self.assertEqual(connection.execute("SELECT * FROM task_pending_approvals ORDER BY id").fetchall(), before)
+        self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_introduction_runs_graph_and_metadata_against_stage_before(self):
+        fixture, plan = self.lifecycle_plan()
+        with mock.patch.object(operations, "admit_source_admission", side_effect=synthetic_verified_source_admission):
+            self.assertEqual(reconcile_canonical_workflows(plan, mode="prepare")["phase"], "prepared")
+            result = reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+        self.assertEqual(result["phase"], "complete")
+        self.assertEqual(len(graph_apply_rows(fixture)), 1)
+        self.assertEqual(read_state(fixture)["workflows"][workflow_id(0)]["metadata"]["description"],
+                         plan.value["workflows"][0]["target_metadata"]["description"])
+
+    def test_graph_only_introduction_then_metadata_and_graph_reuse_need_no_packet(self):
+        fixture, combined = self.lifecycle_plan()
+        value = combined.value
+        item = value["workflows"][0]
+        item["intent"] = "graph-only"
+        del item["target_metadata"]
+        review_path = Path(item["compatibility_review_ref"]["path"])
+        review = json.loads(review_path.read_bytes())
+        review["target_metadata_sha256"] = item["source_metadata_sha256"]
+        raw = canonical_bytes(review)
+        review_path.write_bytes(raw)
+        item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+        plan = write_canonical_v2_plan(fixture, value, name="graph-introduction.json")
+        with mock.patch.object(operations, "admit_source_admission", side_effect=synthetic_verified_source_admission):
+            reconcile_canonical_workflows(plan, mode="prepare")
+            self.assertEqual(reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)["phase"], "complete")
+        Path(self.candidate["provenance_ref"]["path"]).unlink()
+        for intent in ("metadata-only", "graph-only"):
+            metadata = {**read_state(fixture)["workflows"][workflow_id(0)]["metadata"],
+                        "description": "Independent metadata with unchanged installed admission"}
+            _, value = canonical_v2_plan(fixture, intent=intent, source_admission_enabled=False,
+                                         metadata=metadata, name=f"reuse-{intent}.json")
+            item = value["workflows"][0]
+            item["source_admission"] = self.admission
+            if intent == "graph-only":
+                # A genuinely unrelated graph-only update, not an empty plan.
+                item["target_graph"]["nodes"][2]["description"] = "Unrelated node description"
+            review_path = Path(item["compatibility_review_ref"]["path"])
+            review = json.loads(review_path.read_bytes())
+            review["source_admission_sha256"] = canonical_sha256(self.admission)
+            state = read_state(fixture)["workflows"][workflow_id(0)]
+            source_graph = {"version": state["version"], **state["graph"]}
+            target_graph = item.get("target_graph", source_graph)
+            from workflowkit.graph import native_graph_postimage, native_graph_projection
+            review["target_graph_sha256"] = canonical_sha256(
+                native_graph_postimage(target_graph, workflow_id=workflow_id(0))
+                if intent == "graph-only" else source_graph)
+            paths = operations._v2_required_review_paths(
+                native_graph_projection(source_graph, workflow_id=workflow_id(0)),
+                native_graph_projection(target_graph, workflow_id=workflow_id(0)), state["metadata"],
+                item.get("target_metadata", state["metadata"]), item["compatibility_snapshot"], self.admission)
+            evidence = review["dispositions"][0]["evidence"]
+            review["dispositions"] = [{"path": path, "disposition": "compatible", "evidence": evidence}
+                                      for path in sorted(paths)]
+            raw = canonical_bytes(review)
+            review_path.write_bytes(raw)
+            item["compatibility_review_ref"]["sha256"] = hashlib.sha256(raw).hexdigest()
+            plan = write_canonical_v2_plan(fixture, value, name=f"reuse-{intent}.json")
+            with self.subTest(intent=intent), mock.patch.object(
+                operations, "admit_source_admission", side_effect=synthetic_verified_source_admission,
+            ), mock.patch.object(operations, "prepare_source_publication_v2", side_effect=AssertionError("producer reran")):
+                reconcile_canonical_workflows(plan, mode="prepare")
+                self.assertEqual(reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)["phase"], "complete")
+
+    def test_external_drift_between_introduction_stages_fails_stage_before(self):
+        fixture, plan = self.lifecycle_plan()
+        original = operations._settle_or_run
+        def drift_after_graph(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kwargs["effect_key"].endswith(":graph"):
+                state = read_state(fixture)
+                state["workflows"][workflow_id(0)]["metadata"]["description"] = "external drift"
+                write_state(fixture, state)
+            return result
+        with mock.patch.object(operations, "admit_source_admission", side_effect=synthetic_verified_source_admission):
+            reconcile_canonical_workflows(plan, mode="prepare")
+            with mock.patch.object(operations, "_settle_or_run", side_effect=drift_after_graph):
+                with self.assertRaises(EffectBlocked):
+                    reconcile_canonical_workflows(plan, mode="apply", confirm=plan.sha256)
+        self.assertEqual(len(graph_apply_rows(fixture)), 1)
+        self.assertFalse(any(row[:2] == ["workflow", "update"] for row in read_log(fixture)))
+
+    def test_missing_actual_packet_after_attempt_allows_settlement_but_not_next_effect(self):
+        fixture, plan = self.lifecycle_plan()
+        with mock.patch.object(operations, "admit_source_admission", side_effect=synthetic_verified_source_admission):
+            reconcile_canonical_workflows(plan, mode="prepare")
+            install_v2_unresolved_graph_postimage(fixture, plan)
+            Path(self.candidate["provenance_ref"]["path"]).unlink()
+        child = subprocess.run(
+            [sys.executable, "-B", "-c", (
+                "import sys\n"
+                "from tests.test_canonical_workflow_lifecycle import synthetic_verified_source_admission\n"
+                "import workflowkit.operations as operations\n"
+                "operations.admit_source_admission = synthetic_verified_source_admission\n"
+                "plan = operations.load_plan(sys.argv[1], schema='canonical-workflow-reconcile-plan-v2', "
+                "expected_sha256=sys.argv[2])\n"
+                "operations.reconcile_canonical_workflows(plan, mode='apply', confirm=plan.sha256)\n"
+            ), str(self.fixture.project / "canonical-plan-v2.json"), plan.sha256],
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+            cwd=self.fixture.project, capture_output=True, text=True, timeout=60,
+        )
+        self.assertNotEqual(child.returncode, 0)
+        self.assertIn("publication provenance", child.stderr)
+        with OperationJournal(Path(plan.value["state_dir"]), "canonical-workflow-reconcile", plan) as journal:
+            graph_key, metadata_key = (f"apply:{workflow_id(0)}:{name}" for name in ("graph", "metadata"))
+            self.assertEqual(journal.state["effects"][graph_key]["status"], "verified")
+            self.assertNotIn(metadata_key, journal.state["effects"])
+        self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_dispatch_rejects_observed_receipt_digest_drift_before_policy_selection(self):
+        path = Path(self.admission["receipt_ref"]["path"])
+        original = path.read_bytes()
+        for raw in (b"not json", canonical_bytes({"schema": "delivery-source-publication-v1"})):
+            with self.subTest(raw=raw):
+                path.write_bytes(raw)
+                with self.assertRaises(PlanValidationError):
+                    self.gate()
+                path.write_bytes(original)
+
+    def test_dispatch_digest_mismatch_blocks_native_effect_even_if_next_read_restores_v2(self):
+        fixture, plan = self.lifecycle_plan()
+        actual = operations._read_source_record
+        def dispatch_drift(*args, **kwargs):
+            path, raw, mode = actual(*args, **kwargs)
+            if kwargs.get("label") == "source policy dispatch":
+                raw = canonical_bytes({"schema": "delivery-source-publication-v1"})
+            return path, raw, mode
+        with mock.patch.object(operations, "_read_source_record", side_effect=dispatch_drift), mock.patch.object(
+            operations, "admit_source_admission", side_effect=synthetic_verified_source_admission,
+        ):
+            with self.assertRaisesRegex(PlanValidationError, "dispatch receipt digest"):
+                reconcile_canonical_workflows(plan, mode="prepare")
+        self.assertEqual(graph_apply_rows(fixture), [])
+
+    def test_introduction_requires_typed_packet_and_exact_owned_capture(self):
+        self.assertTrue(self.gate())
+        self.review["dispositions"] = []
+        self.write_review()
+        with self.assertRaisesRegex(PlanValidationError, "typed publication provenance"):
+            self.gate()
+
+    def test_capture_a_cannot_be_reused_for_plan_b(self):
+        other = json.loads(json.dumps(self.source))
+        other["metadata"]["description"] = "independently changed capture B"
+        self.item["source_metadata_sha256"] = canonical_sha256(other["metadata"])
+        with self.assertRaisesRegex(PlanValidationError, "immutable plan preimage"):
+            self.gate(source=other)
+
+    def test_full_installed_carrier_reuse_needs_no_producer_or_packet(self):
+        installed = {**self.source, "version": self.target["version"], "graph": self.target}
+        self.review_path.unlink()
+        Path(self.candidate["provenance_ref"]["path"]).unlink()
+        self.assertFalse(self.gate(source=installed))
+        unrelated = json.loads(json.dumps(self.target))
+        unrelated["version"] += 1
+        unrelated["nodes"][1]["description"] = "unrelated graph update"
+        self.assertFalse(self.gate(source=installed, target=unrelated))
+
+    def test_changed_carrier_cannot_select_reuse_by_same_receipt(self):
+        installed = {**self.source, "graph": json.loads(json.dumps(self.target))}
+        installed["graph"]["edges"][0]["prompt_template"] += " altered noncanonical prefix"
+        with self.assertRaises(PlanValidationError):
+            self.gate(source=installed)
+
+    def test_candidate_packet_substitution_fails_even_after_resigning_review(self):
+        packet_path = Path(self.candidate["provenance_ref"]["path"])
+        packet = json.loads(packet_path.read_bytes())
+        packet["candidate_receipt_ref"]["sha256"] = "f" * 64
+        raw = canonical_bytes(packet)
+        packet_path.write_bytes(raw)
+        self.review["dispositions"][0]["evidence"][0]["sha256"] = hashlib.sha256(raw).hexdigest()
+        self.write_review()
+        with self.assertRaisesRegex(PlanValidationError, "frame/receipt identity"):
+            self.gate()
+
+
 class NativeGraphTransportTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("KENT_NATIVE_SOURCE_GATE_REQUEST"), "private gate request not supplied")
     def test_captured_puber_gate_only_ingress_survives_native_encoding(self):
@@ -527,6 +895,8 @@ def canonical_v2_plan(
     source_admission_enabled: bool = True,
     name: str = "canonical-plan-v2.json",
     approval_parameter_description: str | None = None,
+    approval_context_mode: str | None = None,
+    prefix_only: bool = False,
 ) -> tuple[operations.LoadedPlan, dict]:
     state = read_state(fixture)
     wid = workflow_id(0)
@@ -586,6 +956,10 @@ def canonical_v2_plan(
             {"key": "delivery_context", "purpose": "ordinary", "description": approval_parameter_description},
             {"key": "other", "purpose": "ordinary", "description": "Unchanged"},
         ]
+    if approval_context_mode is not None:
+        edge = next(row for row in workflow["graph"]["edges"] if row["key"] == "backlog_plan")
+        edge["context_mode"] = approval_context_mode
+        edge["context_source"] = {"kind": "immediate_source"}
     detail = workflow["details"]["TASK-1"]
     detail["live_sessions"] = []
     detail["current_nodes"] = [{"node_id": "90e31940-4c84-466e-8e72-26f53c2f36f4"}]
@@ -605,7 +979,7 @@ def canonical_v2_plan(
     }
     target_graph = json.loads(json.dumps(source_graph))
     target_graph["version"] += 1
-    if not any(edge.get("key") == "implement_replan" for edge in source_graph["edges"]):
+    if not prefix_only and not any(edge.get("key") == "implement_replan" for edge in source_graph["edges"]):
         target_graph["transition_groups"].append({
             "id": "c6a3f68e-7629-404a-8153-2d5f0e32ff0d",
             "source_node_id": "7d280478-d98b-4462-9ae6-f58bf0d5a8d0",
@@ -1182,10 +1556,17 @@ def make_native_persistence(
                 "entered_by_edge_id": edge["id"],
             }
             effective_edge = {**edge, "workflow_id": workflow_id(0)}
-            context = {
-                "active_source": {"kind": "exact", "session_id": None},
-                "target_session": {"kind": "reuse", "session_id": None},
-            }
+            # Materialize the native representation for the actual edge mode.
+            if edge["context_mode"] == "new_session":
+                context = {
+                    "active_source": {"kind": "deferred_self"},
+                    "target_session": {"kind": "create"},
+                }
+            else:
+                context = {
+                    "active_source": {"kind": "exact", "session_id": None},
+                    "target_session": {"kind": "reuse", "session_id": None},
+                }
             connection.execute(
                 "INSERT INTO task_pending_approval_branches VALUES (?, ?, ?, ?, ?)",
                 (
@@ -1328,6 +1709,8 @@ def native_canonical_v2_plan(
     with_questions: bool = False,
     with_bindings: bool = False,
     approval_descriptions: tuple[str, str, str] | None = None,
+    approval_context_mode: str = "new_session",
+    prefix_only: bool = False,
 ) -> tuple[operations.LoadedPlan, dict, dict]:
     if synchronize_effects:
         # Install before canonical_v2_plan binds the executable digest. Only
@@ -1375,6 +1758,8 @@ def native_canonical_v2_plan(
     plan, value = canonical_v2_plan(
         fixture, intent=intent,
         approval_parameter_description=approval_descriptions[1] if approval_descriptions else None,
+        approval_context_mode=approval_context_mode if with_approvals else None,
+        prefix_only=prefix_only,
     )
     home, database, sessions_root, connection, sessions, _, question_input = make_native_persistence(
         fixture,
@@ -3032,7 +3417,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             "assignee_selection": "configured",
             "thinking_selection": "configured",
             "requires_approval": True,
-            "context_mode": "reuse",
+            "context_mode": "continue_session",
             "context_source": {"kind": "current_session"},
             "parameters": {},
             "prompt_template": "Resume the same node.",
@@ -3256,6 +3641,170 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
             affected_decisions=affected, target_graph=target_graph,
         )
         self.assertEqual(affected, {approval["id"]})
+
+    def test_native_approval_context_dispatch_is_closed_and_raw_bound(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            fixture = make_workflow_fixture(Path(temporary))
+            _, context, _ = native_canonical_v2_plan(
+                fixture, self, production_shape=True, with_approvals=True,
+            )
+            connection = context["connection"]
+            connection.row_factory = sqlite3.Row
+            original_approval = dict(connection.execute(
+                "SELECT * FROM task_pending_approvals ORDER BY id LIMIT 1",
+            ).fetchone())
+            original_branch = dict(connection.execute(
+                "SELECT * FROM task_pending_approval_branches WHERE approval_id=?",
+                (original_approval["id"],),
+            ).fetchone())
+            original_nodes = [dict(row) for row in connection.execute(
+                "SELECT * FROM task_current_nodes WHERE task_id=?",
+                (original_approval["source_task_id"],),
+            )]
+            original_graph = read_state(fixture)["workflows"][workflow_id(0)]["graph"]
+            for mode in ("new_session", "continue_session", "compact_and_continue_session"):
+                for session_id in (None, "44444444-4444-4444-8444-444444444444"):
+                    with self.subTest(mode=mode, session_id=session_id):
+                        approval = {**original_approval, "source_session_id": session_id}
+                        nodes = [{**row, "session_id": session_id} for row in original_nodes]
+                        graph = json.loads(json.dumps(original_graph))
+                        edge = next(row for row in graph["edges"] if row["key"] == "backlog_plan")
+                        edge["context_mode"] = mode
+                        frozen_edge = {
+                            **json.loads(original_branch["effective_edge_configuration_json"]),
+                            "context_mode": mode,
+                        }
+                        reuse = {
+                            "active_source": {"kind": "exact", "session_id": session_id},
+                            "target_session": {"kind": "reuse", "session_id": session_id},
+                        }
+                        create = {
+                            "active_source": {"kind": "deferred_self"},
+                            "target_session": {"kind": "create"},
+                        }
+                        resolved = create if mode == "new_session" else reuse
+                        branch = {
+                            **original_branch,
+                            "effective_edge_configuration_json": json.dumps(frozen_edge),
+                            "context_source_resolution_json": json.dumps(resolved),
+                        }
+
+                        def payload(current_approval=approval, current_branch=branch,
+                                    current_graph=graph, current_nodes=nodes):
+                            return operations._native_approval_payload(
+                                current_approval, [current_branch], current_nodes, workflow_id(0), current_graph,
+                            )
+
+                        envelope = payload()
+                        self.assertEqual(envelope, {"approval": approval, "branches": [branch]})
+                        baseline = canonical_sha256(envelope)
+                        self.assertNotEqual(
+                            canonical_sha256(payload({**approval, "workflow_version": approval["workflow_version"] + 1})),
+                            baseline,
+                        )
+                        for column, source in (
+                            ("transition_snapshot_json", approval), ("materialized_values_json", approval),
+                            ("target_snapshot_json", branch), ("effective_edge_configuration_json", branch),
+                            ("context_source_resolution_json", branch),
+                        ):
+                            changed_approval, changed_branch = dict(approval), dict(branch)
+                            changed = changed_approval if source is approval else changed_branch
+                            changed[column] = " " + source[column]
+                            self.assertNotEqual(
+                                canonical_sha256(payload(changed_approval, changed_branch)), baseline, column,
+                            )
+                            semantic = json.loads(source[column])
+                            if column == "context_source_resolution_json":
+                                # Every semantic context change is either another
+                                # closed mode or invalid, never silently normalized.
+                                semantic["active_source"]["unexpected"] = True
+                            elif column == "effective_edge_configuration_json":
+                                semantic["prompt_template"] = "Changed frozen prompt bytes."
+                            else:
+                                semantic["fixture_semantic_change"] = True
+                            changed[column] = json.dumps(semantic)
+                            if column == "context_source_resolution_json":
+                                with self.assertRaises(EffectBlocked):
+                                    payload(changed_approval, changed_branch)
+                            else:
+                                self.assertNotEqual(
+                                    canonical_sha256(payload(changed_approval, changed_branch)), baseline, column,
+                                )
+
+                        invalid_contexts = [
+                            reuse if mode == "new_session" else create,
+                            {"active_source": reuse["active_source"], "target_session": create["target_session"]},
+                            {"active_source": create["active_source"], "target_session": reuse["target_session"]},
+                            {**resolved, "extra": None},
+                            {"active_source": resolved["active_source"]},
+                            {"target_session": resolved["target_session"]},
+                        ]
+                        for key in ("active_source", "target_session"):
+                            invalid_contexts.extend([
+                                {**resolved, key: {**resolved[key], "extra": None}},
+                                {**resolved, key: {**resolved[key], "session_id": "foreign-session"}},
+                                {**resolved, key: {"kind": "unknown"}},
+                            ])
+                            if mode == "new_session":
+                                invalid_contexts.append({**resolved, key: {**resolved[key], "session_id": None}})
+                        for invalid in invalid_contexts:
+                            with self.subTest(invalid_context=invalid), self.assertRaises(EffectBlocked):
+                                payload(current_branch={
+                                    **branch, "context_source_resolution_json": json.dumps(invalid),
+                                })
+                        for bad_mode in (None, "", "reuse", "unknown", " new_session"):
+                            bad_graph = json.loads(json.dumps(graph))
+                            next(row for row in bad_graph["edges"] if row["id"] == edge["id"])[
+                                "context_mode"] = bad_mode
+                            with self.subTest(bad_mode=bad_mode), self.assertRaises(EffectBlocked):
+                                payload(current_graph=bad_graph, current_branch={
+                                    **branch, "effective_edge_configuration_json": json.dumps({
+                                        **frozen_edge, "context_mode": bad_mode,
+                                    }),
+                                })
+                        other_mode = "continue_session" if mode == "new_session" else "new_session"
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_branch={
+                                **branch, "effective_edge_configuration_json": json.dumps({
+                                    **frozen_edge, "context_mode": other_mode,
+                                }),
+                            })
+                        bad_graph = json.loads(json.dumps(graph))
+                        next(row for row in bad_graph["edges"] if row["id"] == edge["id"])[
+                            "context_mode"] = other_mode
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_graph=bad_graph)
+                        for column, key, value in (
+                            ("effective_edge_configuration_json", "id", "foreign-edge"),
+                            ("effective_edge_configuration_json", "workflow_id", workflow_id(1)),
+                            ("effective_edge_configuration_json", "target_node_id", "foreign-node"),
+                            ("effective_edge_configuration_json", "transition_group_id", "foreign-group"),
+                            ("target_snapshot_json", "node_id", "foreign-node"),
+                            ("target_snapshot_json", "entered_by_edge_id", "foreign-edge"),
+                            ("target_snapshot_json", "node_kind", "script"),
+                        ):
+                            invalid = {**json.loads(branch[column]), key: value}
+                            with self.subTest(column=column, key=key), self.assertRaises(EffectBlocked):
+                                payload(current_branch={**branch, column: json.dumps(invalid)})
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_branch={**branch, "transition_branch_key": "foreign-transition"})
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_approval={**approval, "source_node_id": "foreign-source"})
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_approval={**approval, "source_transition_branch_key": "foreign-branch"})
+                        with self.assertRaises(EffectBlocked):
+                            payload(current_approval={**approval, "source_session_id": "foreign-session"})
+                        if mode == "new_session":
+                            target = json.loads(branch["target_snapshot_json"])
+                            bad_graph = json.loads(json.dumps(graph))
+                            next(row for row in bad_graph["nodes"] if row["id"] == target["node_id"])[
+                                "kind"] = "script"
+                            with self.assertRaises(EffectBlocked):
+                                payload(current_graph=bad_graph)
+                            with self.assertRaises(EffectBlocked):
+                                payload(current_graph=bad_graph, current_branch={
+                                    **branch, "target_snapshot_json": json.dumps({**target, "node_kind": "script"}),
+                                })
 
     def test_native_process_adapters_bind_executable_and_database_descriptors(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
@@ -3950,8 +4499,13 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 self.assertEqual(item["compatibility_snapshot"]["native_components"], components)
 
     def test_native_frozen_approvals_survive_real_graph_and_metadata_effects(self) -> None:
-        for intent in ("graph-only", "graph-and-metadata"):
-            with self.subTest(intent=intent), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+        cases = [
+            (intent, mode)
+            for intent in ("graph-only", "graph-and-metadata")
+            for mode in ("new_session", "continue_session", "compact_and_continue_session")
+        ]
+        for intent, mode in cases:
+            with self.subTest(intent=intent, mode=mode), tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
                 fixture = make_workflow_fixture(Path(temporary))
                 state = read_state(fixture)
                 state["workflows"][workflow_id(0)]["version"] = 16
@@ -3959,8 +4513,21 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 plan, context, observed = native_canonical_v2_plan(
                     fixture, self, production_shape=True, with_approvals=True,
                     intent=intent, synchronize_effects=True,
+                    approval_context_mode=mode, prefix_only=True,
                 )
                 connection = context["connection"]
+                source_workflow = read_state(fixture)["workflows"][workflow_id(0)]
+                source_graph = {"version": source_workflow["version"], **source_workflow["graph"]}
+                # The only graph content change is the reviewed ingress prefix.
+                target = json.loads(json.dumps(plan.value["workflows"][0]["target_graph"]))
+                source_ingress = operations._v2_ingress_edge(source_graph, "fixture source")
+                target_ingress = operations._v2_ingress_edge(target, "fixture target")
+                self.assertTrue(target_ingress["prompt_template"].endswith(
+                    "\n\n" + source_ingress["prompt_template"],
+                ))
+                target_ingress["prompt_template"] = source_ingress["prompt_template"]
+                target["version"] = source_graph["version"]
+                self.assertEqual(target, source_graph)
                 before = [
                     connection.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall()
                     for table in ("task_pending_approvals", "task_pending_approval_branches")
@@ -6398,7 +6965,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                 self.assertEqual(journal.state["members"][0]["status"], "graph_verified")
 
     def test_v2_settles_attempted_graph_before_missing_evidence_blocks_next_effect(self) -> None:
-        for missing in ("runtime", "review", "receipt"):
+        for missing in ("runtime", "review", "receipt", "provenance"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temporary:
                 fixture = make_workflow_fixture(Path(temporary))
                 plan, _ = canonical_v2_plan(
@@ -6412,8 +6979,12 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     Path(item["runtime_refs"][0]["path"]).unlink()
                 elif missing == "review":
                     Path(item["compatibility_review_ref"]["path"]).unlink()
-                else:
+                elif missing == "receipt":
                     Path(item["source_admission"]["receipt_ref"]["path"]).unlink()
+                else:
+                    # An unavailable typed packet is a new-effect gate, never a
+                    # reason to skip observational settlement of an old attempt.
+                    pass
 
                 admission_calls = []
 
@@ -6425,13 +6996,20 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     operations,
                     "admit_source_admission",
                     side_effect=refuse_fresh_admission,
-                ) as admission:
+                ) as admission, mock.patch.object(
+                    operations, "_source_publication_provenance",
+                    side_effect=(PlanValidationError("source publication packet is unavailable")
+                                 if missing == "provenance" else
+                                 lambda *_args: False),
+                ) as provenance:
                     with self.assertRaises((PlanValidationError, EffectBlocked)):
                         reconcile_canonical_workflows(
                             plan,
                             mode="apply",
                             confirm=plan.sha256,
                         )
+                if missing == "provenance":
+                    self.assertEqual(provenance.call_count, 1)
                 self.assertEqual(admission.call_count, 1 if missing == "receipt" else 0)
                 self.assertEqual(len(admission_calls), admission.call_count)
                 self.assertEqual(graph_apply_rows(fixture), [])

@@ -1166,7 +1166,49 @@ class KitRuntimeBindingTest(unittest.TestCase):
             self.assertEqual(foreign_binding.returncode, 0, foreign_binding.stderr)
             self.assertIn("rejected", json.loads(foreign_binding.stdout))
 
-    def test_puber_runtime_qualifies_real_r2_source_admission_without_session(self) -> None:
+    def test_v3_bootstrap_reader_rejects_resigned_nested_metadata_before_qualification(self):
+        from tests.test_delivery_source_admission import DeliverySourceAdmissionTests
+        fixture = DeliverySourceAdmissionTests("test_published_closure_and_cli_are_read_only")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.put(fixture.kit, "workflowkit/kit_runtime.py", (REPO_ROOT / "workflowkit/kit_runtime.py").read_text())
+        fixture.commit(fixture.kit)
+        fixture.receipt["kit_commit"] = fixture.git(fixture.kit, "rev-parse", "HEAD").strip()
+        fixture.refresh_receipt_files()
+        fixture.use_content_policy()
+        receipt = json.loads(json.dumps(fixture.receipt))
+        admission = {"receipt_ref": {"path": str(fixture.receipt_path), "sha256": fixture.digest},
+                     "primary_root": str(fixture.project), "kit_root": str(fixture.kit),
+                     "kit_ref": "refs/remotes/origin/main"}
+        self.assertEqual(kit_runtime._read_source_receipt(
+            admission, project_id="project-test", workflow_id="workflow-test")[1].commit,
+            receipt["kit_commit"])
+        for change in ({"policy": "delivery_reliability_v1"}, {"local_inputs": None},
+                       {"source_commit": "bad"}, {"runtime_roots": receipt["runtime_roots"] * 2},
+                       {"project_memory": {**receipt["project_memory"], "legacy_task_ids": ["old", "old"]}}):
+            fixture.receipt = {**receipt, **change}
+            fixture.pin()
+            admission["receipt_ref"]["sha256"] = fixture.digest
+            with self.subTest(change=change), self.assertRaisesRegex(kit_runtime.KitRuntimeError, "v3 publication metadata"):
+                kit_runtime._read_source_receipt(admission, project_id="project-test", workflow_id="workflow-test")
+
+    def test_runtime_v3_initial_and_later_script_bootstrap_admits_rewritten_primary(self):
+        self.test_puber_runtime_qualifies_real_r2_source_admission_without_session(content_policy=True)
+
+    def test_source_v2_puber_initial_and_later_scripts_use_real_admission(self):
+        self.test_puber_runtime_qualifies_real_r2_source_admission_without_session(source_only=True)
+
+    def test_source_v2_slack_initial_and_later_agents_use_real_admission(self):
+        self.test_puber_runtime_qualifies_real_r2_source_admission_without_session(source_only=True, agent=True)
+
+    def test_runtime_v3_agent_prefix_bootstrap_uses_real_full_admission(self):
+        self.test_puber_runtime_qualifies_real_r2_source_admission_without_session(content_policy=True, agent=True)
+
+    def test_source_v2_later_agent_preserves_initial_compact_script_carrier(self):
+        self.test_puber_runtime_qualifies_real_r2_source_admission_without_session(
+            source_only=True, later_agent=True)
+
+    def test_puber_runtime_qualifies_real_r2_source_admission_without_session(self, content_policy=False, source_only=False, agent=False, later_agent=False) -> None:
         from tests.test_canonical_workflow_lifecycle import (
             create_verified_source_fixture,
         )
@@ -1231,6 +1273,18 @@ class KitRuntimeBindingTest(unittest.TestCase):
         )
         fixture.repin_native_sources()
 
+        if source_only:
+            fixture.receipt.pop("project_memory")
+            fixture.receipt.update(schema="delivery-source-publication-v2",
+                                   policy="published_source_project_content_v1", local_inputs=[])
+            fixture.pin()
+            fixture.rewrite_product_history(fixture.project)
+        elif content_policy:
+            fixture.use_content_policy()
+            fixture.installation_binding["receipt_sha256"] = fixture.digest
+            fixture.write_installation_binding()
+            fixture.rewrite_product_history(fixture.project)
+
         admission = dict(fixture.source_admission)
         admission["receipt_ref"] = dict(admission["receipt_ref"])
         admission["receipt_ref"]["sha256"] = fixture.digest
@@ -1242,6 +1296,10 @@ class KitRuntimeBindingTest(unittest.TestCase):
             "kind": "script-edge",
             "edge_id": "initial-ingress-edge",
         }
+        if source_only:
+            admission["binding"] = {"kind": "plan-publication"}
+        if agent:
+            admission["ingress"]["kind"] = "agent-edge"
         frame = {
             "project_id": project_id,
             "workflow_id": workflow_id,
@@ -1309,11 +1367,22 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 ],
             },
         }
+        if agent:
+            from workflowkit.delivery import source_admission_gate
+            for node in graph["graph"]["nodes"]:
+                if node["id"] in (initial_node, later_node):
+                    node["kind"] = "agent"
+            graph["graph"]["transition_groups"][0]["description"] = ""
+            graph["graph"]["edges"][0]["prompt_template"] = source_admission_gate(
+                admission, project_id=project_id, workflow_id=workflow_id, project_root=str(fixture.project))
+        if later_agent:
+            graph["graph"]["nodes"][2]["kind"] = "agent"
         graph_path = fixture.base / "script-graph.json"
         graph_path.write_text(json.dumps(graph))
         task_path = fixture.base / "script-task.json"
 
         def write_task(node_id: str, script_path: str) -> None:
+            agent_context = agent or (later_agent and node_id == later_node)
             task_path.write_text(json.dumps({
                 "summary": {
                     "id": task_id,
@@ -1328,9 +1397,9 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 },
                 "project": {"default_workspace_id": "workspace-test"},
                 "worktree_path": str(fixture.project),
-                "current_nodes": [],
+                "current_nodes": ([{"node_id": node_id, "session_id": "6c724730-01ea-49e7-a2b1-a64d7fbe3ba1"}] if agent_context else []),
                 "live_sessions": [],
-                "current_scripts": [{
+                "current_scripts": [] if agent_context else [{
                     "current_node": {
                         "node_id": node_id,
                         "transition_branch_key": None,
@@ -1348,11 +1417,18 @@ class KitRuntimeBindingTest(unittest.TestCase):
             f"workflow_id = {workflow_id!r}\n"
             f"task_path = pathlib.Path({str(task_path)!r})\n"
             f"graph_path = pathlib.Path({str(graph_path)!r})\n"
+            f"agent = {(agent or later_agent)!r}\n"
+            f"worktree_status = {fixture.native_worktree_status()!r}\n"
             "args = sys.argv[1:]\n"
             "if args == ['project', project]:\n"
             "    print(project_id)\n"
             "elif args == ['project', 'list']:\n"
             "    print(project_id + '\\tFixture\\t' + project)\n"
+            "elif args[:2] == ['project', 'workspaces']:\n"
+            "    print(json.dumps({'project_id': project_id, 'offset': 0, 'workspaces': [{\n"
+            "        'workspace_id': 'workspace-test', 'root_path': project, 'is_default': True}]}))\n"
+            "elif args == ['worktree', 'status', '--session', '6c724730-01ea-49e7-a2b1-a64d7fbe3ba1', '--json']:\n"
+            "    print(json.dumps(worktree_status))\n"
             "elif len(args) == 6 and args[:2] == ['task', 'show'] and "
             "args[2] == task_id and args[3] == '--project' and "
             "args[4] == project_id and args[5] == '--json':\n"
@@ -1361,7 +1437,9 @@ class KitRuntimeBindingTest(unittest.TestCase):
             "and args[4:] == ['--json']:\n"
             "    print(graph_path.read_text())\n"
             "elif args[:2] == ['task', 'list']:\n"
-            "    print(json.dumps({'items': [{'task_id': task_id}]}))\n"
+            "    print(json.dumps({'scope': {'project_id': project_id}, 'tasks': [\n"
+            "        {'task_id': task_id, 'short_id': 'PUBER-14'}]} if agent else \n"
+            "        {'items': [{'task_id': task_id}]}))\n"
             "else:\n"
             "    raise SystemExit(2)\n"
         )
@@ -1377,7 +1455,8 @@ class KitRuntimeBindingTest(unittest.TestCase):
             from pathlib import Path
 
             project = Path(sys.argv[1])
-            task_id, node_id, workflow_id, project_id = sys.argv[2:]
+            task_id, node_id, workflow_id, project_id, is_agent = sys.argv[2:]
+            is_agent = is_agent == "1"
             bootstrap_path = project / ".kent/scripts/workflow_kit_runtime.py"
             loader = importlib.machinery.SourceFileLoader(
                 "published_puber_kit_runtime", str(bootstrap_path)
@@ -1388,12 +1467,12 @@ class KitRuntimeBindingTest(unittest.TestCase):
             loader.exec_module(bootstrap)
             context = {"task_id": task_id, "node_id": node_id}
             qualified = bootstrap.qualified_kit_runtime(
-                project, source_binding=context
+                project, source_binding=None if is_agent else context
             )
             assert qualified is not None and qualified.native_authorized
             operations = qualified.module("operations")
             kent = Path(shutil.which("kent")).resolve()
-            if node_id == "initial-script":
+            if node_id == "initial-script" and not is_agent:
                 verified = operations.admit_script_source_ingress(
                     project, context, kent_path=kent
                 )
@@ -1401,7 +1480,7 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 graph_response = bootstrap._native_graph(
                     kent, project, workflow_id
                 )
-                ingress = bootstrap._validate_script_ingress_graph(
+                ingress = bootstrap._read_source_ingress_graph(
                     graph_response,
                     project_id=project_id,
                     workflow_id=workflow_id,
@@ -1440,6 +1519,9 @@ class KitRuntimeBindingTest(unittest.TestCase):
                 for key, value in os.environ.items()
                 if key != "KENT_SESSION_ID"
             }
+            run_is_agent = agent or (later_agent and node_id == later_node)
+            if run_is_agent:
+                env["KENT_SESSION_ID"] = "6c724730-01ea-49e7-a2b1-a64d7fbe3ba1"
             env["HOME"] = str(fixture.home)
             env["PATH"] = str(fixture.bin) + os.pathsep + env.get("PATH", "")
             env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1456,6 +1538,7 @@ class KitRuntimeBindingTest(unittest.TestCase):
                     node_id,
                     workflow_id,
                     project_id,
+                    "1" if run_is_agent else "0",
                 ],
                 cwd=fixture.project,
                 env=env,
