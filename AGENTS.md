@@ -6,11 +6,20 @@
 - Explicit user-driven orchestration belongs in `prompts/`; model-triggered
   disciplines belong in `skills/`.
 - Review roles disable first-class edit tools. Reviewer shell access is
-  inspection-only except for a Workflow node's required append of its own
-  evidence through the qualified configured evidence adapter, using genuine
-  current Task/Node/Session/Step identity. This permits no source/checkpoint
-  edits, direct ledger writes, another producer's append, sealing, recovery or
-  other shell writes.
+  inspection-only with two narrow exceptions for a genuinely assigned current
+  Workflow review node: append only this node's own required evidence through
+  the qualified configured evidence adapter, using genuine current
+  Task/Node/Session/Step identity; and, only when explicitly configured for
+  `shell_command`, submit this node's own actual result through the
+  reminder-prescribed `kent task complete`, using current native identity,
+  the declared transition and required parameters. Never use `--force`, another
+  Task/Session selector, manual move/start/stop/resume/cancel, approval answers
+  or graph/config mutation. This permits no source/checkpoint edits, fabricated
+  sibling results, direct ledger writes, another producer's append, sealing,
+  recovery or external
+  product effects; no other shell writes are permitted. Missing qualification
+  blocks the dependent action: never guess a binding or bypass initialization.
+  Standalone/non-Workflow review remains inspection-only.
 - Role prompts own behavior only. Model, reasoning, verbosity, tools, and
   delegation eligibility belong in Kent configuration; role-prompt
   frontmatter must not declare `model` or `tools`.
