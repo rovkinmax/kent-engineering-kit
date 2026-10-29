@@ -19,6 +19,7 @@ from workflowkit.profile import ProjectProfile
 
 
 ADAPTER_TEMPLATES = {
+    "resource_lease": REPO_ROOT / "templates" / "project" / "resource-lease-client",
     "jira_api": REPO_ROOT / "templates" / "project" / "jira-api.sh",
     "mobile_evidence_audit": (
         REPO_ROOT / "templates" / "project" / "mobile-evidence-audit.sh"
