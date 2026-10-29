@@ -14,13 +14,18 @@ copying unrelated machine state.
   `~/.kent/bin/kent-worktree <command> --session <id> ...`, avoiding inherited
   caller identity. An explicit initial `--branch-name` does not authorize
   renaming an active task branch.
-- Cleanup closes task-owned shells and leaves before post-session Janitor
-  deletion. Native refusal must not be bypassed with force or foreign-owner
-  cancellation. Reconcile partial effects before retry.
+- Cleanup follows the qualified owner/procedure explicitly selected by the
+  native Workflow. The selected legacy route closes task-owned shells and
+  leaves before post-session Script Janitor deletion. An Agent cleanup route
+  needs separate qualification and explicit selection; neither a profile map
+  nor ordinary R2 storage access selects it automatically.
+  Native refusal must not be bypassed with force or foreign-owner cancellation.
+  Reconcile partial effects before retry.
 - For workflows carrying `pr_base_branch`, Cleanup freezes that exact
-  authority-bound target and the Janitor re-observes the PR target before
-  merged cleanup. Non-merged cleanup uses explicit `not-applicable`; it is
-  absence of target evidence, not proof of a branch name. See the
+  authority-bound target. The selected legacy Script Janitor re-observes the
+  PR target before merged cleanup; other selected routes retain their
+  qualified target checks. Non-merged cleanup uses explicit `not-applicable`;
+  it is absence of target evidence, not proof of a branch name. See the
   [delivery continuity contract](workflow-contract.md#delivery-continuity).
 - Deletion succeeds only with validated terminal/native success, absent path
   and Git registration, and exact retained worktree identity. `scheduled`
@@ -47,12 +52,34 @@ Sessions or signal unknown processes.
 
 Unknown/refused release or incomplete proof preserves resources and follows
 the existing recovery route. Ask only for a genuine cross-owner decision or
-external action. Confirmed release resumes normal preparation/leave/Janitor.
+external action. Confirmed release resumes normal preparation/leave under the
+selected cleanup procedure; post-session Script Janitor handoff belongs only
+to the selected legacy route.
 
 Owner acknowledgement is not an atomic reservation. Native managed-process
 checks do not exclude arbitrary processes, child startup or same-user writes.
 Report unavailable exclusion honestly; do not add a sweeper or global lock
 service.
+
+## Separately qualified Agent cleanup
+
+An explicitly selected Agent-owned route uses supported native worktree
+operations and its reviewed retention, owner-release, leave, deletion and
+recovery procedure. Ordinary document publication is not terminal acceptance
+or deletion authority. Preserve exact original Task/worktree/root/branch
+identity and before/after observations outside the retiring worktree.
+
+An interruption after deletion must settle the observed effect before retry.
+Do not recreate the tree, replay deletion, move a Task past its cleanup owner,
+or infer success from Resume acknowledgement. If the retained target no longer
+exists, use only the separately authorized supported replacement-target
+recovery and re-read actual native startup/root identity.
+
+Task interruption is not a subprocess-kill guarantee. Prove owner-controlled
+shell/child settlement or safely retain the resource; a surviving bounded child
+that exits naturally is not evidence that interruption killed it. Controlled
+post-delete recovery does not qualify server-crash, power-loss, mid-RPC or
+SIGKILL recovery, nor establish blanket production cleanup safety.
 
 ## Setup hook
 
@@ -67,11 +94,15 @@ on setup having run.
 
 ## Task runtime state
 
-Project checkpoints use ignored `.kent/runtime/<task-short-id>/` through the
-qualified profile command. Checkpoints are mutable state; append-only evidence
-is immutable history. Neither replaces the other. Helpers verify repository/
-ignored-storage identity and safe file ownership. Janitor retires state only
-after evidence retention and acknowledged owning cleanup.
+Selected legacy project checkpoints use ignored
+`.kent/runtime/<task-short-id>/` through the qualified profile command.
+Checkpoints are mutable state; append-only evidence is immutable history.
+Neither replaces the other. Helpers verify repository/
+ignored-storage identity and safe file ownership. On the selected legacy route,
+Script Janitor retires state only after evidence retention and acknowledged
+owning cleanup. Other routes must explicitly qualify their own runtime
+storage, retention and terminal cleanup obligations rather than importing
+legacy checkpoint/ledger state.
 
 ## MCP project identity
 

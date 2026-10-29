@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Project Android operations with explicit custody and separate evidence."""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import fcntl
+import hashlib
+import json
+import os
+import selectors
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import time
+import types
+import re
+
+PROTOCOL = 1
+# Exact source bundle: verify and execute the same bytes before any dispatch.
+BUNDLE_HASHES = {
+    "android_tools_native.py": "7dc05fba9b40349761df181e018499b816dd6e1a1592cfa98fe2da2a9c11b962",
+    "android_tools_evidence.py": "fcee3620d1a42f408f5a160e461cb67b74a309a63447afb1fe1a3fcb871d4da9",
+}
+LIMIT = 262144
+
+
+class Error(ValueError):
+    pass
+
+
+def inspect_lease(command):
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = {child.stdout: bytearray(), child.stderr: bytearray()}
+    deadline = time.monotonic() + 10
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream in output:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ)
+            while selector.get_map() or child.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise Error("lease_inspection_timeout")
+                for key, _ in selector.select(0.1):
+                    data = os.read(key.fd, 65536)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                    else:
+                        output[key.fileobj].extend(data)
+                        if sum(map(len, output.values())) > LIMIT:
+                            raise Error("lease_inspection_output_limit")
+        if child.wait() != 0:
+            raise Error("lease_inspection_failed")
+        return json.loads(output[child.stdout])
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=1)
+        for stream in output:
+            stream.close()
+
+
+def load_bundle():
+    modules = {}
+    for filename, expected in BUNDLE_HASHES.items():
+        path = Path(__file__).absolute().parent / filename
+        if path.is_symlink() or not path.is_file():
+            raise Error("bundle_incomplete")
+        data = path.read_bytes()
+        if len(data) > 1048576 or hashlib.sha256(data).hexdigest() != expected:
+            raise Error("bundle_mismatch")
+        modules[filename] = (path, data)
+    loaded = {}
+    for filename, (path, data) in modules.items():
+        name = filename.removesuffix(".py")
+        module = types.ModuleType(name)
+        module.__file__ = str(path)
+        sys.modules[name] = module
+        exec(compile(data, str(path), "exec"), module.__dict__)
+        if getattr(module, "BUNDLE_PROTOCOL", None) != PROTOCOL:
+            raise Error("bundle_protocol_mismatch")
+        loaded[name] = module
+    return loaded
+
+
+def private(path, directory=False):
+    info = path.lstat()
+    if (stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077
+            or not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))):
+        raise Error("private_binding_required")
+
+
+def read_private(path):
+    private(path)
+    if path.stat().st_size > LIMIT:
+        raise Error("binding_too_large")
+    value = json.loads(path.read_bytes())
+    if not isinstance(value, dict):
+        raise Error("invalid_binding")
+    return value
+
+
+def configuration(path):
+    value = read_private(path)
+    if set(value) - {"retention"} != {
+        "schema", "source_root", "records_directory", "timeout_seconds",
+        "output_limit_bytes", "providers", "lease",
+    } or value["schema"] != PROTOCOL:
+        raise Error("unsupported_configuration")
+    retention = value.get("retention", {"max_bytes": 500000000, "max_age_seconds": 604800})
+    if (not isinstance(retention, dict)
+            or set(retention) != {"max_bytes", "max_age_seconds"}
+            or type(retention["max_bytes"]) is not int
+            or not 1048576 <= retention["max_bytes"] <= 10000000000
+            or type(retention["max_age_seconds"]) is not int
+            or not 60 <= retention["max_age_seconds"] <= 31536000):
+        raise Error("invalid_retention")
+    value["retention"] = retention
+    for key in ("source_root", "records_directory"):
+        if not isinstance(value[key], str) or not Path(value[key]).is_absolute():
+            raise Error("absolute_path_required")
+    if (type(value["timeout_seconds"]) not in (int, float)
+            or not 0 < value["timeout_seconds"] <= 300
+            or type(value["output_limit_bytes"]) is not int
+            or not 4096 <= value["output_limit_bytes"] <= 8388608):
+        raise Error("invalid_limits")
+    if set(value["providers"]) != {"mobile-native", "google-android"}:
+        raise Error("invalid_providers")
+    for provider in value["providers"].values():
+        if (set(provider) != {"executable", "version"}
+                or not Path(provider["executable"]).is_absolute()
+                or not isinstance(provider["version"], str)):
+            raise Error("invalid_provider")
+    lease = value["lease"]
+    if (not isinstance(lease, dict) or set(lease) != {
+        "schema", "executable", "pool", "runs_directory", "profiles",
+    } or lease["schema"] != 1):
+        raise Error("invalid_lease_configuration")
+    for key in ("executable", "pool", "runs_directory"):
+        if not isinstance(lease[key], str) or not Path(lease[key]).is_absolute():
+            raise Error("invalid_lease_configuration")
+    if (not isinstance(lease["profiles"], dict)
+            or not lease["profiles"]
+            or any(not isinstance(k, str) or not isinstance(v, str) or not k or not v
+                   for k, v in lease["profiles"].items())):
+        raise Error("invalid_lease_configuration")
+    return value
+
+
+def custody(config, serial):
+    if not isinstance(serial, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", serial):
+        raise Error("device_serial_required")
+    run = Path(os.environ.get("RESOURCE_LEASE_RUN_DIRECTORY", ""))
+    if not run.is_absolute():
+        raise Error("owned_run_required")
+    private(run, directory=True)
+    binding = read_private(run / "binding.json")
+    state = read_private(run / "status.json")
+    private(run / "receipt.json")
+    if (binding.get("schema") != 1 or binding.get("config") != config["lease"]
+            or run.parent != Path(config["lease"]["runs_directory"])
+            or binding.get("profile") not in config["lease"]["profiles"]
+            or state.get("phase") != "active"
+            or not 0 <= time.monotonic() - state.get("updated_at", 0) <= 30
+            or (run / "command-stop-uncertain.json").exists()
+            or any((run / name).exists() for name in ("finish.json", "stop-renewal.json"))):
+        raise Error("lease_binding_invalid")
+    lock_path = run / "helper.lock"
+    private(lock_path)
+    fd = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            raise Error("lease_owner_not_running")
+    finally:
+        os.close(fd)
+    current = inspect_lease(
+        [config["lease"]["executable"], "--root", config["lease"]["pool"],
+         "inspect", "--owner", binding["owner"], "--lease", str(run / "receipt.json")],
+    )
+    prior = state.get("lease") or {}
+    if (current.get("state") != "active" or current.get("quarantined") is not False
+            or current.get("service_available") is not True
+            or current.get("owner") != binding["owner"]
+            or current.get("capability") != binding["capability"]
+            or current.get("endpoint", {}).get("adb_serial") != serial
+            or current.get("expires_in", 0) <= 0
+            or any(current.get(key) != prior.get(key) for key in ("id", "generation", "slot"))):
+        raise Error("lease_lost_or_foreign")
+    return current
+
+
+def handoff_uncertain():
+    run = Path(os.environ["RESOURCE_LEASE_RUN_DIRECTORY"])
+    private(run, directory=True)
+    path = run / "command-stop-uncertain.json"
+    payload = b'{"schema":1,"reason":"native_runner_drain_unconfirmed"}\n'
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        private(path)
+        return
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("family", choices=("device", "preview", "docs", "evidence"))
+    parser.add_argument("action")
+    parser.add_argument("--arguments", default="{}", help="JSON operation arguments; never secrets")
+    parser.add_argument("--binding-file", help="Private binding for explicit evidence export")
+    parser.add_argument("--helper", help="Qualified project-memory executable for export")
+    parser.add_argument("--interface", choices=("standalone", "workflow"), default="standalone")
+    parser.add_argument("--include-artifacts", action="store_true")
+    args = parser.parse_args()
+    config = configuration(Path(args.config))
+    arguments = json.loads(args.arguments)
+    if not isinstance(arguments, dict):
+        raise Error("arguments_must_be_object")
+    modules = load_bundle()
+    if args.family == "evidence":
+        if args.action != "export" or set(arguments) != {"invocation_id"}:
+            raise Error("unsupported_evidence_operation")
+        if not args.binding_file or not args.helper:
+            raise Error("export_binding_required")
+        evidence = modules["android_tools_evidence"]
+        handle = evidence.open_run(Path(config["records_directory"]), arguments["invocation_id"])
+        result = evidence.export_run(
+            handle, read_private(Path(args.binding_file)), helper=Path(args.helper),
+            interface=args.interface, include_artifacts=args.include_artifacts,
+            **config["retention"],
+        )
+        print(json.dumps(dataclasses.asdict(result), sort_keys=True))
+        return 0 if result.status == "exported" else 1
+    operation = f"{args.family}.{args.action}"
+    provider_id = "mobile-native" if args.family == "device" else "google-android"
+    provider = config["providers"][provider_id]
+    safe_context = {}
+    if args.family == "device":
+        if args.action == "capture" and arguments.pop("scene", None) != "known-safe":
+            raise Error("capture_scene_unqualified")
+        lease = custody(config, arguments.get("device_serial"))
+        safe_context = {
+            "lease_id": lease["id"], "generation": lease["generation"],
+            "device_serial": arguments["device_serial"],
+        }
+    elif args.family == "preview":
+        safe_context = {"target": arguments.get("target", "")}
+    native = modules["android_tools_native"]
+    evidence = modules["android_tools_evidence"]
+    handle = evidence.begin_run(
+        Path(config["records_directory"]), operation, provider_id, safe_context,
+        **config["retention"],
+        reservation_bytes=evidence.reservation_for_operation(
+            operation, config["output_limit_bytes"],
+        ),
+    )
+    try:
+        result = native.execute_android_native(
+            provider_id, operation, arguments,
+            executable=Path(provider["executable"]), expected_version=provider["version"],
+            timeout_s=config.get("timeout_seconds", 120),
+            output_limit_bytes=config.get("output_limit_bytes", 1048576),
+            source_root=Path(config["source_root"]),
+            staging_dir=handle.staging_directory,
+        )
+        handoff = None
+        if args.family == "device" and result.error == "drain_unknown":
+            try:
+                handoff_uncertain()
+                handoff = "uncertainty_recorded"
+            except (Error, OSError, KeyError):
+                handoff = "handoff_unknown"
+        if args.family == "device":
+            try:
+                custody(config, arguments.get("device_serial"))
+            except (Error, ValueError, OSError, KeyError, subprocess.SubprocessError):
+                if result.error != "drain_unknown":
+                    result = dataclasses.replace(
+                        result, transport="unknown", effect="unknown", error="lease_lost",
+                    )
+        # Evidence is intentionally narrower than the useful interactive result.
+        manifest = evidence.finish_run(handle, result)
+    finally:
+        evidence.release_run(handle)
+    output = dataclasses.asdict(result)
+    output["local_manifest"] = str(manifest)
+    if handoff:
+        output["lease_handoff"] = handoff
+    print(json.dumps(output, sort_keys=True))
+    return 0 if result.error is None else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Error as error:
+        print(json.dumps({"error": str(error), "effect": "not_dispatched"}))
+        raise SystemExit(1)
+    except (ValueError, OSError, KeyError, subprocess.SubprocessError):
+        print(json.dumps({"error": "android_tools_rejected", "effect": "unknown"}))
+        raise SystemExit(1)

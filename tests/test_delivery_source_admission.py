@@ -2160,7 +2160,7 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid local instruction inventory"):
                 self.inspect()
 
-    def test_v2_adapter_rejects_inconsistent_real_cli_count(self):
+    def test_v2_storage_does_not_consume_inspector_cli_count(self):
         self.native_adapter_fixture()
         self.add_local_instruction()
         self.repin_native_sources()
@@ -2174,8 +2174,7 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         inspector.write_text(changed)
         self.repin_native_sources()
         result = self.adapter_call("workflow", "initialize-task")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid-memory-request", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_v2_local_instruction_real_cli_detects_end_change(self):
         path = self.add_local_instruction()
@@ -2793,7 +2792,7 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         self.assertEqual(json.loads(metadata)["byte_size"], len(content))
         self.assertEqual(raw, content)
 
-    def test_native_first_ingress_qualifies_before_task_binding_write(self):
+    def test_native_first_ingress_requires_storage_identity_not_current_source_ref(self):
         self.native_adapter_fixture()
         self.native_task = self.make_native_task(task_id="task-new", short_id="OSM-131")
         self.write_fake_kent(self.native_task)
@@ -2803,11 +2802,20 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
 
         self.installation_binding["source_ref"] = "HEAD"
         self.write_installation_binding()
-        self.native_task = self.make_native_task(task_id="task-blocked", short_id="OSM-132")
+        self.native_task = self.make_native_task(task_id="task-unpinned", short_id="OSM-132")
+        self.write_fake_kent(self.native_task)
+        unpinned = self.adapter_call("workflow", "initialize-task", task_id="task-unpinned")
+        self.assertEqual(unpinned.returncode, 0, unpinned.stderr)
+        self.assertTrue((self.memory_project / "tasks/OSM-132/task.json").is_file())
+
+        profile = self.project / ".kent/workflow-profile.toml"
+        profile.write_text(profile.read_text().replace('project_uid = "project-uid"',
+                                                       'project_uid = "foreign"'))
+        self.native_task = self.make_native_task(task_id="task-blocked", short_id="OSM-133")
         self.write_fake_kent(self.native_task)
         blocked = self.adapter_call("workflow", "initialize-task", task_id="task-blocked")
         self.assertEqual(blocked.returncode, 2)
-        self.assertFalse((self.memory_project / "tasks/OSM-132").exists())
+        self.assertFalse((self.memory_project / "tasks/OSM-133").exists())
 
     def test_fixed_legacy_task_routes_before_candidate_source_closure(self):
         self.native_adapter_fixture(legacy_task_ids=("task-legacy",))
@@ -2965,26 +2973,56 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["result"]["mode"], "r2")
 
-    def test_source_admission_mismatch_blocks_before_candidate_core_import(self):
+    def test_storage_never_imports_candidate_core_after_candidate_source_drift(self):
         self.native_adapter_fixture()
         marker = self.base / "candidate-core-imported"
         candidate_core = self.project / ".kent/scripts/workflow_project_memory.py"
         candidate_core.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
-        blocked = self.adapter_call("workflow", "initialize-task", task_id="task-new")
-        self.assertEqual(blocked.returncode, 2)
+        initialized = self.adapter_call("workflow", "initialize-task")
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
         self.assertFalse(marker.exists())
-        self.assertFalse((self.memory_project / "tasks/OSM-130").exists())
-        self.assertNotIn("candidate-core-imported", blocked.stdout + blocked.stderr)
+        self.assertTrue((self.memory_project / "tasks/OSM-130/task.json").exists())
+        self.assertNotIn("candidate-core-imported", initialized.stdout + initialized.stderr)
 
     def test_unpinned_installed_inspector_is_not_executed(self):
         self.native_adapter_fixture()
         marker = self.base / "candidate-inspector-imported"
         self.put(self.kit, "scripts/inspect-delivery-source",
                  f"from pathlib import Path\nPath({str(marker)!r}).touch()\n", 0o755)
-        blocked = self.adapter_call("workflow", "initialize-task", task_id="task-new")
-        self.assertEqual(blocked.returncode, 2)
+        initialized = self.adapter_call("workflow", "initialize-task")
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
         self.assertFalse(marker.exists())
-        self.assertFalse((self.memory_project / "tasks/OSM-130").exists())
+        self.assertTrue((self.memory_project / "tasks/OSM-130/task.json").exists())
+
+    def test_ordinary_storage_survives_drift_while_explicit_source_admission_stays_strict(self):
+        self.native_adapter_fixture()
+        profile = self.project / ".kent/workflow-profile.toml"
+        profile.write_text(profile.read_text() + "\n[unrelated]\nvalue = true\n")
+        self.put(self.project, ".kent/workflows/native-snapshot.json", '{"changed": true}\n')
+        self.put(self.kit, "workflowkit/delivery.py", "# compatible helper update\n")
+        core = self.kit / ".kent/scripts/workflow_project_memory.py"
+        core.write_text(core.read_text() + "\n# Compatible installed core update.\n")
+        (self.kit / "scripts/inspect-delivery-source").unlink()
+        # This is a storage authorization change only. Source publication still
+        # requires current qualified source, helper, profile and inspector parity.
+        with self.assertRaises(ValueError):
+            self.inspect()
+        initialized = self.adapter_call("workflow", "initialize-task")
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        published = self.adapter_call("workflow", "publish", extra={
+            "document_key": "tasks/OSM-130/plan", "expected_revision": None,
+            "content": "Ordinary storage", "operation_id": "storage-drift", "provenance": [],
+        })
+        self.assertEqual(published.returncode, 0, published.stderr)
+        read = self.adapter_call("workflow", "read", extra={"document_key": "tasks/OSM-130/plan"})
+        self.assertEqual(read.returncode, 0, read.stderr)
+        self.assertEqual(json.loads(read.stdout)["result"], json.loads(published.stdout)["result"])
+        mcp = self.adapter_call("mcp", "resolve-mcp")
+        self.assertEqual(mcp.returncode, 0, mcp.stderr)
+        profile.write_text(profile.read_text().replace('project_uid = "project-uid"',
+                                                       'project_uid = "foreign"'))
+        blocked = self.adapter_call("mcp", "resolve-mcp")
+        self.assertEqual(blocked.returncode, 2)
 
     def test_standalone_mcp_without_native_project_binding_blocks_without_effect(self):
         self.native_adapter_fixture()

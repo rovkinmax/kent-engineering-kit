@@ -11,17 +11,27 @@
   attempt budgets. Previously accepted limits remain binding until applicable
   human supersession; retain that history and carry later corrections forward.
   New scope, risk or cost still requires the applicable decision.
-- Changes to the Kent Engineering Kit, generated or live workflows, workflow
-  adapters/contracts, agent roles, or Kent configuration require one bounded
-  governance pass before mutation:
-  1. investigate the current behavior and affected surfaces;
-  2. present a preview naming the files, graph delta, rollout, rollback, and
-     restart impact;
-  3. obtain at least two independent read-only reviews of that preview;
-  4. obtain explicit user approval;
-  5. only then edit files or mutate live Kent state.
-  Ordinary product implementation does not inherit this ceremony. Approval is
-  valid for the previewed scope only; stop and present a new preview before a
+- Changes to generated or live workflows, workflow adapters/contracts, agent
+  roles, or Kent configuration retain strong governance, whether they are
+  Kit-owned or project-owned: investigate the affected behavior and surfaces,
+  preview the exact file set, graph delta, rollout, rollback, and restart
+  impact, obtain two independent read-only PASS reviews of the same preview
+  hash, and receive explicit human approval before mutation. Kit self-development
+  has one narrow exception for a semantically compatible Kit-source fix
+  selected by an authorized execution. Resolve the authoritative
+  `contracts/kit-change-policy.md`
+  through the installed `kent-engineering-kit` skill symlink under
+  `${KENT_PERSISTENCE_ROOT:-$HOME/.kent}/skills`; read it from the Kit checkout,
+  not the consumer working directory or persistence-root `contracts` copy.
+  Only that selected route may use bounded scope, focused regression tests,
+  independent final review, and CI without two preliminary reviews or
+  additional human approval solely because the fix changes Kit source.
+  It does not override another selected Workflow or apply retroactively by
+  metadata. All other Kit source changes retain the strong procedure.
+  The policy's semantic criteria—not labels, paths, diff size, or green tests—
+  determine eligibility. Product implementation does not inherit this
+  Kit-governance ceremony.
+  Approval is valid only for the previewed scope; return for review before
   material scope expansion.
 - Resolve material product or architecture decisions one at a time. Include a
   concrete recommendation and keep final authority with the user.

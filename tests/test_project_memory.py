@@ -142,7 +142,7 @@ class ProjectMemoryTests(unittest.TestCase):
                          root / "scripts/inspect-delivery-source", root / "templates/project/workflow-project-memory")]
         self.assertTrue(all(value == copies[0] for value in copies))
 
-    def test_native_adapter_v2_private_instruction_both_validators(self):
+    def test_native_storage_v2_private_instruction_drift_is_historical_metadata(self):
         installed, source, environment = self.native_adapter_fixture()
         ignore = source / ".gitignore"
         ignore.write_text(ignore.read_text() + "\n.kent/skills/private/\n")
@@ -177,7 +177,7 @@ class ProjectMemoryTests(unittest.TestCase):
         path.write_bytes(b"changed private fixture\n")
         result = self.adapter_call(installed, source, None, "initialize-task",
                                    native_environment=environment, interface="workflow")
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_report_only_preparation_requires_gate_before_writing_and_retries_exactly(self):
         import workflowkit.project_memory as core
@@ -1100,12 +1100,26 @@ class ProjectMemoryTests(unittest.TestCase):
             if arguments[0] == "project":
                 return b"project-native\n"
             if arguments[0] == "task":
-                return json.dumps({"summary": {"workflow_id": "workflow-native"}}).encode()
+                return json.dumps({
+                    "summary": {"id": "task-native", "project_id": "project-native",
+                                "workflow_id": "workflow-native"},
+                    "source_workspace": {"root_path": str(source), "is_primary": True,
+                                         "workspace_id": "workspace-native"},
+                    "project": {"default_workspace_id": "workspace-native"},
+                    "worktree_path": None,
+                    "current_scripts": [{"current_node": {
+                        "node_id": "node-script", "transition_branch_key": None}}],
+                }).encode()
             return json.dumps(graph).encode()
 
         import workflowkit.project_memory as core
-        with patch.dict(require.__globals__, {
+        with patch.dict(os.environ, {}, clear=True), patch.dict(require.__globals__, {
                 "git_root": lambda value: source, "native_read": read,
+                "confirm_source_binding": lambda installation: None,
+                "PREADMISSION": {"mode": "r2", "standalone": False,
+                                 "project_id": "project-native", "workspace": str(source),
+                                 "primary_root": str(source), "task_id": "task-native",
+                                 "primary_workspace_id": "workspace-native"},
                 "record_bytes": lambda *args, **kwargs: (
                     b'[commands]\nplan_contract_accept = '
                     b'".kent/scripts/workflow-plan-contract-accept"\n')}):
@@ -1117,6 +1131,17 @@ class ProjectMemoryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     require(core, request)
                 graph["graph"]["nodes"][0][key] = original
+            with patch.dict(require.__globals__, {
+                    "record_bytes": Mock(side_effect=[
+                        b'[commands]\nplan_contract_accept = ".kent/scripts/workflow-plan-contract-accept"\n',
+                        b'[commands]\nplan_contract_accept = ".kent/scripts/changed"\n',
+                    ])}):
+                with self.assertRaisesRegex(ValueError, "selector changed before effect"):
+                    require(core, request)
+            with patch.dict(require.__globals__, {
+                    "confirm_source_binding": Mock(side_effect=ValueError("binding changed"))}):
+                with self.assertRaisesRegex(ValueError, "binding changed"):
+                    require(core, request)
             with self.assertRaises(ValueError):
                 require(core, {"workspace_path": str(source)})
 
@@ -1297,6 +1322,10 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
         self.native_project_list_root = str(project)
         self.native_task_show_log = base / "native-task-show.log"
         self.native_command_log = base / "native-command.log"
+        self.native_graph_nodes = [{
+            "id": "node-accept", "kind": "script",
+            "script_path": ".kent/scripts/workflow-plan-contract-accept",
+        }]
 
         def write_fake_kent():
             binary = self.bin / "kent"
@@ -1323,6 +1352,7 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
                     "problems": [],
                 }
             worktree_status_json = json.dumps(native_worktree_status)
+            graph_nodes_json = json.dumps(self.native_graph_nodes)
             binary.write_text(
                 f"#!{sys.executable}\n"
                 "import json, sys\n"
@@ -1336,9 +1366,11 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
                 f"task_show_log = {str(self.native_task_show_log)!r}\n"
                 f"native_command_log = {str(self.native_command_log)!r}\n"
                 f"workflow = {workflow_id!r}\n"
+                f"worktree = {self.native_task.get('worktree_path')!r}\n"
+                f"graph_nodes = json.loads({graph_nodes_json!r})\n"
                 "with open(native_command_log, 'a', encoding='utf-8') as output:\n"
                 "    output.write(json.dumps(args) + '\\n')\n"
-                "if len(args) == 2 and args[0] == 'project' and args[1] == project:\n"
+                "if len(args) == 2 and args[0] == 'project' and args[1] in (project, worktree):\n"
                 "    print('project-test')\n"
                 "elif args == ['project', 'list']:\n"
                 "    print('project-test\\tFixture\\t' + native_project_list_root)\n"
@@ -1364,9 +1396,7 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
                 "    print(json.dumps({'scope': {'project_id': 'project-test'}, "
                 "'tasks': rows}))\n"
                 "elif args == ['workflow', 'graph', 'inspect', workflow, '--json']:\n"
-                "    print(json.dumps({'workflow_id': workflow, 'graph': {'nodes': [{"
-                "'id': 'node-accept', 'kind': 'script', "
-                "'script_path': '.kent/scripts/workflow-plan-contract-accept'}]}}))\n"
+                "    print(json.dumps({'workflow_id': workflow, 'graph': {'nodes': graph_nodes}}))\n"
                 "else:\n"
                 "    sys.exit(2)\n")
             binary.chmod(0o700)
@@ -1485,6 +1515,337 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
         return subprocess.run([str(self.bin / "kent-project-memory"), interface],
                               input=payload, text=raw_body is None, capture_output=True,
                               env=environment, cwd=source, timeout=120)
+
+    def test_ordinary_storage_ignores_source_drift_but_preserves_r2_identity(self) -> None:
+        installed, source, environment = self.native_adapter_fixture()
+        profile = source / ".kent/workflow-profile.toml"
+        profile.write_text(profile.read_text() + "\n[unrelated]\nchanged = true\n")
+        (self.kit / "scripts/inspect-delivery-source").write_text(
+            "raise RuntimeError('ordinary storage must not execute inspector')\n")
+        (self.kit / "workflowkit/delivery.py").write_text("# unrelated helper update\n")
+        (source / ".kent/project-contract.md").write_text("Updated instructions.\n")
+        core = installed / "workflow_project_memory.py"
+        core.write_text(core.read_text() + "\n# Safe compatible installed update.\n")
+        (source / ".kent/scripts/workflow_project_memory.py").write_text(
+            "raise RuntimeError('product-local core must not be imported')\n")
+        initialized = self.adapter_call(
+            installed, source, None, "initialize-task", interface="workflow",
+            native_environment=environment)
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        published = self.adapter_call(
+            installed, source, None, "publish", interface="workflow",
+            native_environment=environment, document_key="tasks/OSM-130/plan",
+            expected_revision=None, content="Storage remains authorized",
+            operation_id="source-drift", provenance=[])
+        self.assertEqual(published.returncode, 0, published.stderr)
+        read = self.adapter_call(
+            installed, source, None, "read", interface="workflow",
+            native_environment=environment, document_key="tasks/OSM-130/plan")
+        self.assertEqual(read.returncode, 0, read.stderr)
+        self.assertEqual(json.loads(read.stdout)["result"], json.loads(published.stdout)["result"])
+        (self.kit / "scripts/inspect-delivery-source").unlink()
+        # Each invocation loads the current safely bound installed bytes, not a
+        # receipt-pinned or product-local copy.
+        update_marker = self.kit / "compatible-core-loaded"
+        core.write_text(core.read_text() + (
+            f"\nPath({str(update_marker)!r}).write_text('current installed bytes')\n"))
+        mcp = self.adapter_call(installed, source, None, "resolve-mcp",
+                                native_environment=environment)
+        self.assertEqual(mcp.returncode, 0, mcp.stderr)
+        self.assertEqual(update_marker.read_text(), "current installed bytes")
+        profile.write_text(profile.read_text().replace('project_uid = "project-a"',
+                                                       'project_uid = "foreign"'))
+        blocked = self.adapter_call(installed, source, None, "resolve-mcp",
+                                    native_environment=environment)
+        self.assertEqual(blocked.returncode, 2)
+
+    def test_acceptance_uses_primary_selector_not_matching_script_and_caller_map(self) -> None:
+        installed, primary, environment = self.native_adapter_fixture()
+        initialized = self.adapter_call(
+            installed, primary, None, "initialize-task", interface="workflow",
+            native_environment=environment)
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        worktree = primary.parent / "caller"
+        subprocess.run(["git", "-C", str(primary), "worktree", "add", "--detach",
+                        str(worktree), "HEAD"], check=True, capture_output=True)
+        self.native_task["worktree_path"] = str(worktree)
+        # A real current Script and caller-local mapping agree, but PRIMARY does not.
+        self.native_graph_nodes[0]["script_path"] = ".kent/scripts/unrelated-script"
+        self._write_adapter_fake_kent()
+        profile = worktree / ".kent/workflow-profile.toml"
+        profile.write_text(profile.read_text().replace(
+            ".kent/scripts/workflow-plan-contract-accept", ".kent/scripts/unrelated-script"))
+        context = {"task_id": "task-native", "node_id": "node-accept"}
+        script_environment = {"PATH": environment["PATH"]}
+        # On an empty task this would create a plan if the selector check were
+        # bypassed; an existing plan must not hide the authorization failure.
+        prepared = self.adapter_call(
+            installed, worktree, None, "prepare-report-only", interface="workflow",
+            native_environment=script_environment, native_context=context, provenance=[])
+        self.assertEqual(prepared.returncode, 2, prepared.stdout + prepared.stderr)
+        self.assertFalse((self.store.path / "tasks/OSM-130/plan").exists())
+        plan = self.store.publish("tasks/OSM-130/plan", None, "Reviewed plan",
+                                  operation_id="plan", provenance=[])
+        read = self.adapter_call(
+            installed, worktree, None, "read", interface="workflow",
+            native_environment=script_environment, native_context=context,
+            document_key="tasks/OSM-130/plan")
+        self.assertEqual(read.returncode, 0, read.stderr)
+        for operation, fields in (
+                ("accept-plan", {"expected_revision": plan.token, "expected_accepted": None,
+                                 "metadata": {"work_kind": "feature", "authority_refs": ["human:1"]}}),
+                ("prepare-report-only", {"provenance": []})):
+            with self.subTest(operation=operation):
+                result = self.adapter_call(
+                    installed, worktree, None, operation, interface="workflow",
+                    native_environment=script_environment, native_context=context, **fields)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIsNone(self.store.accepted_head("OSM-130"))
+        self.assertEqual(self.store.read("tasks/OSM-130/plan").token, plan.token)
+        # The genuine PRIMARY command remains accepted even when the caller's
+        # local mapping is still unrelated; drift cannot choose the selector.
+        self.native_graph_nodes[0]["script_path"] = ".kent/scripts/workflow-plan-contract-accept"
+        self._write_adapter_fake_kent()
+        accepted = self.adapter_call(
+            installed, worktree, None, "accept-plan", interface="workflow",
+            native_environment=script_environment, native_context=context,
+            expected_revision=plan.token, expected_accepted=None,
+            metadata={"work_kind": "feature", "authority_refs": ["human:1"]})
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIsNotNone(self.store.accepted_head("OSM-130"))
+        # prepare-report-only also succeeds through the primary selector on a
+        # fresh, genuinely native-bound task, independently of the caller map.
+        self.native_task["summary"]["short_id"] = "OSM-131"
+        self.native_task["summary"]["id"] = "task-report"
+        self._write_adapter_fake_kent()
+        self.store.initialize_task("OSM-131", None, [{
+            "namespace": "kent", "project_id": "project-test", "task_id": "task-report",
+        }])
+        prepared = self.adapter_call(
+            installed, worktree, None, "prepare-report-only", interface="workflow",
+            native_environment=script_environment,
+            native_context={"task_id": "task-report", "node_id": "node-accept"}, provenance=[])
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.assertEqual(self.store.read("tasks/OSM-131/plan").path.read_text(), "not-applicable\n")
+
+    def test_missing_or_unsafe_primary_selector_blocks_only_acceptance(self) -> None:
+        installed, source, environment = self.native_adapter_fixture()
+        initialized = self.adapter_call(
+            installed, source, None, "initialize-task", interface="workflow",
+            native_environment=environment)
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        plan = self.store.publish("tasks/OSM-130/plan", None, "Reviewed plan",
+                                  operation_id="plan", provenance=[])
+        profile = source / ".kent/workflow-profile.toml"
+        original = profile.read_text()
+        line = 'plan_contract_accept = ".kent/scripts/workflow-plan-contract-accept"'
+        for replacement in ('unrelated = "value"', 'plan_contract_accept = "../unsafe"',
+                            'plan_contract_accept = ""', 'plan_contract_accept = 7'):
+            with self.subTest(mapping=replacement):
+                profile.write_text(original.replace(line, replacement))
+                read = self.adapter_call(
+                    installed, source, None, "read", interface="workflow",
+                    native_environment=environment, document_key="tasks/OSM-130/plan")
+                self.assertEqual(read.returncode, 0, read.stderr)
+                mcp = self.adapter_call(installed, source, None, "resolve-mcp",
+                                        native_environment=environment)
+                self.assertEqual(mcp.returncode, 0, mcp.stderr)
+                for operation, fields in (
+                        ("accept-plan", {"expected_revision": plan.token, "expected_accepted": None,
+                                         "metadata": {"work_kind": "feature",
+                                                      "authority_refs": ["human:1"]}}),
+                        ("prepare-report-only", {"provenance": []})):
+                    blocked = self.adapter_call(
+                        installed, source, None, operation, interface="workflow",
+                        native_environment={"PATH": environment["PATH"]},
+                        native_context={"task_id": "task-native", "node_id": "node-accept"},
+                        **fields)
+                    self.assertEqual(blocked.returncode, 2)
+                self.assertIsNone(self.store.accepted_head("OSM-130"))
+                self.assertEqual(self.store.read("tasks/OSM-130/plan").token, plan.token)
+
+    def test_acceptance_selector_rejects_caller_mapping_in_isolation(self) -> None:
+        adapter = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-project-memory"))
+        require = adapter["require_acceptance_script"]
+        primary, caller = Path("/primary"), Path("/caller")
+        task = {
+            "summary": {"id": "task-native", "project_id": "project-test",
+                        "workflow_id": "workflow-native"},
+            "source_workspace": {"root_path": str(primary), "is_primary": True,
+                                 "workspace_id": "workspace-test"},
+            "project": {"default_workspace_id": "workspace-test"},
+            "worktree_path": str(caller),
+            "current_scripts": [{"current_node": {"node_id": "node-unrelated",
+                                                  "transition_branch_key": None}}],
+        }
+        graph = {"workflow_id": "workflow-native", "graph": {"nodes": [{
+            "id": "node-unrelated", "kind": "script",
+            "script_path": ".kent/scripts/unrelated-script",
+        }]}}
+
+        def native_read(arguments, _workspace):
+            if arguments[0] == "project":
+                return b"project-test\n"
+            return json.dumps(task if arguments[0] == "task" else graph).encode()
+
+        def profile_read(_core, path, **_kwargs):
+            command = ("workflow-plan-contract-accept" if path.parent.parent == primary
+                       else "unrelated-script")
+            return f'[commands]\nplan_contract_accept = ".kent/scripts/{command}"\n'.encode()
+
+        with patch.dict(os.environ, {}, clear=True), patch.dict(require.__globals__, {
+                "native_read": native_read, "git_root": lambda value: Path(value),
+                "record_bytes": profile_read,
+                "PREADMISSION": {"mode": "r2", "standalone": False,
+                                 "project_id": "project-test", "workspace": str(caller),
+                                 "primary_root": str(primary), "task_id": "task-native",
+                                 "primary_workspace_id": "workspace-test"}}):
+            with self.assertRaisesRegex(ValueError, "does not own acceptance"):
+                require(sys.modules[ProjectMemory.__module__], {
+                    "workspace_path": str(caller),
+                    "native_context": {"task_id": "task-native", "node_id": "node-unrelated"}})
+
+    def test_installed_core_executes_verified_bytes_without_reopening(self) -> None:
+        installed, _, _, _ = self.adapter_fixture()
+        adapter = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "templates/project/workflow-project-memory"))
+        load = adapter["load_core"]
+        source = installed / "workflow_project_memory.py"
+        verified = source.read_bytes()
+
+        def replace_after_read(*_args, **_kwargs):
+            source.write_text("raise RuntimeError('second open executed different bytes')\n")
+            return verified
+
+        with patch.dict(load.__globals__, {"record_bytes": replace_after_read}):
+            module = load(self.kit, self.receipt)
+        self.assertTrue(callable(module.ProjectMemory))
+
+    def test_storage_rejects_malformed_requests_and_private_records_before_core_import(self) -> None:
+        installed, source, environment = self.native_adapter_fixture()
+        marker = self.kit / "core-imported"
+        core = installed / "workflow_project_memory.py"
+        core.write_text(core.read_text() + f"\nPath({str(marker)!r}).touch()\n")
+
+        def blocked(operation="initialize-task", **fields):
+            result = self.adapter_call(
+                installed, source, None, operation, interface="workflow",
+                native_environment=environment, **fields)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertNotIn(str(self.root), result.stderr)
+            self.assertFalse(marker.exists())
+            self.assertFalse((self.store.path / "tasks/OSM-130").exists())
+
+        blocked("unknown-operation")
+        blocked(extra="unknown-field")
+        blocked(schema="r2-workflow-request-v9")
+        # Record integrity and closed schemas remain mandatory, even though
+        # historical source digests no longer admit current installed code.
+        original_binding = dict(self.installation_binding)
+        for change in (
+                {"extra": True}, {"schema": "r2-installation-binding-v1"},
+                {"project_id": "foreign"}, {"primary_root": str(self.kit)},
+                {"primary_workspace_id": "foreign"}, {"profile_sha256": "bad"},
+                {"receipt_sha256": "0" * 64}, {"helper_bindings": []}):
+            with self.subTest(binding=change):
+                self.installation_binding_path.write_text(json.dumps(original_binding | change))
+                blocked()
+        self.write_adapter_binding()
+        original_receipt = json.loads(json.dumps(self.receipt))
+        for change in (
+                {"extra": True}, {"schema": "delivery-runtime-publication-unknown"},
+                {"project_id": "foreign"}, {"workflow_id": "bad identity"},
+                {"source_commit": "bad"}, {"policy": "published_source_v1"},
+                {"project_memory": {**original_receipt["project_memory"],
+                                    "project_uid": "foreign"}},
+                {"project_memory": {**original_receipt["project_memory"],
+                                    "legacy_task_ids": ["same", "same"]}},
+                {"files": [original_receipt["files"][0], original_receipt["files"][0]]}):
+            with self.subTest(receipt=change):
+                self.receipt = original_receipt | change
+                self.pin_adapter_receipt()
+                self.write_adapter_binding()
+                blocked()
+        self.receipt = original_receipt
+        self.pin_adapter_receipt()
+        self.write_adapter_binding()
+        result = self.adapter_call(
+            installed, source, None, "initialize-task", interface="workflow",
+            native_environment=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists())
+
+    def test_storage_rejects_hardlinked_and_writable_installed_core(self) -> None:
+        installed, source, binding, _ = self.adapter_fixture()
+        core = installed / "workflow_project_memory.py"
+        core.chmod(0o666)
+        writable = self.adapter_call(installed, source, binding, "resolve-mcp")
+        self.assertEqual(writable.returncode, 2)
+        self.assertEqual(writable.stdout, "")
+        core.chmod(0o644)
+        os.link(core, installed / "hardlinked-core.py")
+        hardlinked = self.adapter_call(installed, source, binding, "resolve-mcp")
+        self.assertEqual(hardlinked.returncode, 2)
+        self.assertEqual(hardlinked.stdout, "")
+
+    def test_facade_upgrade_keeps_private_binding_selected_core_root(self) -> None:
+        installed, source, environment = self.native_adapter_fixture()
+        binding_before = self.installation_binding_path.read_bytes()
+        receipt_before = self.receipt_path.read_bytes()
+        facade = self.kit.parent / "facade"
+        facade.mkdir()
+        shutil.copyfile(installed / "workflow-project-memory", facade / "workflow-project-memory")
+        (facade / "workflow-project-memory").chmod(0o755)
+        poison = "raise RuntimeError('facade or caller core must not be imported')\n"
+        (facade / "workflow_project_memory.py").write_text(poison)
+        (source / ".kent/scripts/workflow_project_memory.py").write_text(poison)
+        adapter_link = self.bin / "kent-project-memory"
+        adapter_link.unlink()
+        adapter_link.symlink_to(facade / "workflow-project-memory")
+        # The facade and caller copies are deliberately incompatible. Only the
+        # unchanged core at the private binding's Kit root can satisfy storage.
+        result = self.adapter_call(
+            installed, source, None, "initialize-task", interface="workflow",
+            native_environment=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mcp = self.adapter_call(installed, source, None, "resolve-mcp",
+                                native_environment=environment)
+        self.assertEqual(mcp.returncode, 0, mcp.stderr)
+        self.assertEqual(self.installation_binding_path.read_bytes(), binding_before)
+        self.assertEqual(self.receipt_path.read_bytes(), receipt_before)
+
+    def test_app_shaped_resolve_plan_caller_keeps_legacy_fields_and_additive_comparison(self) -> None:
+        installed, source, environment = self.native_adapter_fixture()
+        initialized = self.adapter_call(
+            installed, source, None, "initialize-task", interface="workflow",
+            native_environment=environment)
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        first = self.store.publish("tasks/OSM-130/plan", None, "- [ ] Implement\n",
+                                   operation_id="plan", provenance=[])
+        current = self.store.publish("tasks/OSM-130/plan", first.token, "- [x] Implement\n",
+                                     operation_id="progress", provenance=[])
+        for supplied_path, supplied in ((str(first.path), first), ("not-applicable", current)):
+            with self.subTest(plan_path=supplied_path):
+                response = self.adapter_call(
+                    installed, source, None, "resolve-plan", interface="workflow",
+                    native_environment=environment, plan_path=supplied_path)
+                self.assertEqual(response.returncode, 0, response.stderr)
+                result = json.loads(response.stdout)["result"]
+                # The older App caller consumes these four fields unchanged.
+                legacy_keys = {"supplied_revision", "working_revision",
+                               "working_path", "working_sha256"}
+                self.assertEqual({key: result[key] for key in legacy_keys}, {
+                    "supplied_revision": supplied.token, "working_revision": current.token,
+                    "working_path": str(current.path), "working_sha256": current.sha256,
+                })
+                comparison = self.store.compare_plan_revisions(
+                    "OSM-130", supplied.token, current.token)
+                self.assertEqual(set(result), legacy_keys | {
+                    "supplied_sha256", "supplied_comparison"})
+                self.assertEqual(result["supplied_sha256"], supplied.sha256)
+                self.assertEqual(result["supplied_comparison"], comparison["comparison"])
 
     def test_native_adapter_legacy_requires_verified_task_workspace(self) -> None:
         installed, source, environment = self.native_adapter_fixture(legacy=True)
@@ -1690,7 +2051,7 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
         profile.write_text(profile.read_text() + "\n# changed after qualification\n")
         changed = self.adapter_call(installed, source, None, "resolve-mcp",
                                     native_environment=environment)
-        self.assertEqual(changed.returncode, 2)
+        self.assertEqual(changed.returncode, 0, changed.stderr)
 
     def test_native_helper_knowledge_publish_preserves_accepted_plan_digest(self) -> None:
         installed, source, environment = self.native_adapter_fixture()
@@ -1883,6 +2244,14 @@ store.publish(sys.argv[2], sys.argv[3], "next", operation_id="crash-write",
 
     def test_real_mcp_wrappers_with_installed_adapter_and_core(self) -> None:
         installed, source, binding, _ = self.adapter_fixture()
+        # Real list/call wrappers must not inherit whole-source admission from
+        # the installed storage interface, for standalone or native callers.
+        profile = source / ".kent/workflow-profile.toml"
+        profile.write_text(profile.read_text() + "\n# Non-storage profile change.\n")
+        (self.kit / "scripts/inspect-delivery-source").unlink()
+        (self.kit / "workflowkit/delivery.py").write_text("# unrelated helper update\n")
+        core = installed / "workflow_project_memory.py"
+        core.write_text(core.read_text() + "\n# Safe installed core update.\n")
         executable = installed / "workflow-project-memory"
         home = self.home
         adapter_link = self.bin / "kent-project-memory"

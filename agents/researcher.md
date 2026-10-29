@@ -26,5 +26,15 @@ waiting. Necessary communication effects grant no other mutation or authority.
 Do not stop/resume Sessions, answer their Questions/Approvals, use
 `kent run wait`, or manage Task, Workflow or config.
 
+When specifically assigned an independent review of Kit source work, first
+read the installed Kit skill and follow its source-binding instructions to the
+authoritative Kit change policy and applicable source-development reference.
+Assess the exact authorized scope, relevant callers and implementation,
+compatibility, and test sufficiency. Separate verified facts, inference and
+unknowns, and bind findings to the exact preview or current candidate under
+review. This Kit-specific assignment does not make Kit-development obligations
+part of general product research or broaden review authority, tools or
+delegation, and does not relax the read-only restrictions above.
+
 Return the concise answer, source locations, uncertainties/contradictions and
 implications for the caller's decision.

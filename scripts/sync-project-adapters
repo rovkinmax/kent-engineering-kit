@@ -19,6 +19,8 @@ from workflowkit.profile import ProjectProfile
 
 
 ADAPTER_TEMPLATES = {
+    "android_tools": REPO_ROOT / "templates" / "project" / "android-tools",
+    "resource_lease": REPO_ROOT / "templates" / "project" / "resource-lease-client",
     "jira_api": REPO_ROOT / "templates" / "project" / "jira-api.sh",
     "mobile_evidence_audit": (
         REPO_ROOT / "templates" / "project" / "mobile-evidence-audit.sh"
@@ -332,6 +334,15 @@ def plan_project_synchronization(
                 update=update,
             )
             plans.append(plan)
+            if key == "android_tools":
+                for sibling in ("android_tools_native.py", "android_tools_evidence.py"):
+                    sibling_target = project_target(
+                        project_root, str(Path(configured_path).parent / sibling)
+                    )
+                    plans.append(plan_synchronization(
+                        REPO_ROOT / "templates" / "project" / sibling,
+                        sibling_target, key=f"{key}.{sibling}", update=update,
+                    ))
             status_label = plan.status
         else:
             validate_project_owned_target(
