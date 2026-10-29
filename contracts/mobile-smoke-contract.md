@@ -3,24 +3,48 @@
 Projects load this contract conditionally from their runtime procedure and
 supply platform targeting, installation, login, resource and evidence adapters.
 
+## Project Operation Policy
+
+Load the project's canonical operation policy before applying these defaults.
+Applicable original authority recorded there may permit account changes,
+credential use, retries and reset of owned pool resources without another question.
+Do not transfer one project's authority to another project, production targets,
+private devices or another owner. Secret use does not permit secret disclosure.
+Authentication alone does not prohibit useful scoped diagnostics. Concrete human
+budgets remain binding; there is no universal one-attempt budget or requirement
+to restore disposable account data. Restore state when the scenario or protected
+resource policy requires it.
+
+## Opt-in standalone resource leases
+
+Projects may opt into the separate
+[resource-lease integration](resource-lease-integration.md) for newly managed
+pool devices. This does not replace the legacy lock protocol for existing
+consumers or permit mixing legacy devices into the new pool. The project
+procedure chooses one protocol explicitly and retains that binding through
+checkpoint, all device operations and cleanup. Existing retained runs finish
+under their original protocol. New consumers require compatible freshly loaded
+instructions, the pinned CLI and project configuration.
+
 ## Installation And App-Data Safety
 
 Distinguish a fresh task binary, preservation-only replacement and destructive
 reset. Normal authorized Smoke may build/install through the preservation
 adapter; incompatible signer, downgrade, unknown metadata or failed replacement
-blocks installation. Never retry destructively.
+blocks that preservation operation. Applicable project policy may authorize a
+reset/reinstall route through the resource owner's lifecycle.
 
 Uninstall, clear-data, downgrade, simulator erase or equivalent reset requires
-explicit action-specific authority. Test/login permission is not reset
+applicable authority, including standing project policy. Test/login permission alone is not reset
 permission. Reconcile checkpoint artifact/install proof before repeating work.
 Record authentication only as authenticated, unauthenticated or unknown;
-never retain credential values or authenticated content.
+never retain credential values. Apply project data policy to authenticated content.
 
 ## Default Authorization
 
 On an acquired test emulator/simulator, focused declared Smoke may inspect an
 already-authenticated app, navigate, scroll, move focus and exercise reversible
-local settings with original-state restoration. Package-scoped liveness/crash
+local settings, restoring where required by policy/scenario. Package-scoped liveness/crash
 checks are permitted; open-ended exploration is not.
 
 When semantics are insufficient, use scoped visual inspection. Relevant
@@ -32,7 +56,7 @@ a separate effect.
 
 ## Explicit Authorization Required
 
-Require applicable original authority for physical devices/additional emulators,
+Absent standing project authority, require original authority for physical devices/additional emulators,
 credentials/MFA/permissions/secrets, destructive resets and account/server/
 purchase/subscription/progress mutations. Local navigation alone is not an
 external effect. Prefer non-mutating observation or deterministic tests when
@@ -56,11 +80,11 @@ ambiguity.
 
 ## Authorized Login Recovery
 
-Login guidance belongs to the project procedure. This contract grants no
-credential-entry authority.
+Login guidance and standing authority belong to project policy and procedure.
+This generic contract grants no project-specific credential authority.
 
 - Reconcile checkpoint and destination first; skip input when already
-  authenticated. Verify original task/account/environment/action consent.
+  authenticated. Verify applicable account/environment/action authority, including project policy.
   Unknown authority blocks secret entry, not permitted read-only diagnosis.
 - Prove exact eligible target, control identity/focus and a secret-safe input/
   readback path covering transcripts, logs and temporary capture before input.
@@ -83,20 +107,26 @@ credential-entry authority.
 
 ## Interaction Proof
 
-Before acquisition, verify current Task/Session identity through the qualified
+For Workflow Smoke, verify current Task/Session identity through the qualified
 profile identity command and choose an eligible exact target/form factor.
 Persist the adapter's validated resource/token result before device actions.
 Script owners use [typed Script leases](mobile-script-lease-contract.md),
 never impersonate Sessions or place Script tokens in evidence.
 
-Evidence setup must succeed before acquisition/install/input. Use permitted
+Required Workflow evidence setup must succeed before acquisition/install/input. Use permitted
 project evidence commands; missing persistence capability is not permission
 for source edits, shell-write substitution or tool-policy changes.
+
+Standalone execution requires no native Task or R2 admission. Its synchronous
+lease owner maintains renewal and cleanup; the facade checks private binding,
+live ownership and exact endpoint before dispatch. Local sanitized outcome records
+support recovery. Explicit export is separate: export failure cannot replay an
+action or satisfy a Workflow completion requirement.
 
 Prefer semantic targets. For required directional navigation, establish focus,
 derive bounded routes and verify results; replan on mismatch. Blind fixed
 event loops are not proof. For mutable controls, prove identity/focus, original
-state, changed state and intended local effect, then restore and verify.
+state, changed state and intended local effect; restore only where required.
 Visibility and event counts alone do not establish success.
 
 Settle owned runners, instrumentation, app processes, fixtures and kept-open

@@ -1303,6 +1303,18 @@ jq -e '.assertion == "passed" and .assertionResults == ["passed"]' \
 jq -e '.action == "unknown"' "$tmp/positive-with-contradictory-error.out" >/dev/null
 
 echo r2 >"$home/.kent/mcp-mode"
+# Caller instructions and graph artifacts are not storage authority. The real
+# installed-core/receipt boundary is exercised by test_project_memory.py; this
+# wire fixture ensures wrappers do not add their own source-admission gate.
+mkdir -p "$r2_worktree/.kent/workflows" "$r2_worktree/.kent/scripts"
+echo '# unrelated caller profile update' >"$r2_worktree/.kent/workflow-profile.toml"
+echo '{"unpublished_graph_artifact":true}' >"$r2_worktree/.kent/workflows/candidate.json"
+cat >"$r2_worktree/.kent/scripts/inspect-delivery-source" <<'SH'
+#!/usr/bin/env bash
+echo "unexpected caller source admission" >&2
+exit 97
+SH
+chmod +x "$r2_worktree/.kent/scripts/inspect-delivery-source"
 test ! -e "$r2_worktree/.todo"
 test ! -e "$r2_worktree/build/mcp-cache"
 r2_trace_start="$(wc -l <"$home/.kent/mcp-protocol.jsonl" | tr -d '[:space:]')"

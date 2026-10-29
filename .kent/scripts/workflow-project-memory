@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve workflow-owned project memory using the qualified sibling core."""
+"""Resolve workflow-owned project memory using the safely bound installed core."""
 from __future__ import annotations
 
 import importlib.util
@@ -249,24 +249,16 @@ def read_fd(fd, name, *, maximum, private):
 
 def load_core(kit_root: Path, receipt: dict):
     source = kit_root / ".kent/scripts/workflow_project_memory.py"
-    info = source.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
-        raise ValueError("unsafe installed memory core")
-    item = next((item for item in receipt["files"]
-                 if item.get("root") == str(kit_root)
-                 and item.get("relative_path") == ".kent/scripts/workflow_project_memory.py"), None)
-    if not isinstance(item, dict):
-        raise ValueError("qualified installed memory core is absent")
-    raw = record_bytes(None, source, private=False)
-    if (len(raw) != item["byte_size"]
-            or hashlib.sha256(raw).hexdigest() != item["sha256"]):
-        raise ValueError("qualified installed memory core differs")
+    # The private installation binding selects the code root. The receipt is
+    # historical publication metadata, not a pin on compatible installed code.
+    raw = record_bytes(None, source, private=False, maximum=MAX_SOURCE_FILE_BYTES)
     spec = importlib.util.spec_from_file_location("workflow_project_memory", source)
     if spec is None or spec.loader is None:
         raise ValueError("installed memory core unavailable")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    # Execute exactly the stable, safe-file read above, without a loader reopen.
+    exec(compile(raw, str(source), "exec"), module.__dict__)
     return module
 
 
@@ -312,12 +304,8 @@ def resolve_standalone(core, request):
         allow_nan=False).encode("utf-8")).hexdigest()
     if binding_digest != expected.get("standalone_binding_sha256"):
         raise ValueError("standalone binding changed after source admission")
-    profile_path = workspace / ".kent/workflow-profile.toml"
-    profile = tomllib.loads(record_bytes(core, profile_path, private=False).decode())
-    config = profile.get("project_memory")
-    if not isinstance(config, dict) or set(config) != {
-            "root", "project_key", "project_uid", "mode"} or config["mode"] != "r2":
-        raise ValueError("R2 profile required")
+    confirm_source_binding(expected)
+    config = expected["config"]
     store = core.ProjectMemory(Path(config["root"]), config["project_key"], config["project_uid"])
     store._project()
     task = store._task(binding["task_key"])
@@ -415,8 +403,6 @@ def installation_records(project_id, primary, primary_workspace_id=None):
     if not isinstance(binding["profile_sha256"], str) or not SHA256_PATTERN.fullmatch(
             binding["profile_sha256"]):
         raise ValueError("invalid installed profile digest")
-    if profile_raw is None or hashlib.sha256(profile_raw).hexdigest() != binding["profile_sha256"]:
-        raise ValueError("qualified primary profile differs")
     if not isinstance(config, dict) or set(config) != {
             "root", "project_key", "project_uid", "mode"} or config["mode"] != "r2":
         raise ValueError("installed R2 configuration incomplete")
@@ -810,11 +796,15 @@ def confirm_source_binding(installation):
     profile_raw = record_bytes(
         None, Path(installation["primary_root"]) / ".kent/workflow-profile.toml",
         private=False, maximum=MAX_NATIVE_OUTPUT)
-    if hashlib.sha256(profile_raw).hexdigest() != installation["profile_sha256"]:
-        raise ValueError("primary profile changed during admission")
+    if tomllib.loads(profile_raw.decode("utf-8")).get("project_memory") != installation["config"]:
+        raise ValueError("primary storage configuration changed during admission")
 
 
 def preflight_source_admission(interface, request):
+    if interface == "workflow" and request.get("operation") != "resolve-janitor":
+        bootstrap_closed(request, workflow_request_fields(request), "r2-workflow-request-v1")
+    elif interface == "mcp":
+        bootstrap_closed(request, mcp_request_fields(request), "r2-mcp-request-v1")
     standalone = interface == "mcp" and "standalone_binding" in request
     if standalone and "task_locator" in request:
         raise ValueError("standalone binding conflicts with Task locator")
@@ -856,12 +846,10 @@ def preflight_source_admission(interface, request):
         installation = installation_records(project_id, primary)
         if installation["mode"] != "r2":
             raise ValueError("standalone R2 source binding unavailable")
-        inspection = run_source_inspector(installation, project_id, primary, workspace)
         confirm_source_binding(installation)
         return {
             **installation, "mode": "r2", "interface": interface,
             "standalone": True, "workspace": str(workspace), "task_id": None,
-            "inspection": inspection,
             "standalone_binding_sha256": hashlib.sha256(json.dumps(
                 request["standalone_binding"], ensure_ascii=False, sort_keys=True,
                 separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest(),
@@ -888,7 +876,8 @@ def preflight_source_admission(interface, request):
     workspace_id = source.get("workspace_id")
     bootstrap_key(workspace_id)
     if (task.get("project", {}).get("default_workspace_id") != workspace_id
-            or str(workspace) != (task.get("worktree_path") or str(primary))):
+            or str(workspace) != (task.get("worktree_path") or str(primary))
+            or native_project_id(primary) != project_id):
         raise ValueError("native task workspace differs")
     installation = installation_records(project_id, primary, workspace_id)
     task_id = summary["id"]
@@ -910,13 +899,11 @@ def preflight_source_admission(interface, request):
             "standalone": False, "workspace": str(workspace), "task_id": task_id,
             "primary_workspace_id": workspace_id,
         }
-    inspection = run_source_inspector(installation, project_id, primary, workspace)
     confirm_source_binding(installation)
     return {
         **installation, "mode": "r2", "interface": interface, "standalone": False,
         "workspace": str(workspace), "task_id": task_id,
         "primary_workspace_id": workspace_id, "session_id": session_id,
-        "inspection": inspection,
     }
 
 
@@ -1008,11 +995,11 @@ def admitted_native_store(core, primary, project_id, primary_workspace_id, summa
             or binding["kit_root"] != expected.get("kit_root")):
         raise ValueError("native source binding differs from admission")
     profile_raw = record_bytes(core, profile_path, private=False)
-    if len(profile_raw) > core.MAX_BYTES or core._digest(profile_raw) != binding["profile_sha256"]:
-        raise ValueError("qualified primary profile differs")
+    if len(profile_raw) > core.MAX_BYTES:
+        raise ValueError("primary profile exceeds limit")
     config = tomllib.loads(profile_raw.decode()).get("project_memory")
     if (not isinstance(config, dict) or set(config) != {"root", "project_key", "project_uid", "mode"}
-            or config["mode"] != "r2"):
+            or config["mode"] != "r2" or config != expected["config"]):
         raise ValueError("installed R2 configuration incomplete")
     receipt_raw = record_bytes(core, Path(binding["receipt_path"]),
                                maximum=MAX_RECEIPT_BYTES)
@@ -1048,13 +1035,7 @@ def admitted_native_store(core, primary, project_id, primary_workspace_id, summa
         raise ValueError("invalid legacy task inventory")
     for task_id in legacy:
         core._key(task_id)
-    files = receipt["files"]
-    expected = [item for item in files if isinstance(item, dict)
-                and item.get("relative_path") == ".kent/workflow-profile.toml"
-                and item.get("sha256") == binding["profile_sha256"]
-                and item.get("byte_size") == len(profile_raw)]
-    if not expected:
-        raise ValueError("profile not included in qualified source receipt")
+    confirm_source_binding(expected)
     store = core.ProjectMemory(Path(config["root"]), config["project_key"], config["project_uid"])
     store._project()
     task_key = core._key(summary["short_id"])
@@ -1157,26 +1138,48 @@ def require_acceptance_script(core, request):
         raise ValueError("acceptance requires graph-owned Script")
     workspace = git_root(request["workspace_path"])
     project = native_read(["project", str(workspace)], workspace).decode().strip()
-    task = core._json(native_read(
-        ["task", "show", context["task_id"], "--project", project, "--json"], workspace))
+    task, script, _ = native_task_context(request, workspace, project)
+    if task is None or script is None:
+        raise ValueError("acceptance requires current native Script")
+    source = task.get("source_workspace")
+    if not isinstance(source, dict) or source.get("is_primary") is not True:
+        raise ValueError("acceptance primary workspace unresolved")
+    primary = git_root(source.get("root_path"))
+    if (task.get("project", {}).get("default_workspace_id") != source.get("workspace_id")
+            or str(workspace) != (task.get("worktree_path") or str(primary))
+            or native_project_id(primary) != project):
+        raise ValueError("acceptance primary workspace differs")
+    assert_preadmission(project, workspace, primary, task["summary"]["id"],
+                        source["workspace_id"])
     workflow = core._key(task["summary"]["workflow_id"])
     graph = core._json(native_read(
         ["workflow", "graph", "inspect", workflow, "--json"], workspace))
     if graph.get("workflow_id") != workflow:
         raise ValueError("acceptance graph identity differs")
-    profile = tomllib.loads(record_bytes(
-        core, workspace / ".kent/workflow-profile.toml", private=False).decode())
-    command = profile.get("commands", {}).get("plan_contract_accept")
-    if not isinstance(command, str) or not command:
-        raise ValueError("acceptance command unavailable")
+    def selector():
+        profile = tomllib.loads(record_bytes(
+            core, primary / ".kent/workflow-profile.toml", private=False,
+            maximum=MAX_NATIVE_OUTPUT).decode("utf-8"))
+        commands = profile.get("commands")
+        command = commands.get("plan_contract_accept") if isinstance(commands, dict) else None
+        if (not isinstance(command, str) or not command
+                or command.startswith("/") or "\\" in command or "\x00" in command
+                or any(part in ("", ".", "..") for part in command.split("/"))):
+            raise ValueError("acceptance command unavailable")
+        return command
+
+    command = selector()
     nodes = [node for node in graph["graph"]["nodes"]
              if node.get("id") == context["node_id"]]
     if (len(nodes) != 1 or nodes[0].get("kind") != "script"
             or nodes[0].get("script_path") != command):
         raise ValueError("current graph node does not own acceptance")
+    confirm_source_binding(PREADMISSION)
+    if selector() != command:
+        raise ValueError("primary acceptance selector changed before effect")
 
 
-def workflow_dispatch(core, request, body=None):
+def workflow_request_fields(request):
     operations = {
         "resolve-task": set(), "initialize-task": set(),
         "read": {"document_key"},
@@ -1199,8 +1202,12 @@ def workflow_dispatch(core, request, body=None):
         fields.add("native_context")
     if operation == "initialize-task" and "source_refs" in request:
         fields.add("source_refs")
-    core._closed(request, fields,
-                 "r2-workflow-request-v1")
+    return fields
+
+
+def workflow_dispatch(core, request, body=None):
+    operation = request.get("operation")
+    core._closed(request, workflow_request_fields(request), "r2-workflow-request-v1")
     store, task, locator = resolve_native(
         core, request, initialize=operation == "initialize-task")
     if store is None:
@@ -1317,7 +1324,7 @@ def public_invocation(store, task, invocation, state):
     return result
 
 
-def dispatch(core, request, body=None):
+def mcp_request_fields(request):
     operation = request.get("operation")
     if not isinstance(operation, str) or operation not in FIELDS:
         raise ValueError("unsupported memory operation")
@@ -1326,7 +1333,12 @@ def dispatch(core, request, body=None):
         fields.add("task_locator")
     if "standalone_binding" in request:
         fields.add("standalone_binding")
-    core._closed(request, fields, "r2-mcp-request-v1")
+    return fields
+
+
+def dispatch(core, request, body=None):
+    operation = request.get("operation")
+    core._closed(request, mcp_request_fields(request), "r2-mcp-request-v1")
     store, task, locator = (resolve_standalone(core, request) if "standalone_binding" in request
                             else resolve_native(core, request))
     if operation == "resolve-mcp":

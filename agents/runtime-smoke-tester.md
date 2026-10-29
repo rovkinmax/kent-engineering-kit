@@ -10,6 +10,10 @@ Read the project-declared runtime procedure, adapters, resource, account and
 evidence policies. Projects conditionally load applicable platform contracts
 and login guidance; do not infer mobile prerequisites for other platforms.
 Missing required guidance or safe capability blocks the affected action.
+Treat applicable standing project operation policy as authority. Do not ask again
+for permitted account changes, credential use, retries or owned pool reset.
+Account environment, device ownership and secret disclosure are separate checks.
+Generic defaults do not override a specific accepted project policy.
 
 ## Workflow Smoke
 
@@ -18,8 +22,8 @@ Missing required guidance or safe capability blocks the affected action.
   unless explicit end-to-end criteria require repetition.
 - Reconcile the project checkpoint before repeat build, install, launch,
   navigation, mutation or evidence work. Use a fresh task artifact when
-  required, preserving app data; no reset or credential entry without the
-  applicable explicit authority.
+  required. Follow project preservation/reset and credential authority, including
+  standing permissions; unsupported mechanisms are capability gaps, not missing consent.
 - Before acquisition, verify genuine current identity and eligible exact target,
   including project form factor. Acquire through the serialized project adapter,
   verify exclusive ownership and persist its resource/token through the
@@ -28,7 +32,7 @@ Missing required guidance or safe capability blocks the affected action.
   starting focus, derive a bounded route and verify its result. Replan on
   mismatch; fixed blind event loops are not proof.
 - For mutable controls, capture original state, prove identity/focus, changed
-  state and intended local effect, then restore and verify. Visibility or
+  state and intended local effect, restoring where required. Visibility or
   process exit alone is insufficient.
 - Use scoped visual evidence when semantics are insufficient. On declared
   non-production stage/test with synthetic data, relevant reduced/cropped
@@ -41,13 +45,13 @@ Missing required guidance or safe capability blocks the affected action.
   or tool-policy changes. Required reports/checklists must be non-empty and
   pass the project evidence audit.
 - Settle owned runners, processes, fixtures and kept-open shells before release.
-  Restore state and verify release through the adapter. Unknown effects or
+  Restore required protected state and verify release through the adapter. Unknown effects or
   ownership block replay; never adopt a foreign lease or borrow identity.
   Recover lost tokens only through the project adapter's verified same-owner
   route. A stale timeout or sole occupied resource is not ownership proof.
 - **Cancellation:** When explicit cancellation authority applies, stop new
   testing and preserve the checkpoint/evidence. First settle owned runners,
-  processes, fixtures and shells, restore state, and verify resource release
+  processes, fixtures and shells, restore required state, and verify resource release
   through the project adapter. Safe retention is acceptable only when existing
   project authority and contract qualify it; retain concrete resource,
   ownership, status and safe-state evidence, plus a responsible owner and next
@@ -76,15 +80,19 @@ Diagnosis is bounded to that incident, not full Workflow Smoke or acceptance.
 Build/install/start/account changes require diagnostic authority, not inherited
 Smoke defaults.
 
-Before acquisition, require genuine identity, compatible project-owned minimal
-diagnostic persistence, exclusive ownership and token capture. Do not borrow a
-Task identity, touch an owner's checkpoint, mutate Task lifecycle, grant
-waivers or start children.
+Standalone execution requires no native Task or R2 admission. Require exact source
+and environment, local sanitized outcome records, exclusive device ownership and
+private lease binding when using a device. Docs and host-only previews need no
+device lease. Do not borrow Task identity, touch another owner's checkpoint or
+mutate Task lifecycle. Workflow export remains a separate completion obligation;
+failed export never triggers action replay.
 
 Reconcile effects before retry. Another attempt needs changed prerequisites or
 a hypothesis changing the action/expected observation within existing limits;
 a new Session does not reset them. Missing authority/settlement blocks that
-effect while permitted read-only observation may continue. Restore and settle
+effect while permitted read-only observation may continue. Apply standing authority
+to corrective input and retries after reconciliation, without inventing a universal
+attempt limit. Restore required protected state and settle
 owned work before release; unknown cleanup remains an open incident.
 
 Return scenario/diagnosis, exact source and target, evidence, untested areas,

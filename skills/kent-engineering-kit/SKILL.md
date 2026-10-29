@@ -8,10 +8,23 @@ Read the active node context manifest, `.kent/workflow-profile.toml` and
 conditional sources. `AGENTS.md` owns authority, governance, safety and
 language; roles own behavior, configuration owns execution settings.
 
-Projects supply build, architecture, integrations, devices, credentials and
-release procedures. The shared workflow owns lifecycle, approval/review
-ordering, fan-out/Join, cleanup handoff and portable parameters. Maintainer
-contracts are generator sources, not a mandatory node reading catalog.
+Kent's selected native Workflow owns topology, parameters, lifecycle and
+approval/review ordering. Projects supply product requirements, build,
+architecture, integrations, devices, credentials and release procedures.
+Maintainer contracts are generator sources, not a mandatory node reading
+catalog.
+
+## Conditional engineering references
+
+When the active context selects Kit self-development, read
+[Kit source development](references/kit-source-development.md) and, using the
+source binding below, the authoritative Kit change policy. Do not use them to
+select or activate a Workflow.
+
+When the active native prompt selects a shared Engineering stage, read
+[Engineering stage responsibilities](references/engineering.md) for the
+current stage only. Do not preload other stages. The active native prompt
+continues to define its actual inputs and result requirements.
 
 When a role requires a shared Kit contract, use this installed skill's source
 binding: resolve the `kent-engineering-kit` directory under
@@ -37,5 +50,8 @@ Source changes do not update installed/live state or locked Sessions. Installati
 activation, publication, restart and default/link changes require their exact
 effect authority and capable owner; a source-only approval grants none.
 
-Run the profile's verification command. Kit source verification is
-`./scripts/validate`; `--installed-state` is a separate authorized inspection.
+Use verification selected by the active project profile, Workflow and
+approved scope. The Kit source-change policy and its approved preview determine
+whether focused checks, full `./scripts/validate`, configured CI, or a
+combination is required. The full source validator is distinct from
+`--installed-state`, which is a separate authorized inspection.

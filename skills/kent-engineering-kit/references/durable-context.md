@@ -34,7 +34,12 @@ only that original source can establish what its author decided.
 ## Discover before asking or continuing
 
 Before continuing after a context change, inspect the task-fixed mode, accepted
-and working plan, evidence, checkpoints, and referenced artifacts.
+and working plan, and the evidence, checkpoints and artifacts declared by the
+selected route. Native nodes and edges select that route; a profile, command
+map or installed storage interface does not select legacy Plan Contract,
+ledger, packet, watcher or Janitor procedures.
+
+### Selected legacy discovery tooling
 
 A retained legacy checkout may predate the inspection and packet commands.
 Check its own profile and helper capabilities before invoking them. If the
@@ -136,8 +141,9 @@ worktree location.
 - Tasks inventoried as legacy at cutover—including Backlog and terminal
   Tasks—remain on their existing task paths and accepted snapshots. Do not
   migrate them automatically.
-- A new native Task enters R2 only after qualified first-ingress admission
-  verifies its project, Task, workspace, and current Session, then binds
+- A new native Task enters R2 only after qualified first-ingress storage
+  authorization verifies project, Task, canonical execution root, primary
+  workspace and genuine current Session, then binds
   `task.json` in the external project store. A graph-owned Script may operate
   on an already bound Task, but it does not create the first binding. Native
   references in `task.json` are checked against current native readback.
@@ -154,16 +160,45 @@ worktree location.
   inventory, or for a project that has not adopted R2. New R2 work does not
   use `.todo`; old Tasks keep their old contracts and locations.
 
-The project profile's `[project_memory]` table binds `root`, `project_key`,
-`project_uid`, and `mode = "r2"`. The installed adapter also validates the
-native primary project binding and the immutable cutover receipt. The
-`delivery_reliability = "v1"` workflow policy is a separate producer-evidence
-capability; it is not a substitute for R2 Task admission. A profile switch or
-this document does not qualify an installation. If the required adapter,
-source receipt, or binding is absent or mismatched, stop on that concrete
-admission error. The current native adapter's Task path requires a primary
-source workspace; do not infer secondary-workspace support or installed
-qualification from these source contracts.
+### Ordinary storage authorization
+
+Use the qualified installed `kent-project-memory` interface: `workflow` for
+native documents and attachments, `mcp` for MCP binding and invocation
+operations. Resolve that entry point from the approved installation, not a
+caller-selected code path or product-local core. Do not replace a project's
+relative `commands.project_memory` with an absolute installed path: the
+profile's sibling-closure validation and legacy callers remain intact.
+
+The safely read bound primary profile's `[project_memory]` table supplies
+exact `root`, `project_key`, `project_uid`, and `mode = "r2"`. Ordinary storage
+authorization also requires genuine native identity, safe private installation
+and immutable cutover records, their integrity and closed schemas, the fixed
+legacy inventory, and the exact Task adoption identity. The adapter loads
+safe installed core bytes only from the private binding's trusted Kit root,
+executes that verified read without reopening it, and rechecks relevant
+binding/storage state before effects. Preserve namespace, immutable revision,
+CAS, retry, privacy and artifact-framing guards.
+Native-bound requests require genuine current Task/Session or Script
+ownership. Standalone MCP uses native project/primary verification plus its
+explicit standalone task binding, not invented native Task ownership.
+
+Historical publication refs, whole-profile digests, file inventories and helper
+declarations remain metadata, not admission of current code for ordinary
+storage. These calls do not execute `inspect-delivery-source` or require
+current publication ancestry, whole-Kit parity, unrelated helper/instruction
+equality, graph-artifact parity or a receipt-pinned core digest. Safe compatible
+installed-core changes are visible on subsequent calls. Updating a facade or
+alias does not relocate the private binding's Kit/core root.
+
+Explicit source inspection, publication and reconciliation retain their strict
+source-admission contracts; ordinary storage authorization does not satisfy or
+bypass them. `delivery_reliability = "v1"` remains a separate producer-evidence
+capability, not storage authority or route selection. A profile switch or this
+document does not qualify an installation. Missing, unsafe, malformed or
+conflicting storage records block without a legacy fallback. The native Task
+path still requires its bound primary source workspace; do not infer
+secondary-workspace support, installation or native activation from source
+contracts.
 
 ## R2 documents and accepted plans
 
@@ -241,18 +276,25 @@ Workflow acceptance must preserve the references required by the existing
 graph and project gates; readers must still retrieve and verify the original
 sources.
 
-Acceptance can recover missing tagged pointers from validated ledger narrative,
-including `summary`. This discovers locators, not authorship or consent, and
-never parses damaged suffixes.
+Carry the exact reviewed immutable plan revision and digest, applicable
+requirements/design revision references, and verified original decision
+locators in the plan or the selected Workflow's declared acceptance inputs.
+Do not accept the latest working head by convention, treat publication as
+acceptance, invent request/metadata fields, or use a knowledge summary as the
+reviewed contract.
+
+Selected legacy acceptance can recover missing tagged pointers from validated
+ledger narrative, including `summary`. This discovers locators, not authorship
+or consent, and never parses damaged suffixes.
 
 R2 normalization treats line-ending changes, trailing whitespace, final blank
 lines, and checkbox progress as non-contract changes. A new immutable working
 revision may therefore be published while the existing accepted snapshot
 remains authoritative. A changed normalized plan or applicable coder
-selection is drift and must follow existing Plan Revalidation and independent
-review before a new acceptance. Knowledge revisions do not silently expand a
-Task plan. Sessions reread relevant knowledge before decisions; model memory is
-not updated automatically.
+selection is drift and must follow the selected route's revalidation and
+independent review before a new acceptance. Knowledge revisions do not silently
+expand a Task plan. Sessions reread relevant knowledge before decisions; model
+memory is not updated automatically.
 
 The workflow adapter's closed `r2-workflow-request-v1` interface accepts
 `resolve-task`, `initialize-task`, `read`, `publish`, `accepted-head`,
@@ -272,6 +314,11 @@ adapter permits `initialize-task` only from a verified current Session, not a
 Script. Do not invent extra request fields or treat implementation plumbing as
 a new authority interface.
 
+`resolve-plan` retains `supplied_revision`, `working_revision`, `working_path`
+and `working_sha256`; `supplied_sha256` and `supplied_comparison` are additive
+response fields for comparing the exact supplied revision with the working
+revision. None of these locators or comparisons establishes acceptance.
+
 Session callers may supply `task_locator` with the exact native Task ID to
 avoid scanning the project inventory. It is only a lookup hint: the adapter
 still verifies the inherited current Session, project, workspace and Task.
@@ -282,23 +329,34 @@ MCP call/list wrappers expose the same hint as
 
 ## Graph-owned acceptance and report-only plans
 
-The existing graph-owned Plan Contract Accept Script remains the only workflow
-acceptance owner. Its adapter checks that the current native Script belongs to
-the configured acceptance node before it prepares or accepts the plan. Plan
-Review and any existing project-specific approval gate remain intact. This
-mechanical ownership does **not** add a universal human-approval gate, and
-does not authenticate a referenced decision. Do not ask for new approval
-merely to repair a pointer or agent-owned bookkeeping; do ask when a genuinely
-new decision is required by the applicable contract.
+The workflow adapter permits `accept-plan` and `prepare-report-only` only for
+an actual current native Script whose graph `script_path` equals
+`commands.plan_contract_accept` from the safely read, private-bound PRIMARY
+workspace profile. It verifies primary/project/native identity and rechecks
+the binding and selector before the effect. Matching an unrelated genuine
+Script to a caller-local command mapping cannot grant acceptance. A missing or
+unsafe acceptance mapping blocks those operations, not unrelated ordinary
+document or MCP operations. There is no Agent acceptance bypass.
+
+The selected Workflow must declare its acceptance owner and applicable review
+and project approval gates. Using storage does not implicitly select the
+legacy Plan Contract Accept procedure. Mechanical Script ownership does
+**not** add a universal human-approval gate or authenticate a referenced
+decision. Do not ask for new approval merely to repair a pointer or agent-owned
+bookkeeping; do ask when the applicable contract requires a genuinely new
+decision.
 
 For report-only work, the working plan content is exactly
 `not-applicable\n`; the accepted snapshot has `plan_kind = "report_only"` and
 no coder selection. Preparation is an idempotent graph-owned publication, not
-acceptance. The existing acceptance node still performs the acceptance step
-after the applicable review and source checks. No tracked plan is created and
-the sentinel grants no permission or positive result.
+acceptance. The selected acceptance node still performs the acceptance step
+after the review and checks declared by that route. No tracked plan is created
+and the sentinel grants no permission or positive result.
 
 ## Local locator cache and terminal closure
+
+This cache/terminal protocol belongs only to the selected legacy route; it is
+not an automatic consequence of using ordinary R2 storage.
 
 For an R2 Task, `.kent/runtime/<task>/plan-contract.json` is only a
 `r2-plan-contract-cache-v1` locator produced by the qualified adapter, not a
@@ -316,6 +374,11 @@ retention protocol, then retires only the local cache. Cleanup preparation, a
 terminal seal, or an existing terminal sentinel closes acceptance. After that point, a
 retry may verify existing retained state but must not recreate the cache,
 reaccept a plan, or resurrect a report-only sentinel.
+
+The cache/seal/Janitor lifecycle above applies only when the selected legacy
+route declares it. A separately qualified Agent cleanup route must use its
+own declared retention and recovery procedure; storage access alone does not
+qualify that route or select it automatically.
 
 The external store outlives its worktree, but its local revision history is not
 an off-machine backup. Do not delete or garbage-collect old revisions as part

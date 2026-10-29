@@ -1,5 +1,30 @@
 # Execution-history and compatibility policy
 
+## Ordinary storage is not source admission
+
+Native nodes and edges select the execution route; profile presence does not.
+Ordinary R2 document, attachment and MCP calls use the qualified installed
+storage interface. Native-bound calls require genuine project/Task/current
+Session or Script identity; standalone MCP instead requires native project
+verification and its explicit standalone binding, not invented Task ownership.
+Storage authorization preserves the safe private installation and
+cutover records, exact primary/storage projection, fixed legacy inventory,
+Task adoption identity, immutable revisions, namespace, CAS, retry and privacy
+guards. The safely read installed core comes from the private-bound Kit root,
+not the caller's checkout; historical source digests do not pin its compatible
+current bytes.
+
+Ordinary storage does not run the source inspector or require current
+whole-Kit/profile/helper parity, publication refs/ancestry or graph-artifact
+equality. This decoupling neither weakens the explicit source-admission APIs
+below nor qualifies a new installation, graph, retained instruction cohort or
+cleanup route. See [durable context](../skills/kent-engineering-kit/references/durable-context.md#ordinary-storage-authorization)
+for the storage interface and primary-bound Script acceptance checks.
+Publishing a document does not accept it: the declared acceptance inputs must
+retain the exact reviewed immutable plan/digest, applicable requirements/design
+references and original decisions. No storage call selects legacy Plan
+Contract, ledger, watcher or Janitor procedures.
+
 ## Source-only admission candidates
 
 `delivery-source-admission-v2` keeps its closed binding variants. An
@@ -10,8 +35,10 @@ receipt. The outer frame's project, target Workflow, ingress edge and native
 identity remain independently exact. Only the source inspector uses the receipt
 owner; it does not grant cross-project/root/profile/digest substitution.
 
-Trusted installed ingress verifies native identity and installed binding/profile,
-selects task-fixed mode, and for R2 admits source before initialization effects.
+An ingress explicitly carrying this source-admission contract verifies native
+identity and installed binding/profile, selects task-fixed mode, and for R2
+admits source before its initialization effects. That source gate belongs to
+the selected ingress, not every ordinary storage operation.
 Inventoried legacy Tasks retain their original infrastructure and accepted
 contracts. `plan-publication` remains source-only and cannot initialize R2 or
 write documents; final generators requiring R2 reject it. Offline candidates

@@ -135,6 +135,11 @@ before a separately authorized activation. Validate a new non-default candidate
 with a managed-worktree canary before promoting it to the project default.
 Changing source files does not update existing live workflows.
 
+The active topology and native parameters are stored in Kent. Existing
+generator-backed processes remain compatibility paths for consumers that
+select them; they do not establish a separate source repository for new Kit
+workflow topology.
+
 ### Check the revision that will execute
 
 A workflow can exist while the selected branch is missing its project scripts.
@@ -150,6 +155,44 @@ Preflight reads the required files from Git objects, without switching branches
 or creating a worktree. The installed entry point is
 `~/.kent/bin/kent-preflight-revision`. Its launcher selects a compatible Python;
 `KENT_ENGINEERING_KIT_PYTHON` can explicitly select an executable.
+
+### Use ordinary native R2 storage
+
+Use the qualified installed `kent-project-memory` entry point for native
+document/attachment (`workflow`) and MCP (`mcp`) requests. For native-bound
+calls, authorization is positive: genuine project/Task/current Session or
+Script, canonical
+execution root and bound primary workspace, safe private installation/cutover
+records with integrity and closed schemas, exact primary R2 projection,
+fixed legacy inventory and Task adoption identity. The adapter loads safe
+installed core bytes from the private-bound Kit root without a second open
+and preserves CAS, namespaces, immutable revisions, retry and privacy guards.
+Standalone MCP keeps its explicit standalone binding and native
+project/primary verification; it does not impersonate native Task ownership.
+
+Ordinary storage does not run `inspect-delivery-source` or require current
+publication refs/ancestry, whole-profile/Kit/helper parity, graph-artifact
+equality or a receipt-pinned core digest. These historical declarations do
+not freeze compatible installed code. A facade/alias update still uses the
+core selected by the existing private binding; it does not relocate or update
+that core. Missing or conflicting storage authorization blocks without a
+legacy fallback. Explicit source-publication/admission APIs stay strict.
+
+Native nodes and edges select the route. Profile presence or storage access
+does not select legacy Plan Contract, ledger, packet, watcher or Janitor
+procedures. Preserve relative project command maps for existing consumers;
+do not replace `commands.project_memory` with a machine-specific absolute
+alias that violates sibling-closure validation.
+
+Publishing a working document does not accept it. Carry the exact reviewed
+immutable plan revision/digest, applicable requirements/design references and
+original decisions through the selected Workflow's declared inputs. Adapter
+acceptance and report-only preparation require a genuine current Script and
+the trusted PRIMARY profile's acceptance selector, not a matching caller-local
+map. There is no Agent bypass. See
+[durable context](../skills/kent-engineering-kit/references/durable-context.md)
+for the authoritative storage and acceptance interface; source readiness alone
+does not qualify an installation or activate a native route.
 
 ### Admit a native source ingress
 
@@ -187,7 +230,8 @@ external effect. Native identity mismatch, missing source, or changed bytes
 must stop before the effect and report the fixed blocker.
 This ingress API is only for the Script node targeted by the exact frame;
 later Script nodes must use their own qualified native/provenance contracts
-and must not pretend that the ingress frame targets them.
+and must not pretend that the ingress frame targets them. This explicit
+source gate is not a prerequisite for every ordinary R2 storage call.
 
 Adapter synchronization is a separate operation:
 `./scripts/sync-project-adapters --project /path/to/project`.
@@ -214,12 +258,30 @@ scheduler or observation after the session exits.
 
 ## Developing the Kit
 
+### Select a source-change route
+
+Read the [Kit source change policy](../contracts/kit-change-policy.md) and
+[source-development instruction](../skills/kent-engineering-kit/references/kit-source-development.md)
+before classifying or editing Kit source. Only changes meeting the policy's
+semantic criteria use the compatible route: authorized scope, one writer,
+focused regression tests, independent review of the actual candidate, and
+configured CI. Sensitive, mixed, or unknown changes use the strong
+preview/review/approval route. Labels, file paths, diff size and green tests
+do not establish eligibility.
+
+The native Kent database owns Kit Workflow topology and parameters. The
+retained Kit source builder and snapshot support only the legacy Kit execution
+until a separately reviewed and authorized cutover. A policy document or
+source candidate does not activate a graph or change retained Task and Session
+instructions. Product Engineering's separate review stages are unchanged.
+
 ### Select source without changing the installed checkout
 
 The [self-development contract](../.kent/project-contract.md) and
 [project profile](../.kent/workflow-profile.toml) define the development process.
 Use a Kent-managed source worktree; preserve the installed primary checkout,
-its local `main`, symlinks, global configuration, and consumer pins.
+its local `main`, symlinks and global configuration. Keep source development,
+installation and native Workflow activation as separate activities.
 Follow [global governance](../global/AGENTS.md#authority-and-decisions) before edits.
 
 Before starting a Task from the default branch, explicitly refresh and inspect
@@ -239,23 +301,76 @@ preflight. A first Task Script cannot repair stale source selection.
 After an approved delivery is merged, refresh remote tracking and repeat
 preflight before the next Task. Do not check out or fast-forward installed local
 `main` as part of ordinary source development. Installed adoption follows the
-separate [source versus installed state](../.kent/project-contract.md#effects-and-report-only-work)
+separate [source versus installed state](../.kent/project-contract.md#legacy-effects-and-report-only-work)
 procedure.
 
 ### Verify and deliver
 
-Run affected tests and focused production-shaped wrapper/helper checks from the
-selected source worktree. The configured verifier owns one fresh full
-`./scripts/validate` run after writer bookkeeping; carry its report/log and
-source/environment identity references through the existing handoffs. Source or
-environment drift requires fresh verification. Do not use `--installed-state`
-for source development.
+Run focused regression tests and production-shaped caller checks from the
+selected source worktree. Apply additional checks required by the approved
+scope and the selected route. The compatible route requires configured CI
+under the source-change policy; Kit ownership alone does not make the full
+local validator or a legacy identity handoff universal.
 
-See [verification ownership](../.kent/project-contract.md#verification-and-evidence)
-for the exact report and identity requirements.
+For sensitive, mixed or unknown source work, follow the checks in its approved
+preview. When a full Kit source validation is required, run one fresh
+`./scripts/validate` on the stable candidate. Do not use `--installed-state`
+for source development without separate authority.
+
+Tasks whose selected native Workflow still uses the legacy Kit delivery
+process follow its separate [verification and evidence contract](../.kent/project-contract.md#legacy-verification-and-evidence),
+including its validator and identity-handoff requirements. Do not apply that
+legacy protocol to a different selected route.
+
+### Separate source preparation, installation and native activation
+
+Source work changes only the approved Kit checkout. It does not install
+instructions, alter Kent's native graph, migrate Tasks, or refresh retained
+Sessions. Installation changes shared instructions or helpers; follow its
+separate authority and compatibility procedure. Global configuration changes
+also require a coordinated restart and refresh-boundary check.
+
+Native Workflow topology and parameters are changed in Kent through its
+supported interface, only after a complete exact preview, impact-scoped
+compatibility review of affected Tasks and retained executions, and separate
+effect authority. Include changed instructions, carried values, pending
+decisions, rollout, restart and rollback in that preview. A source revert does
+not undo an installed or native effect. Keep legacy workflow source only for
+consumers that still select it; cutover and retirement require their own
+reviewed scope.
+
+For compatible Kit updates, follow the consumer-compatibility rule in the
+source-change policy. Identify concrete breaking interfaces and handle only
+their affected consumers under the applicable authority.
+
 Commit, push, PR creation, merge, installation, and live workflow changes retain
 their separate authorization boundaries. A merged source PR is not evidence of
 installed adoption or successful runtime qualification.
+
+### Cleanup route qualification
+
+Only the selected legacy route uses its post-session Script Janitor. An
+Agent-owned cleanup route requires separately reviewed qualification,
+explicit native selection and exact deletion/resource authority. Follow the
+[worktree contract](../contracts/worktree-contract.md#separately-qualified-agent-cleanup);
+storage access, a profile command map or source edits cannot select the route.
+
+The parent source-cutover audit, Session353's
+`workflow-audit/AGENT-CLEANUP-QUALIFICATION-RESULT.md`, records a bounded
+experiment, not a blanket production PASS. It observed owner-specific and
+dirty-root refusals, completed deletion with independent absent
+path/registration/branch readback, and controlled interruption after deletion
+with supported replacement-target recovery and no deletion replay.
+The original bounded child survived interruption and exited naturally after
+600 seconds; this is not a subprocess-kill guarantee. Four experiment Sessions
+were created against the original limit of three; the reviewed bounded
+continuation does not retroactively satisfy that limit.
+
+That result does not qualify server-crash, power-loss, mid-RPC deletion or
+SIGKILL recovery. A production route must qualify its own retention,
+owner-controlled child settlement, exact target, resource release and recovery
+obligations. Installation and native activation remain separately authorized
+effects with retained-execution compatibility checks.
 
 ## Find an operational contract
 
@@ -267,6 +382,7 @@ notes as current installation state.
 | Workflow lifecycle, profile policies, and execution targets | [Workflow contract](../contracts/workflow-contract.md) |
 | Changes to existing workflows | [Update compatibility](../contracts/workflow-update-compatibility.md) |
 | Accepted plans and revalidation | [Plan contract](../contracts/plan-contract.md) |
+| Ordinary R2 storage and reviewed immutable document inputs | [Durable context](../skills/kent-engineering-kit/references/durable-context.md#ordinary-storage-authorization) |
 | Runtime evidence and recovery | [Evidence recovery](../contracts/evidence-recovery.md) |
 | PR checks and merge handling | [PR contract](../contracts/workflow-contract.md#pr) |
 | Worktree ownership and cleanup | [Worktree contract](../contracts/worktree-contract.md), [task-owned cleanup](../contracts/workflow-contract.md#task-owned-cleanup) |
