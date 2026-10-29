@@ -31,6 +31,50 @@ module_spec.loader.exec_module(kit)
 
 
 class KitDevelopmentWorkflowTest(unittest.TestCase):
+    def test_review_shell_exceptions_require_own_current_native_node(self) -> None:
+        inherited = ("global/AGENTS.md", "AGENTS.md")
+        roles = tuple(f"agents/{name}.md" for name in (
+            "spec-reviewer", "standards-reviewer", "compliance_reviewer",
+            "grill", "architecture-designer", "researcher",
+        ))
+        for path in (*inherited, *roles):
+            text = " ".join((ROOT / path).read_text().split())
+            # Instruction-contract coverage only; native enforcement still
+            # requires qualification after authorized installation.
+            for phrase in (
+                "inspection-only", "genuinely assigned current Workflow review node",
+                "only this node's own required evidence",
+                "qualified configured evidence adapter",
+                "Task/Node/Session/Step identity",
+                "explicitly configured for `shell_command`",
+                "this node's own actual result",
+                "reminder-prescribed `kent task complete`",
+                "current native identity",
+                "the declared transition and required parameters",
+                "Never use `--force`, another Task/Session selector",
+                "approval answers", "graph/config mutation",
+                "sibling results", "external product effects",
+                "no other shell writes are permitted",
+                "bypass initialization", "Standalone/non-Workflow review remains inspection-only",
+            ):
+                with self.subTest(path=path, phrase=phrase):
+                    self.assertIn(phrase, text)
+            for forbidden in (
+                "the sole write exception", "the sole mutation exception",
+                "no other shell writes beyond",
+            ):
+                with self.subTest(path=path, forbidden=forbidden):
+                    self.assertNotIn(forbidden, text)
+        for path in roles:
+            text = " ".join((ROOT / path).read_text().split())
+            for phrase in (
+                "Do not edit sources or checkpoints", "write the ledger directly",
+                "append for another producer", "seal or recover",
+                "First-class edit tools remain disabled",
+            ):
+                with self.subTest(path=path, phrase=phrase):
+                    self.assertIn(phrase, text)
+
     def test_prompt_improvement_contracts_preserve_safety_boundaries(self) -> None:
         expectations = {
             "prompts/review-change.md": (

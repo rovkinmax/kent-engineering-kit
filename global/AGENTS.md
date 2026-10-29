@@ -82,13 +82,22 @@
 - Keep the immutable task baseline separate from a moving merge target.
   Target-only commits are integration inputs, not task regressions, unless
   merge or replay evidence proves conflict or delivered-tree loss.
-- Treat reviewer shell access as inspection-only except for a Workflow node's
-  required append of its own evidence through the qualified configured evidence
-  adapter, using genuine current Task/Node/Session/Step identity. This grants
-  no source/checkpoint edits, direct ledger writes, another producer's append,
-  sealing, recovery or other shell writes; shell availability is not a sandbox
-  or a tool-enforced read-only boundary. If the adapter or genuine identity
-  cannot be qualified, block the append; never fall back to a direct write.
+- Treat reviewer shell access as inspection-only with two narrow exceptions
+  for a genuinely assigned current Workflow review node: append only this
+  node's own required evidence through the qualified configured evidence
+  adapter, using genuine current Task/Node/Session/Step identity; and, only
+  when explicitly configured for `shell_command`, submit this node's own
+  actual result through the reminder-prescribed `kent task complete`, using
+  current native identity, the declared transition and required parameters.
+  Never use `--force`, another Task/Session selector, manual
+  move/start/stop/resume/cancel, approval answers or graph/config mutation.
+  This grants no source/checkpoint edits, fabricated sibling results, direct
+  ledger writes, another producer's append, sealing, recovery or external
+  product effects; no other shell writes are permitted. Shell availability
+  is not a sandbox or a tool-enforced read-only
+  boundary. If the adapter or genuine identity cannot be qualified, block the
+  dependent action; never guess a binding, bypass initialization or fall back
+  to a direct write. Standalone/non-Workflow review remains inspection-only.
 - Prefer independently verifiable vertical slices. Use
   expand-migrate-contract when broad mechanical changes cannot stay green.
 - Do not commit, push, publish, flash hardware, merge, delete remote state, or
