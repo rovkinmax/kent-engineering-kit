@@ -335,7 +335,8 @@ def plan_project_synchronization(
             )
             plans.append(plan)
             if key == "android_tools":
-                for sibling in ("android_tools_native.py", "android_tools_evidence.py"):
+                for sibling in ("android_tools_native.py", "android_tools_evidence.py",
+                                "android_tools_custody.py"):
                     sibling_target = project_target(
                         project_root, str(Path(configured_path).parent / sibling)
                     )

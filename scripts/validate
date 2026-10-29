@@ -36,6 +36,7 @@ python3 -m py_compile \
   "$repo_root/templates/project/android-tools" \
   "$repo_root/templates/project/android_tools_native.py" \
   "$repo_root/templates/project/android_tools_evidence.py" \
+  "$repo_root/templates/project/android_tools_custody.py" \
   "$repo_root/workflowkit/ci_contract.py" \
   "$repo_root/workflowkit/kit_runtime.py" \
   "$repo_root/workflowkit/delivery.py" \
