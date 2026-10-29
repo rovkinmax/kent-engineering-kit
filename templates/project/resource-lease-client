@@ -25,6 +25,8 @@ CLI_TIMEOUT = 10.0
 ACQUIRE_TIMEOUT = 300.0
 CLEANUP_TIMEOUT = 120.0
 HEARTBEAT_MAX_AGE = 30.0
+CUSTODY_MARKER_PROTOCOL = 1
+UNCERTAINTY_MARKER = "command-stop-uncertain.json"
 STOP = False
 
 
@@ -85,7 +87,7 @@ def read(path: Path):
     return value
 
 
-def write(path: Path, value):
+def _write_record(path: Path, value):
     data = (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
     if len(data) > MAX_BYTES:
         raise Error("JSON record exceeds size limit")
@@ -99,6 +101,62 @@ def write(path: Path, value):
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def marker_lock(run: Path):
+    """Protocol 1: all marker publishers/removers lock this directory inode."""
+    private(run, directory=True)
+    fd = os.open(run, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        deadline = time.monotonic() + CLI_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Busy("marker coordination lock timed out") from None
+                time.sleep(min(0.05, remaining))
+        info = run.lstat()
+        held = os.fstat(fd)
+        if (info.st_dev, info.st_ino) != (held.st_dev, held.st_ino):
+            raise Error("marker coordination directory changed")
+        private(run, directory=True)
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _stop_marker_publication_failed(run: Path, *, reason: str):
+    """Retain the existing admission barrier even when marker publication fails."""
+    private(run, directory=True)
+    fd = os.open(run, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        _write_record(run / "stop-renewal.json", {
+            "schema": 1, "reason": reason,
+        })
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write(path: Path, value):
+    if path.name != UNCERTAINTY_MARKER:
+        return _write_record(path, value)
+    try:
+        with marker_lock(path.parent) as fd:
+            _write_record(path, value)
+            os.fsync(fd)
+    except (Error, OSError, ValueError) as error:
+        # Never publish unlocked. This barrier also covers file/directory fsync
+        # failures; if it cannot persist, propagate uncertainty to the owner.
+        _stop_marker_publication_failed(
+            path.parent,
+            reason="marker_lock_unavailable" if isinstance(error, Busy) else "marker_publication_failed",
+        )
+        raise
 
 
 @contextmanager
@@ -296,6 +354,7 @@ class Lease:
                 elif not error.startswith(message):
                     error = f"{message}; {error}"
         value = {"phase": phase, "updated_at": time.monotonic(),
+                 "custody_marker_protocol": CUSTODY_MARKER_PROTOCOL,
                  "run_directory": str(self.run), "lease": lease, "error": error}
         if command_stop is not None:
             value["command_stop"] = command_stop
@@ -388,6 +447,7 @@ def prepare(args, binding=None):
     if run.parent != root or run.name == "admission.lock":
         raise Error("run directory must be a non-reserved direct child of runs_directory")
     metadata = {"schema": 1, "config": config, "profile": args.profile,
+                "custody_marker_protocol": CUSTODY_MARKER_PROTOCOL,
                 "capability": config["profiles"][args.profile],
                 "owner": args.owner if binding is None else f"smoke:{binding['task']}:{binding['session']}",
                 "binding": binding}

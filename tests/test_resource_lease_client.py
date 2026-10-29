@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import fcntl
 import io
 import json
 import os
@@ -121,6 +122,97 @@ class ResourceLeaseClientTests(unittest.TestCase):
         self.assertEqual(self.calls().count("acquire"), 1)
         self.assertGreaterEqual(self.calls().count("renew"), 2)
         self.assertEqual(self.calls()[-1], "release")
+        run = next(path for path in self.runs.iterdir() if path.is_dir())
+        self.assertEqual(client.read(run / "binding.json")["custody_marker_protocol"], 1)
+        self.assertEqual(client.read(run / "status.json")["custody_marker_protocol"], 1)
+
+    def test_runtime_protocol_is_emitted_by_owner_not_copied_from_binding(self):
+        self.root.chmod(0o700)
+        lease = client.Lease(self.root, {"custody_marker_protocol": "foreign"})
+        status = lease.record("active")
+        self.assertEqual(status["custody_marker_protocol"], client.CUSTODY_MARKER_PROTOCOL)
+
+    def test_marker_lock_timeout_retains_durable_stop_barrier_without_unlocked_marker(self):
+        self.root.chmod(0o700)
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(client, "CLI_TIMEOUT", 0.02), patch.object(
+                    client.os, "fsync", wraps=os.fsync) as sync:
+                with self.assertRaisesRegex(client.Busy, "marker coordination lock timed out"):
+                    client.write(self.root / client.UNCERTAINTY_MARKER, {
+                        "schema": 1, "reason": "signal_error",
+                    })
+                self.assertGreaterEqual(sync.call_count, 2)
+            self.assertFalse((self.root / client.UNCERTAINTY_MARKER).exists())
+            self.assertEqual(client.read(self.root / "stop-renewal.json"), {
+                "schema": 1, "reason": "marker_lock_unavailable",
+            })
+            lease = client.Lease(self.root, {})
+            lease.record("active", command_stop="unconfirmed")
+            with self.assertRaises(client.CommandStopUncertain):
+                lease.finish()
+            status = client.read(self.root / "status.json")
+            self.assertEqual(status["phase"], "failed")
+            self.assertEqual(status["command_stop"], "unconfirmed")
+        finally:
+            os.close(fd)
+
+    def test_marker_publication_file_and_directory_fsync_failures_retain_stop_barrier(self):
+        self.root.chmod(0o700)
+        real_fsync = os.fsync
+        for failed_call in (1, 2):
+            calls = 0
+
+            def fsync(fd):
+                nonlocal calls
+                calls += 1
+                if calls == failed_call:
+                    raise OSError("fixture_fsync")
+                return real_fsync(fd)
+
+            marker = self.root / client.UNCERTAINTY_MARKER
+            stop = self.root / "stop-renewal.json"
+            with self.subTest(failed_call=failed_call), patch.object(
+                    client.os, "fsync", side_effect=fsync):
+                with self.assertRaisesRegex(OSError, "fixture_fsync"):
+                    client.write(marker, {"schema": 1, "reason": "signal_error"})
+            self.assertTrue(stop.is_file())
+            self.assertFalse(any(self.root.glob(f".{client.UNCERTAINTY_MARKER}-*")))
+            marker.unlink(missing_ok=True)
+            stop.unlink()
+
+    def test_marker_lock_failure_never_publishes_unlocked_and_reports_barrier_failure(self):
+        self.root.chmod(0o700)
+        with patch.object(client, "marker_lock", side_effect=OSError("fixture_lock")):
+            with self.assertRaisesRegex(OSError, "fixture_lock"):
+                client.write(self.root / client.UNCERTAINTY_MARKER, {})
+        self.assertTrue((self.root / "stop-renewal.json").is_file())
+        self.assertFalse((self.root / client.UNCERTAINTY_MARKER).exists())
+        with patch.object(client, "marker_lock", side_effect=OSError("fixture_lock")), patch.object(
+                client, "_stop_marker_publication_failed", side_effect=OSError("fixture_barrier")
+        ), self.assertRaisesRegex(OSError, "fixture_barrier"):
+            client.write(self.root / client.UNCERTAINTY_MARKER, {})
+        self.assertFalse((self.root / client.UNCERTAINTY_MARKER).exists())
+
+    def test_marker_replace_failure_preserves_durable_barrier_and_removes_temporary(self):
+        self.root.chmod(0o700)
+        real_replace = os.replace
+        marker = self.root / client.UNCERTAINTY_MARKER
+
+        def replace(source, destination):
+            if destination == marker:
+                raise OSError("fixture_replace")
+            return real_replace(source, destination)
+
+        with patch.object(client.os, "replace", side_effect=replace), patch.object(
+                client.os, "fsync", wraps=os.fsync) as sync:
+            with self.assertRaisesRegex(OSError, "fixture_replace"):
+                client.write(marker, {"schema": 1, "reason": "signal_error"})
+            self.assertGreaterEqual(sync.call_count, 3)
+        self.assertFalse(marker.exists())
+        self.assertTrue((self.root / "stop-renewal.json").is_file())
+        self.assertFalse(any(self.root.glob(f".{client.UNCERTAINTY_MARKER}-*")))
 
     def test_command_failure_preserved_and_cleanup_runs(self):
         result = self.invoke(*self.run_args("raise SystemExit(7)"))

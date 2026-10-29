@@ -4,65 +4,27 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import fcntl
 import hashlib
 import json
 import os
-import selectors
 from pathlib import Path
 import stat
 import subprocess
 import sys
-import time
 import types
-import re
 
 PROTOCOL = 1
 # Exact source bundle: verify and execute the same bytes before any dispatch.
 BUNDLE_HASHES = {
     "android_tools_native.py": "7dc05fba9b40349761df181e018499b816dd6e1a1592cfa98fe2da2a9c11b962",
     "android_tools_evidence.py": "fcee3620d1a42f408f5a160e461cb67b74a309a63447afb1fe1a3fcb871d4da9",
+    "android_tools_custody.py": "782470769557bc9327f19ede7b297b6666593ed8fd4feb3890dd7887868cf008",
 }
 LIMIT = 262144
 
 
 class Error(ValueError):
     pass
-
-
-def inspect_lease(command):
-    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    output = {child.stdout: bytearray(), child.stderr: bytearray()}
-    deadline = time.monotonic() + 10
-    try:
-        with selectors.DefaultSelector() as selector:
-            for stream in output:
-                os.set_blocking(stream.fileno(), False)
-                selector.register(stream, selectors.EVENT_READ)
-            while selector.get_map() or child.poll() is None:
-                if time.monotonic() >= deadline:
-                    raise Error("lease_inspection_timeout")
-                for key, _ in selector.select(0.1):
-                    data = os.read(key.fd, 65536)
-                    if not data:
-                        selector.unregister(key.fileobj)
-                    else:
-                        output[key.fileobj].extend(data)
-                        if sum(map(len, output.values())) > LIMIT:
-                            raise Error("lease_inspection_output_limit")
-        if child.wait() != 0:
-            raise Error("lease_inspection_failed")
-        return json.loads(output[child.stdout])
-    finally:
-        if child.poll() is None:
-            child.terminate()
-            try:
-                child.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait(timeout=1)
-        for stream in output:
-            stream.close()
 
 
 def load_bundle():
@@ -84,6 +46,8 @@ def load_bundle():
         exec(compile(data, str(path), "exec"), module.__dict__)
         if getattr(module, "BUNDLE_PROTOCOL", None) != PROTOCOL:
             raise Error("bundle_protocol_mismatch")
+        if filename == "android_tools_custody.py" and getattr(module, "CUSTODY_API_VERSION", None) != 1:
+            raise Error("custody_api_mismatch")
         loaded[name] = module
     return loaded
 
@@ -153,65 +117,20 @@ def configuration(path):
 
 
 def custody(config, serial):
-    if not isinstance(serial, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", serial):
-        raise Error("device_serial_required")
-    run = Path(os.environ.get("RESOURCE_LEASE_RUN_DIRECTORY", ""))
-    if not run.is_absolute():
-        raise Error("owned_run_required")
-    private(run, directory=True)
-    binding = read_private(run / "binding.json")
-    state = read_private(run / "status.json")
-    private(run / "receipt.json")
-    if (binding.get("schema") != 1 or binding.get("config") != config["lease"]
-            or run.parent != Path(config["lease"]["runs_directory"])
-            or binding.get("profile") not in config["lease"]["profiles"]
-            or state.get("phase") != "active"
-            or not 0 <= time.monotonic() - state.get("updated_at", 0) <= 30
-            or (run / "command-stop-uncertain.json").exists()
-            or any((run / name).exists() for name in ("finish.json", "stop-renewal.json"))):
-        raise Error("lease_binding_invalid")
-    lock_path = run / "helper.lock"
-    private(lock_path)
-    fd = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+    module = load_bundle()["android_tools_custody"]
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            pass
-        else:
-            raise Error("lease_owner_not_running")
-    finally:
-        os.close(fd)
-    current = inspect_lease(
-        [config["lease"]["executable"], "--root", config["lease"]["pool"],
-         "inspect", "--owner", binding["owner"], "--lease", str(run / "receipt.json")],
-    )
-    prior = state.get("lease") or {}
-    if (current.get("state") != "active" or current.get("quarantined") is not False
-            or current.get("service_available") is not True
-            or current.get("owner") != binding["owner"]
-            or current.get("capability") != binding["capability"]
-            or current.get("endpoint", {}).get("adb_serial") != serial
-            or current.get("expires_in", 0) <= 0
-            or any(current.get(key) != prior.get(key) for key in ("id", "generation", "slot"))):
-        raise Error("lease_lost_or_foreign")
-    return current
+        with module.borrow_device(config.get("lease"), serial) as borrowed:
+            return borrowed.check()
+    except module.Error as error:
+        raise Error(str(error)) from None
 
 
 def handoff_uncertain():
-    run = Path(os.environ["RESOURCE_LEASE_RUN_DIRECTORY"])
-    private(run, directory=True)
-    path = run / "command-stop-uncertain.json"
-    payload = b'{"schema":1,"reason":"native_runner_drain_unconfirmed"}\n'
+    module = load_bundle()["android_tools_custody"]
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    except FileExistsError:
-        private(path)
-        return
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
+        module.handoff_uncertain("native_runner_drain_unconfirmed")
+    except module.Error as error:
+        raise Error(str(error)) from None
 
 
 def main():

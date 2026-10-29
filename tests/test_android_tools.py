@@ -7,7 +7,7 @@ import unittest
 import hashlib
 import json
 import os
-import time
+import runpy
 import subprocess
 import sys
 from unittest.mock import patch
@@ -59,10 +59,14 @@ class BundleTests(unittest.TestCase):
                 (root / filename).write_bytes((SOURCE.parent / filename).read_bytes())
             with patch.object(facade, "__file__", str(root / "android-tools")):
                 facade.load_bundle()
-                native_copy = root / "android_tools_native.py"
-                native_copy.write_bytes(native_copy.read_bytes() + b"\n")
-                with self.assertRaisesRegex(facade.Error, "bundle_mismatch"):
-                    facade.load_bundle()
+                for filename in facade.BUNDLE_HASHES:
+                    sibling = root / filename
+                    original = sibling.read_bytes()
+                    sibling.write_bytes(original + b"\n")
+                    with self.subTest(filename=filename), self.assertRaisesRegex(
+                            facade.Error, "bundle_mismatch"):
+                        facade.load_bundle()
+                    sibling.write_bytes(original)
 
     def test_private_binding_required(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -73,6 +77,53 @@ class BundleTests(unittest.TestCase):
                 facade.read_private(path)
             path.chmod(0o600)
             self.assertEqual(facade.read_private(path), {})
+
+    def test_custody_api_version_is_checked_after_byte_qualification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for version in (None, 2):
+                content = b"BUNDLE_PROTOCOL = 1\n"
+                if version is not None:
+                    content += f"CUSTODY_API_VERSION = {version}\n".encode()
+                (root / "android_tools_custody.py").write_bytes(content)
+                with patch.object(facade, "__file__", str(root / "android-tools")), patch.object(
+                        facade, "BUNDLE_HASHES", {
+                            "android_tools_custody.py": hashlib.sha256(content).hexdigest(),
+                        }
+                ), self.assertRaisesRegex(facade.Error, "custody_api_mismatch"):
+                    facade.load_bundle()
+
+    def test_managed_projection_includes_complete_qualified_bundle(self):
+        sync = runpy.run_path(str(SOURCE.parents[2] / "scripts/sync-project-adapters"))
+        profile = SimpleNamespace(
+            schema_version=3, kit_managed_adapters=["android_tools"],
+            kit_managed_commands=[], commands={},
+            adapters={"android_tools": ".kent/adapters/android/android-tools"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plans, _ = sync["plan_project_synchronization"](profile, root, update=False)
+            expected = {"android-tools", *facade.BUNDLE_HASHES}
+            self.assertEqual({plan.target.name for plan in plans}, expected)
+            for plan in plans:
+                sync["apply_synchronization"](plan)
+                self.assertEqual(plan.target.read_bytes(), (SOURCE.parent / plan.target.name).read_bytes())
+            target = root / ".kent/adapters/android"
+            with patch.object(facade, "__file__", str(target / "android-tools")):
+                self.assertEqual(set(facade.load_bundle()), {
+                    name.removesuffix(".py") for name in facade.BUNDLE_HASHES
+                })
+            custody = target / "android_tools_custody.py"
+            custody.write_bytes(custody.read_bytes() + b"\n")
+            before = {name: (target / name).read_bytes() for name in expected}
+            with self.assertRaisesRegex(ValueError, "differs"):
+                sync["plan_project_synchronization"](profile, root, update=False)
+            self.assertEqual(before, {name: (target / name).read_bytes() for name in expected})
+            plans, _ = sync["plan_project_synchronization"](profile, root, update=True)
+            for plan in plans:
+                sync["apply_synchronization"](plan)
+            with patch.object(facade, "__file__", str(target / "android-tools")):
+                facade.load_bundle()
 
     def test_missing_run_is_not_ownership(self):
         with patch.dict("os.environ", {}, clear=True):
@@ -316,51 +367,24 @@ class BundleTests(unittest.TestCase):
             self.assertIs(evidence.finish_run.call_args.args[1], result)
             evidence.release_run.assert_called_once_with(evidence.begin_run.return_value)
 
-    def test_custody_rejects_expired_foreign_generation_and_endpoint(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            run = root / "run"
-            run.mkdir(mode=0o700)
-            lease_config = {
-                "schema": 1, "executable": "/qualified/resource-lease", "pool": "/pool",
-                "runs_directory": str(root), "profiles": {"ui.clean": "clean"},
-            }
-            current = {
-                "id": "original", "owner": "owner", "capability": "clean",
-                "generation": 1, "slot": "slot", "state": "active",
-                "service_available": True, "quarantined": False, "expires_in": 30,
-                "endpoint": {"adb_serial": "emulator-5576"},
-            }
-            values = {
-                "binding.json": {
-                    "schema": 1, "config": lease_config, "profile": "ui.clean",
-                    "owner": "owner", "capability": "clean",
-                },
-                "status.json": {"phase": "active", "updated_at": time.monotonic(),
-                                "lease": current, "command_stop": "unconfirmed"},
-                "receipt.json": {},
-                "helper.lock": {},
-            }
-            for filename, value in values.items():
-                path = run / filename
-                path.write_text(json.dumps(value))
-                path.chmod(0o600)
-            with patch.dict(os.environ, {"RESOURCE_LEASE_RUN_DIRECTORY": str(run)}), patch.object(
-                facade.fcntl, "flock", side_effect=BlockingIOError
-            ), patch.object(facade, "inspect_lease", return_value=current):
-                self.assertEqual(facade.custody({"lease": lease_config}, "emulator-5576"), current)
-                for key, value in (
-                    ("state", "expired"), ("owner", "foreign"), ("generation", 2),
-                    ("id", "replacement"), ("service_available", False),
-                    ("endpoint", {"adb_serial": "emulator-5580"}),
-                ):
-                    with self.subTest(key=key), patch.object(
-                        facade, "inspect_lease", return_value={**current, key: value}
-                    ), self.assertRaises(facade.Error):
-                        facade.custody({"lease": lease_config}, "emulator-5576")
-            with patch.dict(os.environ, {"RESOURCE_LEASE_RUN_DIRECTORY": str(run)}):
-                with self.assertRaisesRegex(facade.Error, "lease_owner_not_running"):
-                    facade.custody({"lease": lease_config}, "emulator-5576")
+    def test_facade_delegates_to_qualified_public_custody_without_remote_marker(self):
+        module = facade.load_bundle()["android_tools_custody"]
+        borrowed = Mock()
+        borrowed.__enter__ = Mock(return_value=borrowed)
+        borrowed.__exit__ = Mock(return_value=None)
+        current = {"id": "original", "generation": 1}
+        borrowed.check.return_value = current
+        with patch.object(facade, "load_bundle", return_value={
+                "android_tools_custody": module,
+        }), patch.object(module, "borrow_device", return_value=borrowed) as borrow:
+            self.assertEqual(facade.custody({"lease": {"fixture": 1}}, "emulator-5576"), current)
+            borrow.assert_called_once_with({"fixture": 1}, "emulator-5576")
+            borrowed.begin_remote_execution.assert_not_called()
+            borrowed.confirm_remote_stopped.assert_not_called()
+            for reason in ("lease_lost_or_foreign", "lease_owner_not_running"):
+                borrowed.check.side_effect = module.Error(reason)
+                with self.assertRaisesRegex(facade.Error, reason):
+                    facade.custody({"lease": {"fixture": 1}}, "emulator-5576")
 
     def test_uncertainty_marker_survives_owner_resource_teardown(self):
         from test_resource_lease_client import FAKE, SCRIPT
