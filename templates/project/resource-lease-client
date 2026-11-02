@@ -644,7 +644,8 @@ def check(run):
     except Busy:
         pass
     try:
-        native_active(lease.metadata["binding"])
+        if lease.metadata["binding"] is not None:
+            native_active(lease.metadata["binding"])
         current = lease.cli("inspect")
         active(current)
     except (Error, OSError, ValueError):

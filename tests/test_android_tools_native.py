@@ -94,8 +94,271 @@ INVALID_PNG = (
     + _png_chunk(b"IEND", b"")
 )
 
+PNG_INVALID_CASES = {
+    "missing_idat": PNG[:33] + _png_chunk(b"IEND", b""),
+    "bad_deflate": INVALID_PNG,
+    "bad_crc": PNG[:-1] + bytes([PNG[-1] ^ 1]),
+    "trailing_bytes": PNG + b"extra",
+    "bad_filter": (
+        PNG[:33] + _png_chunk(b"IDAT", zlib.compress(b"\x05" + bytes(6) + bytes(14)))
+        + _png_chunk(b"IEND", b"")
+    ),
+    "pixel_limit": (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 16384, 16384, 8, 2, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(b""))
+        + _png_chunk(b"IEND", b"")
+    ),
+    "decoded_limit": (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 4000, 4000, 16, 6, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(b""))
+        + _png_chunk(b"IEND", b"")
+    ),
+}
+
+
+class SelectorTapTests(unittest.TestCase):
+    def run_tap(self, xml, arguments=None, *, custody_error=None, lookup_error=None,
+                tap_error=None, callback=True, version_error=None):
+        self.events = []
+        self.commands = []
+        def process(argv, **kwargs):
+            self.commands.append(argv)
+            self.events.append(argv[1])
+            if argv[1] == "--version":
+                return NATIVE._ProcessOutput(VERSION.encode(), 0, version_error)
+            if argv[1] == "ui-dump":
+                return NATIVE._ProcessOutput(xml.encode(), 0, lookup_error)
+            self.assertEqual(argv[1], "tap")
+            self.assertNotIn("--text", argv)
+            self.assertNotIn("--resource-id", argv)
+            self.assertTrue(argv[-2].isdigit() and argv[-1].isdigit())
+            return NATIVE._ProcessOutput(b"", 1 if tap_error == "provider_failed" else 0,
+                                         None if tap_error == "provider_failed" else tap_error)
+        def before():
+            self.events.append("custody")
+            if custody_error:
+                raise ValueError("lease changed")
+        with patch.object(NATIVE, "_run_process", side_effect=process):
+            return NATIVE.execute_android_native(
+                "mobile-native", "device.tap",
+                {"device_serial": "offline-parser-fixture",
+                 **({"resource_id": "login_button"} if arguments is None else arguments)},
+                executable=Path(sys.executable), expected_version=VERSION,
+                before_effect=before if callback else None,
+            )
+
+    def target(self, **kwargs):
+        return _ui_node_xml("android.widget.Button", resource_id="login_button",
+                            clickable=True, **kwargs)
+
+    def test_unique_target_is_one_coordinate_dispatch_after_fresh_custody(self):
+        result = self.run_tap(_ui_xml(self.target()))
+        self.assertIsNone(result.error)
+        self.assertEqual(self.events, ["--version", "ui-dump", "custody", "tap"])
+        self.assertEqual(self.commands[-1][-2:], ("50", "25"))
+        self.assertEqual(result.data, {"dispatched": True})
+        self.assertNotIn("login_button", json.dumps(result.to_dict()))
+
+    def test_missing_ambiguous_ineligible_or_invalid_target_never_taps(self):
+        node = self.target()
+        cases = [
+            _ui_xml(), _ui_xml(node, node),
+            _ui_xml(node.replace('resource-id="login_button"', 'resource-id="login_button_extra"')),
+            _ui_xml(node.replace('resource-id="login_button"', 'resource-id="LOGIN_BUTTON"')),
+            _ui_xml(node, node.replace('enabled="true"', 'enabled="false"')),
+            _ui_xml(node.replace('enabled="true"', 'enabled="false"')),
+            _ui_xml(node.replace('enabled="true"', '')),
+            _ui_xml(node.replace('clickable="true"', 'clickable="false"')),
+            _ui_xml(node.replace('enabled="true"', 'enabled="unknown"')),
+        ]
+        cases += [_ui_xml(self.target(bounds=bounds)) for bounds in (
+            "[0,0][0,50]", "[100,0][50,50]", "[0,0][100001,50]", "malformed",
+            "[0,0][" + "9" * 5000 + ",50]",
+        )]
+        for xml in cases:
+            with self.subTest(xml=xml[:100]):
+                result = self.run_tap(xml)
+                self.assertEqual(result.effect, "not_dispatched")
+                self.assertIsNotNone(result.error)
+                self.assertNotIn("tap", self.events)
+                self.assertNotIn("custody", self.events)
+                self.assertIsNone(result.data)
+
+    def test_text_modes_are_explicit_and_assertion_semantics_are_unchanged(self):
+        xml = _ui_xml(self.target(text="Continue"))
+        for params, accepted in (
+            ({"text": "Continue"}, True), ({"text": "continue"}, False),
+            ({"text": "Cont"}, False),
+            ({"text": "continue", "case_sensitive": False}, True),
+            ({"text": "Cont", "text_match": "contains"}, True),
+            ({"text": "cont", "text_match": "contains"}, False),
+            ({"text": "cont", "text_match": "contains", "case_sensitive": False}, True),
+        ):
+            with self.subTest(params=params):
+                result = self.run_tap(xml, params)
+                self.assertEqual(result.error is None, accepted)
+                self.assertEqual(self.events.count("tap"), int(accepted))
+        nodes, _ = NATIVE._validate_native_ui_xml(xml.encode(), 4096)
+        self.assertEqual(NATIVE._count_selector(nodes, "text", "cont"), 1)
+        result = self.run_tap(_ui_xml(self.target(content_desc="Continue")), {"text": "Continue"})
+        self.assertIsNone(result.error)
+        result = self.run_tap(_ui_xml(self.target(text="Continue", password=True)), {"text": "Continue"})
+        self.assertEqual(result.effect, "not_dispatched")
+        self.assertNotIn("tap", self.events)
+
+    def test_invalid_selector_parameters_fail_before_provider(self):
+        for params in (
+            {"resource_id": "login_button", "text_match": "exact"},
+            {"resource_id": "login_button", "case_sensitive": True},
+            {"text": "Continue", "text_match": "regex"},
+            {"text": "Continue", "case_sensitive": "false"},
+            {"text": "Continue", "x": 0, "y": 0},
+            {"x": 0, "y": 0, "text_match": "contains"},
+            {"text": "Continue", "resource_id": "login_button"},
+        ):
+            with self.subTest(params=params):
+                result = self.run_tap(_ui_xml(self.target()), params)
+                self.assertEqual(result.error, "invalid_arguments")
+                self.assertEqual(self.events, [])
+
+    def test_lookup_and_custody_failures_do_not_dispatch_and_tap_failure_stays_unknown(self):
+        xml = _ui_xml(self.target())
+        for error in ("query_timeout", "interrupted", "drain_unknown"):
+            result = self.run_tap(xml, version_error=error)
+            self.assertEqual((result.error, result.effect), (error, "not_dispatched"))
+            self.assertEqual(self.events, ["--version"])
+            result = self.run_tap(xml, lookup_error=error)
+            self.assertEqual(result.error, error)
+            self.assertEqual(result.effect, "not_dispatched")
+            self.assertNotIn("tap", self.events)
+        result = self.run_tap(xml, custody_error=True)
+        self.assertEqual((result.error, result.effect), ("lease_lost", "not_dispatched"))
+        self.assertNotIn("tap", self.events)
+        result = self.run_tap(xml, callback=False)
+        self.assertEqual((result.error, result.effect), ("lease_lost", "not_dispatched"))
+        self.assertEqual(self.events, [])
+        for error in ("provider_failed", "query_timeout", "drain_unknown"):
+            result = self.run_tap(xml, tap_error=error)
+            self.assertEqual((result.error, result.effect), (error, "unknown"))
+            self.assertEqual(self.events.count("tap"), 1)
+
+    def test_lookup_and_custody_share_effect_deadline(self):
+        with patch.object(NATIVE.time, "monotonic", side_effect=[0, 0, 31]):
+            result = self.run_tap(_ui_xml(self.target()))
+        self.assertEqual((result.error, result.effect), ("query_timeout", "not_dispatched"))
+        self.assertNotIn("tap", self.events)
+
+    def test_enabled_is_optional_for_observation_but_required_for_tap(self):
+        xml = _ui_xml(self.target().replace('enabled="true"', ''))
+        nodes, _ = NATIVE._validate_native_ui_xml(xml.encode(), 4096)
+        self.assertNotIn("enabled", nodes[0])
+        result = self.run_tap(xml)
+        self.assertEqual((result.error, result.effect), ("assertion_failed", "not_dispatched"))
+
+    def test_nonzero_or_malformed_lookup_never_taps(self):
+        self.assertEqual(self.run_tap("not XML").effect, "not_dispatched")
+        self.assertNotIn("tap", self.events)
+        responses = [NATIVE._ProcessOutput(VERSION.encode(), 0), NATIVE._ProcessOutput(b"", 2)]
+        with patch.object(NATIVE, "_run_process", side_effect=responses) as process:
+            result = NATIVE.execute_android_native(
+                "mobile-native", "device.tap",
+                {"device_serial": "offline-parser-fixture", "resource_id": "login_button"},
+                executable=Path(sys.executable), expected_version=VERSION,
+                before_effect=lambda: self.fail("must not reach custody"),
+            )
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual((result.error, result.effect), ("provider_failed", "not_dispatched"))
+
 
 class AndroidToolsNativeTest(unittest.TestCase):
+    def test_shared_png_bytes_validator(self) -> None:
+        self.assertEqual(NATIVE.validate_png_bytes(PNG), (2, 3))
+        for name, content in PNG_INVALID_CASES.items():
+            with self.subTest(name=name), self.assertRaises(NATIVE._InputError):
+                NATIVE.validate_png_bytes(content)
+
+    def test_platform_metadata_preserves_projection(self) -> None:
+        node = _ui_node_xml("android.view.View", text="Public")
+        baseline = NATIVE._validate_native_ui_xml(_ui_xml(node).encode(), 1048576)
+        for order in ("-2147483648", "-1", "0", "1", "2147483647"):
+            with self.subTest(order=order):
+                xml = _ui_xml(node.replace(
+                    "<node ", f'<node drawing-order="{order}" hint="PRIVATE_HINT_SENTINEL" ', 1
+                ))
+                actual = NATIVE._validate_native_ui_xml(xml.encode(), 1048576)
+                self.assertEqual(actual, baseline)
+                self.assertNotIn("PRIVATE_HINT_SENTINEL", json.dumps(actual))
+
+    def test_discarded_platform_metadata_does_not_require_known_types(self) -> None:
+        baseline_node = _ui_node_xml("android.view.View")
+        baseline = NATIVE._validate_native_ui_xml(_ui_xml(baseline_node).encode(), 1048576)
+        for value in ("", "+1", "-0", "01", "-01", " 1", "1 ", "1.0", "1e0",
+                      "١", "2147483648", "-2147483649", "12345678901234567890"):
+            with self.subTest(value=value):
+                node = baseline_node.replace(
+                    "<node ", f'<node drawing-order="{value}" ', 1
+                )
+                self.assertEqual(NATIVE._validate_native_ui_xml(_ui_xml(node).encode(), 1048576),
+                                 baseline)
+
+    def test_hint_is_discarded_for_every_node_sensitivity(self) -> None:
+        for class_name, password, resource_id in (
+            ("android.view.View", False, ""),
+            ("android.view.View", True, ""),
+            ("android.widget.EditText", False, ""),
+            ("android.view.View", False, "app:id/password"),
+        ):
+            for hint in ("", "Public example", "password=PRIVATE_HINT_SENTINEL"):
+                with self.subTest(class_name=class_name, password=password, hint=hint):
+                    node = _ui_node_xml(class_name, password=password, resource_id=resource_id,
+                                        text="Public", content_desc="Label")
+                    baseline = NATIVE._validate_native_ui_xml(_ui_xml(node).encode(), 1048576)
+                    xml = _ui_xml(node.replace("<node ", f'<node hint="{hint}" ', 1))
+                    actual = NATIVE._validate_native_ui_xml(xml.encode(), 1048576)
+                    self.assertEqual(actual, baseline)
+                    self.assertNotIn("hint", actual[0][0])
+                    self.assertNotIn("PRIVATE_HINT_SENTINEL", json.dumps(actual))
+
+    def test_unknown_response_metadata_is_not_projected(self) -> None:
+        baseline = NATIVE._validate_native_ui_xml(
+            _ui_xml(_ui_node_xml("android.view.View")).encode(), 1048576,
+        )
+        node = _ui_node_xml("android.view.View").replace(
+            "<node ", '<node hint="" drawing-order="0" unknown-platform-key="PRIVATE_SENTINEL" ', 1
+        )
+        xml = _ui_xml(node).replace(
+            '<hierarchy rotation="0"', '<hierarchy rotation="PRIVATE_SENTINEL" vendor="PRIVATE_SENTINEL"',
+        )
+        self.assertEqual(NATIVE._validate_native_ui_xml(xml.encode(), 1048576), baseline)
+
+    def test_projected_fields_remain_required_and_typed(self) -> None:
+        node = _ui_node_xml("android.view.View")
+        for attribute in ('class="android.view.View"', 'bounds="[0,0][100,50]"',
+                          'clickable="false"', 'password="false"'):
+            with self.subTest(missing=attribute):
+                self.assertIn(attribute, node)
+                with self.assertRaises(NATIVE._InputError):
+                    NATIVE._validate_native_ui_xml(
+                        _ui_xml(node.replace(attribute, "")).encode(), 1048576,
+                    )
+        for attribute in ("clickable", "password", "NAF", "enabled"):
+            with self.subTest(invalid=attribute):
+                value = "true" if attribute == "enabled" else "false"
+                candidate = node.replace(f'{attribute}="{value}"', f'{attribute}="unknown"')
+                if attribute == "NAF":
+                    candidate = node.replace("<node ", '<node NAF="unknown" ', 1)
+                with self.assertRaises(NATIVE._InputError):
+                    NATIVE._validate_native_ui_xml(_ui_xml(candidate).encode(), 1048576)
+        for attribute in ("checked", "focused"):
+            value = "true" if attribute == "enabled" else "false"
+            candidate = node.replace(f'{attribute}="{value}"', f'{attribute}="new-format"')
+            self.assertEqual(
+                NATIVE._validate_native_ui_xml(_ui_xml(candidate).encode(), 1048576),
+                NATIVE._validate_native_ui_xml(_ui_xml(node).encode(), 1048576),
+            )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -352,7 +615,7 @@ class AndroidToolsNativeTest(unittest.TestCase):
         result = self.call(
             "mobile-native",
             "device.tap",
-            {"device_serial": "emulator-5554", "text": "Continue"},
+            {"device_serial": "emulator-5554", "x": 50, "y": 25},
             mode="spawn",
             timeout=0.2,
         )
@@ -681,7 +944,7 @@ class AndroidToolsNativeTest(unittest.TestCase):
         self.assertIsNone(result.error)
         self.assertTrue(result.data[0]["naf"])
 
-    def test_native_tree_rejects_unknown_node_fields(self) -> None:
+    def test_native_tree_ignores_unknown_metadata_and_preserves_privacy(self) -> None:
         result = self.call(
             "mobile-native",
             "device.tree",
@@ -697,7 +960,9 @@ class AndroidToolsNativeTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(result.error, "invalid_provider_output")
+        self.assertIsNone(result.error)
+        self.assertEqual(result.data[0]["text"], "<redacted>")
+        self.assertNotIn("future-attribute", result.data[0])
 
     def test_native_tree_rejects_xml_entities(self) -> None:
         result = self.call(

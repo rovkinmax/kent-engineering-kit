@@ -7,7 +7,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import runpy
+import importlib.util
+import sys
 import struct
 import tempfile
 import threading
@@ -15,11 +16,35 @@ import time
 import unittest
 import zlib
 from unittest.mock import patch
+from test_android_tools_native import PNG, PNG_INVALID_CASES
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EVIDENCE = runpy.run_path(str(ROOT / "templates/project/android_tools_evidence.py"))
-NATIVE = runpy.run_path(str(ROOT / "templates/project/android_tools_native.py"))
+NATIVE_SPEC = importlib.util.spec_from_file_location(
+    "android_tools_native", ROOT / "templates/project/android_tools_native.py"
+)
+NATIVE_MODULE = importlib.util.module_from_spec(NATIVE_SPEC)
+sys.modules[NATIVE_SPEC.name] = NATIVE_MODULE
+NATIVE_SPEC.loader.exec_module(NATIVE_MODULE)
+NATIVE = vars(NATIVE_MODULE)
+EVIDENCE_SPEC = importlib.util.spec_from_file_location(
+    "android_tools_evidence_tested", ROOT / "templates/project/android_tools_evidence.py"
+)
+EVIDENCE_MODULE = importlib.util.module_from_spec(EVIDENCE_SPEC)
+sys.modules[EVIDENCE_SPEC.name] = EVIDENCE_MODULE
+EVIDENCE_SPEC.loader.exec_module(EVIDENCE_MODULE)
+EVIDENCE = vars(EVIDENCE_MODULE)
+
+
+class SharedPngValidationTests(unittest.TestCase):
+    def test_evidence_uses_native_validator(self):
+        self.assertIs(EVIDENCE["validate_png_bytes"], NATIVE["validate_png_bytes"])
+        self.assertNotIn("RunOutcome", EVIDENCE)
+        self.assertNotIn("RunOutcome", EVIDENCE["__all__"])
+        self.assertEqual(EVIDENCE["_png_dimensions"](PNG), (2, 3))
+        for name, content in PNG_INVALID_CASES.items():
+            with self.subTest(name=name), self.assertRaises(EVIDENCE["EvidenceError"]):
+                EVIDENCE["_png_dimensions"](content)
 
 
 def png_1x1() -> bytes:
@@ -416,6 +441,29 @@ class AndroidToolsEvidenceTests(unittest.TestCase):
         history = (self.handle.run_directory / "export.jsonl").read_text(encoding="utf-8")
         self.assertIn(result.manifest_sha256, history)
         self.assertNotIn(str(self.root), history)
+
+    def test_historical_png_export_does_not_revalidate_or_rewrite(self) -> None:
+        # The former evidence parser admitted header/end-only PNGs.
+        staged = EVIDENCE["stage_artifact"](
+            self.handle, "historical.png", PNG_INVALID_CASES["missing_idat"], "image/png",
+        )
+        with patch.object(EVIDENCE_MODULE, "validate_png_bytes", return_value=(2, 3)):
+            manifest_path = EVIDENCE["finish_run"](
+                self.handle, NATIVE["NativeResult"]("completed", "observed"),
+                artifacts=[staged],
+            )
+        original = manifest_path.read_bytes()
+        helper = self.write_helper("project-memory", FAKE_STANDALONE)
+        counter = self.root / "historical-helper-calls"
+        with patch.dict(os.environ, {"EVIDENCE_COUNTER": str(counter)}), patch.object(
+            EVIDENCE_MODULE, "validate_png_bytes",
+            side_effect=AssertionError("historical export must not invoke new admission"),
+        ):
+            result = EVIDENCE["export_run"](
+                self.handle, self.binding(), helper=helper, include_artifacts=True,
+            )
+        self.assertEqual(result.status, "exported")
+        self.assertEqual(manifest_path.read_bytes(), original)
 
     def test_failed_export_retry_and_hash_mismatch_never_replay_device_effect(self) -> None:
         self.finish_native_result()
