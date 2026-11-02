@@ -26,6 +26,144 @@ loader.exec_module(facade)
 
 
 class BundleTests(unittest.TestCase):
+    def test_selector_tap_rechecks_identity_and_preserves_proven_no_dispatch(self):
+        native = facade.load_bundle()["android_tools_native"]
+        lease = {"id": "lease", "generation": 1}
+        config = {
+            "records_directory": "/records", "source_root": "/source",
+            "output_limit_bytes": 4096, "timeout_seconds": 2,
+            "retention": {"max_bytes": 500000000, "max_age_seconds": 604800},
+            "providers": {"mobile-native": {"executable": sys.executable, "version": "1"}},
+        }
+        xml = (b'<hierarchy><node class="Button" bounds="[0,0][100,50]" '
+               b'clickable="true" password="false" enabled="true" resource-id="login_button"/></hierarchy>')
+        for middle in (lease, {"id": "lease", "generation": 2}, facade.Error("lost")):
+            evidence = Mock()
+            evidence.begin_run.return_value = SimpleNamespace(staging_directory=Path("/stage"))
+            evidence.reservation_for_operation.return_value = 100
+            evidence.finish_run.return_value = Path("/records/id/manifest.json")
+            final = lease if middle is lease else facade.Error("lost")
+            responses = [native._ProcessOutput(b"1", 0), native._ProcessOutput(xml, 0),
+                         native._ProcessOutput(b"", 0)]
+            output = io.StringIO()
+            with self.subTest(middle=middle), patch.object(
+                facade, "configuration", return_value=config
+            ), patch.object(facade, "load_bundle", return_value={
+                "android_tools_native": native, "android_tools_evidence": evidence,
+                "android_tools_custody": object(),
+            }), patch.object(facade, "custody", side_effect=[lease, middle, final]) as custody, patch.object(
+                native, "_run_process", side_effect=responses
+            ) as process, patch.object(sys, "argv", [
+                "android-tools", "--config", "/config", "device", "tap",
+                "--arguments", '{"device_serial":"offline-parser-fixture","resource_id":"login_button"}',
+            ]), redirect_stdout(output):
+                self.assertEqual(facade.main(), 0 if middle is lease else 1)
+            self.assertEqual(custody.call_count, 3)
+            self.assertEqual(process.call_count, 3 if middle is lease else 2)
+            payload = json.loads(output.getvalue())
+            if middle is not lease:
+                self.assertEqual((payload["error"], payload["effect"]), ("lease_lost", "not_dispatched"))
+            self.assertNotIn("login_button", output.getvalue())
+            evidence.finish_run.assert_called_once()
+            evidence.release_run.assert_called_once()
+
+    def docs_config(self):
+        return {
+            "schema": 1, "timeout_seconds": 2, "output_limit_bytes": 4096,
+            "providers": {"google-android": {"executable": "/tool", "version": "1"}},
+        }
+
+    def test_docs_without_recording_needs_no_store_source_or_lease(self):
+        native_class = facade.load_bundle()["android_tools_native"].NativeResult
+        for action, arguments in (("search", {"query": "Compose"}), ("fetch", {"url": "kb://guide"})):
+            for full in (False, True):
+                for error in (None, "provider_failed"):
+                    config = self.docs_config()
+                    if full:
+                        config.update(source_root="/missing", records_directory="/unavailable", lease=None)
+                        config["providers"]["mobile-native"] = {"unavailable": True}
+                    result = native_class("completed", "not_applicable", error=error)
+                    native, evidence = Mock(), Mock()
+                    native.execute_android_native.return_value = result
+                    output = io.StringIO()
+                    with self.subTest(action=action, full=full, error=error), patch.object(
+                        facade, "read_private", return_value=config
+                    ), patch.object(facade, "load_bundle", return_value={
+                        "android_tools_native": native, "android_tools_evidence": evidence,
+                    }), patch.object(facade, "custody", side_effect=AssertionError("no lease needed")), patch.object(
+                        sys, "argv", ["android-tools", "--config", "/private/config", "docs", action,
+                                      "--arguments", json.dumps(arguments)]
+                    ), redirect_stdout(output):
+                        self.assertEqual(facade.main(), 0 if error is None else 1)
+                    payload = json.loads(output.getvalue())
+                    self.assertIsNone(payload["local_manifest"])
+                    self.assertEqual(payload["error"], error)
+                    evidence.assert_not_called()
+                    self.assertEqual(evidence.mock_calls, [])
+                    native.execute_android_native.assert_called_once_with(
+                        "google-android", f"docs.{action}", arguments,
+                        executable=Path("/tool"), expected_version="1",
+                        timeout_s=2, output_limit_bytes=4096,
+                    )
+
+    def test_minimal_docs_config_does_not_admit_recorded_device_or_preview(self):
+        for family, action, extra in (("docs", "search", ["--record"]),
+                                      ("device", "tree", []), ("preview", "list", [])):
+            with self.subTest(family=family), patch.object(
+                facade, "read_private", return_value=self.docs_config()
+            ), patch.object(facade, "load_bundle") as bundle, patch.object(
+                sys, "argv", ["android-tools", "--config", "/config", family, action, *extra]
+            ), self.assertRaisesRegex(facade.Error, "unsupported_configuration"):
+                facade.main()
+            bundle.assert_not_called()
+
+    def test_docs_configuration_still_validates_limits_provider_and_unknown_keys(self):
+        for change in (
+            {"schema": 2}, {"extra": True}, {"timeout_seconds": True},
+            {"timeout_seconds": 301}, {"output_limit_bytes": 4095},
+            {"providers": {}}, {"providers": {"google-android": {"executable": "relative", "version": "1"}}},
+        ):
+            with self.subTest(change=change), patch.object(
+                facade, "read_private", return_value={**self.docs_config(), **change}
+            ), self.assertRaises(facade.Error):
+                facade.configuration(Path("/config"), docs_only=True)
+
+    def test_docs_unknown_action_and_record_on_other_family_fail_before_config(self):
+        for family, action, extra in (("docs", "future", []), ("preview", "list", ["--record"])):
+            with patch.object(facade, "configuration") as config, patch.object(
+                sys, "argv", ["android-tools", "--config", "/config", family, action, *extra]
+            ), self.assertRaises(facade.Error):
+                facade.main()
+            config.assert_not_called()
+
+    def test_explicit_docs_and_both_preview_operations_keep_recording(self):
+        native_class = facade.load_bundle()["android_tools_native"].NativeResult
+        for family, action, extra in (("docs", "search", ["--record"]),
+                                      ("preview", "list", []), ("preview", "render", [])):
+            config = self.docs_config()
+            config.update(source_root="/source", records_directory="/records",
+                          retention={"max_bytes": 500000000, "max_age_seconds": 604800})
+            native, evidence = Mock(), Mock()
+            native.execute_android_native.return_value = native_class("completed", "not_applicable")
+            evidence.begin_run.return_value = SimpleNamespace(staging_directory=Path("/stage"))
+            evidence.reservation_for_operation.return_value = 100
+            evidence.finish_run.return_value = Path("/records/id/manifest.json")
+            output = io.StringIO()
+            with self.subTest(family=family, action=action), patch.object(
+                facade, "configuration", return_value=config
+            ), patch.object(facade, "load_bundle", return_value={
+                "android_tools_native": native, "android_tools_evidence": evidence,
+            }), patch.object(sys, "argv", [
+                "android-tools", "--config", "/config", family, action, *extra,
+            ]), redirect_stdout(output):
+                self.assertEqual(facade.main(), 0)
+            self.assertEqual(json.loads(output.getvalue())["local_manifest"], "/records/id/manifest.json")
+            evidence.begin_run.assert_called_once()
+            evidence.finish_run.assert_called_once()
+            evidence.release_run.assert_called_once_with(evidence.begin_run.return_value)
+            self.assertEqual(native.execute_android_native.call_args.kwargs["source_root"], Path("/source"))
+            self.assertEqual(native.execute_android_native.call_args.kwargs["staging_dir"], Path("/stage"))
+
     def test_unqualified_bundle_rejected(self):
         with patch.object(facade, "BUNDLE_HASHES", {"absent.py": "0" * 64}):
             with self.assertRaises(facade.Error):
@@ -128,7 +266,7 @@ class BundleTests(unittest.TestCase):
     def test_missing_run_is_not_ownership(self):
         with patch.dict("os.environ", {}, clear=True):
             with self.assertRaises(facade.Error):
-                facade.custody({}, "emulator-5576")
+                facade.custody(facade.load_bundle()["android_tools_custody"], {}, "emulator-5576")
 
     def test_retention_defaults_and_explicit_bounds(self):
         config = {
@@ -186,7 +324,7 @@ class BundleTests(unittest.TestCase):
                 "android_tools_native": native, "android_tools_evidence": evidence,
             }), patch.object(sys, "argv", [
                 "android-tools", "--config", "/config", "docs", "search",
-                "--arguments", '{"query":"Compose"}',
+                "--arguments", '{"query":"Compose"}', "--record",
             ]), self.assertRaises((ValueError, KeyboardInterrupt)):
                 facade.main()
             if failure == "admission":
@@ -200,6 +338,7 @@ class BundleTests(unittest.TestCase):
             })
 
     def test_dpad_keys_use_custody_and_evidence_path(self):
+        sentinel_custody = object()
         result_type = make_dataclass("DpadResult", [
             ("transport", str), ("effect", str), ("error", str),
             ("data", dict), ("artifacts", tuple),
@@ -232,8 +371,9 @@ class BundleTests(unittest.TestCase):
                     return_value={
                         "android_tools_native": native,
                         "android_tools_evidence": evidence,
+                        "android_tools_custody": sentinel_custody,
                     },
-                ), patch.object(facade, "custody", side_effect=[lease, lease]) as custody, patch.object(
+                ) as bundle, patch.object(facade, "custody", side_effect=[lease, lease]) as custody, patch.object(
                     sys,
                     "argv",
                     [
@@ -248,8 +388,9 @@ class BundleTests(unittest.TestCase):
                 self.assertEqual(payload["data"], {"dispatched": True})
                 self.assertEqual(payload["local_manifest"], str(manifest))
                 self.assertEqual(custody.call_count, 2)
+                bundle.assert_called_once_with()
                 for call_args in custody.call_args_list:
-                    self.assertEqual(call_args.args, (config, serial))
+                    self.assertEqual(call_args.args, (sentinel_custody, config, serial))
                 self.assertEqual(
                     evidence.begin_run.call_args.args,
                     (
@@ -311,6 +452,7 @@ class BundleTests(unittest.TestCase):
                         return_value={
                             "android_tools_native": native,
                             "android_tools_evidence": evidence,
+                            "android_tools_custody": Mock(),
                         },
                     ), patch.object(
                         facade, "custody", side_effect=failure
@@ -332,6 +474,7 @@ class BundleTests(unittest.TestCase):
                     native.execute_android_native.assert_not_called()
 
     def test_uncertain_drain_preserves_handoff_outcome_and_releases_record(self):
+        sentinel_custody = object()
         result_type = make_dataclass("Result", [
             ("transport", str), ("effect", str), ("error", str),
             ("data", dict), ("artifacts", tuple),
@@ -352,14 +495,17 @@ class BundleTests(unittest.TestCase):
                 facade, "configuration", return_value=config
             ), patch.object(facade, "load_bundle", return_value={
                 "android_tools_native": native, "android_tools_evidence": evidence,
-            }), patch.object(facade, "custody", side_effect=[
+                "android_tools_custody": sentinel_custody,
+            }) as bundle, patch.object(facade, "custody", side_effect=[
                 {"id": "lease", "generation": 1}, facade.Error("lease_lost"),
             ]), patch.object(facade, "handoff_uncertain",
-                             side_effect=OSError() if marker_failure else None), patch.object(
+                             side_effect=OSError() if marker_failure else None) as handoff, patch.object(
                 sys, "argv", ["android-tools", "--config", "/config", "device", "tap",
                               "--arguments", '{"device_serial":"emulator-5576"}']
             ), redirect_stdout(output):
                 self.assertEqual(facade.main(), 1)
+            bundle.assert_called_once_with()
+            handoff.assert_called_once_with(sentinel_custody)
             payload = json.loads(output.getvalue())
             self.assertEqual(payload["error"], "drain_unknown")
             self.assertEqual(payload["lease_handoff"],
@@ -374,17 +520,16 @@ class BundleTests(unittest.TestCase):
         borrowed.__exit__ = Mock(return_value=None)
         current = {"id": "original", "generation": 1}
         borrowed.check.return_value = current
-        with patch.object(facade, "load_bundle", return_value={
-                "android_tools_custody": module,
-        }), patch.object(module, "borrow_device", return_value=borrowed) as borrow:
-            self.assertEqual(facade.custody({"lease": {"fixture": 1}}, "emulator-5576"), current)
+        with patch.object(facade, "load_bundle", side_effect=AssertionError("must reuse module")), patch.object(
+                module, "borrow_device", return_value=borrowed) as borrow:
+            self.assertEqual(facade.custody(module, {"lease": {"fixture": 1}}, "emulator-5576"), current)
             borrow.assert_called_once_with({"fixture": 1}, "emulator-5576")
             borrowed.begin_remote_execution.assert_not_called()
             borrowed.confirm_remote_stopped.assert_not_called()
             for reason in ("lease_lost_or_foreign", "lease_owner_not_running"):
                 borrowed.check.side_effect = module.Error(reason)
                 with self.assertRaisesRegex(facade.Error, reason):
-                    facade.custody({"lease": {"fixture": 1}}, "emulator-5576")
+                    facade.custody(module, {"lease": {"fixture": 1}}, "emulator-5576")
 
     def test_uncertainty_marker_survives_owner_resource_teardown(self):
         from test_resource_lease_client import FAKE, SCRIPT
@@ -405,7 +550,7 @@ class BundleTests(unittest.TestCase):
             code = (
                 "import runpy; "
                 f"scope=runpy.run_path({str(SOURCE)!r},run_name='facade_fixture'); "
-                "scope['handoff_uncertain'](); raise SystemExit(1)"
+                "scope['handoff_uncertain'](scope['load_bundle']()['android_tools_custody']); raise SystemExit(1)"
             )
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), "run", "--config", str(config),

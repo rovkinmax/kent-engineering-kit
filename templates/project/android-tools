@@ -16,8 +16,8 @@ import types
 PROTOCOL = 1
 # Exact source bundle: verify and execute the same bytes before any dispatch.
 BUNDLE_HASHES = {
-    "android_tools_native.py": "7dc05fba9b40349761df181e018499b816dd6e1a1592cfa98fe2da2a9c11b962",
-    "android_tools_evidence.py": "fcee3620d1a42f408f5a160e461cb67b74a309a63447afb1fe1a3fcb871d4da9",
+    "android_tools_native.py": "97cad8d0fba456afcd31460fe862876fa762e2c486e6def10a2d5f83e43f0e1f",
+    "android_tools_evidence.py": "1d5e7b63c27f972bb2757709a128e45226a7a7abdc0bb6cdbb24632771989d1d",
     "android_tools_custody.py": "782470769557bc9327f19ede7b297b6666593ed8fd4feb3890dd7887868cf008",
 }
 LIMIT = 262144
@@ -69,13 +69,33 @@ def read_private(path):
     return value
 
 
-def configuration(path):
+def configuration(path, *, docs_only=False):
     value = read_private(path)
-    if set(value) - {"retention"} != {
-        "schema", "source_root", "records_directory", "timeout_seconds",
-        "output_limit_bytes", "providers", "lease",
-    } or value["schema"] != PROTOCOL:
+    required = {"schema", "timeout_seconds", "output_limit_bytes", "providers"}
+    storage = {"source_root", "records_directory", "lease"}
+    if (not required <= set(value) or set(value) - required - storage - {"retention"}
+            or (not docs_only and not storage <= set(value))
+            or value["schema"] != PROTOCOL):
         raise Error("unsupported_configuration")
+    if (type(value["timeout_seconds"]) not in (int, float)
+            or not 0 < value["timeout_seconds"] <= 300
+            or type(value["output_limit_bytes"]) is not int
+            or not 4096 <= value["output_limit_bytes"] <= 8388608):
+        raise Error("invalid_limits")
+    providers = value["providers"]
+    required_providers = {"google-android"} if docs_only else {"mobile-native", "google-android"}
+    if (not isinstance(providers, dict) or not required_providers <= set(providers)
+            or set(providers) - {"mobile-native", "google-android"}):
+        raise Error("invalid_providers")
+    for name in required_providers:
+        provider = providers[name]
+        if (not isinstance(provider, dict) or set(provider) != {"executable", "version"}
+                or not isinstance(provider["executable"], str)
+                or not Path(provider["executable"]).is_absolute()
+                or not isinstance(provider["version"], str)):
+            raise Error("invalid_provider")
+    if docs_only:
+        return value
     retention = value.get("retention", {"max_bytes": 500000000, "max_age_seconds": 604800})
     if (not isinstance(retention, dict)
             or set(retention) != {"max_bytes", "max_age_seconds"}
@@ -88,18 +108,6 @@ def configuration(path):
     for key in ("source_root", "records_directory"):
         if not isinstance(value[key], str) or not Path(value[key]).is_absolute():
             raise Error("absolute_path_required")
-    if (type(value["timeout_seconds"]) not in (int, float)
-            or not 0 < value["timeout_seconds"] <= 300
-            or type(value["output_limit_bytes"]) is not int
-            or not 4096 <= value["output_limit_bytes"] <= 8388608):
-        raise Error("invalid_limits")
-    if set(value["providers"]) != {"mobile-native", "google-android"}:
-        raise Error("invalid_providers")
-    for provider in value["providers"].values():
-        if (set(provider) != {"executable", "version"}
-                or not Path(provider["executable"]).is_absolute()
-                or not isinstance(provider["version"], str)):
-            raise Error("invalid_provider")
     lease = value["lease"]
     if (not isinstance(lease, dict) or set(lease) != {
         "schema", "executable", "pool", "runs_directory", "profiles",
@@ -116,8 +124,7 @@ def configuration(path):
     return value
 
 
-def custody(config, serial):
-    module = load_bundle()["android_tools_custody"]
+def custody(module, config, serial):
     try:
         with module.borrow_device(config.get("lease"), serial) as borrowed:
             return borrowed.check()
@@ -125,8 +132,7 @@ def custody(config, serial):
         raise Error(str(error)) from None
 
 
-def handoff_uncertain():
-    module = load_bundle()["android_tools_custody"]
+def handoff_uncertain(module):
     try:
         module.handoff_uncertain("native_runner_drain_unconfirmed")
     except module.Error as error:
@@ -143,8 +149,15 @@ def main():
     parser.add_argument("--helper", help="Qualified project-memory executable for export")
     parser.add_argument("--interface", choices=("standalone", "workflow"), default="standalone")
     parser.add_argument("--include-artifacts", action="store_true")
+    parser.add_argument("--record", action="store_true",
+                        help="Record docs queries for explicit evidence export")
     args = parser.parse_args()
-    config = configuration(Path(args.config))
+    if args.family == "docs" and args.action not in {"search", "fetch"}:
+        raise Error("unsupported_operation")
+    if args.record and args.family != "docs":
+        raise Error("record_only_for_docs")
+    docs_only = args.family == "docs" and not args.record
+    config = configuration(Path(args.config), docs_only=docs_only)
     arguments = json.loads(args.arguments)
     if not isinstance(arguments, dict):
         raise Error("arguments_must_be_object")
@@ -166,11 +179,21 @@ def main():
     operation = f"{args.family}.{args.action}"
     provider_id = "mobile-native" if args.family == "device" else "google-android"
     provider = config["providers"][provider_id]
+    if docs_only:
+        result = modules["android_tools_native"].execute_android_native(
+            provider_id, operation, arguments,
+            executable=Path(provider["executable"]), expected_version=provider["version"],
+            timeout_s=config["timeout_seconds"], output_limit_bytes=config["output_limit_bytes"],
+        )
+        output = dataclasses.asdict(result)
+        output["local_manifest"] = None
+        print(json.dumps(output, sort_keys=True))
+        return 0 if result.error is None else 1
     safe_context = {}
     if args.family == "device":
         if args.action == "capture" and arguments.pop("scene", None) != "known-safe":
             raise Error("capture_scene_unqualified")
-        lease = custody(config, arguments.get("device_serial"))
+        lease = custody(modules["android_tools_custody"], config, arguments.get("device_serial"))
         safe_context = {
             "lease_id": lease["id"], "generation": lease["generation"],
             "device_serial": arguments["device_serial"],
@@ -179,6 +202,11 @@ def main():
         safe_context = {"target": arguments.get("target", "")}
     native = modules["android_tools_native"]
     evidence = modules["android_tools_evidence"]
+    def before_tap():
+        current = custody(modules["android_tools_custody"], config, arguments.get("device_serial"))
+        if (current["id"], current["generation"]) != (lease["id"], lease["generation"]):
+            raise Error("lease_lost")
+
     handle = evidence.begin_run(
         Path(config["records_directory"]), operation, provider_id, safe_context,
         **config["retention"],
@@ -194,21 +222,25 @@ def main():
             output_limit_bytes=config.get("output_limit_bytes", 1048576),
             source_root=Path(config["source_root"]),
             staging_dir=handle.staging_directory,
+            **({"before_effect": before_tap} if operation == "device.tap"
+               and {"text", "resource_id"} & set(arguments) else {}),
         )
         handoff = None
         if args.family == "device" and result.error == "drain_unknown":
             try:
-                handoff_uncertain()
+                handoff_uncertain(modules["android_tools_custody"])
                 handoff = "uncertainty_recorded"
             except (Error, OSError, KeyError):
                 handoff = "handoff_unknown"
         if args.family == "device":
             try:
-                custody(config, arguments.get("device_serial"))
+                custody(modules["android_tools_custody"], config, arguments.get("device_serial"))
             except (Error, ValueError, OSError, KeyError, subprocess.SubprocessError):
                 if result.error != "drain_unknown":
                     result = dataclasses.replace(
-                        result, transport="unknown", effect="unknown", error="lease_lost",
+                        result, transport="unknown",
+                        effect="not_dispatched" if result.effect == "not_dispatched" else "unknown",
+                        error="lease_lost",
                     )
         # Evidence is intentionally narrower than the useful interactive result.
         manifest = evidence.finish_run(handle, result)

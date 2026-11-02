@@ -16,14 +16,14 @@ import re
 import selectors
 import shutil
 import stat
-import struct
 import subprocess
 import sys
 import threading
 import time
 import uuid
-import zlib
 from typing import Any, Iterable, Mapping
+
+from android_tools_native import _InputError as NativeInputError, validate_png_bytes
 
 MAX_ARTIFACTS = 16
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
@@ -66,7 +66,6 @@ _ERRORS = {
     "preview_result_missing", "invalid_png", "missing_output",
     "invalid_provider_output", "assertion_failed",
 }
-_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _DATA_BOOL = {"captured", "completed", "visible"}
 _DATA_INT = {"match_count", "duration_ms", "exit_code", "api_level", "http_status"}
 _TIME_LOCK = threading.Lock()
@@ -110,21 +109,6 @@ class RunHandle:
     staging_directory: Path
     manifest_path: Path
     _lease: _RunLease | None = field(default=None, repr=False, compare=False)
-
-
-@dataclass(frozen=True)
-class RunOutcome:
-    transport: str
-    effect: str
-    error: str | None = None
-    data: Any = None
-    artifacts: tuple[dict[str, Any], ...] = ()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "transport": self.transport, "effect": self.effect, "error": self.error,
-            "data": self.data, "artifacts": list(self.artifacts),
-        }
 
 
 @dataclass(frozen=True)
@@ -1094,9 +1078,7 @@ def _stage_artifact_active(staging: Path, name: str, content: bytes,
 
 
 def _native_outcome(value: Any) -> tuple[dict[str, Any], list[Any]]:
-    if isinstance(value, RunOutcome):
-        result = value.to_dict()
-    elif isinstance(value, Mapping):
+    if isinstance(value, Mapping):
         result = dict(value)
     elif callable(getattr(value, "to_dict", None)):
         result = value.to_dict()
@@ -1193,36 +1175,10 @@ def _artifact_metadata(staging: Path, item: Any) -> tuple[str, str, bytes, int |
 
 
 def _png_dimensions(raw: bytes) -> tuple[int, int]:
-    if len(raw) < 33 or not raw.startswith(_PNG_SIGNATURE):
-        raise EvidenceError("invalid PNG artifact")
-    offset, width, height = len(_PNG_SIGNATURE), 0, 0
-    saw_header = saw_end = False
-    while offset + 12 <= len(raw):
-        size = struct.unpack(">I", raw[offset:offset + 4])[0]
-        end = offset + size + 12
-        if end > len(raw):
-            raise EvidenceError("invalid PNG chunk")
-        kind = raw[offset + 4:offset + 8]
-        payload = raw[offset + 8:offset + 8 + size]
-        crc = struct.unpack(">I", raw[offset + 8 + size:end])[0]
-        if zlib.crc32(kind + payload) & 0xFFFFFFFF != crc:
-            raise EvidenceError("invalid PNG checksum")
-        if not saw_header:
-            if kind != b"IHDR" or size != 13:
-                raise EvidenceError("PNG header is missing")
-            width, height = struct.unpack(">II", payload[:8])
-            if not 0 < width <= 16384 or not 0 < height <= 16384:
-                raise EvidenceError("invalid PNG dimensions")
-            saw_header = True
-        if kind == b"IEND":
-            if size or end != len(raw):
-                raise EvidenceError("invalid PNG ending")
-            saw_end = True
-            break
-        offset = end
-    if not saw_header or not saw_end:
-        raise EvidenceError("incomplete PNG artifact")
-    return width, height
+    try:
+        return validate_png_bytes(raw)
+    except NativeInputError as error:
+        raise EvidenceError("invalid PNG artifact") from error
 
 
 def _store_artifact(run: Path, name: str, media: str, raw: bytes,
@@ -1848,6 +1804,6 @@ def _export_pinned(handle: RunHandle, run: Path, identity: Mapping[str, str],
 
 __all__ = [
     "BindingError", "EvidenceError", "ExportResult", "RetentionLimitError", "RunHandle",
-    "RunOutcome", "StagedArtifact", "begin_run", "export_run", "finish_run", "open_run",
+    "StagedArtifact", "begin_run", "export_run", "finish_run", "open_run",
     "release_run", "reservation_for_operation", "stage_artifact",
 ]

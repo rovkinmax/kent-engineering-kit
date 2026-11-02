@@ -15,7 +15,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,6 +30,42 @@ loader.exec_module(client)
 
 TASK = "task-11111111-1111-4111-8111-111111111111"
 SESSION = "22222222-2222-4222-8222-222222222222"
+
+
+class PublicCheckTests(unittest.TestCase):
+    def test_standalone_check_observes_lease_without_native_task(self):
+        self.check_case(None)
+
+    def test_workflow_check_still_observes_native_task(self):
+        self.check_case({"project": "/project", "task": TASK, "session": SESSION})
+
+    def check_case(self, binding):
+        @contextmanager
+        def owned_lock(_):
+            raise client.Busy("owned")
+            yield
+
+        with tempfile.TemporaryDirectory() as directory:
+            current = {"state": "active", "endpoint": {"adb_serial": "emulator-5574"},
+                       "expires_in": 30, "quarantined": False}
+            lease = SimpleNamespace(run=Path(directory), metadata={"binding": binding},
+                                    cli=lambda action: current)
+            status = {"phase": "active", "updated_at": time.monotonic()}
+            with patch.object(client, "load", return_value=lease), patch.object(
+                client, "read", return_value=status
+            ), patch.object(client, "lock", owned_lock), patch.object(
+                client, "native_active"
+            ) as native:
+                self.assertEqual(client.check(lease.run)["lease"], current)
+                if binding is None:
+                    native.assert_not_called()
+                else:
+                    native.assert_called_once_with(binding)
+                current["state"] = "completed"
+                with self.assertRaisesRegex(client.Error, "lease is not active"):
+                    client.check(lease.run)
+                self.assertTrue((lease.run / "stop-renewal.json").exists())
+
 
 FAKE = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
@@ -114,6 +150,18 @@ class ResourceLeaseClientTests(unittest.TestCase):
 
     def calls(self):
         return (self.pool / "calls").read_text().splitlines()
+
+    def test_owned_standalone_command_can_use_public_check(self):
+        code = (
+            "import os,subprocess,sys; "
+            f"result=subprocess.run([sys.executable,{str(SCRIPT)!r},'check','--run-dir',"
+            "os.environ['RESOURCE_LEASE_RUN_DIRECTORY']],capture_output=True,text=True); "
+            "assert result.returncode==0,result.stderr"
+        )
+        result = self.invoke(*self.run_args(code))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls().count("acquire"), 1)
+        self.assertEqual(self.calls()[-1], "release")
 
     def test_command_renews_and_releases_exact_serial(self):
         result = self.invoke(*self.run_args(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import errno
@@ -18,7 +18,7 @@ import struct
 import subprocess
 import threading
 import time
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 import xml.etree.ElementTree as ET
 import zlib
 
@@ -77,39 +77,7 @@ _PACKAGE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+\Z")
 _TARGET = re.compile(r"[A-Za-z0-9_.:-]+@[A-Za-z0-9_.-]+\Z")
 _FQN = re.compile(r"[A-Za-z_$][A-Za-z0-9_$.]*\Z")
 _UI_BOUNDS = re.compile(r"\[\d+,\d+\]\[\d+,\d+\]\Z")
-_UI_XML_NODE_ATTRIBUTES = {
-    "index",
-    "text",
-    "resource-id",
-    "class",
-    "package",
-    "content-desc",
-    "checkable",
-    "checked",
-    "clickable",
-    "enabled",
-    "focusable",
-    "focused",
-    "scrollable",
-    "long-clickable",
-    "password",
-    "selected",
-    "NAF",
-    "bounds",
-}
-_UI_XML_BOOLEAN_ATTRIBUTES = {
-    "checkable",
-    "checked",
-    "clickable",
-    "enabled",
-    "focusable",
-    "focused",
-    "scrollable",
-    "long-clickable",
-    "password",
-    "selected",
-    "NAF",
-}
+_UI_XML_BOOLEAN_ATTRIBUTES = {"clickable", "password", "NAF", "enabled"}
 _KEYS = {
     "back",
     "home",
@@ -153,6 +121,7 @@ class _CallSpec:
     artifact_path: Path | None = None
     artifact_dir: Path | None = None
     assertion: tuple[str, str, bool] | None = None
+    tap_selector: tuple[str, str, str, bool] | None = None
     cwd: Path | None = None
     fqn: str | None = None
 
@@ -185,6 +154,7 @@ def execute_android_native(
     output_limit_bytes: int = 1024 * 1024,
     source_root: Path | None = None,
     staging_dir: Path | None = None,
+    before_effect: Callable[[], None] | None = None,
 ) -> NativeResult:
     """Execute one closed native operation without shell expansion or retries."""
 
@@ -211,21 +181,55 @@ def execute_android_native(
             source_root=source_root,
             staging_dir=staging_dir,
         )
+        if spec.tap_selector is not None and before_effect is None:
+            raise _InputError("lease_lost")
     except _InputError as error:
         return _not_started(error.code)
     except (OSError, TypeError, ValueError):
         return _not_started("invalid_arguments")
 
+    deadline = time.monotonic() + timeout if spec.tap_selector is not None else None
     command_prefix = ("--no-metrics",) if provider_id == "google-android" else ()
     version_output = _run_process(
         (str(executable_path), *command_prefix, "--version"),
-        timeout_s=5.0,
+        timeout_s=min(5.0, timeout) if deadline is not None else 5.0,
         output_limit_bytes=min(output_limit, 4096),
     )
     if version_output.error is not None:
-        return _process_failure(version_output, effectful=False)
+        failure = _process_failure(version_output, effectful=False)
+        return replace(failure, effect="not_dispatched") if spec.tap_selector is not None else failure
     if version_output.exit_code != 0 or not _version_matches(version_output.stdout, version):
         return _not_started("provider_version_mismatch")
+
+    if spec.tap_selector is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return NativeResult("timed_out", "not_dispatched", "query_timeout")
+        observation = _run_process(
+            (str(executable_path), *spec.argv),
+            timeout_s=remaining, output_limit_bytes=output_limit,
+        )
+        if observation.error is not None:
+            return replace(_process_failure(observation, effectful=False), effect="not_dispatched")
+        if observation.exit_code != 0:
+            return NativeResult("failed", "not_dispatched", "provider_failed")
+        try:
+            nodes, _ = _validate_native_ui_xml(observation.stdout, output_limit)
+            x, y = _selector_tap_coordinates(nodes, spec.tap_selector)
+        except _InputError as error:
+            return NativeResult("completed", "not_dispatched", error.code)
+        try:
+            before_effect()
+        except (ValueError, OSError, KeyError, subprocess.SubprocessError):
+            return NativeResult("completed", "not_dispatched", "lease_lost")
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            return NativeResult("timed_out", "not_dispatched", "query_timeout")
+        spec = _build_call(
+            provider_id, operation,
+            {"device_serial": arguments["device_serial"], "x": x, "y": y},
+            source_root=source_root, staging_dir=staging_dir,
+        )
 
     result = _run_process(
         (str(executable_path), *command_prefix, *spec.argv),
@@ -545,21 +549,29 @@ def _build_call(
     if operation == "device.tap":
         _closed_arguments(
             arguments,
-            {"device_serial", "text", "resource_id", "x", "y"},
+            {"device_serial", "text", "resource_id", "x", "y", "text_match", "case_sensitive"},
             {"device_serial"},
         )
         coordinates = {"x", "y"} & set(arguments)
         if coordinates:
             if coordinates != {"x", "y"}:
                 raise _InputError("invalid_arguments")
-            if "text" in arguments or "resource_id" in arguments:
+            if {"text", "resource_id", "text_match", "case_sensitive"} & set(arguments):
                 raise _InputError("invalid_arguments")
             x, y = _coordinate(arguments["x"]), _coordinate(arguments["y"])
             command = ("tap", "--platform", "android", "--device", serial, str(x), str(y))
         else:
             field, value = _selector(arguments)
-            flag = "--text" if field == "text" else "--resource-id"
-            command = ("tap", "--platform", "android", "--device", serial, flag, value)
+            if field != "text" and {"text_match", "case_sensitive"} & set(arguments):
+                raise _InputError("invalid_arguments")
+            text_match = arguments.get("text_match", "exact")
+            case_sensitive = arguments.get("case_sensitive", True)
+            if text_match not in ("exact", "contains") or type(case_sensitive) is not bool:
+                raise _InputError("invalid_arguments")
+            return _CallSpec(
+                ("ui-dump", "--platform", "android", "--format", "xml", "--device", serial),
+                "tap_selector", tap_selector=(field, value, text_match, case_sensitive),
+            )
         return _CallSpec(command, "status", effectful=True)
 
     if operation == "device.key":
@@ -1111,16 +1123,15 @@ def _validate_native_ui_xml(
                     if depth == 0:
                         if element.tag != "hierarchy" or root_seen:
                             raise _InputError("invalid_provider_output")
-                        if set(element.attrib) - {"rotation"}:
-                            raise _InputError("invalid_provider_output")
                         root_seen = True
                     else:
                         if element.tag != "node" or stack[-1] not in {"hierarchy", "node"}:
                             raise _InputError("invalid_provider_output")
                         attributes = element.attrib
                         required = {"class", "bounds", "clickable", "password"}
-                        if required - set(attributes) or set(attributes) - _UI_XML_NODE_ATTRIBUTES:
+                        if required - set(attributes):
                             raise _InputError("invalid_provider_output")
+                        # Response metadata is discarded; validate only projected fields.
                         if any(
                             attributes.get(name) not in {"true", "false"}
                             for name in _UI_XML_BOOLEAN_ATTRIBUTES
@@ -1139,6 +1150,8 @@ def _validate_native_ui_xml(
                         }
                         if "NAF" in attributes:
                             node["naf"] = attributes["NAF"] == "true"
+                        if "enabled" in attributes:
+                            node["enabled"] = attributes["enabled"] == "true"
                         for xml_name, field in (
                             ("text", "text"),
                             ("resource-id", "resource_id"),
@@ -1198,6 +1211,39 @@ def _is_sensitive_ui_node(node: Mapping[str, Any]) -> bool:
     return isinstance(resource_id, str) and bool(
         re.search(r"password|passphrase|secret|credential|token", resource_id, re.IGNORECASE)
     )
+
+
+def _selector_tap_coordinates(
+    nodes: list[dict[str, Any]], selector: tuple[str, str, str, bool],
+) -> tuple[int, int]:
+    field, expected, text_match, case_sensitive = selector
+    matches = []
+    needle = expected if case_sensitive else expected.casefold()
+    for node in nodes:
+        if field == "resource_id":
+            matched = node.get("resource_id") == expected
+        else:
+            values = [
+                value if case_sensitive else value.casefold()
+                for key in ("text", "content_desc")
+                if isinstance(value := node.get(key), str) and value != "<redacted>"
+            ]
+            matched = any(needle == value if text_match == "exact" else needle in value
+                          for value in values)
+        if matched:
+            matches.append(node)
+    if len(matches) != 1:
+        raise _InputError("assertion_failed")
+    node = matches[0]
+    if node.get("enabled") is not True or node.get("clickable") is not True:
+        raise _InputError("assertion_failed")
+    coordinates = re.findall(r"\d+", node["bounds"])
+    if len(coordinates) != 4 or any(len(value) > 6 for value in coordinates):
+        raise _InputError("assertion_failed")
+    left, top, right, bottom = map(int, coordinates)
+    if not (0 <= left < right <= 100_000 and 0 <= top < bottom <= 100_000):
+        raise _InputError("assertion_failed")
+    return (left + right) // 2, (top + bottom) // 2
 
 
 def _count_selector(value: Any, field: str, expected: str) -> int:
@@ -1283,8 +1329,10 @@ def _redact_text(value: str) -> str:
     return _SECRET_TEXT.sub(r"\1\2<redacted>", value)
 
 
-def _validate_png(path: Path, output_limit: int) -> dict[str, Any]:
-    content = _read_bounded_file(path, min(output_limit, MAX_ARTIFACT_BYTES))
+def validate_png_bytes(content: bytes) -> tuple[int, int]:
+    """Validate bounded PNG pixels and return dimensions without filesystem access."""
+    if len(content) > MAX_ARTIFACT_BYTES:
+        raise _InputError("artifact_limit")
     if len(content) < 45 or not content.startswith(b"\x89PNG\r\n\x1a\n"):
         raise _InputError("invalid_png")
     offset = 8
@@ -1360,6 +1408,12 @@ def _validate_png(path: Path, output_limit: int) -> dict[str, Any]:
     scanline_size = row_bytes + 1
     if any(decoded[row] > 4 for row in range(0, decoded_size, scanline_size)):
         raise _InputError("invalid_png")
+    return width, height
+
+
+def _validate_png(path: Path, output_limit: int) -> dict[str, Any]:
+    content = _read_bounded_file(path, min(output_limit, MAX_ARTIFACT_BYTES))
+    width, height = validate_png_bytes(content)
     return {
         "path": str(path),
         "media_type": "image/png",
