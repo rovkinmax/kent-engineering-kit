@@ -110,6 +110,11 @@
   execution target, execution root, or resolved commit in project metadata.
 - Task comments are durable context, not a live control channel. Send active
   run feedback through `kent run steer` or the equivalent interactive message.
+- For a dependency wait, identify the unmet prerequisite and observable
+  condition that resolves it. Use observation that can detect that condition;
+  do not substitute a coordinating Session's completion for an intermediate
+  result. Once resolved, continue within existing authority, ownership and
+  effect checks. Preserve explicit monitoring, deadlines and pause instructions.
 - Resolve task-fixed storage mode through the qualified project adapter before
   choosing document paths. R2 tasks use external immutable revisions and
   protected compare-and-swap writes; legacy tasks retain their original paths.

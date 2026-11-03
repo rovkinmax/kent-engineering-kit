@@ -26,13 +26,18 @@ to qualified single writers; Kent owns lifecycle.
 
 1. Read the whole selection's execution, decisions, progress and dependencies.
    Failed reads remain unknown Tasks, not omitted ones.
-2. Resolve discoverable facts and original authority. Diagnose independently
-   actionable incidents while other producers or decisions are pending.
+2. Resolve discoverable facts and original authority. Choose the next action
+   from evidence: arrange ready authorized work with an existing capable owner,
+   observe a concrete unmet prerequisite, or diagnose the missing next action.
+   A blocked dependency holds only its dependent work. Repeated coordination
+   or status messages alone prove neither productive execution nor a runtime
+   fault; inspect what the owner is actually doing.
 3. Recheck recipient, authority and prerequisites before effects. Record intent,
    use supported interfaces and verify actual settlement; queue acceptance or
    message delivery alone does not prove execution/decision closure.
 4. Preserve remaining work, authority locators, effects, consumed budgets,
-   owners and next actions in existing goal/Task records across context changes.
+   owners and next actions in existing Task/progress records across context
+   changes. Keep the enduring endpoint and boundaries in the goal.
    Link completed proof and historical detail; identify the first remaining
    action or exact awaited change, unknown effects, remaining limits and
    owner/cleanup duties. Do not create a second authority registry or mirror
@@ -97,10 +102,16 @@ and recommendation. Recover accessible authority and agent bookkeeping; do not
 make the user carry messages, perform authorized engineering or repeat consent.
 Keep independent work moving when one action is blocked.
 
-Observe while authorized work or a real awaited producer exists, backing off on
-unchanged progress and honoring report cadence. A stable capability gap without
-a producer needs actionable escalation, not indefinite polling. Respect explicit
-monitoring/pause instructions.
+Before a blocking Question, pass already-resolved answers and independently
+executable next actions to existing owners when possible; do not delay a genuine
+required decision to finish unrelated work.
+
+Use the shared dependency-wait rule. When a prerequisite resolves, arrange the
+next authorized action after the remaining ownership/effect checks. Respect
+real producer, queue or deadline conditions, report cadence and explicit
+monitoring/pause instructions; elapsed time or unchanged source files alone do
+not establish a stall. A stable capability gap without a recovery producer
+needs actionable escalation, not indefinite polling.
 
 Use available native Questions for new human decisions; pending is not completed.
 Without that tool, report remaining blockers when independent work is exhausted.
