@@ -215,7 +215,7 @@ def stop_child(child, *, group=False):
         child.wait(timeout=5)
 
 
-def capture(command, *, timeout=CLI_TIMEOUT, tick=None):
+def capture(command, *, timeout=CLI_TIMEOUT, tick=None, resource_operation=None):
     """Bound both output streams while retaining only owned child handles."""
     child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output = {child.stdout: bytearray(), child.stderr: bytearray()}
@@ -241,7 +241,16 @@ def capture(command, *, timeout=CLI_TIMEOUT, tick=None):
             if child.wait() != 0:
                 # CLI stderr is diagnostic only; do not copy arbitrary tool
                 # responses (which may include secrets) into evidence.
-                raise Error(f"{Path(command[0]).name} failed with exit {child.returncode}")
+                label = (f"resource-lease {resource_operation}" if resource_operation
+                         else Path(command[0]).name)
+                message = f"{label} failed with exit {child.returncode}"
+                if resource_operation == "acquire":
+                    message += (
+                        ". Check pool status using executable and pool from the client configuration:"
+                        " <executable> --root <pool> status."
+                        " Inspect the original run before retrying."
+                    )
+                raise Error(message)
             value = json.loads(output[child.stdout], object_pairs_hook=unique_object)
             if not isinstance(value, dict):
                 raise Error("command returned a non-object result")
@@ -327,7 +336,7 @@ class Lease:
             command += ["--capability", self.metadata["capability"], "--wait", str(ACQUIRE_TIMEOUT)]
         elif action in {"cancel", "release"}:
             command += ["--wait", str(CLEANUP_TIMEOUT)]
-        value = capture(command, timeout=timeout, tick=tick)
+        value = capture(command, timeout=timeout, tick=tick, resource_operation=action)
         if (value.get("owner") != self.metadata["owner"]
                 or value.get("capability") != self.metadata["capability"]):
             raise Error("CLI returned a different lease binding")
