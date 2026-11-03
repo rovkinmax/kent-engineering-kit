@@ -85,6 +85,10 @@ owner = args[args.index("--owner")+1]
 receipt = pathlib.Path(args[args.index("--lease")+1])
 with (root/"calls").open("a") as stream:
     stream.write(action+"\n")
+if action == "acquire" and (root/"reject-acquire").exists():
+    print("private-stdout-canary")
+    print("private-stderr-canary", file=sys.stderr)
+    raise SystemExit(8)
 if (root/"reject").exists() and action == "renew":
     raise SystemExit(9)
 if action == "acquire":
@@ -100,6 +104,10 @@ else:
 if action in ("acquire","renew"):
     value["expires_at"] = time.monotonic() + 1.5
     receipt.write_text(json.dumps(value))
+if action == "acquire" and (root/"reject-after-receipt").exists():
+    print("private-stdout-canary")
+    print("private-stderr-canary", file=sys.stderr)
+    raise SystemExit(8)
 if value["state"] == "active" and time.monotonic() >= value["expires_at"]:
     value["state"] = "expired"
     value["endpoint"] = None
@@ -272,8 +280,75 @@ class ResourceLeaseClientTests(unittest.TestCase):
         (self.pool / "reject").touch()
         result = self.invoke(*self.run_args("import time; time.sleep(10)"))
         self.assertEqual(result.returncode, 1)
-        self.assertIn("failed with exit 9", result.stderr)
+        self.assertIn("resource-lease renew failed with exit 9", result.stderr)
+        self.assertNotIn("Check pool status", result.stderr)
         self.assertEqual(self.calls()[-1], "release")
+
+    def test_acquire_failure_has_safe_guidance_without_extra_commands(self):
+        for after_receipt in (False, True):
+            with self.subTest(after_receipt=after_receipt):
+                flag = self.pool / (
+                    "reject-after-receipt" if after_receipt else "reject-acquire"
+                )
+                flag.touch()
+                before = self.calls() if (self.pool / "calls").exists() else []
+                result = self.invoke(*self.run_args("raise SystemExit(99)"))
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('"command_exit": null', result.stderr)
+                self.assertIn("resource-lease acquire failed with exit 8", result.stderr)
+                self.assertIn(
+                    "Check pool status using executable and pool from the client configuration:",
+                    result.stderr,
+                )
+                self.assertIn("<executable> --root <pool> status", result.stderr)
+                self.assertIn("Inspect the original run before retrying.", result.stderr)
+                for secret in ("private-stdout-canary", "private-stderr-canary"):
+                    self.assertNotIn(secret, result.stdout + result.stderr)
+                expected = ["acquire", "cancel"] if after_receipt else ["acquire"]
+                self.assertEqual(self.calls()[len(before):], expected)
+                flag.unlink()
+
+    def test_capture_resource_operations_do_not_expose_child_streams(self):
+        code = (
+            "import sys; print('private-stdout-canary'); "
+            "print('private-stderr-canary', file=sys.stderr); sys.exit(7)"
+        )
+        for operation in ("renew", "inspect", "release", "cancel"):
+            with self.subTest(operation=operation):
+                with self.assertRaises(client.Error) as raised:
+                    client.capture(
+                        [sys.executable, "-c", code], resource_operation=operation,
+                    )
+                self.assertEqual(
+                    str(raised.exception), f"resource-lease {operation} failed with exit 7",
+                )
+
+    def test_capture_preserves_native_callback_failure(self):
+        failure = client.Error("native Session is not running")
+
+        def tick():
+            raise failure
+
+        with self.assertRaises(client.Error) as raised:
+            client.capture(
+                [sys.executable, "-c", "import time; time.sleep(3)"],
+                tick=tick, resource_operation="acquire",
+            )
+        self.assertIs(raised.exception, failure)
+
+    def test_capture_success_and_non_resource_error_remain_unchanged(self):
+        with patch.object(client.subprocess, "Popen", wraps=subprocess.Popen) as spawn:
+            value = client.capture(
+                [sys.executable, "-c", 'print(\'{"state":"active"}\')'],
+                resource_operation="acquire",
+            )
+        self.assertEqual(value, {"state": "active"})
+        self.assertEqual(spawn.call_count, 1)
+        with self.assertRaises(client.Error) as raised:
+            client.capture([sys.executable, "-c", "raise SystemExit(6)"])
+        self.assertEqual(
+            str(raised.exception), f"{Path(sys.executable).name} failed with exit 6",
+        )
 
     def test_conflicting_serial_rejected_before_command(self):
         self.environment["ANDROID_SERIAL"] = "foreign"

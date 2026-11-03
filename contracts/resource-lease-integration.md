@@ -87,6 +87,17 @@ merely because observation fails; existing lease expiry is the fallback.
 
 Renewal cadence is derived from CLI `expires_in`, no greater than one third
 of the observed remaining lease lifetime. CLI operations are bounded.
+When a resource-lease subprocess exits nonzero, the client reports the requested
+operation and exit code without copying subprocess stdout or stderr. Acquisition
+failures additionally identify the existing pool-status command using the
+executable and pool from the client configuration and advise inspecting the
+original run before retrying. The displayed `<executable>` and `<pool>` are
+literal placeholders, not values or a claim that the executable is on PATH.
+This guidance does not classify the failure cause or establish cleanup. The
+client performs no additional observation, service startup, or retry. Existing
+exit codes, result schemas, receipt handling, renewal, and cleanup behavior
+remain unchanged.
+
 Same-Session continuation may check and retain an exact healthy binding.
 Cross-Session handoff ends the old lease and acquires a new one; no implicit
 owner transfer. Revalidate installed artifact and application state as required
