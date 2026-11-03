@@ -72,7 +72,7 @@ import json, os, pathlib, sys, time
 args = sys.argv[1:]
 if args[:2] == ["task", "show"]:
     print(json.dumps({"summary":{"id":args[2],"done":False},
-                      "status":{"kind":"running","native_state":"active"}}))
+                      "status":{"kind":"running","native_state":"running"}}))
     raise SystemExit
 if args[:2] == ["task", "sessions"]:
     state = pathlib.Path(os.environ["NATIVE_STATE"]).read_text().strip()
@@ -369,7 +369,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
     def test_current_native_schema_and_ineligible_tasks_before_acquisition(self):
         binding = {"project": "/project", "task": TASK, "session": SESSION}
         detail = {"summary": {"id": TASK, "done": False},
-                  "status": {"kind": "running", "native_state": "active"}}
+                  "status": {"kind": "running", "native_state": "running"}}
         page = {"task_id": TASK, "items": [{"session_id": SESSION, "status": "running"}],
                 "next_offset": None}
         with patch.object(client, "capture", side_effect=[detail, page]) as capture:
@@ -393,6 +393,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
             dict(detail, status={"kind": "running", "native_state": state})
             for state in ("interrupted", "completed", "unknown", None)
         ]
+        rejected.append(dict(detail, status={"kind": "running"}))
         args = SimpleNamespace(task=TASK, session=SESSION, project="/project",
                                config=str(self.config), profile="smoke.persistent",
                                run_dir=str(self.runs / "rejected"))
@@ -408,7 +409,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
     def test_current_native_schema_still_requires_exact_running_session(self):
         binding = {"project": "/project", "task": TASK, "session": SESSION}
         detail = {"summary": {"id": TASK, "done": False},
-                  "status": {"kind": "running", "native_state": "active"}}
+                  "status": {"kind": "running", "native_state": "running"}}
         matching = {"session_id": SESSION, "status": "running"}
         inventories = [[], [dict(matching, session_id="other")], [matching, matching]]
         inventories += [[dict(matching, status=state)]
