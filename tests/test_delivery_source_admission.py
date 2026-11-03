@@ -1263,11 +1263,11 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
             "output_path", "provenance_output_path", "predecessor_capture_ref", "predecessor_receipt_ref",
             "project_id", "workflow_id", "primary_workspace_id", "project_root", "primary_root",
             "source_commit", "source_ref", "kit_root", "kit_commit", "kit_ref", "ci_helper",
-            "helper_bindings", "additional_published_paths",
+            "helper_bindings", "additional_published_paths", "retired_paths",
         })
-        self.assertTrue(all(parameter.kind is inspect.Parameter.KEYWORD_ONLY
-                            and parameter.default is inspect.Parameter.empty
-                            for parameter in signature.parameters.values()))
+        for name, parameter in signature.parameters.items():
+            self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertEqual(parameter.default, None if name == "retired_paths" else inspect.Parameter.empty)
 
     def test_source_v2_content_policy_accepts_rewritten_product(self):
         self.receipt.pop("project_memory")
@@ -1452,6 +1452,33 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
                     "predecessor_receipt_ref": self.old_source_admission["receipt_ref"],
                     "additional_published_paths": []}
 
+    def refresh_source_predecessor_capture(self, arguments):
+        self.pin()
+        receipt_ref = {"path": str(self.receipt_path), "sha256": self.digest}
+        self.old_source_admission["receipt_ref"] = receipt_ref
+        arguments["predecessor_receipt_ref"] = receipt_ref
+        from workflowkit.delivery import source_admission_gate
+        self.source_capture["graph"]["edges"][0]["prompt_template"] = source_admission_gate(
+            self.old_source_admission, project_id=self.producer_project_id,
+            workflow_id=self.source_capture["workflow_id"], project_root=str(self.project))
+        capture_path = Path(arguments["predecessor_capture_ref"]["path"])
+        capture_raw = operations.canonical_bytes(self.source_capture)
+        capture_path.write_bytes(capture_raw)
+        capture_path.chmod(0o600)
+        arguments["predecessor_capture_ref"] = {
+            "path": str(capture_path), "sha256": hashlib.sha256(capture_raw).hexdigest(),
+        }
+
+    def include_source_predecessor_extra(self, arguments, root, relative_path):
+        path = Path(root) / relative_path
+        raw = path.read_bytes()
+        self.receipt["files"].append({
+            "root": str(root), "relative_path": relative_path,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "byte_size": len(raw), "mode": stat.S_IMODE(path.stat().st_mode),
+        })
+        self.refresh_source_predecessor_capture(arguments)
+
     def produce_source(self, arguments):
         with mock.patch.dict(os.environ, {"HOME": str(self.home)}), mock.patch.object(
             operations, "__file__", str(self.kit / "workflowkit/operations.py"),
@@ -1466,11 +1493,149 @@ class DeliverySourceAdmissionTests(unittest.TestCase):
         for ref in candidate.values():
             self.assertEqual(Path(ref["path"]).stat().st_mode & 0o777, 0o600)
             self.assertEqual(hashlib.sha256(Path(ref["path"]).read_bytes()).hexdigest(), ref["sha256"])
+        provenance = json.loads(Path(candidate["provenance_ref"]["path"]).read_bytes())
+        self.assertEqual(provenance["schema"], "delivery-source-publication-provenance-v1")
+        self.assertEqual(set(provenance), {
+            "schema", "predecessor_capture_ref", "predecessor_receipt_ref",
+            "candidate_receipt_ref", "additional_published_paths",
+        })
         self.assertEqual(self.inspect(
             receipt_path=candidate["receipt_ref"]["path"], receipt_sha256=candidate["receipt_ref"]["sha256"],
             project_id=self.producer_project_id, workflow_id=FIXTURE_WORKFLOW, ci_helper=self.ci_helper,
             helper_bindings={str(self.adapter_link): str(self.adapter_target)})["status"], "admitted")
         self.assertEqual(self.receipt_path.read_bytes(), json.dumps(self.receipt).encode())
+
+    def test_source_v2_producer_allows_explicit_product_extra_retirement(self):
+        arguments = self.source_producer_fixture()
+        self.put(self.project, "retained-extra.txt", "retain this extra\n")
+        self.commit(self.project)
+        predecessor_head = self.git(self.project, "rev-parse", "HEAD").strip()
+        self.git(self.project, "update-ref", arguments["source_ref"], predecessor_head)
+        self.receipt["source_commit"] = predecessor_head
+        arguments["source_commit"] = predecessor_head
+        self.include_source_predecessor_extra(arguments, self.project, "product.txt")
+        self.include_source_predecessor_extra(arguments, self.project, "retained-extra.txt")
+        predecessor_receipt = self.receipt_path.read_bytes()
+        predecessor_receipt_ref = dict(arguments["predecessor_receipt_ref"])
+
+        self.git(self.project, "rm", "product.txt")
+        self.commit(self.project)
+        candidate_head = self.git(self.project, "rev-parse", "HEAD").strip()
+        self.git(self.project, "update-ref", arguments["source_ref"], candidate_head)
+        task = self.base / "retirement-task"
+        self.git(self.project, "worktree", "add", "-qb", "retirement-task", str(task))
+        arguments["project_root"] = str(task)
+        arguments["source_commit"] = candidate_head
+        arguments["retired_paths"] = [{
+            "root": str(self.project), "relative_path": "product.txt",
+        }]
+
+        legacy_arguments = {key: value for key, value in arguments.items() if key != "retired_paths"}
+        with self.assertRaisesRegex(ValueError, "source publication extra is not published"):
+            self.produce_source(legacy_arguments)
+        candidate = self.produce_source(arguments)
+        receipt = json.loads(Path(candidate["receipt_ref"]["path"]).read_bytes())
+        self.assertEqual(receipt["schema"], "delivery-source-publication-v2")
+        self.assertNotIn(("product.txt", str(self.project)), {
+            (item["relative_path"], item["root"]) for item in receipt["files"]
+        })
+        self.assertIn(("retained-extra.txt", str(self.project)), {
+            (item["relative_path"], item["root"]) for item in receipt["files"]
+        })
+        provenance = json.loads(Path(candidate["provenance_ref"]["path"]).read_bytes())
+        self.assertEqual(provenance["schema"], "delivery-source-publication-provenance-v2")
+        self.assertEqual(set(provenance), {
+            "schema", "predecessor_capture_ref", "predecessor_receipt_ref",
+            "candidate_receipt_ref", "additional_published_paths", "retired_paths",
+        })
+        self.assertEqual(provenance["retired_paths"], arguments["retired_paths"])
+        self.assertEqual(provenance["predecessor_receipt_ref"], predecessor_receipt_ref)
+        self.assertEqual(Path(predecessor_receipt_ref["path"]).read_bytes(), predecessor_receipt)
+
+    def test_source_v2_producer_rejects_infrastructure_retirement(self):
+        arguments = self.source_producer_fixture()
+        arguments["retired_paths"] = [{
+            "root": str(self.project), "relative_path": "AGENTS.md",
+        }]
+        with self.assertRaisesRegex(
+            operations.PlanValidationError, "not a predecessor product extra",
+        ):
+            self.produce_source(arguments)
+        self.assertFalse(Path(arguments["output_path"]).exists())
+
+    def test_source_v2_producer_rejects_unlisted_retirement(self):
+        arguments = self.source_producer_fixture()
+        arguments["retired_paths"] = [{
+            "root": str(self.project), "relative_path": "missing-product-extra.txt",
+        }]
+        with self.assertRaisesRegex(
+            operations.PlanValidationError, "not a predecessor product extra",
+        ):
+            self.produce_source(arguments)
+        self.assertFalse(Path(arguments["output_path"]).exists())
+
+    def test_source_v2_producer_rejects_kit_extra_retirement(self):
+        arguments = self.source_producer_fixture()
+        self.put(self.kit, "kit-extra.txt", "Kit source is not retireable here\n")
+        self.commit(self.kit)
+        predecessor_kit_head = self.git(self.kit, "rev-parse", "HEAD").strip()
+        self.git(self.kit, "update-ref", arguments["kit_ref"], predecessor_kit_head)
+        self.receipt["kit_commit"] = predecessor_kit_head
+        arguments["kit_commit"] = predecessor_kit_head
+        self.include_source_predecessor_extra(arguments, self.kit, "kit-extra.txt")
+
+        self.git(self.kit, "rm", "kit-extra.txt")
+        self.commit(self.kit)
+        candidate_kit_head = self.git(self.kit, "rev-parse", "HEAD").strip()
+        self.git(self.kit, "update-ref", arguments["kit_ref"], candidate_kit_head)
+        arguments["kit_commit"] = candidate_kit_head
+        arguments["retired_paths"] = [{
+            "root": str(self.kit), "relative_path": "kit-extra.txt",
+        }]
+        with self.assertRaisesRegex(
+            operations.PlanValidationError, "retired path root is not a bound product root",
+        ):
+            self.produce_source(arguments)
+
+    def test_source_v2_producer_rejects_retirement_of_local_instruction(self):
+        arguments = self.source_producer_fixture()
+        relative_path = ".kent/skills/private/instructions.md"
+        path = self.project / relative_path
+        self.put(self.project, relative_path, "local instruction\n", 0o600)
+        raw = path.read_bytes()
+        self.receipt["local_inputs"] = [{
+            "kind": "local-instruction", "root": str(self.project), "relative_path": relative_path,
+            "sha256": hashlib.sha256(raw).hexdigest(), "byte_size": len(raw), "mode": 0o600,
+        }]
+        self.refresh_source_predecessor_capture(arguments)
+        arguments["retired_paths"] = [{
+            "root": str(self.project), "relative_path": relative_path,
+        }]
+        with self.assertRaisesRegex(
+            operations.PlanValidationError, "local instructions cannot be retired",
+        ):
+            self.produce_source(arguments)
+
+    def test_source_v2_producer_rejects_retirement_of_helper_target(self):
+        arguments = self.source_producer_fixture()
+        helper_target = self.project / "product.txt"
+        arguments["helper_bindings"] = [
+            *arguments["helper_bindings"],
+            {"link": str(self.bin / "product-helper"), "target": str(helper_target)},
+        ]
+        self.include_source_predecessor_extra(arguments, self.project, "product.txt")
+        self.git(self.project, "rm", "product.txt")
+        self.commit(self.project)
+        candidate_head = self.git(self.project, "rev-parse", "HEAD").strip()
+        self.git(self.project, "update-ref", arguments["source_ref"], candidate_head)
+        arguments["source_commit"] = candidate_head
+        arguments["retired_paths"] = [{
+            "root": str(self.project), "relative_path": "product.txt",
+        }]
+        with self.assertRaisesRegex(
+            operations.PlanValidationError, "source helper targets cannot be retired",
+        ):
+            self.produce_source(arguments)
 
     def test_source_v2_producer_rejects_retained_mode_changes_and_undeclared_extra(self):
         arguments = self.source_producer_fixture()

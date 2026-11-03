@@ -83,7 +83,127 @@ class SourcePublicationProvenanceTests(unittest.TestCase):
 
     def gate(self, source=None, target=None):
         return operations._source_publication_provenance(
-            self.item, self.source if source is None else source, self.target if target is None else target)
+            self.item, self.source if source is None else source, self.target if target is None else target,
+            project_root=str(self.fixture.project))
+
+    def prepare_retirement_candidate(self):
+        fixture = self.fixture
+        arguments = self.arguments
+        path = "retired-extra.txt"
+        fixture.put(fixture.project, path, "published predecessor extra\n")
+        fixture.commit(fixture.project)
+        predecessor_head = fixture.git(fixture.project, "rev-parse", "HEAD").strip()
+        fixture.git(fixture.project, "update-ref", arguments["source_ref"], predecessor_head)
+        fixture.receipt["source_commit"] = predecessor_head
+        arguments["source_commit"] = predecessor_head
+        fixture.include_source_predecessor_extra(arguments, fixture.project, path)
+
+        fixture.git(fixture.project, "rm", path)
+        fixture.commit(fixture.project)
+        candidate_head = fixture.git(fixture.project, "rev-parse", "HEAD").strip()
+        fixture.git(fixture.project, "update-ref", arguments["source_ref"], candidate_head)
+        arguments["source_commit"] = candidate_head
+        arguments["output_path"] = str(fixture.evidence / "retirement-candidate.json")
+        arguments["provenance_output_path"] = str(fixture.evidence / "retirement-provenance.json")
+        arguments["retired_paths"] = [{"root": str(fixture.project), "relative_path": path}]
+
+        self.candidate = fixture.produce_source(arguments)
+        self.admission = {
+            **self.admission,
+            "receipt_ref": {
+                key: self.candidate["receipt_ref"][key] for key in ("path", "sha256")
+            },
+        }
+        from workflowkit.delivery import source_admission_gate
+        self.target = json.loads(json.dumps(self.source["graph"]))
+        self.target["version"] += 1
+        self.target["edges"][0]["prompt_template"] = source_admission_gate(
+            self.admission, project_id=fixture.producer_project_id,
+            workflow_id=self.source["workflow_id"], project_root=str(fixture.project))
+        self.item["source_admission"] = self.admission
+        self.item["source_graph_sha256"] = canonical_sha256(self.source["graph"])
+        self.review["dispositions"][0]["evidence"] = [{
+            key: self.candidate["provenance_ref"][key] for key in ("path", "sha256")
+        }]
+        self.write_review()
+        return path
+
+    def update_candidate_receipt(self, mutate):
+        receipt_path = Path(self.candidate["receipt_ref"]["path"])
+        receipt = json.loads(receipt_path.read_bytes())
+        mutate(receipt)
+        receipt_raw = canonical_bytes(receipt)
+        receipt_path.write_bytes(receipt_raw)
+        receipt_ref = {
+            "path": str(receipt_path),
+            "sha256": hashlib.sha256(receipt_raw).hexdigest(),
+        }
+        self.admission["receipt_ref"] = receipt_ref
+        self.item["source_admission"] = self.admission
+        from workflowkit.delivery import source_admission_gate
+        self.target["edges"][0]["prompt_template"] = source_admission_gate(
+            self.admission, project_id=self.fixture.producer_project_id,
+            workflow_id=self.source["workflow_id"], project_root=str(self.fixture.project))
+        packet_path = Path(self.candidate["provenance_ref"]["path"])
+        packet = json.loads(packet_path.read_bytes())
+        packet["candidate_receipt_ref"] = receipt_ref
+        packet_raw = canonical_bytes(packet)
+        packet_path.write_bytes(packet_raw)
+        self.review["dispositions"][0]["evidence"] = [{
+            "path": str(packet_path),
+            "sha256": hashlib.sha256(packet_raw).hexdigest(),
+        }]
+        self.write_review()
+
+    def update_provenance_packet(self, mutate):
+        packet_path = Path(self.candidate["provenance_ref"]["path"])
+        packet = json.loads(packet_path.read_bytes())
+        mutate(packet)
+        packet_raw = canonical_bytes(packet)
+        packet_path.write_bytes(packet_raw)
+        self.review["dispositions"][0]["evidence"] = [{
+            "path": str(packet_path),
+            "sha256": hashlib.sha256(packet_raw).hexdigest(),
+        }]
+        self.write_review()
+
+    def test_product_extra_retirement_passes_canonical_provenance_gate(self):
+        path = self.prepare_retirement_candidate()
+        self.assertTrue(self.gate())
+        packet = json.loads(Path(self.candidate["provenance_ref"]["path"]).read_bytes())
+        self.assertEqual(packet["schema"], "delivery-source-publication-provenance-v2")
+        self.assertEqual(packet["retired_paths"], [{
+            "root": str(self.fixture.project), "relative_path": path,
+        }])
+
+    def test_canonical_gate_requires_retirement_predecessor_membership(self):
+        self.prepare_retirement_candidate()
+        self.update_provenance_packet(lambda packet: packet.update(retired_paths=[{
+            "root": str(self.fixture.project), "relative_path": "never-published.txt",
+        }]))
+        with self.assertRaisesRegex(
+            PlanValidationError, "not a predecessor product extra",
+        ):
+            self.gate()
+
+    def test_canonical_gate_rejects_retirement_still_in_published_tree(self):
+        path = self.prepare_retirement_candidate()
+        self.fixture.put(self.fixture.project, path, "stale published tree entry\n")
+        self.fixture.commit(self.fixture.project)
+        retained_head = self.fixture.git(self.fixture.project, "rev-parse", "HEAD").strip()
+        self.update_candidate_receipt(lambda receipt: receipt.update(source_commit=retained_head))
+        with self.assertRaisesRegex(
+            PlanValidationError, "retired path remains in the published product tree",
+        ):
+            self.gate()
+
+    def test_canonical_gate_rejects_retirement_still_in_live_product_copy(self):
+        path = self.prepare_retirement_candidate()
+        self.fixture.put(self.fixture.project, path, "stale live copy\n")
+        with self.assertRaisesRegex(
+            PlanValidationError, "retired path remains in a live product copy",
+        ):
+            self.gate()
 
     def lifecycle_plan(self, *, native=False, intent="graph-and-metadata", affected=False):
         """Real typed provenance through the fake native multistage executor.
@@ -7101,7 +7221,7 @@ class CanonicalWorkflowLifecycleTest(unittest.TestCase):
                     operations, "_source_publication_provenance",
                     side_effect=(PlanValidationError("source publication packet is unavailable")
                                  if missing == "provenance" else
-                                 lambda *_args: False),
+                                 lambda *_args, **_kwargs: False),
                 ) as provenance:
                     with self.assertRaises((PlanValidationError, EffectBlocked)):
                         reconcile_canonical_workflows(
