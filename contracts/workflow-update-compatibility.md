@@ -267,11 +267,22 @@ and bypasses fail. Capture integrity is not native authentication. Offline
 preparation performs no native call, old admission, graph/frame construction or
 R2/helper/binding effect. Two exclusive 0600 outputs in existing owned 0700
 directories contain the receipt candidate and closed
-`delivery-source-publication-provenance-v1` packet. Partial failures retain only
-unadmitted private artifacts; retries cannot overwrite them.
+`delivery-source-publication-provenance-v1` packet when no extras are retired.
+An explicit nonempty `retired_paths` input instead emits the closed
+`delivery-source-publication-provenance-v2` packet with that root-qualified
+retirement list. The source receipt remains `delivery-source-publication-v2`;
+the optional input does not change its schema or the source-publication receipt.
+Partial failures retain only unadmitted private artifacts; retries cannot
+overwrite them.
 
 Extra coverage is root-qualified: preserve every predecessor extra plus explicit
-additions, without deletion/replacement/implicit root remapping. Recover prior
+additions, without implicit deletion/replacement/root remapping. A retirement
+must name an extra present in the digest-bound predecessor receipt, rooted in a
+bound product repository; infrastructure, Kit-repository extras, local
+instructions, and declared helper targets are not retireable. The retired path
+must be absent from the candidate published product tree and every live product
+copy. Retirements and additions cannot overlap. Coverage is exactly predecessor
+extras minus declared retirements plus explicit additions. Recover prior
 coverage from the digest-bound receipt, not an old Git tree or directory scan.
 New hashes/bytes come from new published Git blobs. Project extras project to
 every bound product copy in HEAD/index/files, including the task workspace;
@@ -282,8 +293,9 @@ private umask permissions with identical bytes and owner executable identity.
 Introducing or replacing the full admission/carrier requires a compatibility
 review disposition `source_admission.publication_provenance` whose one evidence
 reference is the typed packet. The packet binds predecessor capture/receipt,
-candidate receipt and explicit additions. At preparation and repeated new-effect
-checks, validate packet/candidate/target references, monotonic coverage and the
+candidate receipt, explicit additions and, for provenance-v2, declared
+retirements. At preparation and repeated new-effect checks, validate
+packet/candidate/target references, monotonic coverage and the
 capture against the immutable original plan/journal preimage, including IDs,
 version, graph, metadata, links and default. Independently compare actual native
 state with current `stage.before`; do not compare it to the original capture

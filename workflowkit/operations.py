@@ -2387,26 +2387,122 @@ def _source_publication_extras(receipt, kit_root):
             if not infrastructure(item['relative_path'], roles[item['root']])}
 
 
-def _source_publication_coverage(prior, candidate, old_kit_root, new_kit_root, additions):
-    """Check monotonic root-qualified extras and immutable retained permissions."""
-    if not isinstance(additions, list) or len(additions) > SOURCE_RECEIPT_FILE_LIMIT:
-        raise PlanValidationError('additional published paths exceed bound')
-    added = set()
-    for row in additions:
+def _source_publication_paths(value, label):
+    if not isinstance(value, list) or len(value) > SOURCE_RECEIPT_FILE_LIMIT:
+        raise PlanValidationError(f'{label} exceed bound')
+    result = []
+    seen = set()
+    for row in value:
         if not isinstance(row, dict) or set(row) != {'root', 'relative_path'}:
-            raise PlanValidationError('additional published path is not closed')
-        root = str(_source_canonical_path(row['root'], 'additional source root'))
+            raise PlanValidationError(f'{label} are not closed')
+        root = str(_source_canonical_path(row['root'], f'{label} root'))
         name = row['relative_path']
         if (not isinstance(name, str) or not name or name.startswith('/') or '\\' in name or '\x00' in name
                 or any(part in ('', '.', '..') for part in name.split('/'))):
-            raise PlanValidationError('additional published path is invalid')
+            raise PlanValidationError(f'{label} contain an invalid path')
         identity = (root, name)
-        if identity in added:
-            raise PlanValidationError('duplicate additional published path')
-        added.add(identity)
+        if identity in seen:
+            raise PlanValidationError(f'{label} contain a duplicate path')
+        seen.add(identity)
+        result.append({'root': root, 'relative_path': name})
+    return result
+
+
+def _source_publication_retirement_identities(
+    prior, old_kit_root, retirements, product_roots, helper_targets, new_kit_root,
+):
+    if not retirements:
+        return []
+    if product_roots is None:
+        raise PlanValidationError('retired paths require bound product roots')
+    products = {
+        str(_source_canonical_root(str(root), 'retirement product root'))
+        for root in product_roots
+    }
+    old_kit = _source_canonical_root(str(old_kit_root), 'predecessor Kit root')
+    new_kit = _source_canonical_root(str(new_kit_root), 'candidate Kit root')
+    try:
+        kit_common = {
+            _git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+            for root in (old_kit, new_kit)
+        }
+    except OperationError as error:
+        raise PlanValidationError('retired paths cannot qualify Kit repository roles') from error
+    protected = {
+        str(_source_canonical_path(str(path), 'source helper target'))
+        for path in helper_targets
+    }
+    old_extras = _source_publication_extras(prior, str(old_kit))
+    previous = {(item['root'], item['relative_path']): item for item in prior['files']}
+    local = {(item['root'], item['relative_path']) for item in prior['local_inputs']}
+    normalized = _source_publication_paths(retirements, 'retired published paths')
+    for row in normalized:
+        identity = (row['root'], row['relative_path'])
+        if identity in local:
+            raise PlanValidationError('local instructions cannot be retired as published extras')
+        if identity not in old_extras or identity not in previous:
+            raise PlanValidationError('retired path is not a predecessor product extra')
+        if row['root'] not in products:
+            raise PlanValidationError('retired path root is not a bound product root')
+        root = _source_canonical_root(row['root'], 'retired product root')
+        try:
+            common = _git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+        except OperationError as error:
+            raise PlanValidationError('retired product repository cannot be qualified') from error
+        if common in kit_common:
+            raise PlanValidationError('Kit publication extras cannot be retired')
+        if str(root / row['relative_path']) in protected:
+            raise PlanValidationError('source helper targets cannot be retired')
+        _sha256(previous[identity].get('sha256'), 'predecessor retired path digest')
+    return normalized
+
+
+def _source_publication_retired_paths_absent(candidate, retirements, product_roots):
+    if not retirements:
+        return
+    roots = {
+        _source_canonical_root(str(root), 'retirement product root')
+        for root in product_roots
+    }
+    if not roots or not {str(root) for root in roots} <= set(candidate['runtime_roots']):
+        raise PlanValidationError('candidate source receipt omits a bound retirement product root')
+    commits = candidate['source_commit']
+    for root in roots:
+        for row in retirements:
+            name = row['relative_path']
+            code, output, error = _run(
+                ['/usr/bin/git', '-C', str(root), '--literal-pathspecs', 'ls-tree', '-z',
+                 '--full-tree', commits, '--', name],
+                cwd=root, output_limit=4096,
+            )
+            if code:
+                raise PlanValidationError('retired path cannot be checked in the published product tree')
+            if any(entry.rpartition(b'\t')[2] == name.encode('utf-8')
+                   for entry in output.split(b'\x00') if entry):
+                raise PlanValidationError('retired path remains in the published product tree')
+            if os.path.lexists(root / name):
+                raise PlanValidationError('retired path remains in a live product copy')
+
+
+def _source_publication_coverage(
+    prior, candidate, old_kit_root, new_kit_root, additions, retirements=None,
+    *, product_roots=None, helper_targets=(),
+):
+    """Check explicit product-extra retirements, monotonic coverage and retained permissions."""
+    added_rows = _source_publication_paths(additions, 'additional published paths')
+    added = {(row['root'], row['relative_path']) for row in added_rows}
+    retired_rows = _source_publication_paths(retirements or [], 'retired published paths')
+    if len(added) + len(retired_rows) > SOURCE_RECEIPT_FILE_LIMIT:
+        raise PlanValidationError('source publication path changes exceed bound')
+    retired_rows = _source_publication_retirement_identities(
+        prior, old_kit_root, retired_rows, product_roots, helper_targets, new_kit_root,
+    )
+    retired = {(row['root'], row['relative_path']) for row in retired_rows}
     old_extras = _source_publication_extras(prior, old_kit_root)
     new_extras = _source_publication_extras(candidate, new_kit_root)
-    if added & set(old_extras) or set(new_extras) != set(old_extras) | added:
+    if added & set(old_extras) or added & retired:
+        raise PlanValidationError('source publication additions overlap retained or retired extras')
+    if set(new_extras) != (set(old_extras) - retired) | added:
         raise PlanValidationError('source publication extra coverage is not monotonic')
     previous = {(item['root'], item['relative_path']): item for item in prior['files']}
     for item in candidate['files']:
@@ -2415,6 +2511,7 @@ def _source_publication_coverage(prior, candidate, old_kit_root, new_kit_root, a
             raise PlanValidationError('retained publication mode changed')
     if candidate['local_inputs'] != prior['local_inputs']:
         raise PlanValidationError('source publication local instructions changed')
+    _source_publication_retired_paths_absent(candidate, retired_rows, product_roots or ())
     return added
 
 
@@ -2422,13 +2519,15 @@ def prepare_source_publication_v2(
     *, output_path, provenance_output_path, predecessor_capture_ref, predecessor_receipt_ref,
     project_id, workflow_id, primary_workspace_id, project_root, primary_root,
     source_commit, source_ref, kit_root, kit_commit, kit_ref, ci_helper,
-    helper_bindings, additional_published_paths,
+    helper_bindings, additional_published_paths, retired_paths=None,
 ):
     """Prepare two unadmitted candidates from an integrity-bound predecessor.
 
     No native calls, R2 effects, graph/frame creation or old admission occurs.
     A self-consistent capture is not native authentication: the later typed
     canonical gate must compare it to the actual immutable plan preimage.
+    Retire only explicit product extras; an empty retirement set preserves the
+    provenance-v1 packet shape.
     """
     project_id = _native_project_id(project_id, 'publication project_id')
     workflow_id = _uuid(workflow_id, 'publication workflow_id')
@@ -2473,6 +2572,9 @@ def prepare_source_publication_v2(
     }, 'candidate source declarations')
     targets = [Path(row['target']) for row in declaration['helper_bindings']]
     targets.append(kit / 'scripts/prepare-github-ci')
+    helper_targets = set(targets)
+    helper_targets.update(Path(row['target']) for row in prior_frame['helper_bindings'])
+    helper_targets.add(Path(prior_frame['kit_root']) / 'scripts/prepare-github-ci')
     require(ci_helper not in {row['link'] for row in declaration['helper_bindings']},
             'duplicate candidate CI helper')
     products, executables = inspector['content_roles'](
@@ -2493,7 +2595,22 @@ def prepare_source_publication_v2(
         root, name = inspector['canonical'](row['root']), inspector['relative'](row['relative_path'])
         require(root in roots, 'additional source root has no trusted role')
         additions.append({'root': str(root), 'relative_path': name})
-    extras = set(old_extras) | {(row['root'], row['relative_path']) for row in additions}
+    retirements = []
+    if retired_paths is not None:
+        require(isinstance(retired_paths, list)
+                and len(retired_paths) <= SOURCE_RECEIPT_FILE_LIMIT, 'invalid retired source inventory')
+        for row in retired_paths:
+            inspector['closed'](row, ('root', 'relative_path'))
+            root, name = inspector['canonical'](row['root']), inspector['relative'](row['relative_path'])
+            retirements.append({'root': str(root), 'relative_path': name})
+    retirements = _source_publication_paths(retirements, 'retired published paths')
+    retirements = _source_publication_retirement_identities(
+        prior, prior_frame['kit_root'], retirements, products, helper_targets, kit,
+    )
+    retired = {(row['root'], row['relative_path']) for row in retirements}
+    added = {(row['root'], row['relative_path']) for row in additions}
+    require(not (retired & added), 'retired and additional source paths overlap')
+    extras = (set(old_extras) - retired) | added
     require(all(Path(root) in roots for root, _ in extras), 'retained extra root cannot be remapped')
     result = {'schema': 'delivery-source-publication-v2', 'policy': 'published_source_project_content_v1',
               'project_id': project_id, 'workflow_id': workflow_id, 'source_commit': source_commit,
@@ -2533,7 +2650,10 @@ def prepare_source_publication_v2(
             result['files'].append(item)
         projections.append((root, expected, source_tree, is_kit))
     validate_source_v2_receipt(result, primary, kit)
-    _source_publication_coverage(prior, result, prior_frame['kit_root'], str(kit), additions)
+    _source_publication_coverage(
+        prior, result, prior_frame['kit_root'], str(kit), additions, retirements,
+        product_roots=products, helper_targets=helper_targets,
+    )
     # Product extras are declared root-locally, but admission projects their
     # union onto every product copy. Keep the receipt declarations unchanged.
     product_extras = {
@@ -2578,6 +2698,10 @@ def prepare_source_publication_v2(
                 require(heads[root] == executables[root][1], 'source executable root HEAD differs')
         require(all(inspector['local_identity'](path) == identity for path, identity in local_identities.items()),
                 'local instruction identity changed')
+        _source_publication_coverage(
+            prior, result, prior_frame['kit_root'], str(kit), additions, retirements,
+            product_roots=products, helper_targets=helper_targets,
+        )
         require((inspector['publication'](project, source_commit, source_ref, content=True),
                  inspector['publication'](kit, kit_commit, kit_ref, content=True)) == tips,
                 'source publication ref changed')
@@ -2590,11 +2714,14 @@ def prepare_source_publication_v2(
             'source publication output already exists or overlaps')
     receipt_ref = _exclusive_publication_output(output, canonical_bytes(result), inspector)
     try:
-        packet = {'schema': 'delivery-source-publication-provenance-v1',
+        packet = {'schema': ('delivery-source-publication-provenance-v2' if retirements else
+                             'delivery-source-publication-provenance-v1'),
                   'predecessor_capture_ref': predecessor_capture_ref,
                   'predecessor_receipt_ref': predecessor_receipt_ref,
                   'candidate_receipt_ref': {key: receipt_ref[key] for key in ('path', 'sha256')},
                   'additional_published_paths': additions}
+        if retirements:
+            packet['retired_paths'] = retirements
         provenance_ref = _exclusive_publication_output(provenance_output, canonical_bytes(packet), inspector)
         freshness()
     except Exception as error:
@@ -6292,7 +6419,7 @@ def _v2_required_review_paths(
     return paths
 
 
-def _source_publication_provenance(item, source, target_graph):
+def _source_publication_provenance(item, source, target_graph, *, project_root=None):
     """Bind new content-policy introduction to the immutable owned preimage.
 
     Reuse is derived from the complete carrier/frame, not a caller flag or
@@ -6356,9 +6483,16 @@ def _source_publication_provenance(item, source, target_graph):
     if not isinstance(evidence, list) or len(evidence) != 1:
         raise PlanValidationError('source publication provenance requires one exact packet reference')
     _, _, packet = _publication_reference(evidence[0], 'publication provenance', canonical_json=True)
-    if set(packet) != {'schema', 'predecessor_capture_ref', 'predecessor_receipt_ref',
-                       'candidate_receipt_ref', 'additional_published_paths'} or packet.get('schema') != \
-            'delivery-source-publication-provenance-v1':
+    packet_fields = {'schema', 'predecessor_capture_ref', 'predecessor_receipt_ref',
+                     'candidate_receipt_ref', 'additional_published_paths'}
+    packet_schema = packet.get('schema')
+    if packet_schema == 'delivery-source-publication-provenance-v1' and set(packet) == packet_fields:
+        retirements = []
+    elif (packet_schema == 'delivery-source-publication-provenance-v2'
+          and set(packet) == packet_fields | {'retired_paths'}
+          and isinstance(packet.get('retired_paths'), list) and packet['retired_paths']):
+        retirements = packet['retired_paths']
+    else:
         raise PlanValidationError('source publication provenance packet is not closed')
     capture, predecessor, _ = _source_publication_capture(packet['predecessor_capture_ref'])
     if (canonical_sha256(capture) != canonical_sha256(_canonical_v2_owned(source))
@@ -6384,8 +6518,20 @@ def _source_publication_provenance(item, source, target_graph):
     validate_source_v2_receipt({**prior, 'schema': 'delivery-source-publication-v2',
                                'policy': 'published_source_project_content_v1'},
                               admission['primary_root'], predecessor['admission']['kit_root'])
+    project_root = _source_canonical_root(
+        str(project_root if project_root is not None else admission['primary_root']),
+        'source publication project root',
+    )
+    primary_root = _source_canonical_root(admission['primary_root'], 'source publication primary root')
+    helper_targets = {
+        Path(predecessor['admission']['kit_root']) / 'scripts/prepare-github-ci',
+        Path(admission['kit_root']) / 'scripts/prepare-github-ci',
+        *(Path(row['target']) for row in predecessor['admission']['helper_bindings']),
+        *(Path(row['target']) for row in admission['helper_bindings']),
+    }
     _source_publication_coverage(prior, candidate, predecessor['admission']['kit_root'],
-                                 admission['kit_root'], packet['additional_published_paths'])
+                                 admission['kit_root'], packet['additional_published_paths'], retirements,
+                                 product_roots={project_root, primary_root}, helper_targets=helper_targets)
     return True
 
 
@@ -6488,7 +6634,9 @@ def _validate_canonical_v2_target(
             raise PlanValidationError(str(error)) from error
     publication_introduction = False
     if source_admission is not None:
-        publication_introduction = _source_publication_provenance(item, source, graph)
+        publication_introduction = _source_publication_provenance(
+            item, source, graph, project_root=parsed['project_root'],
+        )
     source_semantics = {
         key: source_review_graph[key]
         for key in ('nodes', 'edges', 'node_groups', 'transition_groups')
