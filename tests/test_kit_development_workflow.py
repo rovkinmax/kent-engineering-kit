@@ -77,6 +77,10 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
 
     def test_prompt_improvement_contracts_preserve_safety_boundaries(self) -> None:
         expectations = {
+            "global/AGENTS.md": (
+                "For a dependency wait",
+                "ownership and effect checks",
+            ),
             "prompts/review-change.md": (
                 "agents/standards-reviewer.md", "agents/spec-reviewer.md",
                 "first read the installed `kent-engineering-kit` skill's `SKILL.md`",
@@ -205,6 +209,8 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
             "agents/task-supervisor.md": (
                 "first remaining action or exact awaited change",
                 "unknown effects", "owner/cleanup duties", "fresh pre-effect readbacks",
+                "Choose the next action from evidence",
+                "do not delay a genuine required decision",
             ),
             "prompts/migrate-tasks.md": (
                 "first remaining action or exact awaited change", "link completed proof",
