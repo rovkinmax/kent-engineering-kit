@@ -288,7 +288,7 @@ def native_active(binding):
     if (not isinstance(summary, dict) or not isinstance(status, dict)
             or summary.get("id") != task or summary.get("done") is not False
             or status.get("kind") != "running"
-            or status.get("native_state") not in {"active", "waiting", "waiting_ask", "waiting_approval"}):
+            or status.get("native_state") not in {"running", "active", "waiting", "waiting_ask", "waiting_approval"}):
         raise Error("native Task is not observably active")
     offset = 0
     for _page in range(100):
