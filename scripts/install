@@ -2,8 +2,16 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: install"
+  echo "Usage: install | install project {preview,apply} [options]"
 }
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "project" ]]; then
+  shift
+  exec python3 -I -B -c \
+    'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module("workflowkit.project_install", run_name="__main__")' \
+    "$repo_root" "$@"
+fi
 
 if [[ $# -gt 0 ]]; then
   case "$1" in

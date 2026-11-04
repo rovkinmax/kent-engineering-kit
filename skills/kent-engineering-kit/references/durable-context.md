@@ -8,6 +8,14 @@ deployment. It must remain outside the checkout. This reference does not
 choose a universal machine-specific path, and a profile entry alone does not
 mean that the root or installed adapter is ready.
 
+For an approved fresh project with zero native Tasks, use the existing
+[installer project procedure](../../../docs/OPERATIONS.md#install-a-fresh-r2-project).
+It registers ordinary storage with the first supported receipt/binding without
+a predecessor, legacy Task or shared-tool retarget. Its publication candidate
+is not full mixed-runtime source admission. Registration is not native ingress
+qualification, graph-owned plan acceptance, Task adoption, or permission to
+create a canary; qualify the complete selected Workflow before promotion.
+
 ## Keep durable sources separate
 
 - **Original human decision:** the native user message, Question answer, or
