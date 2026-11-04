@@ -31,6 +31,79 @@ module_spec.loader.exec_module(kit)
 
 
 class KitDevelopmentWorkflowTest(unittest.TestCase):
+    def test_cleanup_routes_follow_native_ownership_not_storage_or_kind(self) -> None:
+        text = (ROOT / ".kent/commands/cleanup-task.md").read_text()
+        dispatch, rest = text.split("## Agent-owned cleanup\n", 1)
+        agent, legacy = rest.split("## Legacy post-session Janitor\n", 1)
+        for phrase in (
+            "native assignment, ownership and outgoing transition contract",
+            "`kind=agent`, R2 storage",
+            "post-session Script Janitor", "Agent's own `cleanup_result`",
+            "no fallback", "mutually exclusive", "no deletion authority",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, dispatch)
+        for phrase in (
+            "Merge is not cleanup permission",
+            "Dirty, unknown, foreign or ambiguous state",
+            "Inventory all ignored and runtime materials explicitly",
+            "Git-clean alone is not sufficient",
+            "explicitly authorized reproducible caches",
+            "exact digests and complete readback",
+            "unapproved disposal block tree deletion",
+            "real native handles", "qualified installed storage",
+            "Task/Node/Session/Step producer identity",
+            "unknown storage blocks writes", "Read the retained record back",
+            "Do not invoke legacy `prepare_cleanup`",
+            "separate\nsubsequent Agent step",
+            "`target.worktree=null`", "`problems=[]`",
+            "scheduled leave is not release proof",
+            "no force or branch-deletion options",
+            "retained restorative metadata",
+            "separate explicit\nauthority",
+            "Do not delete remote branches",
+            "symbolic ref, changed OID, new checkout",
+            "Worktree enumeration is not atomic with ref deletion",
+            "OID CAS guards only the\nref value",
+            "supported coordination",
+            "tree retired; local ref retained, CAS exclusion unqualified",
+            "does not block otherwise authorized tree retirement",
+            "update-ref --no-deref -d refs/heads/<branch> <expected-oid>",
+            "Never refresh the expected OID",
+            "Actual path absence and absent Git registration are deletion proof",
+            "existing native\n`cleanup_result` carrier",
+            "reminder-prescribed `kent task complete`",
+            "No blind retries", "separately authorized\nsupervisor recovery",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, agent)
+        for phrase in (
+            "existing native `task.worktree_path`",
+            "Preserve necessary work evidence before deletion",
+            "No new\npost-delete R2 write or Task-comment protocol is required",
+            "No additional after-result storage or evidence\ninfrastructure is required",
+        ):
+            with self.subTest(channel_phrase=phrase):
+                self.assertIn(phrase, agent)
+        # Byte-level legacy preservation; this is instruction coverage only.
+        self.assertEqual(
+            hashlib.sha256(legacy.lstrip("\n").encode()).hexdigest(),
+            "ff5237fde98731483239c38ed47460cac6235576caf0c888612f7dc6bc475481",
+        )
+
+    def test_delivery_helper_ownership_is_legacy_only(self) -> None:
+        text = (ROOT / ".kent/context/delivery.md").read_text()
+        for phrase in (
+            "native ownership and the outgoing transition contract",
+            "not from Task kind or R2 storage",
+            "Only the selected\nlegacy route's helper",
+            "Agent-owned cleanup follows the mapped Agent section",
+            "No post-delete storage protocol is required",
+            "obligations do not apply",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
     def test_review_shell_exceptions_require_own_current_native_node(self) -> None:
         inherited = ("global/AGENTS.md", "AGENTS.md")
         roles = tuple(f"agents/{name}.md" for name in (
