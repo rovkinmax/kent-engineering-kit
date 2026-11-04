@@ -1464,6 +1464,10 @@ class WorkflowKitTest(unittest.TestCase):
             name for name, model in expected_models.items() if model == "gpt-6-luna"
         }
         luna_roles = luna_selectors.intersection(roles)
+        astra_selectors = {
+            name for name, model in expected_models.items() if model == "gpt-6-astra"
+        }
+        astra_roles = astra_selectors.intersection(roles)
         expected_reasoning = {
             "root": "high",
             "reviewer": "xhigh",
@@ -1485,9 +1489,9 @@ class WorkflowKitTest(unittest.TestCase):
             {
                 "root": 400000,
                 **{name: 372000 for name in luna_selectors},
+                **{name: 400000 for name in astra_roles},
                 "implementation-simple": 372000,
                 "implementation-complex": 400000,
-                "complexity-planner": 400000,
             },
         )
         self.assertEqual(
@@ -1502,18 +1506,17 @@ class WorkflowKitTest(unittest.TestCase):
             role = roles[name]
             with self.subTest(role=name):
                 if name in {"default", "defaultExtra"}:
-                    self.assertEqual(
-                        role,
-                        {
-                            "model": expected_models[name],
-                            "thinking_level": "low",
-                            "model_verbosity": "low",
-                        },
-                    )
-                    effective_default = {**config, **role}
-                    self.assertEqual(effective_default["model"], expected_models[name])
-                    self.assertEqual(effective_default["thinking_level"], "low")
-                    self.assertEqual(effective_default["model_context_window"], 400000)
+                    expected_default = {
+                        "model": expected_models[name],
+                        "thinking_level": "low",
+                        "model_verbosity": "low",
+                    }
+                    if name == "defaultExtra":
+                        expected_default.update(
+                            model_context_window=400000,
+                            context_compaction_threshold_tokens=360000,
+                        )
+                    self.assertEqual(role, expected_default)
                 elif name == "fast":
                     for key in ("agent_callable", "workflow_subagent", "tools"):
                         self.assertNotIn(key, role)
@@ -1578,10 +1581,7 @@ class WorkflowKitTest(unittest.TestCase):
                 ): 353400,
                 **{
                     ("subagents", name, "context_compaction_threshold_tokens"): 360000
-                    for name in (
-                        "implementation-complex",
-                        "complexity-planner",
-                    )
+                    for name in astra_roles | {"implementation-complex"}
                 },
             },
         )
