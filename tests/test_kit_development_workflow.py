@@ -209,7 +209,7 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
             "agents/task-supervisor.md": (
                 "first remaining action or exact awaited change",
                 "unknown effects", "owner/cleanup duties", "fresh pre-effect readbacks",
-                "Choose the next action from evidence",
+                "Keep method choices with the assigned owner",
                 "do not delay a genuine required decision",
             ),
             "prompts/migrate-tasks.md": (
