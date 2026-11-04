@@ -27,6 +27,84 @@ from workflowkit.graph import graph_matches_spec, plan_workflow_graph
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 class GeneratedStageContractsTests(unittest.TestCase):
+    def test_storage_routes_reach_generated_writers_and_replan_owners(self):
+        from workflowkit.delivery import (
+            implement_prompt, owner_replan_instruction, plan_revalidation_prompt,
+            plan_storage_guidance,
+        )
+
+        current = ProjectProfile.from_toml(
+            REPO_ROOT, (REPO_ROOT / ".kent/workflow-profile.toml").read_text(),
+            check_files=False,
+        )
+        legacy = self.profile()
+        # Non-v1 consumers retain their original snapshot contract.
+        original = plan_storage_guidance(legacy)
+        self.assertIn("schema_version=1", original)
+        self.assertNotIn("project/installation", original)
+        for adopted in (False, True):
+            for selected in (False, True):
+                profile = replace(
+                    legacy,
+                    project_memory=current.project_memory if adopted else None,
+                    policies={
+                        **legacy.policies, "delivery_reliability": "v1",
+                        "writer_sessions": "continuous",
+                        "coder_selection": "complexity" if selected else "disabled",
+                    },
+                )
+                guidance = plan_storage_guidance(profile)
+                normalized = " ".join(guidance.split())
+                with self.subTest(adopted=adopted, selected=selected):
+                    if adopted:
+                        # R2 remains authoritative; only inventoried old Tasks
+                        # can use the existing legacy snapshot after adoption.
+                        self.assertIn("`resolve-task`", normalized)
+                        self.assertIn("`check-plan`", normalized)
+                        self.assertIn("`resolve-plan`", normalized)
+                        self.assertIn("never fall back to legacy storage", normalized)
+                        self.assertIn(
+                            "Only for a Task confirmed as inventoried legacy", normalized)
+                        self.assertNotIn("project is proven not", normalized)
+                    else:
+                        self.assertIn("project is proven not to have adopted R2", normalized)
+                        self.assertIn("missing profile table alone is not proof", normalized)
+                        self.assertIn("adoption is unknown, incomplete or conflicting", normalized)
+                        self.assertIn("If the Task is R2", normalized)
+                        self.assertIn("block; do not assume legacy", normalized)
+                        self.assertNotIn("inventoried", normalized)
+                        self.assertNotIn("`resolve-task`", normalized)
+                    self.assertIn("without writing", normalized)
+                    for fresh in (False, True):
+                        writer = implement_prompt(
+                            profile, fresh_session=fresh, coder_selection=selected)
+                        if selected:
+                            self.assertIn(guidance, writer)
+                    for from_review in (False, True):
+                        self.assertIn(guidance, plan_revalidation_prompt(
+                            profile, from_review=from_review, coder_selection=selected))
+                    owner = owner_replan_instruction(profile)
+                    self.assertIn(guidance, owner)
+                    for guard in (
+                        "schema_version=1", "task_short_id={{.TaskShortId}}",
+                        "normalized_sha256", "regular non-escaping workspace file",
+                        "work_kind is", "declared by the project profile",
+                    ):
+                        self.assertIn(guard, owner)
+                    for builder in (build_delivery_workflow, build_canary_workflow):
+                        spec = builder(profile, 5)
+                        # Includes initial/continued and Fix recovery edges,
+                        # regardless of coder-selection policy.
+                        owner_edges = [
+                            edge for edge in spec.edges
+                            if edge.prompt and "recover accessible bindings" in edge.prompt
+                        ]
+                        self.assertTrue(owner_edges)
+                        for edge in owner_edges:
+                            self.assertIn(guidance, edge.prompt, edge.key)
+                        self.assertTrue(any(
+                            "fix" in edge.key for edge in owner_edges))
+
     def test_writer_and_owner_recover_original_context_before_escalation(self):
         from workflowkit.delivery import implement_prompt, owner_replan_instruction
 

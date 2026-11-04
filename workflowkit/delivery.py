@@ -5467,9 +5467,11 @@ storage. Only for a Task confirmed as inventoried legacy, use its existing
 `.kent/runtime/{{.TaskShortId}}/plan-contract.json` snapshot without writing."""
     return """This profile has not adopted the project-memory adapter;
 do not invoke an absent helper. Use the local
-`.kent/runtime/{{.TaskShortId}}/plan-contract.json` snapshot only for a Task
-confirmed as inventoried legacy. If the Task is R2 or its mode cannot be
-proven, block; do not assume legacy mode or create a fallback."""
+`.kent/runtime/{{.TaskShortId}}/plan-contract.json` snapshot without writing
+only when the project is proven not to have adopted R2. Verify the actual
+project/installation binding; a missing profile table alone is not proof.
+If the Task is R2 or project adoption is unknown, incomplete or conflicting,
+block; do not assume legacy mode or create a fallback."""
 
 
 def owner_replan_instruction(profile: ProjectProfile | None = None) -> str:
