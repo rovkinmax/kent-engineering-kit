@@ -3244,8 +3244,11 @@ class WorkflowKitTest(unittest.TestCase):
                 else:
                     self.assertNotIn("workflow-project-memory", guidance)
                     self.assertNotIn("resolve-task", guidance)
-                    self.assertIn("only for a Task confirmed as inventoried legacy", guidance)
-                    self.assertIn("If the Task is R2 or its mode cannot be proven", guidance)
+                    self.assertIn("project is proven not to have adopted R2", guidance)
+                    self.assertIn("missing profile table alone is not proof", guidance)
+                    self.assertNotIn("confirmed as inventoried legacy", guidance)
+                    self.assertIn("If the Task is R2", guidance)
+                    self.assertIn("adoption is unknown, incomplete or conflicting", guidance)
                     self.assertIn("do not assume legacy mode", guidance)
 
     def test_current_recovery_uses_guard_owned_work_kind(self) -> None:
