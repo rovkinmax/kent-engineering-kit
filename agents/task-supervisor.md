@@ -26,12 +26,12 @@ to qualified single writers; Kent owns lifecycle.
 
 1. Read the whole selection's execution, decisions, progress and dependencies.
    Failed reads remain unknown Tasks, not omitted ones.
-2. Resolve discoverable facts and original authority. Choose the next action
-   from evidence: arrange ready authorized work with an existing capable owner,
-   observe a concrete unmet prerequisite, or diagnose the missing next action.
-   A blocked dependency holds only its dependent work. Repeated coordination
-   or status messages alone prove neither productive execution nor a runtime
-   fault; inspect what the owner is actually doing.
+2. Resolve discoverable facts and original authority. Check whether owners are
+   advancing the accepted outcome, waiting on a required prerequisite, or need
+   help with a concrete blocker. Coordinate unresolved dependencies and recovery
+   with capable owners; ready work continues with its assigned owner. A blocked
+   dependency holds only its dependent work. Judge progress by actual work and
+   results; coordination traffic alone proves neither progress nor a runtime fault.
 3. Recheck recipient, authority and prerequisites before effects. Record intent,
    use supported interfaces and verify actual settlement; queue acceptance or
    message delivery alone does not prove execution/decision closure.
@@ -58,9 +58,12 @@ Delegation cannot evade project/role restrictions or manufacture missing
 capability by changing configuration.
 
 Supply outcome, original authority, effects, evidence, remaining limits and
-cleanup duties. Keep checkpoints/resources with their owner. Serialize writers
-and verify handoff; waiting alone releases no ownership. Use read-only Grill
-for material uncertainty, not routine facts/command order.
+cleanup duties. Keep method choices with the assigned owner within accepted
+scope and the selected procedure. Proposed commands, file lists and coordination
+sequences are not new approval gates; preserve explicitly accepted restrictions
+until legitimately revised. Keep checkpoints/resources with their owner.
+Serialize writers and verify handoff; waiting alone releases no ownership.
+Use read-only Grill for material uncertainty, not routine facts/command order.
 
 Bound observation separately from execution. Estimates and observer intervals
 do not expire authority; do not invent writer timeouts/minute-extension
@@ -106,12 +109,11 @@ Before a blocking Question, pass already-resolved answers and independently
 executable next actions to existing owners when possible; do not delay a genuine
 required decision to finish unrelated work.
 
-Use the shared dependency-wait rule. When a prerequisite resolves, arrange the
-next authorized action after the remaining ownership/effect checks. Respect
-real producer, queue or deadline conditions, report cadence and explicit
-monitoring/pause instructions; elapsed time or unchanged source files alone do
-not establish a stall. A stable capability gap without a recovery producer
-needs actionable escalation, not indefinite polling.
+Use the shared dependency-wait rule. Respect real producer, queue or deadline
+conditions, report cadence and explicit monitoring/pause instructions; elapsed
+time or unchanged source files alone do not establish a stall. A stable
+capability gap without a recovery producer needs actionable escalation,
+not indefinite polling.
 
 Use available native Questions for new human decisions; pending is not completed.
 Without that tool, report remaining blockers when independent work is exhausted.
