@@ -150,6 +150,10 @@ class PublicationCandidateApiTests(unittest.TestCase):
                 "output_path", "predecessor_binding_ref", "predecessor_receipt_ref", "project_id",
                 "receipt_workflow_id", "primary_root", "primary_workspace_id", "source_commit", "source_ref",
                 "kit_root", "kit_commit", "kit_ref", "ci_helper", "helper_bindings"},
+            "prepare_initial_runtime_publication_v3": {
+                "project_id", "receipt_workflow_id", "primary_root", "primary_workspace_id",
+                "source_commit", "source_ref", "kit_root", "kit_commit", "kit_ref",
+                "ci_helper", "helper_bindings", "project_memory"},
 
         }
         for name, fields in expected.items():
@@ -161,6 +165,14 @@ class PublicationCandidateApiTests(unittest.TestCase):
 
 
 class WorkflowKitTest(unittest.TestCase):
+    def test_project_installer_dispatch_precedes_global_effects(self):
+        source = (REPO_ROOT / "scripts/install").read_text()
+        dispatch = source.index('if [[ "${1:-}" == "project" ]]')
+        self.assertLess(dispatch, source.index("link_item()"))
+        self.assertIn("exec python3 -I -B -c", source)
+        self.assertIn('sys.path.insert(0, sys.argv.pop(1))', source)
+        self.assertIn('"$repo_root" "$@"', source)
+
     def test_script_source_ingress_public_api_delegates_exactly(self) -> None:
         import workflowkit.delivery as delivery
 

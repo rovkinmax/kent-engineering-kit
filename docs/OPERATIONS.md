@@ -16,6 +16,98 @@ grant permission to install, activate, publish, or delete anything.
 
 ## Install the Kit
 
+### Install a fresh R2 project
+
+The no-argument installer below remains the global installation entrypoint.
+Its explicit `project` submode installs only one fresh project's R2
+registration. It requires an already registered native primary checkout,
+zero native Tasks, an explicit linked/validated non-default Workflow UUID,
+an R2 profile with the existing `delivery_reliability = "v1"` publication
+contract, published clean project/Kit source and declared executable helpers.
+This first version accepts no unpublished local instruction declarations.
+The global `kent-project-memory` alias must already safely select this Kit.
+The installer positively verifies its published adapter/template and
+installed/authoritative core byte pairs, then reads the registration through
+the ordinary bound adapter and its safe `load_core` path. These are
+ordinary-storage registration conditions, not full source admission.
+
+The CI helper alias may still select a retained runtime. Its actual target
+and whether it matches the publication declaration are observed in the plan,
+not changed. The first receipt remains a genuine **unadmitted publication
+candidate** produced from the qualified source/helper declarations; it does
+not attest that the current mixed executable cohort is admitted. Neither
+alias is created or retargeted. Strict source/CI inspection is unchanged:
+any Workflow selecting a source-admission gate still blocks on mismatched
+CI/helper targets until separately qualified.
+Custom `KENT_PERSISTENCE_ROOT` values other than `$HOME/.kent` are rejected,
+because the current installation reader uses that fixed location.
+
+Keep Task creation paused from preview through installation readback.
+Preview reads native state and source and writes only canonical JSON to stdout:
+
+```sh
+./scripts/install project preview \
+  --project /absolute/primary/checkout \
+  --workflow APPROVED_NONDEFAULT_WORKFLOW_UUID \
+  --source-ref refs/remotes/origin/main \
+  --kit-ref refs/remotes/origin/main
+```
+
+Save these exact bytes in a regular owner-only file in an owned 0700 directory
+outside source checkouts. Review the plan and its SHA-256, then obtain the
+applicable installation authorization. Apply requires those immutable bytes,
+their digest and the exact native project ID printed in the plan:
+
+```sh
+./scripts/install project apply \
+  --plan /absolute/private/reviewed-plan.json \
+  --expect-plan-sha256 REVIEWED_SHA256 \
+  --confirm project-EXACT_NATIVE_UUID
+```
+
+The command repeats source/native checks, takes one project lock, initializes
+or validates the empty project namespace using the existing R2 core, publishes
+the first immutable `delivery-runtime-publication-v3` receipt under
+`$HOME/.kent/project-memory-installations/PROJECT_ID/receipt.json`, then
+exclusively publishes `r2-installation-binding-v2` under
+`$HOME/.kent/project-memory-bindings/PROJECT_ID.json`. The binding is last.
+Owned private directories, a project lock and temporary publication files are
+also effects. An existing shared R2 root and unrelated projects are preserved.
+No predecessor, schema migration, legacy fallback, Task/Workflow mutation or
+global configuration change is performed. Installation from a managed Git
+worktree or a secondary native workspace is rejected, not redirected.
+
+An exact completed retry validates source, native state and the ordinary
+installation reader and reports `already-installed` without further writes.
+An exact fully published receipt with an empty initialized namespace can resume
+the same plan under its lock. Different bindings/receipts, unsafe files,
+unexpected namespace contents and partial/corrupt records block continuation;
+the installer never repairs permissions, removes foreign state or overwrites
+registration. A crash can leave private `.publish-*` staging files. Preserve
+and inspect them; a staging hardlink left after publication may deliberately
+block readback until separately authorized recovery. Do not force a retry by
+deleting records.
+
+Native state and filesystem publication are not one transaction. If readback
+or revalidation fails after binding publication, retain all records and treat
+installation as **UNQUALIFIED**. Inspect the observed binding/receipt and native
+state before recovery. `qualified: false` is returned even after successful
+registration: successful reports set `storage_registered: true`,
+`source_admitted: false`, `qualified: false`. Before default promotion or
+feature-task rollout, separately qualify the actual non-default Workflow:
+native Plan/intake, immutable plan publication/read, graph-owned acceptance/
+CAS, Implement, Verify, PR/CI, and Cleanup/retention, including managed-worktree
+access. A storage roundtrip alone is not this full lifecycle qualification.
+No `.todo` fallback is created; documents stay R2-only without import.
+
+Before first adoption, rollback is a separately approved removal or relocation
+of only the verified fresh installation artifacts and an empty owned project
+namespace; this installer has no automatic rollback command. After any Task
+adoption, preserve R2 history and use a compatible forward repair; do not
+convert it to legacy. Existing installed projects and retained Tasks are not
+targets of this fresh route. Source publication changes no live graph, native
+default or locked Session. No automatic restart/instruction refresh occurs.
+
 ### Before installation
 
 Keep the repository in a stable location: the installer links directly to this

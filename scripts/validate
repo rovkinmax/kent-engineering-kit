@@ -45,6 +45,7 @@ python3 -m py_compile \
   "$repo_root/workflowkit/runtime.py" \
   "$repo_root/scripts/prepare-github-ci" \
   "$repo_root/workflowkit/operations.py" \
+  "$repo_root/workflowkit/project_install.py" \
   "$repo_root/scripts/activate-primary-checkout" \
   "$repo_root/scripts/reconcile-canonical-workflows" \
   "$repo_root/templates/project/android-apk-install-preserve" \

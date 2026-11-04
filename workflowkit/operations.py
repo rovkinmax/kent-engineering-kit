@@ -1959,6 +1959,43 @@ def prepare_runtime_publication_v3(
     source_commit, source_ref, kit_root, kit_commit, kit_ref, ci_helper,
     helper_bindings,
 ):
+    if output_path is None:
+        raise ValueError('invalid absolute path')
+    return _prepare_runtime_publication_v3(
+        output_path=output_path, predecessor_binding_ref=predecessor_binding_ref,
+        predecessor_receipt_ref=predecessor_receipt_ref, project_id=project_id,
+        receipt_workflow_id=receipt_workflow_id, primary_root=primary_root,
+        primary_workspace_id=primary_workspace_id, source_commit=source_commit,
+        source_ref=source_ref, kit_root=kit_root, kit_commit=kit_commit, kit_ref=kit_ref,
+        ci_helper=ci_helper, helper_bindings=helper_bindings,
+    )
+
+
+def prepare_initial_runtime_publication_v3(
+    *, project_id, receipt_workflow_id, primary_root, primary_workspace_id,
+    source_commit, source_ref, kit_root, kit_commit, kit_ref, ci_helper,
+    helper_bindings, project_memory,
+):
+    """Read-only first receipt preparation. No predecessor or installation effects."""
+    memory = dict(project_memory)
+    if set(memory) != {'root', 'project_key', 'project_uid', 'legacy_task_ids'} or memory['legacy_task_ids'] != []:
+        raise PlanValidationError('fresh installation requires an empty legacy inventory')
+    return _prepare_runtime_publication_v3(
+        output_path=None, predecessor_binding_ref=None, predecessor_receipt_ref=None,
+        project_id=project_id, receipt_workflow_id=receipt_workflow_id,
+        primary_root=primary_root, primary_workspace_id=primary_workspace_id,
+        source_commit=source_commit, source_ref=source_ref, kit_root=kit_root,
+        kit_commit=kit_commit, kit_ref=kit_ref, ci_helper=ci_helper,
+        helper_bindings=helper_bindings, initial_memory=memory,
+    )
+
+
+def _prepare_runtime_publication_v3(
+    *, output_path, predecessor_binding_ref, predecessor_receipt_ref,
+    project_id, receipt_workflow_id, primary_root, primary_workspace_id,
+    source_commit, source_ref, kit_root, kit_commit, kit_ref, ci_helper,
+    helper_bindings, initial_memory=None,
+):
     """Prepare an unadmitted private candidate; never install or admit it.
 
     The producer must execute from the exact qualified Kit it is publishing.
@@ -2013,56 +2050,22 @@ def prepare_runtime_publication_v3(
         require(sha256_bytes(raw) == ref['sha256'], 'predecessor digest differs')
         return path, raw, namespace['parse_json'](raw)
 
-    _, binding_raw, binding = preimage(predecessor_binding_ref, binding_path)
-    namespace['closed'](binding, {
-        'schema', 'project_id', 'primary_root', 'primary_workspace_id', 'profile_sha256',
-        'receipt_path', 'receipt_sha256', 'kit_root', 'source_ref', 'kit_ref',
-        'ci_helper', 'helper_bindings',
-    })
-    require(binding['schema'] == SOURCE_BINDING_SCHEMA
-            and binding['project_id'] == project_id and binding['primary_root'] == str(primary)
-            and binding['primary_workspace_id'] == primary_workspace_id,
-            'predecessor installation identity differs')
-    _sha256(binding['profile_sha256'], 'predecessor profile digest')
-    canonical(binding['kit_root'])
-    require(predecessor_receipt_ref == {
-        'path': binding['receipt_path'], 'sha256': binding['receipt_sha256'],
-    }, 'predecessor receipt differs from installed binding')
-    _, receipt_raw, prior = preimage(predecessor_receipt_ref)
-    prior_schema = prior.get('schema') if isinstance(prior, dict) else None
-    require(prior_schema in ('delivery-runtime-publication-v1', 'delivery-runtime-publication-v2',
-                             'delivery-runtime-publication-v3'), 'unsupported predecessor receipt')
-    namespace['closed'](prior, {
-        'schema', 'policy', 'project_id', 'workflow_id', 'source_commit', 'kit_commit',
-        'runtime_roots', 'files', 'project_memory',
-    } | ({'local_inputs'} if prior_schema != 'delivery-runtime-publication-v1' else set()))
-    require(prior['policy'] == ('delivery_reliability_project_content_v1'
-            if prior_schema == 'delivery-runtime-publication-v3' else 'delivery_reliability_v1'),
-            'predecessor policy differs')
-    require(prior['project_id'] == project_id and prior['workflow_id'] == receipt_workflow_id,
-            'predecessor receipt owner differs')
-    normalized_prior = {**prior, 'schema': 'delivery-runtime-publication-v3',
-                        'policy': 'delivery_reliability_project_content_v1',
-                        'local_inputs': prior.get('local_inputs', [])}
-    validate_runtime_v3_receipt(normalized_prior, primary, binding['kit_root'])
+    if initial_memory is None:
+        binding_raw, receipt_raw, binding, prior = _runtime_publication_predecessor(
+            preimage, namespace, binding_path, predecessor_binding_ref, predecessor_receipt_ref,
+            project_id, receipt_workflow_id, primary, primary_workspace_id, kit,
+        )
+        memory = prior['project_memory']
+        local_inputs = prior.get('local_inputs', [])
+    else:
+        initial_binding_raw = (
+            read(binding_path, SOURCE_RECEIPT_BYTES_LIMIT, private=True)[0]
+            if os.path.lexists(binding_path) else None
+        )
+        memory, local_inputs = initial_memory, []
+    expected_memory = {name: memory[name] for name in ('root', 'project_key', 'project_uid')}
     primary, project_common = repository(primary)
     kit, kit_common = repository(kit)
-    # Prior profile must be bound simultaneously by binding, receipt and Git.
-    old_tree = tree(primary, prior['source_commit'])
-    old_profile = old_tree.get('.kent/workflow-profile.toml')
-    require(old_profile is not None and old_profile[:2] == ('100644', 'blob'),
-            'predecessor profile is not a published regular blob')
-    old_raw = git_read(primary, 'cat-file', 'blob', old_profile[2])
-    old_entries = [item for item in prior['files'] if item['root'] == str(primary)
-                   and item['relative_path'] == '.kent/workflow-profile.toml']
-    require(len(old_entries) == 1 and sha256_bytes(old_raw) == binding['profile_sha256']
-            and sha256_bytes(old_raw) == old_entries[0]['sha256']
-            and len(old_raw) == old_entries[0]['byte_size']
-            and not old_entries[0]['mode'] & 0o100, 'predecessor profile binding differs')
-    old_config = tomllib.loads(old_raw.decode('utf-8')).get('project_memory')
-    memory = prior['project_memory']
-    expected_memory = {name: memory[name] for name in ('root', 'project_key', 'project_uid')}
-    require(old_config == {**expected_memory, 'mode': 'r2'}, 'predecessor memory identity differs')
     require(isinstance(helper_bindings, list) and len(helper_bindings) <= 64,
             'invalid candidate helper bindings')
 
@@ -2081,18 +2084,17 @@ def prepare_runtime_publication_v3(
             targets.append(canonical(row['target']))
         return seen, targets
 
-    # Also close the predecessor declaration; it is not an alias authorization.
-    require(isinstance(binding['helper_bindings'], list) and len(binding['helper_bindings']) <= 64,
-            'invalid predecessor helper declarations')
-    prior_links, _ = helper_declarations(binding['helper_bindings'])
-    require(binding['ci_helper'] not in prior_links, 'duplicate predecessor CI helper')
+    if initial_memory is None:
+        require(isinstance(binding['helper_bindings'], list) and len(binding['helper_bindings']) <= 64,
+                'invalid predecessor helper declarations')
+        prior_links, _ = helper_declarations(binding['helper_bindings'])
+        require(binding['ci_helper'] not in prior_links, 'duplicate predecessor CI helper')
+        for ref in (binding['source_ref'], binding['kit_ref']):
+            require(isinstance(ref, str) and ref.startswith(('refs/remotes/', 'refs/tags/'))
+                    and not ref.endswith('/HEAD'), 'invalid predecessor publication ref')
+            git_read(primary, 'check-ref-format', ref)
     namespace['key'](primary_workspace_id)
-    for ref in (binding['source_ref'], binding['kit_ref']):
-        require(isinstance(ref, str) and ref.startswith(('refs/remotes/', 'refs/tags/'))
-                and not ref.endswith('/HEAD'), 'invalid predecessor publication ref')
-        git_read(primary, 'check-ref-format', ref)
     links, targets = helper_declarations(helper_bindings)
-    # Validate the closed mandatory declaration without dereferencing it.
     ci_links, _ = helper_declarations([{'link': ci_helper,
                                       'target': str(kit / 'scripts/prepare-github-ci')}])
     require(not links & ci_links, 'duplicate candidate CI helper')
@@ -2113,7 +2115,7 @@ def prepare_runtime_publication_v3(
         'project_id': project_id, 'workflow_id': receipt_workflow_id,
         'source_commit': source_commit, 'kit_commit': kit_commit,
         'runtime_roots': sorted(str(root) for root in roots), 'files': [],
-        'project_memory': memory, 'local_inputs': prior.get('local_inputs', []),
+        'project_memory': memory, 'local_inputs': local_inputs,
     }
     require(all(heads[root] == head for root, head in initial_heads.items()),
             'candidate source HEAD changed')
@@ -2165,9 +2167,16 @@ def prepare_runtime_publication_v3(
                 for target in targets), 'candidate helper not qualified executable')
 
     def freshness():
-        require(read(binding_path, SOURCE_RECEIPT_BYTES_LIMIT, private=True)[0] == binding_raw
-                and read(predecessor_receipt_ref['path'], SOURCE_RECEIPT_BYTES_LIMIT,
-                         private=True)[0] == receipt_raw, 'predecessor changed during preparation')
+        if initial_memory is None:
+            require(read(binding_path, SOURCE_RECEIPT_BYTES_LIMIT, private=True)[0] == binding_raw
+                    and read(predecessor_receipt_ref['path'], SOURCE_RECEIPT_BYTES_LIMIT,
+                             private=True)[0] == receipt_raw, 'predecessor changed during preparation')
+        else:
+            current_binding_raw = (
+                read(binding_path, SOURCE_RECEIPT_BYTES_LIMIT, private=True)[0]
+                if os.path.lexists(binding_path) else None
+            )
+            require(current_binding_raw == initial_binding_raw, 'installation binding changed')
         for root, expected, source_tree, is_kit in projections:
             locals_here = {item['relative_path']: item for item in result['local_inputs']
                            if item['root'] == str(root)}
@@ -2189,8 +2198,9 @@ def prepare_runtime_publication_v3(
     freshness()
     raw = json.dumps(result, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
     require(len(raw) <= SOURCE_RECEIPT_BYTES_LIMIT, 'candidate receipt exceeds limit')
+    if output_path is None:
+        return result
     output = canonical(output_path)
-    # Existing private owner directory only; no provisioning and no overwrite.
     parent = output.parent
     info = parent.lstat()
     require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
@@ -2215,6 +2225,63 @@ def prepare_runtime_publication_v3(
     finally:
         os.close(directory)
     return {'path': str(output), 'sha256': sha256_bytes(raw), 'byte_size': len(raw)}
+
+
+def _runtime_publication_predecessor(
+    preimage, namespace, binding_path, predecessor_binding_ref, predecessor_receipt_ref,
+    project_id, receipt_workflow_id, primary, primary_workspace_id, kit,
+):
+    require, canonical = namespace['require'], namespace['canonical']
+    tree, git_read = namespace['tree'], namespace['git']
+    _, binding_raw, binding = preimage(predecessor_binding_ref, binding_path)
+    namespace['closed'](binding, {
+        'schema', 'project_id', 'primary_root', 'primary_workspace_id', 'profile_sha256',
+        'receipt_path', 'receipt_sha256', 'kit_root', 'source_ref', 'kit_ref',
+        'ci_helper', 'helper_bindings',
+    })
+    require(binding['schema'] == SOURCE_BINDING_SCHEMA
+            and binding['project_id'] == project_id and binding['primary_root'] == str(primary)
+            and binding['primary_workspace_id'] == primary_workspace_id,
+            'predecessor installation identity differs')
+    _sha256(binding['profile_sha256'], 'predecessor profile digest')
+    canonical(binding['kit_root'])
+    require(predecessor_receipt_ref == {
+        'path': binding['receipt_path'], 'sha256': binding['receipt_sha256'],
+    }, 'predecessor receipt differs from installed binding')
+    _, receipt_raw, prior = preimage(predecessor_receipt_ref)
+    prior_schema = prior.get('schema') if isinstance(prior, dict) else None
+    require(prior_schema in ('delivery-runtime-publication-v1', 'delivery-runtime-publication-v2',
+                             'delivery-runtime-publication-v3'), 'unsupported predecessor receipt')
+    namespace['closed'](prior, {
+        'schema', 'policy', 'project_id', 'workflow_id', 'source_commit', 'kit_commit',
+        'runtime_roots', 'files', 'project_memory',
+    } | ({'local_inputs'} if prior_schema != 'delivery-runtime-publication-v1' else set()))
+    require(prior['policy'] == ('delivery_reliability_project_content_v1'
+            if prior_schema == 'delivery-runtime-publication-v3' else 'delivery_reliability_v1'),
+            'predecessor policy differs')
+    require(prior['project_id'] == project_id and prior['workflow_id'] == receipt_workflow_id,
+            'predecessor receipt owner differs')
+    normalized_prior = {**prior, 'schema': 'delivery-runtime-publication-v3',
+                        'policy': 'delivery_reliability_project_content_v1',
+                        'local_inputs': prior.get('local_inputs', [])}
+    validate_runtime_v3_receipt(normalized_prior, primary, binding['kit_root'])
+    # Prior profile must be bound simultaneously by binding, receipt and Git.
+    old_tree = tree(primary, prior['source_commit'])
+    old_profile = old_tree.get('.kent/workflow-profile.toml')
+    require(old_profile is not None and old_profile[:2] == ('100644', 'blob'),
+            'predecessor profile is not a published regular blob')
+    old_raw = git_read(primary, 'cat-file', 'blob', old_profile[2])
+    old_entries = [item for item in prior['files'] if item['root'] == str(primary)
+                   and item['relative_path'] == '.kent/workflow-profile.toml']
+    require(len(old_entries) == 1 and sha256_bytes(old_raw) == binding['profile_sha256']
+            and sha256_bytes(old_raw) == old_entries[0]['sha256']
+            and len(old_raw) == old_entries[0]['byte_size']
+            and not old_entries[0]['mode'] & 0o100, 'predecessor profile binding differs')
+    old_config = tomllib.loads(old_raw.decode('utf-8')).get('project_memory')
+    memory = prior['project_memory']
+    expected_memory = {name: memory[name] for name in ('root', 'project_key', 'project_uid')}
+    require(old_config == {**expected_memory, 'mode': 'r2'}, 'predecessor memory identity differs')
+    return binding_raw, receipt_raw, binding, prior
 
 
 def _publication_reference(ref, label, *, canonical_json=False):
