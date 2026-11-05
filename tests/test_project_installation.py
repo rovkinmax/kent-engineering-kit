@@ -99,7 +99,9 @@ class ProjectInstallationTests(unittest.TestCase):
             "import json, sys\n"
             f"project, root, workflow = {project_id!r}, {str(primary)!r}, {workflow!r}\n"
             "args = sys.argv[1:]\n"
-            "if args == ['project', 'list']: print(project + '\\tFixture\\t' + root)\n"
+            "if args == ['project', 'list']:\n"
+            " print(project + '\\tFixture\\t./')\n"
+            " print('project-33333333-3333-4333-8333-333333333333\\tOther\\t~/other')\n"
             "elif args == ['project', root]: print(project)\n"
             "elif args[:2] == ['project', 'workspaces']:\n"
             " print(json.dumps({'project_id': project, 'offset': 0, 'workspaces': "
@@ -531,8 +533,7 @@ print(json.dumps({"schema": receipt["schema"], "legacy_task_ids": receipt["proje
 
         with mock.patch.object(install, "environment", return_value=(ci.parent.parent, kent)), \
                 mock.patch.object(op, "_git", side_effect=git, create=True), \
-                mock.patch.object(op, "_project_rows", return_value=[
-                    {"id": project_id, "path": str(primary)}], create=True), \
+                mock.patch.object(op, "_run", return_value=(0, (project_id + "\n").encode(), b"")), \
                 mock.patch.object(install, "native_snapshot", return_value=native), \
                 mock.patch.object(install, "empty_store"), \
                 mock.patch.object(install, "storage_bindings", return_value=(ci, [], {
@@ -549,6 +550,79 @@ print(json.dumps({"schema": receipt["schema"], "legacy_task_ids": receipt["proje
                  if filename.is_file()}
         self.assertEqual(after, before)
         self.assertFalse((ci.parent.parent / "project-memory-installations").exists())
+
+    def test_explicit_project_lookup_rejects_noncanonical_or_failed_output(self):
+        project_id = "project-22222222-2222-4222-8222-222222222222"
+        kent = self.root / "kent"
+        invalid = [
+            (1, (project_id + "\n").encode()),
+            (0, b""), (0, b"\xff\n"), (0, b"project-fixture\n"),
+            (0, (project_id.upper() + "\n").encode()),
+            (0, (" " + project_id + "\n").encode()),
+            (0, (project_id + "\n\n").encode()),
+            (0, (project_id + "\n" + project_id + "\n").encode()),
+            (0, (project_id + "\tFixture\t./\n").encode()),
+        ]
+        for code, output in invalid:
+            with self.subTest(code=code, output=output), \
+                    mock.patch.object(install, "environment", return_value=(self.root, kent)), \
+                    mock.patch.object(op, "_git", side_effect=[
+                        str(self.root), str(self.root / ".git"), ".git"]), \
+                    mock.patch.object(op, "_run", return_value=(code, output, b"")) as run, \
+                    mock.patch.object(op, "_project_rows") as rows, \
+                    mock.patch.object(install, "native_snapshot") as snapshot:
+                with self.assertRaises(op.PlanValidationError):
+                    install.build_plan(project=str(self.root),
+                                       workflow="22222222-2222-4222-8222-222222222222",
+                                       source_ref="unused", kit_ref="unused")
+                run.assert_called_once_with(
+                    [str(kent), "project", str(self.root)], cwd=self.root)
+                rows.assert_not_called()
+                snapshot.assert_not_called()
+
+    def test_checkout_guards_precede_project_lookup(self):
+        for top, common in (
+            (str(self.root / "nested"), ".git"),
+            (str(self.root), str(self.root / "shared.git")),
+        ):
+            with self.subTest(top=top, common=common), \
+                    mock.patch.object(install, "environment",
+                                      return_value=(self.root, self.root / "kent")), \
+                    mock.patch.object(op, "_git", side_effect=[
+                        top, str(self.root / ".git"), common]), \
+                    mock.patch.object(op, "_run") as run:
+                with self.assertRaises(op.PlanValidationError):
+                    install.build_plan(project=str(self.root),
+                                       workflow="22222222-2222-4222-8222-222222222222",
+                                       source_ref="unused", kit_ref="unused")
+                run.assert_not_called()
+
+    def test_native_snapshot_keeps_project_and_primary_workspace_guards(self):
+        project_id = "project-22222222-2222-4222-8222-222222222222"
+        other_id = "project-33333333-3333-4333-8333-333333333333"
+        primary = {"workspace_id": "workspace-primary", "root_path": str(self.root),
+                   "is_default": True}
+        cases = [
+            ([], project_id, [primary]),
+            ([project_id, project_id], project_id, [primary]),
+            ([other_id], other_id, [primary]),
+            ([project_id], other_id, [primary]),
+            ([project_id], project_id, []),
+            ([project_id], project_id, [primary, dict(primary, workspace_id="workspace-other")]),
+            ([project_id], project_id, [dict(primary, root_path=str(self.root / "wrong"))]),
+            ([project_id], project_id, [dict(primary, is_default=False)]),
+        ]
+        (self.root / "wrong").mkdir()
+        for projects, lookup, workspaces in cases:
+            with self.subTest(projects=projects, lookup=lookup, workspaces=workspaces), \
+                    mock.patch.object(op, "_project_rows", return_value=[
+                        {"id": item, "path": "./"} for item in projects]), \
+                    mock.patch.object(op, "_run", return_value=(0, lookup.encode(), b"")), \
+                    mock.patch.object(op, "_kent_pages", return_value=[{
+                        "project_id": project_id, "offset": 0, "workspaces": workspaces}]):
+                with self.assertRaises(op.PlanValidationError):
+                    install.native_snapshot(self.root / "kent", self.root, project_id,
+                                            "22222222-2222-4222-8222-222222222222")
 
     def test_storage_binding_accepts_mixed_ci_without_changing_aliases(self):
         kent_root = self.root / "home/.kent"
