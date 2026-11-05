@@ -212,10 +212,13 @@ def build_plan(*, project, workflow, source_ref, kit_ref):
     common = Path(op._git(primary, "rev-parse", "--git-common-dir"))
     common = (primary / common).resolve() if not common.is_absolute() else common.resolve()
     require(git_dir == common, "installation from a managed worktree is not supported")
-    project_ids = [row["id"] for row in op._project_rows(kent, primary)
-                   if row["path"] == str(primary)]
-    require(len(project_ids) == 1, "explicit primary native project identity unavailable")
-    project_id = op._native_project_id(project_ids[0], "installation project")
+    code, output, _ = op._run([str(kent), "project", str(primary)], cwd=primary)
+    require(code == 0, "explicit primary native project identity unavailable")
+    try:
+        project_id = output.decode("utf-8").removesuffix("\n")
+    except UnicodeDecodeError as error:
+        raise op.PlanValidationError("native project identity is not UTF-8") from error
+    project_id = op._native_project_id(project_id, "installation project")
     workflow = op._uuid(workflow, "installation Workflow")
     native = native_snapshot(kent, primary, project_id, workflow)
     profile_path = primary / ".kent/workflow-profile.toml"
