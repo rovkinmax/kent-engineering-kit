@@ -193,10 +193,10 @@ class LiteTests(unittest.TestCase):
     def test_backedges_reuse_writer_and_replan_owner(self):
         for edge in lite.load_spec().edges:
             if edge.target == "implement" and edge.source != "plan_review":
-                self.assertEqual(("continue_session", "node:implement"),
+                self.assertEqual(("continue_session", "previous_target"),
                                  (edge.context, edge.context_source))
             if edge.target == "plan" and edge.source != "backlog":
-                self.assertEqual(("continue_session", "node:plan"),
+                self.assertEqual(("continue_session", "previous_target"),
                                  (edge.context, edge.context_source))
 
     def test_inputs_declared_and_identity_carried_on_every_edge(self):
@@ -517,6 +517,48 @@ class LiteTests(unittest.TestCase):
                 inspected = dict(self.client.inspect_graph(created["id"]), **changes)
                 with self.assertRaisesRegex(SpecError, "identity/version"):
                     lite.bind_fresh_seed(plan["graph"], inspected, created)
+
+
+    def test_selected_target_context_is_rejected_before_native_create(self):
+        value = json.loads((lite.KIT / lite.PACKAGE).read_bytes())
+        routes = [edge for edge in value["edges"] if edge["context"] == "continue_session"]
+        self.assertEqual(8, len(routes))
+        for route in routes:
+            with self.subTest(transition=route["transition"]):
+                invalid = deepcopy(value)
+                edge = next(item for item in invalid["edges"] if item["key"] == route["key"])
+                edge["context_source"] = "node:" + edge["target"]
+                with patch.object(Path, "read_bytes", return_value=lite.encode(invalid)):
+                    with self.assertRaisesRegex(
+                        SpecError, "selected context source cannot be the edge target node"
+                    ):
+                        lite.preview(self.root, self.client)
+                self.assertEqual([], self.client.writes)
+
+    def test_strict_previous_target_has_a_guaranteed_prior_owner(self):
+        spec = lite.load_spec()
+        routes = [edge for edge in spec.edges if edge.context == "continue_session"]
+        self.assertEqual({
+            "plan_revise", "implement_replan", "verify_replan", "review_replan",
+            "verify_fix", "review_fix", "publish_fix", "observe_fix",
+        }, {edge.transition for edge in routes})
+        nodes = {node.key: node for node in spec.nodes}
+        for route in routes:
+            with self.subTest(transition=route.transition):
+                self.assertEqual("previous_target", route.context_source)
+                self.assertEqual(("agent", "default"),
+                                 (nodes[route.target].kind, nodes[route.target].agent))
+                # Removing the target must make this source unreachable from start:
+                # every legitimate arrival therefore already passed its owner.
+                seen, todo = set(), ["backlog"]
+                while todo:
+                    node = todo.pop()
+                    if node in seen or node == route.target:
+                        continue
+                    seen.add(node)
+                    todo.extend(edge.target for edge in spec.edges if edge.source == node)
+                self.assertNotIn(route.source, seen)
+
 
 
 if __name__ == "__main__":

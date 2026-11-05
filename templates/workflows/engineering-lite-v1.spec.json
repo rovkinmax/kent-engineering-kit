@@ -148,7 +148,7 @@
     {
       "assignee_selection": "configured",
       "context": "continue_session",
-      "context_source": "node:plan",
+      "context_source": "previous_target",
       "key": "plan_revise",
       "parameters": [
         {
@@ -343,7 +343,7 @@
     {
       "assignee_selection": "configured",
       "context": "continue_session",
-      "context_source": "node:implement",
+      "context_source": "previous_target",
       "key": "verify_fix",
       "parameters": [
         {
@@ -473,7 +473,7 @@
     {
       "assignee_selection": "configured",
       "context": "continue_session",
-      "context_source": "node:implement",
+      "context_source": "previous_target",
       "key": "review_fix",
       "parameters": [
         {
@@ -603,7 +603,7 @@
     {
       "assignee_selection": "configured",
       "context": "continue_session",
-      "context_source": "node:implement",
+      "context_source": "previous_target",
       "key": "publish_fix",
       "parameters": [
         {
@@ -668,7 +668,7 @@
     {
       "assignee_selection": "configured",
       "context": "continue_session",
-      "context_source": "node:implement",
+      "context_source": "previous_target",
       "key": "observe_fix",
       "parameters": [
         {
@@ -928,7 +928,7 @@
     {
       "assignee_selection": "configured",
       "context": "continue_session",
-      "context_source": "node:plan",
+      "context_source": "previous_target",
       "key": "implement_replan",
       "parameters": [
         {
@@ -993,7 +993,7 @@
     {
       "assignee_selection": "configured",
       "context": "continue_session",
-      "context_source": "node:plan",
+      "context_source": "previous_target",
       "key": "verify_replan",
       "parameters": [
         {
@@ -1058,7 +1058,7 @@
     {
       "assignee_selection": "configured",
       "context": "continue_session",
-      "context_source": "node:plan",
+      "context_source": "previous_target",
       "key": "review_replan",
       "parameters": [
         {
