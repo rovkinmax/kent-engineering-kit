@@ -219,7 +219,7 @@ class BundleTests(unittest.TestCase):
     def test_custody_api_version_is_checked_after_byte_qualification(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for version in (None, 2):
+            for version in (None, 1):
                 content = b"BUNDLE_PROTOCOL = 1\n"
                 if version is not None:
                     content += f"CUSTODY_API_VERSION = {version}\n".encode()

@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "templates/project/resource-lease-client"
+PROOF_TEMPLATE = ROOT / "templates/project/resource_lease_stop_proof.py"
 loader = importlib.machinery.SourceFileLoader("resource_client_tested", str(SCRIPT))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 client = importlib.util.module_from_spec(spec)
@@ -50,7 +51,9 @@ class PublicCheckTests(unittest.TestCase):
                        "expires_in": 30, "quarantined": False}
             lease = SimpleNamespace(run=Path(directory), metadata={"binding": binding},
                                     cli=lambda action: current)
-            status = {"phase": "active", "updated_at": time.monotonic()}
+            status = {"phase": "active", "updated_at": time.monotonic(),
+                      "stop_protocol": client.STOP_PROTOCOL,
+                      "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL}
             with patch.object(client, "load", return_value=lease), patch.object(
                 client, "read", return_value=status
             ), patch.object(client, "lock", owned_lock), patch.object(
@@ -93,7 +96,8 @@ if (root/"reject").exists() and action == "renew":
     raise SystemExit(9)
 if action == "acquire":
     value = {"owner":owner,"capability":args[args.index("--capability")+1],
-             "id":"lease-one","state":"active","cleanup_pending":False,
+             "id":"lease-one","generation":1,"slot":"test","service_available":True,
+             "state":"active","cleanup_pending":False,
              "quarantined":False,"endpoint":{"adb_serial":"emulator-5574"}}
     receipt.write_text(json.dumps(value))
     receipt.chmod(0o600)
@@ -179,8 +183,8 @@ class ResourceLeaseClientTests(unittest.TestCase):
         self.assertGreaterEqual(self.calls().count("renew"), 2)
         self.assertEqual(self.calls()[-1], "release")
         run = next(path for path in self.runs.iterdir() if path.is_dir())
-        self.assertEqual(client.read(run / "binding.json")["custody_marker_protocol"], 1)
-        self.assertEqual(client.read(run / "status.json")["custody_marker_protocol"], 1)
+        self.assertEqual(client.read(run / "binding.json")["custody_marker_protocol"], 2)
+        self.assertEqual(client.read(run / "status.json")["custody_marker_protocol"], 2)
 
     def test_runtime_protocol_is_emitted_by_owner_not_copied_from_binding(self):
         self.root.chmod(0o700)
@@ -205,7 +209,8 @@ class ResourceLeaseClientTests(unittest.TestCase):
                 "schema": 1, "reason": "marker_lock_unavailable",
             })
             lease = client.Lease(self.root, {})
-            lease.record("active", command_stop="unconfirmed")
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            lease.record("active", parent_command_stop="unconfirmed")
             with self.assertRaises(client.CommandStopUncertain):
                 lease.finish()
             status = client.read(self.root / "status.json")
@@ -536,6 +541,10 @@ class ResourceLeaseClientTests(unittest.TestCase):
             run.mkdir(mode=0o700)
             client.write(run / "status.json", {
                 "phase": "finished", "updated_at": index,
+                "stop_protocol": client.STOP_PROTOCOL,
+                "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+                "parent_command_stop": "not_started", "remote_command_stop": "not_started",
+                "command_stop": "not_started",
                 "lease": {"state": "completed", "cleanup_pending": False, "quarantined": False},
             })
         unknown = self.runs / "unknown"
@@ -557,7 +566,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
         run = Path(args.run_dir)
         secret = "must-not-leak-stop-exception"
         actions, signals, waits = [], [], []
-        original_tick, original_write = client.Renewal.tick, client.write
+        original_tick, original_write_record = client.Renewal.tick, client._write_record
         finish_status_failed = False
 
         class Child:
@@ -580,7 +589,8 @@ class ResourceLeaseClientTests(unittest.TestCase):
             action = command[3]
             self.assertIn(action, ("acquire", "release"))
             actions.append(action)
-            value = {"owner": args.owner, "capability": "clean", "state": "active",
+            value = {"owner": args.owner, "capability": "clean", "id": "lease-one",
+                     "generation": 1, "slot": "test", "state": "active",
                      "cleanup_pending": False, "quarantined": False,
                      "endpoint": {"adb_serial": "never-used"}, "expires_in": 30,
                      "expires_at": time.monotonic() + 30}
@@ -591,7 +601,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
                 if cleanup_fails:
                     raise client.Error("diagnostic resource cleanup not confirmed")
                 value.update(state="completed", endpoint=None)
-            original_write(run / "receipt.json", value)
+            original_write_record(run / "receipt.json", value)
             return value
 
         def interrupt(renewal):
@@ -610,7 +620,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
 
         def failing_write(path, value):
             nonlocal finish_status_failed
-            if path.name == "command-stop-uncertain.json" and marker_fails:
+            if path.name == client.PARENT_UNCERTAINTY_MARKER and marker_fails:
                 raise OSError(secret)
             if path.name == "status.json" and value["phase"] == "failed" and status_fails:
                 raise OSError(secret)
@@ -618,7 +628,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
                     and value["phase"] == "failed" and value.get("lease", {}).get("state") == "completed"):
                 finish_status_failed = True
                 raise OSError(secret)
-            return original_write(path, value)
+            return original_write_record(path, value)
 
         stderr = io.StringIO()
         with (patch.object(client, "capture", side_effect=fake_capture),
@@ -627,7 +637,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
                            if mode == "not_started" else None),
               patch.object(client.os, "killpg", side_effect=killpg),
               patch.object(client.Renewal, "tick", interrupt),
-              patch.object(client, "write", side_effect=failing_write),
+              patch.object(client, "_write_record", side_effect=failing_write),
               redirect_stderr(stderr)):
             result = client.run_command(args)
         self.assertEqual(result, 1)
@@ -645,6 +655,10 @@ class ResourceLeaseClientTests(unittest.TestCase):
             completed.mkdir(mode=0o700, exist_ok=True)
             client.write(completed / "status.json", {
                 "phase": "finished", "updated_at": time.monotonic() + index,
+                "stop_protocol": client.STOP_PROTOCOL,
+                "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+                "parent_command_stop": "not_started", "remote_command_stop": "not_started",
+                "command_stop": "not_started",
                 "lease": {"state": "completed", "cleanup_pending": False, "quarantined": False},
             })
         client.prune(self.runs)
@@ -662,7 +676,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
                 self.assertFalse(status["lease"]["cleanup_pending"])
                 self.assertIn("command stop is uncertain", status["error"])
                 self.assertIn("command stop is uncertain", stderr)
-                marker = run / "command-stop-uncertain.json"
+                marker = run / client.PARENT_UNCERTAINTY_MARKER
                 self.assertEqual(client.read(marker), {
                     "schema": 1, "reason": "wait_timeout" if mode == "timeout" else "signal_error"})
                 self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
@@ -687,7 +701,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
             with self.subTest(status_fails=status_fails):
                 run, status, stderr = self.stop_case(
                     "oserror", marker_fails=True, status_fails=status_fails)
-                self.assertFalse((run / "command-stop-uncertain.json").exists())
+                self.assertFalse((run / client.PARENT_UNCERTAINTY_MARKER).exists())
                 self.assertEqual(status["command_stop"], "unconfirmed")
                 self.assertNotEqual(status["phase"], "finished")
                 self.assertIn("uncertainty marker persistence failed", stderr)
@@ -699,6 +713,160 @@ class ResourceLeaseClientTests(unittest.TestCase):
                 self.assertEqual(after["command_stop"], "unconfirmed")
                 self.assertEqual(after["lease"]["state"], "completed")
                 self.assert_retained_after_prune(run)
+
+    def _write_remote_stop(self, run, state, operation_id="fixture-operation"):
+        binding = client.read(run / "binding.json")
+        encoded = client.canonical_json(binding)
+        marker_path = run / client.UNCERTAINTY_MARKER
+        marker_payload = {"schema": 2, "reason": "remote_stop_unconfirmed",
+                          "operation_id": (operation_id if operation_id != "fixture-operation"
+                                           else "00000000-0000-4000-8000-000000000001")}
+        marker_path.write_bytes(client.canonical_json(marker_payload) + b"\n")
+        marker_path.chmod(0o600)
+        marker_identity = client._marker_identity(marker_path)
+        marker_path.unlink()
+        remote = {
+            "schema": 1,
+            "stop_protocol": client.STOP_PROTOCOL,
+            "operation_id": operation_id if operation_id != "fixture-operation" else
+            "00000000-0000-4000-8000-000000000001",
+            "state": state,
+            "run_directory": str(run.resolve()),
+            "binding_sha256": __import__("hashlib").sha256(encoded).hexdigest(),
+            "lease_identity": {
+                "id": "lease-one", "generation": 1, "slot": "test",
+                "owner": "test-command", "capability": "clean",
+            },
+            "marker_identity": marker_identity,
+        }
+        client.write(run / client.REMOTE_STOP_RECORD, remote)
+        return remote
+
+    def test_confirmed_remote_operation_survives_heartbeat_and_finishes(self):
+        lease = client.prepare(self.prepare_args("remote-confirmed-heartbeat"))
+        run = lease.run
+        binding = client.read(run / "binding.json")
+        active_lease = {
+            "owner": "test-command", "capability": "clean", "id": "lease-one",
+            "generation": 1, "slot": "test", "state": "active",
+            "cleanup_pending": False, "quarantined": False,
+            "endpoint": {"adb_serial": "emulator-5574"},
+        }
+        client.write(run / "receipt.json", active_lease)
+        lease.record("active", lease=active_lease, parent_command_stop="confirmed")
+        remote = self._write_remote_stop(run, "pending")
+        client.write(run / client.UNCERTAINTY_MARKER, {
+            "schema": 2, "reason": "remote_stop_unconfirmed",
+            "operation_id": remote["operation_id"],
+        })
+        remote["marker_identity"] = client._marker_identity(run / client.UNCERTAINTY_MARKER)
+        client.write(run / client.REMOTE_STOP_RECORD, remote)
+        pending = lease.record("active")
+        self.assertEqual(pending["remote_command_stop"], "pending")
+        self.assertEqual(pending["command_stop"], "unconfirmed")
+        remote["state"] = "confirmed"
+        client.write(run / client.REMOTE_STOP_RECORD, remote)
+        (run / client.UNCERTAINTY_MARKER).unlink()
+        heartbeat = lease.record("active")
+        self.assertEqual(heartbeat["remote_command_stop"], "confirmed")
+        self.assertEqual(heartbeat["command_stop"], "confirmed")
+        with patch.object(lease, "cli", return_value={
+            "owner": "test-command", "capability": "clean", "id": "lease-one",
+            "generation": 1, "slot": "test", "state": "completed",
+            "cleanup_pending": False, "quarantined": False, "endpoint": None,
+        }):
+            final = lease.finish()
+        self.assertEqual(final["phase"], "finished")
+        self.assertEqual(final["remote_command_stop"], "confirmed")
+
+    def test_terminal_null_generation_finish_can_repeat(self):
+        lease = client.prepare(self.prepare_args("remote-repeat-terminal"))
+        active = {
+            "owner": "test-command", "capability": "clean", "id": "lease-one",
+            "generation": 1, "slot": "test", "state": "active",
+            "cleanup_pending": False, "quarantined": False,
+            "endpoint": {"adb_serial": "emulator-5574"},
+        }
+        client.write(lease.run / "receipt.json", active)
+        lease.record("active", lease=active, parent_command_stop="confirmed")
+        self._write_remote_stop(lease.run, "confirmed")
+        terminal = dict(active, state="completed", generation=None, endpoint=None)
+        with patch.object(lease, "cli", return_value=terminal):
+            self.assertEqual(lease.finish()["phase"], "finished")
+            self.assertEqual(lease.finish()["phase"], "finished")
+        self.assertIsNone(client.read(lease.run / "status.json")["lease"]["generation"])
+
+    def test_stop_proof_reader_rejects_tampered_symlink_and_writable_siblings(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "resource-lease-client"
+            sibling = root / "resource_lease_stop_proof.py"
+            sentinel = root / "executed"
+            script.write_text("#!/usr/bin/env python3\n")
+            sibling.write_text(f"from pathlib import Path\nPath({str(sentinel)!r}).touch()\n")
+            sibling.chmod(0o600)
+            pinned = hashlib.sha256(b"trusted-reader-source").hexdigest()
+            with patch.object(client, "__file__", str(script)), patch.object(
+                    client, "STOP_PROOF_SHA256", pinned):
+                with self.assertRaisesRegex(client.Error, "digest does not match"):
+                    client._load_stop_proof()
+            self.assertFalse(sentinel.exists(), "unverified code executed before digest check")
+            sibling.unlink()
+            sibling.symlink_to(PROOF_TEMPLATE)
+            with patch.object(client, "__file__", str(script)):
+                with self.assertRaisesRegex(client.Error, "trusted sibling"):
+                    client._load_stop_proof()
+            sibling.unlink()
+            sibling.write_bytes(PROOF_TEMPLATE.read_bytes())
+            sibling.chmod(0o622)
+            with patch.object(client, "__file__", str(script)):
+                with self.assertRaisesRegex(client.Error, "trusted sibling"):
+                    client._load_stop_proof()
+
+    def test_remote_confirmation_does_not_clear_parent_uncertainty(self):
+        run, _status, _stderr = self.stop_case("oserror")
+        binding = client.read(run / "binding.json")
+        lease = client.Lease(run, binding)
+        remote = self._write_remote_stop(run, "confirmed")
+        self.assertFalse((run / client.UNCERTAINTY_MARKER).exists())
+        status = lease.record("active")
+        self.assertEqual(status["parent_command_stop"], "unconfirmed")
+        self.assertEqual(status["remote_command_stop"], "confirmed")
+        self.assertEqual(status["command_stop"], "unconfirmed")
+        with patch.object(lease, "cli", return_value={
+            "owner": "test-command", "capability": "clean", "id": "lease-one",
+            "generation": 1, "slot": "test", "state": "completed",
+            "cleanup_pending": False, "quarantined": False, "endpoint": None,
+        }), self.assertRaises(client.CommandStopUncertain):
+            lease.finish()
+        self.assertEqual(client.read(run / "status.json")["command_stop"], "unconfirmed")
+
+    def test_missing_remote_marker_is_not_confirmation(self):
+        result = self.invoke(*self.run_args("pass"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = next(path for path in self.runs.iterdir() if path.is_dir())
+        binding = client.read(run / "binding.json")
+        lease = client.Lease(run, binding)
+        self._write_remote_stop(run, "pending")
+        status = lease.record("active", parent_command_stop="confirmed")
+        self.assertFalse((run / client.UNCERTAINTY_MARKER).exists())
+        self.assertEqual(status["remote_command_stop"], "pending")
+        self.assertEqual(status["command_stop"], "unconfirmed")
+        with patch.object(lease, "cli", return_value={
+            "owner": "test-command", "capability": "clean", "id": "lease-one",
+            "generation": 1, "slot": "test", "state": "completed",
+            "cleanup_pending": False, "quarantined": False, "endpoint": None,
+        }), self.assertRaises(client.CommandStopUncertain):
+            lease.finish()
+
+    def test_dangling_remote_record_symlink_is_not_treated_as_absent(self):
+        lease = client.prepare(self.prepare_args("dangling-remote-stop"))
+        record = lease.run / client.REMOTE_STOP_RECORD
+        record.symlink_to(lease.run / "missing-remote-stop-record")
+        with client.marker_lock(lease.run) as directory_fd:
+            with self.assertRaisesRegex(client.Error, "not an owner-private file"):
+                client._remote_stop_state(lease.run, None, directory_fd)
 
     def test_confirmed_command_stop_remains_finished(self):
         _run, status, stderr = self.stop_case("confirmed")
@@ -722,7 +890,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
         self.assertEqual(status["phase"], "finished")
         self.assertEqual(status["command_stop"], "not_started")
         self.assertEqual(status["lease"]["state"], "completed")
-        self.assertFalse((run / "command-stop-uncertain.json").exists())
+        self.assertFalse((run / client.PARENT_UNCERTAINTY_MARKER).exists())
         self.assertIn("diagnostic command not started", stderr)
         self.assertNotIn("command stop is uncertain", stderr)
 
@@ -733,6 +901,11 @@ class ResourceLeaseClientTests(unittest.TestCase):
             run.mkdir(mode=0o700)
             client.write(run / "status.json", {
                 "phase": "finished" if finished else "failed", "updated_at": index,
+                "stop_protocol": client.STOP_PROTOCOL,
+                "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+                "parent_command_stop": "not_started" if finished else "unconfirmed",
+                "remote_command_stop": "not_started",
+                "command_stop": "not_started" if finished else "unconfirmed",
                 "lease": {"state": "completed", "cleanup_pending": False, "quarantined": False}
                 if finished else None, "error": None if finished else "preserved unknown outcome",
             })
@@ -943,6 +1116,23 @@ class ResourceLeaseClientTests(unittest.TestCase):
         synchronizer["apply_synchronization"](plan)
         self.assertEqual(target.read_bytes(), SCRIPT.read_bytes())
         self.assertTrue(os.access(target, os.X_OK))
+        profile = SimpleNamespace(
+            schema_version=3, kit_managed_adapters=["resource_lease"],
+            kit_managed_commands=[], commands={},
+            adapters={"resource_lease": ".kent/adapters/mobile/resource-lease-client"},
+        )
+        plans, _ = synchronizer["plan_project_synchronization"](
+            profile, (self.root / "project").resolve(), update=False)
+        self.assertEqual({plan.target.name for plan in plans}, {
+            "resource-lease-client", "resource_lease_stop_proof.py",
+        })
+        for plan in plans:
+            synchronizer["apply_synchronization"](plan)
+            self.assertEqual(
+                plan.target.read_bytes(),
+                SCRIPT.read_bytes() if plan.target.name == "resource-lease-client"
+                else PROOF_TEMPLATE.read_bytes(),
+            )
 
 
 @unittest.skipUnless(os.environ.get("RESOURCE_LEASE_SOURCE"),

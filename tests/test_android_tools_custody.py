@@ -40,11 +40,12 @@ class CustodyTests(unittest.TestCase):
         self.binding = {
             "schema": 1, "config": self.config, "profile": "ui.clean",
             "owner": "owner", "capability": "clean",
-            "custody_marker_protocol": 1,
+            "custody_marker_protocol": 2, "stop_protocol": 2,
         }
         self.state = {"phase": "active", "updated_at": time.monotonic(),
                       "lease": self.current, "command_stop": "unconfirmed",
-                      "custody_marker_protocol": 1}
+                      "parent_command_stop": "pending", "stop_protocol": 2,
+                      "custody_marker_protocol": 2}
         for name, value in (("binding.json", self.binding), ("status.json", self.state),
                             ("receipt.json", {}), ("helper.lock", {})):
             self.write(name, value)
@@ -68,7 +69,7 @@ class CustodyTests(unittest.TestCase):
         return api.borrow_device(self.config, "emulator-5576")
 
     def test_public_typed_configuration_and_no_lease_ownership_calls(self):
-        self.assertEqual(api.CUSTODY_API_VERSION, 1)
+        self.assertEqual(api.CUSTODY_API_VERSION, 2)
         config = self.write("config.json", {"lease": self.config})
         typed = api.load_lease_config(config)
         self.assertIsInstance(typed, api.LeaseConfig)
@@ -166,16 +167,20 @@ class CustodyTests(unittest.TestCase):
                 self.assertGreaterEqual(fsync.call_count, 2)
             marker = self.run / api.MARKER
             payload = json.loads(marker.read_bytes())
-            self.assertEqual(payload["schema"], 1)
+            self.assertEqual(payload["schema"], 2)
             self.assertEqual(payload["reason"], "remote_stop_unconfirmed")
+            self.assertEqual(payload["operation_id"], json.loads(
+                (self.run / api.REMOTE_STOP_RECORD).read_bytes())["operation_id"])
+            self.assertEqual(json.loads((self.run / api.REMOTE_STOP_RECORD).read_bytes())["state"], "pending")
             self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
             self.assertEqual(custody.check(), self.current)
-            with self.assertRaisesRegex(api.Error, "lease_binding_invalid"):
+            with self.assertRaisesRegex(api.Error, "remote_execution_unconfirmed"):
                 self.borrow().check()
             with self.assertRaisesRegex(api.Error, "remote_execution_already_started"):
                 custody.begin_remote_execution()
             custody.confirm_remote_stopped()
             self.assertFalse(marker.exists())
+            self.assertEqual(json.loads((self.run / api.REMOTE_STOP_RECORD).read_bytes())["state"], "confirmed")
             self.assertEqual(self.borrow().check(), self.current)
             with self.assertRaisesRegex(api.Error, "remote_execution_not_started"):
                 custody.confirm_remote_stopped()
@@ -193,9 +198,10 @@ class CustodyTests(unittest.TestCase):
             self.assertTrue(marker.exists())
             with self.assertRaisesRegex(api.Error, "custody_closed"):
                 custody.confirm_remote_stopped()
-            with self.assertRaisesRegex(api.Error, "lease_binding_invalid"):
+            with self.assertRaisesRegex(api.Error, "remote_execution_unconfirmed"):
                 self.borrow().check()
             marker.unlink()  # Fixture reset, never production cleanup.
+            (self.run / api.REMOTE_STOP_RECORD).unlink()
 
     def test_host_process_exit_preserves_marker(self):
         code = (
@@ -211,6 +217,42 @@ class CustodyTests(unittest.TestCase):
         self.assertTrue((self.run / api.MARKER).exists())
         with self.assertRaises(api.Error):
             self.borrow().check()
+
+    def test_dangling_remote_record_symlink_is_not_treated_as_absent(self):
+        record = self.run / api.REMOTE_STOP_RECORD
+        record.symlink_to(self.run / "missing-remote-stop-record")
+        with self.assertRaisesRegex(api.Error, "private_binding_required"):
+            self.borrow().check()
+
+    def test_remote_pending_persistence_failure_prevents_marker_and_dispatch(self):
+        with self.borrow() as custody, patch.object(api, "_write_remote_record", side_effect=OSError("disk")):
+            with self.assertRaisesRegex(OSError, "disk"):
+                custody.begin_remote_execution()
+        self.assertFalse((self.run / api.MARKER).exists())
+        self.assertFalse((self.run / api.REMOTE_STOP_RECORD).exists())
+
+    def test_confirm_retry_completes_only_matching_marker_after_persisted_proof(self):
+        marker = self.run / api.MARKER
+        with self.borrow() as custody:
+            custody.begin_remote_execution()
+            operation_id = custody._operation_id
+            original_unlink = Path.unlink
+
+            def fail_marker_unlink(path, *args, **kwargs):
+                if path == marker:
+                    raise OSError("fixture_unlink")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", fail_marker_unlink):
+                with self.assertRaisesRegex(OSError, "fixture_unlink"):
+                    custody.confirm_remote_stopped()
+            remote = json.loads((self.run / api.REMOTE_STOP_RECORD).read_bytes())
+            self.assertEqual(remote["state"], "confirmed")
+            self.assertEqual(remote["operation_id"], operation_id)
+            self.assertTrue(marker.exists())
+            custody.confirm_remote_stopped()
+            self.assertFalse(marker.exists())
+            self.assertEqual(json.loads((self.run / api.REMOTE_STOP_RECORD).read_bytes())["state"], "confirmed")
 
     def test_changed_replaced_missing_and_symlink_markers_are_never_removed(self):
         marker = self.run / api.MARKER
@@ -239,6 +281,42 @@ class CustodyTests(unittest.TestCase):
                     self.assertEqual(marker.exists() or marker.is_symlink(), mutation != "missing")
                 if marker.exists() or marker.is_symlink():
                     marker.unlink()
+                (self.run / api.REMOTE_STOP_RECORD).unlink(missing_ok=True)
+
+    def test_confirmed_marker_replacement_after_crash_keeps_identical_bytes(self):
+        marker = self.run / api.MARKER
+        with self.borrow() as custody:
+            custody.begin_remote_execution()
+            original = marker.read_bytes()
+            original_unlink = Path.unlink
+
+            def fail_marker_unlink(path, *args, **kwargs):
+                if path == marker:
+                    raise OSError("fixture_unlink")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", fail_marker_unlink):
+                with self.assertRaisesRegex(OSError, "fixture_unlink"):
+                    custody.confirm_remote_stopped()
+        self.assertTrue(marker.exists())
+        # A restarted custodian has no in-memory inode snapshot; the durable fingerprint
+        # must still reject an ABA replacement with identical marker bytes.
+        marker.unlink()
+        marker.write_bytes(original)
+        marker.chmod(0o600)
+        with self.assertRaisesRegex(api.Error, "uncertainty_marker_changed"):
+            self.borrow().check()
+        self.assertEqual(marker.read_bytes(), original)
+
+    def test_stop_signal_arriving_during_pool_inspection_blocks_return(self):
+        def inspect(_):
+            self.write("finish.json", {"schema": 1})
+            return self.current
+
+        with patch.object(api, "inspect_lease", side_effect=inspect):
+            with self.assertRaisesRegex(api.Error, "parent_command_stop_unconfirmed"):
+                self.borrow().check()
+        self.assertTrue((self.run / "finish.json").exists())
 
     def test_two_consumers_race_exclusively_and_loser_cannot_clean_winner(self):
         ready = threading.Barrier(2)
@@ -277,7 +355,7 @@ class CustodyTests(unittest.TestCase):
                 with self.assertRaisesRegex(api.Error, "lease_binding_invalid"):
                     custody.begin_remote_execution()
             self.assertEqual(json.loads(marker.read_bytes())["reason"], "foreign_fixture")
-            with self.assertRaisesRegex(api.Error, "remote_execution_not_started"):
+            with self.assertRaisesRegex(api.Error, "uncertainty_marker_changed"):
                 custody.confirm_remote_stopped()
             self.assertTrue(marker.exists())
 
@@ -315,7 +393,8 @@ class CustodyTests(unittest.TestCase):
         def owner_publish():
             try:
                 client.write(self.run / api.MARKER, {
-                    "schema": 1, "reason": "native_owner_stop_uncertain",
+                    "schema": 2, "reason": "native_runner_drain_unconfirmed",
+                    "operation_id": "00000000-0000-4000-8000-000000000002",
                 })
                 published.set()
             except BaseException as error:
@@ -346,22 +425,25 @@ class CustodyTests(unittest.TestCase):
                     thread.join(timeout=10)
                     self.assertFalse(thread.is_alive())
             self.assertEqual(failures, [])
-            self.assertEqual(samples, 3)
+            self.assertEqual(samples, 4)
             marker = self.run / api.MARKER
             self.assertTrue(marker.is_file(), "cleanup deleted the native owner's replacement")
-            self.assertEqual(json.loads(marker.read_bytes())["reason"], "native_owner_stop_uncertain")
+            self.assertEqual(json.loads(marker.read_bytes())["reason"],
+                             "native_runner_drain_unconfirmed")
 
     def test_native_owner_publication_before_confirmation_is_retained(self):
         from test_resource_lease_client import client
         with self.borrow() as custody:
             custody.begin_remote_execution()
-            client.write(self.run / api.MARKER, {"schema": 1, "reason": "signal_error"})
+            client.write(self.run / api.MARKER, {
+                "schema": 2, "reason": "signal_error", "operation_id": "foreign-operation",
+            })
             with self.assertRaisesRegex(api.Error, "uncertainty_marker_changed"):
                 custody.confirm_remote_stopped()
             self.assertEqual(json.loads((self.run / api.MARKER).read_bytes())["reason"],
                              "signal_error")
 
-    def test_legacy_checks_remain_valid_but_remote_begin_requires_protocol_pair(self):
+    def test_legacy_records_are_not_upgraded_or_used_by_new_custody(self):
         for binding_version, status_version in (
                 (None, None), (None, 1), (1, None), (0, 1), (1, 2), (True, 1), (1, True)):
             binding = dict(self.binding)
@@ -376,10 +458,9 @@ class CustodyTests(unittest.TestCase):
                 state["custody_marker_protocol"] = status_version
             self.write("binding.json", binding)
             self.write("status.json", state)
-            with self.subTest(binding=binding_version, status=status_version), self.borrow() as custody:
-                self.assertEqual(custody.check(), self.current)
-                with self.assertRaisesRegex(api.Error, "owner_marker_protocol_required"):
-                    custody.begin_remote_execution()
+            with self.subTest(binding=binding_version, status=status_version):
+                with self.assertRaisesRegex(api.Error, "owner_stop_protocol_required"):
+                    self.borrow().check()
                 self.assertFalse((self.run / api.MARKER).exists())
 
     def test_active_marker_refuses_lost_runtime_protocol_without_cleanup(self):
@@ -388,7 +469,7 @@ class CustodyTests(unittest.TestCase):
             state = dict(self.state)
             state.pop("custody_marker_protocol")
             self.write("status.json", state)
-            with self.assertRaisesRegex(api.Error, "owner_marker_protocol_required"):
+            with self.assertRaisesRegex(api.Error, "owner_stop_protocol_required"):
                 custody.confirm_remote_stopped()
             self.assertTrue((self.run / api.MARKER).exists())
 
@@ -423,12 +504,24 @@ class CustodyTests(unittest.TestCase):
 
     def test_marker_creation_fsync_failure_retains_uncertainty(self):
         with self.borrow() as custody:
-            with patch.object(api.os, "fsync", side_effect=OSError("fixture_fsync")):
+            real_fsync = os.fsync
+            calls = 0
+
+            def fail_marker_sync(fd):
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    raise OSError("fixture_fsync")
+                return real_fsync(fd)
+
+            with patch.object(api.os, "fsync", side_effect=fail_marker_sync):
                 with self.assertRaisesRegex(OSError, "fixture_fsync"):
                     custody.begin_remote_execution()
             self.assertTrue((self.run / api.MARKER).exists())
+            remote = json.loads((self.run / api.REMOTE_STOP_RECORD).read_bytes())
+            self.assertEqual(remote["state"], "pending")
             with self.assertRaises(api.Error):
-                custody.check()
+                self.borrow().check()
 
     def test_categorical_handoff_preserves_existing_marker_and_rejects_secret_reason(self):
         with self.assertRaisesRegex(api.Error, "invalid_uncertainty_reason"):
