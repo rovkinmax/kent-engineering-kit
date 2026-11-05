@@ -22,7 +22,6 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "templates/project/resource-lease-client"
-PROOF_TEMPLATE = ROOT / "templates/project/resource_lease_stop_proof.py"
 loader = importlib.machinery.SourceFileLoader("resource_client_tested", str(SCRIPT))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 client = importlib.util.module_from_spec(spec)
@@ -796,34 +795,6 @@ class ResourceLeaseClientTests(unittest.TestCase):
             self.assertEqual(lease.finish()["phase"], "finished")
         self.assertIsNone(client.read(lease.run / "status.json")["lease"]["generation"])
 
-    def test_stop_proof_reader_rejects_tampered_symlink_and_writable_siblings(self):
-        import hashlib
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            script = root / "resource-lease-client"
-            sibling = root / "resource_lease_stop_proof.py"
-            sentinel = root / "executed"
-            script.write_text("#!/usr/bin/env python3\n")
-            sibling.write_text(f"from pathlib import Path\nPath({str(sentinel)!r}).touch()\n")
-            sibling.chmod(0o600)
-            pinned = hashlib.sha256(b"trusted-reader-source").hexdigest()
-            with patch.object(client, "__file__", str(script)), patch.object(
-                    client, "STOP_PROOF_SHA256", pinned):
-                with self.assertRaisesRegex(client.Error, "digest does not match"):
-                    client._load_stop_proof()
-            self.assertFalse(sentinel.exists(), "unverified code executed before digest check")
-            sibling.unlink()
-            sibling.symlink_to(PROOF_TEMPLATE)
-            with patch.object(client, "__file__", str(script)):
-                with self.assertRaisesRegex(client.Error, "trusted sibling"):
-                    client._load_stop_proof()
-            sibling.unlink()
-            sibling.write_bytes(PROOF_TEMPLATE.read_bytes())
-            sibling.chmod(0o622)
-            with patch.object(client, "__file__", str(script)):
-                with self.assertRaisesRegex(client.Error, "trusted sibling"):
-                    client._load_stop_proof()
-
     def test_remote_confirmation_does_not_clear_parent_uncertainty(self):
         run, _status, _stderr = self.stop_case("oserror")
         binding = client.read(run / "binding.json")
@@ -1106,7 +1077,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
         # The descendant survived wrapper death until its own bounded exit.
         self.assertNotIn("release", self.calls())
 
-    def test_scoped_adapter_synchronization_preserves_runtime_loader(self):
+    def test_scoped_adapter_sync_omits_retired_reconciliation_reader(self):
         synchronizer = runpy.run_path(str(ROOT / "scripts/sync-project-adapters"))
         self.assertEqual(synchronizer["ADAPTER_TEMPLATES"]["resource_lease"], SCRIPT)
         self.assertIn("kit_runtime_loader", synchronizer["COMMAND_TEMPLATES"])
@@ -1123,16 +1094,26 @@ class ResourceLeaseClientTests(unittest.TestCase):
         )
         plans, _ = synchronizer["plan_project_synchronization"](
             profile, (self.root / "project").resolve(), update=False)
-        self.assertEqual({plan.target.name for plan in plans}, {
-            "resource-lease-client", "resource_lease_stop_proof.py",
-        })
+        self.assertEqual({plan.target.name for plan in plans}, {"resource-lease-client"})
         for plan in plans:
             synchronizer["apply_synchronization"](plan)
-            self.assertEqual(
-                plan.target.read_bytes(),
-                SCRIPT.read_bytes() if plan.target.name == "resource-lease-client"
-                else PROOF_TEMPLATE.read_bytes(),
-            )
+            self.assertEqual(plan.target.read_bytes(), SCRIPT.read_bytes())
+
+    def test_legacy_reconciliation_command_is_not_published(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--help"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("reconcile", result.stdout)
+
+    def test_recovery_reader_is_not_documented_as_a_kit_interface(self):
+        contract = (ROOT / "contracts/resource-lease-integration.md").read_text()
+        self.assertNotIn("resource-lease-client reconcile", contract)
+        self.assertNotIn("resource_lease_stop_proof.py", contract)
+        self.assertIn("## Configuration and interface", contract)
+        self.assertIn("## Stop provenance protocol 2", contract)
+        self.assertIn("## Native owner observation", contract)
 
 
 @unittest.skipUnless(os.environ.get("RESOURCE_LEASE_SOURCE"),

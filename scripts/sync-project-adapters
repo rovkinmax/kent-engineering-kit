@@ -340,8 +340,6 @@ def plan_project_synchronization(
                     "android_tools_native.py", "android_tools_evidence.py",
                     "android_tools_custody.py",
                 )
-            elif key == "resource_lease":
-                siblings = ("resource_lease_stop_proof.py",)
             for sibling in siblings:
                 sibling_target = project_target(
                     project_root, str(Path(configured_path).parent / sibling)
