@@ -523,3 +523,57 @@ source-only receipt never authorizes R2 storage. Source success does not install
 new readers, refresh retained frames, change global aliases or prove a consumer
 cohort compatible. Publication/adoption and forward-qualified rollback are
 separate decisions; restarting Kent is not a substitute for compatibility.
+
+## Install the ready Engineering Lite v1
+
+The ready package is `templates/workflows/engineering-lite-v1.spec.json`, not
+the compatibility profile generator's Lite. Its eleven fixed nodes use existing
+Agent roles, independent immutable R2 plan review, one implementation/fix writer,
+verification, independent candidate review, PR/CI/explicit human merge and fully
+Agent-owned Cleanup. There is no Script acceptance, ledger, checkpoint or Janitor.
+
+The project supplies the four Lite context/procedure/contract files named by
+the bootstrap prompt plus its existing profile and AGENTS rules. Plan ingress
+qualifies actual ordinary R2 via the installed adapter; independent native
+Plan Review is the acceptance owner, not storage `accept-plan`.
+
+Run from the primary project checkout using published Kit source:
+
+```sh
+/path/to/kit/scripts/install workflow preview --project /primary/project --template engineering-lite-v1
+/path/to/kit/scripts/install workflow apply --plan /outside/reviewed-plan.json --confirm EXACT_FILE_SHA256
+```
+
+Preview writes canonical JSON only to stdout. It binds full graph rows and IDs,
+package/installer/docs/tests, project instructions, native project/workspaces,
+Workflow inventories, Kent binary and the actual local installer import
+closure, including package initialization and existing graph/Kent/native
+identity helpers. It positively qualifies canonical Git primary checkout and
+native default workspace/project using existing source-only identity helpers;
+Git failure is fatal, never a fallback to the input path.
+Review its exact bytes, two independent
+PASS results and human effect approval before apply. Apply checks source/native
+drift and creates only one new non-default project-specific Workflow. Native
+Workflow UUID/version come from actual creation; planned graph row IDs remain
+exact. It never reconciles an existing Workflow by matching its name.
+
+An apply failure after creation may leave a partial Workflow; preserve its real
+ID, inspect effects and obtain separately authorized settlement. No automatic
+retry/rollback/delete, default change, Task creation or foreign graph update.
+
+Fresh R2 projects then use the existing zero-Task project installer and qualify
+actual runtime before promotion. Already-registered projects preserve binding,
+receipt and Tasks: never rerun fresh installation. Qualification must prove
+actual immutable publication/review, implementation/verification, checked PR
+and authorized merge, supported Agent leave/delete and interruption settlement.
+Offline tests do not establish lifecycle readiness or production cleanup safety.
+
+Rollout is source approval/implementation/CI/publication, project instruction
+approval/publication, read-only native preview, separately approved non-default
+installation, qualification, then separately approved default/promotion.
+Rollback before starts retains the unselected graph; after starts, stop new
+starts and settle existing owners normally. Never migrate active Tasks or
+delete external R2 data/retained evidence as rollback. No Kent config, role,
+global alias or restart change is required. Retained Sessions keep locked
+instructions; new dispatch/reset/compaction may load new instructions and must
+remain compatible with carried values. Existing compatibility graphs are intact.

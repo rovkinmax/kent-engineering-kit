@@ -2,10 +2,16 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: install | install project {preview,apply} [options]"
+  echo "Usage: install | install {project,workflow} {preview,apply} [options]"
 }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "workflow" ]]; then
+  shift
+  exec python3 -I -B -c \
+    'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module("workflowkit.lite_install", run_name="__main__")' \
+    "$repo_root" "$@"
+fi
 if [[ "${1:-}" == "project" ]]; then
   shift
   exec python3 -I -B -c \
