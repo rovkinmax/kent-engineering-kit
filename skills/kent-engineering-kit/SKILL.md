@@ -44,6 +44,14 @@ Use supported Kent interfaces and project procedures for Task/Session
 operations. Requeueing is not startup, a pending Question is not completion,
 and unknown effects require settlement before retry.
 
+For new or changed Workflows, graphs, prompts, parameters, context modes,
+role responsibilities or related adapter contracts, proactively apply the
+mandatory whole-workflow contract audit in the compatibility policy below.
+One of the existing two independent read-only reviewers owns the full
+end-to-end matrix for the exact preview/candidate hash; no extra standing
+review or user reminder is required. Separate static evidence from actual
+runtime qualification and refresh the affected audit after material changes.
+
 Workflow updates follow
 [compatibility policy](../../contracts/workflow-update-compatibility.md).
 Source changes do not update installed/live state or locked Sessions. Installation,

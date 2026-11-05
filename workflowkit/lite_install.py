@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import sys
 
 from .graph import graph_matches_spec, native_graph_postimage, plan_workflow_graph
-from .kent import KentClient, KentCommandError
+from .kent import KentClient, KentCommandError, canonical_workflow_selector
 from .model import EdgeSpec, NodeSpec, ParameterSpec, SpecError, WorkflowSpec
 from . import operations as op
 
@@ -33,6 +35,10 @@ PROJECT_FILES = (
     ".kent/context/engineering-lite.md", ".kent/commands/delivery-lite.md",
     ".kent/commands/cleanup-lite.md",
 )
+BUILTIN_FIELDS = {
+    "TaskId", "TaskShortId", "TaskTitle", "TaskBody",
+    "NodeId", "NodeKey", "NodeDisplayName", "SessionId",
+}
 
 
 def encode(value):
@@ -70,9 +76,62 @@ def load_spec():
         execution_target=value["execution_target"], nodes=nodes, edges=tuple(edges),
     )
     spec.validate()
+    validate_native_inputs(spec)
     require(len(nodes) == 11 and all(n.kind in {"start", "agent", "terminal"} for n in nodes),
             "ready Lite must retain its fixed eleven-node Agent topology")
     return spec
+
+
+def validate_native_inputs(spec):
+    """Closed ready-package subset of native start/placeholder rules, not a graph framework."""
+    starts = {node.key for node in spec.nodes if node.kind == "start"}
+    for edge in spec.edges:
+        require(edge.source not in starts or not edge.parameters,
+                "start transitions cannot declare parameters")
+        declared = {parameter.key for parameter in edge.parameters}
+        for expression in re.findall(r"{{\s*(.*?)\s*}}", edge.prompt or ""):
+            fields = expression.strip().removeprefix(".").split(".")
+            if len(fields) == 1:
+                require(fields[0] in BUILTIN_FIELDS, "unsupported native prompt field")
+                require(fields[0] != "SessionId" or edge.source not in starts,
+                        "start has no producer Session")
+            else:
+                require(len(fields) == 2 and fields[0] == "Params"
+                        and fields[1] in declared,
+                        "prompt must use a declared native .Params field")
+
+
+def bind_fresh_seed(graph, inspected, created):
+    """Preserve only the exact two endpoints returned by native fresh creation."""
+    require(created.get("version") == 1
+            and inspected.get("expected_version") == 1
+            and inspected.get("workflow_id") == created["id"],
+            "fresh Workflow identity/version differs")
+    seed = inspected["graph"]
+    require(not seed["edges"] and not seed["transition_groups"]
+            and not seed["node_groups"] and len(seed["nodes"]) == 2,
+            "unexpected fresh Workflow seed; preserve and inspect")
+    by_key = {node.get("key"): node for node in seed["nodes"]}
+    require(set(by_key) == {"backlog", "done"}, "unexpected fresh Workflow seed endpoints")
+    ids = {}
+    for key, kind, label in (("backlog", "start", "Backlog"), ("done", "terminal", "Done")):
+        node = by_key[key]
+        node_id = node.get("id")
+        require(isinstance(node_id, str) and canonical_workflow_selector(node_id) == node_id
+                and node == {"id": node_id, "key": key, "kind": kind,
+                             "display_name": label, "group_id": None},
+                "unexpected fresh Workflow seed node")
+        reviewed = next(row for row in graph["nodes"] if row["key"] == key)
+        ids[reviewed["id"]] = node_id
+    require(len(set(ids.values())) == 2, "fresh Workflow seed identities overlap")
+    bound = deepcopy(graph)
+    for node in bound["nodes"]:
+        node["id"] = ids.get(node["id"], node["id"])
+    for group in bound["transition_groups"]:
+        group["source_node_id"] = ids.get(group["source_node_id"], group["source_node_id"])
+    for edge in bound["edges"]:
+        edge["target_node_id"] = ids.get(edge["target_node_id"], edge["target_node_id"])
+    return bound
 
 
 def qualified_identity(root, client):
@@ -142,6 +201,7 @@ def preview(root, client):
         "execution_target": spec.execution_target, "state": state,
         "graph": native_graph_postimage(graph, workflow_id=empty["workflow_id"]),
         "effects": ["create one Workflow", "apply exact complete graph",
+                    "preserve freshly created Backlog/Done IDs by their reviewed keys",
                     "set new Workflow execution target", "validate", "link non-default"],
     }
 
@@ -163,23 +223,29 @@ def apply(plan, raw, confirmation, client):
     require(not any(row.get("name") == spec.name for row in plan["state"]["workflow_inventory"]),
             "refusing existing Workflow")
     # This is deliberately create-only. Never call KentClient.apply's name reconciliation.
-    client.run_json(["workflow", "create", "--description", spec.description, "--json", spec.name])
+    created = client.run_json(["workflow", "create", "--description", spec.description, "--json", spec.name])
+    require(isinstance(created.get("id"), str)
+            and canonical_workflow_selector(created["id"]) == created["id"]
+            and created.get("name") == spec.name and created.get("version") == 1,
+            "unexpected creation response; preserve effects and inspect")
     # Native names are not ownership. Identify our sole new row before touching a graph.
     before = {row["id"] for row in plan["state"]["workflow_inventory"]}
     added = [row for row in client.workflow_records() if row["id"] not in before]
-    require(len(added) == 1 and added[0].get("name") == spec.name,
+    require(len(added) == 1 and added[0].get("name") == spec.name
+            and added[0].get("id") == created["id"],
             "creation inventory is ambiguous; preserve effects and inspect, never reconcile by name")
     workflow_id = added[0]["id"]
     try:
         definition = client.require_inspect(workflow_id)
+        require(not client.workflow_has_tasks(definition) and not client.workflow_is_linked(definition),
+                "new Workflow acquired Tasks/links; preserve and inspect")
         inspected = client.inspect_graph(workflow_id)
-        require(all(not inspected["graph"][key] for key in (
-            "nodes", "edges", "node_groups", "transition_groups")), "new Workflow is not empty")
-        document = dict(inspected, graph=plan["graph"])
+        bound = bind_fresh_seed(plan["graph"], inspected, created)
+        document = dict(inspected, graph=bound)
         client.apply_graph_document(document, confirm_destructive=False)
         client.ensure_workflow_metadata(workflow_id, spec, definition)
         after = client.inspect_graph(workflow_id)
-        require(after["graph"] == native_graph_postimage(plan["graph"], workflow_id=workflow_id),
+        require(after["graph"] == native_graph_postimage(bound, workflow_id=workflow_id),
                 "exact graph readback differs")
         client.assert_exact_graph_document(spec, after)
         client.validate(workflow_id)

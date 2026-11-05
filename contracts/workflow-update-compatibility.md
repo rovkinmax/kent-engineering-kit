@@ -1,5 +1,40 @@
 # Execution-history and compatibility policy
 
+## Mandatory whole-workflow contract audit
+
+For every new or changed Workflow, graph, prompt, parameter, context mode,
+role responsibility or related adapter contract, one of the already-required
+two independent read-only reviewers must audit the complete affected Workflow
+end to end before source/live effect approval. Run this audit without waiting
+for an explicit user request. It is part of the existing two-review gate, not
+a third standing review, a new role or an automatic graph-building framework.
+
+Bind the audit to the exact complete source/graph preview or candidate hash.
+Read the actual effective roles and primary native/API contracts, not just
+generator models or test mocks. Cover every node/edge, prompt and carrier in
+one compact producer -> parameter/value -> consumer matrix, including initial
+ingress, repeated cycles, backedges, cancellation and terminal paths.
+
+Check deterministically: reachability/terminal paths, parameter-free start
+restrictions, canonical native placeholders and rendered values, declared
+required string carriers and matching descriptions, context-source dominance
+and retained-session compatibility, graph projection/readback, fresh-create
+seed shape/ownership, and focused negative tests for invalid native inputs.
+Check semantically: genuine producer identity, plan/candidate freshness,
+actual role permissions, read-only review limits, replan/reverification,
+no-diff and non-delivery, publication/merge/deletion authority, unknown effects,
+interruption recovery, pre-delete evidence and actual cleanup completion.
+
+Report the exact identity, full compact matrix, findings, limits and each
+deferred obligation with its owner and due milestone. Static/model/template
+checks do not qualify real native/provider/R2/resource operations; actual
+runtime qualification remains a separately authorized required milestone.
+Missing proof blocks only its dependent effect and must never be relabeled
+PASS. After a material change, refresh the affected end-to-end audit and both
+applicable preview reviews; do not inherit stale PASS from another hash.
+This audit grants no installation, migration, approval-answer, publication,
+restart or other effect authority.
+
 ## Ordinary storage is not source admission
 
 Native nodes and edges select the execution route; profile presence does not.

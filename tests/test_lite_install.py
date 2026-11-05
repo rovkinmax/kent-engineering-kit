@@ -1,5 +1,6 @@
 """Offline contracts for the fixed ready package and create-only install boundary."""
 from copy import deepcopy
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ from unittest.mock import patch
 
 from workflowkit import lite_install as lite
 from workflowkit.graph import graph_matches_spec
-from workflowkit.model import SpecError
+from workflowkit.model import ParameterSpec, SpecError
 from workflowkit.kent import KentCommandError
 
 
@@ -21,7 +22,12 @@ class Client:
         self.workspace = self.project_workspace = root
         self.binary = "/fixture/kent"
         self.writes = []
-        self.graph = {"nodes": [], "edges": [], "node_groups": [], "transition_groups": []}
+        self.graph = {"nodes": [
+            {"id": "22222222-2222-4222-8222-222222222222", "key": "backlog", "kind": "start",
+             "display_name": "Backlog", "group_id": None},
+            {"id": "33333333-3333-4333-8333-333333333333", "key": "done", "kind": "terminal",
+             "display_name": "Done", "group_id": None},
+        ], "edges": [], "node_groups": [], "transition_groups": []}
         self.links = []
         self.name = ""
         self.workflow_id = "11111111-1111-4111-8111-111111111111"
@@ -40,7 +46,7 @@ class Client:
             raise AssertionError(args)
         self.writes.append(("create", args))
         self.name = args[-1]
-        return {}
+        return {"id": self.workflow_id, "name": self.name, "version": 1}
 
     def require_inspect(self, selector):
         return {"workflow": {"id": self.workflow_id, "name": self.name}}
@@ -74,6 +80,12 @@ class Client:
         if project_id is None and self.name:
             return ({"id": self.workflow_id, "name": self.name},)
         return tuple(self.links)
+
+    def workflow_has_tasks(self, definition):
+        return False
+
+    def workflow_is_linked(self, definition):
+        return False
 
 
 class LiteTests(unittest.TestCase):
@@ -121,10 +133,23 @@ class LiteTests(unittest.TestCase):
 
     def test_create_exact_graph_nondefault_only(self):
         plan = self.plan()
+        created = {"id": self.client.workflow_id, "name": plan["name"], "version": 1}
+        expected = lite.bind_fresh_seed(plan["graph"], self.client.inspect_graph(created["id"]), created)
         self.apply(plan)
         operations = [name for name, _ in self.client.writes]
         self.assertEqual(["create", "graph", "metadata", "validate", "link", "validate"], operations)
-        self.assertEqual(plan["graph"], self.client.graph)
+        self.assertEqual(expected, self.client.graph)
+        endpoints = {node["key"]: node["id"] for node in self.client.graph["nodes"]
+                     if node["key"] in {"backlog", "done"}}
+        self.assertEqual({"backlog": "22222222-2222-4222-8222-222222222222",
+                          "done": "33333333-3333-4333-8333-333333333333"}, endpoints)
+        original = {row["key"]: row["id"] for row in plan["graph"]["nodes"]}
+        for node in self.client.graph["nodes"]:
+            if node["key"] not in endpoints:
+                self.assertEqual(original[node["key"]], node["id"])
+        for collection in ("edges", "transition_groups"):
+            self.assertEqual([row["id"] for row in plan["graph"][collection]],
+                             [row["id"] for row in self.client.graph[collection]])
 
     def test_wrong_digest_rejected(self):
         plan = self.plan()
@@ -177,13 +202,19 @@ class LiteTests(unittest.TestCase):
     def test_inputs_declared_and_identity_carried_on_every_edge(self):
         for edge in lite.load_spec().edges:
             parameters = {p.key for p in edge.parameters}
+            if edge.source == "backlog":
+                self.assertEqual(set(), parameters)
+                self.assertNotIn("Incoming values:", edge.prompt)
+                self.assertNotIn("{{.Params.", edge.prompt)
+                self.assertIn("{{.TaskBody}}", edge.prompt)
+                continue
             self.assertTrue({"plan_ref", "decision_refs", "plan_review_result",
                              "candidate_ref", "verification_result",
                              "candidate_review_result", "delivery_ref",
                              "disposition", "cleanup_result", "feedback"} <= parameters)
             if edge.prompt:
                 for key in parameters:
-                    self.assertIn("{{." + key + "}}", edge.prompt)
+                    self.assertIn("{{.Params." + key + "}}", edge.prompt)
 
     def test_failure_and_review_backedges(self):
         edges = {e.transition: e.target for e in lite.load_spec().edges}
@@ -400,6 +431,92 @@ class LiteTests(unittest.TestCase):
                 with self.assertRaisesRegex(lite.op.PlanValidationError, "default workspace root differs"):
                     lite.apply(plan, raw, lite.digest(raw), client)
             self.assertEqual([], client.writes)
+
+    def test_start_parameter_rejected_before_native_create(self):
+        spec = lite.load_spec()
+        start = next(edge for edge in spec.edges if edge.source == "backlog")
+        invalid = replace(spec, edges=tuple(
+            replace(edge, parameters=(ParameterSpec("plan_ref", "Unavailable at start."),))
+            if edge == start else edge for edge in spec.edges))
+        with self.assertRaisesRegex(SpecError, "start transitions cannot declare parameters"):
+            lite.validate_native_inputs(invalid)
+        self.assertEqual([], self.client.writes)
+
+    def test_root_parameter_aliases_and_absent_carriers_are_rejected(self):
+        spec = lite.load_spec()
+        edge = next(edge for edge in spec.edges if edge.source == "plan")
+        for expression in ("{{.plan_ref}}", "{{.Params.missing}}", "{{.Inputs.plan_ref}}",
+                           "{{.Params.prior.plan_ref}}"):
+            with self.subTest(expression=expression):
+                invalid = replace(spec, edges=tuple(
+                    replace(item, prompt=item.prompt + "\n" + expression) if item == edge else item
+                    for item in spec.edges))
+                with self.assertRaises(SpecError):
+                    lite.validate_native_inputs(invalid)
+        self.assertEqual([], self.client.writes)
+
+    def test_start_cannot_reference_missing_incoming_value_or_source_session(self):
+        spec = lite.load_spec()
+        start = next(edge for edge in spec.edges if edge.source == "backlog")
+        for expression in ("{{.Params.plan_ref}}", "{{.SessionId}}"):
+            with self.subTest(expression=expression):
+                invalid = replace(spec, edges=tuple(
+                    replace(edge, prompt=edge.prompt + "\n" + expression) if edge == start else edge
+                    for edge in spec.edges))
+                with self.assertRaises(SpecError):
+                    lite.validate_native_inputs(invalid)
+
+    def test_load_spec_rejects_baseline_native_invariants_before_preview(self):
+        value = json.loads((lite.KIT / lite.PACKAGE).read_bytes())
+        start = next(edge for edge in value["edges"] if edge["source"] == "backlog")
+        start["parameters"] = [{"key": "unavailable", "description": "No Agent producer."}]
+        with patch.object(Path, "read_bytes", return_value=lite.encode(value)):
+            with self.assertRaisesRegex(SpecError, "start transitions cannot declare parameters"):
+                lite.preview(self.root, self.client)
+        self.assertEqual([], self.client.writes)
+
+    def test_empty_or_foreign_seed_rows_are_never_replaced(self):
+        plan = self.plan()
+        for mutation in ("empty", "extra_node", "edge", "node_group", "group", "unknown_field"):
+            with self.subTest(mutation=mutation):
+                client = Client(self.root)
+                if mutation == "empty":
+                    client.graph["nodes"] = []
+                elif mutation == "extra_node":
+                    client.graph["nodes"].append({
+                        "id": "44444444-4444-4444-8444-444444444444", "key": "foreign", "kind": "agent"})
+                elif mutation == "unknown_field":
+                    client.graph["nodes"][0]["foreign"] = True
+                else:
+                    collection = {"edge": "edges", "node_group": "node_groups",
+                                  "group": "transition_groups"}[mutation]
+                    client.graph[collection].append({"id": "foreign"})
+                raw = lite.encode(plan)
+                with patch.object(Path, "resolve", return_value=self.root):
+                    with self.assertRaisesRegex(KentCommandError, "seed"):
+                        lite.apply(plan, raw, lite.digest(raw), client)
+                self.assertEqual(["create"], [name for name, _ in client.writes])
+
+    def test_new_seed_with_tasks_or_links_is_not_mutated(self):
+        plan = self.plan()
+        for method in ("workflow_has_tasks", "workflow_is_linked"):
+            with self.subTest(method=method):
+                client = Client(self.root)
+                setattr(client, method, lambda definition: True)
+                raw = lite.encode(plan)
+                with patch.object(Path, "resolve", return_value=self.root):
+                    with self.assertRaisesRegex(KentCommandError, "Tasks/links"):
+                        lite.apply(plan, raw, lite.digest(raw), client)
+                self.assertEqual(["create"], [name for name, _ in client.writes])
+
+    def test_changed_seed_version_or_identity_is_blocked(self):
+        plan = self.plan()
+        created = {"id": self.client.workflow_id, "version": 1}
+        for changes in ({"expected_version": 2}, {"workflow_id": "foreign"}):
+            with self.subTest(changes=changes):
+                inspected = dict(self.client.inspect_graph(created["id"]), **changes)
+                with self.assertRaisesRegex(SpecError, "identity/version"):
+                    lite.bind_fresh_seed(plan["graph"], inspected, created)
 
 
 if __name__ == "__main__":
