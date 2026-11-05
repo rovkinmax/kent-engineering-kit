@@ -554,8 +554,11 @@ Git failure is fatal, never a fallback to the input path.
 Review its exact bytes, two independent
 PASS results and human effect approval before apply. Apply checks source/native
 drift and creates only one new non-default project-specific Workflow. Native
-Workflow UUID/version come from actual creation; planned graph row IDs remain
-exact. It never reconciles an existing Workflow by matching its name.
+Workflow UUID/version and its initial Backlog/Done seed IDs come from actual
+creation. The installer requires exactly that owned version-1 seed, no links
+or Tasks, and preserves its two endpoint IDs by reviewed key. Other reviewed
+graph row IDs remain exact; all references to those endpoints are remapped
+and full native postimage is checked. Unknown/empty/changed seed is blocked. It never reconciles an existing Workflow by matching its name.
 
 An apply failure after creation may leave a partial Workflow; preserve its real
 ID, inspect effects and obtain separately authorized settlement. No automatic
