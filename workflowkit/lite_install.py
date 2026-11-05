@@ -86,6 +86,8 @@ def validate_native_inputs(spec):
     """Closed ready-package subset of native start/placeholder rules, not a graph framework."""
     starts = {node.key for node in spec.nodes if node.kind == "start"}
     for edge in spec.edges:
+        require(edge.context_source != "node:" + edge.target,
+                "selected context source cannot be the edge target node")
         require(edge.source not in starts or not edge.parameters,
                 "start transitions cannot declare parameters")
         declared = {parameter.key for parameter in edge.parameters}
