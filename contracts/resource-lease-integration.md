@@ -56,37 +56,36 @@ resource-lease-client finish --run-dir RUN
 missing endpoint keys. A project wrapper supplies platform-specific mappings
 and commands; the adapter itself has no Android or Gradle knowledge.
 
-## Stop provenance protocol 2
+## Stop provenance
 
-New bindings and status records use `stop_protocol: 2` and
-`custody_marker_protocol: 2`. Status keeps the public aggregate
-`command_stop`, derived from two independent causes:
+Bindings retain `custody_marker_protocol: 1`. Every new status contains the
+required `parent_command_stop` enum (`not_started`, `pending`, `confirmed`,
+`unconfirmed`) and `external_stop_unconfirmed` boolean. The public
+`command_stop` aggregate is derived from those fields and the existing
+`command-stop-uncertain.json` marker; it is never used as intrinsic provenance.
+The external negative is sticky, and heartbeats preserve it. A parent command
+may be `pending` while active child operations use their owned custody marker.
+The marker keeps its baseline schema-1 reason/operation format and exclusive,
+fsynced create-before-dispatch lifecycle; only its live context may confirm and
+remove the exact observed marker. A confirmation cannot clear a global or
+foreign negative.
 
-- `parent_command_stop` records the lease client's local child lifecycle.
-- `remote_command_stop` records the remote operation lifecycle.
+Global uncertainty handoff updates the existing private status without requiring
+a live lease or helper. It preserves lease observations and heartbeat time.
+Existing runs with absent or malformed required provenance, or unknown marker
+formats, are rejected without migration. No remote journal or additional run
+state files are used.
 
-A remote operation is represented by one `remote-stop.json` record with
-`schema: 1`, `stop_protocol: 2`, a canonical operation UUID, exact run path,
-binding digest, lease identity and a durable marker fingerprint. The fingerprint
-binds device/inode, size, modification/change times and SHA-256 from marker
-creation through confirmation, including across owner restart. A missing
-fingerprint after a crash is not reconstructed from operation UUID or marker
-contents; reconciliation fails closed. Its state is `pending` or `confirmed`.
-The `command-stop-uncertain.json` marker has `schema: 2` and the same operation
-UUID; it is removed only when its durable fingerprint matches the confirmation
-record. A pending operation remains pending if its marker is missing. Parent-command
-uncertainty uses the separate `parent-command-stop-uncertain.json` marker and
-cannot be cleared by remote confirmation. `finish` succeeds only after all
-applicable causes are settled and resource cleanup is confirmed. Legacy
-bindings/statuses remain legacy; ordinary client loading refuses them rather
-than silently rewriting provenance.
-The bound operation record retains historical lease generation. Terminal pool
-observations may report `generation: null`; repeated finish keeps that actual
-observation null and does not depend on the previous status retaining a number.
+`finish` performs ordinary release even when command outcome is unknown. It
+reports confirmed resource cleanup separately, persists the terminal lease
+observation, retains `command_stop: unconfirmed`, and returns failed status with
+a nonzero result; cleanup does not prove business success or remote drain.
+Unknown/failed runs are not pruned.
 
-## Legacy stop recovery boundary
-
-The Kit no longer ships a reader or public command for reconciling legacy stop records. Any incident-specific recovery is private to that incident and requires its own exact evidence and authorization; it is not a supported general-purpose API. Preserve original errors and unknown business effects, and never replay or reacquire a resource as an automatic recovery.
+Legacy stop records have no general-purpose recovery reader or command.
+Incident-specific recovery requires its own exact evidence and authority.
+Preserve original errors and unknown business effects; never replay or reacquire
+a resource as automatic recovery.
 `run` acquires one lease, renews while the direct command runs, waits for its
 synchronous finalizers, and releases. It preserves command failure and reports
 cleanup failure separately; lease loss cannot produce success. Ordinary

@@ -334,20 +334,16 @@ def plan_project_synchronization(
                 update=update,
             )
             plans.append(plan)
-            siblings = ()
             if key == "android_tools":
-                siblings = (
-                    "android_tools_native.py", "android_tools_evidence.py",
-                    "android_tools_custody.py",
-                )
-            for sibling in siblings:
-                sibling_target = project_target(
-                    project_root, str(Path(configured_path).parent / sibling)
-                )
-                plans.append(plan_synchronization(
-                    REPO_ROOT / "templates" / "project" / sibling,
-                    sibling_target, key=f"{key}.{sibling}", update=update,
-                ))
+                for sibling in ("android_tools_native.py", "android_tools_evidence.py",
+                                "android_tools_custody.py"):
+                    sibling_target = project_target(
+                        project_root, str(Path(configured_path).parent / sibling)
+                    )
+                    plans.append(plan_synchronization(
+                        REPO_ROOT / "templates" / "project" / sibling,
+                        sibling_target, key=f"{key}.{sibling}", update=update,
+                    ))
             status_label = plan.status
         else:
             validate_project_owned_target(

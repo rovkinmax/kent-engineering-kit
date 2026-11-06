@@ -219,7 +219,7 @@ class BundleTests(unittest.TestCase):
     def test_custody_api_version_is_checked_after_byte_qualification(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for version in (None, 1):
+            for version in (None, 0, 2):
                 content = b"BUNDLE_PROTOCOL = 1\n"
                 if version is not None:
                     content += f"CUSTODY_API_VERSION = {version}\n".encode()
@@ -230,6 +230,16 @@ class BundleTests(unittest.TestCase):
                         }
                 ), self.assertRaisesRegex(facade.Error, "custody_api_mismatch"):
                     facade.load_bundle()
+            content = b"BUNDLE_PROTOCOL = 1\nCUSTODY_API_VERSION = 1\n"
+            (root / "android_tools_custody.py").write_bytes(content)
+            with patch.object(facade, "__file__", str(root / "android-tools")), patch.object(
+                    facade, "BUNDLE_HASHES", {
+                        "android_tools_custody.py": hashlib.sha256(content).hexdigest(),
+                    }
+            ):
+                self.assertEqual(
+                    facade.load_bundle()["android_tools_custody"].CUSTODY_API_VERSION, 1,
+                )
 
     def test_managed_projection_includes_complete_qualified_bundle(self):
         sync = runpy.run_path(str(SOURCE.parents[2] / "scripts/sync-project-adapters"))
@@ -570,12 +580,15 @@ class BundleTests(unittest.TestCase):
             self.assertEqual((pool / "calls").read_text().splitlines().count("acquire"), 1)
             self.assertEqual((pool / "calls").read_text().splitlines().count("release"), 1)
             marker = statuses[0].parent / "command-stop-uncertain.json"
-            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(marker.exists())
+            self.assertTrue(status["external_stop_unconfirmed"])
             retried = subprocess.run(
                 [sys.executable, str(SCRIPT), "finish", "--run-dir", str(statuses[0].parent)],
                 capture_output=True, timeout=15,
             )
             self.assertNotEqual(retried.returncode, 0)
+            self.assertEqual(json.loads(retried.stdout)["phase"], "failed")
+            self.assertIn("resource cleanup confirmed", json.loads(retried.stdout)["error"])
 
 
 if __name__ == "__main__":

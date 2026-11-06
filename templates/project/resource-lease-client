@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import hashlib
 import json
 import math
 import os
@@ -26,11 +25,15 @@ CLI_TIMEOUT = 10.0
 ACQUIRE_TIMEOUT = 300.0
 CLEANUP_TIMEOUT = 120.0
 HEARTBEAT_MAX_AGE = 30.0
-CUSTODY_MARKER_PROTOCOL = 2
-STOP_PROTOCOL = 2
+CUSTODY_MARKER_PROTOCOL = 1
 UNCERTAINTY_MARKER = "command-stop-uncertain.json"
-PARENT_UNCERTAINTY_MARKER = "parent-command-stop-uncertain.json"
-REMOTE_STOP_RECORD = "remote-stop.json"
+PARENT_STATES = {"not_started", "pending", "confirmed", "unconfirmed"}
+MARKER_REASONS = {
+    "native_runner_drain_unconfirmed", "remote_stop_unconfirmed",
+    "host_interrupted", "remote_execution_uncertain",
+    "wait_timeout", "signal_error",
+}
+STATUS_PHASES = {"preparing", "acquiring", "active", "stopped", "failed", "finished"}
 STOP = False
 
 
@@ -39,10 +42,6 @@ class Error(ValueError):
 
 
 class Busy(Error):
-    pass
-
-
-class CommandStopUncertain(Error):
     pass
 
 
@@ -147,7 +146,7 @@ def _stop_marker_publication_failed(run: Path, *, reason: str):
 
 
 def write(path: Path, value):
-    if path.name not in {UNCERTAINTY_MARKER, PARENT_UNCERTAINTY_MARKER}:
+    if path.name != UNCERTAINTY_MARKER:
         return _write_record(path, value)
     try:
         with marker_lock(path.parent) as fd:
@@ -324,128 +323,81 @@ def native_active(binding):
     raise Error("native Session is missing from bounded inventory")
 
 
-def canonical_json(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, allow_nan=False).encode()
-
-
-def aggregate_command_stop(parent_stop, remote_stop):
-    if parent_stop in {"pending", "unconfirmed"} or remote_stop == "pending":
-        return "unconfirmed"
-    if parent_stop == "not_started" and remote_stop == "not_started":
-        return "not_started"
-    return "confirmed"
-
-
-def _marker_identity(path: Path) -> dict:
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-        raise Error("remote stop marker is not an owner-private regular file")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        opened = os.fstat(fd)
-        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
-            raise Error("remote stop marker changed while opening")
-        raw = os.read(fd, MAX_BYTES + 1)
-        after = os.fstat(fd)
-        current = path.lstat()
-        if (len(raw) > MAX_BYTES or len(raw) != opened.st_size
-                or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-                != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
-                or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)):
-            raise Error("remote stop marker changed while reading")
-        return {
-            "device": after.st_dev, "inode": after.st_ino, "size": after.st_size,
-            "mtime_ns": after.st_mtime_ns, "ctime_ns": after.st_ctime_ns,
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        }
-    finally:
-        os.close(fd)
-
-
-def _remote_stop_state(run: Path, lease, directory_fd: int):
-    path = run / REMOTE_STOP_RECORD
-    marker = run / UNCERTAINTY_MARKER
+def _marker_present(run: Path) -> bool:
+    path = run / UNCERTAINTY_MARKER
     if not (path.exists() or path.is_symlink()):
-        if marker.exists() or marker.is_symlink():
-            raise Error("remote stop marker lacks provenance")
-        return "not_started"
+        return False
     value = read(path)
-    required = {"schema", "stop_protocol", "operation_id", "state", "run_directory",
-                "binding_sha256", "lease_identity", "marker_identity"}
-    if set(value) != required or type(value.get("schema")) is not int or value["schema"] != 1:
-        raise Error("invalid remote stop record")
-    if type(value.get("stop_protocol")) is not int or value["stop_protocol"] != STOP_PROTOCOL:
-        raise Error("unsupported remote stop protocol")
-    operation_id = value.get("operation_id")
-    try:
-        if not isinstance(operation_id, str) or str(uuid.UUID(operation_id)) != operation_id:
-            raise ValueError
-    except ValueError:
-        raise Error("invalid remote operation identity") from None
-    if value.get("state") not in {"pending", "confirmed"}:
-        raise Error("invalid remote operation state")
-    if value.get("run_directory") != str(run.resolve()):
-        raise Error("remote operation belongs to another run")
-    binding_path = run / "binding.json"
-    if not binding_path.exists():
-        raise Error("remote operation has no owner binding")
-    binding = read(binding_path)
-    if (binding.get("stop_protocol") != STOP_PROTOCOL
-            or binding.get("custody_marker_protocol") != CUSTODY_MARKER_PROTOCOL
-            or hashlib.sha256(canonical_json(binding)).hexdigest() != value.get("binding_sha256")):
-        raise Error("remote operation owner binding changed")
-    identity = value.get("lease_identity")
-    if (not isinstance(identity, dict) or set(identity) != {
-            "id", "generation", "slot", "owner", "capability"}
-            or not isinstance(identity.get("id"), str) or not identity["id"]
-            or type(identity.get("generation")) is not int or identity["generation"] < 0
-            or not isinstance(identity.get("slot"), str) or not identity["slot"]
-            or identity.get("owner") != binding.get("owner")
-            or identity.get("capability") != binding.get("capability")
-            or value.get("marker_identity") is not None and (
-                not isinstance(value.get("marker_identity"), dict)
-                or set(value["marker_identity"]) != {
-                    "device", "inode", "size", "mtime_ns", "ctime_ns", "sha256"}
-                or any(type(value["marker_identity"].get(key)) is not int
-                       or value["marker_identity"][key] < 0 for key in (
-                           "device", "inode", "size", "mtime_ns", "ctime_ns"))
-                or not isinstance(value["marker_identity"].get("sha256"), str)
-                or re.fullmatch(r"[0-9a-f]{64}", value["marker_identity"]["sha256"]) is None
-            )
-            or value.get("state") == "confirmed" and value.get("marker_identity") is None):
-        raise Error("remote operation lease identity is invalid")
-    if lease is not None:
-        if not isinstance(lease, dict) or lease.get("id") != identity["id"] or lease.get("slot") != identity["slot"]:
-            raise Error("remote operation lease identity changed")
-        generation = lease.get("generation")
-        if generation is None:
-            if lease.get("state") not in {"completed", "cancelled", "expired"}:
-                raise Error("remote operation lease generation is unavailable")
-            # The bound operation record above retains the historical generation.
-            # Terminal observations legitimately clear it; the previous status is
-            # another observation, not the durable historical identity.
-        elif type(generation) is not int or generation != identity["generation"]:
-            raise Error("remote operation lease identity changed")
-    if marker.exists() or marker.is_symlink():
-        marker_value = read(marker)
-        marker_identity = _marker_identity(marker)
-        if (marker_value.get("schema") != 2
-                or marker_value.get("operation_id") != operation_id
-                or marker_value.get("reason") not in {
-                    "remote_stop_unconfirmed", "host_interrupted",
-                    "remote_execution_uncertain", "native_runner_drain_unconfirmed"}
-                or value.get("marker_identity") is None
-                or marker_identity != value["marker_identity"]):
-            raise Error("remote stop marker changed")
-        if value["state"] == "confirmed":
-            os.fsync(directory_fd)
-            marker.unlink()
-            os.fsync(directory_fd)
-    elif value["state"] == "pending":
-        # Missing marker is not evidence; the durable pending record remains authoritative.
-        return "pending"
-    return value["state"]
+    if (set(value) != {"schema", "reason", "operation"}
+            or type(value.get("schema")) is not int or value["schema"] != 1
+            or value.get("reason") not in MARKER_REASONS
+            or not isinstance(value.get("operation"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", value["operation"]) is None):
+        raise Error("uncertainty marker format is unsupported")
+    return True
+
+
+def aggregate_command_stop(parent_stop, external_unconfirmed, marker_present):
+    if (parent_stop in {"pending", "unconfirmed"}
+            or external_unconfirmed or marker_present):
+        return "unconfirmed"
+    return "not_started" if parent_stop == "not_started" else "confirmed"
+
+
+def validate_binding(value, run: Path) -> dict:
+    required = {
+        "schema", "config", "profile", "custody_marker_protocol",
+        "capability", "owner", "binding",
+    }
+    config = value.get("config")
+    profile = value.get("profile")
+    binding = value.get("binding")
+    if (set(value) != required
+            or type(value.get("schema")) is not int or value["schema"] != 1
+            or type(value.get("custody_marker_protocol")) is not int
+            or value["custody_marker_protocol"] != CUSTODY_MARKER_PROTOCOL
+            or not isinstance(config, dict)
+            or set(config) != {"schema", "executable", "pool", "runs_directory", "profiles"}
+            or type(config.get("schema")) is not int or config["schema"] != 1
+            or any(not isinstance(config.get(key), str)
+                   or not Path(config[key]).is_absolute()
+                   for key in ("executable", "pool", "runs_directory"))
+            or not isinstance(config.get("profiles"), dict) or not config["profiles"]
+            or any(not isinstance(key, str) or not key
+                   or not isinstance(capability, str) or not capability
+                   for key, capability in config["profiles"].items())
+            or not isinstance(profile, str)
+            or not isinstance(value.get("owner"), str) or not value["owner"]
+            or config["profiles"].get(profile) != value.get("capability")
+            or run.parent != Path(config["runs_directory"])
+            or binding is not None and (
+                not isinstance(binding, dict)
+                or set(binding) != {"project", "task", "session"}
+                or any(not isinstance(binding[key], str) or not binding[key]
+                       for key in ("project", "task", "session")))):
+        raise Error("legacy or malformed consumer run binding requires qualified reconciliation")
+    return value
+
+
+def validate_status(value, run: Path) -> dict:
+    updated_at = value.get("updated_at")
+    required = {"phase", "updated_at", "custody_marker_protocol",
+                "parent_command_stop", "external_stop_unconfirmed",
+                "command_stop", "run_directory", "lease", "error"}
+    if (set(value) != required
+            or value.get("phase") not in STATUS_PHASES
+            or type(updated_at) not in (int, float) or not math.isfinite(updated_at)
+            or updated_at < 0
+            or type(value.get("custody_marker_protocol")) is not int
+            or value["custody_marker_protocol"] != CUSTODY_MARKER_PROTOCOL
+            or value.get("parent_command_stop") not in PARENT_STATES
+            or type(value.get("external_stop_unconfirmed")) is not bool
+            or value.get("command_stop") not in {"not_started", "confirmed", "unconfirmed"}
+            or value.get("run_directory") != str(run)
+            or value.get("lease") is not None and not isinstance(value["lease"], dict)
+            or value.get("error") is not None and not isinstance(value["error"], str)):
+        raise Error("legacy or malformed owner status requires qualified reconciliation")
+    return value
 
 
 @dataclass
@@ -472,51 +424,53 @@ class Lease:
 
     def record(self, phase, *, lease=None, error=None, parent_command_stop=None):
         with marker_lock(self.run) as directory_fd:
-            try:
-                previous = read(self.run / "status.json")
-            except FileNotFoundError:
-                previous = {}
-            if previous and previous.get("stop_protocol") != STOP_PROTOCOL:
-                raise Error("legacy stop record requires qualified reconciliation")
-            parent_stop = parent_command_stop
-            if parent_stop is None:
-                parent_stop = previous.get("parent_command_stop", "not_started")
-            if parent_stop not in {"not_started", "pending", "confirmed", "unconfirmed"}:
+            previous = validate_status(read(self.run / "status.json"), self.run)
+            prior_parent = previous["parent_command_stop"]
+            parent_stop = prior_parent if parent_command_stop is None else parent_command_stop
+            if parent_stop not in PARENT_STATES:
                 raise Error("invalid parent command-stop state")
-            parent_marker = self.run / PARENT_UNCERTAINTY_MARKER
-            if parent_marker.exists() or parent_marker.is_symlink():
+            if prior_parent == "unconfirmed":
                 parent_stop = "unconfirmed"
             prior_lease = lease if lease is not None else previous.get("lease")
-            remote_stop = _remote_stop_state(self.run, prior_lease, directory_fd)
-            if remote_stop not in {"not_started", "pending", "confirmed"}:
-                raise Error("invalid remote command-stop state")
-            command_stop = aggregate_command_stop(parent_stop, remote_stop)
-            if phase == "finished" and (
-                    parent_stop not in {"not_started", "confirmed"}
-                    or remote_stop not in {"not_started", "confirmed"}):
+            marker_present = _marker_present(self.run)
+            external_unconfirmed = previous["external_stop_unconfirmed"]
+            command_stop = aggregate_command_stop(
+                parent_stop, external_unconfirmed, marker_present,
+            )
+            if external_unconfirmed and phase in {"preparing", "acquiring", "active", "finished"}:
                 phase = "failed"
-                error = error or previous.get("error") or "command stop is uncertain"
+            if phase == "finished" and command_stop == "unconfirmed":
+                phase = "failed"
+                error = error or previous.get("error")
             if command_stop == "unconfirmed":
-                if phase == "finished":
-                    phase = "failed"
-                message = "command stop is uncertain"
+                message = ("command stop is uncertain; resource cleanup confirmed; "
+                           "command/business outcome remains unknown"
+                           if phase == "failed" and lease is not None
+                           and lease.get("state") in {"completed", "cancelled", "expired"}
+                           and lease.get("cleanup_pending") is False
+                           and lease.get("quarantined") is False
+                           else "command stop is uncertain")
                 if not error:
-                    error = message
-                elif not error.startswith(message):
+                    error = previous.get("error") or message
+                if message not in error:
                     error = f"{message}; {error}"
-            lease_value = prior_lease
+            if error is None and phase not in {"preparing", "acquiring", "active"}:
+                error = previous.get("error")
             value = {"phase": phase, "updated_at": time.monotonic(),
-                     "stop_protocol": STOP_PROTOCOL,
                      "custody_marker_protocol": CUSTODY_MARKER_PROTOCOL,
                      "parent_command_stop": parent_stop,
-                     "remote_command_stop": remote_stop,
-                     "run_directory": str(self.run), "lease": lease_value, "error": error,
+                     "external_stop_unconfirmed": external_unconfirmed,
+                     "run_directory": str(self.run), "lease": prior_lease, "error": error,
                      "command_stop": command_stop}
             _write_record(self.run / "status.json", value)
             os.fsync(directory_fd)
             return value
 
     def finish(self, cancel=False):
+        validate_binding(self.metadata, self.run)
+        with marker_lock(self.run):
+            validate_status(read(self.run / "status.json"), self.run)
+            _marker_present(self.run)
         if not (self.run / "receipt.json").exists():
             # The CLI writes its receipt before registration. With the helper
             # lock held and acquire child reaped, no receipt means no request.
@@ -533,8 +487,6 @@ class Lease:
             status = self.record("finished", lease=value)
         except (Error, OSError, ValueError) as error:
             raise FinishStatusUncertain(value) from error
-        if status["phase"] != "finished":
-            raise CommandStopUncertain(status["error"])
         return status
 
 
@@ -552,31 +504,19 @@ def prune(root):
     """Bound proven-finished records; retain all unknown/failed evidence."""
     completed = []
     allowed = {"binding.json", "status.json", "receipt.json", "helper.lock",
-               "finish.json", "launched.json", "stop-renewal.json",
-               REMOTE_STOP_RECORD, PARENT_UNCERTAINTY_MARKER}
+               "finish.json", "launched.json", "stop-renewal.json"}
 
     def finished(run):
-        status = read(run / "status.json")
+        status = validate_status(read(run / "status.json"), run)
         value = status.get("lease") or {}
-        marker = run / UNCERTAINTY_MARKER
-        parent_marker = run / PARENT_UNCERTAINTY_MARKER
-        remote_path = run / REMOTE_STOP_RECORD
-        remote_state = "not_started"
-        if remote_path.exists() or remote_path.is_symlink():
-            binding = read(run / "binding.json")
-            remote = read(remote_path)
-            if (remote.get("stop_protocol") != STOP_PROTOCOL
-                    or remote.get("binding_sha256") != hashlib.sha256(canonical_json(binding)).hexdigest()
-                    or remote.get("state") not in {"pending", "confirmed"}):
-                return None
-            remote_state = remote["state"]
-        if (status.get("stop_protocol") == STOP_PROTOCOL
-                and status.get("parent_command_stop") in {"not_started", "confirmed"}
-                and remote_state in {"not_started", "confirmed"}
+        marker_present = _marker_present(run)
+        if (status.get("parent_command_stop") in {"not_started", "confirmed"}
+                and not status.get("external_stop_unconfirmed")
                 and status.get("phase") == "finished"
-                and status.get("command_stop") in ("confirmed", "not_started")
-                and not (marker.exists() or marker.is_symlink())
-                and not (parent_marker.exists() or parent_marker.is_symlink())
+                and status.get("command_stop") == aggregate_command_stop(
+                    status["parent_command_stop"], False, marker_present,
+                )
+                and not marker_present
                 and value.get("state") in {"completed", "cancelled", "expired"}
                 and value.get("cleanup_pending") is False
                 and value.get("quarantined") is False):
@@ -594,16 +534,17 @@ def prune(root):
     for _updated, run in sorted(completed)[:-64]:
         try:
             with lock(run):
-                if finished(run) is None:
-                    continue
-                files = list(run.iterdir())
-                if any(path.name not in allowed for path in files):
-                    continue
-                for path in files:
-                    private(path)
-                for path in files:
-                    path.unlink()
-                run.rmdir()
+                with marker_lock(run):
+                    if finished(run) is None:
+                        continue
+                    files = list(run.iterdir())
+                    if any(path.name not in allowed for path in files):
+                        continue
+                    for path in files:
+                        private(path)
+                    for path in files:
+                        path.unlink()
+                    run.rmdir()
         except (Error, OSError):
             continue
 
@@ -618,11 +559,11 @@ def prepare(args, binding=None):
     if run.parent != root or run.name == "admission.lock":
         raise Error("run directory must be a non-reserved direct child of runs_directory")
     metadata = {"schema": 1, "config": config, "profile": args.profile,
-                "stop_protocol": STOP_PROTOCOL,
                 "custody_marker_protocol": CUSTODY_MARKER_PROTOCOL,
                 "capability": config["profiles"][args.profile],
                 "owner": args.owner if binding is None else f"smoke:{binding['task']}:{binding['session']}",
                 "binding": binding}
+    created = False
     with admission_lock(root):
         prune(root)
         try:
@@ -630,12 +571,27 @@ def prepare(args, binding=None):
             if count >= MAX_RUNS and not run.exists():
                 raise Error("consumer run retention limit reached; inspect completed records")
             run.mkdir(mode=0o700)
+            created = True
         except FileExistsError:
             private(run, directory=True)
             if read(run / "binding.json") != metadata:
                 raise Error("existing run has a different immutable binding")
         else:
             write(run / "binding.json", metadata)
+            with marker_lock(run) as directory_fd:
+                initial = {
+                    "phase": "preparing", "updated_at": time.monotonic(),
+                    "custody_marker_protocol": CUSTODY_MARKER_PROTOCOL,
+                    "parent_command_stop": "not_started",
+                    "external_stop_unconfirmed": False,
+                    "run_directory": str(run), "lease": None, "error": None,
+                    "command_stop": "not_started",
+                }
+                _write_record(run / "status.json", initial)
+                os.fsync(directory_fd)
+    if not created:
+        validate_status(read(run / "status.json"), run)
+        _marker_present(run)
     return Lease(run, metadata)
 
 
@@ -644,11 +600,9 @@ def load(run):
     private(run, directory=True)
     run = run.resolve()
     metadata = read(run / "binding.json")
-    if (type(metadata.get("schema")) is not int or metadata["schema"] != 1
-            or metadata.get("stop_protocol") != STOP_PROTOCOL
-            or metadata.get("custody_marker_protocol") != CUSTODY_MARKER_PROTOCOL
-            or run.parent != Path(metadata["config"]["runs_directory"])):
-        raise Error("legacy stop record requires qualified reconciliation")
+    validate_binding(metadata, run)
+    validate_status(read(run / "status.json"), run)
+    _marker_present(run)
     return Lease(run, metadata)
 
 
@@ -743,8 +697,9 @@ def run_command(args):
                     reason = "wait_timeout" if isinstance(error, subprocess.TimeoutExpired) else "signal_error"
                     failure = f"command stop is uncertain ({reason})"
                     try:
-                        write(lease.run / PARENT_UNCERTAINTY_MARKER,
-                              {"schema": 1, "reason": reason})
+                        write(lease.run / UNCERTAINTY_MARKER, {
+                            "schema": 1, "reason": reason, "operation": uuid.uuid4().hex,
+                        })
                     except (Error, OSError, ValueError):
                         failure += "; uncertainty marker persistence failed"
                     try:
@@ -760,10 +715,10 @@ def run_command(args):
                         failure = "command stop confirmation persistence failed"
                         print(f"resource-lease-client: {failure}", file=sys.stderr)
             try:
-                lease.finish(cancel=not acquired)
-            except CommandStopUncertain as error:
-                failure = failure or str(error)
-                print(f"resource-lease-client: {error}", file=sys.stderr)
+                status = lease.finish(cancel=not acquired)
+                if status["phase"] != "finished":
+                    failure = failure or status.get("error") or "command stop is uncertain"
+                    print(f"resource-lease-client: {failure}", file=sys.stderr)
             except (Error, OSError, ValueError) as error:
                 if isinstance(error, FinishStatusUncertain):
                     cleanup_error, cleanup_value = str(error), error.lease
@@ -784,7 +739,7 @@ def run_command(args):
 def serve(run):
     lease = load(run)
     with lock(lease.run):
-        if (lease.run / "status.json").exists():
+        if validate_status(read(lease.run / "status.json"), lease.run)["phase"] != "preparing":
             raise Error("a stopped helper cannot be restarted")
         renewal = Renewal(lease)
         try:
@@ -794,7 +749,9 @@ def serve(run):
                 time.sleep(0.1)
         except InterruptedError:
             try:
-                lease.finish(cancel=renewal.value is None)
+                status = lease.finish(cancel=renewal.value is None)
+                if status["phase"] != "finished":
+                    return 1
             except (Error, OSError, ValueError) as error:
                 lease.record("failed", error=str(error))
                 return 1
@@ -810,10 +767,8 @@ def check(run):
     lease = load(run)
     if (lease.run / "stop-renewal.json").exists():
         raise Error("renewal was permanently stopped")
-    value = read(lease.run / "status.json")
-    if (value.get("stop_protocol") != STOP_PROTOCOL
-            or value.get("custody_marker_protocol") != CUSTODY_MARKER_PROTOCOL):
-        raise Error("legacy stop record requires qualified reconciliation")
+    value = validate_status(read(lease.run / "status.json"), lease.run)
+    _marker_present(lease.run)
     age = time.monotonic() - value["updated_at"]
     if value.get("phase") != "active" or not 0 <= age <= HEARTBEAT_MAX_AGE:
         raise Error("helper is not observably active")
@@ -844,8 +799,11 @@ def start(args):
     binding = {"project": args.project, "task": task, "session": args.session}
     native_active(binding)
     lease = prepare(args, binding)
-    if (lease.run / "status.json").exists():
+    status = validate_status(read(lease.run / "status.json"), lease.run)
+    if status["phase"] == "active":
         return check(lease.run)
+    if status["phase"] != "preparing":
+        raise Error("a stopped helper cannot be restarted")
     # Serialize launch admission separately from the long-lived helper lock.
     with lock(lease.run):
         if (lease.run / "launched.json").exists():
@@ -883,11 +841,9 @@ def finish(run):
                 return lease.finish(cancel=not (lease.run / "receipt.json").exists())
         except Busy:
             pass
-        value = read(lease.run / "status.json")
+        value = validate_status(read(lease.run / "status.json"), lease.run)
         if value.get("phase") == "finished":
             return value
-        if value.get("phase") == "failed":
-            raise Error(value.get("error") or "helper cleanup failed")
         time.sleep(0.1)
     raise Error("helper cleanup timed out")
 
@@ -920,7 +876,7 @@ def main():
         result = (start(args) if args.action == "start" else
                   check(args.run_dir) if args.action == "check" else finish(args.run_dir))
         print(json.dumps(result, sort_keys=True))
-        return 0
+        return 1 if args.action == "finish" and result.get("phase") != "finished" else 0
     except (Error, OSError, ValueError, KeyError, TypeError) as error:
         print(f"resource-lease-client: {error}", file=sys.stderr)
         return 1

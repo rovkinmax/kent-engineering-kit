@@ -18,7 +18,7 @@ PROTOCOL = 1
 BUNDLE_HASHES = {
     "android_tools_native.py": "97cad8d0fba456afcd31460fe862876fa762e2c486e6def10a2d5f83e43f0e1f",
     "android_tools_evidence.py": "1d5e7b63c27f972bb2757709a128e45226a7a7abdc0bb6cdbb24632771989d1d",
-    "android_tools_custody.py": "0daad6047c83744df351a0c87a56dc57b443f8caa49cb6a9d13643354301f484",
+    "android_tools_custody.py": "a87de1b65ca5163e35c39709d6c01a76293a93f77faca8c90105d4bff62b8b59",
 }
 LIMIT = 262144
 
@@ -46,7 +46,7 @@ def load_bundle():
         exec(compile(data, str(path), "exec"), module.__dict__)
         if getattr(module, "BUNDLE_PROTOCOL", None) != PROTOCOL:
             raise Error("bundle_protocol_mismatch")
-        if filename == "android_tools_custody.py" and getattr(module, "CUSTODY_API_VERSION", None) != 2:
+        if filename == "android_tools_custody.py" and getattr(module, "CUSTODY_API_VERSION", None) != 1:
             raise Error("custody_api_mismatch")
         loaded[name] = module
     return loaded
