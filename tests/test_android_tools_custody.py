@@ -618,11 +618,13 @@ class CustodyTests(unittest.TestCase):
                 "active", lease=self.current, parent_command_stop="pending",
             )
             self.assertEqual(heartbeat["command_stop"], "unconfirmed")
+            self.assertIsNone(heartbeat["error"])
             owner.record("active", lease=self.current, parent_command_stop="confirmed")
             custody.confirm_remote_stopped()
 
         settled = owner.record("active", parent_command_stop="confirmed")
         self.assertEqual(settled["command_stop"], "confirmed")
+        self.assertIsNone(settled["error"])
 
         fcntl.flock(self.owner, fcntl.LOCK_UN)
         terminal = {
@@ -636,6 +638,41 @@ class CustodyTests(unittest.TestCase):
             final = client.finish(self.run)
         self.assertEqual(final["phase"], "finished")
         self.assertEqual(final["command_stop"], "confirmed")
+        self.assertIsNone(final["error"])
+
+    def test_native_helper_can_finish_immediately_after_owned_confirmation(self):
+        self.finish_after_owned_confirmation("not_started")
+
+    def test_confirmed_parent_can_finish_immediately_after_owned_confirmation(self):
+        self.finish_after_owned_confirmation("confirmed")
+
+    def finish_after_owned_confirmation(self, parent):
+        from test_resource_lease_client import client
+
+        self.write("status.json", {
+            **self.state, "parent_command_stop": parent, "command_stop": parent,
+        })
+        owner = client.Lease(self.run, self.binding)
+        with self.borrow() as custody:
+            custody.begin_remote_execution()
+            heartbeat = owner.record("active", lease=self.current)
+            self.assertEqual(heartbeat["command_stop"], "unconfirmed")
+            custody.confirm_remote_stopped()
+
+        self.assertFalse((self.run / api.MARKER).exists())
+        fcntl.flock(self.owner, fcntl.LOCK_UN)
+        terminal = {
+            **self.current, "state": "completed", "endpoint": None,
+            "expires_in": 0, "cleanup_pending": False,
+        }
+        with patch.object(client.Lease, "cli", return_value=terminal) as release:
+            final = client.finish(self.run)
+        self.assertEqual(release.call_count, 1)
+        self.assertEqual(release.call_args.args, ("release",))
+        self.assertEqual(final["phase"], "finished")
+        self.assertEqual(final["command_stop"], parent)
+        self.assertFalse(final["external_stop_unconfirmed"])
+        self.assertIsNone(final["error"], final)
 
 
 if __name__ == "__main__":

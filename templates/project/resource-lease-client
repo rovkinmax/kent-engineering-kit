@@ -442,7 +442,11 @@ class Lease:
             if phase == "finished" and command_stop == "unconfirmed":
                 phase = "failed"
                 error = error or previous.get("error")
-            if command_stop == "unconfirmed":
+            # Pending work is not a failure, but explicit negatives and
+            # uncertainty remaining at stop must retain their diagnostics.
+            if command_stop == "unconfirmed" and (
+                    phase not in {"preparing", "acquiring", "active"}
+                    or parent_stop == "unconfirmed"):
                 message = ("command stop is uncertain; resource cleanup confirmed; "
                            "command/business outcome remains unknown"
                            if phase == "failed" and lease is not None
@@ -454,7 +458,7 @@ class Lease:
                     error = previous.get("error") or message
                 if message not in error:
                     error = f"{message}; {error}"
-            if error is None and phase not in {"preparing", "acquiring", "active"}:
+            if error is None:
                 error = previous.get("error")
             value = {"phase": phase, "updated_at": time.monotonic(),
                      "custody_marker_protocol": CUSTODY_MARKER_PROTOCOL,
@@ -513,6 +517,7 @@ def prune(root):
         if (status.get("parent_command_stop") in {"not_started", "confirmed"}
                 and not status.get("external_stop_unconfirmed")
                 and status.get("phase") == "finished"
+                and status["error"] is None
                 and status.get("command_stop") == aggregate_command_stop(
                     status["parent_command_stop"], False, marker_present,
                 )

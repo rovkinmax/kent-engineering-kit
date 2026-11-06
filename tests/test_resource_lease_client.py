@@ -194,6 +194,39 @@ class ResourceLeaseClientTests(unittest.TestCase):
         status = lease.record("active")
         self.assertEqual(status["custody_marker_protocol"], client.CUSTODY_MARKER_PROTOCOL)
 
+    def test_pending_parent_is_not_a_lifecycle_error_while_work_is_active(self):
+        for phase in ("preparing", "acquiring", "active"):
+            with self.subTest(phase=phase):
+                lease = client.prepare(self.prepare_args(f"pending-{phase}"))
+                status = lease.record(phase, parent_command_stop="pending")
+                self.assertEqual(status["phase"], phase)
+                self.assertEqual(status["command_stop"], "unconfirmed")
+                self.assertIsNone(status["error"])
+
+    def test_heartbeat_and_finish_preserve_existing_non_null_errors(self):
+        terminal = {"state": "completed", "cleanup_pending": False,
+                    "quarantined": False, "endpoint": None}
+        for index, error in enumerate(("real lifecycle failure", "", "command stop is uncertain")):
+            with self.subTest(error=error):
+                lease = client.prepare(self.prepare_args(f"retained-error-{index}"))
+                client.write(lease.run / "receipt.json", {})
+                lease.record("stopped", error=error, parent_command_stop="confirmed")
+                self.assertEqual(lease.record("active")["error"], error)
+                with patch.object(lease, "cli", return_value=terminal):
+                    status = lease.finish()
+                self.assertEqual(status["phase"], "finished")
+                self.assertEqual(status["error"], error)
+
+    def test_intrinsic_unconfirmed_parent_remains_an_error_during_heartbeat(self):
+        lease = client.prepare(self.prepare_args("intrinsic-stop-error"))
+        status = lease.record("active", parent_command_stop="unconfirmed")
+        self.assertEqual(status["command_stop"], "unconfirmed")
+        self.assertIn("command stop is uncertain", status["error"])
+        later = lease.record("active", parent_command_stop="confirmed")
+        self.assertEqual(later["parent_command_stop"], "unconfirmed")
+        self.assertEqual(later["command_stop"], "unconfirmed")
+        self.assertEqual(later["error"], status["error"])
+
     def test_marker_lock_timeout_retains_durable_stop_barrier_without_unlocked_marker(self):
         lease = client.prepare(self.prepare_args("marker-timeout"))
         fd = os.open(lease.run, os.O_RDONLY | os.O_DIRECTORY)
@@ -672,6 +705,19 @@ class ResourceLeaseClientTests(unittest.TestCase):
         self.assertTrue((run / "status.json").exists())
         self.assertEqual(len(list(self.runs.glob("newer-*"))), 64)
 
+    def test_prune_retains_finished_runs_with_non_null_errors(self):
+        terminal = {"state": "completed", "cleanup_pending": False,
+                    "quarantined": False, "endpoint": None}
+        for index, error in enumerate(("real lifecycle failure", "", "command stop is uncertain")):
+            with self.subTest(error=error):
+                lease = client.prepare(self.prepare_args(f"finished-error-{index}"))
+                client.write(lease.run / "receipt.json", {})
+                lease.record("stopped", error=error, parent_command_stop="confirmed")
+                with patch.object(lease, "cli", return_value=terminal):
+                    status = lease.finish()
+                self.assertEqual(status["error"], error)
+                self.assert_retained_after_prune(lease.run)
+
     def test_uncertain_command_stop_retains_cleanup_result_and_diagnostics(self):
         for mode in ("oserror", "timeout"):
             with self.subTest(mode=mode):
@@ -893,6 +939,12 @@ class ResourceLeaseClientTests(unittest.TestCase):
         return api, target
 
     def test_prune_rechecks_after_handoff_commits_before_final_eligibility(self):
+        self.prune_recheck_case(external=True)
+
+    def test_prune_rechecks_after_error_commits_before_final_eligibility(self):
+        self.prune_recheck_case(external=False)
+
+    def prune_recheck_case(self, *, external):
         api, target = self.seed_prune_handoff_runs()
         helper_lock_held = threading.Event()
         continue_prune = threading.Event()
@@ -923,18 +975,28 @@ class ResourceLeaseClientTests(unittest.TestCase):
             thread.start()
             try:
                 self.assertTrue(helper_lock_held.wait(5), "prune did not reach helper lock")
-                api.handoff_uncertain("host_interrupted")
+                if external:
+                    api.handoff_uncertain("host_interrupted")
+                else:
+                    client.load(target).record("finished", error="late lifecycle failure")
                 status = client.read(target / "status.json")
-                self.assertTrue(status["external_stop_unconfirmed"])
-                self.assertEqual(status["phase"], "failed")
+                if external:
+                    self.assertTrue(status["external_stop_unconfirmed"])
+                    self.assertEqual(status["phase"], "failed")
+                else:
+                    self.assertEqual(status["error"], "late lifecycle failure")
             finally:
                 continue_prune.set()
                 thread.join(timeout=10)
 
         self.assertTrue(prune_done.is_set())
         self.assertEqual(prune_errors, [])
-        self.assertTrue(target.is_dir(), "a committed UNKNOWN must remain in history")
-        self.assertTrue(client.read(target / "status.json")["external_stop_unconfirmed"])
+        self.assertTrue(target.is_dir(), "a committed failure must remain in history")
+        status = client.read(target / "status.json")
+        if external:
+            self.assertTrue(status["external_stop_unconfirmed"])
+        else:
+            self.assertEqual(status["error"], "late lifecycle failure")
 
     def test_prune_delete_lock_prevents_late_handoff_false_acknowledgement(self):
         api, target = self.seed_prune_handoff_runs()
