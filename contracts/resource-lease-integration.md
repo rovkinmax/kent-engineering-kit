@@ -38,8 +38,8 @@ there is no fallback. The adapter does not start or initialize the service.
 The installer pins the executable artifact and prepares the pool separately.
 Configuration, run directories, receipts and control files are owner-private.
 No receipt secret may appear in argv, checkpoints, logs or workflow evidence.
-Keep at most 64 proven-finished run records. Unknown/failed records are retained;
-at 256 total run entries admission stops for explicit operator inspection.
+Keep at most 64 clean, error-free finished run records. Retain all others;
+at 256 total entries, stop admission for explicit operator inspection.
 
 Commands:
 
@@ -56,6 +56,30 @@ resource-lease-client finish --run-dir RUN
 missing endpoint keys. A project wrapper supplies platform-specific mappings
 and commands; the adapter itself has no Android or Gradle knowledge.
 
+## Stop provenance
+
+Bindings retain `custody_marker_protocol: 1`. Status requires
+`parent_command_stop` (`not_started`, `pending`, `confirmed`,
+`unconfirmed`) and sticky boolean `external_stop_unconfirmed`. Derive public
+`command_stop` from both fields and the operation marker; never reuse that
+aggregate as parent provenance. Heartbeats preserve external uncertainty.
+Pending parent work may coexist with an owned child-operation marker.
+
+The existing schema-1 `command-stop-uncertain.json` marker retains its
+reason/operation format and exclusive, fsynced creation before dispatch.
+Only its live context may confirm and remove that exact marker; confirmation
+cannot clear parent or foreign uncertainty. Global handoff needs no live
+lease/helper and preserves lease observations and heartbeat time.
+
+`finish` releases the original resource and persists confirmed cleanup.
+Unconfirmed stop still returns failed/unconfirmed with a nonzero exit.
+Cleanup proves neither business success nor remote stop. Preserve errors
+and unknown outcomes.
+
+Reject missing/malformed provenance and unknown marker formats without
+migration. No extra state files, remote journal or general legacy recovery API.
+Incident recovery needs its own evidence and authority; never automatically
+replay an operation or acquire a replacement.
 `run` acquires one lease, renews while the direct command runs, waits for its
 synchronous finalizers, and releases. It preserves command failure and reports
 cleanup failure separately; lease loss cannot produce success. Ordinary

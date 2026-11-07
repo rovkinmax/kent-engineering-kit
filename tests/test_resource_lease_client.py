@@ -50,9 +50,14 @@ class PublicCheckTests(unittest.TestCase):
                        "expires_in": 30, "quarantined": False}
             lease = SimpleNamespace(run=Path(directory), metadata={"binding": binding},
                                     cli=lambda action: current)
-            status = {"phase": "active", "updated_at": time.monotonic()}
+            status = {"phase": "active", "updated_at": time.monotonic(),
+                      "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+                      "parent_command_stop": "not_started",
+                      "external_stop_unconfirmed": False,
+                      "command_stop": "not_started",
+                      "run_directory": str(lease.run), "lease": None, "error": None}
             with patch.object(client, "load", return_value=lease), patch.object(
-                client, "read", return_value=status
+                client, "read", side_effect=lambda _path: dict(status)
             ), patch.object(client, "lock", owned_lock), patch.object(
                 client, "native_active"
             ) as native:
@@ -93,7 +98,8 @@ if (root/"reject").exists() and action == "renew":
     raise SystemExit(9)
 if action == "acquire":
     value = {"owner":owner,"capability":args[args.index("--capability")+1],
-             "id":"lease-one","state":"active","cleanup_pending":False,
+             "id":"lease-one","generation":1,"slot":"test","service_available":True,
+             "state":"active","cleanup_pending":False,
              "quarantined":False,"endpoint":{"adb_serial":"emulator-5574"}}
     receipt.write_text(json.dumps(value))
     receipt.chmod(0o600)
@@ -184,31 +190,67 @@ class ResourceLeaseClientTests(unittest.TestCase):
 
     def test_runtime_protocol_is_emitted_by_owner_not_copied_from_binding(self):
         self.root.chmod(0o700)
-        lease = client.Lease(self.root, {"custody_marker_protocol": "foreign"})
+        lease = client.prepare(self.prepare_args("runtime-protocol"))
         status = lease.record("active")
         self.assertEqual(status["custody_marker_protocol"], client.CUSTODY_MARKER_PROTOCOL)
 
+    def test_pending_parent_is_not_a_lifecycle_error_while_work_is_active(self):
+        for phase in ("preparing", "acquiring", "active"):
+            with self.subTest(phase=phase):
+                lease = client.prepare(self.prepare_args(f"pending-{phase}"))
+                status = lease.record(phase, parent_command_stop="pending")
+                self.assertEqual(status["phase"], phase)
+                self.assertEqual(status["command_stop"], "unconfirmed")
+                self.assertIsNone(status["error"])
+
+    def test_heartbeat_and_finish_preserve_existing_non_null_errors(self):
+        terminal = {"state": "completed", "cleanup_pending": False,
+                    "quarantined": False, "endpoint": None}
+        for index, error in enumerate(("real lifecycle failure", "", "command stop is uncertain")):
+            with self.subTest(error=error):
+                lease = client.prepare(self.prepare_args(f"retained-error-{index}"))
+                client.write(lease.run / "receipt.json", {})
+                lease.record("stopped", error=error, parent_command_stop="confirmed")
+                self.assertEqual(lease.record("active")["error"], error)
+                with patch.object(lease, "cli", return_value=terminal):
+                    status = lease.finish()
+                self.assertEqual(status["phase"], "finished")
+                self.assertEqual(status["error"], error)
+
+    def test_intrinsic_unconfirmed_parent_remains_an_error_during_heartbeat(self):
+        lease = client.prepare(self.prepare_args("intrinsic-stop-error"))
+        status = lease.record("active", parent_command_stop="unconfirmed")
+        self.assertEqual(status["command_stop"], "unconfirmed")
+        self.assertIn("command stop is uncertain", status["error"])
+        later = lease.record("active", parent_command_stop="confirmed")
+        self.assertEqual(later["parent_command_stop"], "unconfirmed")
+        self.assertEqual(later["command_stop"], "unconfirmed")
+        self.assertEqual(later["error"], status["error"])
+
     def test_marker_lock_timeout_retains_durable_stop_barrier_without_unlocked_marker(self):
-        self.root.chmod(0o700)
-        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        lease = client.prepare(self.prepare_args("marker-timeout"))
+        fd = os.open(lease.run, os.O_RDONLY | os.O_DIRECTORY)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with patch.object(client, "CLI_TIMEOUT", 0.02), patch.object(
                     client.os, "fsync", wraps=os.fsync) as sync:
                 with self.assertRaisesRegex(client.Busy, "marker coordination lock timed out"):
-                    client.write(self.root / client.UNCERTAINTY_MARKER, {
+                    client.write(lease.run / client.UNCERTAINTY_MARKER, {
                         "schema": 1, "reason": "signal_error",
                     })
                 self.assertGreaterEqual(sync.call_count, 2)
-            self.assertFalse((self.root / client.UNCERTAINTY_MARKER).exists())
-            self.assertEqual(client.read(self.root / "stop-renewal.json"), {
+            self.assertFalse((lease.run / client.UNCERTAINTY_MARKER).exists())
+            self.assertEqual(client.read(lease.run / "stop-renewal.json"), {
                 "schema": 1, "reason": "marker_lock_unavailable",
             })
-            lease = client.Lease(self.root, {})
-            lease.record("active", command_stop="unconfirmed")
-            with self.assertRaises(client.CommandStopUncertain):
-                lease.finish()
-            status = client.read(self.root / "status.json")
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            lease.record("active", parent_command_stop="unconfirmed")
+            terminal = {"state": "completed", "cleanup_pending": False,
+                        "quarantined": False, "endpoint": None}
+            with patch.object(lease, "cli", return_value=terminal):
+                final = lease.finish()
+            self.assertEqual(final["phase"], "failed")
+            status = client.read(lease.run / "status.json")
             self.assertEqual(status["phase"], "failed")
             self.assertEqual(status["command_stop"], "unconfirmed")
         finally:
@@ -520,8 +562,8 @@ class ResourceLeaseClientTests(unittest.TestCase):
                 client.active(dict(base, **change))
 
     def test_cleanup_uncertainty_is_not_success(self):
-        lease = client.Lease(self.root, {})
-        client.write(self.root / "receipt.json", {})
+        lease = client.prepare(self.prepare_args("cleanup-uncertain"))
+        client.write(lease.run / "receipt.json", {})
         for result in ({"state": "completed", "cleanup_pending": True, "quarantined": False},
                        {"state": "completed", "cleanup_pending": False, "quarantined": True},
                        {"state": "failed", "cleanup_pending": False, "quarantined": False}):
@@ -532,16 +574,21 @@ class ResourceLeaseClientTests(unittest.TestCase):
     def test_pruning_only_proven_finished_records(self):
         self.runs.mkdir(mode=0o700)
         for index in range(66):
-            run = self.runs / str(index)
+            run = self.runs.resolve() / str(index)
             run.mkdir(mode=0o700)
             client.write(run / "status.json", {
                 "phase": "finished", "updated_at": index,
+                "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+                "parent_command_stop": "not_started",
+                "external_stop_unconfirmed": False,
+                "command_stop": "not_started",
+                "run_directory": str(run.resolve()), "error": None,
                 "lease": {"state": "completed", "cleanup_pending": False, "quarantined": False},
             })
         unknown = self.runs / "unknown"
         unknown.mkdir(mode=0o700)
         client.write(unknown / "status.json", {"phase": "failed"})
-        client.prune(self.runs)
+        client.prune(self.runs.resolve())
         self.assertEqual(len(list(self.runs.iterdir())), 65)
         self.assertTrue(unknown.exists())
         self.assertFalse((self.runs / "0").exists())
@@ -557,7 +604,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
         run = Path(args.run_dir)
         secret = "must-not-leak-stop-exception"
         actions, signals, waits = [], [], []
-        original_tick, original_write = client.Renewal.tick, client.write
+        original_tick, original_write_record = client.Renewal.tick, client._write_record
         finish_status_failed = False
 
         class Child:
@@ -580,7 +627,8 @@ class ResourceLeaseClientTests(unittest.TestCase):
             action = command[3]
             self.assertIn(action, ("acquire", "release"))
             actions.append(action)
-            value = {"owner": args.owner, "capability": "clean", "state": "active",
+            value = {"owner": args.owner, "capability": "clean", "id": "lease-one",
+                     "generation": 1, "slot": "test", "state": "active",
                      "cleanup_pending": False, "quarantined": False,
                      "endpoint": {"adb_serial": "never-used"}, "expires_in": 30,
                      "expires_at": time.monotonic() + 30}
@@ -591,7 +639,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
                 if cleanup_fails:
                     raise client.Error("diagnostic resource cleanup not confirmed")
                 value.update(state="completed", endpoint=None)
-            original_write(run / "receipt.json", value)
+            original_write_record(run / "receipt.json", value)
             return value
 
         def interrupt(renewal):
@@ -610,7 +658,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
 
         def failing_write(path, value):
             nonlocal finish_status_failed
-            if path.name == "command-stop-uncertain.json" and marker_fails:
+            if path.name == client.UNCERTAINTY_MARKER and marker_fails:
                 raise OSError(secret)
             if path.name == "status.json" and value["phase"] == "failed" and status_fails:
                 raise OSError(secret)
@@ -618,7 +666,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
                     and value["phase"] == "failed" and value.get("lease", {}).get("state") == "completed"):
                 finish_status_failed = True
                 raise OSError(secret)
-            return original_write(path, value)
+            return original_write_record(path, value)
 
         stderr = io.StringIO()
         with (patch.object(client, "capture", side_effect=fake_capture),
@@ -627,7 +675,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
                            if mode == "not_started" else None),
               patch.object(client.os, "killpg", side_effect=killpg),
               patch.object(client.Renewal, "tick", interrupt),
-              patch.object(client, "write", side_effect=failing_write),
+              patch.object(client, "_write_record", side_effect=failing_write),
               redirect_stderr(stderr)):
             result = client.run_command(args)
         self.assertEqual(result, 1)
@@ -641,16 +689,34 @@ class ResourceLeaseClientTests(unittest.TestCase):
 
     def assert_retained_after_prune(self, run):
         for index in range(65):
-            completed = self.runs / f"newer-{index}"
+            completed = self.runs.resolve() / f"newer-{index}"
             completed.mkdir(mode=0o700, exist_ok=True)
             client.write(completed / "status.json", {
                 "phase": "finished", "updated_at": time.monotonic() + index,
+                "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+                "parent_command_stop": "not_started",
+                "external_stop_unconfirmed": False,
+                "command_stop": "not_started",
+                "run_directory": str(completed.resolve()), "error": None,
                 "lease": {"state": "completed", "cleanup_pending": False, "quarantined": False},
             })
-        client.prune(self.runs)
+        client.prune(self.runs.resolve())
         self.assertTrue((run / "receipt.json").exists())
         self.assertTrue((run / "status.json").exists())
         self.assertEqual(len(list(self.runs.glob("newer-*"))), 64)
+
+    def test_prune_retains_finished_runs_with_non_null_errors(self):
+        terminal = {"state": "completed", "cleanup_pending": False,
+                    "quarantined": False, "endpoint": None}
+        for index, error in enumerate(("real lifecycle failure", "", "command stop is uncertain")):
+            with self.subTest(error=error):
+                lease = client.prepare(self.prepare_args(f"finished-error-{index}"))
+                client.write(lease.run / "receipt.json", {})
+                lease.record("stopped", error=error, parent_command_stop="confirmed")
+                with patch.object(lease, "cli", return_value=terminal):
+                    status = lease.finish()
+                self.assertEqual(status["error"], error)
+                self.assert_retained_after_prune(lease.run)
 
     def test_uncertain_command_stop_retains_cleanup_result_and_diagnostics(self):
         for mode in ("oserror", "timeout"):
@@ -662,13 +728,16 @@ class ResourceLeaseClientTests(unittest.TestCase):
                 self.assertFalse(status["lease"]["cleanup_pending"])
                 self.assertIn("command stop is uncertain", status["error"])
                 self.assertIn("command stop is uncertain", stderr)
-                marker = run / "command-stop-uncertain.json"
-                self.assertEqual(client.read(marker), {
-                    "schema": 1, "reason": "wait_timeout" if mode == "timeout" else "signal_error"})
+                marker = run / client.UNCERTAINTY_MARKER
+                marker_value = client.read(marker)
+                self.assertEqual(marker_value["reason"],
+                                 "wait_timeout" if mode == "timeout" else "signal_error")
+                self.assertRegex(marker_value["operation"], r"^[0-9a-f]{32}$")
                 self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
                 retried = self.invoke("finish", "--run-dir", str(run))
                 self.assertEqual(retried.returncode, 1, retried.stderr)
-                self.assertIn("command stop is uncertain", retried.stderr)
+                self.assertIn("command stop is uncertain", retried.stdout)
+                self.assertIn("resource cleanup confirmed", retried.stdout)
                 self.assertEqual(client.read(run / "status.json")["lease"]["state"], "completed")
                 self.assertTrue(marker.exists())
                 self.assert_retained_after_prune(run)
@@ -687,7 +756,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
             with self.subTest(status_fails=status_fails):
                 run, status, stderr = self.stop_case(
                     "oserror", marker_fails=True, status_fails=status_fails)
-                self.assertFalse((run / "command-stop-uncertain.json").exists())
+                self.assertFalse((run / client.UNCERTAINTY_MARKER).exists())
                 self.assertEqual(status["command_stop"], "unconfirmed")
                 self.assertNotEqual(status["phase"], "finished")
                 self.assertIn("uncertainty marker persistence failed", stderr)
@@ -699,6 +768,64 @@ class ResourceLeaseClientTests(unittest.TestCase):
                 self.assertEqual(after["command_stop"], "unconfirmed")
                 self.assertEqual(after["lease"]["state"], "completed")
                 self.assert_retained_after_prune(run)
+
+    def test_terminal_null_generation_finish_can_repeat(self):
+        lease = client.prepare(self.prepare_args("repeat-terminal"))
+        active = {
+            "owner": "test-command", "capability": "clean", "id": "lease-one",
+            "generation": 1, "slot": "test", "state": "active",
+            "cleanup_pending": False, "quarantined": False,
+            "endpoint": {"adb_serial": "emulator-5574"},
+        }
+        client.write(lease.run / "receipt.json", active)
+        lease.record("active", lease=active, parent_command_stop="confirmed")
+        terminal = dict(active, state="completed", generation=None, endpoint=None)
+        with patch.object(lease, "cli", return_value=terminal):
+            self.assertEqual(lease.finish()["phase"], "finished")
+            self.assertEqual(lease.finish()["phase"], "finished")
+        self.assertIsNone(client.read(lease.run / "status.json")["lease"]["generation"])
+
+    def test_external_stop_negative_survives_aggregate_recomputation(self):
+        lease = client.prepare(self.prepare_args("sticky-external-stop"))
+        client.write(lease.run / "status.json", {
+            "phase": "active",
+            "updated_at": time.monotonic(),
+            "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+            "parent_command_stop": "confirmed",
+            "external_stop_unconfirmed": True,
+            "command_stop": "unconfirmed",
+            "run_directory": str(lease.run),
+            "lease": None,
+            "error": None,
+        })
+
+        status = lease.record("active", parent_command_stop="confirmed")
+
+        self.assertTrue(status["external_stop_unconfirmed"])
+        self.assertEqual(status["command_stop"], "unconfirmed")
+        self.assertEqual(status["phase"], "failed")
+
+    def test_unknown_marker_format_is_rejected_before_release(self):
+        lease = client.prepare(self.prepare_args("unknown-marker-format"))
+        lease.record("active", parent_command_stop="confirmed")
+        client.write(lease.run / client.UNCERTAINTY_MARKER, {
+            "schema": 2, "reason": "remote_stop_unconfirmed",
+            "operation_id": "00000000-0000-4000-8000-000000000001",
+        })
+        with patch.object(lease, "cli") as call:
+            with self.assertRaisesRegex(client.Error, "uncertainty marker format"):
+                lease.finish()
+            call.assert_not_called()
+
+    def test_v2_status_journal_is_rejected_before_release(self):
+        lease = client.prepare(self.prepare_args("v2-status"))
+        status = client.read(lease.run / "status.json")
+        status.update(stop_protocol=2, remote_command_stop="pending")
+        client.write(lease.run / "status.json", status)
+        with patch.object(lease, "cli") as call:
+            with self.assertRaisesRegex(client.Error, "malformed owner status"):
+                lease.finish()
+            call.assert_not_called()
 
     def test_confirmed_command_stop_remains_finished(self):
         _run, status, stderr = self.stop_case("confirmed")
@@ -722,20 +849,259 @@ class ResourceLeaseClientTests(unittest.TestCase):
         self.assertEqual(status["phase"], "finished")
         self.assertEqual(status["command_stop"], "not_started")
         self.assertEqual(status["lease"]["state"], "completed")
-        self.assertFalse((run / "command-stop-uncertain.json").exists())
+        self.assertFalse((run / client.UNCERTAINTY_MARKER).exists())
         self.assertIn("diagnostic command not started", stderr)
         self.assertNotIn("command stop is uncertain", stderr)
+
+    def test_finish_waits_through_failed_phase_until_helper_releases(self):
+        lease = client.prepare(self.prepare_args("failed-before-release"))
+        active = {
+            "owner": "test-command", "capability": "clean", "id": "lease-one",
+            "generation": 1, "slot": "test", "state": "active",
+            "cleanup_pending": False, "quarantined": False,
+            "endpoint": {"adb_serial": "emulator-5574"},
+        }
+        client.write(lease.run / "receipt.json", active)
+        lease.record("active", lease=active, parent_command_stop="confirmed")
+        lease.record("failed", error="helper failed before resource release")
+        helper_fd = os.open(
+            lease.run / "helper.lock", os.O_RDWR | os.O_CREAT, 0o600,
+        )
+        fcntl.flock(helper_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def stop_helper_lock():
+            time.sleep(0.1)
+            fcntl.flock(helper_fd, fcntl.LOCK_UN)
+
+        thread = threading.Thread(target=stop_helper_lock)
+        thread.start()
+        terminal = {
+            **active, "state": "completed", "endpoint": None,
+            "cleanup_pending": False,
+        }
+        started = time.monotonic()
+        try:
+            with patch.object(client.Lease, "cli", return_value=terminal) as cli:
+                final = client.finish(lease.run)
+            self.assertGreaterEqual(time.monotonic() - started, 0.08)
+            self.assertEqual(final["phase"], "finished")
+            cli.assert_called_once()
+        finally:
+            thread.join(timeout=5)
+            os.close(helper_fd)
 
     def seed_runs(self, count, *, finished=False):
         self.runs.mkdir(mode=0o700, exist_ok=True)
         for index in range(count):
-            run = self.runs / f"{'finished' if finished else 'failed'}-{index}"
+            run = self.runs.resolve() / f"{'finished' if finished else 'failed'}-{index}"
             run.mkdir(mode=0o700)
             client.write(run / "status.json", {
                 "phase": "finished" if finished else "failed", "updated_at": index,
+                "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+                "parent_command_stop": "not_started" if finished else "unconfirmed",
+                "external_stop_unconfirmed": False,
+                "command_stop": "not_started" if finished else "unconfirmed",
+                "run_directory": str(run),
                 "lease": {"state": "completed", "cleanup_pending": False, "quarantined": False}
                 if finished else None, "error": None if finished else "preserved unknown outcome",
             })
+
+    def seed_prune_handoff_runs(self):
+        from test_android_tools_custody import api
+
+        self.runs.mkdir(mode=0o700, exist_ok=True)
+        root = self.runs.resolve()
+        config = json.loads(self.config.read_text())
+        config["runs_directory"] = str(root)
+        target = root / "finished-0"
+        for index in range(65):
+            run = root / f"finished-{index}"
+            run.mkdir(mode=0o700)
+            client.write(run / "status.json", {
+                "phase": "finished", "updated_at": index,
+                "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+                "parent_command_stop": "confirmed",
+                "external_stop_unconfirmed": False,
+                "command_stop": "confirmed",
+                "run_directory": str(run),
+                "lease": {"state": "completed", "cleanup_pending": False,
+                          "quarantined": False},
+                "error": None,
+            })
+            if run == target:
+                client.write(run / "binding.json", {
+                    "schema": 1, "config": config, "profile": "ui.clean",
+                    "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+                    "capability": "clean", "owner": "test-command", "binding": None,
+                })
+                client.write(run / "receipt.json", {})
+                client.write(run / "helper.lock", {})
+        return api, target
+
+    def test_prune_rechecks_after_handoff_commits_before_final_eligibility(self):
+        self.prune_recheck_case(external=True)
+
+    def test_prune_rechecks_after_error_commits_before_final_eligibility(self):
+        self.prune_recheck_case(external=False)
+
+    def prune_recheck_case(self, *, external):
+        api, target = self.seed_prune_handoff_runs()
+        helper_lock_held = threading.Event()
+        continue_prune = threading.Event()
+        prune_done = threading.Event()
+        prune_errors = []
+        original_lock = client.lock
+
+        @contextmanager
+        def pause_after_helper_lock(run):
+            with original_lock(run):
+                if run == target:
+                    helper_lock_held.set()
+                    if not continue_prune.wait(5):
+                        raise AssertionError("prune final check was not released")
+                yield
+
+        def run_prune():
+            try:
+                client.prune(self.runs.resolve())
+            except BaseException as error:
+                prune_errors.append(error)
+            finally:
+                prune_done.set()
+
+        with patch.object(client, "lock", pause_after_helper_lock), patch.dict(
+                os.environ, {"RESOURCE_LEASE_RUN_DIRECTORY": str(target)}):
+            thread = threading.Thread(target=run_prune, name="prune-before-final-check")
+            thread.start()
+            try:
+                self.assertTrue(helper_lock_held.wait(5), "prune did not reach helper lock")
+                if external:
+                    api.handoff_uncertain("host_interrupted")
+                else:
+                    client.load(target).record("finished", error="late lifecycle failure")
+                status = client.read(target / "status.json")
+                if external:
+                    self.assertTrue(status["external_stop_unconfirmed"])
+                    self.assertEqual(status["phase"], "failed")
+                else:
+                    self.assertEqual(status["error"], "late lifecycle failure")
+            finally:
+                continue_prune.set()
+                thread.join(timeout=10)
+
+        self.assertTrue(prune_done.is_set())
+        self.assertEqual(prune_errors, [])
+        self.assertTrue(target.is_dir(), "a committed failure must remain in history")
+        status = client.read(target / "status.json")
+        if external:
+            self.assertTrue(status["external_stop_unconfirmed"])
+        else:
+            self.assertEqual(status["error"], "late lifecycle failure")
+
+    def test_prune_delete_lock_prevents_late_handoff_false_acknowledgement(self):
+        api, target = self.seed_prune_handoff_runs()
+        status_path = target / "status.json"
+        deletion_started = threading.Event()
+        continue_delete = threading.Event()
+        handoff_lock_attempted = threading.Event()
+        handoff_done = threading.Event()
+        prune_done = threading.Event()
+        handoff_lock_result = {}
+        handoff_result = {}
+        prune_errors = []
+        target_info = target.stat()
+        original_iterdir = Path.iterdir
+        original_unlink = Path.unlink
+        original_flock = fcntl.flock
+
+        def ordered_iterdir(path):
+            entries = list(original_iterdir(path))
+            if path == target:
+                entries.sort(key=lambda entry: entry.name != "status.json")
+            return iter(entries)
+
+        def pause_before_status_unlink(path, *args, **kwargs):
+            if path == status_path and threading.current_thread().name == "prune-delete":
+                deletion_started.set()
+                if not continue_delete.wait(5):
+                    raise AssertionError("status deletion was not released")
+            return original_unlink(path, *args, **kwargs)
+
+        def observe_real_flock(fd, flags):
+            info = os.fstat(fd)
+            is_handoff_directory = (
+                threading.current_thread().name == "global-handoff"
+                and (info.st_dev, info.st_ino) == (target_info.st_dev, target_info.st_ino)
+                and "result" not in handoff_lock_result
+            )
+            try:
+                result = original_flock(fd, flags)
+            except BlockingIOError:
+                if is_handoff_directory:
+                    handoff_lock_result["result"] = "contended"
+                    handoff_lock_attempted.set()
+                raise
+            else:
+                if is_handoff_directory:
+                    handoff_lock_result["result"] = "acquired"
+                    handoff_lock_attempted.set()
+                return result
+
+        def run_prune():
+            try:
+                client.prune(self.runs.resolve())
+            except BaseException as error:
+                prune_errors.append(error)
+            finally:
+                prune_done.set()
+
+        def run_handoff():
+            try:
+                api.handoff_uncertain("host_interrupted")
+            except BaseException as error:
+                handoff_result.update(success=False, error=error)
+            else:
+                handoff_result["success"] = True
+            finally:
+                handoff_done.set()
+
+        with patch.object(Path, "iterdir", ordered_iterdir), patch.object(
+                Path, "unlink", pause_before_status_unlink), patch.object(
+                fcntl, "flock", observe_real_flock), patch.dict(
+                    os.environ, {"RESOURCE_LEASE_RUN_DIRECTORY": str(target)}):
+            prune_thread = threading.Thread(target=run_prune, name="prune-delete")
+            prune_thread.start()
+            try:
+                self.assertTrue(deletion_started.wait(5), "prune did not reach deletion")
+                handoff_thread = threading.Thread(target=run_handoff, name="global-handoff")
+                handoff_thread.start()
+                self.assertTrue(
+                    handoff_lock_attempted.wait(5),
+                    "global handoff did not attempt the run-directory lock",
+                )
+                first_lock_result = handoff_lock_result.get("result")
+                if first_lock_result == "acquired":
+                    handoff_done.wait(5)
+                else:
+                    self.assertFalse(
+                        handoff_done.is_set(),
+                        "handoff returned while prune held the run-directory lock",
+                    )
+            finally:
+                continue_delete.set()
+                prune_thread.join(timeout=10)
+                if "handoff_thread" in locals():
+                    handoff_thread.join(timeout=15)
+
+        self.assertTrue(prune_done.is_set())
+        self.assertEqual(prune_errors, [])
+        self.assertTrue(handoff_done.is_set())
+        self.assertFalse(
+            handoff_result.get("success"),
+            "a late handoff must not acknowledge a run that prune deleted",
+        )
+        self.assertEqual(handoff_lock_result.get("result"), "contended")
+        self.assertFalse(target.exists())
 
     def test_concurrent_admission_uses_independent_root_lock_handles(self):
         self.seed_runs(255)
@@ -853,7 +1219,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
             self.assertEqual(call.call_args.args[0], "cancel")
 
     def test_no_receipt_after_acquire_stopped_means_no_registered_request(self):
-        lease = client.Lease(self.root, {})
+        lease = client.prepare(self.prepare_args("no-receipt"))
         with patch.object(client.Lease, "cli") as call:
             result = lease.finish(cancel=True)
             self.assertEqual(result["phase"], "finished")
@@ -921,8 +1287,8 @@ class ResourceLeaseClientTests(unittest.TestCase):
         lease = client.load(run)
 
         def cleanup_unknown_command():
-            with self.assertRaisesRegex(client.CommandStopUncertain, "command stop is uncertain"):
-                lease.finish()
+            final = lease.finish()
+            self.assertEqual(final["phase"], "failed")
             status = client.read(run / "status.json")
             self.assertEqual(status["phase"], "failed")
             self.assertEqual(status["command_stop"], "unconfirmed")
@@ -933,7 +1299,7 @@ class ResourceLeaseClientTests(unittest.TestCase):
         # The descendant survived wrapper death until its own bounded exit.
         self.assertNotIn("release", self.calls())
 
-    def test_scoped_adapter_synchronization_preserves_runtime_loader(self):
+    def test_scoped_adapter_sync_omits_retired_reconciliation_reader(self):
         synchronizer = runpy.run_path(str(ROOT / "scripts/sync-project-adapters"))
         self.assertEqual(synchronizer["ADAPTER_TEMPLATES"]["resource_lease"], SCRIPT)
         self.assertIn("kit_runtime_loader", synchronizer["COMMAND_TEMPLATES"])
@@ -943,6 +1309,34 @@ class ResourceLeaseClientTests(unittest.TestCase):
         synchronizer["apply_synchronization"](plan)
         self.assertEqual(target.read_bytes(), SCRIPT.read_bytes())
         self.assertTrue(os.access(target, os.X_OK))
+        profile = SimpleNamespace(
+            schema_version=3, kit_managed_adapters=["resource_lease"],
+            kit_managed_commands=[], commands={},
+            adapters={"resource_lease": ".kent/adapters/mobile/resource-lease-client"},
+        )
+        plans, _ = synchronizer["plan_project_synchronization"](
+            profile, (self.root / "project").resolve(), update=False)
+        self.assertEqual({plan.target.name for plan in plans}, {"resource-lease-client"})
+        for plan in plans:
+            synchronizer["apply_synchronization"](plan)
+            self.assertEqual(plan.target.read_bytes(), SCRIPT.read_bytes())
+
+    def test_legacy_reconciliation_command_is_not_published(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--help"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("reconcile", result.stdout)
+
+    def test_recovery_reader_is_not_documented_as_a_kit_interface(self):
+        contract = (ROOT / "contracts/resource-lease-integration.md").read_text()
+        self.assertNotIn("resource-lease-client reconcile", contract)
+        self.assertNotIn("resource_lease_stop_proof.py", contract)
+        self.assertIn("## Configuration and interface", contract)
+        self.assertIn("## Stop provenance", contract)
+        self.assertIn("external_stop_unconfirmed", contract)
+        self.assertIn("## Native owner observation", contract)
 
 
 @unittest.skipUnless(os.environ.get("RESOURCE_LEASE_SOURCE"),
