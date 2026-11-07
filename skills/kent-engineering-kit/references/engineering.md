@@ -103,11 +103,18 @@ device authority.
 
 ## Delivery Observation
 
-Observe publication, pull-request, CI or merge state only when assigned and
-after the authorized owner has completed the relevant effect. Verify current
-identity and provider state; pending is waiting, and unknown or stale state is
-not success. Do not publish, push, merge, infer an effect from Task status, or
-expand the implementation diff.
+Observation is read-only. A separately assigned publication phase, even with
+the same owner, requires an explicit project procedure, original per-effect
+authority and current candidate, ownership and effect checks.
+
+Settle prior publication attempts read-only, including unknown results, before
+another authorized write. After publication settles, verify current identity
+and provider state for the authorized endpoint, PR, CI or merge. Pending,
+unknown or stale state is not success; Task status is not effect proof.
+
+Do not publish, push, merge or edit source during observation. Corrections
+follow the selected Workflow's existing routes with renewed candidate/effect checks.
+Resume, source acceptance and green CI grant no publication authority.
 
 ## Cleanup
 
