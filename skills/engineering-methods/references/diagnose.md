@@ -1,0 +1,45 @@
+# Technical diagnosis
+
+## Objective
+
+Diagnose a technical failure through a tight, reproducible feedback loop.
+
+## Process
+
+1. Produce one agent-runnable command that exercises the exact symptom and can
+   return a failing verdict.
+2. Run it and minimise the scenario until every remaining element is
+   load-bearing.
+3. Rank falsifiable hypotheses supported by the observations. Keep
+   observations, causal hypotheses, confirmed cause, and repair choice
+   distinct; an explanation of a failure does not establish that a proposed
+   repair is necessary.
+4. Test one variable at a time with targeted instrumentation.
+5. If repair is authorized and a correct public seam exists, add a failing
+   regression test before the fix.
+6. Apply the smallest root-cause fix only within existing repair authority.
+   Diagnosis alone authorizes no source mutation. Before recommending
+   infrastructure repair, check, within a bounded and proportionate
+   investigation, whether an existing supported route can satisfy the accepted
+   outcome. Preserve applicable receiver and procedure contracts. For an
+   observed data-delivery failure, distinguish the accepted outcome and
+   required data completeness from the current representation. Check whether a
+   supported, lossless file/reference delivery route can satisfy the accepted
+   outcome and whether the receiver supports it. A viable route does not
+   authorize changing a shared contract; that requires separate authority.
+   Preserve existing procedure prohibitions and historical `FAILED`/`UNKNOWN`
+   outcomes. Before recommending an exception, inspect the accessible rationale,
+   relevant supported recovery, and governed procedure-change path; this does
+   not itself authorize changing the procedure. If the rationale or access is
+   unavailable, state that it is unknown and keep only dependent effects
+   blocked; reading and discussion may continue. Cleanup proof or case
+   independence alone is insufficient to recommend an exception. Do not
+   execute an unapproved or known incompatible route merely to test that
+   alternative.
+7. After an authorized repair, re-run the focused test, original reproduction,
+   and applicable project verification.
+8. Remove temporary instrumentation and state the confirmed cause.
+
+If reproduction is unavailable, continue useful bounded read-only diagnosis.
+Separate established facts from hypotheses and name the missing access or
+artifact; do not claim a confirmed cause or repair.
