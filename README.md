@@ -25,6 +25,7 @@ the explicit API, shared finite budgets and independent downstream limits.
 | --- | --- |
 | Understand an unfamiliar codebase | Guided exploration of its structure, terminology, and constraints |
 | Choose an approach | Design alternatives, architectural analysis, and grill critique |
+| Navigate uncertain work, diagnose failures, or review a change | Shared [engineering methods](skills/engineering-methods/SKILL.md) and the individual prompts below |
 | Make a change | Planning, focused implementation, and test-driven slices |
 | Check the result | Independent reviews, project-owned verification, and optional runtime checks |
 | Deliver and follow up | Configurable PR/CI workflows, task supervision, and managed-worktree cleanup |

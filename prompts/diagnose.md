@@ -2,21 +2,12 @@
 
 Diagnose `$ARGUMENTS` through a tight, reproducible feedback loop.
 
-# Process
+# Method
 
-1. Produce one agent-runnable command that exercises the exact symptom and can
-   return a failing verdict.
-2. Run it and minimise the scenario until every remaining element is load-bearing.
-3. Rank falsifiable hypotheses supported by the observations.
-4. Test one variable at a time with targeted instrumentation.
-5. If repair is authorized and a correct public seam exists, add a failing
-   regression test before the fix.
-6. Apply the smallest root-cause fix only within existing repair authority.
-   Diagnosis alone authorizes no source mutation.
-7. After an authorized repair, re-run the focused test, original reproduction,
-   and applicable project verification.
-8. Remove temporary instrumentation and state the confirmed cause.
-
-If reproduction is unavailable, continue useful bounded read-only diagnosis.
-Separate established facts from hypotheses and name the missing access or
-artifact; do not claim a confirmed cause or repair.
+Load the canonical
+`${KENT_PERSISTENCE_ROOT:-$HOME/.kent}/skills/engineering-methods/SKILL.md`
+through its installer symlink, then follow only `references/diagnose.md`
+relative to that skill directory and apply it to this prompt's objective and
+request. This prompt explicitly selects Technical diagnosis; if its binding
+or reference is missing, foreign, or unreadable, report the gap without
+substituting another method or copy.

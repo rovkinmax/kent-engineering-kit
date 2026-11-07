@@ -154,7 +154,7 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
                 "For a dependency wait",
                 "ownership and effect checks",
             ),
-            "prompts/review-change.md": (
+            "skills/engineering-methods/references/review-change.md": (
                 "agents/standards-reviewer.md", "agents/spec-reviewer.md",
                 "first read the installed `kent-engineering-kit` skill's `SKILL.md`",
                 "block only the dependent action",
@@ -296,6 +296,122 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
             for phrase in phrases:
                 with self.subTest(path=path, phrase=phrase):
                     self.assertIn(phrase, text)
+
+    def test_shared_engineering_methods_keep_fixed_entrypoints_and_boundaries(self) -> None:
+        methods = {
+            "wayfind": (
+                "wayfind.md",
+                "Map a large or uncertain effort described by `$ARGUMENTS` "
+                "without prematurely\nturning unknowns into implementation tasks.",
+                (
+                    "pending human questions", "agent proposals",
+                    "accepted constraints", "original decision-locator sources",
+                    "Continue independently ready accepted work",
+                    "hold only work",
+                ),
+            ),
+            "diagnose": (
+                "diagnose.md",
+                "Diagnose `$ARGUMENTS` through a tight, reproducible feedback loop.",
+                (
+                    "falsifiable hypotheses", "observations, causal hypotheses, "
+                    "confirmed cause, and repair choice",
+                    "does not establish that a proposed repair is necessary",
+                    "existing supported route can satisfy the accepted outcome",
+                    "For an observed data-delivery failure",
+                    "distinguish the accepted outcome and required data completeness "
+                    "from the current representation",
+                    "supported, lossless file/reference delivery route",
+                    "whether the receiver supports it",
+                    "A viable route does not authorize changing a shared contract",
+                    "accessible rationale", "relevant supported recovery",
+                    "governed procedure-change path",
+                    "historical `FAILED`/`UNKNOWN`",
+                    "rationale or access is unavailable",
+                    "keep only dependent effects blocked",
+                    "reading and discussion may continue",
+                    "Cleanup proof or case independence alone is insufficient",
+                    "unapproved or known incompatible route",
+                ),
+            ),
+            "grill": (
+                "grill.md",
+                "Stress-test and clarify `$ARGUMENTS` until the user and agent "
+                "share one precise\nunderstanding.",
+                (
+                    "Ask exactly one decision question at a time",
+                    "recommended answer", "original acceptance source",
+                    "Question answers", "qualified Kit source bindings",
+                    "role permission boundaries", "agreed outcome",
+                    "recommended next action",
+                ),
+            ),
+            "design-alternatives": (
+                "design-alternatives.md",
+                "Design materially different interfaces for `$ARGUMENTS`.",
+                (
+                    "existing supported routes", "necessary tools, roles, or "
+                    "infrastructure from optional",
+                    "Required project governance reviews remain mandatory",
+                    "Do not edit production code",
+                ),
+            ),
+            "review-change": (
+                "review-change.md",
+                "Review `$ARGUMENTS` independently against repository standards "
+                "and intended\nbehavior.",
+                (
+                    "original messages or Question answers",
+                    "Standards:", "Specification fidelity:",
+                    "independence limits", "Do not invoke workflow-only roles",
+                    "do not silently substitute criteria",
+                    "finding count per axis",
+                ),
+            ),
+        }
+        index = (ROOT / "skills/engineering-methods/SKILL.md").read_text()
+        self.assertIn("Honor an explicitly selected method", index)
+        self.assertIn("Do not replace that selection or require a sequence", index)
+        self.assertIn("a locator or summary is not consent", index)
+        self.assertIn("Ordinary errors do not automatically", index)
+        self.assertIn("not the consumer's working directory", index)
+        self.assertIn("An isolated qualification root", index)
+
+        for name, (reference_name, objective, phrases) in methods.items():
+            with self.subTest(method=name):
+                wrapper = (ROOT / f"prompts/{name}.md").read_text()
+                objective_section, method_section = wrapper.split(
+                    "\n# Method\n", maxsplit=1,
+                )
+                self.assertEqual(
+                    objective_section.removeprefix("# Objective\n\n").rstrip("\n"),
+                    objective,
+                )
+                self.assertEqual(wrapper.count("$ARGUMENTS"), 1)
+                self.assertIn(f"references/{reference_name}", method_section)
+                self.assertIn("explicitly selects", method_section)
+                self.assertIn("that skill directory", method_section)
+                self.assertIn("substituting another", method_section)
+
+                reference = (
+                    ROOT / "skills/engineering-methods/references"
+                    / reference_name
+                ).read_text()
+                self.assertNotIn("$ARGUMENTS", reference)
+                self.assertIn(f"references/{reference_name}", index)
+                compact_reference = " ".join(reference.split())
+                for phrase in phrases:
+                    with self.subTest(method=name, phrase=phrase):
+                        self.assertIn(phrase, compact_reference)
+
+        supervisor = (ROOT / "agents/task-supervisor.md").read_text()
+        self.assertIn("proactively load only", supervisor)
+        self.assertIn("selected Workflow's obligations", supervisor)
+        self.assertIn("it adds no method sequence\nor review gate", supervisor)
+        grill_role = (ROOT / "agents/grill.md").read_text()
+        self.assertIn("engineering-methods/SKILL.md", grill_role)
+        self.assertIn("references/grill.md", grill_role)
+        self.assertIn("never edit\ndecision/source files yourself", grill_role)
 
     def test_operations_project_contract_fragments_exist(self) -> None:
         operations = (ROOT / "docs/OPERATIONS.md").read_text()

@@ -3774,6 +3774,141 @@ class WorkflowKitTest(unittest.TestCase):
         )
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
 
+    def test_install_resolves_engineering_methods_through_disposable_binding(self) -> None:
+        temporary = tempfile.TemporaryDirectory(
+            prefix="engineering methods installer fixture ",
+        )
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        kit = root / "kit checkout with spaces"
+
+        required_files = (
+            "scripts/install",
+            "scripts/kent-worktree",
+            "scripts/preflight-revision",
+            "scripts/prepare-github-ci",
+            "scripts/resolve-github-merge-strategy",
+            "global/AGENTS.md",
+            "adapters/gradle/shell-postprocess-hook",
+            "adapters/mcp/kent-mcp-call",
+            "adapters/mcp/kent-mcp-list",
+            ".kent/scripts/workflow-project-memory",
+            ".kent/scripts/workflow_project_memory.py",
+        )
+        for relative in required_files:
+            source = REPO_ROOT / relative
+            destination = kit / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        for directory in ("skills", "prompts", "agents"):
+            shutil.copytree(REPO_ROOT / directory, kit / directory)
+
+        installer = kit / "scripts/install"
+        adapter = kit / ".kent/scripts/workflow-project-memory"
+        installer.chmod(installer.stat().st_mode | 0o111)
+        adapter.chmod(adapter.stat().st_mode | 0o111)
+        unrelated_cwd = root / "unrelated consumer cwd"
+        unrelated_cwd.mkdir()
+        persistence = root / "custom persistence root" / "kent"
+        environment = dict(os.environ)
+        environment["KENT_PERSISTENCE_ROOT"] = str(persistence)
+
+        installed = subprocess.run(
+            [str(installer)],
+            cwd=unrelated_cwd,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        skill_link = persistence / "skills/engineering-methods"
+        self.assertTrue(skill_link.is_symlink())
+        canonical_skill = skill_link.resolve(strict=True)
+        self.assertEqual(
+            canonical_skill,
+            (kit / "skills/engineering-methods").resolve(strict=True),
+        )
+        for reference in (
+            "wayfind.md", "diagnose.md", "grill.md",
+            "design-alternatives.md", "review-change.md",
+        ):
+            with self.subTest(reference=reference):
+                self.assertTrue(
+                    (canonical_skill / "references" / reference).is_file()
+                )
+
+        for prompt, reference in (
+            ("wayfind.md", "wayfind.md"),
+            ("diagnose.md", "diagnose.md"),
+            ("grill.md", "grill.md"),
+            ("design-alternatives.md", "design-alternatives.md"),
+            ("review-change.md", "review-change.md"),
+        ):
+            installed_prompt = persistence / "prompts" / prompt
+            self.assertTrue(installed_prompt.is_symlink())
+            self.assertEqual(
+                installed_prompt.resolve(strict=True),
+                (kit / "prompts" / prompt).resolve(strict=True),
+            )
+            self.assertIn(
+                f"references/{reference}",
+                installed_prompt.read_text(),
+            )
+        installed_grill = persistence / "agents/grill.md"
+        self.assertTrue(installed_grill.is_symlink())
+        self.assertEqual(
+            installed_grill.resolve(strict=True),
+            (kit / "agents/grill.md").resolve(strict=True),
+        )
+        self.assertIn(
+            "references/grill.md",
+            installed_grill.read_text(),
+        )
+
+        repeated = subprocess.run(
+            [str(installer)],
+            cwd=unrelated_cwd,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(skill_link.resolve(strict=True), canonical_skill)
+
+        foreign_persistence = root / "foreign persistence root" / "kent"
+        foreign_skill = foreign_persistence / "skills/engineering-methods"
+        foreign_skill.parent.mkdir(parents=True)
+        foreign_directory = root / "foreign skill"
+        foreign_directory.mkdir()
+        (foreign_directory / "SKILL.md").write_text("foreign binding\n")
+        foreign_skill.symlink_to(foreign_directory, target_is_directory=True)
+        foreign_environment = dict(environment)
+        foreign_environment["KENT_PERSISTENCE_ROOT"] = str(foreign_persistence)
+        refused = subprocess.run(
+            [str(installer)],
+            cwd=unrelated_cwd,
+            env=foreign_environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("refusing to replace foreign symlink", refused.stderr)
+        self.assertEqual(
+            foreign_skill.resolve(strict=True),
+            foreign_directory.resolve(strict=True),
+        )
+        self.assertEqual(
+            (foreign_directory / "SKILL.md").read_text(),
+            "foreign binding\n",
+        )
+
     def test_worktree_wrapper_clears_inherited_kent_context(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

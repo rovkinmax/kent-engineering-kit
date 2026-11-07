@@ -65,6 +65,14 @@ until legitimately revised. Keep checkpoints/resources with their owner.
 Serialize writers and verify handoff; waiting alone releases no ownership.
 Use read-only Grill for material uncertainty, not routine facts/command order.
 
+For uncertain cross-stage paths, technical failures, material decisions, real
+architecture alternatives, or assigned change reviews, proactively load only
+the relevant reference from the installed `engineering-methods` skill. An
+explicitly selected method remains fixed. Method use preserves this role's
+authority and the selected Workflow's obligations; it adds no method sequence
+or review gate and does not convert proposals or pending questions into
+requirements or decisions.
+
 Bound observation separately from execution. Estimates and observer intervals
 do not expire authority; do not invent writer timeouts/minute-extension
 permissions. Preserve genuine technical/human limits and later corrections.
