@@ -147,10 +147,56 @@ class AndroidToolsEvidenceTests(unittest.TestCase):
             EVIDENCE["reservation_for_operation"]("device.capture", 4096),
             2 * EVIDENCE["MAX_ARTIFACT_BYTES"] + EVIDENCE["RESERVATION_METADATA_BYTES"],
         )
+        self.assertEqual(
+            EVIDENCE["reservation_for_operation"]("device.input", 4096),
+            EVIDENCE["RESERVATION_METADATA_BYTES"],
+        )
         with self.assertRaises(EVIDENCE["EvidenceError"]):
             EVIDENCE["reservation_for_operation"]("unknown.operation", 4096)
         with self.assertRaises(EVIDENCE["EvidenceError"]):
             EVIDENCE["reservation_for_operation"]("device.tap", 4095)
+
+    def test_input_manifest_keeps_only_dispatch_categories_and_safe_context(self) -> None:
+        value = "stage-input-private-canary"
+        handle = EVIDENCE["begin_run"](
+            self.record_root,
+            "device.input",
+            "mobile-native",
+            {
+                "device_serial": "emulator-5554",
+                "lease_id": "lease-123",
+                "generation": 4,
+            },
+        )
+        EVIDENCE["finish_run"](
+            handle,
+            {
+                "transport": "completed",
+                "effect": "unknown",
+                "error": None,
+                "data": {"dispatched": True, "text": value},
+                "artifacts": [],
+            },
+        )
+        manifest = json.loads(handle.manifest_path.read_text())
+
+        self.assertEqual(manifest["operation"], "device.input")
+        self.assertEqual(manifest["context"], {
+            "device_serial": "emulator-5554", "lease_id": "lease-123", "generation": 4,
+        })
+        self.assertEqual(manifest["outcome"], {
+            "transport": "completed", "effect": "unknown", "error": None, "data": {},
+        })
+        self.assertNotIn(value, json.dumps(manifest))
+
+        helper = self.write_helper("project-memory", FAKE_STANDALONE)
+        counter = self.root / "input-export-calls"
+        with patch.dict(os.environ, {"EVIDENCE_COUNTER": str(counter)}):
+            exported = EVIDENCE["export_run"](handle, self.binding(), helper=helper)
+        self.assertEqual(exported.status, "exported")
+        history = (handle.run_directory / "export.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(value, history)
+        self.assertEqual(counter.read_text(encoding="utf-8").splitlines(), ["artifact-write"])
 
     def test_unlock_releases_original_thread_lock_after_fd_reuse(self) -> None:
         lock_dir = self.root / "fd-reuse-locks"

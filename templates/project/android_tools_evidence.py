@@ -419,7 +419,7 @@ def reservation_for_operation(operation: str, output_limit_bytes: int) -> int:
     if operation not in {
         "docs.search", "docs.fetch", "preview.list", "device.tree",
         "device.assert-visible", "device.assert-gone", "device.launch",
-        "device.tap", "device.key", "device.swipe",
+        "device.tap", "device.key", "device.swipe", "device.input",
     }:
         raise EvidenceError("unsupported operation for retention reservation")
     return RESERVATION_METADATA_BYTES

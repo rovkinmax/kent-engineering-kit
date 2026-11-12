@@ -16,8 +16,8 @@ import types
 PROTOCOL = 1
 # Exact source bundle: verify and execute the same bytes before any dispatch.
 BUNDLE_HASHES = {
-    "android_tools_native.py": "97cad8d0fba456afcd31460fe862876fa762e2c486e6def10a2d5f83e43f0e1f",
-    "android_tools_evidence.py": "1d5e7b63c27f972bb2757709a128e45226a7a7abdc0bb6cdbb24632771989d1d",
+    "android_tools_native.py": "2c98ddf97c9f06a53d3ffa34c0682a7db8b580a90881ed5fed233804b8256bdd",
+    "android_tools_evidence.py": "dcf71983c09a4f5079813a76889a739c0554d2355c874768046abe7de49ffb3f",
     "android_tools_custody.py": "a87de1b65ca5163e35c39709d6c01a76293a93f77faca8c90105d4bff62b8b59",
 }
 LIMIT = 262144
@@ -144,7 +144,11 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("family", choices=("device", "preview", "docs", "evidence"))
     parser.add_argument("action")
-    parser.add_argument("--arguments", default="{}", help="JSON operation arguments; never secrets")
+    parser.add_argument(
+        "--arguments",
+        default="{}",
+        help="JSON operation arguments passed to the configured provider process",
+    )
     parser.add_argument("--binding-file", help="Private binding for explicit evidence export")
     parser.add_argument("--helper", help="Qualified project-memory executable for export")
     parser.add_argument("--interface", choices=("standalone", "workflow"), default="standalone")
@@ -207,13 +211,18 @@ def main():
         if (current["id"], current["generation"]) != (lease["id"], lease["generation"]):
             raise Error("lease_lost")
 
-    handle = evidence.begin_run(
-        Path(config["records_directory"]), operation, provider_id, safe_context,
-        **config["retention"],
-        reservation_bytes=evidence.reservation_for_operation(
+    try:
+        reservation = evidence.reservation_for_operation(
             operation, config["output_limit_bytes"],
-        ),
-    )
+        )
+        handle = evidence.begin_run(
+            Path(config["records_directory"]), operation, provider_id, safe_context,
+            **config["retention"], reservation_bytes=reservation,
+        )
+    except (ValueError, OSError):
+        if operation == "device.input":
+            raise Error("android_tools_rejected") from None
+        raise
     try:
         result = native.execute_android_native(
             provider_id, operation, arguments,
@@ -222,8 +231,9 @@ def main():
             output_limit_bytes=config.get("output_limit_bytes", 1048576),
             source_root=Path(config["source_root"]),
             staging_dir=handle.staging_directory,
-            **({"before_effect": before_tap} if operation == "device.tap"
-               and {"text", "resource_id"} & set(arguments) else {}),
+            **({"before_effect": before_tap} if operation == "device.input"
+               or (operation == "device.tap"
+                   and {"text", "resource_id"} & set(arguments)) else {}),
         )
         handoff = None
         if args.family == "device" and result.error == "drain_unknown":
