@@ -26,6 +26,212 @@ loader.exec_module(facade)
 
 
 class BundleTests(unittest.TestCase):
+    def test_input_dispatch_rechecks_custody_and_records_only_safe_context(self):
+        native = facade.load_bundle()["android_tools_native"]
+        lease = {"id": "lease", "generation": 1}
+        config = {
+            "records_directory": "/records", "source_root": "/source",
+            "output_limit_bytes": 4096, "timeout_seconds": 2,
+            "retention": {"max_bytes": 500000000, "max_age_seconds": 604800},
+            "providers": {
+                "mobile-native": {"executable": Path(sys.executable), "version": "4.4.1"},
+            },
+        }
+        evidence = Mock()
+        evidence.begin_run.return_value = SimpleNamespace(staging_directory=Path("/stage"))
+        evidence.reservation_for_operation.return_value = 100
+        evidence.finish_run.return_value = Path("/records/id/manifest.json")
+        value = "stage-input-sentinel"
+        events = []
+
+        def process(argv, **_kwargs):
+            if "--version" in argv:
+                events.append("version")
+                return native._ProcessOutput(b"mcp-devices-cli 4.4.1", 0)
+            events.append("input")
+            return native._ProcessOutput(b"private-provider-sentinel", 0)
+
+        def checked_custody(*_args):
+            events.append("custody")
+            return lease
+
+        output = io.StringIO()
+        with patch.object(facade, "configuration", return_value=config), patch.object(
+            facade, "load_bundle", return_value={
+                "android_tools_native": native,
+                "android_tools_evidence": evidence,
+                "android_tools_custody": object(),
+            }
+        ), patch.object(facade, "custody", side_effect=checked_custody), patch.object(
+            native, "_run_process", side_effect=process
+        ), patch.object(sys, "argv", [
+            "android-tools", "--config", "/config", "device", "input",
+            "--arguments", json.dumps({"device_serial": "emulator-5554", "text": value}),
+        ]), redirect_stdout(output):
+            self.assertEqual(facade.main(), 0)
+
+        self.assertEqual(events, ["custody", "version", "custody", "input", "custody"])
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "transport": "completed", "effect": "unknown", "error": None,
+                "data": {"dispatched": True}, "artifacts": [],
+                "local_manifest": "/records/id/manifest.json",
+            },
+        )
+        self.assertNotIn(value, output.getvalue())
+        self.assertNotIn("private-provider-sentinel", output.getvalue())
+        evidence.begin_run.assert_called_once()
+        safe_context = evidence.begin_run.call_args.args[3]
+        self.assertEqual(safe_context, {
+            "lease_id": "lease", "generation": 1, "device_serial": "emulator-5554",
+        })
+        self.assertNotIn(value, json.dumps(safe_context))
+        result = evidence.finish_run.call_args.args[1]
+        self.assertEqual(result.data, {"dispatched": True})
+        self.assertNotIn(value, json.dumps(result.to_dict()))
+
+    def test_input_custody_loss_after_version_query_prevents_dispatch(self):
+        native = facade.load_bundle()["android_tools_native"]
+        lease = {"id": "lease", "generation": 1}
+        config = {
+            "records_directory": "/records", "source_root": "/source",
+            "output_limit_bytes": 4096, "timeout_seconds": 2,
+            "retention": {"max_bytes": 500000000, "max_age_seconds": 604800},
+            "providers": {
+                "mobile-native": {"executable": Path(sys.executable), "version": "4.4.1"},
+            },
+        }
+        evidence = Mock()
+        evidence.begin_run.return_value = SimpleNamespace(staging_directory=Path("/stage"))
+        evidence.reservation_for_operation.return_value = 100
+        evidence.finish_run.return_value = Path("/records/id/manifest.json")
+        events = []
+
+        def process(argv, **_kwargs):
+            events.append("version" if "--version" in argv else "input")
+            return native._ProcessOutput(b"mcp-devices-cli 4.4.1", 0)
+
+        custody_results = [lease, facade.Error("lease_lost"), facade.Error("lease_lost")]
+
+        def custody_check(*_args):
+            events.append("custody")
+            result = custody_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        output = io.StringIO()
+        with patch.object(facade, "configuration", return_value=config), patch.object(
+            facade, "load_bundle", return_value={
+                "android_tools_native": native,
+                "android_tools_evidence": evidence,
+                "android_tools_custody": object(),
+            }
+        ), patch.object(facade, "custody", side_effect=custody_check), patch.object(
+            native, "_run_process", side_effect=process
+        ), patch.object(sys, "argv", [
+            "android-tools", "--config", "/config", "device", "input",
+            "--arguments", '{"device_serial":"emulator-5554","text":"ordinary"}',
+        ]), redirect_stdout(output):
+            self.assertEqual(facade.main(), 1)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual((payload["effect"], payload["error"]), ("not_dispatched", "lease_lost"))
+        self.assertEqual(events, ["custody", "version", "custody", "custody"])
+        self.assertEqual(evidence.finish_run.call_args.args[1].effect, "not_dispatched")
+
+    def test_input_custody_loss_after_dispatch_is_unknown_without_replay(self):
+        native = facade.load_bundle()["android_tools_native"]
+        lease = {"id": "lease", "generation": 1}
+        config = {
+            "records_directory": "/records", "source_root": "/source",
+            "output_limit_bytes": 4096, "timeout_seconds": 2,
+            "retention": {"max_bytes": 500000000, "max_age_seconds": 604800},
+            "providers": {
+                "mobile-native": {"executable": Path(sys.executable), "version": "4.4.1"},
+            },
+        }
+        evidence = Mock()
+        evidence.begin_run.return_value = SimpleNamespace(staging_directory=Path("/stage"))
+        evidence.reservation_for_operation.return_value = 100
+        evidence.finish_run.return_value = Path("/records/id/manifest.json")
+        events = []
+
+        def process(argv, **_kwargs):
+            if "--version" in argv:
+                events.append("version")
+                return native._ProcessOutput(b"mcp-devices-cli 4.4.1", 0)
+            events.append("input")
+            return native._ProcessOutput(b"", 0)
+
+        custody_results = [lease, lease, facade.Error("lease_lost")]
+
+        def custody_check(*_args):
+            events.append("custody")
+            result = custody_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        output = io.StringIO()
+        with patch.object(facade, "configuration", return_value=config), patch.object(
+            facade, "load_bundle", return_value={
+                "android_tools_native": native,
+                "android_tools_evidence": evidence,
+                "android_tools_custody": object(),
+            }
+        ), patch.object(facade, "custody", side_effect=custody_check), patch.object(
+            native, "_run_process", side_effect=process
+        ), patch.object(sys, "argv", [
+            "android-tools", "--config", "/config", "device", "input",
+            "--arguments", '{"device_serial":"emulator-5554","text":"ordinary"}',
+        ]), redirect_stdout(output):
+            self.assertEqual(facade.main(), 1)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(
+            (payload["transport"], payload["effect"], payload["error"]),
+            ("unknown", "unknown", "lease_lost"),
+        )
+        self.assertEqual(payload["local_manifest"], "/records/id/manifest.json")
+        self.assertEqual(events, ["custody", "version", "custody", "input", "custody"])
+        self.assertEqual(events.count("input"), 1)
+        evidence.finish_run.assert_called_once()
+        self.assertEqual(evidence.finish_run.call_args.args[1].effect, "unknown")
+
+    def test_input_evidence_reservation_failure_prevents_provider_dispatch(self):
+        native = facade.load_bundle()["android_tools_native"]
+        lease = {"id": "lease", "generation": 1}
+        config = {
+            "records_directory": "/records", "source_root": "/source",
+            "output_limit_bytes": 4096, "timeout_seconds": 2,
+            "retention": {"max_bytes": 500000000, "max_age_seconds": 604800},
+            "providers": {
+                "mobile-native": {"executable": Path(sys.executable), "version": "4.4.1"},
+            },
+        }
+        evidence = Mock()
+        evidence.reservation_for_operation.side_effect = ValueError("capacity sentinel")
+        native.execute_android_native = Mock()
+        with patch.object(facade, "configuration", return_value=config), patch.object(
+            facade, "load_bundle", return_value={
+                "android_tools_native": native,
+                "android_tools_evidence": evidence,
+                "android_tools_custody": object(),
+            }
+        ), patch.object(facade, "custody", return_value=lease), patch.object(
+            sys, "argv", [
+                "android-tools", "--config", "/config", "device", "input",
+                "--arguments", '{"device_serial":"emulator-5554","text":"ordinary"}',
+            ]
+        ):
+            with self.assertRaisesRegex(facade.Error, "android_tools_rejected"):
+                facade.main()
+
+        evidence.begin_run.assert_not_called()
+        native.execute_android_native.assert_not_called()
+
     def test_selector_tap_rechecks_identity_and_preserves_proven_no_dispatch(self):
         native = facade.load_bundle()["android_tools_native"]
         lease = {"id": "lease", "generation": 1}
