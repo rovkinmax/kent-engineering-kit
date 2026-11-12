@@ -21,21 +21,119 @@ BUNDLE_HASHES = {
     "android_tools_custody.py": "a87de1b65ca5163e35c39709d6c01a76293a93f77faca8c90105d4bff62b8b59",
 }
 LIMIT = 262144
+MAX_BUNDLE_FILE_BYTES = 1048576
+MAX_QUALIFICATION_BYTES = 65536
+BUNDLE_CONTRACTS = {
+    "custody_api": 1,
+    "custody_marker": 1,
+    "device_launch": 1,
+    "native_result": 1,
+    "run_manifest": "android-tools-run-v1",
+}
 
 
 class Error(ValueError):
     pass
 
 
+class LoadedBundle:
+    """Loaded modules and metadata from the exact bytes verified by the loader."""
+
+    def __init__(self, modules, files):
+        self.modules = modules
+        self.files = files
+
+    def __getitem__(self, name):
+        return self.modules[name]
+
+    def __iter__(self):
+        return iter(self.modules)
+
+    def __len__(self):
+        return len(self.modules)
+
+
+def _file_identity(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_stable_file(path, *, limit=MAX_BUNDLE_FILE_BYTES):
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as error:
+        raise Error("bundle_incomplete") from error
+    except OSError as error:
+        raise Error("bundle_unreadable") from error
+    try:
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_nlink != 1
+                or before.st_mode & 0o022
+                or before.st_size <= 0
+                or before.st_size > limit
+            ):
+                raise Error("bundle_unsafe")
+            chunks = []
+            size = 0
+            while True:
+                block = os.read(descriptor, min(65536, limit + 1 - size))
+                if not block:
+                    break
+                chunks.append(block)
+                size += len(block)
+                if size > limit:
+                    raise Error("bundle_size_limit")
+            after = os.fstat(descriptor)
+            current = os.stat(path, follow_symlinks=False)
+        except Error:
+            raise
+        except OSError as error:
+            raise Error("bundle_unstable") from error
+        raw = b"".join(chunks)
+        if (
+            _file_identity(before) != _file_identity(after)
+            or _file_identity(after) != _file_identity(current)
+            or size != after.st_size
+        ):
+            raise Error("bundle_unstable")
+        return raw, {
+            "path": str(path),
+            "size_bytes": size,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "mode": stat.S_IMODE(after.st_mode),
+        }
+    finally:
+        os.close(descriptor)
+
+
 def load_bundle():
     modules = {}
+    files = {}
+    directory = Path(__file__).absolute().parent
     for filename, expected in BUNDLE_HASHES.items():
-        path = Path(__file__).absolute().parent / filename
-        if path.is_symlink() or not path.is_file():
-            raise Error("bundle_incomplete")
-        data = path.read_bytes()
-        if len(data) > 1048576 or hashlib.sha256(data).hexdigest() != expected:
+        path = directory / filename
+        data, metadata = _read_stable_file(path)
+        if metadata["sha256"] != expected:
             raise Error("bundle_mismatch")
+        files[filename] = metadata
         modules[filename] = (path, data)
     loaded = {}
     for filename, (path, data) in modules.items():
@@ -49,7 +147,45 @@ def load_bundle():
         if filename == "android_tools_custody.py" and getattr(module, "CUSTODY_API_VERSION", None) != 1:
             raise Error("custody_api_mismatch")
         loaded[name] = module
-    return loaded
+    return LoadedBundle(loaded, files)
+
+
+def qualify_bundle():
+    bundle = load_bundle()
+    launcher = Path(__file__).absolute()
+    _launcher_bytes, launcher_metadata = _read_stable_file(launcher)
+    if launcher.resolve(strict=True) != launcher:
+        raise Error("bundle_entrypoint_not_canonical")
+    custody = bundle["android_tools_custody"]
+    if getattr(custody, "CUSTODY_API_VERSION", None) != 1:
+        raise Error("custody_api_mismatch")
+    if getattr(custody, "CUSTODY_MARKER_PROTOCOL", None) != 1:
+        raise Error("custody_marker_mismatch")
+    bundle_hashes = {
+        filename: bundle.files[filename]["sha256"]
+        for filename in sorted(BUNDLE_HASHES)
+    }
+    identity = {
+        "launcher_sha256": launcher_metadata["sha256"],
+        "bundle_sha256s": bundle_hashes,
+    }
+    canonical = json.dumps(
+        identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    result = {
+        "schema": "android-tools-bundle-qualification-v1",
+        "installation_id": hashlib.sha256(canonical).hexdigest(),
+        "contracts": dict(BUNDLE_CONTRACTS),
+        "custody": {
+            "path": bundle.files["android_tools_custody.py"]["path"],
+            "size_bytes": bundle.files["android_tools_custody.py"]["size_bytes"],
+            "sha256": bundle.files["android_tools_custody.py"]["sha256"],
+        },
+    }
+    emitted = json.dumps(result, sort_keys=True).encode("utf-8") + b"\n"
+    if len(emitted) > MAX_QUALIFICATION_BYTES:
+        raise Error("qualification_size_limit")
+    return result
 
 
 def private(path, directory=False):
@@ -139,7 +275,32 @@ def handoff_uncertain(module):
         raise Error(str(error)) from None
 
 
+def _first_positional_argument(argv):
+    options_with_values = {
+        "--arguments", "--binding-file", "--config", "--helper", "--interface",
+    }
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return argv[index + 1] if index + 1 < len(argv) else None
+        option = token.split("=", 1)[0]
+        if option in options_with_values:
+            index += 1 if "=" in token else 2
+        elif token.startswith("-"):
+            index += 1
+        else:
+            return token
+    return None
+
+
 def main():
+    argv = sys.argv[1:]
+    if _first_positional_argument(argv) == "bundle":
+        if argv != ["bundle", "qualify"]:
+            raise Error("bundle_qualification_arguments_rejected")
+        print(json.dumps(qualify_bundle(), sort_keys=True))
+        return 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("family", choices=("device", "preview", "docs", "evidence"))

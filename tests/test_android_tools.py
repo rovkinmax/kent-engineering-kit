@@ -388,6 +388,212 @@ class BundleTests(unittest.TestCase):
                 with self.assertRaises(facade.Error):
                     facade.load_bundle()
 
+    def test_stable_bundle_reader_rejects_unsafe_files_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "module.py"
+            path.write_bytes(b"BUNDLE_PROTOCOL = 1\n")
+            path.chmod(0o600)
+            self.assertEqual(facade._read_stable_file(path)[1]["size_bytes"], path.stat().st_size)
+
+            path.chmod(0o622)
+            with self.assertRaisesRegex(facade.Error, "bundle_unsafe"):
+                facade._read_stable_file(path)
+            path.chmod(0o600)
+            link = root / "link.py"
+            link.symlink_to(path)
+            with self.assertRaises(facade.Error):
+                facade._read_stable_file(link)
+
+            directory_path = root / "directory.py"
+            directory_path.mkdir()
+            with self.assertRaisesRegex(facade.Error, "bundle_unsafe"):
+                facade._read_stable_file(directory_path)
+            oversize_path = root / "oversize.py"
+            oversize_path.write_bytes(b"x" * (facade.MAX_BUNDLE_FILE_BYTES + 1))
+            oversize_path.chmod(0o600)
+            with self.assertRaisesRegex(facade.Error, "bundle_unsafe"):
+                facade._read_stable_file(oversize_path)
+            fifo = root / "pipe.py"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(facade.Error, "bundle_unsafe"):
+                facade._read_stable_file(fifo)
+            path.chmod(0o600)
+            with patch.object(facade.os, "getuid", return_value=os.getuid() + 1):
+                with self.assertRaisesRegex(facade.Error, "bundle_unsafe"):
+                    facade._read_stable_file(path)
+            hardlink = root / "hardlink.py"
+            os.link(path, hardlink)
+            with self.assertRaisesRegex(facade.Error, "bundle_unsafe"):
+                facade._read_stable_file(path)
+
+    def test_stable_bundle_reader_rejects_replacement_growth_and_truncation(self):
+        for case in ("replace", "growth", "truncate"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "module.py"
+                path.write_bytes(b"x" * 128)
+                path.chmod(0o600)
+                original_fstat = os.fstat
+                calls = 0
+
+                def fstat(descriptor):
+                    nonlocal calls
+                    calls += 1
+                    before = original_fstat(descriptor)
+                    if calls == 2 and case == "replace":
+                        replacement = root / "replacement.py"
+                        replacement.write_bytes(b"x" * 128)
+                        replacement.chmod(0o600)
+                        replacement.replace(path)
+                    return before
+
+                original_read = os.read
+                reads = 0
+
+                def read(descriptor, count):
+                    nonlocal reads
+                    raw = original_read(descriptor, count)
+                    reads += 1
+                    if reads == 1 and case in {"growth", "truncate"}:
+                        path.write_bytes(b"x" * (256 if case == "growth" else 64))
+                        path.chmod(0o600)
+                    return raw
+
+                with patch.object(facade.os, "fstat", side_effect=fstat), patch.object(
+                    facade.os, "read", side_effect=read
+                ), self.assertRaisesRegex(facade.Error, "bundle_unstable"):
+                    facade._read_stable_file(path)
+
+    def test_loaded_bundle_metadata_describes_the_verified_module_bytes(self):
+        bundle = facade.load_bundle()
+        self.assertEqual(set(bundle.files), set(facade.BUNDLE_HASHES))
+        for filename, expected in facade.BUNDLE_HASHES.items():
+            metadata = bundle.files[filename]
+            self.assertEqual(metadata["sha256"], expected)
+            self.assertEqual(metadata["size_bytes"], Path(metadata["path"]).stat().st_size)
+            self.assertEqual(Path(metadata["path"]), SOURCE.parent / filename)
+
+    def test_bundle_qualification_returns_only_fixed_contracts_and_verified_metadata(self):
+        with patch.object(facade, "read_private", side_effect=AssertionError("config read")), patch.object(
+            facade, "configuration", side_effect=AssertionError("config admission")
+        ), patch.object(facade, "custody", side_effect=AssertionError("custody operation")):
+            result = facade.qualify_bundle()
+        bundle = facade.load_bundle()
+        self.assertEqual(set(result), {"schema", "installation_id", "contracts", "custody"})
+        self.assertEqual(result["schema"], "android-tools-bundle-qualification-v1")
+        self.assertEqual(result["contracts"], facade.BUNDLE_CONTRACTS)
+        self.assertEqual(
+            result["custody"],
+            {key: bundle.files["android_tools_custody.py"][key]
+             for key in ("path", "size_bytes", "sha256")},
+        )
+        identity = {
+            "launcher_sha256": hashlib.sha256(SOURCE.read_bytes()).hexdigest(),
+            "bundle_sha256s": {
+                name: bundle.files[name]["sha256"] for name in sorted(facade.BUNDLE_HASHES)
+            },
+        }
+        canonical = json.dumps(
+            identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        self.assertEqual(result["installation_id"], hashlib.sha256(canonical).hexdigest())
+        emitted = json.dumps(result, sort_keys=True).encode("utf-8") + b"\n"
+        self.assertLessEqual(
+            len(emitted),
+            facade.MAX_QUALIFICATION_BYTES,
+        )
+
+    def test_bundle_qualification_cli_needs_no_options_or_config(self):
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["android-tools", "bundle", "qualify"]), redirect_stdout(output):
+            self.assertEqual(facade.main(), 0)
+        self.assertEqual(json.loads(output.getvalue()), facade.qualify_bundle())
+
+    def test_relative_config_named_bundle_keeps_existing_docs_dispatch(self):
+        native = facade.load_bundle()["android_tools_native"]
+        result = native.NativeResult("completed", "not_applicable")
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "bundle"
+            config_path.write_text(json.dumps(self.docs_config()), encoding="utf-8")
+            config_path.chmod(0o600)
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(directory)
+                output = io.StringIO()
+                with patch.object(facade, "load_bundle", return_value={
+                    "android_tools_native": native,
+                }), patch.object(
+                    native, "execute_android_native", return_value=result,
+                ) as execute, patch.object(sys, "argv", [
+                    "android-tools", "--config", "bundle", "docs", "search",
+                    "--arguments", '{"query":"Compose"}',
+                ]), redirect_stdout(output):
+                    self.assertEqual(facade.main(), 0)
+                self.assertIsNone(json.loads(output.getvalue())["local_manifest"])
+                execute.assert_called_once()
+            finally:
+                os.chdir(previous_cwd)
+
+    def test_bundle_qualification_rejects_all_extra_and_unknown_arguments(self):
+        cases = (
+            ["bundle", "qualify", "--record"],
+            ["bundle", "qualify", "--config", "/private/config"],
+            ["bundle", "qualify", "--include-artifacts"],
+            ["bundle", "qualify", "--helper", "/private/helper"],
+            ["bundle", "qualify", "--operation", "device.launch"],
+            ["--record", "bundle", "qualify"],
+            ["--config", "/private/config", "bundle", "qualify"],
+            ["bundle", "unsupported"],
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments), patch.object(
+                facade, "load_bundle", side_effect=AssertionError("invalid invocation loaded bundle")
+            ), patch.object(
+                facade, "configuration", side_effect=AssertionError("invalid invocation read config")
+            ), patch.object(sys, "argv", ["android-tools", *arguments]), self.assertRaisesRegex(
+                facade.Error, "bundle_qualification_arguments_rejected"
+            ):
+                facade.main()
+
+    def test_bundle_qualification_invalid_cli_emits_only_bounded_failure_json(self):
+        result = subprocess.run(
+            [sys.executable, "-B", str(SOURCE), "bundle", "qualify", "--record"],
+            cwd=SOURCE.parent,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertLessEqual(len(result.stdout), facade.MAX_QUALIFICATION_BYTES)
+        value = json.loads(result.stdout)
+        self.assertEqual(set(value), {"error", "effect"})
+        self.assertEqual(value["error"], "bundle_qualification_arguments_rejected")
+        self.assertNotIn("schema", value)
+
+    def test_bundle_qualification_requires_the_public_custody_marker_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            launcher = root / "android-tools"
+            launcher.write_text("#!/usr/bin/env python3\n")
+            launcher.chmod(0o700)
+            custody_path = root / "android_tools_custody.py"
+            content = (
+                b"BUNDLE_PROTOCOL = 1\n"
+                b"CUSTODY_API_VERSION = 1\n"
+                b"CUSTODY_MARKER_PROTOCOL = 2\n"
+            )
+            custody_path.write_bytes(content)
+            custody_path.chmod(0o600)
+            with patch.object(facade, "__file__", str(launcher)), patch.object(
+                facade, "BUNDLE_HASHES", {
+                    "android_tools_custody.py": hashlib.sha256(content).hexdigest(),
+                }
+            ), self.assertRaisesRegex(facade.Error, "custody_marker_mismatch"):
+                facade.qualify_bundle()
+
     def test_source_bundle_hashes_match_and_mixed_native_bundle_is_rejected(self):
         for filename in facade.BUNDLE_HASHES:
             source = SOURCE.parent / filename
