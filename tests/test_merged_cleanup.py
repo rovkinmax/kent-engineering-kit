@@ -396,8 +396,48 @@ class MergedCleanupPolicyTests(unittest.TestCase):
 
     def test_missing_task_session_ancestry_is_a_completeness_blocker(self):
         rows = [session(ROOT_SESSION, task_id=TASK, parent=SUPERVISOR_SESSION)]
-        with self.assertRaisesRegex(CleanupError, "root is missing|ancestry"):
-            build_session_closure(rows, task_id=TASK, project_id=PROJECT)
+        for catalog in (rows, rows + [session(SUPERVISOR_SESSION)]):
+            with self.subTest(parent_present=len(catalog) == 2):
+                with self.assertRaisesRegex(CleanupError, "root is missing|ancestry"):
+                    build_session_closure(catalog, task_id=TASK, project_id=PROJECT)
+
+    def test_registered_roots_bound_subtrees_without_selecting_coordinator(self):
+        coordinator = "99999999-9999-4999-8999-999999999999"
+        for root_key in ("supervisor_session_id", "reused_root_session_ids"):
+            with self.subTest(root_key=root_key):
+                membership = {
+                    "schema": "merged-cleanup-supervision-v1",
+                    "project_id": PROJECT,
+                    "supervisor_session_id": SUPERVISOR_SESSION,
+                    "task_ids": [TASK],
+                    "reused_root_session_ids": (
+                        [ROOT_SESSION] if root_key == "reused_root_session_ids" else []
+                    ),
+                }
+                boundary = (ROOT_SESSION if root_key == "reused_root_session_ids"
+                            else SUPERVISOR_SESSION)
+                rows = [
+                    session(coordinator),
+                    session(SUPERVISOR_SESSION, parent=coordinator),
+                    session(ROOT_SESSION, task_id=TASK, parent=(
+                        coordinator if boundary == ROOT_SESSION else SUPERVISOR_SESSION)),
+                    session(CHILD_SESSION, parent=boundary),
+                ]
+                result = build_session_closure(
+                    rows, task_id=TASK, project_id=PROJECT, supervision=[membership])
+                self.assertEqual(
+                    {row["session_id"] for row in result},
+                    {SUPERVISOR_SESSION, ROOT_SESSION, CHILD_SESSION})
+                for invalid_rows, error in (
+                    ([row for row in rows if row["session_id"] != boundary], "root is missing"),
+                    ([dict(row, task_id=OTHER_TASK) if row["session_id"] == CHILD_SESSION
+                      else row for row in rows], "unregistered Task owner"),
+                    ([row for row in rows if row["session_id"] != coordinator], "ancestry"),
+                ):
+                    with self.assertRaisesRegex(CleanupError, error):
+                        build_session_closure(
+                            invalid_rows, task_id=TASK, project_id=PROJECT,
+                            supervision=[membership])
 
     def test_foreign_reassigned_catalog_paths_do_not_enter_removal_closure(self):
         rows = [session(ROOT_SESSION, task_id=TASK)]
