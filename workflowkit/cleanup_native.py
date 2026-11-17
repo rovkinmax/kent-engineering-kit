@@ -1797,10 +1797,10 @@ class NativeCleanupBackend:
             raise CleanupError("merged cleanup preparation schema differs")
         session_id, session_row = self._current_agent_session()
         if history_operation is None:
-            operator_task_id = os.environ.get("KENT_TASK_ID", "")
+            # Kent injects Session/Step identity, not a Task environment value.
+            # The qualified native Session row owns the Task binding.
+            operator_task_id = session_row["task_id"]
             _uuid4(operator_task_id, _TASK_ID, "current operator Task")
-            if session_row["task_id"] != operator_task_id:
-                raise CleanupError("current Agent Session is not owned by the current operator Task")
             task_id = subject_task_id or operator_task_id
             project_id = _uuid4(session_row["project_id"], _PROJECT_ID, "Task Project")
         else:
