@@ -45,7 +45,10 @@ python3 -m py_compile \
   "$repo_root/workflowkit/runtime.py" \
   "$repo_root/scripts/prepare-github-ci" \
   "$repo_root/workflowkit/operations.py" \
+  "$repo_root/workflowkit/cleanup.py" \
+  "$repo_root/workflowkit/cleanup_native.py" \
   "$repo_root/workflowkit/project_install.py" \
+  "$repo_root/scripts/cleanup-merged-task" \
   "$repo_root/scripts/activate-primary-checkout" \
   "$repo_root/scripts/reconcile-canonical-workflows" \
   "$repo_root/templates/project/android-apk-install-preserve" \
@@ -115,6 +118,10 @@ done
 }
 [[ -x "$repo_root/scripts/prepare-github-ci" ]] || {
   echo "GitHub CI preparation CLI is not executable" >&2
+  exit 1
+}
+[[ -x "$repo_root/scripts/cleanup-merged-task" ]] || {
+  echo "merged cleanup CLI is not executable" >&2
   exit 1
 }
 ruby -ryaml -rjson -e 'exit 0' >/dev/null

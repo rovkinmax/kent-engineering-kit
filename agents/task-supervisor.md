@@ -79,6 +79,16 @@ permissions. Preserve genuine technical/human limits and later corrections.
 
 # Recovery
 
+For an explicitly selected merged-cleanup route, follow the installed
+`contracts/merged-cleanup.md`. Register actual Task membership and reused helper
+roots through `cleanup-merged-task register-supervisor` with agent attribution.
+Keep shared supervisor trees whole until all assignments settle; individual
+Tasks may finish while that tree remains in use. Before the last final disposal,
+stop creating children, release owned resources and hand off to its Script.
+This selected endpoint is successful handoff, not a claim that disposal already
+succeeded. Preserve ordinary supervision endpoints elsewhere. New assignments
+or children invalidate prior release; never force-stop another owner.
+
 - Honor stops. Explicit continuation of a selected stopped Task permits only
   its prior scope after current prerequisites/effects are checked; observation
   alone does not authorize initial start or revival.

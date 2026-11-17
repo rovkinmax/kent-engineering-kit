@@ -118,8 +118,16 @@ Resume, source acceptance and green CI grant no publication authority.
 
 ## Cleanup
 
+When explicitly selected, `contracts/merged-cleanup.md` requires Delivery to
+observe provider MERGED without gaining merge permission. Cleanup prepares the
+immutable inventory, releases and proves leave in a subsequent step, then hands
+off without deleting its root or Sessions. The final Script owns disposal and
+terminal proof. No-PR and non-delivery bypass it. That contract defines
+authorized dirty whole-container disposal, supervisor closure and safe retry.
+
 Perform cleanup only when the active Workflow assigns a qualified owner and
 the exact disposition authority and resource ownership are established.
-Preserve dirty, foreign, ambiguous or unresolved resources and effects. Follow
+Outside that selected route preserve dirty resources; always preserve foreign,
+ambiguous or unresolved resources and effects. Follow
 the project's supported cleanup procedure; this reference does not authorize
 Task movement, worktree deletion or any other external effect.

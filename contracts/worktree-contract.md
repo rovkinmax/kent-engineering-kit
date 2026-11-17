@@ -33,6 +33,12 @@ copying unrelated machine state.
 
 ## Cross-Session cleanup coordination
 
+An explicitly selected [merged cleanup route](merged-cleanup.md) supersedes
+ordinary clean-folder retention only for its authorized exclusive merged
+subject. It prepares in the Agent and deletes in a final Script, permits dirty
+whole-folder force without bypassing live owners, and qualifies same-subject
+native Resume recreation with retained branch and immutable inventory.
+
 Freeze exact Task/project/root/branch and recover prior coordination evidence.
 Close only proven task-owned children through their existing handles. Neither
 cwd/ancestry nor parent movement/PID exit establishes foreign-child ownership
