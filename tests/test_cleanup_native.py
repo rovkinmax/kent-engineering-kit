@@ -1489,7 +1489,7 @@ class NativeCleanupTests(unittest.TestCase):
                 }
 
         with (
-            mock.patch.dict(os.environ, {"KENT_SESSION_ID": SESSION, "KENT_TASK_ID": TASK}),
+            mock.patch.dict(os.environ, {"KENT_SESSION_ID": SESSION}, clear=True),
             mock.patch.object(sys, "argv", [str(entrypoint)]),
             mock.patch.object(backend, "runner", side_effect=runner),
             mock.patch.object(backend, "_native_task", return_value=task_detail),
@@ -1499,6 +1499,30 @@ class NativeCleanupTests(unittest.TestCase):
             mock.patch.object(backend, "_git", side_effect=git),
             mock.patch.object(backend, "_memory_call", side_effect=memory_call),
         ):
+            qualified_session_id, qualified_row = backend._current_agent_session()
+            for invalid_task in (None, "task-99999999-9999-4999-8999-999999999999"):
+                with self.subTest(native_task_binding=invalid_task):
+                    with mock.patch.object(
+                        backend, "_current_agent_session",
+                        return_value=(qualified_session_id, {**qualified_row, "task_id": invalid_task}),
+                    ):
+                        with self.assertRaises(CleanupError):
+                            backend.prepare(request)
+            snapshot = backend._snapshot_once((TASK,))
+            for key in ("session_id", "node_id"):
+                with self.subTest(current_node_binding=key):
+                    invalid_snapshot = {
+                        **snapshot,
+                        "current_nodes": [
+                            {**row, key: "12345678-1234-4234-8234-123456789abc"}
+                            if row["task_id"] == TASK else row
+                            for row in snapshot["current_nodes"]
+                        ],
+                    }
+                    with mock.patch.object(backend, "_snapshot_once", return_value=invalid_snapshot):
+                        with self.assertRaisesRegex(CleanupError, "current Agent"):
+                            backend.prepare(request)
+            self.assertEqual(artifacts, {})
             handoff = backend.prepare(request)
             stored = next(iter(artifacts.values()))
             stored_value = json.loads(stored)
