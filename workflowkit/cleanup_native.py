@@ -315,7 +315,6 @@ def _validate_cleanup_route_graph(
     if (
         len(groups) != 1
         or groups[0].get("transition_id") != "disposal_completed"
-        or groups[0].get("workflow_id") != workflow_id
     ):
         raise CleanupError("final cleanup Script has an unexpected transition route")
     edges = [
@@ -369,7 +368,6 @@ def _validate_delivered_policy_graph(
     ]
     if (
         len(groups) != 1
-        or groups[0].get("workflow_id") != workflow_id
     ):
         raise CleanupError("selected Workflow has no unique delivered policy group")
     group = groups[0]
@@ -1663,7 +1661,6 @@ class NativeCleanupBackend:
             and group.get("id") == edges[0].get("transition_group_id")
             and isinstance(group.get("source_node_id"), str)
             and _SESSION_ID.fullmatch(group["source_node_id"])
-            and group.get("workflow_id") == workflow_id
         ]
         return (
             groups[0].get("transition_id")

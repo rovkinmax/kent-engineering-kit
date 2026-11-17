@@ -587,13 +587,12 @@ class NativeCleanupTests(unittest.TestCase):
         edge_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
         transition_id = "not_delivered"
         graph = {
-            "workflow_id": WORKFLOW,
             "edges": [{
                 "id": edge_id,
                 "target_node_id": DONE_NODE, "transition_group_id": DELIVERED_GROUP,
             }],
             "transition_groups": [{
-                "id": DELIVERED_GROUP, "workflow_id": WORKFLOW,
+                "id": DELIVERED_GROUP,
                 "source_node_id": SOURCE_NODE,
                 "transition_id": transition_id,
             }],
@@ -612,6 +611,26 @@ class NativeCleanupTests(unittest.TestCase):
             self.backend._terminal_transition(OTHER_TASK, detail),
             "not_delivered",
         )
+        # A completed first Task releases shared supervision for the second.
+        for transition in ("disposal_completed", "ordinary_delivered"):
+            graph["transition_groups"][0]["transition_id"] = transition
+            self.assertEqual(
+                self.backend._terminal_transition(OTHER_TASK, detail), transition)
+        for key, value in (
+            ("target_node_id", SOURCE_NODE),
+            ("transition_group_id", "missing-group"),
+        ):
+            with self.subTest(edge_binding=key):
+                with mock.patch.dict(graph["edges"][0], {key: value}):
+                    self.assertIsNone(self.backend._terminal_transition(OTHER_TASK, detail))
+        wrong_workflow = "12345678-1234-4234-8234-123456789abc"
+        with mock.patch.object(
+            self.backend, "_read",
+            return_value=json.dumps({"workflow_id": wrong_workflow, "graph": graph}).encode(),
+        ):
+            self.backend._graph = {"workflow_id": wrong_workflow, "graph": graph}
+            self.assertIsNone(self.backend._terminal_transition(OTHER_TASK, detail))
+        self.backend._graph = {"workflow_id": WORKFLOW, "graph": graph}
         self.backend._snapshot_once = lambda *_args: {
             "current_nodes": [{
                 "task_id": OTHER_TASK, "node_id": DONE_NODE,
@@ -1134,7 +1153,6 @@ class NativeCleanupTests(unittest.TestCase):
             }],
             "transition_groups": [{
                 "id": "group-1",
-                "workflow_id": WORKFLOW,
                 "source_node_id": "cleanup",
                 "transition_id": "disposal_completed",
             }],
@@ -1143,6 +1161,10 @@ class NativeCleanupTests(unittest.TestCase):
             _validate_cleanup_route_graph(graph, WORKFLOW, entrypoint),
             entrypoint.resolve(),
         )
+        with self.assertRaisesRegex(CleanupError, "graph is incomplete"):
+            _validate_cleanup_route_graph(
+                {**graph, "workflow_id": "12345678-1234-4234-8234-123456789abc"},
+                WORKFLOW, entrypoint)
         with self.assertRaisesRegex(CleanupError, "successor edge"):
             _validate_cleanup_route_graph({
                 **graph,
@@ -1198,12 +1220,12 @@ class NativeCleanupTests(unittest.TestCase):
             ],
             "transition_groups": [
                 {
-                    "id": DELIVERED_GROUP, "workflow_id": WORKFLOW,
+                    "id": DELIVERED_GROUP,
                     "source_node_id": SOURCE_NODE, "transition_id": "delivered",
                     "description": compact if description is None else description,
                 },
                 {
-                    "id": DISPOSAL_GROUP, "workflow_id": WORKFLOW,
+                    "id": DISPOSAL_GROUP,
                     "source_node_id": ENTRY_NODE, "transition_id": "disposal_completed",
                 },
             ],
@@ -1231,6 +1253,8 @@ class NativeCleanupTests(unittest.TestCase):
             + '","workflow_id":"' + WORKFLOW + '","mode":"not_after_merge"}',
             '{"schema":"merged-cleanup-policy-v1","project_id":"' + wrong_project
             + '","workflow_id":"' + WORKFLOW + '","mode":"after_merge"}',
+            '{"schema":"merged-cleanup-policy-v1","project_id":"' + PROJECT
+            + '","workflow_id":"12345678-1234-4234-8234-123456789abc","mode":"after_merge"}',
             "é" * 1001,
         ]
         entrypoint = Path(__file__).resolve().parents[1] / "scripts/cleanup-merged-task"
