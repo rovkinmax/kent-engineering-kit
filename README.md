@@ -32,6 +32,16 @@ the explicit API, shared finite budgets and independent downstream limits.
 
 You can use individual tools without adopting a full project workflow.
 
+### Draft messages in your voice
+
+The [writing-voice skill](skills/writing-voice/SKILL.md) uses a private profile
+at `${KENT_PERSISTENCE_ROOT:-$HOME/.kent}/private/writing-voice/profile.md`
+when drafting communication on your behalf. Keep personal profiles outside
+Git and shared Kit files. Reading a profile brings it into model context
+and potentially Session history; it is not cloud-isolated storage.
+Without an available, authorized profile, the agent provides a neutral draft
+and states that the profile was not applied. Drafting does not authorize sending.
+
 ## Two ways to use it
 
 ### Bring a specialist to one problem
