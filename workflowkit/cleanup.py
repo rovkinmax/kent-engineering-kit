@@ -313,10 +313,12 @@ def build_session_closure(
         row["session_id"] for row in normalized
         if row["project_id"] == project_id and row["task_id"] == task_id
     }
+    registered_roots: set[str] = set()
     for record in memberships:
         if task_id in record["task_ids"]:
-            roots.add(record["supervisor_session_id"])
-            roots.update(record["reused_root_session_ids"])
+            registered_roots.add(record["supervisor_session_id"])
+            registered_roots.update(record["reused_root_session_ids"])
+    roots.update(registered_roots)
     if not roots:
         raise CleanupError("Task has no native Session roots")
     missing_roots = roots - set(by_id)
@@ -334,12 +336,14 @@ def build_session_closure(
         if len(selected) > MAX_SESSIONS:
             raise CleanupError("Session descendant closure exceeds its bound")
 
-    # A direct task Session with an unregistered parent proves that the
-    # supervisor/helper ownership chain is incomplete.
+    # Explicit supervisor/reused roots bound the authorized subtree; their
+    # known parents supply ancestry, not authority to delete the coordinator.
+    # Ordinary direct Task roots still require the complete registered chain.
     for session_id in roots:
         parent = by_id[session_id]["parent_agent_session_id"]
         if parent is not None and parent not in selected:
-            raise CleanupError("Task Session ancestry is not registered")
+            if session_id not in registered_roots or parent not in by_id:
+                raise CleanupError("Task Session ancestry is not registered")
     if any(
         by_id[session_id]["task_id"] is not None
         and by_id[session_id]["task_id"] not in registered_tasks
