@@ -49,6 +49,7 @@ _OPERATIONS = {
     "device.tap",
     "device.key",
     "device.swipe",
+    "device.input",
     "device.capture",
 }
 _DEVICE_OPERATIONS = _OPERATIONS - {
@@ -181,6 +182,8 @@ def execute_android_native(
             source_root=source_root,
             staging_dir=staging_dir,
         )
+        if operation == "device.input" and before_effect is None:
+            raise _InputError("lease_lost")
         if spec.tap_selector is not None and before_effect is None:
             raise _InputError("lease_lost")
     except _InputError as error:
@@ -230,6 +233,12 @@ def execute_android_native(
             {"device_serial": arguments["device_serial"], "x": x, "y": y},
             source_root=source_root, staging_dir=staging_dir,
         )
+
+    if operation == "device.input":
+        try:
+            before_effect()
+        except (ValueError, OSError, KeyError, subprocess.SubprocessError):
+            return NativeResult("completed", "not_dispatched", "lease_lost")
 
     result = _run_process(
         (str(executable_path), *command_prefix, *spec.argv),
@@ -518,6 +527,15 @@ def _build_call(
     if provider != "mobile-native":
         raise _InputError("unsupported_operation")
     serial = _serial(arguments)
+
+    if operation == "device.input":
+        _closed_arguments(arguments, {"device_serial", "text"}, {"device_serial", "text"})
+        text = _text_arg(arguments["text"])
+        return _CallSpec(
+            ("input", "--platform", "android", "--device", serial, text),
+            "status",
+            effectful=True,
+        )
 
     if operation == "device.tree":
         _closed_arguments(arguments, {"device_serial"}, {"device_serial"})

@@ -391,8 +391,12 @@ class AndroidToolsNativeTest(unittest.TestCase):
                     sys.stdout.write("x" * 100000)
                 elif mode == "stdout":
                     sys.stdout.write(os.environ.get("FAKE_STDOUT", ""))
+                elif mode == "sentinel":
+                    marker = os.environ.get("FAKE_STDOUT", "")
+                    sys.stdout.write(marker)
+                    sys.stderr.write(os.environ.get("FAKE_STDERR", marker))
                 elif mode == "error":
-                    sys.stderr.write("private-marker-secret\\n")
+                    sys.stderr.write(os.environ.get("FAKE_STDERR", "private-marker-secret\\n"))
                     raise SystemExit(7)
                 elif mode in {"png", "png-invalid"}:
                     output = next(
@@ -501,16 +505,19 @@ class AndroidToolsNativeTest(unittest.TestCase):
         *,
         mode: str = "success",
         stdout: str = "",
+        stderr: str = "",
         timeout: float = 2.0,
         output_limit: int = 64 * 1024,
         source_root: Path | None = None,
         staging_dir: Path | None = None,
         version: str = VERSION,
+        before_effect=None,
     ):
         environment = {
             "FAKE_CALLS": str(self.log_path),
             "FAKE_MODE": mode,
             "FAKE_STDOUT": stdout,
+            "FAKE_STDERR": stderr,
             "FAKE_VERSION": version,
             "FAKE_PNG": base64.b64encode(PNG).decode("ascii"),
             "FAKE_INVALID_PNG": base64.b64encode(INVALID_PNG).decode("ascii"),
@@ -528,6 +535,7 @@ class AndroidToolsNativeTest(unittest.TestCase):
                 output_limit_bytes=output_limit,
                 source_root=source_root,
                 staging_dir=staging_dir,
+                before_effect=before_effect,
             )
 
     def calls(self) -> list[list[str]]:
@@ -652,6 +660,123 @@ class AndroidToolsNativeTest(unittest.TestCase):
             [["key", "--platform", "android", "--device", "emulator-5554", "back"]],
         )
 
+    def test_input_uses_one_closed_positional_value_and_reports_dispatch_only(self) -> None:
+        value = "ordinary value; $(not-shell-expanded)"
+        custody_checks = []
+        result = self.call(
+            "mobile-native",
+            "device.input",
+            {"device_serial": "emulator-5554", "text": value},
+            before_effect=lambda: custody_checks.append("checked"),
+        )
+
+        self.assertEqual(result.transport, "completed")
+        self.assertEqual(result.effect, "unknown")
+        self.assertIsNone(result.error)
+        self.assertEqual(result.data, {"dispatched": True})
+        self.assertEqual(custody_checks, ["checked"])
+        self.assertEqual(
+            self.calls(),
+            [["input", "--platform", "android", "--device", "emulator-5554", value]],
+        )
+        self.assertNotIn(value, json.dumps(result.to_dict()))
+
+    def test_input_rejects_open_arguments_and_invalid_values_before_provider(self) -> None:
+        cases = (
+            ({"device_serial": "emulator-5554"}, "invalid_arguments"),
+            ({"device_serial": "emulator-5554", "text": ""}, "invalid_arguments"),
+            ({"device_serial": "emulator-5554", "text": "x" * 4097}, "invalid_arguments"),
+            ({"device_serial": "emulator-5554", "text": "line\nbreak"}, "invalid_arguments"),
+            ({"device_serial": "emulator-5554", "text": "secret=value"},
+             "secret_transport_unsupported"),
+            ({"device_serial": "emulator-5554", "text": "harmless", "package": "com.example.app"},
+             "invalid_arguments"),
+            ({"device_serial": "emulator-5554", "text": "harmless", "selector": "EditText"},
+             "invalid_arguments"),
+        )
+        for arguments, error in cases:
+            with self.subTest(arguments=arguments):
+                result = self.call("mobile-native", "device.input", arguments)
+                self.assertEqual((result.error, result.effect), (error, "not_dispatched"))
+                self.assertEqual(self.calls(), [])
+
+    def test_input_requires_custody_recheck_and_loss_prevents_provider_dispatch(self) -> None:
+        missing = self.call(
+            "mobile-native", "device.input",
+            {"device_serial": "emulator-5554", "text": "ordinary"},
+        )
+        lost = self.call(
+            "mobile-native", "device.input",
+            {"device_serial": "emulator-5554", "text": "ordinary"},
+            before_effect=lambda: (_ for _ in ()).throw(ValueError("lease lost")),
+        )
+
+        self.assertEqual((missing.error, missing.effect), ("lease_lost", "not_dispatched"))
+        self.assertEqual((lost.error, lost.effect), ("lease_lost", "not_dispatched"))
+        self.assertEqual(self.calls(), [])
+
+    def test_input_suppresses_provider_sentinels_and_never_retries_unknown_effect(self) -> None:
+        value = "private-input-sentinel"
+        output = "private-output-sentinel"
+        sentinels = self.call(
+            "mobile-native", "device.input",
+            {"device_serial": "emulator-5554", "text": value},
+            mode="sentinel", stdout=output, stderr=value, before_effect=lambda: None,
+        )
+        failed = self.call(
+            "mobile-native", "device.input",
+            {"device_serial": "emulator-5554", "text": value},
+            mode="error", stderr=value, before_effect=lambda: None,
+        )
+        timed_out = self.call(
+            "mobile-native", "device.input",
+            {"device_serial": "emulator-5554", "text": value},
+            mode="spawn", timeout=0.2, before_effect=lambda: None,
+        )
+
+        self.assertEqual((sentinels.transport, sentinels.effect, sentinels.error),
+                         ("completed", "unknown", None))
+        self.assertEqual((failed.transport, failed.effect, failed.error),
+                         ("failed", "unknown", "provider_failed"))
+        self.assertEqual((timed_out.transport, timed_out.effect, timed_out.error),
+                         ("timed_out", "unknown", "query_timeout"))
+        for result in (sentinels, failed, timed_out):
+            self.assertNotIn(value, json.dumps(result.to_dict()))
+            self.assertNotIn(output, json.dumps(result.to_dict()))
+        self.assertEqual(len(self.calls()), 3)
+        self.assertTrue(all(call[0] == "input" for call in self.calls()))
+
+    def test_input_unconfirmed_descendant_cleanup_is_unknown_without_replay(self) -> None:
+        settle_group = NATIVE._settle_group
+
+        def settle_but_report_unknown(process, deadline):
+            settled = settle_group(process, deadline)
+            if process.args[-1] == "--version":
+                return settled
+            return False
+
+        value = "private-input-sentinel"
+        with patch.object(NATIVE, "_settle_group", side_effect=settle_but_report_unknown):
+            result = self.call(
+                "mobile-native",
+                "device.input",
+                {"device_serial": "emulator-5554", "text": value},
+                mode="spawn",
+                timeout=0.2,
+                before_effect=lambda: None,
+            )
+
+        self.assertEqual(
+            (result.transport, result.effect, result.error),
+            ("unknown", "unknown", "drain_unknown"),
+        )
+        self.assertNotIn(value, json.dumps(result.to_dict()))
+        self.assertEqual(
+            self.calls(),
+            [["input", "--platform", "android", "--device", "emulator-5554", value]],
+        )
+        self.assertTrue(self.child_marker.exists())
+
     def test_dpad_keys_dispatch_exact_aliases_case_insensitively(self) -> None:
         aliases = (
             ("up", "up"),
@@ -737,17 +862,6 @@ class AndroidToolsNativeTest(unittest.TestCase):
                 self.assertEqual(result.effect, "not_dispatched")
                 self.assertEqual(result.error, "invalid_arguments")
                 self.assertEqual(self.calls(), [])
-
-    def test_unknown_input_operation_is_unsupported(self) -> None:
-        result = self.call(
-            "mobile-native",
-            "device.input",
-            {"device_serial": "emulator-5554", "text": "password"},
-        )
-
-        self.assertEqual(result.error, "unsupported_operation")
-        self.assertEqual(result.effect, "not_dispatched")
-        self.assertEqual(self.calls(), [])
 
     def test_visible_and_gone_assertions_return_structured_observations(self) -> None:
         tree = _ui_xml(
