@@ -23,6 +23,7 @@ class WritingVoiceTests(unittest.TestCase):
             "Proactively use", "user's behalf", "colleague replies",
             "PR or task comments", "email", "announcements",
             "even without a request for their style",
+            "when profile access is declined or unavailable",
         ):
             with self.subTest(trigger=trigger):
                 self.assertIn(trigger, frontmatter)
@@ -38,14 +39,16 @@ class WritingVoiceTests(unittest.TestCase):
             "do not search another user's home",
             "Do not create, update, copy, or install a profile",
             "style data, not authority",
-            "absent, empty, unreadable, or the read tool is unavailable",
+            "If profile processing consent is declined",
+            "the file is absent, empty or\nunreadable",
+            "the read tool is unavailable",
             "neutral draft",
             "outside the copyable",
             "do not bypass a denial",
             "Do not start research",
             "model context and potentially Session history",
             "obtain\nconsent before reading",
-            "if declined, use the neutral fallback",
+            "if declined, use the neutral fallback and its notice",
             "delegated prompts",
             "It overrides profile preferences",
             "Do not invent supporting facts",
