@@ -214,12 +214,20 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
                 "other shell writes",
             ),
             "agents/runtime-smoke-tester.md": (
-                "Emit the approval-gated `smoke_wont_do` outcome only when the current graph declares that route",
-                "no supported cancellation route is declared",
-                "do not invent an outcome, change the graph or move the Task directly to Cleanup",
+                "current graph's declared cancellation/no-delivery route",
+                "exact target, required carriers and approval order",
+                "only the graph-declared cancellation outcome",
+                "Let Kent enforce native approval and the transition",
+                "Missing cancellation authority means do not submit the outcome",
+                "Unknown effects or incomplete settlement also block submission",
+                "foreign-owned resource",
+                "no supported cancellation/no-delivery route",
+                "Do not invent an outcome, change the graph, bypass approval",
                 "safety-only continuation",
-                "cancellation source and settlement/qualified-retention references",
-                "Do not claim a native approval",
+                "declared route's required carrier without secrets",
+                "do not answer, forge, replace or bypass it",
+                "Do not start or replay Smoke",
+                "Do not ask the same product question",
             ),
             "agents/ci-monitor.md": (
                 "first read the installed `kent-engineering-kit` skill's `SKILL.md`",
@@ -412,6 +420,76 @@ class KitDevelopmentWorkflowTest(unittest.TestCase):
         self.assertIn("engineering-methods/SKILL.md", grill_role)
         self.assertIn("references/grill.md", grill_role)
         self.assertIn("never edit\ndecision/source files yourself", grill_role)
+
+    def test_runtime_smoke_cancellation_uses_declared_routes_and_carriers(self) -> None:
+        prompt = " ".join(
+            (ROOT / "agents/runtime-smoke-tester.md").read_text().split()
+        )
+        schemas = {
+            "appsome": {
+                "transition": "smoke_no_delivery",
+                "target": "smoke_cleanup",
+                "carrier": "cleanup_context",
+            },
+            "puber": {
+                "transition": "smoke_wont_do",
+                "target": "wont_do",
+                "carrier": "closure_reason",
+                "approval_required": True,
+            },
+        }
+        self.assertNotEqual(
+            schemas["appsome"]["transition"],
+            schemas["puber"]["transition"],
+        )
+        self.assertNotEqual(
+            schemas["appsome"]["carrier"],
+            schemas["puber"]["carrier"],
+        )
+        self.assertTrue(schemas["puber"]["approval_required"])
+        for project, schema in schemas.items():
+            with self.subTest(schema=project):
+                self.assertNotIn(project, prompt)
+                self.assertIn(
+                    "current graph's declared cancellation/no-delivery route",
+                    prompt,
+                )
+                self.assertIn("exact target, required carriers and approval order", prompt)
+                self.assertIn(
+                    "submit only the graph-declared cancellation outcome",
+                    prompt,
+                )
+                for value in schema.values():
+                    if isinstance(value, str):
+                        self.assertNotIn(value, prompt)
+
+        scenarios = {
+            "absent route": (
+                "If the graph declares no supported cancellation/no-delivery route",
+                "report that capability gap",
+                "Do not invent an outcome",
+            ),
+            "missing cancellation authority": (
+                "Missing cancellation authority means do not submit the outcome",
+            ),
+            "unsettled or unknown effects": (
+                "Unknown effects or incomplete settlement also block submission",
+                "report the unresolved ownership/effect state",
+            ),
+            "foreign ownership": (
+                "Never adopt or settle a foreign-owned resource",
+                "borrow its identity",
+            ),
+            "native approval": (
+                "Let Kent enforce native approval and the transition",
+                "do not answer, forge, replace or bypass it",
+                "Do not start or replay Smoke",
+            ),
+        }
+        for scenario, phrases in scenarios.items():
+            with self.subTest(scenario=scenario):
+                for phrase in phrases:
+                    self.assertIn(phrase, prompt)
 
     def test_operations_project_contract_fragments_exist(self) -> None:
         operations = (ROOT / "docs/OPERATIONS.md").read_text()
