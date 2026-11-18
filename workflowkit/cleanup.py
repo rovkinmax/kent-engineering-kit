@@ -15,6 +15,9 @@ import uuid
 
 MAX_INVENTORY_BYTES = 8 * 1024 * 1024
 MAX_HANDOFF_BYTES = 65_536
+# Two bounded 64 KiB strings can each expand sixfold under JSON escaping,
+# plus the native identity envelope. This is independent of output limits.
+MAX_NATIVE_SCRIPT_INPUT_BYTES = 1_048_576
 MAX_SCRIPT_OUTPUT_BYTES = 262_144
 MAX_SESSIONS = 4096
 MAX_WORKTREES = 32
@@ -1666,10 +1669,18 @@ def main() -> int:
     try:
         if sys.argv[1:]:
             return _command_main(sys.argv[1:])
-        payload = parse_json(_read_bounded(sys.stdin.buffer, MAX_SCRIPT_OUTPUT_BYTES),
-                             maximum=MAX_SCRIPT_OUTPUT_BYTES)
-        if not isinstance(payload, dict) or set(payload) != {"_kent", "cleanup_result"}:
+        payload = parse_json(_read_bounded(sys.stdin.buffer, MAX_NATIVE_SCRIPT_INPUT_BYTES),
+                             maximum=MAX_NATIVE_SCRIPT_INPUT_BYTES)
+        required = {"_kent", "cleanup_result"}
+        if not isinstance(payload, dict) or set(payload) not in (
+            required, required | {"commentary"},
+        ):
             raise CleanupError("native final Script input is incomplete")
+        if "commentary" in payload and (
+            not isinstance(payload["commentary"], str)
+            or len(payload["commentary"].encode("utf-8")) > 65_536
+        ):
+            raise CleanupError("native final Script commentary is invalid")
         backend = _native_backend()
         handoff = payload["cleanup_result"]
         if not isinstance(handoff, str) or len(handoff.encode("utf-8")) > MAX_HANDOFF_BYTES:

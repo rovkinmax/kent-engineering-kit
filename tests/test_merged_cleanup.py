@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
+from workflowkit import cleanup
 
 from workflowkit.cleanup import (
     CleanupError,
@@ -739,6 +743,51 @@ class MergedCleanupPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(CleanupError, "overlaps"):
                 from workflowkit.cleanup import _assert_control_file_outside_inventory
                 _assert_control_file_outside_inventory(target, inventory)
+
+
+class NativeScriptEnvelopeTests(unittest.TestCase):
+    def invoke(self, raw, backend):
+        with (
+            mock.patch.object(sys, "argv", ["cleanup-merged-task"]),
+            mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(raw))),
+            mock.patch.object(sys, "stdout", io.TextIOWrapper(io.BytesIO())),
+            mock.patch.object(sys, "stderr", io.StringIO()),
+            mock.patch.object(cleanup, "_native_backend", backend),
+            mock.patch.object(cleanup, "validate_handoff", return_value={}),
+            mock.patch.object(cleanup, "execute_inventory", return_value={}),
+            mock.patch.object(cleanup, "output_transition", return_value=b"{}\n"),
+        ):
+            return cleanup.main()
+
+    def test_native_commentary_is_optional_bounded_and_ignored(self):
+        for commentary in (None, "", "Привет 🌍", "\x00" * 65_536):
+            with self.subTest(commentary_bytes=None if commentary is None else len(commentary.encode())):
+                payload = {"_kent": {"task_id": TASK}, "cleanup_result": "{}"}
+                if commentary is not None:
+                    payload["commentary"] = commentary
+                backend = mock.Mock()
+                factory = mock.Mock(return_value=backend)
+                self.assertEqual(self.invoke(json.dumps(payload).encode(), factory), 0)
+                backend.load_handoff.assert_called_once_with({}, payload["_kent"])
+
+    def test_invalid_native_envelopes_fail_before_backend(self):
+        valid = {"_kent": {}, "cleanup_result": "{}"}
+        payloads = [
+            {**valid, "commentary": value}
+            for value in (None, 1, [], {}, "x" * 65_537, "🌍" * 16_385)
+        ] + [{**valid, "unknown": ""}, {"_kent": {}}, {"cleanup_result": "{}"}, []]
+        raw_cases = [json.dumps(payload).encode() for payload in payloads]
+        raw_cases += [
+            b'{"_kent":{},"cleanup_result":"{}","commentary":"","commentary":""}',
+            b'{"_kent":{},"_kent":{},"cleanup_result":"{}"}',
+            b'{"_kent":',
+            b" " * (1_048_576 + 1),
+        ]
+        for index, raw in enumerate(raw_cases):
+            with self.subTest(index=index):
+                factory = mock.Mock()
+                self.assertEqual(self.invoke(raw, factory), 2)
+                factory.assert_not_called()
 
 
 if __name__ == "__main__":
