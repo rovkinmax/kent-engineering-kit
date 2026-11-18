@@ -59,8 +59,19 @@ verification surfaces; the writer's summary or commit alone is not the
 candidate. Review only the assigned perspective and remain read-only.
 
 - A specification review checks the request, decisions and accepted plan.
+  For changed stateful behavior, challenge the governing invariant at a
+  relevant boundary interaction, not only through the examples already in
+  the plan. Identify the source behavior and any existing assertion that
+  covers it; absence of a test alone is not a confirmed defect. Distinguish
+  a counterexample, missing required proof and residual risk.
 - A standards review checks repository rules, architecture, correctness and
   regression risks.
+  Where the change introduces overlapping state guards, asynchronous derived
+  work or shared infrastructure, assess whether each mechanism is necessary
+  and whether dependencies point toward scenario-specific code. Record a
+  concrete simplification or the reason the existing mechanism is needed.
+  Preserve required isolation and cancellation guarantees; do not demand a
+  rewrite merely to reduce line count.
 - A runtime review checks only the approved runtime behavior and evidence
   within its selected scope.
 
@@ -83,6 +94,15 @@ failed, blocked, stale and unknown outcomes distinct; do not relabel old
 evidence or substitute one review perspective for another. Identify the
 capable owner for each remaining obligation and preserve it for the correct
 later stage.
+
+Before escalating a blocker, identify the applicable instruction source and
+original decision if superseded, the concrete unmet prerequisite, and the
+observable condition that clears it. Use the selected execution context,
+not a different checkout's procedure. Recover accessible facts before asking
+the user to decide. Continue independently authorized work; do not wait for
+an entire Session when only a resource or intermediate result is required.
+Preserve unresolved effects and actual attempt limits. Record this in the
+existing report; do not create another tracking system.
 
 ## Learning and Improvement
 
