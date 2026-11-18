@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest import mock
@@ -152,6 +153,9 @@ class RecordingBackend:
 
     def begin_inventory(self, _inventory):
         return None
+
+    def admit_effects(self):
+        pass
 
     def record_settlement(self, _stage, _kind, _index, disposition):
         return disposition
@@ -746,6 +750,165 @@ class MergedCleanupPolicyTests(unittest.TestCase):
 
 
 class NativeScriptEnvelopeTests(unittest.TestCase):
+    def test_inventory_bytes_remain_compatible_with_immutable_baseline(self):
+        inventory = validate_inventory(base_inventory())
+        # Captured by validating the same fixture with f61da076's implementation.
+        self.assertEqual(inventory.sha256, "eca57f0bd4a0e5c980b8eeb3d791a65ff746c2d94e2f39bc8baf46d4d545c367")
+        self.assertEqual(cleanup.inventory_from_bytes(inventory.raw).raw, inventory.raw)
+
+    def history(self, items):
+        return SimpleNamespace(
+            inventories=items, value={"project_id": PROJECT,
+                                     "task_ids": [item.value["task_id"] for item in items]},
+            sha256="a" * 64)
+
+    def test_history_aggregate_and_late_admission_have_zero_effects(self):
+        first = validate_inventory(base_inventory())
+        backend = RecordingBackend()
+        large_value = base_inventory()
+        large_value["pull_request"]["base_ref"] = "r" * 512
+        large = validate_inventory(large_value)
+        members = []
+        for index in range(256):
+            value = json.loads(large.raw)
+            task_id = f"task-{index + 100:08x}-2222-4222-8222-222222222222"
+            sid = f"{index + 100:08x}-5555-4555-8555-555555555555"
+            value["task_id"] = value["sessions"][0]["task_id"] = task_id
+            value["sessions"][0]["session_id"] = sid
+            value["sessions"][0]["artifact_relpath"] = f"projects/{PROJECT}/sessions/{sid}"
+            value["release"].update({"prepared_by_session_id": sid, "owner_session_ids": [sid]})
+            value["member_outcomes"][0]["task_id"] = task_id
+            path, wid, branch = f"/tmp/member-{index}", f"worktree-{index}", f"task/{index}"
+            value["worktrees"][0].update({"path": path, "worktree_id": wid, "branch": branch,
+                                          "owner_task_id": task_id})
+            value["subject"].update({"worktree_path": path, "worktree_id": wid, "branch": branch})
+            members.append(validate_inventory(value))
+        with self.assertRaises(CleanupError):
+            cleanup._preflight_history(self.history(members), backend)
+        self.assertEqual(backend.calls, [])
+        with (
+            mock.patch.object(cleanup, "_native_backend", return_value=backend),
+            mock.patch.object(cleanup, "_read_control_file", return_value=b"{}"),
+            mock.patch.object(cleanup, "history_inventory_from_bytes", return_value=self.history(members)),
+            mock.patch.object(cleanup, "_assert_control_file_outside_inventory"),
+        ):
+            with self.assertRaises(CleanupError):
+                cleanup._command_main(["history-apply", "--inventory", "/private/history.json",
+                                       "--confirm", "a" * 64])
+        self.assertEqual(backend.calls, [])
+        second_value = base_inventory(sessions=[session(CHILD_SESSION, task_id=OTHER_TASK)])
+        second_value["task_id"] = OTHER_TASK
+        second_value["worktrees"][0].update({
+            "path": "/tmp/cleanup-second", "worktree_id": "second",
+            "owner_task_id": OTHER_TASK,
+        })
+        second_value["subject"]["worktree_path"] = "/tmp/cleanup-second"
+        second_value["subject"]["worktree_id"] = "second"
+        # Only preflight dependencies need these immutable rows; their complete
+        # historical binding remains the production validator's responsibility.
+        second = SimpleNamespace(value=second_value, sha256="b" * 64, raw=b"{}")
+        backend.revalidate = mock.Mock(side_effect=[(), CleanupError("late admission")])
+        with self.assertRaisesRegex(CleanupError, "late admission"):
+            cleanup._preflight_history(self.history([first, second]), backend)
+        self.assertFalse(any(call[0].startswith("delete") for call in backend.calls))
+
+    def test_history_shared_resources_and_read_dependencies_block(self):
+        first = validate_inventory(base_inventory())
+        for kind in ("shared-session", "later-protected-root", "later-operator-read"):
+            with self.subTest(kind=kind):
+                value = json.loads(first.raw)
+                value["task_id"] = OTHER_TASK
+                value["worktrees"][0]["path"] = "/tmp/second-root"
+                if kind != "shared-session":
+                    value["sessions"][0]["session_id"] = CHILD_SESSION
+                if kind == "later-protected-root":
+                    value["protected_roots"][0]["path"] = first.value["worktrees"][0]["path"]
+                if kind == "later-operator-read":
+                    value["history_operation"] = {
+                        "operator_session_id": ROOT_SESSION,
+                        "operator_project_id": PROJECT,
+                    }
+                second = SimpleNamespace(value=value, sha256="b" * 64, raw=b"{}")
+                backend = RecordingBackend()
+                with self.assertRaisesRegex(CleanupError, "share removable|invalidates"):
+                    cleanup._preflight_history(self.history([first, second]), backend)
+                self.assertFalse(any(call[0].startswith("delete") for call in backend.calls))
+
+    def test_history_siblings_do_not_remove_native_persistence_parent(self):
+        items = []
+        for index in range(2):
+            value = base_inventory()
+            path = f"/tmp/persistence/worktrees/project/member-{index}"
+            value["subject"]["worktree_path"] = value["worktrees"][0]["path"] = path
+            if index:
+                value["task_id"] = value["sessions"][0]["task_id"] = OTHER_TASK
+                value["worktrees"][0]["owner_task_id"] = OTHER_TASK
+                value["member_outcomes"][0]["task_id"] = OTHER_TASK
+                value["subject"]["worktree_id"] = value["worktrees"][0]["worktree_id"] = "second"
+            sid = ROOT_SESSION if index == 0 else CHILD_SESSION
+            value["sessions"][0]["session_id"] = sid
+            value["sessions"][0]["artifact_relpath"] = f"projects/{PROJECT}/sessions/{sid}"
+            value["release"].update({"prepared_by_session_id": sid, "owner_session_ids": [sid]})
+            value["protected_roots"].append({"path": "/tmp/persistence", "kind": "native-persistence"})
+            items.append(validate_inventory(value))
+        backend = RecordingBackend()
+        backend.context = {"persistence_root": "/tmp/persistence"}
+        cleanup._preflight_history(self.history(items), backend)
+        self.assertEqual(len(backend.calls), 2)
+
+    def test_history_cli_late_member_failure_precedes_every_delete(self):
+        first = validate_inventory(base_inventory())
+        value = json.loads(first.raw)
+        value["task_id"] = OTHER_TASK
+        value["sessions"] = [session(CHILD_SESSION, task_id=OTHER_TASK)]
+        value["worktrees"][0].update({"path": "/tmp/second-root", "worktree_id": "second",
+                                     "owner_task_id": OTHER_TASK})
+        second = SimpleNamespace(value=value, sha256="b" * 64, raw=b"{}")
+        backend = RecordingBackend()
+        original = backend.revalidate
+        def revalidate(value):
+            if value["task_id"] == OTHER_TASK:
+                raise CleanupError("late member rejected")
+            return original(value)
+        backend.revalidate = revalidate
+        with (
+            mock.patch.object(cleanup, "_native_backend", return_value=backend),
+            mock.patch.object(cleanup, "_read_control_file", return_value=b"{}"),
+            mock.patch.object(cleanup, "history_inventory_from_bytes", return_value=self.history([first, second])),
+            mock.patch.object(cleanup, "_assert_control_file_outside_inventory"),
+        ):
+            with self.assertRaisesRegex(CleanupError, "late member"):
+                cleanup._command_main(["history-apply", "--inventory", "/private/history.json",
+                                       "--confirm", "a" * 64])
+        self.assertFalse(any(call[0].startswith("delete") for call in backend.calls))
+
+    def test_full_depth_session_order_is_iterative(self):
+        rows = []
+        for index in range(4096):
+            sid = f"{4096 - index:08x}-1111-4111-8111-111111111111"
+            rows.append(session(sid, task_id=TASK, parent=rows[-1]["session_id"] if rows else None))
+        inventory = validate_inventory(base_inventory(sessions=list(reversed(rows))))
+        backend = RecordingBackend()
+        execute_inventory(inventory, backend)
+        deleted = [call[1] for call in backend.calls if call[0] == "delete-session"]
+        self.assertEqual(deleted, [row["session_id"] for row in reversed(rows)])
+        self.assertEqual(
+            [index for index, _row in cleanup._ordered_sessions(rows)],
+            list(reversed(range(4096))),
+        )
+        rows[0]["parent_agent_session_id"] = rows[-1]["session_id"]
+        with self.assertRaisesRegex(CleanupError, "cycle"):
+            cleanup._ordered_sessions(rows)
+
+    def test_output_bound_includes_newline(self):
+        result = execute_inventory(validate_inventory(base_inventory()), RecordingBackend())
+        size = len(cleanup.output_transition(result))
+        with mock.patch.object(cleanup, "MAX_SCRIPT_OUTPUT_BYTES", size):
+            self.assertEqual(len(cleanup.output_transition(result)), size)
+        with mock.patch.object(cleanup, "MAX_SCRIPT_OUTPUT_BYTES", size - 1):
+            with self.assertRaises(CleanupError):
+                cleanup.output_transition(result)
+
     def invoke(self, raw, backend):
         with (
             mock.patch.object(sys, "argv", ["cleanup-merged-task"]),

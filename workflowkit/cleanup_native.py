@@ -15,6 +15,7 @@ import selectors
 import shutil
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -30,6 +31,7 @@ from .cleanup import (
     MAX_SESSIONS,
     MAX_WORKTREES,
     MAX_RECEIPT_BYTES,
+    MAX_NATIVE_SCRIPT_INPUT_BYTES,
     RECEIPT_SCHEMA,
     _native_worktree_path,
     FiniteHistoryInventory,
@@ -166,6 +168,65 @@ def _safe_environment(context: Mapping[str, Any] | None = None) -> dict[str, str
     return environment
 
 
+def _command_capacity(argv: Sequence[str], environment: Mapping[str, str]) -> None:
+    """Check the actual exec vector, including encoded environment and pointers."""
+    try:
+        args = [os.fsencode(value) for value in argv]
+        env = [os.fsencode(key) + b"=" + os.fsencode(value) for key, value in environment.items()]
+        if any(b"\0" in value for value in (*args, *env)):
+            raise ValueError("NUL in exec vector")
+        limit = os.sysconf("SC_ARG_MAX")
+        # Preserve a conservative platform margin; never trim the environment.
+        size = sum(len(value) + 1 for value in (*args, *env)) + (
+            len(args) + len(env) + 2
+        ) * struct.calcsize("P")
+        if size + 4096 > limit:
+            raise ValueError("exec vector exceeds ARG_MAX")
+        if sys.platform.startswith("linux") and any(
+            len(value) + 1 > os.sysconf("SC_PAGESIZE") * 32 for value in (*args, *env)
+        ):
+            raise ValueError("exec string exceeds platform limit")
+    except (TypeError, ValueError, OSError) as error:
+        raise CleanupError("native command argv/environment capacity is unavailable") from error
+
+
+def _bounded_rows(connection, query, args, *, columns, maximum_rows, budget, deadline,
+                  text_limit=_MAX_SNAPSHOT_BYTES, sql_types=None):
+    """Qualify SQL types and complete byte lengths before materializing payloads."""
+    if connection.execute("PRAGMA encoding").fetchone() != ("UTF-8",):
+        raise CleanupError("native evidence byte accounting requires the native UTF-8 database")
+    aliases = [f"c{i}" for i in range(columns)]
+    metadata = ",".join(
+        f"typeof({name}),length(CAST({name} AS BLOB))" for name in aliases
+    )
+    header = f"WITH evidence({','.join(aliases)}) AS ({query}) SELECT {metadata} FROM evidence"
+    count = 0
+    for row in connection.execute(header, args):
+        count += 1
+        if count > maximum_rows or time.monotonic() > deadline:
+            raise CleanupError("complete native evidence exceeds its row/time bound")
+        for index in range(0, len(row), 2):
+            kind, length = row[index:index + 2]
+            if sql_types is not None and kind not in sql_types[index // 2]:
+                raise CleanupError("native evidence SQL field type differs")
+            if kind not in {"null", "text", "blob", "integer"}:
+                raise CleanupError("native evidence has an unsupported SQL type")
+            size = 0 if kind == "null" else 8 if kind == "integer" else length
+            if size is None or size > text_limit:
+                raise CleanupError("native evidence field exceeds its byte bound")
+            budget[0] -= size
+            if budget[0] < 0:
+                raise CleanupError("complete native evidence exceeds its byte bound")
+    rows = []
+    for row in connection.execute(query, args):
+        if len(rows) >= count or time.monotonic() > deadline:
+            raise CleanupError("complete native evidence changed or timed out")
+        rows.append(row)
+    if len(rows) != count:
+        raise CleanupError("complete native evidence row count changed")
+    return rows
+
+
 def _run_bounded(
     argv: Sequence[str],
     *,
@@ -181,6 +242,7 @@ def _run_bounded(
         or (input_bytes is not None and len(input_bytes) > MAX_INVENTORY_BYTES + 65_536)
     ):
         raise CleanupError("native command bounds are invalid")
+    _command_capacity(argv, environment)
     try:
         process = subprocess.Popen(
             list(argv), cwd=str(cwd), env=dict(environment),
@@ -205,6 +267,7 @@ def _run_bounded(
             selector.unregister(process.stdin)
             process.stdin.close()
     deadline = time.monotonic() + timeout
+    discarded_stderr = 0
     try:
         while selector.get_map():
             remaining = deadline - time.monotonic()
@@ -247,6 +310,12 @@ def _run_bounded(
                     continue
                 output = outputs[key.fd]
                 output.extend(chunk)
+                if key.fd == stderr_fd:
+                    overflow = max(0, len(output) - 65_400)
+                    if overflow:
+                        del output[:overflow]
+                        discarded_stderr += overflow
+                    continue
                 if len(output) > output_limit:
                     process.kill()
                     process.wait()
@@ -262,7 +331,10 @@ def _run_bounded(
         process.stderr.close()
         if process.stdin is not None and not process.stdin.closed:
             process.stdin.close()
-    return code, bytes(outputs[stdout_fd]), bytes(outputs[stderr_fd])
+    diagnostic = bytes(outputs[stderr_fd])
+    if discarded_stderr:
+        diagnostic = f"[discarded {discarded_stderr} stderr bytes]\n".encode() + diagnostic
+    return code, bytes(outputs[stdout_fd]), diagnostic
 
 
 def _json_object(raw: bytes, label: str) -> dict[str, Any]:
@@ -470,10 +542,16 @@ class NativeCleanupBackend:
         self._receipt_entries: dict[tuple, dict[str, Any]] = {}
         self._native_ack: dict[str, dict[str, Any]] = {}
         self._pending_worktree_proofs: dict[str, dict[str, Any]] = {}
+        self._execution_environment = None
+        self._snapshot_capacities = {}
+        self._receipt_growth_plans = {}
+        self._receipt_growth_templates = {}
 
     @property
     def environment(self) -> dict[str, str]:
-        return _safe_environment(self.context)
+        if self._execution_environment is None:
+            return _safe_environment(self.context)
+        return dict(self._execution_environment)
 
     def _run_cli(self, args: Sequence[str], *, cwd: Path, environment=None, **kwargs):
         return _run_bounded(
@@ -546,8 +624,15 @@ class NativeCleanupBackend:
         if inventory is None or self._frozen_script_identity is None:
             raise CleanupError("outside Script lacks a loaded, qualified inventory")
         value = inventory.value
-        if value["subject"]["worktree_id"] not in self._worktree_settlements:
+        acknowledged = any(
+            key[0] == "worktree_native_ack"
+            and value["worktrees"][key[2]]["worktree_id"] == value["subject"]["worktree_id"]
+            for key in self._receipt_entries
+        )
+        if value["subject"]["worktree_id"] not in self._worktree_settlements and not acknowledged:
             raise CleanupError("outside Script root removal is not settled")
+        if _check_path_components(self._script_workspace, allow_missing_tree=True) is not None:
+            raise CleanupError("outside Script root is not absent")
         detail = self._native_task(value["task_id"], value["project_id"])
         summary, source = detail.get("summary", {}), detail.get("source_workspace", {})
         scripts = detail.get("current_scripts")
@@ -644,7 +729,10 @@ class NativeCleanupBackend:
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA busy_timeout=250")
             connection.execute("BEGIN")
-            if connection.execute("PRAGMA query_only").fetchone() != (1,):
+            if (
+                connection.execute("PRAGMA query_only").fetchone() != (1,)
+                or connection.execute("PRAGMA journal_mode").fetchone() != ("wal",)
+            ):
                 raise CleanupError("native observer is not query-only")
             actual = [
                 row[2] for row in connection.execute("PRAGMA database_list")
@@ -693,56 +781,59 @@ class NativeCleanupBackend:
                     for name, kind in required.items()
                 ):
                     raise CleanupError("native observer schema differs")
-            def scan_catalog(cursor, label):
-                rows, scanned_bytes = [], 0
-                while True:
-                    batch = cursor.fetchmany(128)
-                    if not batch:
-                        break
-                    for item in batch:
-                        scanned_bytes += sum(
-                            len(value.encode("utf-8")) if isinstance(value, str)
-                            else len(value) if isinstance(value, bytes) else 8
-                            for value in item if value is not None
-                        )
-                    rows.extend(batch)
-                    if (
-                        len(rows) > _MAX_NATIVE_SESSIONS
-                        or scanned_bytes > _MAX_SNAPSHOT_BYTES
-                        or time.monotonic() > deadline
-                    ):
-                        raise CleanupError(f"native {label} catalog exceeds its bounded scan")
-                return rows
+            budget = [_MAX_SNAPSHOT_BYTES]
+            def scan(query, args=(), columns=1, maximum_rows=_MAX_NATIVE_SESSIONS,
+                     text_limit=_MAX_SNAPSHOT_BYTES, sql_types=None):
+                return _bounded_rows(
+                    connection, query, args, columns=columns, maximum_rows=maximum_rows,
+                    budget=budget, deadline=deadline, text_limit=text_limit, sql_types=sql_types)
 
-            sessions = scan_catalog(connection.execute(
+            sessions = scan(
                 "SELECT id,project_id,task_id,parent_agent_session_id,"
                 "previous_session_id,artifact_relpath,workspace_id,worktree_id "
                 "FROM sessions ORDER BY id LIMIT ?",
-                (_MAX_NATIVE_SESSIONS + 1,),
-            ), "Session")
-            current_node_owners = scan_catalog(connection.execute(
+                (_MAX_NATIVE_SESSIONS + 1,), columns=8,
+                sql_types=[{"text"}, {"text"}, {"text", "null"}, {"text", "null"},
+                           {"text", "null"}, {"text"}, {"text", "null"}, {"text", "null"}],
+            )
+            current_node_owners = scan(
                 "SELECT task_id,node_id,session_id,entered_by_edge_id "
                 "FROM task_current_nodes "
                 "ORDER BY task_id,node_id,session_id LIMIT ?",
-                (_MAX_NATIVE_SESSIONS + 1,),
-            ), "current-node")
+                (_MAX_NATIVE_SESSIONS + 1,), columns=4,
+                sql_types=[{"text"}, {"text"}, {"text", "null"}, {"text", "null"}],
+            )
             if task_ids:
                 placeholders = ",".join("?" for _ in task_ids)
-                current_node_values = connection.execute(
-                    "SELECT task_id,node_id,session_id,current_input_values_json,"
+                projection = (
+                    "CASE WHEN json_valid(current_input_values_json) "
+                    "AND json_type(current_input_values_json)='object' THEN "
+                    "(SELECT json_group_object(key,CASE WHEN type='object' THEN json(value) ELSE value END) "
+                    "FROM json_each(current_input_values_json) WHERE key IN ('cleanup_context','cleanup_result') "
+                    "HAVING count(*)=coalesce(sum(CASE WHEN "
+                    "(key='cleanup_context' AND type='text') OR "
+                    "(key='cleanup_result' AND type IN ('text','object')) "
+                    "THEN CASE WHEN length(CAST(value AS BLOB))<=65536 THEN 1 ELSE 0 END ELSE 0 END),0)) "
+                    "ELSE NULL END"
+                )
+                current_node_values = scan(
+                    f"SELECT task_id,node_id,session_id,{projection},"
                     "entered_by_edge_id "
                     "FROM task_current_nodes "
                     f"WHERE task_id IN ({placeholders}) "
                     "ORDER BY task_id,node_id,session_id LIMIT ?",
-                    (*task_ids, MAX_SESSIONS + 1),
-                ).fetchall()
+                    (*task_ids, MAX_SESSIONS + 1), columns=5, maximum_rows=MAX_SESSIONS,
+                    sql_types=[{"text"}, {"text"}, {"text", "null"}, {"text"}, {"text", "null"}],
+                )
                 if len(current_node_values) > MAX_SESSIONS:
                     raise CleanupError("selected native Task current nodes exceed their bound")
-                tasks = connection.execute(
+                tasks = scan(
                     "SELECT id,project_id,workflow_id,source_workspace_id,managed_worktree_id "
                     f"FROM task_records WHERE id IN ({placeholders}) ORDER BY id LIMIT ?",
-                    (*task_ids, _MAX_MEMBER_TASKS + 1),
-                ).fetchall()
+                    (*task_ids, _MAX_MEMBER_TASKS + 1), columns=5, maximum_rows=_MAX_MEMBER_TASKS,
+                    sql_types=[{"text"}, {"text"}, {"blob", "null"},
+                               {"text", "null"}, {"text", "null"}],
+                )
             else:
                 current_node_values = []
                 tasks = []
@@ -752,38 +843,40 @@ class NativeCleanupBackend:
             worktree_ids = sorted({row[4] for row in tasks if row[4] is not None})
             if workspace_ids:
                 placeholders = ",".join("?" for _ in workspace_ids)
-                workspaces = connection.execute(
+                workspaces = scan(
                     "SELECT id,project_id,canonical_root_path FROM workspaces "
                     f"WHERE id IN ({placeholders}) ORDER BY id LIMIT ?",
                     (*workspace_ids, MAX_WORKTREES + _MAX_MEMBER_TASKS + 1),
-                ).fetchall()
+                    columns=3, maximum_rows=MAX_WORKTREES + _MAX_MEMBER_TASKS,
+                    sql_types=[{"text"}] * 3,
+                )
             else:
                 workspaces = []
             if worktree_ids:
                 placeholders = ",".join("?" for _ in worktree_ids)
-                worktrees = connection.execute(
+                worktrees = scan(
                     "SELECT id,workspace_id,canonical_root_path FROM worktrees "
                     f"WHERE id IN ({placeholders}) ORDER BY id LIMIT ?",
                     (*worktree_ids, MAX_WORKTREES + _MAX_MEMBER_TASKS + 1),
-                ).fetchall()
+                    columns=3, maximum_rows=MAX_WORKTREES + _MAX_MEMBER_TASKS,
+                    sql_types=[{"text"}] * 3,
+                )
             else:
                 worktrees = []
             if task_ids:
                 placeholders = ",".join("?" for _ in task_ids)
-                comments = connection.execute(
+                comments = scan(
                     "SELECT id,task_id,body,author_kind,author_id,created_at_unix_ms,"
                     "updated_at_unix_ms FROM task_comments "
                     f"WHERE task_id IN ({placeholders}) "
                     "ORDER BY task_id,created_at_unix_ms,id LIMIT ?",
-                    (*task_ids, _MAX_MEMBER_TASKS * 256 + 1),
-                ).fetchall()
+                    (*task_ids, _MAX_RECEIPT_COMMENTS + 1),
+                    columns=7, maximum_rows=_MAX_RECEIPT_COMMENTS, text_limit=262_144,
+                    sql_types=[{"text"}] * 5 + [{"integer"}] * 2,
+                )
             else:
                 comments = []
-            estimated = sum(len(str(field).encode("utf-8")) for group in (
-                sessions, current_node_owners, current_node_values, tasks,
-                workspaces, worktrees, comments,
-            ) for row in group for field in row if field is not None)
-            if estimated > _MAX_SNAPSHOT_BYTES or time.monotonic() > deadline:
+            if time.monotonic() > deadline:
                 raise CleanupError("native snapshot exceeds its byte/time bound")
             parsed_current_nodes = []
             selected_task_ids = set(task_ids)
@@ -795,14 +888,14 @@ class NativeCleanupBackend:
                         not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id)
                     ))
                     or not isinstance(values_raw, str)
-                    or len(values_raw.encode("utf-8")) > 65_536
+                    or len(values_raw.encode("utf-8")) > MAX_NATIVE_SCRIPT_INPUT_BYTES
                     or (entered_by_edge_id is not None and (
                         not isinstance(entered_by_edge_id, str)
                         or not _SESSION_ID.fullmatch(entered_by_edge_id)
                     ))
                 ):
                     raise CleanupError("native current-node identity or input size is invalid")
-                values = parse_json(values_raw.encode("utf-8"), maximum=65_536)
+                values = parse_json(values_raw.encode("utf-8"), maximum=MAX_NATIVE_SCRIPT_INPUT_BYTES)
                 if not isinstance(values, dict):
                     raise CleanupError("native current-node values are not an object")
                 parsed_current_nodes.append({
@@ -848,6 +941,11 @@ class NativeCleanupBackend:
         if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
             raise CleanupError("native persistence database changed during observation")
         operations.validate_native_local_context(self.context)
+        # Preserve the exact scan accounting, including duplicate catalog
+        # projections and SQL NULL/integer costs; result JSON is not this budget.
+        self._snapshot_capacities[task_ids] = (
+            _MAX_SNAPSHOT_BYTES - budget[0], len(comments),
+        )
         return {
             "sessions": [
                 dict(zip(
@@ -938,7 +1036,9 @@ class NativeCleanupBackend:
             result.append(comment)
         return result
 
-    def _receipt_comments(self) -> list[dict[str, Any]]:
+    def _receipt_comments(
+        self, exact: tuple[str, str | None] | None = None,
+    ) -> list[dict[str, Any]]:
         """Read every comment page in one qualified read-only WAL transaction."""
         operations.validate_native_local_context(self.context)
         database = Path(self.context["persistence_root"]) / "db/main.sqlite3"
@@ -947,14 +1047,16 @@ class NativeCleanupBackend:
             raise CleanupError("receipt comment database is unsafe")
         connection = None
         result: list[dict[str, Any]] = []
-        deadline, size = time.monotonic() + _SNAPSHOT_SECONDS, 0
+        deadline = time.monotonic() + _SNAPSHOT_SECONDS
         try:
             connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0.25)
+            connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _MAX_RECEIPT_HISTORY_BYTES)
             connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
             connection.execute("PRAGMA query_only=ON")
             connection.execute("BEGIN")
             if (
                 connection.execute("PRAGMA query_only").fetchone() != (1,)
+                or connection.execute("PRAGMA journal_mode").fetchone() != ("wal",)
                 or [r[2] for r in connection.execute("PRAGMA database_list")
                     if r[1] == "main"] != [str(database)]
                 or connection.execute(
@@ -965,30 +1067,33 @@ class NativeCleanupBackend:
             columns = {r[1]: r[2].upper() for r in connection.execute("PRAGMA table_info(task_comments)")}
             if any(columns.get(key) != value for key, value in _COMMENT_COLUMNS.items()):
                 raise CleanupError("receipt comment schema differs")
-            offset = 0
-            while True:
-                page = connection.execute(
+            clause, args = "", (self._receipt_inventory.value["task_id"],)
+            if exact is not None:
+                body, comment_id = exact
+                clause = " AND body=? AND author_kind='agent' AND author_id=?"
+                args += (body, self._receipt_author_id)
+                if comment_id is not None:
+                    clause += " AND id=?"
+                    args += (comment_id,)
+            page = _bounded_rows(
+                connection,
                     "SELECT id,task_id,body,author_kind,author_id,created_at_unix_ms,"
                     "updated_at_unix_ms FROM task_comments WHERE task_id=? "
-                    "ORDER BY created_at_unix_ms,id LIMIT 128 OFFSET ?",
-                    (self._receipt_inventory.value["task_id"], offset),
-                ).fetchall()
-                for item in page:
-                    size += sum(len(v.encode("utf-8")) for v in item if isinstance(v, str))
-                    if (
-                        len(result) >= _MAX_RECEIPT_COMMENTS or size > _MAX_RECEIPT_HISTORY_BYTES
-                        or time.monotonic() > deadline
-                    ):
-                        raise CleanupError("complete receipt history exceeds its row/byte/time bound")
-                    result.append(dict(zip((
-                        "comment_id", "task_id", "body", "author_kind", "author_id",
-                        "created_at_unix_ms", "updated_at_unix_ms",
-                    ), item)))
-                if len(page) < 128:
-                    break
-                offset += len(page)
+                    + clause + " ORDER BY created_at_unix_ms,id LIMIT ?",
+                (*args, _MAX_RECEIPT_COMMENTS + 1),
+                columns=7, maximum_rows=_MAX_RECEIPT_COMMENTS,
+                budget=[_MAX_RECEIPT_HISTORY_BYTES], deadline=deadline, text_limit=262_144,
+                sql_types=[{"text"}] * 5 + [{"integer"}] * 2,
+            )
+            for item in page:
+                result.append(dict(zip((
+                    "comment_id", "task_id", "body", "author_kind", "author_id",
+                    "created_at_unix_ms", "updated_at_unix_ms",
+                ), item)))
         except sqlite3.Error as error:
             raise CleanupError("complete native receipt read is unavailable") from error
+        except CleanupError as error:
+            raise CleanupError("complete receipt history exceeds bounds or is unavailable") from error
         finally:
             if connection is not None:
                 connection.close()
@@ -1027,7 +1132,7 @@ class NativeCleanupBackend:
     @staticmethod
     def _receipt_key(stage: str, entry: Mapping[str, Any]) -> tuple:
         key = (stage, entry["kind"], entry["index"])
-        if stage == "worktree_settled":
+        if stage in {"worktree_settled", "worktree_native_ack"}:
             incarnation = entry["proof"]["incarnation"]
             key += tuple(incarnation[field] for field in ("device", "inode", "ctime_ns"))
         return key
@@ -1050,11 +1155,13 @@ class NativeCleanupBackend:
                 isinstance(value, dict)
                 and isinstance(value.get("schema"), str)
                 and value["schema"].startswith("merged-cleanup-receipt-")
-                and value["schema"] != RECEIPT_SCHEMA
+                and value["schema"] not in {"merged-cleanup-receipt-v1", RECEIPT_SCHEMA}
                 and value.get("inventory_sha256") == inventory.sha256
             ):
                 raise CleanupError("receipt history uses an unsupported receipt version")
-            if not isinstance(value, dict) or value.get("schema") != RECEIPT_SCHEMA:
+            if not isinstance(value, dict) or not isinstance(value.get("schema"), str) or value.get("schema") not in {
+                "merged-cleanup-receipt-v1", RECEIPT_SCHEMA,
+            }:
                 continue
             if value.get("inventory_sha256") != inventory.sha256:
                 continue
@@ -1084,8 +1191,13 @@ class NativeCleanupBackend:
             for key, entry in entries.items() if key[0] == "session_native_settled"
         }
         self._worktree_settlements = set()
+        pending_ack_indices = {
+            key[2] for key in entries
+            if key[0] == "worktree_native_ack"
+            and ("worktree_settled", *key[1:]) not in entries
+        }
         for key in entries:
-            if key[0] == "worktree_settled":
+            if key[0] == "worktree_settled" and key[2] not in pending_ack_indices:
                 row = inventory.value["worktrees"][key[2]]
                 if _check_path_components(Path(row["path"]), allow_missing_tree=True) is None:
                     self._worktree_settlements.add(row["worktree_id"])
@@ -1097,6 +1209,8 @@ class NativeCleanupBackend:
         return records
 
     def begin_inventory(self, inventory):
+        if self._execution_environment is None:
+            self._execution_environment = _safe_environment(self.context)
         self._receipt_inventory = inventory
         self._native_ack = {}
         self._pending_worktree_proofs = {}
@@ -1198,6 +1312,12 @@ class NativeCleanupBackend:
             "inventory_sha256": inventory.sha256, "producer": self._receipt_producer,
             "stage": stage, "entries": [entry],
         }, inventory, self._receipt_producer)
+        environment = self._prepare_receipt_append(receipt)
+        self._append_prepared_receipt(receipt, environment)
+        return disposition
+
+    def _prepare_receipt_append(self, receipt: Mapping[str, Any]) -> dict[str, str]:
+        inventory = self._receipt_inventory
         producer = self._qualify_receipt_producer()
         if producer != self._receipt_producer:
             raise CleanupError("receipt native producer changed")
@@ -1217,12 +1337,28 @@ class NativeCleanupBackend:
         if producer["kind"] == "script":
             environment.pop("KENT_SESSION_ID", None)
             environment.pop("KENT_STEP_ID", None)
+        _command_capacity(self._receipt_argv(body), environment)
+        return environment
+
+    def _receipt_argv(self, body: str) -> list[str]:
+        value = self._receipt_inventory.value
+        return [str(self.kent), "task", "comment", "add", value["task_id"],
+                "--project", value["project_id"], "--author", "agent",
+                "--author-id", self._receipt_author_id, "--body", body]
+
+    def _append_prepared_receipt(
+        self, receipt: Mapping[str, Any], environment: Mapping[str, str],
+    ) -> None:
+        """Closed ACK path: no producer, snapshot, history or postcondition reads."""
+        inventory = self._receipt_inventory
+        receipt = validate_receipt(receipt, inventory, self._receipt_producer)
+        body = canonical_bytes(receipt, maximum=MAX_RECEIPT_BYTES).decode("utf-8")
+        argv = self._receipt_argv(body)
+        _command_capacity(argv, environment)
         try:
-            _, output, _ = self.runner([
-                "task", "comment", "add", inventory.value["task_id"],
-                "--project", inventory.value["project_id"], "--author", "agent",
-                "--author-id", self._receipt_author_id, "--body", body,
-            ], cwd=self.workspace, timeout=30.0, output_limit=4096, environment=environment)
+            _, output, _ = self.runner(
+                argv[1:], cwd=self.workspace, timeout=30.0,
+                output_limit=4096, environment=environment)
         except (OSError, CleanupError):
             output = b""
         # CLI 2.13 emits two TSV lines, not a JSON object. An uncertain write
@@ -1233,15 +1369,168 @@ class NativeCleanupBackend:
         )
         if match is not None and match[2].decode() != inventory.value["task_id"]:
             raise CleanupError("native comment response belongs to another Task")
-        records = self._load_receipts()
+        records = self._receipt_comments(exact=(
+            body, match[1].decode() if match is not None else None,
+        ))
         persisted = [
             row for row in records if row["body"] == body
             and row["author_kind"] == "agent" and row["author_id"] == self._receipt_author_id
+            and type(row["created_at_unix_ms"]) is int
+            and row["updated_at_unix_ms"] == row["created_at_unix_ms"]
+            and isinstance(row["comment_id"], str)
+            and re.fullmatch(r"comment-[0-9a-f-]{36}", row["comment_id"]) is not None
             and (match is None or row["comment_id"] == match[1].decode())
         ]
-        if not persisted or self._receipt_key(stage, entry) not in self._receipt_entries:
+        if not persisted:
             raise CleanupError("receipt write remains unknown after exact complete readback")
-        return disposition
+        for entry in receipt["entries"]:
+            self._receipt_entries[self._receipt_key(receipt["stage"], entry)] = entry
+            # Actual confirmed rows now consume the fresh snapshot budget.
+            # Stop counting their maximum future template as well, without
+            # granting any credit for unobserved catalog removals.
+            remaining = self._receipt_growth_templates.get(inventory.sha256, {})
+            reserved = remaining.pop((receipt["stage"], entry["kind"], entry["index"]), None)
+            if reserved is not None:
+                task_id, growth, rows = self._receipt_growth_plans[inventory.sha256]
+                self._receipt_growth_plans[inventory.sha256] = (
+                    task_id, growth - reserved, rows - 1,
+                )
+            if receipt["stage"] == "session_native_settled":
+                row = inventory.value["sessions"][entry["index"]]
+                self._session_settlements = getattr(self, "_session_settlements", {})
+                self._session_settlements[row["session_id"]] = entry["disposition"]
+
+    def _receipt(
+        self, stage: str, kind: str, index: int, disposition: str, proof: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        inventory = self._receipt_inventory
+        subject = receipt_subject(inventory.value, kind, index)
+        return validate_receipt({
+            "schema": RECEIPT_SCHEMA, "task_id": inventory.value["task_id"],
+            "inventory_sha256": inventory.sha256, "producer": self._receipt_producer,
+            "stage": stage, "entries": [{
+                "kind": kind, "index": index, "subject_sha256": hashlib.sha256(
+                    canonical_bytes(subject)).hexdigest(),
+                "disposition": disposition, "proof": proof,
+            }],
+        }, inventory, self._receipt_producer)
+
+    def admit_effects(self) -> None:
+        """Reserve no comments: prove finite remaining growth and exec capacities."""
+        inventory = self._receipt_inventory
+        if inventory is None:
+            raise CleanupError("effect admission lacks immutable inventory")
+        records = self._load_receipts()
+        templates = []
+        value = inventory.value
+        for member_id in sorted({value["task_id"]} | {
+            task for record in value.get("supervision", []) for task in record["task_ids"]
+        }):
+            _command_capacity([
+                str(self.kent), "task", "show", member_id,
+                "--project", value["project_id"], "--json",
+            ], self.environment)
+        _command_capacity([
+            str(self.kent), "workflow", "graph", "inspect", value["workflow_id"], "--json",
+        ], self.environment)
+        for kind, rows in (("session", value["sessions"]), ("owned", value["owned_containers"])):
+            for index, row in enumerate(rows):
+                if row["disposition"] != "remove":
+                    continue
+                if kind == "session" and ("session_native_settled", kind, index) not in self._receipt_entries:
+                    templates.append(self._receipt("session_native_settled", kind, index, "removed",
+                                                  {"session_id": row["session_id"], "native_status": "ok"}))
+                    _command_capacity([str(self.kent), "session", "delete", "--confirm", "--json",
+                                       row["session_id"]], self.environment)
+                if ("container_settled", kind, index) not in self._receipt_entries:
+                    templates.append(self._receipt("container_settled", kind, index, "removed",
+                                                  {"path_absent": True}))
+        for index, row in enumerate(value["worktrees"]):
+            if row["disposition"] != "remove":
+                continue
+            primary = next(item["path"] for item in value["protected_roots"]
+                           if item["kind"] == "primary-workspace")
+            for arguments in (
+                ["-C", primary, "worktree", "list", "--porcelain"],
+                ["-C", row["path"], "rev-parse", "--verify", "HEAD"],
+                ["-C", primary, "rev-parse", "--verify", f"refs/heads/{row['branch']}"],
+            ):
+                _command_capacity(["/usr/bin/git", *arguments], self.environment)
+            info = _check_path_components(Path(row["path"]), allow_missing_tree=True)
+            if info is None:
+                pending = [
+                    entry["proof"]["incarnation"] for key, entry in self._receipt_entries.items()
+                    if key[:3] == ("worktree_native_ack", "worktree", index)
+                    and ("worktree_settled", *key[1:]) not in self._receipt_entries
+                ]
+                if not pending:
+                    continue
+                incarnation = pending[-1]
+            else:
+                incarnation = {"device": info.st_dev, "inode": info.st_ino, "ctime_ns": info.st_ctime_ns}
+            # Stat fields are platform-native unsigned machine integers. Use their
+            # largest encoded values for the admitted current incarnation's proof.
+            maximum = {key: max(number, 2**64 - 1) for key, number in incarnation.items()}
+            for stage, disposition, proof in (
+                ("worktree_native_ack", "acknowledged",
+                 {"incarnation": maximum, "native_outcome": "NOT_APPLICABLE"}),
+                ("worktree_settled", "removed", {
+                    "incarnation": maximum, "path_absent": True,
+                    "git_registration_absent": True, "branch_oid": row["branch_oid"],
+                    "native_record": "missing",
+                }),
+            ):
+                key = (stage, "worktree", index, *(incarnation[k] for k in ("device", "inode", "ctime_ns")))
+                if key not in self._receipt_entries:
+                    templates.append(self._receipt(stage, "worktree", index, disposition, proof))
+            _command_capacity([
+                str(self.kent), "worktree", "delete", "--project", row["project_id"],
+                "--workspace", row["workspace_id"], "--force", "--json", row["worktree_id"],
+            ], self.environment)
+        size = sum(
+            len(v.encode("utf-8")) if isinstance(v, str) else 8
+            for row in records for v in row.values()
+        )
+        environment = self.environment
+        if self._receipt_producer["kind"] == "script":
+            environment.pop("KENT_SESSION_ID", None)
+            environment.pop("KENT_STEP_ID", None)
+        growth = 0
+        growth_templates = {}
+        for receipt in templates:
+            body = canonical_bytes(receipt, maximum=MAX_RECEIPT_BYTES).decode("utf-8")
+            _command_capacity(self._receipt_argv(body), environment)
+            cost = len(body.encode()) + len(value["task_id"]) + len(self._receipt_author_id) + 44 + 5 + 16
+            growth += cost
+            entry = receipt["entries"][0]
+            growth_templates[(receipt["stage"], entry["kind"], entry["index"])] = cost
+        size += growth
+        if len(records) + len(templates) > _MAX_RECEIPT_COMMENTS or size > _MAX_RECEIPT_HISTORY_BYTES:
+            raise CleanupError("remaining durable receipt growth exceeds complete history capacity")
+        # History admission visits every inventory before any effect. Retain
+        # each member's remaining growth and recheck ALL observed read scopes
+        # when adding a plan: a later member can append into an earlier member's
+        # supervision snapshot. Do not credit speculative Session/catalog
+        # deletions, nor treat successful own-history admission as shared space.
+        self._receipt_growth_plans[inventory.sha256] = (
+            value["task_id"], growth, len(templates),
+        )
+        self._receipt_growth_templates[inventory.sha256] = growth_templates
+        selected = tuple(sorted({value["task_id"]} | {
+            task for record in value.get("supervision", []) for task in record["task_ids"]
+        }))
+        scopes = set(self._snapshot_capacities) | {selected}
+        for scope in sorted(scopes):
+            if not scope:
+                continue
+            self._session_snapshot(scope)
+            used_bytes, used_rows = self._snapshot_capacities[scope]
+            plans = [plan for plan in self._receipt_growth_plans.values() if plan[0] in scope]
+            if (
+                used_bytes + sum(plan[1] for plan in plans) > _MAX_SNAPSHOT_BYTES
+                or used_rows + sum(plan[2] for plan in plans) > _MAX_RECEIPT_COMMENTS
+            ):
+                raise CleanupError("remaining receipt growth exceeds shared snapshot capacity")
 
     def _current_agent_session(self) -> tuple[str, dict[str, Any]]:
         session_id = os.environ.get("KENT_SESSION_ID", "")
@@ -1372,11 +1661,15 @@ class NativeCleanupBackend:
                 database.as_uri() + "?mode=ro", uri=True,
                 timeout=0.25, isolation_level=None,
             )
+            connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _MAX_SNAPSHOT_BYTES)
             connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA busy_timeout=250")
             connection.execute("BEGIN")
-            if connection.execute("PRAGMA query_only").fetchone() != (1,):
+            if (
+                connection.execute("PRAGMA query_only").fetchone() != (1,)
+                or connection.execute("PRAGMA journal_mode").fetchone() != ("wal",)
+            ):
                 raise CleanupError("native path snapshot is not query-only")
             actual = [
                 row[2] for row in connection.execute("PRAGMA database_list")
@@ -1385,13 +1678,16 @@ class NativeCleanupBackend:
             if actual != [str(database)]:
                 raise CleanupError("native path observer database binding differs")
             placeholders = ",".join("?" for _ in worktree_ids)
-            rows = connection.execute(
+            rows = _bounded_rows(
+                connection,
                 "SELECT wt.id,wt.workspace_id,wt.canonical_root_path,w.project_id,"
                 "w.canonical_root_path FROM worktrees wt "
                 "JOIN workspaces w ON w.id=wt.workspace_id "
                 f"WHERE wt.id IN ({placeholders}) ORDER BY wt.id LIMIT ?",
                 (*worktree_ids, MAX_WORKTREES + 1),
-            ).fetchall()
+                columns=5, maximum_rows=MAX_WORKTREES, budget=[_MAX_SNAPSHOT_BYTES],
+                deadline=deadline, sql_types=[{"text"}] * 5,
+            )
             if (
                 (not allow_missing and len(rows) != len(worktree_ids))
                 or len(rows) > MAX_WORKTREES
@@ -1674,7 +1970,7 @@ class NativeCleanupBackend:
         code, _output, _error = _run_bounded(
             ["/usr/bin/git", "-C", str(root or self._primary_path()),
              "merge-base", "--is-ancestor", older, newer],
-            cwd=self.workspace, environment=_safe_environment(),
+            cwd=self.workspace, environment=self.environment,
             timeout=20.0, output_limit=4096,
         )
         if code not in (0, 1):
@@ -2463,6 +2759,7 @@ class NativeCleanupBackend:
             ]
             if (
                 connection.execute("PRAGMA query_only").fetchone() != (1,)
+                or connection.execute("PRAGMA journal_mode").fetchone() != ("wal",)
                 or actual != [str(database)]
             ):
                 raise CleanupError("native root catalog is not read-only and bound")
@@ -2474,8 +2771,12 @@ class NativeCleanupBackend:
                 "ORDER BY wt.id LIMIT ?",
             )
             total_bytes = 0
+            budget = [_MAX_SNAPSHOT_BYTES]
             for query in queries:
-                rows = connection.execute(query, (_MAX_NATIVE_SESSIONS + 1,)).fetchall()
+                rows = _bounded_rows(
+                    connection, query, (_MAX_NATIVE_SESSIONS + 1,), columns=1,
+                    maximum_rows=_MAX_NATIVE_SESSIONS, budget=budget,
+                    deadline=deadline, sql_types=[{"text"}], text_limit=65_536)
                 if len(rows) > _MAX_NATIVE_SESSIONS:
                     raise CleanupError("native workspace/worktree catalog exceeds its bound")
                 for (raw_path,) in rows:
@@ -2963,6 +3264,25 @@ class NativeCleanupBackend:
             self._verify_history_operator(history_operation)
             if task_id not in history_operation["selected_task_ids"]:
                 raise CleanupError("historical subject escaped the frozen exact selection")
+        # An ACK authorizes observation, never absence inference or another Delete.
+        if self._receipt_inventory is not None:
+            pending_ack_by_index = {}
+            for key, entry in list(self._receipt_entries.items()):
+                if key[0] != "worktree_native_ack":
+                    continue
+                if ("worktree_settled", *key[1:]) in self._receipt_entries:
+                    continue
+                pending_ack_by_index.setdefault(key[2], []).append(entry)
+            for index, entries in pending_ack_by_index.items():
+                if len(entries) != 1:
+                    raise CleanupError("multiple unsettled worktree incarnations are ambiguous")
+                entry = entries[0]
+                row = inventory["worktrees"][index]
+                if row["worktree_id"] in self._worktree_settlements:
+                    continue
+                if _check_path_components(Path(row["path"]), allow_missing_tree=True) is None:
+                    self.require_physical_coverage()
+                    self._finish_worktree_ack(row, entry["proof"]["incarnation"])
         selected_tasks = {task_id}
         for membership in inventory["supervision"]:
             if task_id in membership["task_ids"]:
@@ -3268,6 +3588,15 @@ class NativeCleanupBackend:
                 row["device"], row["inode"],
             ):
                 raise CleanupError("native Session artifact was substituted before deletion")
+        ack_receipt = ack_environment = None
+        if self._receipt_inventory is not None:
+            self.admit_effects()
+            index = next(i for i, item in enumerate(self._receipt_inventory.value["sessions"])
+                         if item["session_id"] == session_id)
+            ack_receipt = self._receipt(
+                "session_native_settled", "session", index, "removed",
+                {"session_id": session_id, "native_status": "ok"})
+            ack_environment = self._prepare_receipt_append(ack_receipt)
         code, output, error = self.runner(
             ["session", "delete", "--confirm", "--json", session_id],
             cwd=self.workspace, timeout=120.0, output_limit=65_536,
@@ -3308,16 +3637,20 @@ class NativeCleanupBackend:
                 raise CleanupError("native Session delete exit status contradicts its error")
         else:
             raise CleanupError("native Session delete response identity differs")
+        self._native_ack[session_id] = {"session_id": session_id, "native_status": "ok"}
+        if ack_receipt is not None:
+            self._append_prepared_receipt(ack_receipt, ack_environment)
         self._snapshots = {}
         after = self._snapshot_once()
         if any(item["session_id"] == session_id for item in after["sessions"]):
             raise CleanupError("native Session metadata remains after lifecycle response")
         self._session_settlements = getattr(self, "_session_settlements", {})
         self._session_settlements[session_id] = disposition
-        self._native_ack[session_id] = {"session_id": session_id, "native_status": "ok"}
         return disposition
 
     def remove_session_container(self, row: Mapping[str, Any]) -> str:
+        if self._receipt_inventory is not None:
+            self.admit_effects()
         session_id = row["session_id"]
         if getattr(self, "_session_settlements", {}).get(session_id) not in {"removed", "absent"}:
             raise CleanupError("Session residual cleanup lacks settled lifecycle evidence")
@@ -3364,6 +3697,8 @@ class NativeCleanupBackend:
         return "removed"
 
     def remove_owned_container(self, row: Mapping[str, Any]) -> str:
+        if self._receipt_inventory is not None:
+            self.admit_effects()
         path = _clean_path(row["path"], "owned container")
         if self._receipt_inventory is not None:
             index = next(
@@ -3450,12 +3785,36 @@ class NativeCleanupBackend:
                 ) != row["branch_oid"]:
                     raise CleanupError("receipt-backed worktree retained ref changed")
                 return "removed"
+        ack_receipt = ack_environment = None
+        if self._receipt_inventory is not None:
+            self.admit_effects()
+            index = next(i for i, item in enumerate(self._receipt_inventory.value["worktrees"])
+                         if item["worktree_id"] == row["worktree_id"])
+            acks = [entry for key, entry in self._receipt_entries.items()
+                    if key[:3] == ("worktree_native_ack", "worktree", index)]
+            info = _check_path_components(Path(row["path"]), allow_missing_tree=True)
+            if info is None and acks:
+                return self._finish_worktree_ack(row, acks[-1]["proof"]["incarnation"])
+            if info is not None:
+                incarnation_values = {"device": info.st_dev, "inode": info.st_ino,
+                                      "ctime_ns": info.st_ctime_ns}
+                if any(ack["proof"]["incarnation"] == incarnation_values for ack in acks):
+                    raise CleanupError("acknowledged worktree root still survives; not settled")
         self._verify_git_worktree(row, expect_present=True)
         incarnation = _check_path_components(
             Path(row["path"]), allow_missing_tree=self._receipt_inventory is None,
         )
         if self._receipt_inventory is not None and incarnation is None:
             raise CleanupError("worktree incarnation is unavailable before deletion")
+        if self._receipt_inventory is not None:
+            ack_receipt = self._receipt(
+                "worktree_native_ack", "worktree", index, "acknowledged", {
+                    "incarnation": {
+                        "device": incarnation.st_dev, "inode": incarnation.st_ino,
+                        "ctime_ns": incarnation.st_ctime_ns,
+                    }, "native_outcome": "NOT_APPLICABLE",
+                })
+            ack_environment = self._prepare_receipt_append(ack_receipt)
         code, output, error = self.runner([
             "worktree", "delete", "--project", row["project_id"],
             "--workspace", row["workspace_id"], "--force", "--json",
@@ -3483,6 +3842,17 @@ class NativeCleanupBackend:
             )
         ):
             raise CleanupError("native worktree deletion response is unsettled")
+        if ack_receipt is not None:
+            ack_receipt["entries"][0]["proof"]["native_outcome"] = cleanup["kind"]
+            self._append_prepared_receipt(ack_receipt, ack_environment)
+        return self._finish_worktree_ack(row, None if incarnation is None else {
+            "device": incarnation.st_dev, "inode": incarnation.st_ino,
+            "ctime_ns": incarnation.st_ctime_ns,
+        })
+
+    def _finish_worktree_ack(
+        self, row: Mapping[str, Any], incarnation: Mapping[str, int] | None,
+    ) -> str:
         self._verify_git_worktree(row, expect_present=False)
         retained_branch = self._git(
             "-C", str(self._primary_path()), "rev-parse", "--verify",
@@ -3503,8 +3873,7 @@ class NativeCleanupBackend:
         if incarnation is not None:
             self._pending_worktree_proofs[row["worktree_id"]] = {
                 "incarnation": {
-                    "device": incarnation.st_dev, "inode": incarnation.st_ino,
-                    "ctime_ns": incarnation.st_ctime_ns,
+                    **incarnation,
                 },
                 "path_absent": True, "git_registration_absent": True,
                 "branch_oid": retained_branch,
@@ -3604,7 +3973,7 @@ class NativeCleanupBackend:
     def _git(self, *arguments: str) -> str:
         code, output, error = _run_bounded(
             ["/usr/bin/git", *arguments], cwd=self.workspace,
-            environment=_safe_environment(), timeout=20.0, output_limit=65_536,
+            environment=self.environment, timeout=20.0, output_limit=65_536,
         )
         if code:
             raise CleanupError("Git worktree/ref observation failed: "

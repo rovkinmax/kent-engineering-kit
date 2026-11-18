@@ -110,7 +110,7 @@ Use agent attribution for Script comments, never default human attribution.
 
 ## Failure and recovery
 
-Use append-only `merged-cleanup-receipt-v1` executor observations in existing
+Write append-only `merged-cleanup-receipt-v2` executor observations in existing
 Task comments. Bind exact Task, inventory digest, genuine producer and stage to
 bounded exact subject entries. They are not native operation receipts or a
 new source of permission; agent attribution alone is not authentication.
@@ -121,11 +121,23 @@ Project. Entries use stable original inventory-array index and canonical full
 subject digest, disposition and stage-specific observed proof. Bound each body
 to 16 KiB; persist each native ACK individually. Check returned comment identity,
 exact body and unchanged agent attribution on readback. Do not manufacture
-success receipts from partial-error responses.
+success receipts from partial-error responses. Read both V1 and V2; do not
+rewrite old records or immutable inventories. After a V2 write, continuation
+requires a V2-capable reader; rolling back to a V1-only reader is unsafe.
 After each positive native Session deletion ACK, append and read back
-`session_native_settled` before residual removal. Record `container_settled`
+`session_native_settled` immediately, before snapshot or postcondition reads.
+Prequalify producer, outside cwd, append command and finite capacity before
+dispatch. Between positive ACK and durable append/readback, do not requalify the
+producer or scan full history. Exact returned comment ID, or exact Task/body/
+author query after a lost append response, must positively establish the write.
+Absent/incomplete/timed-out readback blocks; never blindly repeat an append.
+Record `container_settled`
 physical postconditions and require complete exact coverage before root deletion.
-After worktree deletion and postcondition checks, append/read back
+V2 adds `worktree_native_ack`: `acknowledged` disposition, exact immutable row
+binding, pre-dispatch `incarnation` (device/inode/ctime_ns) and validated
+`native_outcome`. This makes no path/Git/native-absence assertion. Persist it
+immediately after the native ACK, before those observations. After postconditions,
+append/read back
 `worktree_settled` before successful stdout. Use explicit Task/project, real
 outside cwd and agent attribution, never a deleted Agent identity.
 
@@ -136,6 +148,44 @@ batches. A lost comment response requires readback, not assumed failure.
 Durable Session ACK permits no-repeat lifecycle recovery and fresh physical
 checks. A previous worktree receipt applies to its old incarnation, not a
 new root recreated by native Resume. Validate that same-subject instance again.
+An ACK-only retry may finish physical observations without repeating Delete.
+A surviving acknowledged incarnation is not settled; multiple unsettled
+incarnations are ambiguous and block. A fresh admitted incarnation needs its own
+ACK and proof. Full history reconciliation is still required before later effects.
+
+Before effects, admit complete bounded evidence, iterative descendant order,
+command vectors, remaining receipt growth and output capacity. Historical apply
+admits every selected member before deleting any: reject overlapping removable
+resources and earlier removals invalidating later read dependencies. Bound both
+per-Task and aggregate output including newline to 262144 bytes. Never partition
+or rewrite an oversize/conflicting batch automatically.
+
+Receipt admission includes actual existing duplicates/metadata and the maximum
+remaining stage proofs for current admitted incarnations. Reserve no comments.
+Also admit their combined byte and row growth in every affected shared snapshot
+scope, including supervision members and catalog overhead. Historical member
+plans accumulate before the first effect and are rechecked against previously
+observed scopes; own-Task receipt capacity alone is insufficient. Credit no
+future Session/catalog deletion to make remaining receipts fit.
+Refresh before effects; concurrent writes, new incarnations or retries require
+fresh admission and can still exhaust capacity. No finite budget guarantees
+unbounded retries. Exec admission uses filesystem encoding, NUL checks, pointer
+overhead, platform vector/string limits and a frozen sanitized environment;
+recheck before spawn without trimming that environment to bypass a failure.
+
+Use complete metadata-first SQL scans within one qualified read-only transaction,
+shared byte budget and N+1 row sentinel before materializing variable payloads.
+Retain the 16 MiB/32768-row snapshot and receipt-history limits, 256 selected
+Tasks and 256 KiB native comment body limit. Project only consumed current-input
+`cleanup_context`/`cleanup_result`, preserving typed legacy result objects;
+validate root object, carrier type and each 64 KiB value, not an arbitrary
+64 KiB cap on unrelated generic node JSON. Payload bounds do not promise an
+equal Python RSS bound.
+
+Drain diagnostic stderr continuously into a 64 KiB tail with discarded-byte
+count. Diagnostic overflow alone never kills a valid machine stdout ACK.
+Stdout remains strictly bounded; timeout, transport errors or malformed/
+oversized stdout never become success.
 
 On failure emit no transition; retain the Script node and immutable inventory.
 Compare current and frozen policy by its four typed values, not formatting or
