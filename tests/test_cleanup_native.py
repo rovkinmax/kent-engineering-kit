@@ -37,6 +37,45 @@ DISPOSAL_GROUP = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 
 
 class NativeCleanupTests(unittest.TestCase):
+    def test_current_node_snapshot_reads_native_binary_uuids(self):
+        self.writer.executescript("""
+            ALTER TABLE task_current_nodes RENAME TO old_current_nodes;
+            CREATE TABLE task_current_nodes (
+                task_id TEXT NOT NULL, node_id BLOB NOT NULL,
+                current_input_values_json TEXT NOT NULL,
+                session_id TEXT, entered_by_edge_id BLOB
+            );
+            DROP TABLE old_current_nodes;
+        """)
+        node_bytes = bytes.fromhex(SOURCE_NODE.replace("-", ""))
+        edge_bytes = bytes.fromhex(ENTRY_NODE.replace("-", ""))
+        self.writer.execute(
+            "INSERT INTO task_current_nodes VALUES (?,?,?,?,?)",
+            (TASK, node_bytes, "{}", SESSION, edge_bytes),
+        )
+        self.writer.commit()
+        for selected in ((), (TASK,)):
+            with self.subTest(selected=selected):
+                row, = self.backend._session_snapshot(selected)["current_nodes"]
+                self.assertEqual((row["node_id"], row["entered_by_edge_id"]), (SOURCE_NODE, ENTRY_NODE))
+                self.assertEqual((row["task_id"], row["session_id"]), (TASK, SESSION))
+
+        for node, edge in ((node_bytes, None), (node_bytes[:-1], edge_bytes),
+                           (node_bytes, edge_bytes + b"\0"), (b"\0" * 16, None),
+                           (SOURCE_NODE, edge_bytes)):
+            self.writer.execute(
+                "UPDATE task_current_nodes SET node_id=?, entered_by_edge_id=?", (node, edge),
+            )
+            self.writer.commit()
+            for selected in ((), (TASK,)):
+                with self.subTest(node=node, edge=edge, selected=selected):
+                    if node == node_bytes and edge is None:
+                        row, = self.backend._session_snapshot(selected)["current_nodes"]
+                        self.assertIsNone(row["entered_by_edge_id"])
+                    else:
+                        with self.assertRaises(CleanupError):
+                            self.backend._session_snapshot(selected)
+
     def test_worktree_ack_v2_binds_exact_row_without_absence_claim(self):
         from test_merged_cleanup import base_inventory
         from workflowkit.cleanup import validate_receipt
