@@ -3480,12 +3480,28 @@ class NativeCleanupBackend:
             fresh = rows_by_id[session_id]
             frozen = next(row for row in inventory["sessions"]
                           if row["session_id"] == session_id)
+            # Native leave clears a released owner's managed worktree while
+            # retaining its workspace. Admit only that exact non-NULL -> NULL
+            # transition for an explicitly released, removable Session/root.
+            released_worktree = (
+                session_id in expected_owners
+                and frozen["disposition"] == "remove"
+                and frozen["worktree_id"] is not None
+                and fresh["worktree_id"] is None
+                and any(
+                    root["disposition"] == "remove"
+                    and root["worktree_id"] == frozen["worktree_id"]
+                    and root["workspace_id"] == frozen["workspace_id"]
+                    and root["project_id"] == frozen["project_id"]
+                    for root in inventory["worktrees"]
+                )
+            )
             for key in (
                 "project_id", "task_id", "parent_agent_session_id",
                 "previous_session_id", "workspace_id", "worktree_id",
                 "artifact_relpath",
             ):
-                if fresh[key] != frozen[key]:
+                if fresh[key] != frozen[key] and not (key == "worktree_id" and released_worktree):
                     raise CleanupError("fresh native Session identity differs from inventory")
             if frozen["device"] is not None and fresh["device"] is not None and (
                 fresh["device"], fresh["inode"]
