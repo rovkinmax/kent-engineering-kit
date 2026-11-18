@@ -1160,14 +1160,20 @@ class NativeCleanupTests(unittest.TestCase):
                 "branches_retained": 1,
             },
         }
-        self.backend._snapshot_once = lambda *_args: {
-            "current_nodes": [{
-                "task_id": OTHER_TASK, "node_id": DONE_NODE,
-                "entered_by_edge_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-                "current_input_values": {"cleanup_result": json.dumps(result)},
-            }],
-        }
-        self.backend._terminal_transition = lambda *_args: "disposal_completed"
+        self.writer.execute(
+            "INSERT INTO tasks VALUES (?,?,?,?,NULL)",
+            (OTHER_TASK, PROJECT, bytes.fromhex(WORKFLOW.replace("-", "")), "workspace-1"),
+        )
+        self.writer.execute(
+            "INSERT INTO task_current_nodes(task_id,node_id,current_input_values_json,"
+            "prior_node_values_json,session_id,entered_by_edge_id) VALUES (?,?,?,'{}',NULL,NULL)",
+            (OTHER_TASK, DONE_NODE, json.dumps({"cleanup_result": json.dumps(result)})),
+        )
+        self.writer.commit()
+        self.backend._graph = {"workflow_id": WORKFLOW, "graph": self._policy_graph()}
+        self.assertIsNone(self.backend._terminal_transition(
+            OTHER_TASK, {"summary": {"workflow_id": WORKFLOW}},
+        ))
         provider_facts = {
             "repository": "org/repo", "number": 4,
             "url": "https://github.com/org/repo/pull/4",
@@ -1204,19 +1210,60 @@ class NativeCleanupTests(unittest.TestCase):
                     "status": {"native_state": "terminal"},
                 },
             )
-        result["task_id"] = TASK
         self.backend._provider_pr = lambda _url: dict(provider_facts)
-        with self.assertRaisesRegex(CleanupError, "belongs to another native Task"):
-            self.backend._task_outcome(
+
+        def outcome(state="terminal"):
+            return self.backend._task_outcome(
                 OTHER_TASK, PROJECT, current_task_id=TASK,
-                current_pr={"url": "https://github.com/org/repo/pull/5"},
+                current_pr={},
                 known_detail={
                     "summary": {
                         "id": OTHER_TASK, "project_id": PROJECT, "workflow_id": WORKFLOW,
                     },
-                    "status": {"native_state": "terminal"},
+                    "status": {"native_state": state},
                 },
             )
+
+        def store(payload, *, node=DONE_NODE, owner=None):
+            self.writer.execute(
+                "UPDATE task_current_nodes SET current_input_values_json=?,node_id=?,session_id=? WHERE task_id=?",
+                (json.dumps(payload), node, owner, OTHER_TASK),
+            )
+            self.writer.commit()
+            self.backend._snapshots = {}
+
+        for key, foreign in (("task_id", TASK), ("project_id", PROJECT.replace("1111", "7777")),
+                             ("workflow_id", SOURCE_NODE)):
+            store({"cleanup_result": json.dumps({**result, key: foreign})})
+            with self.subTest(foreign=key), self.assertRaisesRegex(CleanupError, "another native Task"):
+                outcome()
+        store({"cleanup_result": json.dumps({**result, "phase": "prepared"})})
+        with self.assertRaises(CleanupError):
+            outcome()
+        for payload in ({}, {"cleanup_result": json.dumps({"endpoint": endpoint})},
+                        {"cleanup_result": json.dumps({**result, "schema": "unknown-result-v1"})}):
+            store(payload)
+            with mock.patch.object(self.backend, "_provider_pr", side_effect=AssertionError("untyped PR")):
+                self.assertEqual(outcome()["outcome"], "unknown")
+        store({"cleanup_result": json.dumps(result)})
+        self.assertEqual(outcome("active")["outcome"], "unknown")
+        for node, owner in ((SOURCE_NODE, None), (DONE_NODE, SESSION)):
+            store({"cleanup_result": json.dumps(result)}, node=node, owner=owner)
+            self.assertEqual(outcome()["outcome"], "unknown")
+        store({"cleanup_result": json.dumps(result)})
+        graph_nodes = self.backend._graph["graph"]["nodes"]
+        terminal = next(row for row in graph_nodes if row["id"] == DONE_NODE)
+        with mock.patch.dict(terminal, {"kind": "script"}):
+            self.assertEqual(outcome()["outcome"], "unknown")
+        with mock.patch.object(
+            self.backend, "_provider_pr", return_value={**provider_facts, "base_ref": "wrong"},
+        ), self.assertRaisesRegex(CleanupError, "contradicts"):
+            outcome()
+        with mock.patch.object(
+            self.backend, "_provider_pr", side_effect=CleanupError("not merged"),
+        ), self.assertRaisesRegex(CleanupError, "not merged"):
+            outcome()
+        self.assertEqual(outcome()["outcome"], "merged")
 
     def test_provider_base_oid_drift_does_not_change_frozen_pr_identity(self):
         frozen = {

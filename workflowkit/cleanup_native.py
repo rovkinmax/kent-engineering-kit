@@ -1802,7 +1802,6 @@ class NativeCleanupBackend:
     def _terminal_endpoint(
         self, task_id: str, detail: Mapping[str, Any],
     ) -> dict[str, Any] | None:
-        transition = self._terminal_transition(task_id, detail)
         summary = detail.get("summary")
         project_id = summary.get("project_id") if isinstance(summary, dict) else None
         workflow_id = summary.get("workflow_id") if isinstance(summary, dict) else None
@@ -1843,7 +1842,12 @@ class NativeCleanupBackend:
             ):
                 raise CleanupError("legacy terminal result belongs to another native Task")
             return self._legacy_terminal_endpoint(result.get("endpoint"))
-        if transition != "disposal_completed":
+        if result.get("schema") != "merged-cleanup-result-v1":
+            return None
+        if (
+            detail.get("status", {}).get("native_state") != "terminal"
+            or nodes[0].get("session_id") is not None
+        ):
             return None
         result = validate_result(result)
         if (
@@ -1852,6 +1856,31 @@ class NativeCleanupBackend:
             or result["workflow_id"] != workflow_id
         ):
             raise CleanupError("terminal cleanup_result belongs to another native Task")
+        # Native terminal transitions clear entered_by_edge_id. The validated
+        # typed result identifies a candidate PR, not a chosen incoming edge.
+        # Require the exact current node to be terminal in its native Workflow;
+        # the caller still verifies fresh provider facts before classifying it.
+        graph_response = self._graph
+        if (
+            not isinstance(graph_response, dict)
+            or graph_response.get("workflow_id") != workflow_id
+            or not isinstance(graph_response.get("graph"), dict)
+        ):
+            graph_response = _json_object(self._read([
+                "workflow", "graph", "inspect", workflow_id, "--json",
+            ]), "terminal Task Workflow graph")
+        graph = graph_response.get("graph")
+        graph_nodes = graph.get("nodes") if isinstance(graph, dict) else None
+        terminal_nodes = [
+            row for row in graph_nodes
+            if isinstance(row, dict) and row.get("id") == nodes[0]["node_id"]
+        ] if isinstance(graph_nodes, list) else []
+        if (
+            graph_response.get("workflow_id") != workflow_id
+            or len(terminal_nodes) != 1
+            or terminal_nodes[0].get("kind") != "terminal"
+        ):
+            return None
         endpoint = result.get("endpoint")
         if endpoint is None or not isinstance(endpoint, dict):
             return None
