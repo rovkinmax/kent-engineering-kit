@@ -90,6 +90,7 @@ _CURRENT_NODE_COLUMNS = {
     "task_id": "TEXT", "node_id": "TEXT", "session_id": "TEXT",
     "current_input_values_json": "TEXT", "entered_by_edge_id": "TEXT",
 }
+_CURRENT_NODE_UUID_COLUMNS = {"node_id", "entered_by_edge_id"}
 _NULLABLE_COLUMNS = {
     "sessions": {
         "workspace_id", "worktree_id", "previous_session_id",
@@ -113,6 +114,14 @@ def _uuid4(value: Any, pattern: re.Pattern[str], label: str) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise CleanupError(f"{label} is invalid")
     return value
+
+
+def _current_node_uuid(value: str | bytes, label: str) -> str:
+    if isinstance(value, bytes):
+        if len(value) != 16:
+            raise CleanupError(f"{label} is invalid")
+        value = str(uuid.UUID(bytes=value))
+    return _uuid4(value, _SESSION_ID, label)
 
 
 def _clean_path(path: str | Path, label: str) -> Path:
@@ -747,6 +756,7 @@ class NativeCleanupBackend:
                     "'task_comments','task_current_nodes')",
                 )
             }
+            current_node_uuid_types = {}
             for table, required in (
                 ("sessions", _SESSION_COLUMNS),
                 ("task_records", _TASK_COLUMNS),
@@ -771,7 +781,11 @@ class NativeCleanupBackend:
                 }
                 if any(
                     name not in columns
-                    or columns[name]["type"] != kind
+                    or (
+                        columns[name]["type"] not in {"TEXT", "BLOB"}
+                        if table == "task_current_nodes" and name in _CURRENT_NODE_UUID_COLUMNS
+                        else columns[name]["type"] != kind
+                    )
                     or (
                         table != "task_records"
                         and
@@ -781,6 +795,12 @@ class NativeCleanupBackend:
                     for name, kind in required.items()
                 ):
                     raise CleanupError("native observer schema differs")
+                if table == "task_current_nodes":
+                    current_node_uuid_types = {
+                        name: columns[name]["type"].lower() for name in _CURRENT_NODE_UUID_COLUMNS
+                    }
+            node_types = {current_node_uuid_types["node_id"]}
+            edge_types = {current_node_uuid_types["entered_by_edge_id"], "null"}
             budget = [_MAX_SNAPSHOT_BYTES]
             def scan(query, args=(), columns=1, maximum_rows=_MAX_NATIVE_SESSIONS,
                      text_limit=_MAX_SNAPSHOT_BYTES, sql_types=None):
@@ -801,7 +821,7 @@ class NativeCleanupBackend:
                 "FROM task_current_nodes "
                 "ORDER BY task_id,node_id,session_id LIMIT ?",
                 (_MAX_NATIVE_SESSIONS + 1,), columns=4,
-                sql_types=[{"text"}, {"text"}, {"text", "null"}, {"text", "null"}],
+                sql_types=[{"text"}, node_types, {"text", "null"}, edge_types],
             )
             if task_ids:
                 placeholders = ",".join("?" for _ in task_ids)
@@ -823,7 +843,7 @@ class NativeCleanupBackend:
                     f"WHERE task_id IN ({placeholders}) "
                     "ORDER BY task_id,node_id,session_id LIMIT ?",
                     (*task_ids, MAX_SESSIONS + 1), columns=5, maximum_rows=MAX_SESSIONS,
-                    sql_types=[{"text"}, {"text"}, {"text", "null"}, {"text"}, {"text", "null"}],
+                    sql_types=[{"text"}, node_types, {"text", "null"}, {"text"}, edge_types],
                 )
                 if len(current_node_values) > MAX_SESSIONS:
                     raise CleanupError("selected native Task current nodes exceed their bound")
@@ -881,18 +901,16 @@ class NativeCleanupBackend:
             parsed_current_nodes = []
             selected_task_ids = set(task_ids)
             for task_id, node_id, session_id, values_raw, entered_by_edge_id in current_node_values:
+                node_id = _current_node_uuid(node_id, "native current-node ID")
+                if entered_by_edge_id is not None:
+                    entered_by_edge_id = _current_node_uuid(entered_by_edge_id, "native incoming edge ID")
                 if (
                     not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id)
-                    or not isinstance(node_id, str) or not _SESSION_ID.fullmatch(node_id)
                     or (session_id is not None and (
                         not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id)
                     ))
                     or not isinstance(values_raw, str)
                     or len(values_raw.encode("utf-8")) > MAX_NATIVE_SCRIPT_INPUT_BYTES
-                    or (entered_by_edge_id is not None and (
-                        not isinstance(entered_by_edge_id, str)
-                        or not _SESSION_ID.fullmatch(entered_by_edge_id)
-                    ))
                 ):
                     raise CleanupError("native current-node identity or input size is invalid")
                 values = parse_json(values_raw.encode("utf-8"), maximum=MAX_NATIVE_SCRIPT_INPUT_BYTES)
@@ -908,15 +926,13 @@ class NativeCleanupBackend:
                 for row in parsed_current_nodes
             }
             for task_id, node_id, session_id, entered_by_edge_id in current_node_owners:
+                node_id = _current_node_uuid(node_id, "native current-node ID")
+                if entered_by_edge_id is not None:
+                    entered_by_edge_id = _current_node_uuid(entered_by_edge_id, "native incoming edge ID")
                 if (
                     not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id)
-                    or not isinstance(node_id, str) or not _SESSION_ID.fullmatch(node_id)
                     or (session_id is not None and (
                         not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id)
-                    ))
-                    or (entered_by_edge_id is not None and (
-                        not isinstance(entered_by_edge_id, str)
-                        or not _SESSION_ID.fullmatch(entered_by_edge_id)
                     ))
                 ):
                     raise CleanupError("native current-node owner identity is invalid")
