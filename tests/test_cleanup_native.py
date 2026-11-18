@@ -37,6 +37,140 @@ DISPOSAL_GROUP = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 
 
 class NativeCleanupTests(unittest.TestCase):
+    def test_worktree_ack_v2_binds_exact_row_without_absence_claim(self):
+        from test_merged_cleanup import base_inventory
+        from workflowkit.cleanup import validate_receipt
+        inventory = self.receipt_inventory()
+        inventory.value["worktrees"] = base_inventory()["worktrees"]
+        identity = {"task_id": TASK, "project_id": PROJECT, "node_id": ENTRY_NODE}
+        with mock.patch.object(self.backend, "_script_identity", return_value=identity):
+            self.backend.begin_inventory(inventory)
+        receipt = self.backend._receipt(
+            "worktree_native_ack", "worktree", 0, "acknowledged", {
+                "incarnation": {"device": 1, "inode": 2, "ctime_ns": 3},
+                "native_outcome": "NOT_REQUESTED",
+            })
+        producer = receipt["producer"]
+        self.assertEqual(validate_receipt(receipt, inventory, producer), receipt)
+        entry = receipt["entries"][0]
+        for invalid in (
+            {**receipt, "schema": "merged-cleanup-receipt-v1"},
+            {**receipt, "inventory_sha256": "b" * 64},
+            {**receipt, "entries": [{**entry, "disposition": "removed"}]},
+            {**receipt, "entries": [{**entry, "proof": {**entry["proof"], "path_absent": True}}]},
+            {**receipt, "entries": [{**entry, "proof": {**entry["proof"], "native_outcome": []}}]},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(CleanupError):
+                validate_receipt(invalid, inventory, producer)
+
+    def test_projected_inputs_keep_bounded_carriers_not_generic_payload(self):
+        values = {**{f"unrelated_{index}": "x" * 50_000 for index in range(4)},
+                  "cleanup_context": "\x00" * 65_536,
+                  "cleanup_result": {"schema": "appsome-native-cleanup-result-v1", "endpoint": {}}}
+        self.writer.execute("UPDATE task_current_nodes SET current_input_values_json=?", (json.dumps(values),))
+        self.writer.commit()
+        observed = self.backend._session_snapshot((TASK,))["current_nodes"][0]["current_input_values"]
+        self.assertEqual(observed, {key: values[key] for key in ("cleanup_context", "cleanup_result")})
+        for invalid in ([], {"cleanup_context": 1}, {"cleanup_result": "x" * 65_537}):
+            self.writer.execute("UPDATE task_current_nodes SET current_input_values_json=?", (json.dumps(invalid),))
+            self.writer.commit()
+            with self.assertRaises(CleanupError):
+                self.backend._session_snapshot((TASK,))
+
+    def test_complete_scans_reject_row_byte_and_sql_type_overflow(self):
+        from workflowkit.cleanup_native import _bounded_rows
+        import time
+        self.writer.execute("CREATE TABLE bounded_evidence(value)")
+        self.writer.executemany("INSERT INTO bounded_evidence VALUES (?)", [("a" * 10,), ("b" * 10,)])
+        for kwargs in (
+            {"maximum_rows": 1, "budget": [100]},
+            {"maximum_rows": 2, "budget": [19]},
+            {"maximum_rows": 2, "budget": [100], "text_limit": 9},
+            {"maximum_rows": 2, "budget": [100], "sql_types": [{"integer"}]},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(CleanupError):
+                _bounded_rows(self.writer, "SELECT value FROM bounded_evidence", (),
+                              columns=1, deadline=time.monotonic() + 3, **kwargs)
+
+    def test_positive_session_ack_is_durable_before_failing_snapshot(self):
+        inventory = self.receipt_inventory()
+        identity = {"task_id": TASK, "project_id": PROJECT, "node_id": ENTRY_NODE}
+        state = {"deleted": False, "appended": False, "failed": False, "deletes": 0}
+        snapshot = self.backend._snapshot_once
+        comments = self.backend._receipt_comments
+
+        def observe(*args):
+            if state["deleted"] and not state["failed"]:
+                self.assertTrue(state["appended"])
+                state["failed"] = True
+                raise CleanupError("post-ACK snapshot unavailable")
+            return snapshot(*args)
+
+        def read_comments(*args, **kwargs):
+            if state["deleted"] and not state["failed"]:
+                self.assertIsNotNone(kwargs.get("exact"), "ACK path scanned complete history")
+            return comments(*args, **kwargs)
+
+        def qualify(_context):
+            self.assertFalse(state["deleted"] and not state["failed"],
+                             "producer was requalified inside the ACK fast path")
+            return identity
+
+        def runner(args, **kwargs):
+            if args[:2] == ["session", "delete"]:
+                state["deleted"] = True
+                state["deletes"] += 1
+                self.writer.execute("DELETE FROM sessions WHERE id=?", (SESSION,))
+                self.writer.commit()
+                return 0, json.dumps({"status": "ok", "result": {"session_id": SESSION}}).encode(), b""
+            self.assertEqual(args[:3], ["task", "comment", "add"])
+            state["appended"] = True
+            body = args[args.index("--body") + 1]
+            self.writer.execute("INSERT INTO task_comments VALUES (?,?,?,?,?,?,?)", (
+                "comment-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", TASK, body,
+                "agent", args[args.index("--author-id") + 1], 1, 1))
+            self.writer.commit()
+            return 1, b"", b"lost append response"
+
+        with (
+            mock.patch.object(self.backend, "_script_identity", side_effect=qualify),
+            mock.patch.object(self.backend, "_snapshot_once", side_effect=observe),
+            mock.patch.object(self.backend, "_receipt_comments", side_effect=read_comments),
+            mock.patch.object(self.backend, "runner", side_effect=runner),
+        ):
+            self.backend.begin_inventory(inventory)
+            with self.assertRaisesRegex(CleanupError, "post-ACK snapshot"):
+                self.backend.delete_session(inventory.value["sessions"][0])
+            self.assertEqual(self.backend._receipt_growth_plans[inventory.sha256][2], 1)
+            self.backend.begin_inventory(inventory)
+            self.assertEqual(self.backend.delete_session(inventory.value["sessions"][0]), "removed")
+        self.assertEqual(state["deletes"], 1)
+
+    def test_receipt_growth_and_exec_environment_fail_before_delete(self):
+        inventory = self.receipt_inventory()
+        identity = {"task_id": TASK, "project_id": PROJECT, "node_id": ENTRY_NODE}
+        with mock.patch.object(self.backend, "_script_identity", return_value=identity):
+            self.backend.begin_inventory(inventory)
+            for limit in ("_MAX_RECEIPT_COMMENTS", "_MAX_RECEIPT_HISTORY_BYTES"):
+                with (
+                    mock.patch("workflowkit.cleanup_native." + limit, 1),
+                    mock.patch.object(self.backend, "_receipt_comments", return_value=[]),
+                ):
+                    with mock.patch.object(
+                        self.backend, "runner", side_effect=AssertionError("Delete before capacity admission"),
+                    ) as runner:
+                        with self.assertRaisesRegex(CleanupError, "capacity"):
+                            self.backend.delete_session(inventory.value["sessions"][0])
+                        runner.assert_not_called()
+            self.backend._execution_environment = {"TOO_LARGE": "x" * 1_000_000}
+            with mock.patch("os.sysconf", return_value=262144):
+                with mock.patch.object(
+                    self.backend, "runner", side_effect=AssertionError("Delete before argv admission"),
+                ) as runner:
+                    with self.assertRaisesRegex(CleanupError, "capacity"):
+                        self.backend.delete_session(inventory.value["sessions"][0])
+                    runner.assert_not_called()
+
     def receipt_inventory(self):
         original = Path.cwd()
         self.addCleanup(os.chdir, original)
@@ -55,6 +189,83 @@ class NativeCleanupTests(unittest.TestCase):
         }
         self.backend._script_native_context = {"task_id": TASK, "node_id": ENTRY_NODE}
         return SimpleNamespace(value=value, sha256="a" * 64)
+
+    def test_snapshot_shared_byte_growth_blocks_before_delete(self):
+        self._assert_snapshot_growth_blocks_before_delete(byte_limit=True)
+
+    def test_snapshot_shared_row_growth_blocks_before_delete(self):
+        self._assert_snapshot_growth_blocks_before_delete(byte_limit=False)
+
+    def test_snapshot_batch_byte_growth_is_aggregated_before_effects(self):
+        self._assert_snapshot_growth_blocks_before_delete(byte_limit=True, batch=True)
+
+    def test_snapshot_batch_row_growth_is_aggregated_before_effects(self):
+        self._assert_snapshot_growth_blocks_before_delete(byte_limit=False, batch=True)
+
+    def _assert_snapshot_growth_blocks_before_delete(self, *, byte_limit, batch=False):
+        from workflowkit import cleanup_native
+        inventory = self.receipt_inventory()
+        inventory.value["supervision"] = [{"task_ids": [TASK, OTHER_TASK]}]
+        for index in range(2):
+            self.writer.execute("INSERT INTO task_comments VALUES (?,?,?,?,?,?,?)", (
+                f"comment-{index:08x}-aaaa-4aaa-8aaa-aaaaaaaaaaaa", OTHER_TASK,
+                "unrelated evidence" * 100, "agent", "other", 1, 1))
+        self.writer.commit()
+        budgets = []
+        original_scan = cleanup_native._bounded_rows
+
+        def scan(*args, **kwargs):
+            budgets.append(kwargs["budget"])
+            return original_scan(*args, **kwargs)
+
+        with mock.patch.object(cleanup_native, "_bounded_rows", side_effect=scan):
+            self.backend._session_snapshot((TASK, OTHER_TASK))
+        used = cleanup_native._MAX_SNAPSHOT_BYTES - budgets[-1][0]
+        second = SimpleNamespace(
+            value={**inventory.value, "task_id": OTHER_TASK, "sessions": [{
+                **inventory.value["sessions"][0], "task_id": OTHER_TASK,
+                "session_id": ENTRY_NODE,
+                "artifact_relpath": f"projects/{PROJECT}/sessions/{ENTRY_NODE}",
+            }]}, sha256="b" * 64,
+        )
+
+        def identity(_context):
+            return {"task_id": self.backend._receipt_inventory.value["task_id"],
+                    "project_id": PROJECT, "node_id": ENTRY_NODE}
+
+        growth = []
+        with mock.patch.object(self.backend, "_script_identity", side_effect=identity):
+            for item in (inventory, second):
+                self.backend.begin_inventory(item)
+                growth.append(sum(
+                    len(canonical_bytes(self.backend._receipt(stage, "session", 0, "removed", proof)))
+                    + len(item.value["task_id"]) + len(self.backend._receipt_author_id) + 44 + 5 + 16
+                    for stage, proof in (
+                        ("session_native_settled", {
+                            "session_id": item.value["sessions"][0]["session_id"], "native_status": "ok"}),
+                        ("container_settled", {"path_absent": True}),
+                    )
+                ))
+        limit = (
+            ("_MAX_SNAPSHOT_BYTES", used + (max(growth) if batch else 50))
+            if byte_limit else ("_MAX_RECEIPT_COMMENTS", 4 if batch else 3)
+        )
+        with (
+            mock.patch.object(self.backend, "_script_identity", side_effect=identity),
+            mock.patch.object(cleanup_native, limit[0], limit[1]),
+            mock.patch.object(self.backend, "runner", return_value=(1, b"", b"")) as runner,
+        ):
+            self.backend.begin_inventory(inventory)
+            # Both existing scopes fit, as does the own-Task receipt history.
+            self.backend._session_snapshot((TASK, OTHER_TASK))
+            with self.assertRaisesRegex(CleanupError, "snapshot.*capacity"):
+                if batch:
+                    self.backend.admit_effects()
+                    self.backend.begin_inventory(second)
+                    self.backend.admit_effects()
+                else:
+                    self.backend.delete_session(inventory.value["sessions"][0])
+            runner.assert_not_called()
 
     def test_durable_native_ack_restores_settlement_without_repeating_delete(self):
         inventory = self.receipt_inventory()
@@ -138,6 +349,7 @@ class NativeCleanupTests(unittest.TestCase):
         )
         self.writer.commit()
         native_deletes, root_deletes, receipt_stages = [], [], []
+        retain_root = [False]
         detail = {
             "summary": {"id": TASK, "project_id": PROJECT, "workflow_id": WORKFLOW, "short_id": "KIT-1"},
             "status": {"native_state": "active"}, "worktree_path": str(victim),
@@ -166,7 +378,8 @@ class NativeCleanupTests(unittest.TestCase):
                 return 0, json.dumps({"status": "ok", "result": {"session_id": SESSION}}).encode(), b""
             if args[:2] == ["worktree", "delete"]:
                 root_deletes.append(args[-1])
-                shutil.rmtree(victim)
+                if not retain_root[0]:
+                    shutil.rmtree(victim)
                 return 0, b'{"status":"ok","result":{"cleanup":{"kind":"NOT_REQUESTED"}}}', b""
             if args[:3] == ["task", "comment", "add"]:
                 body = args[args.index("--body") + 1]
@@ -185,9 +398,13 @@ class NativeCleanupTests(unittest.TestCase):
             self.fail(args)
 
         wrong_head = [False]
+        fail_after_worktree_ack = [False]
 
         def git(*args):
             if args[-3:] == ("worktree", "list", "--porcelain"):
+                if not victim.exists() and fail_after_worktree_ack[0]:
+                    fail_after_worktree_ack[0] = False
+                    raise CleanupError("post-worktree-ACK Git unavailable")
                 return (
                     f"worktree {victim}\nHEAD {'a' * 40}\nbranch refs/heads/task/cleanup\n\n"
                     if victim.exists() else ""
@@ -232,8 +449,34 @@ class NativeCleanupTests(unittest.TestCase):
             self.assertEqual(len(root_deletes), 2)
             self.assertEqual(receipt_stages, [
                 "session_native_settled", "container_settled",
-                "worktree_settled", "worktree_settled",
+                "worktree_native_ack", "worktree_settled",
+                "worktree_native_ack", "worktree_settled",
             ])
+            victim.mkdir()
+            with mock.patch("workflowkit.cleanup_native._MAX_RECEIPT_COMMENTS", len(receipt_stages) + 1):
+                with self.assertRaisesRegex(CleanupError, "capacity"):
+                    execute_inventory(inventory, backend())
+            self.assertEqual(len(root_deletes), 2, "new incarnation bypassed fresh receipt admission")
+            interrupted = backend()
+            fail_after_worktree_ack[0] = True
+            with self.assertRaisesRegex(CleanupError, "post-worktree-ACK Git"):
+                execute_inventory(inventory, interrupted)
+            self.assertEqual(receipt_stages[-1], "worktree_native_ack")
+            self.assertEqual(len(root_deletes), 3)
+            resumed = execute_inventory(inventory, interrupted)
+            self.assertEqual(resumed, first)
+            self.assertEqual(len(root_deletes), 3, "ACK retry repeated native Delete")
+            self.assertEqual(receipt_stages[-1], "worktree_settled")
+            victim.mkdir()
+            retain_root[0] = True
+            surviving = backend()
+            with self.assertRaisesRegex(CleanupError, "directory remains"):
+                execute_inventory(inventory, surviving)
+            self.assertEqual(receipt_stages[-1], "worktree_native_ack")
+            delete_count = len(root_deletes)
+            with self.assertRaisesRegex(CleanupError, "root still survives"):
+                execute_inventory(inventory, surviving)
+            self.assertEqual(len(root_deletes), delete_count)
 
     def test_receipt_provenance_conflicts_duplicates_and_complete_pagination(self):
         inventory = self.receipt_inventory()
@@ -267,7 +510,7 @@ class NativeCleanupTests(unittest.TestCase):
                 ({**receipt, "task_id": OTHER_TASK}, {}),
                 ({**receipt, "producer": {**receipt["producer"], "node_id": SOURCE_NODE}}, {}),
                 ({**receipt, "entries": [{**entry, "subject_sha256": "f" * 64}]}, {}),
-                ({**receipt, "schema": "merged-cleanup-receipt-v2"}, {}),
+                ({**receipt, "schema": "merged-cleanup-receipt-v3"}, {}),
                 (json.dumps(receipt)[:-2], {}),
                 (receipt, {"author": "user"}),
                 (receipt, {"actor": "another producer"}),
@@ -283,20 +526,21 @@ class NativeCleanupTests(unittest.TestCase):
             for index in range(1, 130):
                 insert("ordinary historical commentary", index)
             insert(receipt, 130)
-            insert(receipt, 131)  # identical append-only duplicate is harmless
+            insert({**receipt, "schema": "merged-cleanup-receipt-v2"}, 131)
+            insert(receipt, 132)  # mixed-version identical observations are harmless
             self.backend.begin_inventory(inventory)
             self.assertEqual(self.backend._session_settlements, {SESSION: "removed"})
             with mock.patch("workflowkit.cleanup_native._MAX_RECEIPT_COMMENTS", 128):
-                with self.assertRaisesRegex(CleanupError, "history exceeds"):
+                with self.assertRaisesRegex(CleanupError, "exceeds"):
                     self.backend.begin_inventory(inventory)
             physical = {
                 **receipt, "stage": "container_settled",
                 "entries": [{**entry, "proof": {"path_absent": True}}],
             }
-            insert(physical, 132)
+            insert(physical, 133)
             insert({
                 **physical, "entries": [{**physical["entries"][0], "disposition": "absent"}],
-            }, 133)
+            }, 134)
             with self.assertRaisesRegex(CleanupError, "conflicting"):
                 self.backend.begin_inventory(inventory)
 
@@ -507,10 +751,7 @@ class NativeCleanupTests(unittest.TestCase):
         result = self.backend._session_snapshot((TASK,))
         self.assertEqual(len(result["sessions"]), 1)
         self.assertEqual(result["sessions"][0]["session_id"], SESSION)
-        self.assertEqual(
-            result["current_nodes"][0]["current_input_values"]["pr_url"],
-            "https://github.com/org/repo/pull/4",
-        )
+        self.assertEqual(result["current_nodes"][0]["current_input_values"], {})
         self.assertEqual(result["current_nodes"][0]["node_id"], SOURCE_NODE)
         self.writer.rollback()
         self.assertEqual(len(self.backend._session_snapshot((TASK,))["sessions"]), 1)
@@ -1321,6 +1562,13 @@ class NativeCleanupTests(unittest.TestCase):
                 self.assertIn(expected, result.stdout)
 
     def test_bounded_command_has_no_shell_and_enforces_output_and_timeout(self):
+        code, output, error = _run_bounded(
+            [sys.executable, "-c", "import sys;sys.stderr.write('x'*100000);print('ACK')"],
+            cwd=self.root, environment=dict(os.environ), output_limit=128,
+        )
+        self.assertEqual((code, output), (0, b"ACK\n"))
+        self.assertIn(b"discarded", error)
+        self.assertLessEqual(len(error), 65_536)
         code, out, err = _run_bounded(
             [sys.executable, "-c", "print('ready')"],
             cwd=self.project_root, environment={},
@@ -1475,6 +1723,9 @@ class NativeCleanupTests(unittest.TestCase):
 
             def begin_inventory(inner_self, _inventory):
                 return None
+
+            def admit_effects(inner_self):
+                pass
 
             def record_settlement(inner_self, _stage, _kind, _index, disposition):
                 return disposition

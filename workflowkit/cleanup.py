@@ -29,7 +29,7 @@ HANDOFF_SCHEMA = "merged-cleanup-handoff-v1"
 RESULT_SCHEMA = "merged-cleanup-result-v1"
 POLICY_SCHEMA = "merged-cleanup-policy-v1"
 HISTORY_INVENTORY_SCHEMA = "merged-cleanup-history-inventory-v1"
-RECEIPT_SCHEMA = "merged-cleanup-receipt-v1"
+RECEIPT_SCHEMA = "merged-cleanup-receipt-v2"
 MAX_RECEIPT_BYTES = 16_384
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -91,6 +91,7 @@ class CleanupBackend(Protocol):
 
     def revalidate(self, inventory: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]: ...
     def begin_inventory(self, inventory: ImmutableInventory) -> dict[str, Any] | None: ...
+    def admit_effects(self) -> None: ...
     def record_settlement(self, stage: str, kind: str, index: int, disposition: str) -> str: ...
     def require_physical_coverage(self) -> None: ...
     def delete_session(self, row: Mapping[str, Any]) -> str: ...
@@ -1123,7 +1124,7 @@ def validate_result(value: Any) -> dict[str, Any]:
 def receipt_subject(inventory: Mapping[str, Any], kind: str, index: int) -> dict[str, Any]:
     lists = {"session": "sessions", "owned": "owned_containers", "worktree": "worktrees"}
     if (
-        kind not in lists or type(index) is not int
+        not isinstance(kind, str) or kind not in lists or type(index) is not int
         or not 0 <= index < len(inventory[lists[kind]])
     ):
         raise CleanupError("receipt exact inventory index is invalid")
@@ -1141,12 +1142,17 @@ def validate_receipt(
     }, "executor receipt")
     canonical_bytes(row, maximum=MAX_RECEIPT_BYTES)
     if (
-        row["schema"] != RECEIPT_SCHEMA or row["task_id"] != inventory.value["task_id"]
+        not isinstance(row["schema"], str)
+        or row["schema"] not in {"merged-cleanup-receipt-v1", RECEIPT_SCHEMA}
+        or row["task_id"] != inventory.value["task_id"]
         or row["inventory_sha256"] != inventory.sha256 or row["producer"] != producer
     ):
         raise CleanupError("executor receipt has a foreign subject, inventory, or producer")
     stage = row["stage"]
-    if stage not in {"session_native_settled", "container_settled", "worktree_settled"}:
+    if not isinstance(stage, str) or stage not in {"session_native_settled", "container_settled", "worktree_settled",
+                     "worktree_native_ack"} or (
+        stage == "worktree_native_ack" and row["schema"] != RECEIPT_SCHEMA
+    ):
         raise CleanupError("executor receipt stage is invalid")
     if not isinstance(row["entries"], list) or not 1 <= len(row["entries"]) <= 16:
         raise CleanupError("executor receipt entries are empty or oversized")
@@ -1156,7 +1162,9 @@ def validate_receipt(
         subject = receipt_subject(inventory.value, entry["kind"], entry["index"])
         if (
             entry["subject_sha256"] != hashlib.sha256(canonical_bytes(subject)).hexdigest()
-            or entry["disposition"] not in {"removed", "absent"}
+            or not isinstance(entry["disposition"], str) or entry["disposition"] not in (
+                {"acknowledged"} if stage == "worktree_native_ack" else {"removed", "absent"}
+            )
         ):
             raise CleanupError("executor receipt does not bind its exact immutable subject")
         proof = entry["proof"]
@@ -1172,6 +1180,21 @@ def validate_receipt(
                 raise CleanupError("receipt lacks exact container physical postconditions")
             if type(proof["path_absent"]) is not bool:
                 raise CleanupError("receipt physical postcondition is not typed")
+        elif stage == "worktree_native_ack":
+            _closed(proof, {"incarnation", "native_outcome"}, "native worktree ACK")
+            incarnation = _closed(
+                proof["incarnation"], {"device", "inode", "ctime_ns"}, "root incarnation",
+            )
+            if (
+                entry["kind"] != "worktree"
+                or any(type(v) is not int or v < 0 for v in incarnation.values())
+                or incarnation["inode"] == 0
+                or not isinstance(proof["native_outcome"], str) or proof["native_outcome"] not in {
+                    "NOT_REQUESTED", "NOT_APPLICABLE", "RETAINED", "DELETED",
+                    "not_requested", "not_applicable", "retained", "deleted",
+                }
+            ):
+                raise CleanupError("receipt lacks a qualified worktree native ACK")
         else:
             _closed(proof, {
                 "incarnation", "path_absent", "git_registration_absent",
@@ -1185,12 +1208,35 @@ def validate_receipt(
                 or proof["path_absent"] is not True
                 or proof["git_registration_absent"] is not True
                 or proof["branch_oid"] != subject["branch_oid"]
+                or not isinstance(proof["native_record"], str)
                 or proof["native_record"] not in {"absent", "missing"}
                 or any(type(v) is not int or v < 0 for v in incarnation.values())
                 or incarnation["inode"] == 0
             ):
                 raise CleanupError("receipt lacks qualified worktree postconditions")
     return row
+
+
+def _ordered_sessions(
+    sessions: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, Mapping[str, Any]]]:
+    by_id = {row["session_id"]: row for row in sessions}
+    depths = {}
+    for start in by_id:
+        trail, seen, current = [], set(), start
+        while current in by_id and current not in depths:
+            if current in seen:
+                raise CleanupError("native Session parent graph contains a cycle")
+            seen.add(current)
+            trail.append(current)
+            current = by_id[current]["parent_agent_session_id"]
+        depth = depths.get(current, -1)
+        for current in reversed(trail):
+            depth += 1
+            depths[current] = depth
+    return sorted(enumerate(sessions), key=lambda pair: (
+        -depths[pair[1]["session_id"]], pair[1]["session_id"],
+    ))
 
 
 def execute_inventory(
@@ -1207,6 +1253,7 @@ def execute_inventory(
     if completed is not None:
         return validate_result(completed)
     backend.revalidate(value)
+    backend.admit_effects()
     session_dispositions: list[dict[str, str]] = []
     container_dispositions: list[dict[str, str]] = []
     worktree_dispositions: list[dict[str, str]] = []
@@ -1214,22 +1261,7 @@ def execute_inventory(
     # Descendants are deleted before parents. The immutable inventory remains
     # the retry source if any native operation or postcondition is uncertain.
     sessions = list(value["sessions"])
-    depth_by_id: dict[str, int] = {}
-    by_id = {row["session_id"]: row for row in sessions}
-
-    def depth(session_id: str, trail: set[str]) -> int:
-        if session_id in depth_by_id:
-            return depth_by_id[session_id]
-        if session_id in trail:
-            raise CleanupError("native Session parent graph contains a cycle")
-        parent = by_id[session_id]["parent_agent_session_id"]
-        result = 0 if parent not in by_id else depth(parent, trail | {session_id}) + 1
-        depth_by_id[session_id] = result
-        return result
-
-    for session_id in by_id:
-        depth(session_id, set())
-    for row in sorted(sessions, key=lambda item: (-depth_by_id[item["session_id"]], item["session_id"])):
+    for index, row in _ordered_sessions(sessions):
         if row["disposition"] == "shared-in-use":
             session_dispositions.append({
                 "session_id": row["session_id"], "disposition": "shared-in-use",
@@ -1240,14 +1272,14 @@ def execute_inventory(
         if settled not in {"removed", "absent"}:
             raise CleanupError("native Session delete did not settle")
         backend.record_settlement(
-            "session_native_settled", "session", sessions.index(row), settled,
+            "session_native_settled", "session", index, settled,
         )
         backend.revalidate(value)
         physical = backend.remove_session_container(row)
         if physical not in {"removed", "absent"}:
             raise CleanupError("Session residual container did not settle")
         physical = backend.record_settlement(
-            "container_settled", "session", sessions.index(row), physical,
+            "container_settled", "session", index, physical,
         )
         session_dispositions.append({
             "session_id": row["session_id"],
@@ -1306,7 +1338,7 @@ def output_transition(result: Mapping[str, Any]) -> bytes:
         "transition": "disposal_completed",
         "cleanup_result": canonical_bytes(dict(result), maximum=MAX_HANDOFF_BYTES).decode("utf-8"),
     }
-    return canonical_bytes(payload, maximum=MAX_SCRIPT_OUTPUT_BYTES) + b"\n"
+    return canonical_bytes(payload, maximum=MAX_SCRIPT_OUTPUT_BYTES - 1) + b"\n"
 
 
 def _compact_dispositions(
@@ -1326,7 +1358,7 @@ def _compact_dispositions(
     ))
 
 
-def _preflight_result_capacity(inventory: ImmutableInventory) -> None:
+def _preflight_result_capacity(inventory: ImmutableInventory) -> dict[str, Any]:
     value = inventory.value
     result = {
         "schema": RESULT_SCHEMA,
@@ -1364,7 +1396,74 @@ def _preflight_result_capacity(inventory: ImmutableInventory) -> None:
         "cleanup_result": canonical_bytes(
             result, maximum=MAX_HANDOFF_BYTES,
         ).decode("utf-8"),
-    }, maximum=MAX_SCRIPT_OUTPUT_BYTES)
+    }, maximum=MAX_SCRIPT_OUTPUT_BYTES - 1)
+    return result
+
+
+def _preflight_history(inventory: FiniteHistoryInventory, backend: CleanupBackend) -> None:
+    """Admit every member and the aggregate before any member can mutate."""
+    results = [_preflight_result_capacity(item) for item in inventory.inventories]
+    canonical_bytes({
+        "schema": "merged-cleanup-history-result-v1", "phase": "completed",
+        "project_id": inventory.value["project_id"],
+        "task_ids": inventory.value["task_ids"], "inventory_sha256": inventory.sha256,
+        "task_results": results,
+    }, maximum=MAX_SCRIPT_OUTPUT_BYTES - 1)
+    previous = []
+    previous_sessions = set()
+    for member_index, item in enumerate(inventory.inventories):
+        value = item.value
+        paths = [
+            Path(row["path"]) for rows in (
+                value["worktrees"], value["owned_containers"],
+            ) for row in rows if row.get("path")
+        ]
+        protected = [(Path(row["path"]), row["kind"]) for row in value["protected_roots"]]
+        persistence = getattr(backend, "context", {}).get("persistence_root")
+        if persistence:
+            paths.extend(Path(persistence) / row["artifact_relpath"] for row in value["sessions"])
+        operation = value["history_operation"]
+        required_sessions = {row["session_id"] for row in value["sessions"]}
+        if operation is not None:
+            required_sessions.add(operation["operator_session_id"])
+            if persistence:
+                paths.append(
+                    Path(persistence) / "projects" / operation["operator_project_id"]
+                    / "sessions" / operation["operator_session_id"])
+        if previous_sessions.intersection(required_sessions):
+            raise CleanupError("historical members share removable Sessions")
+        if any(a == b or a in b.parents or b in a.parents for a in previous for b in paths):
+            raise CleanupError("earlier historical removal invalidates a later member dependency")
+        if any(
+            a == b or a in b.parents or (kind != "native-persistence" and b in a.parents)
+            for a in previous for b, kind in protected
+        ):
+            raise CleanupError("earlier historical removal invalidates a later protected read")
+        current = [Path(row["path"]) for rows in (
+            value["worktrees"], value["owned_containers"],
+        ) for row in rows if row["disposition"] == "remove" and row["path"]]
+        # Also reject later removals overlapping an earlier removable resource.
+        previous.extend(current)
+        previous_sessions.update(row["session_id"] for row in value["sessions"]
+                                 if row["disposition"] == "remove")
+        if persistence:
+            previous.extend(Path(persistence) / row["artifact_relpath"]
+                            for row in value["sessions"] if row["disposition"] == "remove")
+        _ordered_sessions(value["sessions"])
+        completed = backend.begin_inventory(item)
+        if completed is not None:
+            results[member_index] = validate_result(completed)
+            continue
+        backend.revalidate(value)
+        backend.admit_effects()
+    # Native terminal replay can return an already-applied result. Bound those
+    # actual bytes too, rather than assuming its endpoint equals our template.
+    canonical_bytes({
+        "schema": "merged-cleanup-history-result-v1", "phase": "completed",
+        "project_id": inventory.value["project_id"],
+        "task_ids": inventory.value["task_ids"], "inventory_sha256": inventory.sha256,
+        "task_results": results,
+    }, maximum=MAX_SCRIPT_OUTPUT_BYTES - 1)
 
 
 def _read_bounded(stream, maximum: int) -> bytes:
@@ -1607,6 +1706,7 @@ def _command_main(arguments: Sequence[str]) -> int:
         raw_inventory = _read_control_file(args.inventory, MAX_INVENTORY_BYTES)
         inventory = history_inventory_from_bytes(raw_inventory, args.confirm)
         _assert_control_file_outside_inventory(args.inventory, inventory)
+        _preflight_history(inventory, backend)
         results = [
             execute_inventory(item, backend) for item in inventory.inventories
         ]
@@ -1619,7 +1719,7 @@ def _command_main(arguments: Sequence[str]) -> int:
             "task_results": results,
         }
         sys.stdout.buffer.write(
-            canonical_bytes(result, maximum=MAX_SCRIPT_OUTPUT_BYTES) + b"\n",
+            canonical_bytes(result, maximum=MAX_SCRIPT_OUTPUT_BYTES - 1) + b"\n",
         )
         return 0
     raise CleanupError("unsupported cleanup mode")
