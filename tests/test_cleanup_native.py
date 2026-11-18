@@ -348,6 +348,10 @@ class NativeCleanupTests(unittest.TestCase):
             (ENTRY_NODE, TASK),
         )
         self.writer.commit()
+        # Prepare froze worktree-1 above; supported native leave clears the
+        # owner's Session binding before the real executor revalidates it.
+        self.writer.execute("UPDATE sessions SET worktree_id=NULL WHERE id=?", (SESSION,))
+        self.writer.commit()
         native_deletes, root_deletes, receipt_stages = [], [], []
         retain_root = [False]
         detail = {
@@ -1674,6 +1678,8 @@ class NativeCleanupTests(unittest.TestCase):
         def git(*args):
             if args[-3:] == ("symbolic-ref", "--short", "HEAD"):
                 return "task/merged"
+            if args[-3:] == ("worktree", "list", "--porcelain"):
+                return f"worktree {task_root}\nHEAD {head_oid}\nbranch refs/heads/task/merged\n\n"
             if args[-3:] == ("rev-parse", "--verify", "HEAD"):
                 return head_oid
             if args[-2:] == ("--verify", "refs/heads/task/merged"):
@@ -1890,6 +1896,65 @@ class NativeCleanupTests(unittest.TestCase):
             self.assertEqual(
                 immutable.value["cleanup_context_sha256"], expected_context_sha256,
             )
+            # Supported native leave releases the current owner AND clears its
+            # managed worktree, without changing workspace or frozen inventory.
+            self.assertEqual(immutable.value["sessions"][0]["worktree_id"], "worktree-1")
+            self.writer.execute("UPDATE sessions SET worktree_id=NULL WHERE id=?", (SESSION,))
+            self.writer.execute(
+                "UPDATE task_current_nodes SET node_id=?,session_id=NULL WHERE task_id=?",
+                (ENTRY_NODE, TASK),
+            )
+            self.writer.commit()
+            with mock.patch.object(
+                delivery, "observe_script_identity",
+                return_value=(identity, script_detail, graph_response),
+            ):
+                fresh = backend.revalidate(immutable.value)
+                self.assertIsNone(next(row for row in fresh if row["session_id"] == SESSION)["worktree_id"])
+                native = next(row for row in fresh if row["session_id"] == SESSION)
+                for column, changed in (
+                    ("worktree_id", "foreign-worktree"),
+                    ("workspace_id", "foreign-workspace"),
+                    ("task_id", OTHER_TASK),
+                    ("project_id", PROJECT.replace("1111", "7777")),
+                    ("artifact_relpath", f"projects/{PROJECT}/sessions/{ENTRY_NODE}"),
+                    ("parent_agent_session_id", ENTRY_NODE),
+                    ("previous_session_id", ENTRY_NODE),
+                ):
+                    with self.subTest(native_drift=column):
+                        self.writer.execute(f"UPDATE sessions SET {column}=? WHERE id=?", (changed, SESSION))
+                        self.writer.commit()
+                        with self.assertRaises(CleanupError):
+                            backend.revalidate(immutable.value)
+                        self.writer.execute(
+                            f"UPDATE sessions SET {column}=? WHERE id=?", (native[column], SESSION),
+                        )
+                        self.writer.commit()
+                for gate in ("unlisted-owner", "shared-session", "shared-root", "foreign-root-workspace"):
+                    altered = json.loads(stored)
+                    if gate == "unlisted-owner":
+                        altered["release"]["owner_session_ids"] = []
+                    elif gate == "shared-session":
+                        altered["sessions"][0]["disposition"] = "shared-in-use"
+                    elif gate == "shared-root":
+                        altered["worktrees"][0]["disposition"] = "shared-in-use"
+                    else:
+                        altered["worktrees"][0]["workspace_id"] = "foreign-workspace"
+                    with self.subTest(release_gate=gate), self.assertRaises(CleanupError):
+                        backend.revalidate(altered)
+                self.writer.execute(
+                    "UPDATE task_current_nodes SET session_id=? WHERE task_id=?", (SESSION, TASK),
+                )
+                self.writer.commit()
+                with self.assertRaisesRegex(CleanupError, "still owns"):
+                    backend.revalidate(immutable.value)
+                self.writer.execute("UPDATE task_current_nodes SET session_id=NULL WHERE task_id=?", (TASK,))
+                self.writer.execute("UPDATE sessions SET worktree_id='worktree-1' WHERE id=?", (SESSION,))
+                self.writer.commit()
+                backend.revalidate(immutable.value)  # unchanged bindings remain valid too
+                self.writer.execute("UPDATE sessions SET worktree_id=NULL WHERE id=?", (SESSION,))
+                self.writer.commit()
+            self.assertEqual(immutable.raw, stored)
             executor = Executor()
             result = execute_inventory(immutable, executor)
             self.assertEqual(result["phase"], "completed")
