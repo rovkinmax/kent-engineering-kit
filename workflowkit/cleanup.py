@@ -584,6 +584,60 @@ def _overlaps(left: str, right: str) -> bool:
     return a == b or a in b.parents or b in a.parents
 
 
+def _validate_historical_residual(
+    sessions: Sequence[Mapping[str, Any]], memberships: Sequence[Mapping[str, Any]],
+    outcomes: Mapping[str, Mapping[str, Any]], *, task_id: str, project_id: str,
+) -> None:
+    """Prove directless residual rows through real registered inverse ancestry."""
+    if not memberships or any(
+        item["project_id"] != project_id or task_id not in item["task_ids"]
+        for item in memberships
+    ):
+        raise CleanupError("historical residual has no exact registered Session roots")
+    roots = {
+        root for item in memberships
+        for root in (item["supervisor_session_id"], *item["reused_root_session_ids"])
+    }
+    by_id = {row["session_id"]: row for row in sessions}
+    if roots - by_id.keys():
+        raise CleanupError("registered cleanup Session root is missing")
+    registered_tasks = {member for item in memberships for member in item["task_ids"]}
+    if any(row["task_id"] is not None and row["task_id"] not in registered_tasks for row in sessions):
+        raise CleanupError("historical residual has an unregistered Task owner")
+    children: dict[str, list[str]] = {}
+    for row in sessions:
+        if row["parent_agent_session_id"] is not None:
+            children.setdefault(row["parent_agent_session_id"], []).append(row["session_id"])
+    actual_roots: dict[str, set[str]] = {session_id: set() for session_id in by_id}
+    for root in sorted(roots):
+        pending, seen = [root], set()
+        while pending:
+            session_id = pending.pop()
+            if session_id in seen:
+                continue
+            seen.add(session_id)
+            actual_roots[session_id].add(root)
+            pending.extend(children.get(session_id, ()))
+    if any(
+        not actual_roots[row["session_id"]]
+        or actual_roots[row["session_id"]] != set(row["supervisor_root_ids"])
+        for row in sessions
+    ):
+        raise CleanupError("historical residual is not its registered inverse-parent closure")
+    held_roots = {
+        root for item in memberships
+        if any(
+            outcomes[member]["native_state"] not in {"terminal", "final_disposal"}
+            or outcomes[member]["outcome"] not in {"merged", "no-pr", "non-delivery"}
+            for member in item["task_ids"]
+        )
+        for root in (item["supervisor_session_id"], *item["reused_root_session_ids"])
+    }
+    if any(actual_roots[row["session_id"]] & held_roots and row["disposition"] != "shared-in-use"
+           for row in sessions):
+        raise CleanupError("shared historical residual Session tree is not held whole")
+
+
 def validate_inventory(value: Any) -> ImmutableInventory:
     row = _closed(value, _INVENTORY_FIELDS, "merged cleanup inventory")
     if row["schema"] != INVENTORY_SCHEMA:
@@ -648,10 +702,11 @@ def validate_inventory(value: Any) -> ImmutableInventory:
 
     normalized_sessions = [_session_row(item) for item in sessions]
     _unique([item["session_id"] for item in normalized_sessions], "inventory Sessions")
-    if not any(
+    directless = not any(
         item["project_id"] == project_id and item["task_id"] == task_id
         for item in normalized_sessions
-    ):
+    )
+    if directless and history_operation is None:
         raise CleanupError("inventory omits direct Task Sessions")
     outcomes = [_validate_member_outcome(item) for item in member_outcomes]
     _unique([item["task_id"] for item in outcomes], "supervisor Task outcomes")
@@ -677,6 +732,11 @@ def validate_inventory(value: Any) -> ImmutableInventory:
     for member_id, outcome in outcome_by_task.items():
         if outcome["native_state"] == "final_disposal" and member_id != task_id:
             raise CleanupError("another Task cannot be in final disposal")
+    if directless:
+        _validate_historical_residual(
+            normalized_sessions, memberships, outcome_by_task,
+            task_id=task_id, project_id=project_id,
+        )
     normalized_worktrees = [
         _validate_worktree(
             item, task_id, historical=history_operation is not None,
