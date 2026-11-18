@@ -55,20 +55,35 @@ Generic defaults do not override a specific accepted project policy.
   through the project adapter. Safe retention is acceptable only when existing
   project authority and contract qualify it; retain concrete resource,
   ownership, status and safe-state evidence, plus a responsible owner and next
-  action. Do not infer release from a timeout or waive an unknown cleanup.
-  Emit the approval-gated `smoke_wont_do` outcome only when the current graph
-  declares that route. If it is absent, report that no supported cancellation
-  route is declared after preserving safety and ownership; do not invent an
-  outcome, change the graph or move the Task directly to Cleanup.
+  action. Do not infer release from a timeout or waive unknown cleanup.
+  Read the current graph's declared cancellation/no-delivery route, exact
+  target, required carriers and approval order. Use only that route; do not
+  infer cancellation from an arbitrary outgoing edge or select by a familiar
+  route name. After authority and owned-resource settlement or qualified safe
+  retention are verified, submit only the graph-declared cancellation outcome
+  with its exact required carrier. Let Kent enforce native approval and the
+  transition; do not claim the transition until native state confirms it.
+- If native approval is required, do not answer, forge, replace or bypass it.
+  Do not start or replay Smoke or perform other product actions before the
+  required approval is granted. Continue safety-only settlement only when its
+  authority is independently explicit. Do not ask the same product question
+  merely to recover an approval reference.
+- Missing cancellation authority means do not submit the outcome. Unknown
+  effects or incomplete settlement also block submission; preserve safety and
+  report the unresolved ownership/effect state. Never adopt or settle a
+  foreign-owned resource or borrow its identity.
+- If the graph declares no supported cancellation/no-delivery route, report
+  that capability gap after preserving safety and ownership. Do not invent an
+  outcome, change the graph, bypass approval, or move the Task directly to
+  Cleanup.
 - If Smoke was interrupted, use only a supported, authorized safety-only
   continuation to settle or safely retain owned resources. Observation or
   cancellation does not authorize ordinary runtime replay or resumption of
   stopped work. If the owner or required capability is unavailable, report the
-  recovery gap. Put the cancellation source and settlement/qualified-retention
-  references in `closure_reason` without secrets. Do not claim a native
-  approval, answer or replace a pending approval, or ask the same product
-  cancellation question merely to recover its reference. Cancellation is not
-  Smoke PASS, delivery readiness or settlement of unrelated resources.
+  recovery gap. Put cancellation-source and settlement/qualified-retention
+  references in the declared route's required carrier without secrets.
+  Cancellation is not Smoke PASS, delivery readiness or settlement of
+  unrelated resources.
 - Implementation defects return to the writer. Unavailable resources,
   credentials, targeting or proof are findings/blockers, never a passing run.
 

@@ -1,4 +1,4 @@
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
 thinking_level = "high"
@@ -27,13 +27,13 @@ model_context_window = 372000
 
 # Interactive and headless/default sessions use Sol; their reasoning settings differ.
 [subagents.default]
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 thinking_level = "low"
 model_verbosity = "low"
 
 # Model-switched roles need explicit budgets to override Kent's catalog defaults.
 [subagents.defaultExtra]
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
 thinking_level = "low"
@@ -68,7 +68,7 @@ planning = false
 
 [subagents.researcher]
 description = "Read-only primary-source research for technical and product questions."
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 system_prompt_file = "agents/researcher.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -80,9 +80,71 @@ shell = true
 patch = false
 edit = false
 
+[subagents.reference-researcher]
+description = "Read-only comparison of an explicitly supplied related source checkout."
+model = "gpt-6.2-sol"
+system_prompt_file = "agents/reference-researcher.md"
+thinking_level = "high"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = true
+
+[subagents.reference-researcher.tools]
+shell = true
+patch = false
+edit = false
+
+[subagents.ui-reviewer]
+description = "Read-only review of UI state, rendering, interactions, accessibility, and performance."
+model = "gpt-6.2-astra"
+model_context_window = 400000
+context_compaction_threshold_tokens = 360000
+system_prompt_file = "agents/ui-reviewer.md"
+thinking_level = "medium"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = true
+
+[subagents.ui-reviewer.tools]
+shell = true
+patch = false
+edit = false
+
+[subagents.domain-reviewer]
+description = "Read-only review of domain boundaries, mapping, invariants, persistence, and API semantics."
+model = "gpt-6.2-astra"
+model_context_window = 400000
+context_compaction_threshold_tokens = 360000
+system_prompt_file = "agents/domain-reviewer.md"
+thinking_level = "medium"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = true
+
+[subagents.domain-reviewer.tools]
+shell = true
+patch = false
+edit = false
+
+[subagents.quality-reviewer]
+description = "Broad read-only review for defects, regressions, specification gaps, and test coverage."
+model = "gpt-6.2-astra"
+model_context_window = 400000
+context_compaction_threshold_tokens = 360000
+system_prompt_file = "agents/quality-reviewer.md"
+thinking_level = "medium"
+model_verbosity = "low"
+agent_callable = true
+workflow_subagent = true
+
+[subagents.quality-reviewer.tools]
+shell = true
+patch = false
+edit = false
+
 [subagents.standards-reviewer]
 description = "Read-only review against repository instructions, architecture, and engineering standards."
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
 system_prompt_file = "agents/standards-reviewer.md"
@@ -98,7 +160,7 @@ edit = false
 
 [subagents.spec-reviewer]
 description = "Read-only review of a change against its specification and acceptance criteria."
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
 system_prompt_file = "agents/spec-reviewer.md"
@@ -114,7 +176,7 @@ edit = false
 
 [subagents.architecture-designer]
 description = "Read-only design of alternative module interfaces, seams, and migration strategies."
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
 system_prompt_file = "agents/architecture-designer.md"
@@ -130,7 +192,7 @@ edit = false
 
 [subagents.grill]
 description = "Read-only decision stress-testing and bounded cross-Session criticism."
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
 system_prompt_file = "agents/grill.md"
@@ -146,7 +208,7 @@ edit = false
 
 [subagents.task-supervisor]
 description = "Operational supervision of selected Tasks, factual answers, bounded recovery, and human escalation."
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 system_prompt_file = "agents/task-supervisor.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -192,7 +254,7 @@ edit = false
 
 [subagents.implementation-complex]
 description = "Single-writer implementation role for planner-classified complex work."
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
 system_prompt_file = "agents/implementation-worker.md"
@@ -208,7 +270,7 @@ edit = false
 
 [subagents.complexity-planner]
 description = "Opt-in planner role for implementation complexity and revalidation."
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
 thinking_level = "medium"
@@ -218,7 +280,7 @@ workflow_subagent = true
 
 [subagents.fix-worker]
 description = "Single-writer repair of verified task-scoped findings and failed implementation slices."
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 system_prompt_file = "agents/fix-worker.md"
 thinking_level = "medium"
 model_verbosity = "low"
@@ -232,7 +294,7 @@ edit = false
 
 [subagents.build-doctor]
 description = "Deterministic build and test failure diagnosis with optional bounded fixes."
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 system_prompt_file = "agents/build-doctor.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -262,9 +324,9 @@ edit = false
 
 [subagents.runtime-smoke-tester]
 description = "Platform-neutral runtime smoke execution through project procedures and adapters."
-model = "gpt-6-luna"
-model_context_window = 372000
-context_compaction_threshold_tokens = 353400
+model = "gpt-6.2-sol"
+model_context_window = 400000
+context_compaction_threshold_tokens = 360000
 system_prompt_file = "agents/runtime-smoke-tester.md"
 thinking_level = "high"
 model_verbosity = "low"
@@ -278,7 +340,7 @@ edit = false
 
 [subagents.release-manager]
 description = "Conservative release preparation, publication, tagging, and external release-state management."
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 model_context_window = 400000
 context_compaction_threshold_tokens = 360000
 system_prompt_file = "agents/release-manager.md"

@@ -1421,6 +1421,10 @@ class WorkflowKitTest(unittest.TestCase):
             "fast": ("high", None, None, None, None),
             "compliance_reviewer": ("high", False, False, True, False),
             "researcher": ("high", True, True, True, False),
+            "reference-researcher": ("high", True, True, True, False),
+            "ui-reviewer": ("medium", True, True, True, False),
+            "domain-reviewer": ("medium", True, True, True, False),
+            "quality-reviewer": ("medium", True, True, True, False),
             "standards-reviewer": ("medium", False, False, True, False),
             "spec-reviewer": ("medium", False, False, True, False),
             "architecture-designer": ("high", True, True, True, False),
@@ -1443,27 +1447,31 @@ class WorkflowKitTest(unittest.TestCase):
         self.assertEqual(set(roles), set(expected_roles))
         selectors = {"root": config, "reviewer": config["reviewer"], **roles}
         expected_models = {
-            "root": "gpt-6.1-sol",
+            "root": "gpt-6.2-sol",
             "reviewer": "gpt-6-luna",
-            "default": "gpt-6.1-sol",
-            "defaultExtra": "gpt-6-astra",
+            "default": "gpt-6.2-sol",
+            "defaultExtra": "gpt-6.2-astra",
             "fast": "gpt-6-luna",
             "compliance_reviewer": "gpt-6-luna",
-            "researcher": "gpt-6.1-sol",
-            "standards-reviewer": "gpt-6-astra",
-            "spec-reviewer": "gpt-6-astra",
-            "architecture-designer": "gpt-6-astra",
-            "grill": "gpt-6-astra",
-            "task-supervisor": "gpt-6.1-sol",
+            "researcher": "gpt-6.2-sol",
+            "reference-researcher": "gpt-6.2-sol",
+            "ui-reviewer": "gpt-6.2-astra",
+            "domain-reviewer": "gpt-6.2-astra",
+            "quality-reviewer": "gpt-6.2-astra",
+            "standards-reviewer": "gpt-6.2-astra",
+            "spec-reviewer": "gpt-6.2-astra",
+            "architecture-designer": "gpt-6.2-astra",
+            "grill": "gpt-6.2-astra",
+            "task-supervisor": "gpt-6.2-sol",
             "implementation-worker": "gpt-6-luna",
             "implementation-simple": "gpt-5.6-luna",
-            "implementation-complex": "gpt-6.1-sol",
-            "complexity-planner": "gpt-6-astra",
-            "fix-worker": "gpt-6.1-sol",
-            "build-doctor": "gpt-6.1-sol",
+            "implementation-complex": "gpt-6.2-sol",
+            "complexity-planner": "gpt-6.2-astra",
+            "fix-worker": "gpt-6.2-sol",
+            "build-doctor": "gpt-6.2-sol",
             "workflow-gate": "gpt-6-luna",
-            "runtime-smoke-tester": "gpt-6-luna",
-            "release-manager": "gpt-6-astra",
+            "runtime-smoke-tester": "gpt-6.2-sol",
+            "release-manager": "gpt-6.2-astra",
             "delivery-operator": "gpt-6-luna",
             "ci-monitor": "gpt-6-luna",
             "release-decision": "gpt-6-luna",
@@ -1477,7 +1485,7 @@ class WorkflowKitTest(unittest.TestCase):
         }
         luna_roles = luna_selectors.intersection(roles)
         astra_selectors = {
-            name for name, model in expected_models.items() if model == "gpt-6-astra"
+            name for name, model in expected_models.items() if model == "gpt-6.2-astra"
         }
         astra_roles = astra_selectors.intersection(roles)
         expected_reasoning = {
@@ -1504,6 +1512,7 @@ class WorkflowKitTest(unittest.TestCase):
                 **{name: 400000 for name in astra_roles},
                 "implementation-simple": 372000,
                 "implementation-complex": 400000,
+                "runtime-smoke-tester": 400000,
             },
         )
         self.assertEqual(
@@ -1595,8 +1604,93 @@ class WorkflowKitTest(unittest.TestCase):
                     ("subagents", name, "context_compaction_threshold_tokens"): 360000
                     for name in astra_roles | {"implementation-complex"}
                 },
+                (
+                    "subagents",
+                    "runtime-smoke-tester",
+                    "context_compaction_threshold_tokens",
+                ): 360000,
             },
         )
+
+    def test_added_generic_roles_have_distinct_read_only_contracts(self) -> None:
+        contracts = {
+            "reference-researcher": (
+                "explicitly supplied related source checkout",
+                "exact commit/revision, and freshness",
+                "Do not fetch, pull, rebase",
+                "API/model",
+            ),
+            "ui-reviewer": (
+                "state/rendering boundaries",
+                "accessibility",
+                "performance",
+                "Do not claim device/runtime verification from code inspection",
+            ),
+            "domain-reviewer": (
+                "domain boundaries, mapping, model invariants, persistence",
+                "Do not replace or claim an independent UI review",
+            ),
+            "quality-reviewer": (
+                "correctness defects, regressions, specification",
+                "does not impersonate Workflow Standards or Specification",
+            ),
+        }
+        shared_contract = (
+            "{{.DefaultSystemPromptHarnessWorkflowAutonomy}}",
+            "{{.DefaultSystemPromptFinalAnswerAndFormatting}}",
+            "genuine current Task/Node/Session/Step identity",
+            "qualified configured evidence adapter",
+            "reminder-prescribed `kent task complete`",
+            "Never use `--force`",
+            "First-class edit tools remain disabled",
+            "Do not delegate or invoke child agents",
+        )
+        for role, phrases in contracts.items():
+            prompt = " ".join(
+                (REPO_ROOT / "agents" / f"{role}.md").read_text().split()
+            )
+            with self.subTest(role=role):
+                for phrase in (*shared_contract, *phrases):
+                    self.assertIn(phrase, prompt)
+
+    def test_model_free_project_role_overlays_keep_global_execution_settings(self) -> None:
+        global_roles = tomllib.loads(
+            (REPO_ROOT / "config" / "subagents.toml").read_text()
+        )["subagents"]
+        project_overlay = tomllib.loads(
+            """
+[subagents.researcher]
+system_prompt_file = "subagents/android-researcher.md"
+
+[subagents.reference-researcher]
+system_prompt_file = "subagents/ios-reference.md"
+
+[subagents.runtime-smoke-tester]
+system_prompt_file = "subagents/runtime-smoke-tester.md"
+"""
+        )["subagents"]
+        resolved_roles = deepcopy(global_roles)
+        for role, overrides in project_overlay.items():
+            with self.subTest(role=role):
+                self.assertNotIn("model", overrides)
+                resolved_roles[role].update(overrides)
+                self.assertEqual(
+                    resolved_roles[role]["model"],
+                    global_roles[role]["model"],
+                )
+
+    def test_runtime_smoke_role_keeps_direct_assignment_without_child_calls(self) -> None:
+        role = tomllib.loads(
+            (REPO_ROOT / "config" / "subagents.toml").read_text()
+        )["subagents"]["runtime-smoke-tester"]
+        self.assertTrue(role["agent_callable"])
+        self.assertFalse(role["workflow_subagent"])
+        self.assertEqual(role["model"], "gpt-6.2-sol")
+        self.assertEqual(role["thinking_level"], "high")
+        self.assertEqual(role["model_verbosity"], "low")
+        self.assertEqual(role["model_context_window"], 400000)
+        self.assertEqual(role["context_compaction_threshold_tokens"], 360000)
+        self.assertEqual(role["tools"], {"shell": True, "patch": False, "edit": False})
 
 
     def test_current_complexity_lifecycle_for_both_selected_coders(self) -> None:
@@ -1631,7 +1725,7 @@ class WorkflowKitTest(unittest.TestCase):
         )["subagents"]
         expected = {
             "simple": ("implementation-simple", "gpt-5.6-luna", "xhigh", 372000, 353400),
-            "complex": ("implementation-complex", "gpt-6.1-sol", "medium", 400000, 360000),
+            "complex": ("implementation-complex", "gpt-6.2-sol", "medium", 400000, 360000),
         }
 
         self.assertEqual(
@@ -1646,7 +1740,7 @@ class WorkflowKitTest(unittest.TestCase):
                 planner["model_context_window"],
                 planner["context_compaction_threshold_tokens"],
             ),
-            ("gpt-6-astra", "medium", 400000, 360000),
+            ("gpt-6.2-astra", "medium", 400000, 360000),
         )
         first_entry = edges["plan_contract_implement"]
         revalidation = edges["implement_revalidate"]
