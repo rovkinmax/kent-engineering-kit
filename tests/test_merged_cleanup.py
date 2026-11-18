@@ -394,6 +394,87 @@ class MergedCleanupPolicyTests(unittest.TestCase):
             sorted([CHILD_SESSION, GRANDCHILD_SESSION, ROOT_SESSION]),
         )
 
+    def test_historical_registered_residual_needs_real_roots_not_labels(self):
+        for reused in (False, True):
+            for absent_id in (False, True):
+                with self.subTest(reused=reused, absent_id=absent_id):
+                    membership = {
+                        "schema": "merged-cleanup-supervision-v1", "project_id": PROJECT,
+                        "supervisor_session_id": SUPERVISOR_SESSION, "task_ids": [TASK],
+                        "reused_root_session_ids": [ROOT_SESSION] if reused else [],
+                    }
+                    boundary = ROOT_SESSION if reused else SUPERVISOR_SESSION
+                    rows = [session(SUPERVISOR_SESSION, roots=[SUPERVISOR_SESSION])]
+                    if reused:
+                        rows.append(session(ROOT_SESSION, roots=[ROOT_SESSION]))
+                    rows.append(session(CHILD_SESSION, parent=boundary, roots=[boundary]))
+                    closure = build_session_closure(
+                        rows, task_id=TASK, project_id=PROJECT, supervision=[membership],
+                    )
+                    self.assertEqual({row["session_id"] for row in closure},
+                                     {row["session_id"] for row in rows})
+                    value = base_inventory(sessions=closure, supervision=[membership])
+                    evidence = {"reference": "original permission", "context": "finite residual scope"}
+                    value.update({
+                        "policy": None, "policy_provenance": None,
+                        "cleanup_context_sha256": hashlib.sha256(canonical_bytes(evidence)).hexdigest(),
+                        "history_operation": {
+                            "schema": "merged-cleanup-history-operation-v1", "project_id": PROJECT,
+                            "operator_project_id": PROJECT, "operator_task_id": None,
+                            "operator_session_id": GRANDCHILD_SESSION, "selected_task_ids": [TASK],
+                            "permission_evidence": evidence,
+                        },
+                        "release": {"prepared_by_session_id": GRANDCHILD_SESSION,
+                                    "owner_session_ids": [], "release_sha256": "e" * 64},
+                    })
+                    value["member_outcomes"][0]["native_state"] = "terminal"
+                    value["subject"].update({
+                        "worktree_id": "retained-absent" if absent_id else None,
+                        "worktree_path": None, "branch": None, "head_oid": None, "branch_oid": None,
+                    })
+                    value["worktrees"] = [{
+                        "project_id": PROJECT, "workspace_id": "workspace-1",
+                        "worktree_id": "retained-absent", "path": None,
+                        "branch": None, "head_oid": None, "branch_oid": None,
+                        "role": "task", "owner_task_id": TASK, "disposition": "absent",
+                    }] if absent_id else []
+                    inventory = validate_inventory(value)
+                    backend = RecordingBackend()
+                    execute_inventory(inventory, backend)
+                    self.assertNotIn(("delete-worktree", "retained-absent"), backend.calls)
+                    invalids = [
+                        {**value, "supervision": []},
+                        {**value, "sessions": [row for row in rows if row["session_id"] != SUPERVISOR_SESSION]},
+                        {**value, "sessions": rows + [session(
+                            GRANDCHILD_SESSION, roots=[boundary])]},
+                        {**value, "sessions": [
+                            dict(row, task_id=OTHER_TASK) if row["session_id"] == CHILD_SESSION else row
+                            for row in rows]},
+                        {**value, "sessions": [
+                            dict(row, supervisor_root_ids=[]) if row["session_id"] == CHILD_SESSION else row
+                            for row in rows]},
+                        base_inventory(sessions=closure, supervision=[membership]),
+                    ]
+                    if reused:
+                        invalids.append({**value, "sessions": [
+                            row for row in rows if row["session_id"] != ROOT_SESSION]})
+                    for invalid in invalids:
+                        with self.subTest(invalid=invalid), self.assertRaises(CleanupError):
+                            validate_inventory(invalid)
+                    held = json.loads(json.dumps(value))
+                    held["supervision"][0]["task_ids"] = sorted([TASK, OTHER_TASK])
+                    held["member_outcomes"].append({
+                        "task_id": OTHER_TASK, "native_state": "active", "outcome": "unknown",
+                        "pull_request_url": None, "head_oid": None,
+                        "merged_at": None, "merge_commit": None,
+                    })
+                    for row in held["sessions"]:
+                        row["disposition"] = "shared-in-use"
+                    validate_inventory(held)
+                    held["sessions"][-1]["disposition"] = "remove"
+                    with self.assertRaisesRegex(CleanupError, "held whole"):
+                        validate_inventory(held)
+
     def test_closure_rejects_descendant_owned_by_unregistered_task(self):
         rows = [
             session(ROOT_SESSION, task_id=TASK),

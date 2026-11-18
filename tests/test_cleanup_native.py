@@ -2191,6 +2191,41 @@ class NativeCleanupTests(unittest.TestCase):
                     self.assertRaisesRegex(CleanupError, "Git"),
                 ):
                     backend.revalidate(frozen_missing)
+                # Direct Task Agents have already gone. The genuine registered
+                # standalone supervisor remains, not an invented replacement.
+                membership = {
+                    "schema": "merged-cleanup-supervision-v1", "project_id": victim_project,
+                    "supervisor_session_id": victim_session, "task_ids": [OTHER_TASK],
+                    "reused_root_session_ids": [],
+                }
+                self.writer.execute("UPDATE sessions SET task_id=NULL WHERE id=?", (victim_session,))
+                self.writer.execute("INSERT INTO task_comments VALUES (?,?,?,?,?,?,?)", (
+                    "comment-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", OTHER_TASK,
+                    json.dumps(membership, sort_keys=True, separators=(",", ":")), "agent", "fixture", 1, 1,
+                ))
+                self.writer.commit()
+                backend._snapshots = {}
+                residual = backend.inspect_history(legacy_request).inventories[0]
+                self.assertIsNone(residual.value["sessions"][0]["task_id"])
+                self.assertEqual(residual.value["sessions"][0]["supervisor_root_ids"], [victim_session])
+                self.assertEqual(residual.value["worktrees"][0]["disposition"], "absent")
+                backend.revalidate(residual.value)
+                self.writer.execute(
+                    "UPDATE task_current_nodes SET session_id=? WHERE task_id=?", (victim_session, OTHER_TASK),
+                )
+                self.writer.commit()
+                with self.assertRaisesRegex(CleanupError, "current native owner"):
+                    backend.revalidate(residual.value)
+                self.writer.execute("UPDATE task_current_nodes SET session_id=NULL WHERE task_id=?", (OTHER_TASK,))
+                self.writer.execute("UPDATE sessions SET worktree_id=NULL WHERE id=?", (victim_session,))
+                self.writer.execute("UPDATE tasks SET managed_worktree_id=NULL WHERE id=?", (OTHER_TASK,))
+                self.writer.commit()
+                victim_detail["worktree_path"] = None
+                backend._snapshots = {}
+                rootless = backend.inspect_history(legacy_request).inventories[0]
+                self.assertIsNone(rootless.value["subject"]["worktree_id"])
+                self.assertEqual(rootless.value["worktrees"], [])
+                backend.revalidate(rootless.value)
         self.assertEqual(finite.value["project_id"], victim_project)
         self.assertEqual(finite.value["operator_project_id"], PROJECT)
         self.assertIsNone(finite.value["operator_task_id"])
