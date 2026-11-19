@@ -190,6 +190,107 @@ class CustodyTests(unittest.TestCase):
             with self.assertRaisesRegex(api.Error, "remote_execution_not_started"):
                 custody.confirm_remote_stopped()
 
+    def managed_borrow(self):
+        binding = {**self.binding, "schema": 2,
+                   "binding": {"project": "project", "task": "task", "session": "session"},
+                   "android_runtime": {"checkout": str(self.root), "settings": {}}}
+        self.write("binding.json", binding)
+        self.write("status.json", {**self.state, "parent_command_stop": "not_started",
+                                   "command_stop": "not_started"})
+        return api.DeviceCustody(self.config, "emulator-5576",
+                                 managed=(self.run, binding, ("original", 1)))
+
+    def test_managed_borrow_cannot_publish_marker_after_finish_fence(self):
+        from test_resource_lease_client import client
+
+        custody = self.managed_borrow()
+        with self.assertRaisesRegex(api.Error, "managed_attempt_required"):
+            self.borrow().check()
+        self.assertEqual(custody.check(), self.current)
+        client.request_managed_finish(self.run)
+        with self.assertRaisesRegex(api.Error, "lease_binding_invalid"):
+            custody.begin_remote_execution()
+        self.assertFalse((self.run / api.MARKER).exists())
+
+    def test_slow_managed_inspect_does_not_lock_helper_heartbeat(self):
+        from test_resource_lease_client import client
+
+        custody = self.managed_borrow()
+        first_inspect = threading.Event()
+        resume = threading.Event()
+        original = client.read(self.run / "status.json")
+        problems = []
+
+        def inspect(_, **_options):
+            if not first_inspect.is_set():
+                first_inspect.set()
+                if not resume.wait(5):
+                    raise RuntimeError("fixture did not resume inspection")
+            return self.current
+
+        def borrower():
+            try:
+                custody.begin_remote_execution()
+            except BaseException as error:
+                problems.append(error)
+
+        with patch.object(api, "inspect_lease", side_effect=inspect):
+            thread = threading.Thread(target=borrower)
+            thread.start()
+            try:
+                self.assertTrue(first_inspect.wait(5))
+                owner = client.Lease(self.run, custody._binding)
+                renewal = client.Renewal(owner, native=lambda _: None)
+                renewal.value = self.current
+                renewal.phase = "active"
+                with patch.object(client, "CLI_TIMEOUT", 0.1), patch.object(
+                    client.Lease, "cli", return_value=self.current,
+                ) as allocator:
+                    renewal.tick()
+                    allocator.assert_called_once_with("renew")
+                heartbeat = client.read(self.run / "status.json")
+                self.assertNotEqual(heartbeat["updated_at"], original["updated_at"])
+            finally:
+                resume.set()
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(problems, [])
+        with self.assertRaisesRegex(client.Error, "stop is not confirmed"):
+            client.request_managed_finish(self.run)
+        custody.confirm_remote_stopped()
+        client.request_managed_finish(self.run)
+
+    def test_finish_during_unlocked_managed_inspection_prevents_marker(self):
+        from test_resource_lease_client import client
+
+        custody = self.managed_borrow()
+
+        def inspect(_, **_options):
+            with patch.object(client, "CLI_TIMEOUT", 0.1):
+                client.request_managed_finish(self.run)
+            return self.current
+
+        with patch.object(api, "inspect_lease", side_effect=inspect):
+            with self.assertRaisesRegex(api.Error, "lease_binding_invalid"):
+                custody.begin_remote_execution()
+        self.assertFalse((self.run / api.MARKER).exists())
+
+    def test_delayed_managed_lease_observation_cannot_authorize_dispatch(self):
+        custody = self.managed_borrow()
+        instant = time.monotonic()
+
+        def inspect(_, **_options):
+            nonlocal instant
+            instant += 2
+            return {**self.current, "expires_in": 1}
+
+        with patch.object(api.time, "monotonic", side_effect=lambda: instant), patch.object(
+            api, "inspect_lease", side_effect=inspect,
+        ):
+            with self.assertRaisesRegex(api.Error, "lease_lost_or_foreign"):
+                custody.begin_remote_execution()
+        self.assertFalse((self.run / api.MARKER).exists())
+
     def test_exit_and_exception_are_not_remote_stop_proof(self):
         for failed in (False, True):
             marker = self.run / api.MARKER

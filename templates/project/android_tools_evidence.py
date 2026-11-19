@@ -50,7 +50,7 @@ _TARGET = re.compile(r"[A-Za-z0-9_.:-]+@[A-Za-z0-9_.-]+\Z")
 _SERIAL = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _CONTEXT_FIELDS = {
     "source_revision", "source_fingerprint", "target", "device_serial",
-    "lease_id", "generation", "package_name", "build_variant",
+    "lease_id", "generation", "package_name", "build_variant", "attempt_id",
 }
 _TRANSPORTS = {"not_started", "completed", "failed", "timed_out", "unknown"}
 _EFFECTS = {"not_dispatched", "not_applicable", "observed", "unknown"}
@@ -330,8 +330,10 @@ def _release_thread_lock(fd: int) -> None:
             del _LOCK_REGISTRY[key]
 
 
-def _open_lock_file(parent: int, name: str) -> int:
+def _open_lock_file(parent: int, name: str, *, create: bool) -> int:
     flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+    if not create:
+        return os.open(name, flags, dir_fd=parent)
     try:
         return os.open(
             name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent,
@@ -340,10 +342,10 @@ def _open_lock_file(parent: int, name: str) -> int:
         return os.open(name, flags, dir_fd=parent)
 
 
-def _lock(directory: Path, name: str) -> int:
+def _lock(directory: Path, name: str, *, create: bool = True) -> int:
     parent = _dirfd(directory)
     try:
-        fd = _open_lock_file(parent, name)
+        fd = _open_lock_file(parent, name, create=create)
     finally:
         os.close(parent)
     info = os.fstat(fd)
@@ -361,10 +363,10 @@ def _lock(directory: Path, name: str) -> int:
     return fd
 
 
-def _try_lock(directory: Path, name: str) -> int | None:
+def _try_lock(directory: Path, name: str, *, create: bool = True) -> int | None:
     parent = _dirfd(directory)
     try:
-        fd = _open_lock_file(parent, name)
+        fd = _open_lock_file(parent, name, create=create)
     finally:
         os.close(parent)
     info = os.fstat(fd)
@@ -602,7 +604,7 @@ def _run_info(run: Path, invocation_id: str) -> dict[str, Any]:
     return {
         "path": run, "started_ns": started_ns, "state": state, "size": size,
         "extra": extra, "reservation": reservation, "entries": entries,
-        "contribution": size + extra,
+        "contribution": size + extra, "managed": "attempt_id" in started["context"],
     }
 
 
@@ -841,6 +843,9 @@ def _export_record_matches(
 def _context(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) - _CONTEXT_FIELDS:
         raise EvidenceError("unsupported safe-context field")
+    managed = "attempt_id" in value
+    if managed and not {"lease_id", "generation", "device_serial"} <= value.keys():
+        raise EvidenceError("managed invocation requires lease provenance")
     result = {}
     for key, item in value.items():
         if key == "source_fingerprint":
@@ -850,8 +855,16 @@ def _context(value: Mapping[str, Any]) -> dict[str, Any]:
                     r"(?:[0-9a-f]{7,64}|[A-Za-z0-9][A-Za-z0-9._-]{0,63})", item):
                 raise EvidenceError("invalid source_revision")
             result[key] = item
+        elif key == "attempt_id":
+            try:
+                attempt = uuid.UUID(item) if isinstance(item, str) else None
+            except ValueError:
+                attempt = None
+            if attempt is None or attempt.version != 4 or str(attempt) != item:
+                raise EvidenceError("invalid managed attempt id")
+            result[key] = item
         elif key == "generation":
-            if type(item) is not int or item < 0:
+            if type(item) is not int or item < (1 if managed else 0):
                 raise EvidenceError("invalid generation")
             result[key] = item
         elif key == "package_name":
@@ -1607,20 +1620,41 @@ def _write_export_reservation_locked(run: Path, invocation_id: str,
     return reservation
 
 
+def _require_explicit_evidence(info: Mapping[str, Any]) -> None:
+    if info["managed"]:
+        raise BindingError("managed invocation requires authorized managed export")
+
+
 def _prepare_export_pin(run: Path, invocation_id: str, *,
                         max_bytes: int, max_age_seconds: int) -> int:
     """Atomically acquire an export pin and publish its capacity reservation."""
+    def check_before_creating_missing_lock() -> None:
+        # Ordinary reopens validate under their existing pin. For a partial
+        # store, read the same provenance without writes before legacy recovery.
+        started, _ = _read_started(run, invocation_id)
+        _run_manifest(run, started, invocation_id)
+        _require_explicit_evidence({"managed": "attempt_id" in started["context"]})
+
     while True:
-        root_lock = _lock(run.parent, ".retention.lock")
+        try:
+            root_lock = _lock(run.parent, ".retention.lock", create=False)
+        except FileNotFoundError:
+            check_before_creating_missing_lock()
+            root_lock = _lock(run.parent, ".retention.lock")
         activity_fd: int | None = None
         reservation_published = False
         waiting = False
         try:
-            activity_fd = _try_lock(run, ".active.lock")
+            try:
+                activity_fd = _try_lock(run, ".active.lock", create=False)
+            except FileNotFoundError:
+                check_before_creating_missing_lock()
+                activity_fd = _try_lock(run, ".active.lock")
             if activity_fd is None:
                 waiting = True
             else:
                 info = _run_info(run, invocation_id)
+                _require_explicit_evidence(info)
                 _write_export_reservation_locked(run, invocation_id, info)
                 reservation_published = True
                 _cleanup_locked(
@@ -1661,6 +1695,7 @@ def export_run(handle: RunHandle, binding: Mapping[str, Any], *, helper: str | o
         with lease.guard:
             if lease.fd is None:
                 raise EvidenceError("run invocation has already been released")
+            _require_explicit_evidence(_run_info(run, handle.invocation_id))
             return _export_pinned(
                 handle, run, identity, args, helper_path, interface, include_artifacts,
                 max_bytes, max_age_seconds,
@@ -1704,6 +1739,7 @@ def _export_pinned(handle: RunHandle, run: Path, identity: Mapping[str, str],
         export_lock = _lock(run, ".export.lock")
         _paths(handle)
         info = _run_info(run, handle.invocation_id)
+        _require_explicit_evidence(info)
         if temporary_run is not None:
             temporary_run["validated"] = True
         root_lock = _lock(run.parent, ".retention.lock")

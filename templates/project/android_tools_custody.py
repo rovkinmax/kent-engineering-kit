@@ -1,12 +1,11 @@
-"""Public borrowed-device custody API; no lease ownership or authentication policy.
+"""Borrowed-device custody API; managed identity is verified by the lease client.
 
 Import this module from a byte-qualified android-tools bundle. Call check() before
 device boundaries and during waits. begin_remote_execution() persists one exclusive
 uncertainty marker before dispatch; only positive caller-owned remote termination
 verification authorizes confirm_remote_stopped(). Context/host exit never does.
-The marker blocks consumers, not owner release; it is not quarantine. Existing
-owner bindings use custody marker protocol 1. New stop provenance is recorded in
-the existing status file; legacy or malformed status is not upgraded.
+The managed owner honors the marker at its release boundary. The marker is not
+allocator quarantine. Legacy owners retain their existing release semantics.
 """
 from __future__ import annotations
 
@@ -17,10 +16,12 @@ import json
 import math
 import os
 from pathlib import Path
+import pwd
 import re
 import selectors
 import stat
 import subprocess
+import sys
 import time
 from typing import Any, Iterator, Mapping
 import uuid
@@ -107,10 +108,14 @@ def load_lease_config(path: Path) -> LeaseConfig:
     return LeaseConfig.from_mapping(read_private(path).get("lease"))
 
 
-def inspect_lease(command: list[str]) -> dict[str, Any]:
-    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def inspect_lease(command: list[str], *, timeout: float = 10.0,
+                  env: dict[str, str] | None = None, cwd: str | None = None) -> dict[str, Any]:
+    options = {"env": env, "stdin": subprocess.DEVNULL} if env is not None else {}
+    if cwd is not None:
+        options["cwd"] = cwd
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
     output = {child.stdout: bytearray(), child.stderr: bytearray()}
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + timeout
     try:
         with selectors.DefaultSelector() as selector:
             for stream in output:
@@ -199,10 +204,21 @@ def _owner_binding(run: Path, config: LeaseConfig | None = None) -> dict[str, An
         parsed = LeaseConfig.from_mapping(lease_config)
     except (Error, TypeError):
         raise Error("lease_binding_invalid") from None
-    if (set(binding) != {
-                "schema", "config", "profile", "custody_marker_protocol",
+    required = {"schema", "config", "profile", "custody_marker_protocol",
                 "capability", "owner", "binding"}
-            or type(binding.get("schema")) is not int or binding.get("schema") != 1
+    schema = 1
+    if "android_runtime" in binding:
+        schema = 2
+        required.add("android_runtime")
+        runtime = binding["android_runtime"]
+        if (owner_binding is None or not isinstance(runtime, dict)
+                or set(runtime) != {"checkout", "settings"}
+                or not isinstance(runtime["checkout"], str)
+                or not Path(runtime["checkout"]).is_absolute()
+                or not isinstance(runtime["settings"], dict)):
+            raise Error("lease_binding_invalid")
+    if (set(binding) != required
+            or type(binding.get("schema")) is not int or binding.get("schema") != schema
             or type(binding.get("custody_marker_protocol")) is not int
             or binding["custody_marker_protocol"] != CUSTODY_MARKER_PROTOCOL
             or not isinstance(profile, str)
@@ -349,17 +365,20 @@ def _create_marker(run: Path, directory_fd: int, reason: str) -> tuple[tuple[int
 class DeviceCustody:
     """A borrow of the existing owner, with no acquire/renew/release effects."""
 
-    def __init__(self, lease_config: LeaseConfig | Mapping[str, Any], serial: str):
+    def __init__(self, lease_config: LeaseConfig | Mapping[str, Any], serial: str, *,
+                 managed: tuple[Path, dict[str, Any], tuple[str, int]] | None = None):
         config = lease_config.as_mapping() if isinstance(lease_config, LeaseConfig) else lease_config
         self.config = LeaseConfig.from_mapping(config)
         if not isinstance(serial, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", serial):
             raise Error("device_serial_required")
         self.serial = serial
-        self.run = Path(os.environ.get("RESOURCE_LEASE_RUN_DIRECTORY", ""))
+        self.run = managed[0] if managed is not None else Path(
+            os.environ.get("RESOURCE_LEASE_RUN_DIRECTORY", ""))
         if not self.run.is_absolute():
             raise Error("owned_run_required")
         self._marker: tuple[tuple[int, ...], bytes] | None = None
-        self._binding: dict[str, Any] | None = None
+        self._binding = managed[1] if managed is not None else None
+        self._managed_identity = managed[2] if managed is not None else None
         self._lease_identity: tuple[Any, ...] | None = None
         self._directory_identity: tuple[int, int] | None = None
         self._closed = False
@@ -372,13 +391,15 @@ class DeviceCustody:
         # Host/context exit is not evidence that remote execution stopped.
         self._closed = True
 
-    def _check(self, *, allow_external_uncertainty: bool = False) -> dict[str, Any]:
+    def _local(self, *, allow_external_uncertainty: bool = False):
         if self._closed:
             raise Error("custody_closed")
         private(self.run, directory=True)
         info = self.run.lstat()
         directory_identity = (info.st_dev, info.st_ino)
         binding = _owner_binding(self.run, self.config)
+        if (binding["schema"] == 2) != (self._managed_identity is not None):
+            raise Error("managed_attempt_required")
         state = _owner_status(self.run)
         private(self.run / "receipt.json")
         updated_at = state.get("updated_at")
@@ -420,10 +441,18 @@ class DeviceCustody:
                 raise Error("lease_owner_not_running")
         finally:
             os.close(fd)
-        current = inspect_lease([
+        return binding, state, marker, directory_identity
+
+    def _inspect(self, binding):
+        options = {}
+        if self._managed_identity is not None:
+            options = {"cwd": "/", "env": _allocator_environment(_account_home())}
+        return inspect_lease([
             self.config.executable, "--root", self.config.pool, "inspect", "--owner",
             binding["owner"], "--lease", str(self.run / "receipt.json"),
-        ])
+        ], **options)
+
+    def _verify_lease(self, current, binding, state, *, elapsed=0):
         prior = state.get("lease")
         if not isinstance(prior, dict):
             raise Error("lease_binding_invalid")
@@ -436,13 +465,20 @@ class DeviceCustody:
                 or current.get("capability") != binding["capability"]
                 or not isinstance(endpoint, dict) or endpoint.get("adb_serial") != self.serial
                 or type(remaining) not in (int, float) or not math.isfinite(remaining)
-                or remaining <= 0
+                or remaining <= elapsed
                 or any(current.get(key) != prior.get(key) for key in ("id", "generation", "slot"))
                 or any(current.get(key) is None for key in ("id", "generation", "slot"))
+                or self._managed_identity is not None and identity[:2] != self._managed_identity
                 or self._lease_identity is not None and identity != self._lease_identity):
             raise Error("lease_lost_or_foreign")
-        # Pool inspection can block while the owner publishes a finish/stop signal.
-        # Re-read every local admission barrier after that external call.
+        return identity
+
+    def _check(self, *, allow_external_uncertainty: bool = False) -> dict[str, Any]:
+        binding, state, marker, directory_identity = self._local(
+            allow_external_uncertainty=allow_external_uncertainty,
+        )
+        current = self._inspect(binding)
+        identity = self._verify_lease(current, binding, state)
         latest_binding = _owner_binding(self.run, self.config)
         latest_state = _owner_status(self.run)
         if latest_binding != binding or latest_state != state:
@@ -464,20 +500,55 @@ class DeviceCustody:
         self._directory_identity = directory_identity
         return current
 
+    @contextmanager
+    def _verified_managed(self, *, allow_external_uncertainty: bool = False):
+        # The helper also needs this lock to publish its renewal heartbeat.
+        # Pool I/O must not occupy it, and a newer heartbeat is not a new owner.
+        with _run_lock(self.run):
+            before = self._local(allow_external_uncertainty=allow_external_uncertainty)
+        # Budget from process start: output can have been buffered before
+        # inspect exited, even when its reply reports positive remaining TTL.
+        inspection_started = time.monotonic()
+        current = self._inspect(before[0])
+        with _run_lock(self.run) as fd:
+            binding, state, marker, directory = self._local(
+                allow_external_uncertainty=allow_external_uncertainty,
+            )
+            if (binding, marker, directory) != (before[0], before[2], before[3]):
+                raise Error("lease_binding_invalid")
+            identity = self._verify_lease(
+                current, binding, state, elapsed=time.monotonic() - inspection_started,
+            )
+            self._binding = binding
+            self._lease_identity = identity
+            self._directory_identity = directory
+            yield fd, current
+
     def check(self) -> dict[str, Any]:
+        if self._managed_identity is not None:
+            with self._verified_managed() as (_, current):
+                return current
         with _run_lock(self.run):
             return self._check()
 
+    def _publish_marker(self, fd: int, reason: str) -> None:
+        if self._marker is not None:
+            raise Error("remote_execution_already_started")
+        marker = self.run / MARKER
+        if marker.exists() or marker.is_symlink():
+            raise Error("uncertainty_marker_changed")
+        self._marker = _create_marker(self.run, fd, reason)
+        _write_owner_status(self.run, fd)
+
     def _begin_remote_execution(self, reason: str) -> None:
+        if self._managed_identity is not None:
+            with self._verified_managed() as (fd, _):
+                self._publish_marker(fd, reason)
+            self.check()
+            return
         with _run_lock(self.run) as fd:
             self._check()
-            if self._marker is not None:
-                raise Error("remote_execution_already_started")
-            marker = self.run / MARKER
-            if marker.exists() or marker.is_symlink():
-                raise Error("uncertainty_marker_changed")
-            self._marker = _create_marker(self.run, fd, reason)
-            _write_owner_status(self.run, fd)
+            self._publish_marker(fd, reason)
             self._check()
 
     def begin_remote_execution(self) -> None:
@@ -486,18 +557,27 @@ class DeviceCustody:
 
     def confirm_remote_stopped(self) -> None:
         """Remove only this live context's unchanged marker after positive proof."""
+        if self._managed_identity is not None:
+            with self._verified_managed(allow_external_uncertainty=True) as (fd, _):
+                self._clear_marker(fd)
+            return
         with _run_lock(self.run) as fd:
             if self._closed:
                 raise Error("custody_closed")
             if self._marker is None:
                 raise Error("remote_execution_not_started")
             self._check(allow_external_uncertainty=True)
-            if _marker_snapshot(self.run / MARKER) != self._marker:
-                raise Error("uncertainty_marker_changed")
-            (self.run / MARKER).unlink()
-            os.fsync(fd)
-            self._marker = None
-            _write_owner_status(self.run, fd)
+            self._clear_marker(fd)
+
+    def _clear_marker(self, fd: int) -> None:
+        if self._marker is None:
+            raise Error("remote_execution_not_started")
+        if _marker_snapshot(self.run / MARKER) != self._marker:
+            raise Error("uncertainty_marker_changed")
+        (self.run / MARKER).unlink()
+        os.fsync(fd)
+        self._marker = None
+        _write_owner_status(self.run, fd)
 
     def handoff_uncertain(self, reason_code: str) -> None:
         """Persist a sticky negative independently of owner lease liveness."""
@@ -508,6 +588,108 @@ class DeviceCustody:
 
 def borrow_device(lease_config: LeaseConfig | Mapping[str, Any], serial: str) -> DeviceCustody:
     return DeviceCustody(lease_config, serial)
+
+
+def _trusted_managed_path(path: Path, *, executable=False):
+    if path.resolve(strict=True) != path:
+        raise Error("unsafe_managed_path")
+    for component in (path, *path.parents):
+        info = component.lstat()
+        predicate = stat.S_ISREG if executable and component == path else stat.S_ISDIR
+        if (info.st_uid not in {0, os.getuid()} or info.st_mode & 0o022
+                or not predicate(info.st_mode)):
+            raise Error("unsafe_managed_path")
+    if executable and not os.access(path, os.X_OK):
+        raise Error("unsafe_managed_path")
+
+
+def _managed_client(launcher: Path, home: Path) -> Path:
+    installation = home / ".kent/tools/android"
+    client = installation / "resource-lease-client"
+    if (launcher != installation / "android-tools"
+            or any(os.path.lexists(parent / ".git") for parent in client.parents)):
+        raise Error("managed_installation_required")
+    _trusted_managed_path(launcher, executable=True)
+    _trusted_managed_path(client, executable=True)
+    return client
+
+
+def _account_home() -> Path:
+    return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
+
+
+def _allocator_environment(home: Path) -> dict[str, str]:
+    return {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+
+
+def _device_environment(home: Path, sdk: Path) -> dict[str, str]:
+    adb = sdk / "platform-tools/adb"
+    if os.pathsep in str(adb.parent):
+        raise Error("invalid_managed_sdk_path")
+    _trusted_managed_path(adb, executable=True)
+    if any(os.path.lexists(parent / ".git") for parent in adb.parents):
+        raise Error("managed_sdk_in_checkout")
+    return {
+        **_allocator_environment(home),
+        "PATH": f"{adb.parent}:/usr/bin:/bin",
+        "ANDROID_HOME": str(sdk),
+        "ANDROID_SDK_ROOT": str(sdk),
+        "ADB_SERVER_SOCKET": "tcp:127.0.0.1:5037",
+    }
+
+
+def managed_device(attempt: str, launcher: Path) -> tuple[dict[str, Any], DeviceCustody, dict[str, str]]:
+    session = os.environ.get("KENT_SESSION_ID", "")
+    for selector in (attempt, session):
+        try:
+            value = uuid.UUID(selector)
+        except ValueError:
+            raise Error("invalid_managed_identity") from None
+        if value.version != 4 or str(value) != selector:
+            raise Error("invalid_managed_identity")
+    home = _account_home()
+    client = _managed_client(launcher, home)
+    root = home / ".config/kent/android-tools/managed-runs"
+    _trusted_managed_path(root)
+    private(root, directory=True)
+    if read_private(root / ".managed-only") != {"schema": 1}:
+        raise Error("invalid_managed_run_root")
+    status = inspect_lease(
+        [sys.executable, "-I", "-B", str(client), "status", "--attempt", attempt],
+        timeout=30.0, env={**_allocator_environment(home), "KENT_SESSION_ID": session},
+    )
+    lease, endpoint = status.get("lease"), status.get("endpoint")
+    if (set(status) != {"attempt", "phase", "lease", "endpoint"}
+            or status["attempt"] != attempt or status["phase"] != "active"
+            or not isinstance(lease, dict) or set(lease) != {"id", "generation", "state", "owner"}
+            or lease["state"] != "active" or not isinstance(lease["id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", lease["id"])
+            or type(lease["generation"]) is not int or lease["generation"] < 1
+            or not isinstance(endpoint, dict) or set(endpoint) != {"adb_serial"}):
+        raise Error("invalid_managed_lease_observation")
+    run = root / attempt
+    binding = _owner_binding(run)
+    if (binding["schema"] != 2 or binding["owner"] != lease["owner"]
+            or binding["binding"]["session"] != session):
+        raise Error("managed_android_binding_unavailable")
+    runtime = binding["android_runtime"]
+    checkout = Path(runtime["checkout"]).resolve(strict=True)
+    if str(checkout) != runtime["checkout"] or not Path.cwd().is_relative_to(checkout):
+        raise Error("managed_android_checkout_mismatch")
+    settings = dict(runtime["settings"])
+    _trusted_managed_path(Path(settings["providers"]["mobile-native"]["executable"]),
+                          executable=True)
+    records = Path(settings["records_directory"])
+    _trusted_managed_path(records)
+    private(records, directory=True)
+    sdk_root = settings.pop("android_sdk_root", None)
+    if not isinstance(sdk_root, str) or not Path(sdk_root).is_absolute():
+        raise Error("managed_sdk_unavailable")
+    environment = _device_environment(home, Path(sdk_root))
+    config = {**settings, "source_root": str(checkout), "lease": binding["config"]}
+    custody = DeviceCustody(binding["config"], endpoint["adb_serial"],
+                            managed=(run, binding, (lease["id"], lease["generation"])))
+    return config, custody, environment
 
 
 def handoff_uncertain(reason_code: str) -> None:

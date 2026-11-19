@@ -488,6 +488,45 @@ class AndroidToolsEvidenceTests(unittest.TestCase):
         self.assertIn(result.manifest_sha256, history)
         self.assertNotIn(str(self.root), history)
 
+    def test_explicit_export_refuses_managed_record_without_mutation_or_helper(self) -> None:
+        context = {"attempt_id": "00000000-0000-4000-8000-000000000001",
+                   "generation": 1, "lease_id": "lease", "device_serial": "emulator-5554"}
+        self.finish_native_result()
+        managed = EVIDENCE["begin_run"](self.record_root, "device.key", "mobile-native", context)
+        EVIDENCE["finish_run"](managed, NATIVE["NativeResult"]("completed", "observed"))
+        helper = self.write_helper("project-memory", FAKE_STANDALONE)
+        counter = self.root / "managed-helper-calls"
+
+        def snapshot():
+            return {path.name: path.read_bytes() for path in managed.run_directory.iterdir()
+                    if path.is_file()}
+
+        with patch.dict(os.environ, {"EVIDENCE_COUNTER": str(counter)}):
+            retained = snapshot()
+            with self.assertRaisesRegex(EVIDENCE["BindingError"], "managed export"):
+                EVIDENCE["export_run"](managed, self.binding(), helper=helper)
+            self.assertEqual(snapshot(), retained)
+            EVIDENCE["release_run"](managed)
+            reopened = EVIDENCE["open_run"](self.record_root, managed.invocation_id)
+            retained = snapshot()
+            with self.assertRaisesRegex(EVIDENCE["BindingError"], "managed export"):
+                EVIDENCE["export_run"](reopened, self.binding(), helper=helper)
+            self.assertEqual(snapshot(), retained)
+            root_lock = managed.run_directory.parent / ".retention.lock"
+            (managed.run_directory / ".active.lock").unlink()
+            retained = snapshot()
+            with self.assertRaisesRegex(EVIDENCE["BindingError"], "managed export"):
+                EVIDENCE["export_run"](reopened, self.binding(), helper=helper)
+            self.assertEqual(snapshot(), retained)
+            root_lock.unlink()
+            with self.assertRaisesRegex(EVIDENCE["BindingError"], "managed export"):
+                EVIDENCE["export_run"](reopened, self.binding(), helper=helper)
+            self.assertEqual(snapshot(), retained)
+            self.assertFalse(root_lock.exists())
+            self.assertFalse(counter.exists())
+            legacy = EVIDENCE["export_run"](self.handle, self.binding(), helper=helper)
+        self.assertEqual(legacy.status, "exported")
+
     def test_historical_png_export_does_not_revalidate_or_rewrite(self) -> None:
         # The former evidence parser admitted header/end-only PNGs.
         staged = EVIDENCE["stage_artifact"](
