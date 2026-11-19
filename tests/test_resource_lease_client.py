@@ -17,7 +17,7 @@ import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -32,6 +32,8 @@ loader.exec_module(client)
 
 TASK = "task-11111111-1111-4111-8111-111111111111"
 SESSION = "22222222-2222-4222-8222-222222222222"
+ACTOR_SESSION = "33333333-3333-4333-8333-333333333333"
+STEP = "44444444-4444-4444-8444-444444444444"
 
 
 class PublicCheckTests(unittest.TestCase):
@@ -379,6 +381,23 @@ class ResourceLeaseClientTests(unittest.TestCase):
                 tick=tick, resource_operation="acquire",
             )
         self.assertIs(raised.exception, failure)
+
+    def test_native_run_completion_rejects_success_exit_with_pending_outcome(self):
+        final = {"status": "ok", "result": "completed", "session_id": SESSION}
+        self.assertTrue(client.native_run_completed(final, session=SESSION))
+        for pending in (
+            {"status": "ok", "session_id": SESSION,
+             "outcome": {"kind": "question", "question_id": "q-1"}},
+            {"status": "ok", "session_id": SESSION,
+             "outcome": {"kind": "approval", "approval_id": "a-1"}},
+            {"status": "ok", "session_id": SESSION, "result": ""},
+            {"status": "ok", "session_id": SESSION, "result": "done",
+             "error": "retained"},
+            {"status": "error", "session_id": SESSION, "result": "done"},
+            {**final, "session_id": ACTOR_SESSION},
+        ):
+            with self.subTest(pending=pending):
+                self.assertFalse(client.native_run_completed(pending, session=SESSION))
 
     def test_capture_success_and_non_resource_error_remain_unchanged(self):
         with patch.object(client.subprocess, "Popen", wraps=subprocess.Popen) as spawn:
@@ -1372,29 +1391,39 @@ class ManagedLeaseTests(unittest.TestCase):
         self.kent_state.mkdir(mode=0o700)
         self.node = self.kent_state / "node"
         self.node.write_text("Required Runtime Smoke")
-        kent = self.home / "kent"
-        kent.write_text(f"""#!{sys.executable}
+        self.kent = self.home / "kent"
+        self.kent.write_text(f"""#!{sys.executable}
 import json, os, sys
 from pathlib import Path
 assert os.getcwd() == "/" and os.environ["HOME"] == {str(self.home)!r}
 assert os.environ["KENT_PERSISTENCE_ROOT"] == {str(self.kent_state)!r}
 assert os.environ["PATH"] == "/usr/bin:/bin"
-assert "KENT_SESSION_ID" not in os.environ
 a = sys.argv[1:]
 if a[:2] == ["worktree", "status"]:
-    root = {str(self.checkout)!r}
+    assert "KENT_SESSION_ID" not in os.environ
+    assert "KENT_STEP_ID" not in os.environ
+    session = a[a.index("--session") + 1]
+    root = ({str(self.checkout)!r}
+            if session in {{{SESSION!r}, {ACTOR_SESSION!r}}}
+            else {str(self.workspace)!r})
+    linked = ({{"root": root, "availability": "available"}}
+              if root == {str(self.checkout)!r} else None)
     print(json.dumps({{"problems": [], "target": {{
         "workspace_root": {str(self.workspace)!r}, "workspace_availability": "available",
-        "effective_workdir": root, "worktree": {{"root": root, "availability": "available"}}
+        "effective_workdir": root, "worktree": linked
     }}, "worktree": {{"recorded_root": root, "observed_root": root}}}}))
 elif a[:2] == ["task", "show"]:
     print(json.dumps({{"summary": {{"id": a[2], "done": False, "project_id": {self.project!r},
           "workflow_id": {self.workflow!r}}}, "status": {{"kind": "running", "native_state": "running"}}}}))
 else:
+    if a and a[0] == "run":
+        Path({str(self.home / "native-run-invoked")!r}).touch()
+        raise SystemExit(2)
     print(json.dumps({{"task_id": a[2], "items": [{{"session_id": {SESSION!r}, "status": "running",
           "node_name": Path({str(self.node)!r}).read_text()}}]}}))
 """)
-        kent.chmod(0o700)
+        self.kent.chmod(0o700)
+        self.base_kent = self.kent.read_text()
         self.config = self.home / "config.json"
         self.allocator = self.home / "allocator"
         self.allocator_log = self.home / "allocator-environment"
@@ -1410,7 +1439,7 @@ with open({str(self.allocator_log)!r}, "a") as log:
         self.allocator.chmod(0o700)
         client.write(self.config, {**json.loads(fixture.config.read_text()),
                                    "executable": str(self.allocator)})
-        self.registry = {"schema": 1, "kent_executable": str(kent),
+        self.registry = {"schema": 1, "kent_executable": str(self.kent),
                          "kent_persistence_root": str(self.kent_state),
                          "routes": [{"workspace": str(self.workspace), "project": self.project,
                                      "workflow_id": self.workflow, "smoke_node": "Required Runtime Smoke",
@@ -1427,6 +1456,7 @@ with open({str(self.allocator_log)!r}, "a") as log:
             f"pwd.getpwuid = lambda _: SimpleNamespace(pw_dir={str(self.home)!r})\n", 1))
         self.script.chmod(0o700)
         self.environment = {**fixture.environment, "KENT_SESSION_ID": SESSION,
+                            "KENT_STEP_ID": STEP,
                             "HOME": "/not-account-home", "KENT_PERSISTENCE_ROOT": "/not-native-state",
                             "KENT_MANAGED_OBSERVER": "untrusted context"}
         self.environment.pop("RESOURCE_LEASE_CONFIG", None)
@@ -1465,6 +1495,745 @@ with open({str(self.allocator_log)!r}, "a") as log:
         self.assertEqual(payload["phase"], phase)
         self.assertNotIn(str(self.home), result.stdout)
         return payload
+
+    def test_route_accepts_closed_standalone_intents(self):
+        route = dict(self.registry["routes"][0], standalone_intents=["ui.clean"])
+        unrelated = self.home / "unrelated-primary"
+        unrelated.mkdir()
+        legacy_route = dict(
+            self.registry["routes"][0],
+            project="project-55555555-5555-4555-8555-555555555555",
+            workspace=str(unrelated),
+        )
+        client.write(self.registration, {**self.registry, "routes": [route, legacy_route]})
+        with patch.object(client.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(self.home))):
+            host = client.HostRouting()
+            self.assertEqual(host.route(self.workspace)["standalone_intents"], ["ui.clean"])
+            self.assertNotIn("standalone_intents", host.route(unrelated))
+
+        for invalid in (["ui.clean", "ui.clean"], [""], "ui.clean", [None]):
+            with self.subTest(invalid=invalid):
+                client.write(self.registration, {
+                    **self.registry,
+                    "routes": [dict(route, standalone_intents=invalid), legacy_route],
+                })
+                with patch.object(
+                    client.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(self.home)),
+                ), self.assertRaises(client.Error):
+                    client.HostRouting().route(self.workspace)
+
+    def test_standalone_terminal_requires_original_identity_and_positive_null_endpoint(self):
+        run = self.home / "terminal-proof"
+        run.mkdir(mode=0o700)
+        metadata = {"owner": "standalone:attempt", "capability": "clean"}
+        original = {
+            "id": "lease-one", "generation": 1, "slot": "slot",
+            "owner": metadata["owner"], "capability": metadata["capability"],
+        }
+        client.write(run / "status.json", {
+            "phase": "active", "updated_at": time.monotonic(),
+            "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+            "parent_command_stop": "confirmed", "external_stop_unconfirmed": False,
+            "command_stop": "confirmed", "run_directory": str(run),
+            "lease": original, "error": None,
+        })
+        terminal = {
+            **original, "generation": None, "state": "completed", "endpoint": None,
+            "cleanup_pending": False, "quarantined": False,
+        }
+        client.validate_standalone_terminal(run, metadata, terminal)
+        for change in (
+            {"state": "expired"},
+            {"endpoint": {"adb_serial": "emulator-5574"}},
+            {"endpoint": None, "cleanup_pending": True},
+            {"endpoint": None, "quarantined": True},
+            {"endpoint": None, "id": "replacement"},
+            {"endpoint": None, "owner": "foreign"},
+            {"endpoint": None, "generation": True},
+            {"endpoint": None, "error": "retained"},
+        ):
+            candidate = {**terminal, **change}
+            with self.subTest(change=change), self.assertRaises(client.Error):
+                client.validate_standalone_terminal(run, metadata, candidate)
+        missing = dict(terminal)
+        missing.pop("generation")
+        with self.assertRaises(client.Error):
+            client.validate_standalone_terminal(run, metadata, missing)
+        missing = dict(terminal)
+        missing.pop("endpoint")
+        with self.assertRaises(client.Error):
+            client.validate_standalone_terminal(run, metadata, missing)
+        finished = {
+            "phase": "finished", "updated_at": time.monotonic(),
+            "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+            "parent_command_stop": "confirmed", "external_stop_unconfirmed": False,
+            "command_stop": "confirmed", "run_directory": str(run),
+            "lease": {**terminal}, "error": None,
+        }
+        client.validate_standalone_status(run, finished)
+        for change in (
+            {"error": "retained"},
+            {"parent_command_stop": "unconfirmed", "command_stop": "unconfirmed"},
+            {"external_stop_unconfirmed": True, "command_stop": "unconfirmed"},
+            {"command_stop": "not_started"},
+            {"lease": {**terminal, "endpoint": {"adb_serial": "emulator-5574"}}},
+            {"lease": {**terminal, "cleanup_pending": True}},
+            {"lease": {**terminal, "quarantined": True}},
+        ):
+            with self.subTest(change=change), self.assertRaises(client.Error):
+                client.validate_standalone_status(run, {**finished, **change})
+        marker = {
+            "schema": 1, "reason": "remote_stop_unconfirmed", "operation": uuid.uuid4().hex,
+        }
+        client.write(run / client.UNCERTAINTY_MARKER, marker)
+        with self.assertRaises(client.Error):
+            client.validate_standalone_status(run, finished)
+
+    def test_controller_stop_fences_new_provider_admission_without_holding_guard_io(self):
+        run = self.home / str(uuid.uuid4())
+        run.mkdir(mode=0o700)
+        scope = {
+            "schema": 1, "phase": "claimed", "grant_sha256": "0" * 64,
+            "attempt": run.name, "project": self.project,
+            "workspace": str(self.workspace), "checkout": str(self.checkout),
+            "intent": "ui.clean", "session": SESSION,
+            "stop_requested": False, "admission": None,
+        }
+        client.write(run / "controller.json", scope)
+        for name in ("controller.lock", "controller-state.lock"):
+            path = run / name
+            path.touch(mode=0o600)
+            path.chmod(0o600)
+        entered = threading.Event()
+        guard_open = threading.Event()
+        allow_finish = threading.Event()
+        stop_finished = threading.Event()
+        operations = []
+        failures = []
+
+        def provider_admission():
+            try:
+                with client.controller_admission(run, "acquire"):
+                    operations.append("acquire")
+                    with client.controller_guard(run):
+                        guard_open.set()
+                    entered.set()
+                    if not allow_finish.wait(5):
+                        raise AssertionError("fixture admission was not released")
+            except BaseException as error:
+                failures.append(error)
+
+        def stop():
+            try:
+                client.stop_controller(run)
+                stop_finished.set()
+            except BaseException as error:
+                failures.append(error)
+
+        with patch.object(client, "controller_is_live", return_value=True):
+            provider = threading.Thread(target=provider_admission)
+            provider.start()
+            self.assertTrue(entered.wait(5))
+            self.assertTrue(guard_open.is_set())
+            stopper = threading.Thread(target=stop)
+            stopper.start()
+            deadline = time.monotonic() + 5
+            while not client.read(run / "controller.json")["stop_requested"] \
+                    and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(client.read(run / "controller.json")["stop_requested"])
+            self.assertFalse(stop_finished.is_set())
+            allow_finish.set()
+            provider.join(timeout=5)
+            stopper.join(timeout=5)
+            self.assertFalse(provider.is_alive())
+            self.assertFalse(stopper.is_alive())
+            self.assertEqual(failures, [])
+            self.assertTrue(stop_finished.is_set())
+            self.assertEqual(operations, ["acquire"])
+            self.assertEqual(client.read(run / "controller.json")["phase"], "closed")
+            with self.assertRaises(client.Error):
+                with client.controller_admission(run, "renew"):
+                    operations.append("renew")
+        self.assertEqual(operations, ["acquire"])
+
+    def test_controller_stop_timeout_keeps_admission_sticky_and_unresolved(self):
+        run = self.home / str(uuid.uuid4())
+        run.mkdir(mode=0o700)
+        scope = {
+            "schema": 1, "phase": "claimed", "grant_sha256": "0" * 64,
+            "attempt": run.name, "project": self.project,
+            "workspace": str(self.workspace), "checkout": str(self.checkout),
+            "intent": "ui.clean", "session": SESSION,
+            "stop_requested": False,
+            "admission": {"operation": "acquire", "nonce": "a" * 32},
+        }
+        client.write(run / "controller.json", scope)
+        for name in ("controller.lock", "controller-state.lock"):
+            path = run / name
+            path.touch(mode=0o600)
+            path.chmod(0o600)
+        with self.assertRaisesRegex(
+                client.Error, "standalone provider admission remains unresolved"):
+            client.stop_controller(run, timeout=0.02)
+        stopped = client.read(run / "controller.json")
+        self.assertEqual(stopped["phase"], "failed")
+        self.assertTrue(stopped["stop_requested"])
+        self.assertEqual(stopped["admission"], scope["admission"])
+        with self.assertRaises(client.Error):
+            with client.controller_admission(run, "renew"):
+                self.fail("timed-out admission must remain closed")
+
+    def test_agent_reports_unresolved_when_controller_admission_does_not_drain(self):
+        route = dict(self.registry["routes"][0], standalone_intents=["ui.clean"])
+        config = {**client.configuration(self.config), "runs_directory": str(self.root)}
+        runtime = {"checkout": str(self.checkout), "settings": {}}
+        host = SimpleNamespace(
+            root=self.root, env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"},
+            kent=self.kent, route=lambda _workspace: route,
+            target=lambda _session, exact_cwd: (self.workspace, self.checkout),
+            config=lambda _route: config,
+            android=lambda _route, _checkout, _config: runtime,
+        )
+        admission = {"operation": "acquire", "nonce": "b" * 32}
+
+        def native_launch(_command, **options):
+            options["on_started"](SimpleNamespace())
+            attempt_dirs = [path for path in self.root.iterdir() if path.is_dir()]
+            self.assertEqual(len(attempt_dirs), 1)
+            run = attempt_dirs[0]
+            state = client.read(run / "controller.json")
+            state.update(phase="claimed", session=ACTOR_SESSION, admission=admission)
+            client.write_controller(run, state)
+            return {
+                "status": "ok", "result": "native run ended", "session_id": ACTOR_SESSION,
+            }, 0
+
+        real_stop = client.stop_controller
+
+        def short_stop(run, *, failed=False):
+            return real_stop(run, failed=failed, timeout=0.02)
+
+        args = SimpleNamespace(profile="ui.clean", prompt="fixture", run_dir=None)
+        output = io.StringIO()
+        with (patch.object(client, "pwd", SimpleNamespace(
+                getpwuid=lambda _uid: SimpleNamespace(pw_dir=str(self.home)))),
+              patch.object(client, "physical_linked_checkout",
+                           return_value=(self.workspace, self.checkout)),
+              patch.object(client, "capture", side_effect=native_launch),
+              patch.object(client, "stop_controller", side_effect=short_stop),
+              patch.dict(os.environ, {"KENT_SESSION_ID": SESSION, "KENT_STEP_ID": STEP}),
+              redirect_stdout(output)):
+            result = client.agent(args, host)
+        self.assertEqual(result, 1)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["frontend_completion"], "completed")
+        self.assertEqual(report["device_cleanup"], "unresolved")
+        attempt = report["attempt"]
+        state = client.read(self.root / attempt / "controller.json")
+        self.assertEqual(state["phase"], "failed")
+        self.assertTrue(state["stop_requested"])
+        self.assertEqual(state["admission"], admission)
+        self.assertFalse({"release", "cancel"} & set(
+            self.fixture.calls() if (self.fixture.pool / "calls").exists() else []
+        ))
+
+    def test_agent_does_not_equate_pending_question_with_successful_cleanup(self):
+        route = dict(self.registry["routes"][0], standalone_intents=["ui.clean"])
+        config = {**client.configuration(self.config), "runs_directory": str(self.root)}
+        runtime = {"checkout": str(self.checkout), "settings": {}}
+        host = SimpleNamespace(
+            root=self.root, env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"},
+            kent=self.kent, route=lambda _workspace: route,
+            target=lambda _session, exact_cwd: (self.workspace, self.checkout),
+            config=lambda _route: config,
+            android=lambda _route, _checkout, _config: runtime,
+        )
+
+        def pending_question(_command, **options):
+            options["on_started"](SimpleNamespace())
+            run = next(path for path in self.root.iterdir() if path.is_dir())
+            state = client.read(run / "controller.json")
+            state.update(phase="claimed", session=ACTOR_SESSION)
+            client.write_controller(run, state)
+            client.write(run / "status.json", {
+                "phase": "finished", "updated_at": time.monotonic(),
+                "custody_marker_protocol": client.CUSTODY_MARKER_PROTOCOL,
+                "parent_command_stop": "confirmed", "external_stop_unconfirmed": False,
+                "command_stop": "confirmed", "run_directory": str(run),
+                "lease": {
+                    "id": "lease-original", "generation": None, "slot": "slot-original",
+                    "owner": f"standalone:{run.name}", "capability": "clean",
+                    "state": "completed", "endpoint": None,
+                    "cleanup_pending": False, "quarantined": False,
+                },
+                "error": None,
+            })
+            return {
+                "status": "ok", "session_id": ACTOR_SESSION,
+                "outcome": {"kind": "question", "question_id": "question-1"},
+            }, 0
+
+        args = SimpleNamespace(profile="ui.clean", prompt="fixture", run_dir=None)
+        output = io.StringIO()
+        with (patch.object(client, "pwd", SimpleNamespace(
+                getpwuid=lambda _uid: SimpleNamespace(pw_dir=str(self.home)))),
+              patch.object(client, "physical_linked_checkout",
+                           return_value=(self.workspace, self.checkout)),
+              patch.object(client, "capture", side_effect=pending_question),
+              patch.dict(os.environ, {"KENT_SESSION_ID": SESSION}),
+              redirect_stdout(output)):
+            result = client.agent(args, host)
+        self.assertEqual(result, 1)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["frontend_exit"], 0)
+        self.assertEqual(report["frontend_completion"], "unresolved")
+        self.assertEqual(report["device_cleanup"], "confirmed")
+
+    def test_agent_requires_exact_native_caller_and_bidirectional_git_link_before_run(self):
+        route = dict(self.registry["routes"][0], standalone_intents=["ui.clean"])
+        client.write(self.registration, {**self.registry, "routes": [route]})
+        cases = []
+        missing = dict(self.environment)
+        missing.pop("KENT_SESSION_ID")
+        cases.append(("missing", missing, self.checkout))
+        malformed = dict(self.environment, KENT_SESSION_ID="not-a-session")
+        cases.append(("malformed", malformed, self.checkout))
+        mismatched = dict(
+            self.environment,
+            KENT_SESSION_ID="55555555-5555-4555-8555-555555555555",
+        )
+        cases.append(("native-target-mismatch", mismatched, self.checkout))
+        malformed_step = dict(self.environment, KENT_STEP_ID="not-a-step")
+        cases.append(("malformed-step", malformed_step, self.checkout))
+        cases.append(("wrong-cwd", self.environment, self.workspace))
+        for label, environment, cwd in cases:
+            with self.subTest(label=label):
+                rejected = subprocess.run(
+                    [sys.executable, str(self.script), "agent", "--profile", "ui.clean",
+                     "--prompt", "Must not launch from an unqualified caller."],
+                    cwd=cwd, env=environment, capture_output=True, text=True, timeout=20,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertFalse(self.root.exists())
+                self.assertFalse((self.home / "native-run-invoked").exists())
+                self.assertFalse((self.fixture.pool / "calls").exists())
+
+        marker = self.checkout / ".git"
+        gitdir = Path(marker.read_text().strip()[8:]).resolve()
+        backlink = gitdir / "gitdir"
+        original = backlink.read_bytes()
+        original_mode = backlink.stat().st_mode & 0o777
+        try:
+            backlink.write_text(str(self.workspace / ".git") + "\n")
+            backlink.chmod(original_mode)
+            rejected = subprocess.run(
+                [sys.executable, str(self.script), "agent", "--profile", "ui.clean",
+                 "--prompt", "Must not launch from a stale Git backlink."],
+                cwd=self.checkout, env=self.environment,
+                capture_output=True, text=True, timeout=20,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse(self.root.exists())
+            self.assertFalse((self.home / "native-run-invoked").exists())
+            self.assertFalse((self.fixture.pool / "calls").exists())
+        finally:
+            backlink.write_bytes(original)
+            backlink.chmod(original_mode)
+
+    def test_interrupted_standalone_begin_does_not_publish_explicit_end(self):
+        attempt = str(uuid.uuid4())
+        grant = "A" * 43
+        config = {**client.configuration(self.config), "runs_directory": str(self.root)}
+        standalone = {
+            "attempt": attempt, "project": self.project,
+            "workspace": str(self.workspace), "checkout": str(self.checkout),
+            "intent": "ui.clean", "session": None, "caller_session": SESSION,
+        }
+        lease = client.prepare(
+            SimpleNamespace(profile="ui.clean", run_dir=str(self.root / attempt)),
+            managed_config=config, standalone=standalone,
+            grant_digest=client.hashlib.sha256(grant.encode("ascii")).hexdigest(),
+        )
+        controller = client.read(lease.run / "controller.json")
+        controller["phase"] = "claimed"
+        controller["session"] = str(uuid.uuid4())
+        client.write_controller(lease.run, controller)
+        fake_child = SimpleNamespace(poll=lambda: None)
+        with (patch.object(client, "STOP", True),
+              patch.object(client.subprocess, "Popen", return_value=fake_child),
+              patch.object(client, "stop_controller") as stop,
+              patch.object(client, "request_managed_finish") as request_finish):
+            with self.assertRaisesRegex(client.Error, "startup interrupted"):
+                client.launch(lease, native=lambda _scope: None, helper_env={})
+        stop.assert_called_once_with(lease.run, failed=True)
+        request_finish.assert_not_called()
+        self.assertFalse((lease.run / "finish.json").exists())
+        self.assertFalse((lease.run / "receipt.json").exists())
+        calls = self.fixture.calls() if (self.fixture.pool / "calls").exists() else []
+        self.assertFalse({"release", "cancel"} & set(calls))
+
+    def test_unenabled_standalone_intent_and_failed_native_launch_do_not_allocate(self):
+        route = dict(self.registry["routes"][0], standalone_intents=["not-configured"])
+        client.write(self.registration, {**self.registry, "routes": [route]})
+        denied = subprocess.run(
+            [sys.executable, str(self.script), "agent", "--profile", "ui.clean",
+             "--prompt", "Denied before native launch."],
+            cwd=self.checkout, env=self.environment, capture_output=True, text=True, timeout=20,
+        )
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertFalse((self.fixture.pool / "calls").exists())
+
+        route["standalone_intents"] = ["ui.clean"]
+        failed_records = self.home / "failed-records"
+        failed_records.mkdir(mode=0o700)
+        failed_sdk = self.home / "failed-sdk"
+        failed_adb = failed_sdk / "platform-tools/adb"
+        failed_adb.parent.mkdir(parents=True)
+        failed_adb.write_text("#!/bin/sh\nexit 0\n")
+        failed_adb.chmod(0o700)
+        failed_provider = self.home / "failed-provider"
+        failed_provider.write_text("#!/bin/sh\nexit 0\n")
+        failed_provider.chmod(0o700)
+        failed_settings = self.home / "failed-settings.json"
+        client.write(failed_settings, {
+            "schema": 1, "timeout_seconds": 5, "output_limit_bytes": 4096,
+            "providers": {"mobile-native": {
+                "executable": str(failed_provider), "version": "1.0",
+            }},
+            "records_directory": str(failed_records),
+            "android_sdk_root": str(failed_sdk),
+        })
+        route["android_config"] = str(failed_settings)
+        client.write(self.registration, {**self.registry, "routes": [route]})
+        invocation_marker = f"Path({str(self.home / 'native-run-invoked')!r}).touch()"
+        self.assertIn(invocation_marker, self.base_kent)
+        failed_kent = self.base_kent.replace(
+            invocation_marker + "\n        raise SystemExit(2)",
+            "raise SystemExit(7)",
+        )
+        self.kent.write_text(failed_kent)
+        self.kent.chmod(0o700)
+        failed = subprocess.run(
+            [sys.executable, str(self.script), "agent", "--profile", "ui.clean",
+             "--prompt", "Fail before actor claim."],
+            cwd=self.checkout, env=self.environment, capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(failed.returncode, 1)
+        result = json.loads(failed.stdout)
+        self.assertEqual(result["device_cleanup"], "not_started")
+        self.assertNotIn(str(self.home), failed.stdout + failed.stderr)
+        self.assertFalse((self.fixture.pool / "calls").exists())
+
+    def test_agent_sigterm_stops_unresponsive_native_child_and_keeps_cleanup_unresolved(self):
+        route = dict(self.registry["routes"][0], standalone_intents=["ui.clean"])
+        records = self.home / "signal-records"
+        records.mkdir(mode=0o700)
+        sdk = self.home / "signal-sdk"
+        adb = sdk / "platform-tools/adb"
+        adb.parent.mkdir(parents=True)
+        adb.write_text("#!/bin/sh\nexit 0\n")
+        adb.chmod(0o700)
+        provider = self.home / "signal-provider"
+        provider.write_text("#!/bin/sh\nexit 0\n")
+        provider.chmod(0o700)
+        settings = self.home / "signal-settings.json"
+        client.write(settings, {
+            "schema": 1, "timeout_seconds": 5, "output_limit_bytes": 4096,
+            "providers": {"mobile-native": {
+                "executable": str(provider), "version": "1.0",
+            }},
+            "records_directory": str(records), "android_sdk_root": str(sdk),
+        })
+        route["android_config"] = str(settings)
+        client.write(self.registration, {**self.registry, "routes": [route]})
+        child_pid_file = self.home / "native-child.pid"
+        self.kent.write_text(f"""#!{sys.executable}
+import json, os, signal, sys, time
+from pathlib import Path
+a = sys.argv[1:]
+if a[:2] == ["worktree", "status"]:
+    root = {str(self.checkout)!r}
+    print(json.dumps({{"problems": [], "target": {{
+        "workspace_root": {str(self.workspace)!r}, "workspace_availability": "available",
+        "effective_workdir": root, "worktree": {{"root": root, "availability": "available"}}
+    }}, "worktree": {{"recorded_root": root, "observed_root": root}}}}))
+else:
+    Path({str(child_pid_file)!r}).write_text(str(os.getpid()))
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while True:
+        time.sleep(1)
+""")
+        self.kent.chmod(0o700)
+
+        agent = subprocess.Popen(
+            [sys.executable, str(self.script), "agent", "--profile", "ui.clean",
+             "--prompt", "Wait for the host stop signal."],
+            cwd=self.checkout, env=self.environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        deadline = time.monotonic() + 10
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            if agent.poll() is not None:
+                break
+            time.sleep(0.02)
+        self.assertTrue(child_pid_file.exists(), "native child did not start")
+        native_pid = int(child_pid_file.read_text())
+        agent.send_signal(signal.SIGTERM)
+        stdout, stderr = agent.communicate(timeout=12)
+        self.assertEqual(agent.returncode, 1, (stdout, stderr))
+        result = json.loads(stdout)
+        self.assertIsNone(result["frontend_exit"])
+        self.assertEqual(result["frontend_completion"], "unresolved")
+        self.assertEqual(result["device_cleanup"], "unresolved")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(native_pid, 0)
+        self.assertFalse((self.fixture.pool / "calls").exists())
+        runs = [path for path in self.root.iterdir() if path.is_dir()]
+        self.assertEqual(len(runs), 1)
+        controller = client.read(runs[0] / "controller.json")
+        self.assertEqual(controller["phase"], "failed")
+        self.assertTrue(controller["stop_requested"])
+
+    def test_fresh_agent_grant_runs_scoped_android_dispatch_and_positive_end(self):
+        route = dict(self.registry["routes"][0], standalone_intents=["ui.clean"])
+        settings_path = self.home / "android-settings.json"
+        records = self.home / "records"
+        records.mkdir(mode=0o700)
+        sdk = self.home / "sdk"
+        adb = sdk / "platform-tools/adb"
+        adb.parent.mkdir(parents=True)
+        adb.write_text("#!/bin/sh\nexit 0\n")
+        adb.chmod(0o700)
+        provider = self.home / "provider"
+        provider_log = self.home / "provider-calls.jsonl"
+        provider.write_text(f"""#!{sys.executable}
+import json, os, sys
+with open({str(provider_log)!r}, "a") as out:
+    print(json.dumps({{"argv": sys.argv[1:], "environment": dict(os.environ)}}), file=out)
+if sys.argv[1:] == ["--version"]:
+    print("fixture-mobile-native 1.0")
+elif sys.argv[1:] != ["key", "--platform", "android", "--device", "emulator-5574", "back"]:
+    raise SystemExit(2)
+""")
+        provider.chmod(0o700)
+        client.write(settings_path, {
+            "schema": 1, "timeout_seconds": 5, "output_limit_bytes": 4096,
+            "providers": {"mobile-native": {
+                "executable": str(provider), "version": "1.0",
+            }},
+            "records_directory": str(records), "android_sdk_root": str(sdk),
+        })
+        route["android_config"] = str(settings_path)
+        client.write(self.registration, {**self.registry, "routes": [route]})
+        self.install_android_facade()
+
+        # Model the installed native launcher as a subprocess boundary. Its
+        # only actor input is the host-issued prompt; tool calls remain separate
+        # processes, and native target readback is independent of caller cwd.
+        actor = self.home / "actor.py"
+        actor.write_text(f"""import json, os, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
+client = {str(self.script)!r}
+launcher = {str(self.installation / "android-tools")!r}
+checkout = {str(self.checkout)!r}
+workspace = {str(self.workspace)!r}
+home = {str(self.home)!r}
+records = {str(records)!r}
+managed_root = {str(self.root)!r}
+registration = {str(self.registration)!r}
+allocator_log = {str(self.allocator_log)!r}
+provider_log = {str(provider_log)!r}
+wrong_target_marker = {str(self.home / "wrong-target")!r}
+session = {ACTOR_SESSION!r}
+caller_session = {SESSION!r}
+task = {TASK!r}
+reference = sys.argv[1]
+attempt, grant = reference.split(".", 1)
+assert "ATTEMPT_REF" not in os.environ
+assert all(reference not in item for item in os.environ.values())
+def call(*args, cwd=checkout, env=None):
+    result = subprocess.run([sys.executable, client, *args], cwd=cwd,
+                            env=env or os.environ.copy(), capture_output=True,
+                            text=True, timeout=45)
+    assert reference not in result.stdout + result.stderr
+    return result, json.loads(result.stdout) if result.stdout else None
+bare, bare_result = call("begin", "--attempt", attempt, "--task", task,
+                         "--profile", "ui.clean")
+assert bare.returncode != 0
+assert bare_result == {{"error": "managed_attempt_unresolved"}}
+clone_env = dict(os.environ, KENT_SESSION_ID=caller_session)
+clone, _ = call("begin", "--attempt", reference, "--profile", "ui.clean", env=clone_env)
+assert clone.returncode != 0
+wrong = reference[:-1] + ("A" if reference[-1] != "A" else "B")
+denied, _ = call("begin", "--attempt", wrong, "--profile", "ui.clean")
+assert denied.returncode != 0
+__import__("pathlib").Path(wrong_target_marker).touch()
+wrong_target, _ = call("begin", "--attempt", reference, "--profile", "ui.clean")
+assert wrong_target.returncode != 0
+__import__("pathlib").Path(wrong_target_marker).unlink()
+with ThreadPoolExecutor(max_workers=2) as workers:
+    starts = list(workers.map(
+        lambda _: call("begin", "--attempt", reference, "--profile", "ui.clean"),
+        range(2),
+    ))
+successful = [(process, payload) for process, payload in starts if process.returncode == 0]
+assert len(successful) >= 1
+for process, payload in starts:
+    if process.returncode == 0:
+        assert payload["phase"] == "active"
+    else:
+        assert payload == {{"error": "attempt_pending"}}
+first, begun = successful[0]
+assert begun["phase"] == "active", first.stderr
+retry, repeated = call("begin", "--attempt", reference, "--profile", "ui.clean")
+assert retry.returncode == 0 and repeated["attempt"] == attempt
+foreign_env = dict(os.environ, KENT_SESSION_ID={"55555555-5555-4555-8555-555555555555"!r})
+foreign, _ = call("begin", "--attempt", reference, "--profile", "ui.clean", env=foreign_env)
+assert foreign.returncode != 0
+wrong_cwd, _ = call("begin", "--attempt", reference, "--profile", "ui.clean", cwd=workspace)
+assert wrong_cwd.returncode != 0
+checked, status = call("status", "--attempt", reference)
+assert checked.returncode == 0 and status["phase"] == "active"
+time.sleep(2.2)
+checked, renewed = call("status", "--attempt", reference)
+assert checked.returncode == 0 and renewed["phase"] == "active"
+device = subprocess.run(
+    [sys.executable, "-I", "-B", "-c",
+     "import pwd,runpy,sys; from types import SimpleNamespace; "
+     "home,launcher,*args=sys.argv[1:]; "
+     "pwd.getpwuid=lambda _: SimpleNamespace(pw_dir=home); "
+     "sys.argv=[launcher,*args]; runpy.run_path(launcher,run_name='__main__')",
+     home, launcher, "--attempt", reference, "device", "key",
+     "--arguments", json.dumps({{"key": "back"}})],
+    cwd=checkout, env=os.environ.copy(), capture_output=True, text=True, timeout=45,
+)
+assert device.returncode == 0, (device.stdout, device.stderr)
+assert reference not in device.stdout + device.stderr
+device_result = json.loads(device.stdout)
+assert device_result["transport"] == "completed" and device_result["data"]["dispatched"], device.stdout
+lost_end = subprocess.run([sys.executable, client, "end", "--attempt", reference],
+                          cwd=checkout, env=os.environ.copy(), capture_output=True,
+                          text=True, timeout=45)
+assert lost_end.returncode == 0
+assert reference not in lost_end.stdout + lost_end.stderr
+route_config = json.loads(__import__("pathlib").Path(registration).read_text())
+for route in route_config["routes"]:
+    route.pop("standalone_intents", None)
+__import__("pathlib").Path(registration).write_text(json.dumps(route_config))
+__import__("pathlib").Path(registration).chmod(0o600)
+checked, final = call("status", "--attempt", reference)
+assert checked.returncode == 0 and final["phase"] == "finished"
+reopened, retained = call("begin", "--attempt", reference, "--profile", "ui.clean")
+assert reopened.returncode == 0 and retained["phase"] == "finished"
+for directory in (records, managed_root):
+    for path in __import__("pathlib").Path(directory).rglob("*"):
+        if path.is_file():
+            assert reference not in path.read_text(errors="ignore")
+for path in (allocator_log, provider_log):
+    assert reference not in __import__("pathlib").Path(path).read_text()
+""")
+        actor.chmod(0o700)
+        self.kent.write_text(f"""#!{sys.executable}
+import json, os, re, subprocess, sys
+from pathlib import Path
+a = sys.argv[1:]
+workspace = {str(self.workspace)!r}
+checkout = {str(self.checkout)!r}
+if a[:2] == ["worktree", "status"]:
+    requested_session = a[a.index("--session") + 1]
+    if (Path({str(self.home / "wrong-target")!r}).exists()
+            or requested_session not in {{{SESSION!r}, {ACTOR_SESSION!r}}}):
+        print(json.dumps({{"problems": [], "target": {{
+            "workspace_root": workspace, "workspace_availability": "available",
+            "effective_workdir": workspace, "worktree": None
+        }}, "worktree": {{"recorded_root": workspace, "observed_root": workspace}}}}))
+    else:
+        print(json.dumps({{"problems": [], "target": {{
+            "workspace_root": workspace, "workspace_availability": "available",
+            "effective_workdir": checkout,
+            "worktree": {{"root": checkout, "availability": "available"}}
+        }}, "worktree": {{"recorded_root": checkout, "observed_root": checkout}}}}))
+elif a and a[0] == "run":
+    assert a[a.index("--workspace") + 1] == checkout
+    assert "--output-mode=json" in a and "--session" not in a
+    assert os.getcwd() == checkout
+    assert os.environ["KENT_SESSION_ID"] == {SESSION!r}
+    assert os.environ["KENT_STEP_ID"] == {STEP!r}
+    launch_environment = dict(os.environ)
+    for key in ("LC_CTYPE", "__CF_USER_TEXT_ENCODING"):
+        launch_environment.pop(key, None)
+    assert set(launch_environment) == {{
+        "HOME", "PATH", "KENT_PERSISTENCE_ROOT", "KENT_SESSION_ID", "KENT_STEP_ID",
+    }}
+    match = re.search(r"Host-issued ATTEMPT_REF for this fresh Run: "
+                      r"([0-9a-f-]{{36}}\\.[A-Za-z0-9_-]{{43}})", a[-1])
+    assert match
+    env = dict(os.environ, KENT_SESSION_ID={ACTOR_SESSION!r})
+    env.pop("KENT_STEP_ID")
+    child = subprocess.run([sys.executable, {str(actor)!r}, match.group(1)],
+                          cwd=checkout, env=env, capture_output=True, text=True)
+    print(json.dumps({{
+        "session_id": {ACTOR_SESSION!r}, "status": "ok",
+        "result": "fixture native Run completed",
+    }}))
+    raise SystemExit(child.returncode)
+else:
+    raise SystemExit(2)
+""")
+        self.kent.chmod(0o700)
+        # A terminal observation may legitimately clear generation after
+        # preserving the original lease ID, owner, capability and slot.
+        self.allocator.write_text(self.allocator.read_text().replace(
+            'value["state"] = "completed" if action == "release" else "cancelled"\n',
+            'value["state"] = "completed" if action == "release" else "cancelled"\n'
+            '    if action == "release": value["generation"] = None\n',
+            1,
+        ))
+        command = subprocess.run(
+            [sys.executable, str(self.script), "agent", "--profile", "ui.clean",
+             "--prompt", "Run the isolated fixture and verify one borrowed Android command."],
+            cwd=self.checkout, env=self.environment, capture_output=True, text=True, timeout=90,
+        )
+        self.assertEqual(command.returncode, 0, (command.stdout, command.stderr))
+        result = json.loads(command.stdout)
+        self.assertEqual(result["frontend_exit"], 0)
+        self.assertEqual(result["frontend_completion"], "completed")
+        self.assertEqual(result["device_cleanup"], "confirmed")
+        self.assertEqual(result["session_id"], ACTOR_SESSION)
+        self.assertNotIn(str(self.home), command.stdout + command.stderr)
+        self.assertNotIn(".", result["attempt"])
+        self.assertEqual(self.fixture.calls().count("acquire"), 1)
+        self.assertEqual(self.fixture.calls().count("release"), 1)
+        self.assertGreaterEqual(self.fixture.calls().count("renew"), 2)
+        provider_calls = [json.loads(row) for row in provider_log.read_text().splitlines()]
+        self.assertEqual(sum(row["argv"][:1] == ["key"] for row in provider_calls), 1)
+        self.assertTrue(all(not any("ATTEMPT_REF" in value for value in row["environment"].values())
+                            for row in provider_calls))
+        invocation = json.loads(command.stdout)["session_id"]
+        self.assertEqual(invocation, ACTOR_SESSION)
+        self.assertTrue(all(
+            "KENT_SESSION_ID" not in row["environment"]
+            and "KENT_STEP_ID" not in row["environment"]
+            for row in provider_calls
+        ))
+        allocator_environment = [json.loads(line)[2] for line in self.allocator_log.read_text().splitlines()]
+        self.assertTrue(all(environment.get("KENT_SESSION_ID") is None
+                            and environment.get("KENT_STEP_ID") is None
+                            for environment in allocator_environment))
+        runs = list((records / "runs").iterdir())
+        dispatches = [
+            path for path in runs
+            if path.is_dir()
+            and json.loads((path / "manifest.json").read_bytes())["operation"] == "device.key"
+        ]
+        self.assertEqual(len(dispatches), 1)
+        manifest = json.loads((dispatches[0] / "manifest.json").read_bytes())
+        context = manifest["context"]
+        self.assertEqual(context["attempt_id"], result["attempt"])
+        self.assertRegex(context["attempt_id"], r"^[0-9a-f-]{36}$")
+        self.assertEqual(set(context), {"attempt_id", "generation", "lease_id", "device_serial"})
+        self.assertNotIn(".", context["attempt_id"])
 
     def test_route_pinned_across_lost_reply_and_removed_config(self):
         first = self.assert_result(self.invoke("begin"), "active")

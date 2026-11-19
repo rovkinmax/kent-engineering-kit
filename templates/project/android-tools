@@ -18,7 +18,7 @@ PROTOCOL = 1
 BUNDLE_HASHES = {
     "android_tools_native.py": "fe693efb1d6981945e37613c54e801466a195034cd5f2277981d4ca173dcab2e",
     "android_tools_evidence.py": "2f7cf4334f0b31a279d246922e56da6595619d3e7fcc70daf91157d6ef637dae",
-    "android_tools_custody.py": "f705c1d39f693844dd208fb68c504e0627c3797e0b69a55a6162e613328c839f",
+    "android_tools_custody.py": "9d6bc99bc1292ffe06fdf8f41e5adfaf06cc6aae22a19709ac457168a89b6011",
 }
 LIMIT = 262144
 MAX_BUNDLE_FILE_BYTES = 1048576
@@ -395,7 +395,7 @@ def main():
             "device_serial": arguments["device_serial"],
         }
         if borrowed is not None:
-            safe_context["attempt_id"] = args.attempt
+            safe_context["attempt_id"] = args.attempt.partition(".")[0]
     elif args.family == "preview":
         safe_context = {"target": arguments.get("target", "")}
     native = modules["android_tools_native"]

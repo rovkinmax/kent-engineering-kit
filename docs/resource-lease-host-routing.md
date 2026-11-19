@@ -1,5 +1,83 @@
 # Managed interactive Android lease attempts
 
+## Direct standalone agent lease
+
+An owner-private host route may optionally add `standalone_intents`, a closed
+list of enabled profile names. Omission or an unlisted profile denies direct
+agent admission. Each enabled name must also exist in that route's pinned
+resource-lease configuration, and the route must pin its existing
+`android_config`. The field belongs to the existing route
+registration; it does not add a second pool, Task, Workflow, or registry.
+
+Start exactly one fresh direct native Run from an enrolled primary's physical
+Git linked checkout:
+
+```text
+resource-lease-client agent --profile INTENT --prompt TEXT
+```
+
+The command must itself run inside a native caller Session already positioned
+on that exact linked checkout. Before creating an attempt or launching, it
+requires canonical inherited `KENT_SESSION_ID`, verifies that Session's
+workspace/worktree readback and exact cwd against the physical Git checkout,
+and passes only that Session and an optional canonical `KENT_STEP_ID` into the
+fresh launcher. The actor must be a different native Session; the caller
+Session cannot claim its child Run. A terminal shell or a Session positioned
+on the primary or another linked checkout is denied before attempt creation.
+
+The host qualifies the physical checkout and primary before launch, then uses
+the route's trusted `kent` executable, `kent run --workspace CHECKOUT
+--output-mode=json`, and that exact checkout as the child working directory.
+The command never resumes a Session or creates a Task. Its newly created
+opaque `ATTEMPT_REF` is delivered only in the Run prompt. It is not a host
+path, serial, configuration value, environment variable, result, diagnostic,
+or evidence value. The actor calls the installed sibling tools in separate
+processes:
+
+```text
+resource-lease-client begin --attempt ATTEMPT_REF --profile INTENT
+resource-lease-client status --attempt ATTEMPT_REF
+android-tools --attempt ATTEMPT_REF device ACTION --arguments JSON
+resource-lease-client end --attempt ATTEMPT_REF
+```
+
+`begin` has no `--task` on this path. A bare UUID is not a standalone
+credential and retains only its existing Workflow meaning. Before the first
+allocator call, the host requires the live whole-Run controller, the grant
+digest, the inherited canonical Session UUID, the exact physical primary and
+linked checkout from native target readback, and the exact checkout working
+directory. It seals that Session and route into the managed record. Retries
+remain pinned to that attempt and cannot adopt a different Session, checkout,
+intent, route, or finished record.
+
+The controller lock spans the selected native Run. The helper independently
+checks the bound controller and checkout before and during renewal; no caller
+grant is passed to it. A short publication lock orders provider admission
+against controller stop, but is not held during allocator I/O. If launch,
+controller, native observation, or cleanup becomes ambiguous, the attempt
+remains unresolved and does not automatically acquire a new scope or release
+the device. A native Question/Approval, headless exit, or frontend exit alone
+is not proof of Android command drain or successful cleanup.
+
+Successful cleanup requires an explicit `end`, a clear existing command-drain
+marker/fence, and a real completed allocator observation for the original
+lease identity with `endpoint: null`, no cleanup pending, no quarantine, and
+no retained error. A terminal `generation: null` is accepted only with that
+positive completed observation. The host reports `frontend_completion`
+separately from `device_cleanup`. A native Run counts as complete only when
+its JSON response has `status: "ok"`, the matching canonical Session UUID,
+and a nonblank final `result`, with no `outcome` or error. Kent can exit zero
+for a pending Question or Approval, so exit status or `status: "ok"` alone is
+not completion evidence.
+
+Before enabling this field, update or exclude every older reader of the shared
+registration, including retained processes and readers for unrelated routes;
+old readers reject unknown route keys. Before rollback to an older reader,
+remove the field and disable new standalone admission first. Keep a compatible
+reader and settlement path for all new-schema attempts, including settled
+records; never rewrite or reuse their receipts or IDs. These are source
+contracts, not installation, enrollment, or rollout authorization.
+
 `resource-lease-client begin --profile INTENT --attempt UUID --task task-UUID`
 is an optional entry point for an authorized native Smoke Session. Generate the
 attempt UUIDv4 before calling `begin` and retain it. Use it for

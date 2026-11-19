@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import unittest
 from unittest.mock import patch
 
@@ -89,6 +90,48 @@ class CustodyTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(api.Error, "custody_closed"):
             custody.check()
+
+    def test_standalone_schema_is_bound_to_one_attempt_and_native_session(self):
+        attempt = str(uuid.uuid4())
+        session = str(uuid.uuid4())
+        workspace = self.root / "primary"
+        checkout = self.root / "linked"
+        run = self.root / attempt
+        run.mkdir(mode=0o700)
+        binding = {
+            "schema": 3, "config": self.config, "profile": "ui.clean",
+            "owner": f"standalone:{attempt}", "capability": "clean",
+            "custody_marker_protocol": 1, "binding": None,
+            "standalone": {
+                "attempt": attempt, "project": "project-33333333-3333-4333-8333-333333333333",
+                "workspace": str(workspace), "checkout": str(checkout),
+                "intent": "ui.clean", "session": session,
+                "caller_session": str(uuid.uuid4()),
+            },
+        }
+        (run / "binding.json").write_text(json.dumps(binding))
+        (run / "binding.json").chmod(0o600)
+        self.assertEqual(api._owner_binding(run), binding)
+        self.assertEqual(api._split_attempt_ref(attempt), (attempt, None))
+        grant = "A" * 43
+        self.assertEqual(api._split_attempt_ref(f"{attempt}.{grant}"), (attempt, grant))
+        for change in (
+            {"standalone": {**binding["standalone"], "attempt": str(uuid.uuid4())}},
+            {"standalone": {**binding["standalone"], "session": None}},
+            {"standalone": {**binding["standalone"], "project": "project-not-a-uuid"}},
+            {"standalone": {**binding["standalone"], "checkout": str(workspace)}},
+            {"standalone": {**binding["standalone"],
+                            "caller_session": binding["standalone"]["session"]}},
+            {"binding": {"task": "task", "session": session, "project": "project"}},
+        ):
+            candidate = {**binding, **change}
+            (run / "binding.json").write_text(json.dumps(candidate))
+            (run / "binding.json").chmod(0o600)
+            with self.subTest(change=change), self.assertRaisesRegex(
+                    api.Error, "lease_binding_invalid"):
+                api._owner_binding(run)
+        with self.assertRaisesRegex(api.Error, "invalid_managed_identity"):
+            api._split_attempt_ref(f"{attempt}.{grant[:-1]}")
 
     def test_rejected_configuration_and_private_files(self):
         for value in (None, {}, {**self.config, "extra": 1},
@@ -199,6 +242,119 @@ class CustodyTests(unittest.TestCase):
                                    "command_stop": "not_started"})
         return api.DeviceCustody(self.config, "emulator-5576",
                                  managed=(self.run, binding, ("original", 1)))
+
+    def standalone_borrow(self):
+        from test_resource_lease_client import client
+
+        attempt, session, caller = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+        run = self.root / attempt
+        run.mkdir(mode=0o700)
+        owner = f"standalone:{attempt}"
+        workspace, checkout = self.root / "primary", self.root / "linked"
+        config = {**self.config, "runs_directory": str(self.root)}
+        binding = {
+            "schema": 3, "config": config, "profile": "ui.clean",
+            "owner": owner, "capability": "clean",
+            "custody_marker_protocol": 1, "binding": None,
+            "standalone": {
+                "attempt": attempt,
+                "project": "project-33333333-3333-4333-8333-333333333333",
+                "workspace": str(workspace), "checkout": str(checkout),
+                "intent": "ui.clean", "session": session,
+                "caller_session": caller,
+            },
+            "android_runtime": {"checkout": str(checkout), "settings": {}},
+        }
+        current = {
+            **self.current, "owner": owner, "capability": "clean",
+        }
+        status = {
+            "phase": "active", "updated_at": time.monotonic(),
+            "custody_marker_protocol": 1, "parent_command_stop": "confirmed",
+            "external_stop_unconfirmed": False, "command_stop": "confirmed",
+            "run_directory": str(run), "lease": current, "error": None,
+        }
+        for name, value in (("binding.json", binding), ("status.json", status),
+                            ("receipt.json", {}), ("helper.lock", {})):
+            path = run / name
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+        helper_fd = os.open(run / "helper.lock", os.O_RDONLY)
+        fcntl.flock(helper_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(os.close, helper_fd)
+        for name in ("controller-state.lock", "controller.lock"):
+            path = run / name
+            path.touch(mode=0o600)
+            path.chmod(0o600)
+        controller_fd = os.open(run / "controller.lock", os.O_RDONLY)
+        fcntl.flock(controller_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(os.close, controller_fd)
+        client.write(run / "controller.json", {
+            "schema": 1, "phase": "claimed",
+            "grant_sha256": api.hashlib.sha256(b"A" * 43).hexdigest(),
+            "attempt": attempt, "project": binding["standalone"]["project"],
+            "workspace": str(workspace), "checkout": str(checkout),
+            "intent": "ui.clean", "session": session,
+            "stop_requested": False, "admission": None,
+        })
+        self.inspect.return_value = current
+        custody = api.DeviceCustody(
+            config, "emulator-5576",
+            managed=(run, binding, (current["id"], current["generation"])),
+            standalone_grant="A" * 43,
+        )
+        return custody, run
+
+    def test_controller_stop_between_inspect_and_marker_blocks_device_admission(self):
+        from test_resource_lease_client import client
+
+        custody, run = self.standalone_borrow()
+        inspecting = threading.Event()
+        finish_inspect = threading.Event()
+        provider_calls = []
+        failures = []
+
+        def delayed_inspect(_command, **_options):
+            inspecting.set()
+            if not finish_inspect.wait(5):
+                raise AssertionError("inspection fixture was not released")
+            return self.inspect.return_value
+
+        def dispatch():
+            try:
+                custody.begin_remote_execution()
+                provider_calls.append("device-provider")
+            except BaseException as error:
+                failures.append(error)
+
+        with patch.object(api, "inspect_lease", side_effect=delayed_inspect):
+            worker = threading.Thread(target=dispatch)
+            worker.start()
+            self.assertTrue(inspecting.wait(5))
+            client.stop_controller(run, timeout=0.2)
+            finish_inspect.set()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(provider_calls, [])
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], api.Error)
+        self.assertFalse((run / api.MARKER).exists())
+        controller = client.read(run / "controller.json")
+        self.assertEqual(controller["phase"], "closed")
+        self.assertTrue(controller["stop_requested"])
+
+    def test_standalone_marker_admission_rechecks_exact_grant(self):
+        custody, run = self.standalone_borrow()
+        wrong = api.DeviceCustody(
+            custody.config, custody.serial,
+            managed=(run, custody._binding, custody._managed_identity),
+            standalone_grant="B" * 43,
+        )
+        with self.assertRaisesRegex(api.Error, "controller_admission_unavailable"):
+            wrong.begin_remote_execution()
+        self.assertFalse((run / api.MARKER).exists())
+        custody.begin_remote_execution()
+        self.assertTrue((run / api.MARKER).exists())
 
     def test_managed_borrow_cannot_publish_marker_after_finish_fence(self):
         from test_resource_lease_client import client
