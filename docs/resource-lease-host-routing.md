@@ -9,6 +9,18 @@ resource-lease configuration, and the route must pin its existing
 `android_config`. The field belongs to the existing route
 registration; it does not add a second pool, Task, Workflow, or registry.
 
+For dedicated capacity, an entry can instead be **standalone-only**:
+omit both `workflow_id` and `smoke_node`, supply `android_config` and a
+nonempty `standalone_intents` list, and add `standalone_only` with exactly
+`caller_session` (the enrolled native UUIDv4) and `checkout` (the enrolled
+canonical linked checkout). New Workflow attempts cannot use this entry,
+even when no standalone controller is running. A caller must match both
+selectors after native checkout verification and before any reservation
+or launch. A standalone-only entry's pool must not overlap another
+entry's physical pool, even when the configs differ or the same config
+is referenced twice. New admissions using either conflicting entry fail
+closed. Existing Workflow and dual-use entry formats are unchanged.
+
 Start exactly one fresh direct native Run from an enrolled primary's physical
 Git linked checkout:
 
@@ -70,11 +82,22 @@ and a nonblank final `result`, with no `outcome` or error. Kent can exit zero
 for a pending Question or Approval, so exit status or `status: "ok"` alone is
 not completion evidence.
 
-Before enabling this field, update or exclude every older reader of the shared
+The host operator must not replace an existing route for the same primary,
+or enroll a pool with existing consumers or unsettled obligations. Keep
+the dedicated pool and its enrollment unchanged for the selected launch.
+This does not enforce a one-shot limit for the enrolled caller and is not
+isolation from a process running as the same OS account. Run once; after
+return or uncertainty atomically remove only the verified standalone-only
+entry. Keep observer settings, unrelated routes and compatible readers
+available for existing attempts. Never reuse the dedicated capacity or
+retry while settlement remains unknown.
+
+Before enabling either standalone form, update or exclude every older reader of the shared
 registration, including retained processes and readers for unrelated routes;
 old readers reject unknown route keys. Before rollback to an older reader,
-remove the field and disable new standalone admission first. Keep a compatible
-reader and settlement path for all new-schema attempts, including settled
+disable new standalone admission first: remove `standalone_intents` from a
+dual-use entry, or remove the standalone-only entry. Keep a compatible reader
+and settlement path for all new-schema attempts, including settled
 records; never rewrite or reuse their receipts or IDs. These are source
 contracts, not installation, enrollment, or rollout authorization.
 
@@ -91,10 +114,11 @@ Host operators provision the owner-private
 `~/.config/kent/android-tools/lease-routes.json` at the OS account home. It
 contains `schema: 1`, canonical absolute `kent_executable` and
 `kent_persistence_root`, and a `routes` array. Each route has `project`
-(`project-UUID`), `workspace` (the canonical primary path), `workflow_id`
-(UUID), `smoke_node` (the exact, unique display name in the authorized
-Workflow), and `config` (a canonical owner-private host lease config). Qualify
-the Smoke node's uniqueness when registering it. Executables and settings
+(`project-UUID`), `workspace` (the canonical primary path), and `config`
+(a canonical owner-private host lease config). A Workflow route also has
+`workflow_id` (UUID) and `smoke_node` (the exact, unique display name in the
+authorized Workflow); the standalone-only shape is described above.
+Qualify the Smoke node's uniqueness when registering it. Executables and settings
 must not come from a checkout, symlink or group/world-writable ancestry.
 
 The client verifies the native Session, active Task and physical checkout.
