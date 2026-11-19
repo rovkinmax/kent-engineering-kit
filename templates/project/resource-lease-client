@@ -7,6 +7,7 @@ import fcntl
 import json
 import math
 import os
+import pwd
 import re
 import selectors
 import signal
@@ -218,9 +219,9 @@ def stop_child(child, *, group=False):
         child.wait(timeout=5)
 
 
-def capture(command, *, timeout=CLI_TIMEOUT, tick=None, resource_operation=None):
+def capture(command, *, timeout=CLI_TIMEOUT, tick=None, resource_operation=None, **process):
     """Bound both output streams while retaining only owned child handles."""
-    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **process)
     output = {child.stdout: bytearray(), child.stderr: bytearray()}
     deadline = time.monotonic() + timeout
     try:
@@ -554,8 +555,8 @@ def prune(root):
             continue
 
 
-def prepare(args, binding=None):
-    config = configuration(args.config)
+def prepare(args, binding=None, *, managed_config=None):
+    config = configuration(args.config) if managed_config is None else managed_config
     if args.profile not in config["profiles"]:
         raise Error("requested profile is not configured")
     root = Path(config["runs_directory"])
@@ -570,9 +571,25 @@ def prepare(args, binding=None):
                 "binding": binding}
     created = False
     with admission_lock(root):
-        prune(root)
+        marker = root / ".managed-only"
+        reserved = managed_config is not None or same_managed_root(root)
+        if reserved and os.path.lexists(marker):
+            if read(marker) != {"schema": 1} or managed_config is None:
+                raise Error("run root is reserved for managed attempts")
+        elif managed_config is not None:
+            if any(path.name != "admission.lock" for path in root.iterdir()):
+                raise Error("managed run root already contains legacy state")
+            write(marker, {"schema": 1})
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        if managed_config is None:
+            prune(root)
         try:
-            count = sum(path.name != "admission.lock" for path in root.iterdir())
+            ignored = {"admission.lock", ".managed-only"} if reserved else {"admission.lock"}
+            count = sum(path.name not in ignored for path in root.iterdir())
             if count >= MAX_RUNS and not run.exists():
                 raise Error("consumer run retention limit reached; inspect completed records")
             run.mkdir(mode=0o700)
@@ -612,8 +629,9 @@ def load(run):
 
 
 class Renewal:
-    def __init__(self, lease):
+    def __init__(self, lease, *, native=None):
         self.lease = lease
+        self.native = native
         self.next_native = 0.0
         self.next_record = 0.0
         self.next_renew = 0.0
@@ -628,7 +646,7 @@ class Renewal:
             raise Error("renewal was permanently stopped")
         binding = self.lease.metadata["binding"]
         if binding and now >= self.next_native:
-            native_active(binding)
+            (self.native or native_active)(binding)
             self.next_native = time.monotonic() + (
                 active(self.value) if self.value is not None else 10
             )
@@ -741,12 +759,12 @@ def run_command(args):
         return result if failure is None else 1
 
 
-def serve(run):
+def serve(run, *, native=None):
     lease = load(run)
     with lock(lease.run):
         if validate_status(read(lease.run / "status.json"), lease.run)["phase"] != "preparing":
             raise Error("a stopped helper cannot be restarted")
-        renewal = Renewal(lease)
+        renewal = Renewal(lease) if native is None else Renewal(lease, native=native)
         try:
             renewal.acquire()
             while True:
@@ -768,7 +786,7 @@ def serve(run):
     return 0
 
 
-def check(run):
+def check(run, *, native=None):
     lease = load(run)
     if (lease.run / "stop-renewal.json").exists():
         raise Error("renewal was permanently stopped")
@@ -784,7 +802,7 @@ def check(run):
         pass
     try:
         if lease.metadata["binding"] is not None:
-            native_active(lease.metadata["binding"])
+            (native or native_active)(lease.metadata["binding"])
         current = lease.cli("inspect")
         active(current)
     except (Error, OSError, ValueError):
@@ -804,9 +822,13 @@ def start(args):
     binding = {"project": args.project, "task": task, "session": args.session}
     native_active(binding)
     lease = prepare(args, binding)
+    return launch(lease)
+
+
+def launch(lease, *, native=None, helper_env=None):
     status = validate_status(read(lease.run / "status.json"), lease.run)
     if status["phase"] == "active":
-        return check(lease.run)
+        return check(lease.run) if native is None else check(lease.run, native=native)
     if status["phase"] != "preparing":
         raise Error("a stopped helper cannot be restarted")
     # Serialize launch admission separately from the long-lived helper lock.
@@ -814,17 +836,24 @@ def start(args):
         if (lease.run / "launched.json").exists():
             raise Error("helper startup outcome is unknown; inspect the original run")
         write(lease.run / "launched.json", {"schema": 1})
+        if native is not None:
+            fd = os.open(lease.run, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    action = "_serve" if native is None else "_serve-managed"
     child = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "_serve", "--run-dir", str(lease.run)],
+        [sys.executable, str(Path(__file__).resolve()), action, "--run-dir", str(lease.run)],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
+        start_new_session=True, **({"env": helper_env} if helper_env is not None else {}),
     )
     deadline = time.monotonic() + ACQUIRE_TIMEOUT + 10
     while time.monotonic() < deadline:
         if (lease.run / "status.json").exists():
             value = read(lease.run / "status.json")
             if value.get("phase") == "active":
-                return check(lease.run)
+                return check(lease.run) if native is None else check(lease.run, native=native)
             if value.get("phase") in {"stopped", "failed", "finished"}:
                 raise Error(value.get("error") or "helper stopped")
         if STOP:
@@ -836,13 +865,22 @@ def start(args):
     raise Error("helper readiness timed out; inspect original run before retry")
 
 
-def finish(run):
+def finish(run, *, managed=False):
     lease = load(run)
+    managed = managed or (same_managed_root(lease.run.parent) and marked_managed(lease.run.parent))
     write(lease.run / "finish.json", {"schema": 1})
     deadline = time.monotonic() + CLEANUP_TIMEOUT + CLI_TIMEOUT + 10
     while time.monotonic() < deadline:
         try:
             with lock(lease.run):
+                if managed:
+                    current = validate_status(read(lease.run / "status.json"), lease.run)
+                    if current["phase"] == "finished":
+                        _marker_present(lease.run)
+                        return current
+                    if ((lease.run / "launched.json").exists()
+                            and not (lease.run / "receipt.json").exists()):
+                        raise Error("managed release outcome is unknown")
                 return lease.finish(cancel=not (lease.run / "receipt.json").exists())
         except Busy:
             pass
@@ -851,6 +889,261 @@ def finish(run):
             return value
         time.sleep(0.1)
     raise Error("helper cleanup timed out")
+
+
+def canonical(value):
+    path = absolute(value, "host path")
+    if str(path) != value:
+        raise Error("host path is not canonical")
+    return path
+
+
+def managed_root():
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/kent/android-tools/managed-runs"
+
+
+def same_managed_root(root):
+    fixed = managed_root()
+    return fixed.exists() and root.samefile(fixed)
+
+
+def marked_managed(root):
+    marker = root / ".managed-only"
+    return os.path.lexists(marker) and read(marker) == {"schema": 1}
+
+
+def trusted_path(path):
+    for component in (*reversed(path.parents), path):
+        info = component.lstat()
+        if (stat.S_ISLNK(info.st_mode) or info.st_uid not in {0, os.getuid()}
+                or info.st_mode & 0o022
+                or (component != path and not stat.S_ISDIR(info.st_mode))):
+            raise Error("unsafe host path")
+    return path
+
+
+def checkout_local(path):
+    return any(os.path.lexists(parent / ".git") for parent in path.parents)
+
+
+def existing_overlap(left, right):
+    def contains(root, path):
+        return path.is_relative_to(root) or (
+            root.exists() and any(parent.exists() and parent.samefile(root)
+                                  for parent in (path, *path.parents)))
+    return contains(left, right) or contains(right, left)
+
+
+def native_uuid(value, prefix=""):
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise Error("expected a canonical native UUID")
+    suffix = value[len(prefix):]
+    try:
+        parsed = uuid.UUID(suffix)
+    except ValueError:
+        raise Error("expected a canonical native UUID") from None
+    if str(parsed) != suffix or parsed.version != 4:
+        raise Error("expected a canonical native UUID")
+    return value
+
+
+class HostRouting:
+    def __init__(self, *, helper=False):
+        self.home = canonical(pwd.getpwuid(os.getuid()).pw_dir)
+        location = self.home / ".config/kent/android-tools"
+        if helper:
+            value = json.loads(os.environ["KENT_MANAGED_OBSERVER"], object_pairs_hook=unique_object)
+        else:
+            registration = trusted_path(canonical(str(location / "lease-routes.json")))
+            if checkout_local(registration):
+                raise Error("host registration cannot live in a checkout")
+            value = read(registration)
+        if (set(value) != {"schema", "kent_executable", "kent_persistence_root", "routes"}
+                or type(value["schema"]) is not int or value["schema"] != 1
+                or not isinstance(value["routes"], list) or len(value["routes"]) > 32):
+            raise Error("unsupported host registration")
+        self.kent = trusted_path(canonical(value["kent_executable"]))
+        if not self.kent.is_file() or not os.access(self.kent, os.X_OK) or checkout_local(self.kent):
+            raise Error("trusted Kent executable is unavailable")
+        state = trusted_path(canonical(value["kent_persistence_root"]))
+        if not state.is_dir():
+            raise Error("trusted Kent state is unavailable")
+        self.env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin",
+                    "KENT_PERSISTENCE_ROOT": str(state)}
+        self.routes = value["routes"]
+        self.root = canonical(str(location / "managed-runs"))
+
+    def helper_environment(self):
+        return {**self.env, "KENT_MANAGED_OBSERVER": json.dumps({
+            "schema": 1, "kent_executable": str(self.kent),
+            "kent_persistence_root": self.env["KENT_PERSISTENCE_ROOT"], "routes": [],
+        })}
+
+    def observe(self, deadline, *args):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Error("native observation timed out")
+        return capture([str(self.kent), *args, "--json"], timeout=remaining, cwd="/", env=self.env)
+
+    def workspace(self, session):
+        result = self.observe(time.monotonic() + CLI_TIMEOUT, "worktree", "status", "--session", session)
+        target, roots = result.get("target"), result.get("worktree")
+        if (result.get("problems") != [] or not isinstance(target, dict) or not isinstance(roots, dict)
+                or target.get("workspace_availability") != "available" or "worktree" not in target):
+            raise Error("native checkout unavailable")
+        workspace = canonical(target.get("workspace_root"))
+        linked = target["worktree"]
+        if linked is not None and (not isinstance(linked, dict) or linked.get("availability") != "available"):
+            raise Error("native checkout unavailable")
+        checkout = workspace if linked is None else canonical(linked.get("root"))
+        if (roots.get("recorded_root") != str(checkout) or roots.get("observed_root") != str(checkout)
+                or not canonical(target.get("effective_workdir")).is_relative_to(checkout)
+                or not checkout.is_dir() or not Path.cwd().is_relative_to(checkout)):
+            raise Error("native checkout mismatch")
+        cwd = Path.cwd()
+        while cwd != checkout:
+            if os.path.lexists(cwd / ".git"):
+                raise Error("native checkout mismatch")
+            cwd = cwd.parent
+        return workspace
+
+    def active(self, owner, *, route=None):
+        project, task, session = (owner[key] for key in ("project", "task", "session"))
+        deadline = time.monotonic() + CLI_TIMEOUT
+        detail = self.observe(deadline, "task", "show", task, "--project", project)
+        summary, status = detail.get("summary"), detail.get("status")
+        if (not isinstance(summary, dict) or not isinstance(status, dict)
+                or summary.get("id") != task or summary.get("project_id") != project
+                or summary.get("done") is not False or status.get("kind") != "running"
+                or status.get("native_state") not in {"running", "active", "waiting", "waiting_ask", "waiting_approval"}
+                or route is not None and summary.get("workflow_id") != route["workflow_id"]):
+            raise Error("native Task is not authorized and active")
+        offset, found = 0, False
+        for _page in range(100):
+            page = self.observe(deadline, "task", "sessions", task, "--project", project,
+                                "--offset", str(offset), "--limit", "100")
+            rows = page.get("items")
+            if (page.get("task_id") != task or not isinstance(rows, list) or len(rows) > 100
+                    or any(not isinstance(row, dict) for row in rows)):
+                raise Error("invalid native Session inventory")
+            for row in rows:
+                if row.get("session_id") == session:
+                    if (found or row.get("status") != "running"
+                            or route is not None and row.get("node_name") != route["smoke_node"]):
+                        raise Error("native Session is not authorized and active")
+                    found = True
+            following = page.get("next_offset")
+            if following is None:
+                if found:
+                    return
+                break
+            if type(following) is not int or following <= offset:
+                raise Error("invalid native Session pagination")
+            offset = following
+        raise Error("native Session is missing from bounded inventory")
+
+    def route(self, workspace):
+        matches = []
+        for route in self.routes:
+            if (not isinstance(route, dict)
+                    or set(route) != {"project", "workspace", "workflow_id", "smoke_node", "config"}
+                    or not isinstance(route["smoke_node"], str) or not route["smoke_node"]):
+                raise Error("invalid host route")
+            native_uuid(route["project"], "project-")
+            native_uuid(route["workflow_id"])
+            if canonical(route["workspace"]) == workspace:
+                matches.append(route)
+        if len(matches) != 1:
+            raise Error("host route is missing or ambiguous")
+        return matches[0]
+
+    def config(self, route):
+        path = trusted_path(canonical(route["config"]))
+        if checkout_local(path):
+            raise Error("host config cannot live in a checkout")
+        config = configuration(path)
+        executable = trusted_path(Path(config["executable"]))
+        if checkout_local(executable):
+            raise Error("allocator executable cannot live in a checkout")
+        for registered in self.routes:
+            other = trusted_path(canonical(registered["config"]))
+            if checkout_local(other):
+                raise Error("host config cannot live in a checkout")
+            paths = config if other == path else configuration(other)
+            if any(existing_overlap(Path(paths[key]), self.root) for key in ("runs_directory", "pool")):
+                raise Error("managed runs overlap retained runs")
+        return {**config, "runs_directory": str(self.root)}
+
+
+@contextmanager
+def managed_lock(root, attempt):
+    mutexes = root.parent / "managed-locks"
+    mkdir(mutexes)
+    # Fixed-size namespace: abandoned or rejected UUIDs cannot grow it.
+    path = mutexes / f"{int(uuid.UUID(attempt)) % 64:02x}.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        private(path)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Busy("managed attempt pending") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def managed(args, host):
+    attempt = native_uuid(args.attempt)
+    session = native_uuid(os.environ.get("KENT_SESSION_ID"))
+    workspace = host.workspace(session)
+    run = host.root / attempt
+    with managed_lock(host.root, attempt):
+        if os.path.lexists(run):
+            private(host.root, directory=True)
+            if not marked_managed(host.root):
+                raise Error("unrecognized managed attempt")
+            lease = load(run)
+            owner = lease.metadata["binding"]
+            if (owner is None or owner["session"] != session
+                    or args.action == "begin" and (owner["task"] != args.task
+                                                  or lease.metadata["profile"] != args.profile)):
+                raise Error("managed attempt owner or intent mismatch")
+            host.active(owner)
+        elif args.action == "begin":
+            task = native_uuid(args.task, "task-")
+            route = host.route(workspace)
+            owner = {"project": route["project"], "task": task, "session": session}
+            host.active(owner, route=route)
+            config = host.config(route)
+            args.run_dir = str(run)
+            lease = prepare(args, owner, managed_config=config)
+        else:
+            raise Error("managed attempt not found")
+        if args.action == "begin":
+            result = validate_status(read(run / "status.json"), run)
+            if result["phase"] != "finished":
+                result = launch(lease, native=host.active, helper_env=host.helper_environment())
+        elif args.action == "status":
+            result = validate_status(read(run / "status.json"), run)
+            if result["phase"] != "finished":
+                result = check(run, native=host.active)
+        else:
+            result = finish(run, managed=True)
+        phase, value = result["phase"], result.get("lease")
+        output = {"attempt": attempt, "phase": phase}
+        if isinstance(value, dict):
+            output["lease"] = {key: value[key] for key in ("id", "generation", "owner", "state") if key in value}
+            if phase == "active":
+                lease_id, generation = value.get("id"), value.get("generation")
+                if (not isinstance(lease_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", lease_id)
+                        or type(generation) is not int or generation < 1):
+                    raise Error("managed lease identity is unavailable")
+                serial = value.get("endpoint", {}).get("adb_serial")
+                if not isinstance(serial, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", serial):
+                    raise Error("managed endpoint is unavailable")
+                output["endpoint"] = {"adb_serial": serial}
+        return output
 
 
 def main():
@@ -867,13 +1160,32 @@ def main():
         else:
             for key in ("run-dir", "project", "task", "session"):
                 command.add_argument(f"--{key}", required=True)
-    for name in ("check", "finish", "_serve"):
+    for name in ("check", "finish", "_serve", "_serve-managed"):
         command = commands.add_parser(name)
         command.add_argument("--run-dir", required=True)
+    for name in ("begin", "status", "end"):
+        command = commands.add_parser(name)
+        command.add_argument("--attempt", required=True)
+        if name == "begin":
+            command.add_argument("--task", required=True)
+            command.add_argument("--profile", required=True)
     args = parser.parse_args()
     for number in (signal.SIGTERM, signal.SIGINT):
         signal.signal(number, interrupted)
     try:
+        if args.action in {"begin", "status", "end"}:
+            result = managed(args, HostRouting())
+            print(json.dumps(result, sort_keys=True))
+            return int(args.action == "end" and result["phase"] != "finished")
+        if args.action == "_serve-managed":
+            host = HostRouting(helper=True)
+            run = canonical(args.run_dir)
+            if run.parent != host.root:
+                raise Error("invalid managed run")
+            native_uuid(run.name)
+            if not marked_managed(host.root):
+                raise Error("unrecognized managed attempt")
+            return serve(run, native=host.active)
         if args.action == "run":
             return run_command(args)
         if args.action == "_serve":
@@ -883,6 +1195,10 @@ def main():
         print(json.dumps(result, sort_keys=True))
         return 1 if args.action == "finish" and result.get("phase") != "finished" else 0
     except (Error, OSError, ValueError, KeyError, TypeError) as error:
+        if args.action in {"begin", "status", "end"}:
+            print(json.dumps({"error": "attempt_pending" if isinstance(error, Busy)
+                              else "managed_attempt_unresolved"}, sort_keys=True))
+            return 1
         print(f"resource-lease-client: {error}", file=sys.stderr)
         return 1
 

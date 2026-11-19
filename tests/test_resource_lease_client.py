@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
@@ -1337,6 +1338,267 @@ class ResourceLeaseClientTests(unittest.TestCase):
         self.assertIn("## Stop provenance", contract)
         self.assertIn("external_stop_unconfirmed", contract)
         self.assertIn("## Native owner observation", contract)
+
+
+class ManagedLeaseTests(unittest.TestCase):
+    project = "project-33333333-3333-4333-8333-333333333333"
+    workflow = "44444444-4444-4444-8444-444444444444"
+
+    def setUp(self):
+        fixture = ResourceLeaseClientTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.fixture = fixture
+        temp = tempfile.TemporaryDirectory(dir=Path.home().resolve())
+        self.addCleanup(temp.cleanup)
+        self.home = Path(temp.name)
+        root = self.home / ".config/kent/android-tools"
+        root.mkdir(parents=True, mode=0o700)
+        self.registration = root / "lease-routes.json"
+        self.root = root / "managed-runs"
+        self.workspace, self.checkout = self.home / "primary", self.home / "linked"
+        commands = [
+            ["init", "-q", str(self.workspace)],
+            ["-C", str(self.workspace), "-c", "user.name=Fixture", "-c",
+             "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+             "commit", "-q", "--allow-empty", "-m", "Fixture"],
+            ["-C", str(self.workspace), "worktree", "add", "-q", "--detach", str(self.checkout)],
+        ]
+        for command in commands:
+            subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *command],
+                           check=True, capture_output=True, timeout=10)
+        self.kent_state = self.home / "kent-state"
+        self.kent_state.mkdir(mode=0o700)
+        self.node = self.kent_state / "node"
+        self.node.write_text("Required Runtime Smoke")
+        kent = self.home / "kent"
+        kent.write_text(f"""#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+assert os.getcwd() == "/" and os.environ["HOME"] == {str(self.home)!r}
+assert os.environ["KENT_PERSISTENCE_ROOT"] == {str(self.kent_state)!r}
+assert os.environ["PATH"] == "/usr/bin:/bin"
+assert "KENT_SESSION_ID" not in os.environ
+a = sys.argv[1:]
+if a[:2] == ["worktree", "status"]:
+    root = {str(self.checkout)!r}
+    print(json.dumps({{"problems": [], "target": {{
+        "workspace_root": {str(self.workspace)!r}, "workspace_availability": "available",
+        "effective_workdir": root, "worktree": {{"root": root, "availability": "available"}}
+    }}, "worktree": {{"recorded_root": root, "observed_root": root}}}}))
+elif a[:2] == ["task", "show"]:
+    print(json.dumps({{"summary": {{"id": a[2], "done": False, "project_id": {self.project!r},
+          "workflow_id": {self.workflow!r}}}, "status": {{"kind": "running", "native_state": "running"}}}}))
+else:
+    print(json.dumps({{"task_id": a[2], "items": [{{"session_id": {SESSION!r}, "status": "running",
+          "node_name": Path({str(self.node)!r}).read_text()}}]}}))
+""")
+        kent.chmod(0o700)
+        self.config = self.home / "config.json"
+        self.allocator = self.home / "allocator"
+        self.allocator.write_text(fixture.executable.read_text().replace(
+            "#!/usr/bin/env python3", f"#!{sys.executable}", 1))
+        self.allocator.chmod(0o700)
+        client.write(self.config, {**json.loads(fixture.config.read_text()),
+                                   "executable": str(self.allocator)})
+        self.registry = {"schema": 1, "kent_executable": str(kent),
+                         "kent_persistence_root": str(self.kent_state),
+                         "routes": [{"workspace": str(self.workspace), "project": self.project,
+                                     "workflow_id": self.workflow, "smoke_node": "Required Runtime Smoke",
+                                     "config": str(self.config)}]}
+        client.write(self.registration, self.registry)
+        # Inject only the OS account home into a disposable copy. The copy
+        # then launches the actual helper and allocator as separate processes.
+        self.script = self.home / "resource-lease-client"
+        self.script.write_text(SCRIPT.read_text().replace(
+            "import pwd\n",
+            f"import pwd\nfrom types import SimpleNamespace\n"
+            f"pwd.getpwuid = lambda _: SimpleNamespace(pw_dir={str(self.home)!r})\n", 1))
+        self.environment = {**fixture.environment, "KENT_SESSION_ID": SESSION,
+                            "HOME": "/not-account-home", "KENT_PERSISTENCE_ROOT": "/not-native-state",
+                            "KENT_MANAGED_OBSERVER": "untrusted context"}
+        self.environment.pop("RESOURCE_LEASE_CONFIG", None)
+        self.attempt = str(uuid.uuid4())
+
+    def invoke(self, action, *, attempt=None, cwd=None, env=None, profile="smoke.persistent"):
+        args = [action, "--attempt", attempt or self.attempt]
+        if action == "begin":
+            args += ["--task", TASK, "--profile", profile]
+        return subprocess.run([sys.executable, str(self.script), *args],
+                              cwd=cwd or self.checkout, env=env or self.environment,
+                              capture_output=True, text=True, timeout=20)
+
+    def assert_result(self, result, phase):
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["phase"], phase)
+        self.assertNotIn(str(self.home), result.stdout)
+        return payload
+
+    def test_route_pinned_across_lost_reply_and_removed_config(self):
+        first = self.assert_result(self.invoke("begin"), "active")
+        try:
+            client.write(self.registration, {**self.registry, "routes": []})
+            self.config.unlink()
+            repeated = self.assert_result(self.invoke("begin"), "active")
+            checked = self.assert_result(self.invoke("status"), "active")
+            self.assertEqual(first, repeated)
+            self.assertEqual(first, checked)
+        finally:
+            self.assert_result(self.invoke("end"), "finished")
+        self.assert_result(self.invoke("begin"), "finished")
+        self.assertEqual(self.fixture.calls().count("acquire"), 1)
+        self.assertIn("release", self.fixture.calls())
+
+    def test_other_stage_and_checkout_cannot_allocate(self):
+        self.node.write_text("Implement")
+        self.assertNotEqual(self.invoke("begin").returncode, 0)
+        self.node.write_text("Required Runtime Smoke")
+        self.assertNotEqual(self.invoke("begin", cwd=self.workspace).returncode, 0)
+        nested = self.checkout / "nested"
+        subprocess.run(["git", "init", "-q", str(nested)], check=True, timeout=10)
+        self.assertNotEqual(self.invoke("begin", cwd=nested).returncode, 0)
+        self.assertFalse((self.fixture.pool / "calls").exists())
+
+    def test_unsafe_registration_and_wrong_project_do_not_allocate(self):
+        self.registration.chmod(0o644)
+        self.assertNotEqual(self.invoke("begin").returncode, 0)
+        other = dict(self.registry["routes"][0],
+                     project="project-55555555-5555-4555-8555-555555555555")
+        client.write(self.registration, {**self.registry, "routes": [other]})
+        self.assertNotEqual(self.invoke("begin").returncode, 0)
+        self.assertFalse(self.root.exists())
+        self.assertFalse((self.fixture.pool / "calls").exists())
+
+    def test_changed_intent_cannot_replace_an_active_attempt(self):
+        first = self.assert_result(self.invoke("begin"), "active")
+        try:
+            self.assertNotEqual(self.invoke("begin", profile="ui.clean").returncode, 0)
+            self.assertEqual(self.assert_result(self.invoke("status"), "active"), first)
+            self.assertEqual(self.fixture.calls().count("acquire"), 1)
+        finally:
+            self.assert_result(self.invoke("end"), "finished")
+
+    def test_launched_without_receipt_is_not_confirmed_finished(self):
+        run = self.root / self.attempt
+        ready = self.home / "allocator-ready"
+        fake = self.allocator
+        fake.write_text(fake.read_text().replace(
+            "if action == \"acquire\":\n",
+            f"if action == 'acquire':\n"
+            f"    pathlib.Path({str(ready)!r}).write_text(f'{{os.getpid()}} {{os.getppid()}}')\n"
+            f"    time.sleep(30)\n"
+            "if action == \"acquire\":\n", 1))
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            starting = workers.submit(self.invoke, "begin")
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.025)
+            allocator, helper = map(int, ready.read_text().split())
+            try:
+                os.kill(helper, signal.SIGKILL)
+                self.assertNotEqual(starting.result().returncode, 0)
+                self.assertFalse((run / "receipt.json").exists())
+                self.assertNotEqual(self.invoke("end").returncode, 0)
+                explicit = subprocess.run(
+                    [sys.executable, str(self.script), "finish", "--run-dir", str(run)],
+                    cwd=self.checkout, env=self.environment, capture_output=True, timeout=10)
+                self.assertNotEqual(explicit.returncode, 0)
+                self.assertNotEqual(client.read(run / "status.json")["phase"], "finished")
+            finally:
+                os.kill(allocator, signal.SIGKILL)
+
+    def test_concurrent_begin_reuses_attempt_or_reports_pending(self):
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            replies = list(workers.map(lambda _: self.invoke("begin"), range(2)))
+        try:
+            settled = self.assert_result(self.invoke("status"), "active")
+            for reply in replies:
+                if reply.returncode:
+                    self.assertEqual(json.loads(reply.stdout), {"error": "attempt_pending"})
+                else:
+                    self.assertEqual(self.assert_result(reply, "active"), settled)
+            self.assertEqual(self.fixture.calls().count("acquire"), 1)
+        finally:
+            self.assert_result(self.invoke("end"), "finished")
+
+    def test_prepared_attempt_resumes_after_route_removal(self):
+        run = self.root / self.attempt
+        owner = {"project": self.project, "task": TASK, "session": SESSION}
+        config = {**client.configuration(self.config), "runs_directory": str(self.root)}
+        client.prepare(SimpleNamespace(profile="smoke.persistent", run_dir=str(run)),
+                       owner, managed_config=config)
+        client.write(self.registration, {**self.registry, "routes": []})
+        self.config.unlink()
+        self.assert_result(self.invoke("begin"), "active")
+        try:
+            self.assertEqual(self.fixture.calls().count("acquire"), 1)
+        finally:
+            self.assert_result(self.invoke("end"), "finished")
+
+    def test_allocator_failure_reuses_receipt_for_end_not_for_reacquire(self):
+        flag = self.fixture.pool / "reject-after-receipt"
+        flag.touch()
+        self.assertNotEqual(self.invoke("begin").returncode, 0)
+        self.assertTrue((self.root / self.attempt / "receipt.json").is_file())
+        self.assertNotEqual(self.invoke("begin").returncode, 0)
+        self.assert_result(self.invoke("end"), "finished")
+        self.assertEqual(self.fixture.calls().count("acquire"), 1)
+        self.assertIn("release", self.fixture.calls())
+
+    def test_managed_completed_records_are_not_pruned(self):
+        config = {**client.configuration(self.config), "runs_directory": str(self.root)}
+        owner = {"project": self.project, "task": TASK, "session": SESSION}
+        runs = []
+        for _ in range(66):
+            run = self.root / str(uuid.uuid4())
+            lease = client.prepare(SimpleNamespace(profile="smoke.persistent", run_dir=str(run)),
+                                   owner, managed_config=config)
+            lease.finish()
+            runs.append(run)
+        self.assertEqual(sum(run.is_dir() for run in runs), 66)
+        colliding = self.home / "legacy-config.json"
+        client.write(colliding, config)
+        with patch.object(client.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(self.home))), \
+                self.assertRaisesRegex(client.Error, "reserved for managed"):
+            client.prepare(SimpleNamespace(profile="smoke.persistent", config=str(colliding),
+                                           run_dir=str(self.root / str(uuid.uuid4())), owner="legacy"))
+        self.assert_result(self.invoke("begin", attempt=runs[0].name), "finished")
+        with patch.object(client, "MAX_RUNS", 66), self.assertRaisesRegex(client.Error, "retention limit"):
+            client.prepare(SimpleNamespace(profile="smoke.persistent",
+                                           run_dir=str(self.root / str(uuid.uuid4()))),
+                           owner, managed_config=config)
+        self.assertFalse((self.fixture.pool / "calls").exists())
+
+    def test_unmarked_legacy_in_fixed_root_is_not_a_managed_attempt(self):
+        run = self.root / self.attempt
+        owner = {"project": self.project, "task": TASK, "session": SESSION}
+        colliding = self.home / "legacy-config.json"
+        client.write(colliding, {**client.configuration(self.config), "runs_directory": str(self.root)})
+        client.prepare(SimpleNamespace(config=str(colliding), profile="smoke.persistent",
+                                       run_dir=str(run)), owner)
+        self.node.write_text("Implement")
+        self.assertNotEqual(self.invoke("end").returncode, 0)
+        self.assertFalse((run / "finish.json").exists())
+        self.assertFalse((self.fixture.pool / "calls").exists())
+
+    def test_marker_named_run_remains_valid_in_unrelated_legacy_root(self):
+        config = client.configuration(self.config)
+        root = Path(config["runs_directory"])
+        for name in (".managed-only", "normal-run"):
+            client.prepare(SimpleNamespace(config=str(self.config), profile="smoke.persistent",
+                                           run_dir=str(root / name), owner="legacy"))
+        self.assertTrue((root / "normal-run" / "binding.json").is_file())
+
+    def test_allocator_cannot_succeed_without_exact_public_lease_identity(self):
+        self.allocator.write_text(self.allocator.read_text().replace(
+            '"id":"lease-one","generation":1,', '"generation":True,'))
+        try:
+            result = self.invoke("begin")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("adb_serial", result.stdout)
+        finally:
+            self.assert_result(self.invoke("end"), "finished")
 
 
 @unittest.skipUnless(os.environ.get("RESOURCE_LEASE_SOURCE"),
