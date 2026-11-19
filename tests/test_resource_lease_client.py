@@ -7,6 +7,7 @@ import io
 import json
 import os
 import runpy
+import shutil
 import signal
 import subprocess
 import sys
@@ -1396,8 +1397,16 @@ else:
         kent.chmod(0o700)
         self.config = self.home / "config.json"
         self.allocator = self.home / "allocator"
+        self.allocator_log = self.home / "allocator-environment"
         self.allocator.write_text(fixture.executable.read_text().replace(
-            "#!/usr/bin/env python3", f"#!{sys.executable}", 1))
+            "#!/usr/bin/env python3", f"#!{sys.executable}", 1).replace(
+                "action = args[2]", f"""action = args[2]
+with open({str(self.allocator_log)!r}, "a") as log:
+    environment = {{key: os.environ[key] if key in {{"HOME", "PATH"}} else None
+                   for key in os.environ}}
+    print(json.dumps([action, os.getcwd(), environment]), file=log)""",
+                1,
+            ))
         self.allocator.chmod(0o700)
         client.write(self.config, {**json.loads(fixture.config.read_text()),
                                    "executable": str(self.allocator)})
@@ -1409,16 +1418,38 @@ else:
         client.write(self.registration, self.registry)
         # Inject only the OS account home into a disposable copy. The copy
         # then launches the actual helper and allocator as separate processes.
-        self.script = self.home / "resource-lease-client"
+        self.installation = self.home / ".kent/tools/android"
+        self.installation.mkdir(parents=True, mode=0o700)
+        self.script = self.installation / "resource-lease-client"
         self.script.write_text(SCRIPT.read_text().replace(
             "import pwd\n",
             f"import pwd\nfrom types import SimpleNamespace\n"
             f"pwd.getpwuid = lambda _: SimpleNamespace(pw_dir={str(self.home)!r})\n", 1))
+        self.script.chmod(0o700)
         self.environment = {**fixture.environment, "KENT_SESSION_ID": SESSION,
                             "HOME": "/not-account-home", "KENT_PERSISTENCE_ROOT": "/not-native-state",
                             "KENT_MANAGED_OBSERVER": "untrusted context"}
         self.environment.pop("RESOURCE_LEASE_CONFIG", None)
         self.attempt = str(uuid.uuid4())
+
+    def install_android_facade(self):
+        for file in ("android-tools", "android_tools_custody.py",
+                     "android_tools_evidence.py", "android_tools_native.py"):
+            shutil.copy2(ROOT / "templates/project" / file, self.installation / file)
+
+    def dispatch_android(self, arguments, *, cwd=None, environ=None, action="key", program=None):
+        entry = (
+            "import pwd,runpy,sys; from types import SimpleNamespace; "
+            "home,launcher,*args=sys.argv[1:]; "
+            "pwd.getpwuid=lambda _: SimpleNamespace(pw_dir=home); "
+            "sys.argv=[launcher,*args]; runpy.run_path(launcher,run_name='__main__')"
+        )
+        return subprocess.run([
+            sys.executable, "-I", "-B", "-c", entry, str(self.home),
+            str(program or self.installation / "android-tools"),
+            "--attempt", self.attempt, "device", action, "--arguments", json.dumps(arguments),
+        ], env=environ or self.environment, cwd=cwd or self.checkout,
+            capture_output=True, text=True, timeout=15)
 
     def invoke(self, action, *, attempt=None, cwd=None, env=None, profile="smoke.persistent"):
         args = [action, "--attempt", attempt or self.attempt]
@@ -1545,6 +1576,274 @@ else:
         self.assert_result(self.invoke("end"), "finished")
         self.assertEqual(self.fixture.calls().count("acquire"), 1)
         self.assertIn("release", self.fixture.calls())
+
+    def test_managed_finish_spellings_withhold_allocator_while_marker_is_live(self):
+        self.assert_result(self.invoke("begin"), "active")
+        run = self.root / self.attempt
+        marker = run / client.UNCERTAINTY_MARKER
+        client.write(marker, {"schema": 1, "reason": "remote_stop_unconfirmed",
+                              "operation": uuid.uuid4().hex})
+        try:
+            self.assertNotEqual(self.invoke("end").returncode, 0)
+            direct = subprocess.run(
+                [sys.executable, str(self.script), "finish", "--run-dir", str(run)],
+                env=self.environment, cwd=self.checkout, capture_output=True, timeout=20,
+            )
+            self.assertNotEqual(direct.returncode, 0)
+            self.assertTrue(marker.is_file())
+            self.assertFalse((run / "finish.json").exists())
+            self.assertFalse({"release", "cancel"} & set(self.fixture.calls()))
+        finally:
+            with client.marker_lock(run):
+                marker.unlink()
+            self.assert_result(self.invoke("end"), "finished")
+
+    def test_managed_helper_signal_does_not_release_live_marker(self):
+        self.assert_helper_loss_keeps_live_marker(signal.SIGTERM)
+
+    def test_managed_helper_crash_does_not_release_live_marker(self):
+        self.assert_helper_loss_keeps_live_marker(signal.SIGKILL)
+
+    def assert_helper_loss_keeps_live_marker(self, interruption):
+        run = self.root / self.attempt
+        config = {**client.configuration(self.config), "runs_directory": str(self.root)}
+        owner = {"project": self.project, "task": TASK, "session": SESSION}
+        client.prepare(SimpleNamespace(profile="smoke.persistent", run_dir=str(run)),
+                       owner, managed_config=config)
+        environment = {**self.environment, "KENT_MANAGED_OBSERVER": json.dumps({
+            **self.registry, "routes": [],
+        })}
+        with subprocess.Popen(
+            [sys.executable, str(self.script), "_serve-managed", "--run-dir", str(run)],
+            env=environment, cwd=self.checkout, start_new_session=True,
+        ) as helper:
+            try:
+                deadline = time.monotonic() + 10
+                while self.invoke("status").returncode and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assert_result(self.invoke("status"), "active")
+                marker = run / client.UNCERTAINTY_MARKER
+                client.write(marker, {"schema": 1, "reason": "remote_stop_unconfirmed",
+                                      "operation": uuid.uuid4().hex})
+                helper.send_signal(interruption)
+                self.assertNotEqual(helper.wait(timeout=10), 0)
+                self.assertNotEqual(self.invoke("end").returncode, 0)
+                self.assertTrue(marker.is_file())
+                self.assertFalse((run / "finish.json").exists())
+                self.assertFalse({"release", "cancel"} & set(self.fixture.calls()))
+            finally:
+                if helper.poll() is None:
+                    helper.kill()
+
+    def test_managed_android_dispatch_matches_original_lease_after_route_removal(self):
+        from test_android_tools_native import PNG
+
+        android_settings = self.home / "android-settings.json"
+        records = self.home / "records"
+        records.mkdir(mode=0o700)
+        provider = self.home / "provider"
+        provider_calls = self.home / "provider-log"
+        sdk = self.home / "sdk"
+        adb = sdk / "platform-tools/adb"
+        adb.parent.mkdir(parents=True)
+        adb_log = self.home / "adb-log"
+        adb.write_text(f"#!/bin/sh\n/usr/bin/touch {str(adb_log)!r}\n")
+        adb.chmod(0o700)
+        expected_provider_environment = {
+            "HOME": str(self.home), "PATH": f"{adb.parent}:/usr/bin:/bin",
+            "ANDROID_HOME": str(sdk), "ANDROID_SDK_ROOT": str(sdk),
+            "ADB_SERVER_SOCKET": "tcp:127.0.0.1:5037",
+        }
+        provider.write_text(f"""#!{sys.executable}
+import json, os, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+environment = dict(os.environ)
+# OS/runtime can add their own locale variables to an otherwise closed env.
+for key in ("LC_CTYPE", "__CF_USER_TEXT_ENCODING"):
+    environment.pop(key, None)
+assert os.getcwd() == "/"
+assert environment == {expected_provider_environment!r}, sorted(environment)
+subprocess.run(["adb"], check=True)
+with Path({str(provider_calls)!r}).open("a") as log:
+    log.write(json.dumps(args) + "\\n")
+if args == ["--version"]:
+    print("fixture-mobile-native 1.0")
+elif (args[:6] == ["screenshot", "--platform", "android", "--device",
+                  "emulator-5574", "--output"] and len(args) == 7):
+    Path(args[6]).write_bytes({PNG!r})
+elif args != ["key", "--platform", "android", "--device", "emulator-5574", "back"]:
+    raise SystemExit(2)
+""")
+        provider.chmod(0o700)
+        settings = {
+            "schema": 1, "timeout_seconds": 5, "output_limit_bytes": 4096,
+            "providers": {"mobile-native": {"executable": str(provider), "version": "1.0"}},
+            "records_directory": str(records), "android_sdk_root": str(sdk),
+        }
+        checkout_adb = self.checkout / "sdk/platform-tools/adb"
+        checkout_adb.parent.mkdir(parents=True)
+        shutil.copy2(adb, checkout_adb)
+        unrepresentable_sdk = self.home / f"sdk{os.pathsep}split"
+        unrepresentable_adb = unrepresentable_sdk / "platform-tools/adb"
+        unrepresentable_adb.parent.mkdir(parents=True)
+        shutil.copy2(adb, unrepresentable_adb)
+        self.registry["routes"][0]["android_config"] = str(android_settings)
+        client.write(self.registration, self.registry)
+        for invalid in (
+            {**settings, "lease": {}},
+            {**settings, "timeout_seconds": 0.01},
+            {key: value for key, value in settings.items() if key != "android_sdk_root"},
+            {**settings, "android_sdk_root": str(self.checkout / "sdk")},
+            {**settings, "android_sdk_root": str(self.home / "missing-sdk")},
+            {**settings, "android_sdk_root": str(unrepresentable_sdk)},
+            {**settings, "providers": {"mobile-native": {
+                "executable": str(provider), "version": "bad version",
+            }}},
+        ):
+            with self.subTest(invalid=invalid):
+                client.write(android_settings, invalid)
+                self.assertNotEqual(self.invoke("begin").returncode, 0)
+                self.assertFalse((self.fixture.pool / "calls").exists())
+        client.write(android_settings, settings)
+        poison = {**self.environment, "PATH": "/untrusted-path",
+                  "ANDROID_HOME": "/untrusted-sdk", "ANDROID_SDK_ROOT": "/untrusted-sdk",
+                  "ADB_SERVER_SOCKET": "tcp:127.0.0.1:58471", "ANDROID_SERIAL": "emulator-9999",
+                  "ANDROID_ADB_SERVER_ADDRESS": "127.0.0.1", "ANDROID_ADB_SERVER_PORT": "58472",
+                  "RESOURCE_LEASE_RUN_DIRECTORY": "/foreign"}
+        active = self.assert_result(self.invoke("begin", env=poison), "active")
+        ended = False
+        try:
+            self.config.unlink()
+            android_settings.unlink()
+            client.write(self.registration, {**self.registry, "routes": []})
+            self.assertEqual(self.assert_result(self.invoke("status"), "active"), active)
+            self.install_android_facade()
+            launcher = self.installation / "android-tools"
+
+            def dispatch(arguments, *, cwd=None, environ=None, action="key", program=launcher):
+                return self.dispatch_android(arguments, cwd=cwd, environ=environ or poison,
+                                             action=action, program=program)
+
+            for rejected in (
+                dispatch({"key": "back", "device_serial": "emulator-5574"}),
+                dispatch({"key": "back"}, cwd=self.workspace),
+                dispatch({"key": "back"}, environ={**self.environment, "KENT_SESSION_ID": ""}),
+            ):
+                self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse(provider_calls.exists())
+            for file in (launcher, *self.installation.glob("android_tools_*.py")):
+                shutil.copy2(file, self.checkout / file.name)
+            checkout_client = self.checkout / "resource-lease-client"
+            status_calls = self.home / "checkout-status-calls"
+            checkout_client.write_text(
+                f"from pathlib import Path\nPath({str(status_calls)!r}).touch()\n"
+                f"print({json.dumps(active)!r})\n",
+            )
+            checkout_client.chmod(0o700)
+            self.assertNotEqual(
+                dispatch({"key": "back"}, program=self.checkout / launcher.name).returncode, 0,
+            )
+            self.assertFalse(status_calls.exists())
+            self.assertFalse(provider_calls.exists())
+            result = dispatch({"key": "back"})
+            self.assertEqual(result.returncode, 0, (result.stderr, result.stdout))
+            self.assertTrue(adb_log.is_file())
+            response = json.loads(result.stdout)
+            self.assertNotIn(str(self.home), result.stdout)
+            self.assertNotIn("local_manifest", response)
+            invocation = response["invocation_id"]
+            manifest = json.loads((records / "runs" / invocation / "manifest.json").read_bytes())
+            self.assertEqual(manifest["context"], {
+                "attempt_id": self.attempt, "generation": active["lease"]["generation"],
+                "lease_id": active["lease"]["id"], "device_serial": active["endpoint"]["adb_serial"],
+            })
+            captured = dispatch({"scene": "known-safe"}, action="capture")
+            self.assertEqual(captured.returncode, 0, (captured.stdout, captured.stderr))
+            capture = json.loads(captured.stdout)
+            self.assertNotIn(str(self.home), captured.stdout)
+            self.assertEqual(len(capture["artifacts"]), 1)
+            self.assertNotIn("path", capture["artifacts"][0])
+            self.assertEqual(capture["artifacts"][0]["media_type"], "image/png")
+            capture_manifest = records / "runs" / capture["invocation_id"] / "manifest.json"
+            artifact = json.loads(capture_manifest.read_bytes())["artifacts"][0]
+            self.assertEqual((capture_manifest.parent / artifact["local_locator"]).read_bytes(), PNG)
+            self.assertFalse((self.root / self.attempt / client.UNCERTAINTY_MARKER).exists())
+            self.assert_result(self.invoke("end", env=poison), "finished")
+            ended = True
+            self.assertNotEqual(dispatch({"key": "back"}).returncode, 0)
+            # With admission disabled and the lease settled, retained evidence
+            # is still readable by this bundle without using the allocator.
+            from test_android_tools import facade
+
+            evidence = facade.load_bundle()["android_tools_evidence"]
+            original = capture_manifest.read_bytes()
+            reopened = evidence.open_run(records, capture["invocation_id"])
+            self.assertTrue(evidence._run_info(reopened.run_directory, reopened.invocation_id)["managed"])
+            self.assertEqual(reopened.manifest_path.read_bytes(), original)
+            self.assertFalse((reopened.run_directory / "export.jsonl").exists())
+            self.assertEqual(len(provider_calls.read_bytes().splitlines()), 4)
+            self.assertEqual(self.fixture.calls().count("acquire"), 1)
+            self.assertIn("release", self.fixture.calls())
+            allocator_calls = [json.loads(row) for row in self.allocator_log.read_text().splitlines()]
+            self.assertTrue({"acquire", "inspect", "renew", "release"} <=
+                            {operation for operation, _, _ in allocator_calls})
+            self.assertGreaterEqual(sum(op == "inspect" for op, _, _ in allocator_calls), 12)
+            for operation, cwd, environment in allocator_calls:
+                environment.pop("LC_CTYPE", None)
+                environment.pop("__CF_USER_TEXT_ENCODING", None)
+                self.assertEqual(cwd, "/", operation)
+                self.assertEqual(environment, {"HOME": str(self.home), "PATH": "/usr/bin:/bin"},
+                                 operation)
+        finally:
+            if not ended:
+                self.assert_result(self.invoke("end"), "finished")
+
+    def test_retained_v2_without_sdk_can_settle_but_not_dispatch(self):
+        self.assert_retained_v2_cannot_dispatch()
+
+    def test_retained_v2_with_sdk_path_separator_can_settle_but_not_dispatch(self):
+        sdk = self.home / f"sdk{os.pathsep}split"
+        adb = sdk / "platform-tools/adb"
+        adb.parent.mkdir(parents=True)
+        adb.write_text("#!/bin/sh\nexit 0\n")
+        adb.chmod(0o700)
+        self.assert_retained_v2_cannot_dispatch(sdk)
+
+    def assert_retained_v2_cannot_dispatch(self, sdk=None):
+        owner = {"project": self.project, "task": TASK, "session": SESSION}
+        config = {**client.configuration(self.config), "runs_directory": str(self.root)}
+        records = self.home / "records"
+        records.mkdir(mode=0o700)
+        provider_calls = self.home / "provider-unexpected-calls"
+        provider = self.home / "provider"
+        provider.write_text(f"#!/bin/sh\n/usr/bin/touch {str(provider_calls)!r}\n")
+        provider.chmod(0o700)
+        runtime = {"checkout": str(self.checkout), "settings": {
+            "schema": 1, "timeout_seconds": 5, "output_limit_bytes": 4096,
+            "providers": {"mobile-native": {"executable": str(provider), "version": "1.0"}},
+            "records_directory": str(records),
+        }}
+        if sdk is not None:
+            runtime["settings"]["android_sdk_root"] = str(sdk)
+        with patch.object(client, "managed_root", return_value=self.root):
+            client.prepare(SimpleNamespace(profile="smoke.persistent",
+                                          run_dir=str(self.root / self.attempt)),
+                           owner, managed_config=config, android_runtime=runtime)
+        self.install_android_facade()
+        self.assert_result(self.invoke("begin"), "active")
+        try:
+            self.assert_result(self.invoke("status"), "active")
+            result = self.dispatch_android({"key": "back"})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(json.loads(result.stdout), {
+                "error": "managed_device_unavailable", "effect": "not_dispatched",
+            })
+            self.assertFalse(provider_calls.exists())
+            self.assertFalse((records / "runs").exists())
+        finally:
+            self.assert_result(self.invoke("end"), "finished")
+        self.assertEqual(self.fixture.calls().count("acquire"), 1)
 
     def test_managed_completed_records_are_not_pruned(self):
         config = {**client.configuration(self.config), "runs_directory": str(self.root)}

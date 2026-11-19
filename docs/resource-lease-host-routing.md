@@ -38,6 +38,50 @@ confirmed terminal status is not reported as finished. Settle the original
 attempt through a qualified operator recovery path; do not acquire again
 or infer release from a lost response or elapsed time.
 
-This change does not migrate foreground `run`, retained explicit
-`start/check/finish`, Appsome, `android-tools`, or evidence consumers.
-It is not a deployment or a certification of real emulator readiness.
+## Android device operations on an existing attempt
+
+An operator may add `android_config` to a route to enable the managed
+Android entry point for new admissions. It names an owner-private JSON
+file outside checkouts. The closed schema has `schema: 1`,
+`timeout_seconds`, `output_limit_bytes`, `providers` (exactly
+`mobile-native`, with `executable` and `version`), the trusted
+`android_sdk_root` with `platform-tools/adb` (no `PATH` separator in the SDK
+path), a private canonical
+`records_directory`, and optional `retention`. It does not contain a lease
+section, source checkout, or second pool. Admission pins this policy and
+the native verified physical checkout with the existing lease binding.
+Previously admitted attempts without Android settings are not upgraded.
+Previously pinned Android settings without the SDK remain readable for
+settlement and evidence but cannot dispatch a device command.
+
+`android-tools --attempt UUID device ACTION --arguments JSON` uses the
+authorized attempt's exact endpoint and provider policy. Do not supply a
+serial, config path or storage binding; the result names the invocation
+by ID, not a private path. `android-tools` and the lease client must be
+qualified as co-installed siblings in the OS account's
+`~/.kent/tools/android`, not copied into a checkout. An unobservable attempt, changed
+authority, or unresolved custody is a blocker, not an alternate route.
+Managed allocator subprocesses use the OS account home, system `PATH`, and
+a neutral working directory. The provider uses the pinned SDK and local
+ADB at `127.0.0.1:5037` without caller overrides. Qualify the same local
+server and SDK for the allocator before enabling the route. The provider
+version probe is followed by another custody check before device commands.
+Managed evidence binds invocation to attempt, lease and generation.
+The existing explicit exporter refuses managed evidence; this slice does
+not implement authorized delayed managed export.
+
+A managed device dispatch publishes its custody marker before the
+provider call. The managed release fence and marker share one short
+publication lock. A known completed process group may clear only its own
+marker. A live or uncertain marker blocks all client release and cancel
+paths, including helper interruption. This does not prevent the allocator
+from taking its independent TTL path if the helper cannot renew; expiry
+alone is not verified cleanup or a safe handoff.
+
+Do not migrate existing explicit consumers, foreground `run`, or Appsome
+in this source slice. Before rollout, qualify the actual bundle, safe
+host disposition after helper loss, evidence export/readback, and the
+release Smoke consumer. To roll back, stop new managed admission and retain
+a compatible reader while any managed records or export obligations
+remain. Lease release does not retire its evidence. Do not delete managed
+records to make an old reader pass.

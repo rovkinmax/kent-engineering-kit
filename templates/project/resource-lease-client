@@ -345,6 +345,21 @@ def aggregate_command_stop(parent_stop, external_unconfirmed, marker_present):
     return "not_started" if parent_stop == "not_started" else "confirmed"
 
 
+def request_managed_finish(run: Path):
+    with marker_lock(run) as directory_fd:
+        status = validate_status(read(run / "status.json"), run)
+        if (_marker_present(run) or status["external_stop_unconfirmed"]
+                or status["parent_command_stop"] in {"pending", "unconfirmed"}):
+            raise Error("managed device stop is not confirmed")
+        fence = run / "finish.json"
+        if os.path.lexists(fence):
+            if read(fence) != {"schema": 1}:
+                raise Error("invalid managed finish barrier")
+        else:
+            _write_record(fence, {"schema": 1})
+            os.fsync(directory_fd)
+
+
 def validate_binding(value, run: Path) -> dict:
     required = {
         "schema", "config", "profile", "custody_marker_protocol",
@@ -353,8 +368,19 @@ def validate_binding(value, run: Path) -> dict:
     config = value.get("config")
     profile = value.get("profile")
     binding = value.get("binding")
+    android = value.get("android_runtime")
+    schema = 1
+    if "android_runtime" in value:
+        required.add("android_runtime")
+        if (binding is None or not isinstance(android, dict)
+                or set(android) != {"checkout", "settings"}
+                or not same_managed_root(run.parent) or not marked_managed(run.parent)):
+            raise Error("invalid managed Android binding")
+        pinned_path(android["checkout"])
+        android_settings(android["settings"], retained=True)
+        schema = 2
     if (set(value) != required
-            or type(value.get("schema")) is not int or value["schema"] != 1
+            or type(value.get("schema")) is not int or value["schema"] != schema
             or type(value.get("custody_marker_protocol")) is not int
             or value["custody_marker_protocol"] != CUSTODY_MARKER_PROTOCOL
             or not isinstance(config, dict)
@@ -417,7 +443,11 @@ class Lease:
             command += ["--capability", self.metadata["capability"], "--wait", str(ACQUIRE_TIMEOUT)]
         elif action in {"cancel", "release"}:
             command += ["--wait", str(CLEANUP_TIMEOUT)]
-        value = capture(command, timeout=timeout, tick=tick, resource_operation=action)
+        options = {}
+        if managed_run(self.run):
+            options = {"cwd": "/", "env": {"HOME": str(account_home()),
+                                           "PATH": "/usr/bin:/bin"}}
+        value = capture(command, timeout=timeout, tick=tick, resource_operation=action, **options)
         if (value.get("owner") != self.metadata["owner"]
                 or value.get("capability") != self.metadata["capability"]):
             raise Error("CLI returned a different lease binding")
@@ -471,11 +501,14 @@ class Lease:
             os.fsync(directory_fd)
             return value
 
-    def finish(self, cancel=False):
+    def finish(self, cancel=False, *, managed=False):
         validate_binding(self.metadata, self.run)
-        with marker_lock(self.run):
-            validate_status(read(self.run / "status.json"), self.run)
-            _marker_present(self.run)
+        if managed or managed_run(self.run):
+            request_managed_finish(self.run)
+        else:
+            with marker_lock(self.run):
+                validate_status(read(self.run / "status.json"), self.run)
+                _marker_present(self.run)
         if not (self.run / "receipt.json").exists():
             # The CLI writes its receipt before registration. With the helper
             # lock held and acquire child reaped, no receipt means no request.
@@ -555,7 +588,9 @@ def prune(root):
             continue
 
 
-def prepare(args, binding=None, *, managed_config=None):
+def prepare(args, binding=None, *, managed_config=None, android_runtime=None):
+    if android_runtime is not None and (managed_config is None or binding is None):
+        raise Error("Android settings require managed owner")
     config = configuration(args.config) if managed_config is None else managed_config
     if args.profile not in config["profiles"]:
         raise Error("requested profile is not configured")
@@ -569,6 +604,8 @@ def prepare(args, binding=None, *, managed_config=None):
                 "capability": config["profiles"][args.profile],
                 "owner": args.owner if binding is None else f"smoke:{binding['task']}:{binding['session']}",
                 "binding": binding}
+    if android_runtime is not None:
+        metadata.update(schema=2, android_runtime=android_runtime)
     created = False
     with admission_lock(root):
         marker = root / ".managed-only"
@@ -772,7 +809,7 @@ def serve(run, *, native=None):
                 time.sleep(0.1)
         except InterruptedError:
             try:
-                status = lease.finish(cancel=renewal.value is None)
+                status = lease.finish(cancel=renewal.value is None, managed=native is not None)
                 if status["phase"] != "finished":
                     return 1
             except (Error, OSError, ValueError) as error:
@@ -857,7 +894,10 @@ def launch(lease, *, native=None, helper_env=None):
             if value.get("phase") in {"stopped", "failed", "finished"}:
                 raise Error(value.get("error") or "helper stopped")
         if STOP:
-            write(lease.run / "finish.json", {"schema": 1})
+            if native is not None:
+                request_managed_finish(lease.run)
+            else:
+                write(lease.run / "finish.json", {"schema": 1})
             raise Error("startup interrupted; inspect original run cleanup")
         if child.poll() is not None:
             raise Error("helper exited before readiness; inspect original run")
@@ -867,8 +907,11 @@ def launch(lease, *, native=None, helper_env=None):
 
 def finish(run, *, managed=False):
     lease = load(run)
-    managed = managed or (same_managed_root(lease.run.parent) and marked_managed(lease.run.parent))
-    write(lease.run / "finish.json", {"schema": 1})
+    managed = managed or managed_run(lease.run)
+    if managed:
+        request_managed_finish(lease.run)
+    else:
+        write(lease.run / "finish.json", {"schema": 1})
     deadline = time.monotonic() + CLEANUP_TIMEOUT + CLI_TIMEOUT + 10
     while time.monotonic() < deadline:
         try:
@@ -881,7 +924,7 @@ def finish(run, *, managed=False):
                     if ((lease.run / "launched.json").exists()
                             and not (lease.run / "receipt.json").exists()):
                         raise Error("managed release outcome is unknown")
-                return lease.finish(cancel=not (lease.run / "receipt.json").exists())
+                return lease.finish(cancel=not (lease.run / "receipt.json").exists(), managed=managed)
         except Busy:
             pass
         value = validate_status(read(lease.run / "status.json"), lease.run)
@@ -898,8 +941,12 @@ def canonical(value):
     return path
 
 
+def account_home():
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
 def managed_root():
-    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/kent/android-tools/managed-runs"
+    return account_home() / ".config/kent/android-tools/managed-runs"
 
 
 def same_managed_root(root):
@@ -912,6 +959,10 @@ def marked_managed(root):
     return os.path.lexists(marker) and read(marker) == {"schema": 1}
 
 
+def managed_run(run):
+    return same_managed_root(run.parent) and marked_managed(run.parent)
+
+
 def trusted_path(path):
     for component in (*reversed(path.parents), path):
         info = component.lstat()
@@ -920,6 +971,50 @@ def trusted_path(path):
                 or (component != path and not stat.S_ISDIR(info.st_mode))):
             raise Error("unsafe host path")
     return path
+
+
+def pinned_path(value):
+    if (not isinstance(value, str) or not value.startswith("/")
+            or "\x00" in value or str(Path(value)) != value
+            or os.path.normpath(value) != value):
+        raise Error("invalid pinned Android path")
+    return Path(value)
+
+
+def android_settings(value, *, retained=False):
+    required = {"schema", "timeout_seconds", "output_limit_bytes", "providers", "records_directory"}
+    if not retained:
+        required.add("android_sdk_root")
+    if (not isinstance(value, dict) or not required <= value.keys()
+            or value.keys() - required - {"android_sdk_root", "retention"}
+            or type(value["schema"]) is not int or value["schema"] != 1
+            or type(value["timeout_seconds"]) not in (int, float)
+            or not 0.1 <= value["timeout_seconds"] <= 300
+            or type(value["output_limit_bytes"]) is not int
+            or not 4096 <= value["output_limit_bytes"] <= 8388608):
+        raise Error("invalid managed Android settings")
+    pinned_path(value["records_directory"])
+    if "android_sdk_root" in value:
+        sdk = pinned_path(value["android_sdk_root"])
+        if not retained and os.pathsep in str(sdk):
+            raise Error("invalid managed Android SDK path")
+    providers = value["providers"]
+    if not isinstance(providers, dict) or set(providers) != {"mobile-native"}:
+        raise Error("invalid managed Android provider settings")
+    provider = providers["mobile-native"]
+    if (not isinstance(provider, dict) or set(provider) != {"executable", "version"}
+            or not isinstance(provider["version"], str) or not 0 < len(provider["version"]) <= 128
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", provider["version"]) is None):
+        raise Error("invalid managed Android provider settings")
+    pinned_path(provider["executable"])
+    retention = value.get("retention", {"max_bytes": 500000000, "max_age_seconds": 604800})
+    if (not isinstance(retention, dict) or set(retention) != {"max_bytes", "max_age_seconds"}
+            or type(retention["max_bytes"]) is not int
+            or not 1048576 <= retention["max_bytes"] <= 10000000000
+            or type(retention["max_age_seconds"]) is not int
+            or not 60 <= retention["max_age_seconds"] <= 31536000):
+        raise Error("invalid managed Android retention")
+    return {**value, "retention": retention}
 
 
 def checkout_local(path):
@@ -949,7 +1044,7 @@ def native_uuid(value, prefix=""):
 
 class HostRouting:
     def __init__(self, *, helper=False):
-        self.home = canonical(pwd.getpwuid(os.getuid()).pw_dir)
+        self.home = canonical(str(account_home()))
         location = self.home / ".config/kent/android-tools"
         if helper:
             value = json.loads(os.environ["KENT_MANAGED_OBSERVER"], object_pairs_hook=unique_object)
@@ -985,7 +1080,7 @@ class HostRouting:
             raise Error("native observation timed out")
         return capture([str(self.kent), *args, "--json"], timeout=remaining, cwd="/", env=self.env)
 
-    def workspace(self, session):
+    def target(self, session):
         result = self.observe(time.monotonic() + CLI_TIMEOUT, "worktree", "status", "--session", session)
         target, roots = result.get("target"), result.get("worktree")
         if (result.get("problems") != [] or not isinstance(target, dict) or not isinstance(roots, dict)
@@ -1005,7 +1100,7 @@ class HostRouting:
             if os.path.lexists(cwd / ".git"):
                 raise Error("native checkout mismatch")
             cwd = cwd.parent
-        return workspace
+        return workspace, checkout
 
     def active(self, owner, *, route=None):
         project, task, session = (owner[key] for key in ("project", "task", "session"))
@@ -1044,9 +1139,10 @@ class HostRouting:
 
     def route(self, workspace):
         matches = []
+        required = {"project", "workspace", "workflow_id", "smoke_node", "config"}
         for route in self.routes:
             if (not isinstance(route, dict)
-                    or set(route) != {"project", "workspace", "workflow_id", "smoke_node", "config"}
+                    or not required <= route.keys() or route.keys() - required - {"android_config"}
                     or not isinstance(route["smoke_node"], str) or not route["smoke_node"]):
                 raise Error("invalid host route")
             native_uuid(route["project"], "project-")
@@ -1074,6 +1170,26 @@ class HostRouting:
                 raise Error("managed runs overlap retained runs")
         return {**config, "runs_directory": str(self.root)}
 
+    def android(self, route, checkout, config):
+        if "android_config" not in route:
+            return None
+        source = trusted_path(canonical(route["android_config"]))
+        if checkout_local(source):
+            raise Error("Android settings cannot live in a checkout")
+        settings = android_settings(read(source))
+        executable = trusted_path(canonical(settings["providers"]["mobile-native"]["executable"]))
+        records = trusted_path(canonical(settings["records_directory"]))
+        adb = trusted_path(Path(settings["android_sdk_root"]) / "platform-tools/adb")
+        private(records, directory=True)
+        if (not executable.is_file() or not os.access(executable, os.X_OK)
+                or checkout_local(executable) or checkout_local(records)
+                or not adb.is_file() or not os.access(adb, os.X_OK) or checkout_local(adb)
+                or any(existing_overlap(records, root) for root in (
+                    self.root, Path(config["pool"]), canonical(route["workspace"]), checkout,
+                ))):
+            raise Error("unsafe managed Android provider or records")
+        return {"checkout": str(checkout), "settings": settings}
+
 
 @contextmanager
 def managed_lock(root, attempt):
@@ -1096,7 +1212,7 @@ def managed_lock(root, attempt):
 def managed(args, host):
     attempt = native_uuid(args.attempt)
     session = native_uuid(os.environ.get("KENT_SESSION_ID"))
-    workspace = host.workspace(session)
+    workspace, checkout = host.target(session)
     run = host.root / attempt
     with managed_lock(host.root, attempt):
         if os.path.lexists(run):
@@ -1109,6 +1225,9 @@ def managed(args, host):
                     or args.action == "begin" and (owner["task"] != args.task
                                                   or lease.metadata["profile"] != args.profile)):
                 raise Error("managed attempt owner or intent mismatch")
+            android = lease.metadata.get("android_runtime")
+            if android is not None and android["checkout"] != str(checkout):
+                raise Error("managed Android checkout changed")
             host.active(owner)
         elif args.action == "begin":
             task = native_uuid(args.task, "task-")
@@ -1117,7 +1236,8 @@ def managed(args, host):
             host.active(owner, route=route)
             config = host.config(route)
             args.run_dir = str(run)
-            lease = prepare(args, owner, managed_config=config)
+            lease = prepare(args, owner, managed_config=config,
+                            android_runtime=host.android(route, checkout, config))
         else:
             raise Error("managed attempt not found")
         if args.action == "begin":

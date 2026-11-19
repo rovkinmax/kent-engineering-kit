@@ -16,9 +16,9 @@ import types
 PROTOCOL = 1
 # Exact source bundle: verify and execute the same bytes before any dispatch.
 BUNDLE_HASHES = {
-    "android_tools_native.py": "2c98ddf97c9f06a53d3ffa34c0682a7db8b580a90881ed5fed233804b8256bdd",
-    "android_tools_evidence.py": "dcf71983c09a4f5079813a76889a739c0554d2355c874768046abe7de49ffb3f",
-    "android_tools_custody.py": "a87de1b65ca5163e35c39709d6c01a76293a93f77faca8c90105d4bff62b8b59",
+    "android_tools_native.py": "fe693efb1d6981945e37613c54e801466a195034cd5f2277981d4ca173dcab2e",
+    "android_tools_evidence.py": "2f7cf4334f0b31a279d246922e56da6595619d3e7fcc70daf91157d6ef637dae",
+    "android_tools_custody.py": "f705c1d39f693844dd208fb68c504e0627c3797e0b69a55a6162e613328c839f",
 }
 LIMIT = 262144
 MAX_BUNDLE_FILE_BYTES = 1048576
@@ -206,7 +206,10 @@ def read_private(path):
 
 
 def configuration(path, *, docs_only=False):
-    value = read_private(path)
+    return validate_configuration(read_private(path), docs_only=docs_only)
+
+
+def validate_configuration(value, *, docs_only=False, managed=False):
     required = {"schema", "timeout_seconds", "output_limit_bytes", "providers"}
     storage = {"source_root", "records_directory", "lease"}
     if (not required <= set(value) or set(value) - required - storage - {"retention"}
@@ -219,7 +222,8 @@ def configuration(path, *, docs_only=False):
             or not 4096 <= value["output_limit_bytes"] <= 8388608):
         raise Error("invalid_limits")
     providers = value["providers"]
-    required_providers = {"google-android"} if docs_only else {"mobile-native", "google-android"}
+    required_providers = ({"mobile-native"} if managed else {"google-android"}
+                          if docs_only else {"mobile-native", "google-android"})
     if (not isinstance(providers, dict) or not required_providers <= set(providers)
             or set(providers) - {"mobile-native", "google-android"}):
         raise Error("invalid_providers")
@@ -277,7 +281,7 @@ def handoff_uncertain(module):
 
 def _first_positional_argument(argv):
     options_with_values = {
-        "--arguments", "--binding-file", "--config", "--helper", "--interface",
+        "--arguments", "--attempt", "--binding-file", "--config", "--helper", "--interface",
     }
     index = 0
     while index < len(argv):
@@ -302,7 +306,9 @@ def main():
         print(json.dumps(qualify_bundle(), sort_keys=True))
         return 0
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True)
+    selector = parser.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--config")
+    selector.add_argument("--attempt")
     parser.add_argument("family", choices=("device", "preview", "docs", "evidence"))
     parser.add_argument("action")
     parser.add_argument(
@@ -312,7 +318,7 @@ def main():
     )
     parser.add_argument("--binding-file", help="Private binding for explicit evidence export")
     parser.add_argument("--helper", help="Qualified project-memory executable for export")
-    parser.add_argument("--interface", choices=("standalone", "workflow"), default="standalone")
+    parser.add_argument("--interface", choices=("standalone", "workflow"))
     parser.add_argument("--include-artifacts", action="store_true")
     parser.add_argument("--record", action="store_true",
                         help="Record docs queries for explicit evidence export")
@@ -322,11 +328,27 @@ def main():
     if args.record and args.family != "docs":
         raise Error("record_only_for_docs")
     docs_only = args.family == "docs" and not args.record
-    config = configuration(Path(args.config), docs_only=docs_only)
+    config = configuration(Path(args.config), docs_only=docs_only) if args.config is not None else None
     arguments = json.loads(args.arguments)
     if not isinstance(arguments, dict):
         raise Error("arguments_must_be_object")
     modules = load_bundle()
+    borrowed = None
+    device_environment = None
+    if args.attempt is not None:
+        if (args.family != "device" or "device_serial" in arguments
+                or args.binding_file is not None or args.helper is not None
+                or args.interface is not None or args.include_artifacts):
+            raise Error("managed_device_arguments_rejected")
+        try:
+            config, borrowed, device_environment = modules["android_tools_custody"].managed_device(
+                args.attempt, Path(__file__).absolute(),
+            )
+        except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError):
+            raise Error("managed_device_unavailable") from None
+        config = validate_configuration(config, managed=True)
+        arguments["device_serial"] = borrowed.serial
+
     if args.family == "evidence":
         if args.action != "export" or set(arguments) != {"invocation_id"}:
             raise Error("unsupported_evidence_operation")
@@ -336,7 +358,7 @@ def main():
         handle = evidence.open_run(Path(config["records_directory"]), arguments["invocation_id"])
         result = evidence.export_run(
             handle, read_private(Path(args.binding_file)), helper=Path(args.helper),
-            interface=args.interface, include_artifacts=args.include_artifacts,
+            interface=args.interface or "standalone", include_artifacts=args.include_artifacts,
             **config["retention"],
         )
         print(json.dumps(dataclasses.asdict(result), sort_keys=True))
@@ -355,22 +377,39 @@ def main():
         print(json.dumps(output, sort_keys=True))
         return 0 if result.error is None else 1
     safe_context = {}
+
+    def check_device():
+        if borrowed is None:
+            return custody(modules["android_tools_custody"], config, arguments.get("device_serial"))
+        try:
+            return borrowed.check()
+        except (ValueError, OSError, KeyError, subprocess.SubprocessError):
+            raise Error("managed_device_unavailable") from None
+
     if args.family == "device":
         if args.action == "capture" and arguments.pop("scene", None) != "known-safe":
             raise Error("capture_scene_unqualified")
-        lease = custody(modules["android_tools_custody"], config, arguments.get("device_serial"))
+        lease = check_device()
         safe_context = {
             "lease_id": lease["id"], "generation": lease["generation"],
             "device_serial": arguments["device_serial"],
         }
+        if borrowed is not None:
+            safe_context["attempt_id"] = args.attempt
     elif args.family == "preview":
         safe_context = {"target": arguments.get("target", "")}
     native = modules["android_tools_native"]
     evidence = modules["android_tools_evidence"]
-    def before_tap():
-        current = custody(modules["android_tools_custody"], config, arguments.get("device_serial"))
+    def before_effect():
+        current = check_device()
         if (current["id"], current["generation"]) != (lease["id"], lease["generation"]):
             raise Error("lease_lost")
+
+    guarded = (borrowed is not None or operation == "device.input"
+               or operation == "device.tap" and bool({"text", "resource_id"} & arguments.keys()))
+    dispatch_options = {"before_effect": before_effect} if guarded else {}
+    if borrowed is not None:
+        dispatch_options["device_environment"] = device_environment
 
     try:
         reservation = evidence.reservation_for_operation(
@@ -385,6 +424,11 @@ def main():
             raise Error("android_tools_rejected") from None
         raise
     try:
+        if borrowed is not None:
+            try:
+                borrowed.begin_remote_execution()
+            except (ValueError, OSError, KeyError, subprocess.SubprocessError):
+                raise Error("managed_device_dispatch_blocked") from None
         result = native.execute_android_native(
             provider_id, operation, arguments,
             executable=Path(provider["executable"]), expected_version=provider["version"],
@@ -392,20 +436,23 @@ def main():
             output_limit_bytes=config.get("output_limit_bytes", 1048576),
             source_root=Path(config["source_root"]),
             staging_dir=handle.staging_directory,
-            **({"before_effect": before_tap} if operation == "device.input"
-               or (operation == "device.tap"
-                   and {"text", "resource_id"} & set(arguments)) else {}),
+            **dispatch_options,
         )
         handoff = None
         if args.family == "device" and result.error == "drain_unknown":
             try:
-                handoff_uncertain(modules["android_tools_custody"])
+                if borrowed is None:
+                    handoff_uncertain(modules["android_tools_custody"])
+                else:
+                    borrowed.handoff_uncertain("native_runner_drain_unconfirmed")
                 handoff = "uncertainty_recorded"
-            except (Error, OSError, KeyError):
+            except (ValueError, OSError, KeyError):
                 handoff = "handoff_unknown"
         if args.family == "device":
             try:
-                custody(modules["android_tools_custody"], config, arguments.get("device_serial"))
+                if borrowed is not None and result.error != "drain_unknown":
+                    borrowed.confirm_remote_stopped()
+                check_device()
             except (Error, ValueError, OSError, KeyError, subprocess.SubprocessError):
                 if result.error != "drain_unknown":
                     result = dataclasses.replace(
@@ -418,7 +465,14 @@ def main():
     finally:
         evidence.release_run(handle)
     output = dataclasses.asdict(result)
-    output["local_manifest"] = str(manifest)
+    if borrowed is None:
+        output["local_manifest"] = str(manifest)
+    else:
+        # Managed artifacts are retained under this invocation, not public
+        # provider paths. Evidence already persisted the original descriptors.
+        for artifact in output["artifacts"]:
+            artifact.pop("path", None)
+        output["invocation_id"] = handle.invocation_id
     if handoff:
         output["lease_handoff"] = handoff
     print(json.dumps(output, sort_keys=True))
