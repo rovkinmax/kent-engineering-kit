@@ -12,6 +12,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import hashlib
+import secrets
 import json
 import math
 import os
@@ -194,12 +196,23 @@ def _marker_snapshot(path: Path) -> tuple[tuple[int, ...], bytes]:
     return _identity(after), data
 
 
+def _canonical_uuid(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        return False
+    return parsed.version == 4 and str(parsed) == value
+
+
 def _owner_binding(run: Path, config: LeaseConfig | None = None) -> dict[str, Any]:
     private(run, directory=True)
     binding = read_private(run / "binding.json")
     lease_config = binding.get("config")
     profile = binding.get("profile")
     owner_binding = binding.get("binding")
+    standalone = binding.get("standalone")
     try:
         parsed = LeaseConfig.from_mapping(lease_config)
     except (Error, TypeError):
@@ -207,11 +220,37 @@ def _owner_binding(run: Path, config: LeaseConfig | None = None) -> dict[str, An
     required = {"schema", "config", "profile", "custody_marker_protocol",
                 "capability", "owner", "binding"}
     schema = 1
+    if "standalone" in binding:
+        schema = 3
+        required.add("standalone")
+        expected = {
+            "attempt", "project", "workspace", "checkout", "intent", "session",
+            "caller_session",
+        }
+        if (not isinstance(standalone, dict) or set(standalone) != expected
+                or not _canonical_uuid(standalone.get("attempt"))
+                or standalone["attempt"] != run.name
+                or not isinstance(standalone.get("project"), str)
+                or not standalone["project"].startswith("project-")
+                or not _canonical_uuid(standalone["project"][8:])
+                or not isinstance(standalone.get("intent"), str)
+                or not standalone["intent"]
+                or any(not isinstance(standalone.get(key), str)
+                       or not Path(standalone[key]).is_absolute()
+                       or str(Path(standalone[key])) != standalone[key]
+                       for key in ("workspace", "checkout"))
+                or standalone["workspace"] == standalone["checkout"]
+                or not _canonical_uuid(standalone.get("session"))
+                or not _canonical_uuid(standalone.get("caller_session"))
+                or standalone["session"] == standalone["caller_session"]
+                or owner_binding is not None):
+            raise Error("lease_binding_invalid")
     if "android_runtime" in binding:
-        schema = 2
+        if standalone is None:
+            schema = 2
         required.add("android_runtime")
         runtime = binding["android_runtime"]
-        if (owner_binding is None or not isinstance(runtime, dict)
+        if ((owner_binding is None and standalone is None) or not isinstance(runtime, dict)
                 or set(runtime) != {"checkout", "settings"}
                 or not isinstance(runtime["checkout"], str)
                 or not Path(runtime["checkout"]).is_absolute()
@@ -224,6 +263,12 @@ def _owner_binding(run: Path, config: LeaseConfig | None = None) -> dict[str, An
             or not isinstance(profile, str)
             or dict(parsed.profiles).get(profile) != binding.get("capability")
             or not isinstance(binding.get("owner"), str) or not binding["owner"]
+            or standalone is not None and (
+                profile != standalone["intent"]
+                or binding["owner"] != f"standalone:{run.name}"
+                or "android_runtime" in binding
+                and binding["android_runtime"]["checkout"] != standalone["checkout"]
+            )
             or owner_binding is not None and (
                 not isinstance(owner_binding, dict)
                 or set(owner_binding) != {"project", "task", "session"}
@@ -362,11 +407,89 @@ def _create_marker(run: Path, directory_fd: int, reason: str) -> tuple[tuple[int
     return snapshot
 
 
+@contextmanager
+def _controller_guard(run: Path) -> Iterator[None]:
+    path = run / "controller-state.lock"
+    private(path)
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        deadline = time.monotonic() + MARKER_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Error("controller_admission_timeout") from None
+                time.sleep(0.05)
+        current = path.lstat()
+        if ((info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)
+                or stat.S_ISLNK(current.st_mode)):
+            raise Error("controller_admission_unavailable")
+        yield
+    finally:
+        os.close(fd)
+
+
+def _controller_is_live(run: Path) -> bool:
+    path = run / "controller.lock"
+    private(path)
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _standalone_dispatch_admission(run: Path, binding: dict[str, Any],
+                                   grant: str | None) -> Iterator[None]:
+    standalone = binding.get("standalone")
+    if (not isinstance(standalone, dict) or not isinstance(grant, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{43}", grant) is None):
+        raise Error("controller_admission_unavailable")
+    with _controller_guard(run):
+        controller = read_private(run / "controller.json")
+        required = {
+            "schema", "phase", "grant_sha256", "attempt", "project", "workspace",
+            "checkout", "intent", "session", "stop_requested", "admission",
+        }
+        admission = controller.get("admission")
+        digest = hashlib.sha256(grant.encode("ascii")).hexdigest()
+        if (set(controller) != required or type(controller.get("schema")) is not int
+                or controller["schema"] != 1 or controller.get("phase") != "claimed"
+                or not isinstance(controller.get("grant_sha256"), str)
+                or not secrets.compare_digest(controller["grant_sha256"], digest)
+                or controller.get("attempt") != standalone.get("attempt")
+                or controller.get("project") != standalone.get("project")
+                or controller.get("workspace") != standalone.get("workspace")
+                or controller.get("checkout") != standalone.get("checkout")
+                or controller.get("intent") != standalone.get("intent")
+                or controller.get("session") != standalone.get("session")
+                or controller.get("stop_requested") is not False
+                or admission is not None and (
+                    not isinstance(admission, dict)
+                    or set(admission) != {"operation", "nonce"}
+                    or admission.get("operation") not in {"acquire", "renew"}
+                    or not isinstance(admission.get("nonce"), str)
+                    or re.fullmatch(r"[0-9a-f]{32}", admission["nonce"]) is None)
+                or not _controller_is_live(run)):
+            raise Error("controller_admission_unavailable")
+        yield
+
+
 class DeviceCustody:
     """A borrow of the existing owner, with no acquire/renew/release effects."""
 
     def __init__(self, lease_config: LeaseConfig | Mapping[str, Any], serial: str, *,
-                 managed: tuple[Path, dict[str, Any], tuple[str, int]] | None = None):
+                 managed: tuple[Path, dict[str, Any], tuple[str, int]] | None = None,
+                 standalone_grant: str | None = None):
         config = lease_config.as_mapping() if isinstance(lease_config, LeaseConfig) else lease_config
         self.config = LeaseConfig.from_mapping(config)
         if not isinstance(serial, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", serial):
@@ -379,6 +502,7 @@ class DeviceCustody:
         self._marker: tuple[tuple[int, ...], bytes] | None = None
         self._binding = managed[1] if managed is not None else None
         self._managed_identity = managed[2] if managed is not None else None
+        self._standalone_grant = standalone_grant
         self._lease_identity: tuple[Any, ...] | None = None
         self._directory_identity: tuple[int, int] | None = None
         self._closed = False
@@ -398,7 +522,7 @@ class DeviceCustody:
         info = self.run.lstat()
         directory_identity = (info.st_dev, info.st_ino)
         binding = _owner_binding(self.run, self.config)
-        if (binding["schema"] == 2) != (self._managed_identity is not None):
+        if (binding["schema"] in {2, 3}) != (self._managed_identity is not None):
             raise Error("managed_attempt_required")
         state = _owner_status(self.run)
         private(self.run / "receipt.json")
@@ -543,7 +667,12 @@ class DeviceCustody:
     def _begin_remote_execution(self, reason: str) -> None:
         if self._managed_identity is not None:
             with self._verified_managed() as (fd, _):
-                self._publish_marker(fd, reason)
+                if self._binding is not None and self._binding["schema"] == 3:
+                    with _standalone_dispatch_admission(
+                            self.run, self._binding, self._standalone_grant):
+                        self._publish_marker(fd, reason)
+                else:
+                    self._publish_marker(fd, reason)
             self.check()
             return
         with _run_lock(self.run) as fd:
@@ -638,7 +767,24 @@ def _device_environment(home: Path, sdk: Path) -> dict[str, str]:
     }
 
 
-def managed_device(attempt: str, launcher: Path) -> tuple[dict[str, Any], DeviceCustody, dict[str, str]]:
+def _split_attempt_ref(reference: str) -> tuple[str, str | None]:
+    try:
+        bare = uuid.UUID(reference)
+    except (ValueError, TypeError, AttributeError):
+        bare = None
+    if bare is not None and bare.version == 4 and str(bare) == reference:
+        return reference, None
+    match = re.fullmatch(r"([0-9a-f-]{36})\.([A-Za-z0-9_-]{43})", reference)
+    if match is None:
+        raise Error("invalid_managed_identity")
+    attempt, grant = match.groups()
+    if str(uuid.UUID(attempt)) != attempt or uuid.UUID(attempt).version != 4:
+        raise Error("invalid_managed_identity")
+    return attempt, grant
+
+
+def managed_device(attempt_ref: str, launcher: Path) -> tuple[dict[str, Any], DeviceCustody, dict[str, str]]:
+    attempt, grant = _split_attempt_ref(attempt_ref)
     session = os.environ.get("KENT_SESSION_ID", "")
     for selector in (attempt, session):
         try:
@@ -655,7 +801,7 @@ def managed_device(attempt: str, launcher: Path) -> tuple[dict[str, Any], Device
     if read_private(root / ".managed-only") != {"schema": 1}:
         raise Error("invalid_managed_run_root")
     status = inspect_lease(
-        [sys.executable, "-I", "-B", str(client), "status", "--attempt", attempt],
+        [sys.executable, "-I", "-B", str(client), "status", "--attempt", attempt_ref],
         timeout=30.0, env={**_allocator_environment(home), "KENT_SESSION_ID": session},
     )
     lease, endpoint = status.get("lease"), status.get("endpoint")
@@ -669,12 +815,19 @@ def managed_device(attempt: str, launcher: Path) -> tuple[dict[str, Any], Device
         raise Error("invalid_managed_lease_observation")
     run = root / attempt
     binding = _owner_binding(run)
-    if (binding["schema"] != 2 or binding["owner"] != lease["owner"]
-            or binding["binding"]["session"] != session):
+    if (binding["schema"] not in {2, 3} or binding["owner"] != lease["owner"]
+            or binding["schema"] == 3 and grant is None
+            or binding["schema"] == 2 and grant is not None
+            or (binding["schema"] == 3
+                and binding["standalone"]["session"] != session)
+            or (binding["schema"] == 2
+                and binding["binding"]["session"] != session)):
         raise Error("managed_android_binding_unavailable")
     runtime = binding["android_runtime"]
     checkout = Path(runtime["checkout"]).resolve(strict=True)
-    if str(checkout) != runtime["checkout"] or not Path.cwd().is_relative_to(checkout):
+    if (str(checkout) != runtime["checkout"]
+            or binding["schema"] == 3 and Path.cwd().resolve() != checkout
+            or binding["schema"] == 2 and not Path.cwd().is_relative_to(checkout)):
         raise Error("managed_android_checkout_mismatch")
     settings = dict(runtime["settings"])
     _trusted_managed_path(Path(settings["providers"]["mobile-native"]["executable"]),
@@ -688,7 +841,8 @@ def managed_device(attempt: str, launcher: Path) -> tuple[dict[str, Any], Device
     environment = _device_environment(home, Path(sdk_root))
     config = {**settings, "source_root": str(checkout), "lease": binding["config"]}
     custody = DeviceCustody(binding["config"], endpoint["adb_serial"],
-                            managed=(run, binding, (lease["id"], lease["generation"])))
+                            managed=(run, binding, (lease["id"], lease["generation"])),
+                            standalone_grant=grant)
     return config, custody, environment
 
 
