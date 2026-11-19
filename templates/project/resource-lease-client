@@ -1294,15 +1294,15 @@ class HostRouting:
 
     def route(self, workspace):
         matches = []
-        required = {"project", "workspace", "workflow_id", "smoke_node", "config"}
+        required = {"project", "workspace", "config"}
+        workflow = {"workflow_id", "smoke_node"}
+        allowed = required | workflow | {"android_config", "standalone_intents", "standalone_only"}
         for route in self.routes:
             if (not isinstance(route, dict)
                     or not required <= route.keys()
-                    or route.keys() - required - {"android_config", "standalone_intents"}
-                    or not isinstance(route["smoke_node"], str) or not route["smoke_node"]):
+                    or route.keys() - allowed):
                 raise Error("invalid host route")
             native_uuid(route["project"], "project-")
-            native_uuid(route["workflow_id"])
             if "standalone_intents" in route:
                 intents = route["standalone_intents"]
                 if (not isinstance(intents, list) or len(intents) > 32
@@ -1311,6 +1311,21 @@ class HostRouting:
                                for intent in intents)
                         or len(set(intents)) != len(intents)):
                     raise Error("invalid standalone intent registration")
+            if "standalone_only" in route:
+                scope = route["standalone_only"]
+                if (workflow & route.keys()
+                        or not isinstance(scope, dict)
+                        or set(scope) != {"caller_session", "checkout"}
+                        or not route.get("standalone_intents")
+                        or "android_config" not in route):
+                    raise Error("invalid standalone-only route")
+                native_uuid(scope["caller_session"])
+                canonical(scope["checkout"])
+            else:
+                if (not workflow <= route.keys()
+                        or not isinstance(route["smoke_node"], str) or not route["smoke_node"]):
+                    raise Error("invalid Workflow route")
+                native_uuid(route["workflow_id"])
             if canonical(route["workspace"]) == workspace:
                 matches.append(route)
         if len(matches) != 1:
@@ -1332,6 +1347,10 @@ class HostRouting:
             paths = config if other == path else configuration(other)
             if any(existing_overlap(Path(paths[key]), self.root) for key in ("runs_directory", "pool")):
                 raise Error("managed runs overlap retained runs")
+            if (registered is not route
+                    and ("standalone_only" in route or "standalone_only" in registered)
+                    and existing_overlap(Path(config["pool"]), Path(paths["pool"]))):
+                raise Error("standalone-only route requires a dedicated pool")
         return {**config, "runs_directory": str(self.root)}
 
     def android(self, route, checkout, config):
@@ -1619,6 +1638,10 @@ def agent(args, host):
     if native_workspace != workspace or native_checkout != checkout:
         raise Error("native caller checkout mismatch")
     route = host.route(workspace)
+    if "standalone_only" in route and route["standalone_only"] != {
+        "caller_session": caller_session, "checkout": str(checkout),
+    }:
+        raise Error("standalone-only caller or checkout is not enrolled")
     intents = route.get("standalone_intents")
     if not isinstance(intents, list) or args.profile not in intents:
         raise Error("standalone intent is not enabled for this route")
@@ -1866,6 +1889,8 @@ def managed(args, host):
         elif args.action == "begin":
             task = native_uuid(args.task, "task-")
             route = host.route(workspace)
+            if "standalone_only" in route:
+                raise Error("standalone-only route does not admit Workflow attempts")
             owner = {"project": route["project"], "task": task, "session": session}
             host.active(owner, route=route)
             config = host.config(route)
