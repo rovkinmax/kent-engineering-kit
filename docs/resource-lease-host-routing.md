@@ -1,5 +1,55 @@
 # Managed interactive Android lease attempts
 
+## Foreground commands with host-selected configuration
+
+From a registered physical primary checkout or one of its verified Git
+linked worktrees:
+
+```text
+resource-lease-client run --profile INTENT -- COMMAND [ARG...]
+```
+
+Use the same owner-private OS-account registry described below. A regular
+Workflow route can opt in with `foreground_intents`, a nonempty, unique
+list of enabled profile names. A foreground-only row has exactly
+`project`, `workspace`, `config` and `foreground_intents`; it admits
+neither Workflow nor standalone attempts. The field is not supported
+on standalone-only routes. Both top-level Kent coordinates remain
+required, but foreground admission does not query native Kent. The
+profile must also be defined by the selected config. An unregistered,
+ambiguous, nested, or non-enabled checkout/profile fails before
+acquisition, with no fallback to another pool or `RESOURCE_LEASE_CONFIG`.
+
+The configured allocator and pool, and the config's normal private
+`runs_directory`, must be canonical trusted host paths. The foreground
+runs directory must not overlap a checkout, allocator pool, or managed
+runs root. It can also contain the existing explicit command records.
+The client pins the selected profile and config before acquiring once
+through the existing foreground lifecycle. The allocator uses the OS
+account home, system `PATH`, and `/`. The child keeps its working
+directory and receives both `ANDROID_SERIAL` and `UI_TEST_DEVICE_SERIAL`
+from the acquired endpoint; inherited conflicts are refused. The child
+uses the local loopback ADB server at `127.0.0.1:5037` without ambient
+transport redirects or an exposed run directory. Only later enroll
+pools qualified for that same transport.
+
+The host-selected form does not take `--owner` or `--env`. Explicit
+operator `run --config PATH --profile INTENT --owner OWNER [--env ...]`
+and `start --config` remain unchanged. Host-selected foreground records
+cannot be reopened with legacy `check`, `finish` or `_serve`. There is
+no new public recovery command.
+
+The caller must run a synchronous command that joins its work and
+finalizers before returning. A forwarded nonzero exit or allocator
+terminal result does not establish that a detached Gradle executor
+stopped after losing its client. Do not enable a live pool for this
+consumer until abnormal executor loss is qualified separately. Before
+enrollment update or exclude older readers of the shared registry.
+Before rolling back a compatible reader, disable foreground admission
+by removing the foreground-only row or removing the opt-in from the
+regular row, and retain the reader and receipts until known settled.
+These source contracts do not authorize installation or enrollment.
+
 ## Direct standalone agent lease
 
 An owner-private host route may optionally add `standalone_intents`, a closed
@@ -117,7 +167,8 @@ contains `schema: 1`, canonical absolute `kent_executable` and
 (`project-UUID`), `workspace` (the canonical primary path), and `config`
 (a canonical owner-private host lease config). A Workflow route also has
 `workflow_id` (UUID) and `smoke_node` (the exact, unique display name in the
-authorized Workflow); the standalone-only shape is described above.
+authorized Workflow); the foreground-only and standalone-only shapes are
+described above.
 Qualify the Smoke node's uniqueness when registering it. Executables and settings
 must not come from a checkout, symlink or group/world-writable ancestry.
 
@@ -180,8 +231,8 @@ paths, including helper interruption. This does not prevent the allocator
 from taking its independent TTL path if the helper cannot renew; expiry
 alone is not verified cleanup or a safe handoff.
 
-Do not migrate existing explicit consumers, foreground `run`, or Appsome
-in this source slice. Before rollout, qualify the actual bundle, safe
+Do not migrate existing explicit consumers or reuse managed attempts for
+foreground `run`. Before managed rollout, qualify the actual bundle, safe
 host disposition after helper loss, evidence export/readback, and the
 release Smoke consumer. To roll back, stop new managed admission and retain
 a compatible reader while any managed records or export obligations
