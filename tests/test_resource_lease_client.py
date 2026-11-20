@@ -1513,6 +1513,202 @@ with open({str(self.allocator_log)!r}, "a") as log:
             capture_output=True, text=True, timeout=25,
         )
 
+    def foreground_fixture(self):
+        self.foreground_pool = self.home / "foreground-pool"
+        self.foreground_pool.mkdir(mode=0o700)
+        self.foreground_runs = self.home / "foreground-runs"
+        config = client.read(self.config)
+        config.update(
+            pool=str(self.foreground_pool), runs_directory=str(self.foreground_runs),
+            profiles={**config["profiles"], "ui.persistent": "persistent"},
+        )
+        client.write(self.config, config)
+        self.foreground_route = {
+            "project": self.project, "workspace": str(self.workspace), "config": str(self.config),
+            "foreground_intents": ["ui.clean"],
+        }
+        self.set_foreground_routes(self.foreground_route)
+        self.foreground_child = self.home / "child-observation"
+        self.environment["RESOURCE_LEASE_CONFIG"] = str(self.fixture.config)
+        for variable in ("ANDROID_SERIAL", "UI_TEST_DEVICE_SERIAL"):
+            self.environment.pop(variable, None)
+
+    def set_foreground_routes(self, *routes):
+        client.write(self.registration, {**self.registry, "routes": list(routes)})
+
+    def foreground_cli(self, *args, cwd=None):
+        return subprocess.run(
+            [sys.executable, str(self.script), *args],
+            cwd=cwd or self.workspace, env=self.environment, capture_output=True, text=True, timeout=20,
+        )
+
+    def foreground_run(self, code=None, *, cwd=None, profile="ui.clean", options=()):
+        return self.foreground_cli(
+            "run", "--profile", profile, *options, "--", sys.executable, "-c",
+            code or f"from pathlib import Path; Path({str(self.foreground_child)!r}).touch()", cwd=cwd,
+        )
+
+    def assert_no_foreground_effect(self, result):
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        for path in (self.foreground_runs, self.foreground_child, self.allocator_log):
+            self.assertFalse(path.exists(), path)
+
+    def test_foreground_runs_one_lease_and_releases_after_success_and_test_failure(self):
+        self.foreground_fixture()
+        transports = ("RESOURCE_LEASE_RUN_DIRECTORY", "ANDROID_ADB_SERVER_ADDRESS", "ANDROID_ADB_SERVER_PORT",
+                      "ADB_SERVER_ADDRESS", "ADB_SERVER_PORT")
+        self.environment.update(dict.fromkeys(transports, "caller-override"),
+                                ADB_SERVER_SOCKET="tcp:untrusted:1234", BUILD_TOKEN="fixture-token")
+        calls = self.foreground_pool / "calls"
+        # A regular Workflow route can also opt into foreground admission.
+        self.set_foreground_routes({
+            **self.registry["routes"][0], "foreground_intents": ["ui.clean", "ui.persistent"],
+        })
+        cases = ((self.workspace, "ui.clean", "clean", 0), (self.checkout, "ui.persistent", "persistent", 23))
+        for checkout, profile, capability, result_code in cases:
+            with self.subTest(checkout=checkout, result=result_code):
+                program = f"""\
+import os, sys, time
+from pathlib import Path
+assert os.getcwd() == {str(checkout)!r}
+assert os.environ["ANDROID_SERIAL"] == os.environ["UI_TEST_DEVICE_SERIAL"] == "emulator-5574"
+assert os.environ["ADB_SERVER_SOCKET"] == "tcp:127.0.0.1:5037"
+assert os.environ["BUILD_TOKEN"] == "fixture-token"
+assert not ({set(transports)!r} & os.environ.keys())
+time.sleep(0.75)
+assert Path({str(calls)!r}).read_text().splitlines()[-1] != "release"
+with Path({str(self.foreground_child)!r}).open("a") as log:
+    print("finalizers-completed", file=log)
+sys.exit({result_code})
+"""
+                result = self.foreground_run(program, cwd=checkout, profile=profile)
+                self.assertEqual(result.returncode, result_code, result.stderr)
+                self.assertNotIn(str(self.foreground_runs), result.stderr)
+                actions = calls.read_text().splitlines()
+                self.assertEqual(actions.count("acquire"), 1)
+                self.assertIn("renew", actions)
+                self.assertEqual(actions.count("release"), 1)
+                self.assertEqual(actions[-1], "release")
+                records = [
+                    client.read(path / "binding.json") for path in self.foreground_runs.iterdir()
+                    if path.is_dir()
+                ]
+                self.assertIn((profile, capability), [(r["profile"], r["capability"]) for r in records])
+                calls.unlink()
+        self.assertEqual(self.foreground_child.read_text().splitlines(), ["finalizers-completed"] * 2)
+        expected_env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}
+        for event in self.allocator_log.read_text().splitlines():
+            _, cwd, environment = json.loads(event)
+            # The system/Python bootstrap may set these independently of the caller's environment.
+            for runtime_key in ("__CF_USER_TEXT_ENCODING", "LC_CTYPE"):
+                environment.pop(runtime_key, None)
+            self.assertEqual((cwd, environment), ("/", expected_env))
+        self.assertFalse(self.root.exists())
+        self.assertFalse((self.home / "native-run-invoked").exists())
+
+    def test_foreground_conflicting_serial_never_reaches_the_child(self):
+        self.foreground_fixture()
+        self.environment["UI_TEST_DEVICE_SERIAL"] = "emulator-1234"
+        result = self.foreground_run()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("conflicting inherited UI_TEST_DEVICE_SERIAL", result.stderr)
+        self.assertFalse(self.foreground_child.exists())
+        calls = (self.foreground_pool / "calls").read_text().splitlines()
+        self.assertEqual(calls, ["acquire", "release"])
+
+    def test_foreground_requires_a_real_checkout_at_the_registered_path(self):
+        self.foreground_fixture()
+        damaged = self.home / "damaged"
+        (damaged / ".git").mkdir(parents=True)
+        (damaged / ".git/HEAD").touch()
+        self.set_foreground_routes({**self.foreground_route, "workspace": str(damaged)})
+        self.environment.update(GIT_DIR=str(self.workspace / ".git"), GIT_WORK_TREE=str(damaged))
+        result = self.foreground_run(cwd=damaged)
+        self.assertIn("not in a physical Git checkout", result.stderr)
+        self.assert_no_foreground_effect(result)
+
+    def test_foreground_refuses_invalid_routes_and_options_before_effects(self):
+        self.foreground_fixture()
+        invalid = (
+            [],
+            [self.registry["routes"][0]],
+            [self.standalone_only_route()],
+            [{**self.standalone_only_route(), "foreground_intents": ["ui.clean"]}],
+            [{**self.foreground_route, "foreground_intents": []}],
+            [{**self.foreground_route, "foreground_intents": ["ui.clean", "ui.clean"]}],
+            [{**self.foreground_route, "standalone_intents": ["ui.clean"]}],
+            [self.foreground_route, self.foreground_route],
+        )
+        for routes in invalid:
+            with self.subTest(routes=routes):
+                self.set_foreground_routes(*routes)
+                self.assert_no_foreground_effect(self.foreground_run())
+        self.set_foreground_routes(self.foreground_route)
+        nested = self.checkout / "nested"
+        nested.mkdir()
+        (nested / ".git").symlink_to(nested / "absent-gitdir")
+        for cwd in (self.home, nested):
+            self.assert_no_foreground_effect(self.foreground_run(cwd=cwd))
+        self.assert_no_foreground_effect(self.foreground_run(profile="ui.persistent"))
+        for option in ("--owner", "--env"):
+            self.assert_no_foreground_effect(self.foreground_run(options=[option, ""]))
+        self.assertNotEqual(self.agent_command().returncode, 0)
+        self.assertNotEqual(self.invoke("begin").returncode, 0)
+        self.assertFalse(self.allocator_log.exists())
+        self.assertFalse((self.home / "native-run-invoked").exists())
+
+    def test_foreground_refuses_unsafe_record_roots_without_writing_them(self):
+        self.foreground_fixture()
+        alias = self.home / "pool-alias"
+        alias.symlink_to(self.foreground_pool)
+        roots = (self.workspace / "runs", self.foreground_pool / "runs",
+                 alias / "runs", self.root / "runs")
+        config = client.read(self.config)
+        for root in roots:
+            with self.subTest(root=root):
+                client.write(self.config, {**config, "runs_directory": str(root)})
+                self.assert_no_foreground_effect(self.foreground_run())
+                self.assertFalse(root.exists())
+        self.assertEqual(list(self.foreground_pool.iterdir()), [])
+
+    def test_foreground_and_explicit_share_runs_but_cannot_reopen_foreground(self):
+        self.foreground_fixture()
+
+        def explicit():
+            result = self.foreground_cli(
+                "run", "--config", str(self.config), "--profile", "ui.clean", "--owner", "operator",
+                "--", sys.executable, "-c", "pass",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return Path(json.loads(result.stderr)["run_directory"])
+
+        before = explicit()
+        result = self.foreground_run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = explicit()
+        self.assertNotEqual(before, after)
+        run, = (p for p in self.foreground_runs.iterdir() if p.is_dir() and p not in {before, after})
+        binding = client.read(run / "binding.json")
+        self.assertEqual(client.native_uuid(run.name), run.name)
+        self.assertEqual(binding["owner"], f"foreground:{run.name}")
+        self.assertEqual(binding["schema"], 4)
+        self.assertIs(binding["foreground"], True)
+        self.assertIsNone(binding["binding"])
+        self.assertFalse((self.foreground_runs / ".managed-only").exists())
+        for directory in (before, after):
+            self.assertEqual(client.read(directory / "binding.json")["schema"], 1)
+        calls = self.allocator_log.read_bytes()
+        for directory in (run, self.foreground_runs / "moved"):
+            if directory != run:
+                run.rename(directory)
+            records = {p.name: p.read_bytes() for p in directory.iterdir()}
+            for action in ("check", "finish", "_serve"):
+                denied = self.foreground_cli(action, "--run-dir", str(directory))
+                self.assertIn("foreground command records cannot be reopened", denied.stderr)
+                self.assertEqual(denied.returncode, 1)
+            self.assertEqual({p.name: p.read_bytes() for p in directory.iterdir()}, records)
+        self.assertEqual(self.allocator_log.read_bytes(), calls)
+
     def test_standalone_only_route_denies_workflow_before_task_observation(self):
         route = self.standalone_only_route()
         task_probe = self.home / "task-probe"

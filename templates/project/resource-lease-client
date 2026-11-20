@@ -279,13 +279,13 @@ def absolute(value, label):
     return Path(value).resolve()
 
 
-def configuration(path):
+def configuration(path, *, canonical_paths=False):
     value = read(Path(path))
     if (set(value) != {"schema", "executable", "pool", "runs_directory", "profiles"}
             or type(value["schema"]) is not int or value["schema"] != 1):
         raise Error("unsupported resource client configuration")
     for key in ("executable", "pool", "runs_directory"):
-        value[key] = str(absolute(value[key], key))
+        value[key] = str(canonical(value[key]) if canonical_paths else absolute(value[key], key))
     if not os.access(value["executable"], os.X_OK):
         raise Error("configured resource-lease executable is unavailable")
     profiles = value["profiles"]
@@ -379,6 +379,13 @@ def validate_binding(value, run: Path) -> dict:
     android = value.get("android_runtime")
     standalone = value.get("standalone")
     schema = 1
+    if "foreground" in value:
+        schema = 4
+        required.add("foreground")
+        if (value["foreground"] is not True or binding is not None
+                or "standalone" in value or "android_runtime" in value
+                or value.get("owner") != f"foreground:{native_uuid(run.name)}"):
+            raise Error("invalid foreground binding")
     if "standalone" in value:
         schema = 3
         required.add("standalone")
@@ -482,7 +489,7 @@ class Lease:
         elif action in {"cancel", "release"}:
             command += ["--wait", str(CLEANUP_TIMEOUT)]
         options = {}
-        if managed_run(self.run):
+        if self.metadata.get("foreground") is True or managed_run(self.run):
             options = {"cwd": "/", "env": {"HOME": str(account_home()),
                                            "PATH": "/usr/bin:/bin"}}
         if self.metadata.get("standalone") is not None and action in {"acquire", "renew"}:
@@ -679,7 +686,7 @@ def prune(root):
             continue
 
 
-def prepare(args, binding=None, *, managed_config=None, android_runtime=None,
+def prepare(args, binding=None, *, managed_config=None, foreground_config=None, android_runtime=None,
             standalone=None, grant_digest=None):
     if android_runtime is not None and (
             managed_config is None or binding is None and standalone is None):
@@ -689,22 +696,33 @@ def prepare(args, binding=None, *, managed_config=None, android_runtime=None,
             or not isinstance(grant_digest, str)
             or re.fullmatch(r"[0-9a-f]{64}", grant_digest) is None):
         raise Error("invalid standalone attempt preparation")
-    config = configuration(args.config) if managed_config is None else managed_config
+    foreground = foreground_config is not None
+    if foreground and (binding is not None or managed_config is not None):
+        raise Error("foreground configuration cannot bind a managed owner")
+    config = foreground_config if foreground else (
+        configuration(args.config) if managed_config is None else managed_config
+    )
     if args.profile not in config["profiles"]:
         raise Error("requested profile is not configured")
     root = Path(config["runs_directory"])
     mkdir(root)
-    run = absolute(args.run_dir, "run directory") if getattr(args, "run_dir", None) else root / uuid.uuid4().hex
+    if foreground:
+        run = root / str(uuid.uuid4())
+    else:
+        run = absolute(args.run_dir, "run directory") if getattr(args, "run_dir", None) else root / uuid.uuid4().hex
     if run.parent != root or run.name == "admission.lock":
         raise Error("run directory must be a non-reserved direct child of runs_directory")
-    schema = 3 if standalone is not None else 2 if android_runtime is not None else 1
+    schema = 4 if foreground else 3 if standalone is not None else 2 if android_runtime is not None else 1
     metadata = {"schema": schema, "config": config, "profile": args.profile,
                 "custody_marker_protocol": CUSTODY_MARKER_PROTOCOL,
                 "capability": config["profiles"][args.profile],
-                "owner": (f"standalone:{standalone['attempt']}" if standalone is not None
+                "owner": (f"foreground:{run.name}" if foreground
+                          else f"standalone:{standalone['attempt']}" if standalone is not None
                           else args.owner if binding is None
                           else f"smoke:{binding['task']}:{binding['session']}"),
                 "binding": binding}
+    if foreground:
+        metadata["foreground"] = True
     if standalone is not None:
         metadata["standalone"] = standalone
     if android_runtime is not None:
@@ -712,6 +730,8 @@ def prepare(args, binding=None, *, managed_config=None, android_runtime=None,
     created = False
     with admission_lock(root):
         marker = root / ".managed-only"
+        if foreground and os.path.lexists(marker):
+            raise Error("run root is reserved for managed attempts")
         reserved = managed_config is not None or same_managed_root(root)
         if reserved and os.path.lexists(marker):
             if read(marker) != {"schema": 1} or managed_config is None:
@@ -735,6 +755,8 @@ def prepare(args, binding=None, *, managed_config=None, android_runtime=None,
             run.mkdir(mode=0o700)
             created = True
         except FileExistsError:
+            if foreground:
+                raise Error("foreground run identifier is already in use") from None
             private(run, directory=True)
             if read(run / "binding.json") != metadata:
                 raise Error("existing run has a different immutable binding")
@@ -775,6 +797,8 @@ def load(run):
     private(run, directory=True)
     run = run.resolve()
     metadata = read(run / "binding.json")
+    if metadata.get("foreground") is True or metadata.get("schema") == 4:
+        raise Error("foreground command records cannot be reopened")
     validate_binding(metadata, run)
     validate_status(read(run / "status.json"), run)
     _marker_present(run)
@@ -827,7 +851,26 @@ def run_command(args):
     command = args.command[1:] if args.command and args.command[0] == "--" else args.command
     if not command:
         raise Error("a command is required")
-    lease = prepare(args)
+    foreground = args.config is None
+    config = None
+    if foreground:
+        if args.owner is not None or args.env:
+            raise Error("host-selected run does not accept --owner or --env")
+        host = HostRouting()
+        route = host.route(physical_foreground_workspace())
+        if args.profile not in route.get("foreground_intents", ()):
+            raise Error("foreground profile is not enabled for this checkout")
+        config = host.config(route, foreground=True)
+    try:
+        lease = prepare(args, foreground_config=config)
+    except OSError:
+        if not foreground:
+            raise
+        raise Error("foreground lease state could not be prepared") from None
+
+    def diagnostic(error):
+        return str(error).replace(str(lease.run), "<foreground run>") if foreground else str(error)
+
     child = None
     acquired = False
     failure = None
@@ -838,17 +881,28 @@ def run_command(args):
             value = renewal.acquire()
             acquired = True
             environment = os.environ.copy()
-            for mapping in args.env:
+            mappings = (
+                ("ANDROID_SERIAL=adb_serial", "UI_TEST_DEVICE_SERIAL=adb_serial") if foreground else args.env
+            )
+            for mapping in mappings:
                 variable, separator, key = mapping.partition("=")
                 if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable):
                     raise Error("expected --env VARIABLE=endpoint_key")
                 endpoint = value["endpoint"].get(key)
                 if not isinstance(endpoint, str) or not endpoint:
                     raise Error("required endpoint field is unavailable")
+                if foreground and not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", endpoint):
+                    raise Error("leased Android serial is invalid")
                 if variable in environment and environment[variable] != endpoint:
                     raise Error(f"conflicting inherited {variable}")
                 environment[variable] = endpoint
-            environment["RESOURCE_LEASE_RUN_DIRECTORY"] = str(lease.run)
+            if foreground:
+                for key in ("RESOURCE_LEASE_RUN_DIRECTORY", "ANDROID_ADB_SERVER_ADDRESS", "ANDROID_ADB_SERVER_PORT",
+                            "ADB_SERVER_ADDRESS", "ADB_SERVER_PORT"):
+                    environment.pop(key, None)
+                environment["ADB_SERVER_SOCKET"] = "tcp:127.0.0.1:5037"
+            else:
+                environment["RESOURCE_LEASE_RUN_DIRECTORY"] = str(lease.run)
             # Write ahead of launching: even failed uncertainty-marker/status
             # writes must leave retry/pruning unable to claim a confirmed stop.
             lease.record("active", lease=value, parent_command_stop="pending")
@@ -860,7 +914,7 @@ def run_command(args):
             active(lease.cli("inspect"))
             result = child.returncode
         except (Error, OSError, ValueError, InterruptedError) as error:
-            failure = str(error)
+            failure = diagnostic(error)
             print(f"resource-lease-client: {failure}", file=sys.stderr)
         finally:
             if child is None:
@@ -903,16 +957,17 @@ def run_command(args):
                 if isinstance(error, FinishStatusUncertain):
                     cleanup_error, cleanup_value = str(error), error.lease
                 else:
-                    cleanup_error, cleanup_value = f"cleanup failed: {error}", renewal.value
+                    cleanup_error, cleanup_value = f"cleanup failed: {diagnostic(error)}", renewal.value
                 failure = f"{failure}; {cleanup_error}" if failure else cleanup_error
                 try:
                     lease.record("failed", lease=cleanup_value, error=failure)
                 except (Error, OSError, ValueError):
                     failure += "; cleanup status persistence failed"
                 print(f"resource-lease-client: {failure}", file=sys.stderr)
-        print(json.dumps({"command_exit": child.returncode if child else None,
-                          "consumer_error": failure, "run_directory": str(lease.run)}),
-              file=sys.stderr)
+        summary = {"command_exit": child.returncode if child else None, "consumer_error": failure}
+        if not foreground:
+            summary["run_directory"] = str(lease.run)
+        print(json.dumps(summary), file=sys.stderr)
         return result if failure is None else 1
 
 
@@ -1296,13 +1351,22 @@ class HostRouting:
         matches = []
         required = {"project", "workspace", "config"}
         workflow = {"workflow_id", "smoke_node"}
-        allowed = required | workflow | {"android_config", "standalone_intents", "standalone_only"}
+        foreground_only = required | {"foreground_intents"}
+        allowed = foreground_only | workflow | {"android_config", "standalone_intents", "standalone_only"}
         for route in self.routes:
             if (not isinstance(route, dict)
                     or not required <= route.keys()
                     or route.keys() - allowed):
                 raise Error("invalid host route")
             native_uuid(route["project"], "project-")
+            if "foreground_intents" in route:
+                intents = route["foreground_intents"]
+                if ("standalone_only" in route or not isinstance(intents, list) or not 0 < len(intents) <= 32
+                        or any(not isinstance(intent, str)
+                               or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", intent) is None
+                               for intent in intents)
+                        or len(set(intents)) != len(intents)):
+                    raise Error("invalid foreground intent registration")
             if "standalone_intents" in route:
                 intents = route["standalone_intents"]
                 if (not isinstance(intents, list) or len(intents) > 32
@@ -1321,7 +1385,7 @@ class HostRouting:
                     raise Error("invalid standalone-only route")
                 native_uuid(scope["caller_session"])
                 canonical(scope["checkout"])
-            else:
+            elif route.keys() != foreground_only:
                 if (not workflow <= route.keys()
                         or not isinstance(route["smoke_node"], str) or not route["smoke_node"]):
                     raise Error("invalid Workflow route")
@@ -1332,14 +1396,27 @@ class HostRouting:
             raise Error("host route is missing or ambiguous")
         return matches[0]
 
-    def config(self, route):
+    def config(self, route, *, foreground=False):
         path = trusted_path(canonical(route["config"]))
         if checkout_local(path):
             raise Error("host config cannot live in a checkout")
-        config = configuration(path)
+        config = configuration(path, canonical_paths=foreground)
         executable = trusted_path(Path(config["executable"]))
         if checkout_local(executable):
             raise Error("allocator executable cannot live in a checkout")
+        if foreground:
+            pool = trusted_path(Path(config["pool"]))
+            runs = Path(config["runs_directory"])
+            ancestor = runs
+            while not os.path.lexists(ancestor):
+                ancestor = ancestor.parent
+            trusted_path(ancestor)
+            if (not executable.is_file() or not pool.is_dir() or not ancestor.is_dir()
+                    or checkout_local(runs) or os.path.lexists(runs / ".git")
+                    or os.path.lexists(runs / ".managed-only")):
+                raise Error("unsafe foreground allocator or run storage")
+            if ancestor == runs:
+                private(runs, directory=True)
         for registered in self.routes:
             other = trusted_path(canonical(registered["config"]))
             if checkout_local(other):
@@ -1347,11 +1424,15 @@ class HostRouting:
             paths = config if other == path else configuration(other)
             if any(existing_overlap(Path(paths[key]), self.root) for key in ("runs_directory", "pool")):
                 raise Error("managed runs overlap retained runs")
+            if foreground and any(existing_overlap(runs, target) for target in (
+                    Path(paths["pool"]), canonical(registered["workspace"]),
+            )):
+                raise Error("foreground runs overlap a workspace or allocator pool")
             if (registered is not route
                     and ("standalone_only" in route or "standalone_only" in registered)
                     and existing_overlap(Path(config["pool"]), Path(paths["pool"]))):
                 raise Error("standalone-only route requires a dedicated pool")
-        return {**config, "runs_directory": str(self.root)}
+        return config if foreground else {**config, "runs_directory": str(self.root)}
 
     def android(self, route, checkout, config):
         if "android_config" not in route:
@@ -1387,11 +1468,39 @@ class HostRouting:
             raise Error("standalone native checkout changed")
 
 
-def physical_linked_checkout():
+def physical_git_root():
     cwd = Path.cwd().resolve(strict=True)
     checkout = cwd
     while checkout != checkout.parent and not os.path.lexists(checkout / ".git"):
         checkout = checkout.parent
+    return cwd, checkout
+
+
+def physical_foreground_workspace():
+    _, checkout = physical_git_root()
+    marker = checkout / ".git"
+    try:
+        observation = subprocess.run(
+            ["/usr/bin/git", "-C", str(checkout), "rev-parse",
+             "--show-toplevel", "--absolute-git-dir", "--is-inside-work-tree"],
+            env={"HOME": str(account_home()), "PATH": "/usr/bin:/bin",
+                 "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
+            cwd="/", stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=CLI_TIMEOUT,
+        )
+        top, gitdir, inside = observation.stdout.splitlines()
+        if observation.returncode != 0 or top != str(checkout) or inside != "true":
+            raise Error("unexpected Git checkout observation")
+        if marker.is_dir() and not marker.is_symlink():
+            if gitdir != str(marker) or not trusted_path(marker / "HEAD").is_file():
+                raise Error("unexpected primary Git directory")
+            return checkout
+        return physical_linked_checkout()[0]
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise Error("foreground command is not in a physical Git checkout") from None
+
+
+def physical_linked_checkout():
+    cwd, checkout = physical_git_root()
     marker = checkout / ".git"
     try:
         info = marker.lstat()
@@ -1891,6 +2000,8 @@ def managed(args, host):
             route = host.route(workspace)
             if "standalone_only" in route:
                 raise Error("standalone-only route does not admit Workflow attempts")
+            if "workflow_id" not in route:
+                raise Error("foreground-only route does not admit Workflow attempts")
             owner = {"project": route["project"], "task": task, "session": session}
             host.active(owner, route=route)
             config = host.config(route)
@@ -1930,10 +2041,10 @@ def main():
     commands = parser.add_subparsers(dest="action", required=True)
     for name in ("run", "start"):
         command = commands.add_parser(name)
-        command.add_argument("--config", required=True)
+        command.add_argument("--config", required=(name == "start"))
         command.add_argument("--profile", required=True)
         if name == "run":
-            command.add_argument("--owner", required=True)
+            command.add_argument("--owner")
             command.add_argument("--env", action="append", default=[])
             command.add_argument("command", nargs=argparse.REMAINDER)
         else:
@@ -1952,6 +2063,8 @@ def main():
             command.add_argument("--task")
             command.add_argument("--profile", required=True)
     args = parser.parse_args()
+    if args.action == "run" and args.config is not None and args.owner is None:
+        parser.error("run --config requires --owner")
     for number in (signal.SIGTERM, signal.SIGINT):
         signal.signal(number, interrupted)
     try:
