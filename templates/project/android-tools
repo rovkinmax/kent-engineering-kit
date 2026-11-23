@@ -17,7 +17,7 @@ PROTOCOL = 1
 # Exact source bundle: verify and execute the same bytes before any dispatch.
 BUNDLE_HASHES = {
     "android_tools_native.py": "fe693efb1d6981945e37613c54e801466a195034cd5f2277981d4ca173dcab2e",
-    "android_tools_evidence.py": "2f7cf4334f0b31a279d246922e56da6595619d3e7fcc70daf91157d6ef637dae",
+    "android_tools_evidence.py": "b04ce5c814650f0a46fb766ba5564bce3c1aa54f4c7318ac60c1c5caa22b4c32",
     "android_tools_custody.py": "9d6bc99bc1292ffe06fdf8f41e5adfaf06cc6aae22a19709ac457168a89b6011",
 }
 LIMIT = 262144

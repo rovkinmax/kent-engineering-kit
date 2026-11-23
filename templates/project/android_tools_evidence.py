@@ -42,6 +42,7 @@ MAX_RUN_TREE_ENTRIES = 100_000
 MAX_EVIDENCE_METADATA_BYTES = 64 * 1024
 RESERVATION_METADATA_BYTES = MAX_EVIDENCE_METADATA_BYTES + MAX_EXPORT_LOG_BYTES
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_NATIVE_TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _PACKAGE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+\Z")
@@ -1351,28 +1352,45 @@ def _binding(value: Mapping[str, Any], interface: str) -> tuple[dict[str, str], 
         }
         return identity, {"project_root": str(root), "project_key": project_key, **identity}
     if interface == "workflow":
-        required = {"workspace_path", "project_path", "project_uid", "task_key", "task_uid",
-                    "task_binding_sha256"}
-        if set(value) != required:
+        required = {
+            "workspace_path", "project_path", "project_uid", "task_key", "task_uid",
+            "task_binding_sha256",
+        }
+        has_native_task_id = "native_task_id" in value
+        if set(value) != required | ({"native_task_id"} if has_native_task_id else set()):
             raise BindingError("workflow binding is incomplete")
+        if has_native_task_id:
+            native_task_id = value["native_task_id"]
+            if (not isinstance(native_task_id, str)
+                    or not _NATIVE_TASK_ID.fullmatch(native_task_id)):
+                raise BindingError("invalid native task id")
         identity = {
             "project_uid": _token(value["project_uid"], "project uid"),
             "task_key": _token(value["task_key"], "task key"),
             "task_uid": _token(value["task_uid"], "task uid"),
             "task_binding_sha256": _digest(value["task_binding_sha256"], "task binding hash"),
         }
-        return identity, {
+        args = {
             "workspace_path": str(_path(value["workspace_path"], "workspace")),
             "project_path": str(_path(value["project_path"], "project path")), **identity,
         }
+        if has_native_task_id:
+            args["native_task_id"] = native_task_id
+        return identity, args
     raise BindingError("unsupported memory interface")
 
 
 def _helper(value: str | os.PathLike[str], interface: str) -> Path:
     helper = _path(value, "project-memory helper")
-    expected = "project-memory" if interface == "standalone" else "workflow-project-memory"
-    if helper.name != expected:
-        raise BindingError("helper does not match memory interface")
+    if interface == "standalone":
+        if helper.name != "project-memory":
+            raise BindingError("helper does not match memory interface")
+    elif interface == "workflow":
+        ordinary_r2 = Path.home() / ".kent/ordinary-r2/bin/kent-project-memory"
+        if helper != ordinary_r2 and helper.name != "workflow-project-memory":
+            raise BindingError("helper does not match memory interface")
+    else:
+        raise BindingError("unsupported memory interface")
     info = helper.lstat()
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
         raise BindingError("project-memory helper is not a regular file")
@@ -1380,7 +1398,8 @@ def _helper(value: str | os.PathLike[str], interface: str) -> Path:
 
 
 def _call(helper: Path, interface: str, request: bytes,
-          standalone_args: list[str] | None = None) -> tuple[int | None, bytes]:
+          standalone_args: list[str] | None = None, *,
+          max_output_bytes: int = MAX_HELPER_OUTPUT_BYTES) -> tuple[int | None, bytes]:
     command = [sys.executable, str(helper)]
     if interface == "workflow":
         command.append("workflow")
@@ -1439,15 +1458,13 @@ def _call(helper: Path, interface: str, request: bytes,
                         selector.unregister(input_fd)
                         child.stdin.close()
                 else:
-                    block = os.read(
-                        output_fd, min(65536, MAX_HELPER_OUTPUT_BYTES + 1 - len(output)),
-                    )
+                    block = os.read(output_fd, min(65536, max_output_bytes + 1 - len(output)))
                     if not block:
                         selector.unregister(output_fd)
                         child.stdout.close()
                     else:
                         output.extend(block)
-                        if len(output) > MAX_HELPER_OUTPUT_BYTES:
+                        if len(output) > max_output_bytes:
                             stop_child()
                             return child.returncode, b""
         try:
@@ -1477,8 +1494,13 @@ def _workflow_result(raw: bytes) -> dict[str, Any]:
 
 
 def _confirm_workflow(helper: Path, args: Mapping[str, str]) -> tuple[bool, str]:
-    request = _json({"schema": "r2-workflow-request-v1", "operation": "resolve-task",
-                     "workspace_path": args["workspace_path"]}) + b"\n"
+    request_value = {
+        "schema": "r2-workflow-request-v1", "operation": "resolve-task",
+        "workspace_path": args["workspace_path"],
+    }
+    if "native_task_id" in args:
+        request_value["task_locator"] = args["native_task_id"]
+    request = _json(request_value) + b"\n"
     code, output = _call(helper, "workflow", request)
     if code != 0:
         return False, "binding_unavailable"
@@ -1499,6 +1521,45 @@ def _confirm_workflow(helper: Path, args: Mapping[str, str]) -> tuple[bool, str]
     return True, ""
 
 
+def _attachment_path(args: Mapping[str, str], digest: str) -> str:
+    root = (Path(args["project_root"]) / args["project_key"]
+            if "project_root" in args else Path(args["project_path"]))
+    return str(root / "tasks" / args["task_key"] / "artifacts/attachments/objects" / digest)
+
+
+def _workflow_artifact_receipt(output: bytes, *, operation: str, args: Mapping[str, str],
+                               digest: str, expected_size: int | None
+                               ) -> tuple[bytes | None, str]:
+    header, separator, body = output.partition(b"\n")
+    if (not separator or len(header) > MAX_HELPER_OUTPUT_BYTES
+            or (expected_size is not None and body)
+            or len(body) > MAX_ARTIFACT_BYTES):
+        return None, "invalid_receipt"
+    try:
+        receipt = json.loads(header)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "invalid_receipt"
+    if (not isinstance(receipt, dict)
+            or set(receipt) != {
+                "schema", "operation", "object_sha256", "byte_size", "object_path",
+            }
+            or receipt.get("schema") != "r2-artifact-response-v1"
+            or receipt.get("operation") != operation
+            or receipt.get("object_sha256") != digest
+            or type(receipt.get("byte_size")) is not int
+            or receipt.get("object_path") != _attachment_path(args, digest)):
+        return None, "receipt_mismatch"
+    if operation == "artifact-write":
+        if expected_size is None or receipt["byte_size"] != expected_size:
+            return None, "receipt_mismatch"
+        return b"", ""
+    if (operation != "artifact-read" or expected_size is not None
+            or receipt["byte_size"] != len(body)
+            or _sha(body) != digest):
+        return None, "readback_mismatch"
+    return body, ""
+
+
 def _write_attachment(helper: Path, interface: str, args: Mapping[str, str],
                       content: bytes) -> tuple[bool, str]:
     digest = _sha(content)
@@ -1513,6 +1574,8 @@ def _write_attachment(helper: Path, interface: str, args: Mapping[str, str],
         payload = _json(request) + b"\n" + content
     else:
         request["workspace_path"] = args["workspace_path"]
+        if "native_task_id" in args:
+            request["task_locator"] = args["native_task_id"]
         standalone_args = None
         payload = _json(request) + b"\n" + content
     code, output = _call(helper, interface, payload, standalone_args)
@@ -1520,6 +1583,12 @@ def _write_attachment(helper: Path, interface: str, args: Mapping[str, str],
         return False, "helper_timeout"
     if code != 0:
         return False, "helper_failed"
+    if interface == "workflow" and "native_task_id" in args:
+        _, reason = _workflow_artifact_receipt(
+            output, operation="artifact-write", args=args, digest=digest,
+            expected_size=len(content),
+        )
+        return not reason, reason
     header, separator, body = output.partition(b"\n")
     if not separator or body:
         return False, "invalid_receipt"
@@ -1527,9 +1596,7 @@ def _write_attachment(helper: Path, interface: str, args: Mapping[str, str],
         receipt = json.loads(header)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False, "invalid_receipt"
-    root = (Path(args["project_root"]) / args["project_key"]
-            if interface == "standalone" else Path(args["project_path"]))
-    expected = str(root / "tasks" / args["task_key"] / "artifacts/attachments/objects" / digest)
+    expected = _attachment_path(args, digest)
     if (not isinstance(receipt, dict) or receipt.get("schema") != "r2-artifact-response-v1"
             or receipt.get("operation") != "artifact-write"
             or receipt.get("object_sha256") != digest
@@ -1538,6 +1605,28 @@ def _write_attachment(helper: Path, interface: str, args: Mapping[str, str],
             or receipt.get("object_path") != expected):
         return False, "receipt_mismatch"
     return True, ""
+
+
+def _read_attachment(helper: Path, args: Mapping[str, str],
+                     digest: str) -> tuple[bytes | None, str]:
+    request = _json({
+        "schema": "r2-workflow-request-v1",
+        "operation": "artifact-read",
+        "workspace_path": args["workspace_path"],
+        "task_locator": args["native_task_id"],
+        "sha256": digest,
+    }) + b"\n"
+    code, output = _call(
+        helper, "workflow", request,
+        max_output_bytes=MAX_HELPER_OUTPUT_BYTES + MAX_ARTIFACT_BYTES + 1,
+    )
+    if code is None:
+        return None, "helper_timeout"
+    if code != 0:
+        return None, "helper_failed"
+    return _workflow_artifact_receipt(
+        output, operation="artifact-read", args=args, digest=digest, expected_size=None,
+    )
 
 
 def _history(run: Path) -> list[dict[str, Any]]:
@@ -1687,8 +1776,12 @@ def export_run(handle: RunHandle, binding: Mapping[str, Any], *, helper: str | o
     max_bytes, max_age_seconds = _retention_limits(max_bytes, max_age_seconds)
     if type(include_artifacts) is not bool:
         raise EvidenceError("include_artifacts must be boolean")
-    identity, args = _binding(binding, interface)
     helper_path = _helper(helper, interface)
+    identity, args = _binding(binding, interface)
+    if interface == "workflow":
+        ordinary_r2 = helper_path == Path.home() / ".kent/ordinary-r2/bin/kent-project-memory"
+        if ordinary_r2 != ("native_task_id" in args):
+            raise BindingError("workflow binding does not match memory helper")
     _, run, _, _ = _handle_paths(handle)
     lease = handle._lease
     if lease is not None:
@@ -1780,9 +1873,15 @@ def _export_pinned(handle: RunHandle, run: Path, identity: Mapping[str, str],
         objects = [(envelope, _sha(envelope))]
         objects.extend((content, digest) for digest, content in artifact_bytes)
         hashes = tuple(digest for _, digest in objects)
+        ordinary_r2 = interface == "workflow" and "native_task_id" in args
+        unique_objects = list({
+            digest: (content, digest) for content, digest in objects
+        }.values())
+        operation_objects = unique_objects if ordinary_r2 else objects
         binding_sha = _sha(_json({"interface": interface, "binding": args}))
         history = _history(run)
         attempt = _next_export_attempt(history)
+        reason = ""
         if interface == "workflow":
             valid, reason = _confirm_workflow(helper_path, args)
             if not valid:
@@ -1798,15 +1897,37 @@ def _export_pinned(handle: RunHandle, run: Path, identity: Mapping[str, str],
                          and entry.get("binding_sha256") == binding_sha
                          and entry.get("manifest_sha256") == manifest_sha
                          and entry.get("attachment_sha256s") == list(hashes)), None)
-        if (previous is not None and previous.get("status") == "exported"
-                and _export_record_matches(
-                    previous, interface=interface, identity=identity,
-                    binding_sha=binding_sha, manifest_sha=manifest_sha,
-                    hashes=hashes, objects=objects,
-                )):
+        cached_export = (
+            previous is not None and previous.get("status") == "exported"
+            and _export_record_matches(
+                previous, interface=interface, identity=identity,
+                binding_sha=binding_sha, manifest_sha=manifest_sha,
+                hashes=hashes, objects=objects,
+            )
+        )
+        retryable_history = any(
+            entry.get("interface") == interface
+            and entry.get("binding_sha256") == binding_sha
+            and entry.get("manifest_sha256") == manifest_sha
+            and entry.get("attachment_sha256s") == list(hashes)
+            and entry.get("status") in {"pending", "unknown", "exported"}
+            for entry in history
+        )
+        if cached_export and (interface == "standalone" or "native_task_id" not in args):
             return ExportResult("exported", manifest_sha, hashes, previous["attempt"])
+
+        verified: set[str] = set()
+        if ordinary_r2 and retryable_history:
+            for content, digest in operation_objects:
+                readback, read_reason = _read_attachment(helper_path, args, digest)
+                if readback == content and not read_reason:
+                    verified.add(digest)
+                elif not reason:
+                    reason = read_reason or "readback_mismatch"
+            if cached_export and len(verified) == len(operation_objects):
+                return ExportResult("exported", manifest_sha, hashes, previous["attempt"])
+
         exported = []
-        reason = ""
         _append_export(run, {
             "schema": "android-tools-export-v1", "attempt": attempt, "at": _time(),
             "status": "pending", "reason_code": "", "interface": interface,
@@ -1814,15 +1935,30 @@ def _export_pinned(handle: RunHandle, run: Path, identity: Mapping[str, str],
             "manifest_sha256": manifest_sha, "attachment_sha256s": list(hashes),
             "exported_attachments": [],
         })
-        for content, digest in objects:
-            ok, reason = _write_attachment(helper_path, interface, args, content)
-            if not ok:
-                break
+        for content, digest in operation_objects:
+            if digest not in verified:
+                ok, reason = _write_attachment(helper_path, interface, args, content)
+                if not ok:
+                    break
+                if ordinary_r2:
+                    readback, reason = _read_attachment(helper_path, args, digest)
+                    if readback != content or reason:
+                        if not reason:
+                            reason = "readback_mismatch"
+                        break
+            if ordinary_r2:
+                verified.add(digest)
             exported.append({
                 "sha256": digest, "size_bytes": len(content),
                 "locator": (f"tasks/{identity['task_key']}/artifacts/attachments/objects/"
                             f"{digest}"),
             })
+        if ordinary_r2:
+            exported_by_digest = {item["sha256"]: item for item in exported}
+            exported = [
+                exported_by_digest[digest]
+                for _, digest in objects if digest in exported_by_digest
+            ]
         status = "exported" if len(exported) == len(objects) else "unknown"
         _append_export(run, {
             "schema": "android-tools-export-v1", "attempt": attempt, "at": _time(),

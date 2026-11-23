@@ -80,3 +80,40 @@ Changes to these meanings require a new reviewed contract version. Compatible
 changes to unrelated facade, native, evidence, or provider implementation
 bytes do not change these fixed contracts. The owner remains responsible for
 maintaining the published meanings and regression tests.
+
+## Workflow evidence export
+
+The workflow evidence interface accepts the ordinary-R2 binding fields and a
+`native_task_id` supplied in the existing private `--binding-file`. The
+launcher passes that object unchanged to the evidence module. Binding
+production remains the caller's responsibility: use the native Task ID from
+the current Kent-assigned Workflow metadata; do not infer it from an R2 task
+key or UID, or from an injected environment variable. The installed ordinary
+R2 helper validates the inherited Session against this locator on every
+resolve, attachment read, and attachment write. An absent or mismatched
+locator blocks export.
+
+Workflow exports use only the exact private helper
+`~/.kent/ordinary-r2/bin/kent-project-memory`; arbitrary aliases, symlinks,
+and same-named helpers are rejected. The native Task ID is included in the
+private local binding digest, but not in the exported evidence envelope or R2
+Task identity.
+
+An `exported` result requires a valid write receipt and byte-exact readback for
+each newly written object. On recovery from a pending or unknown attempt, or
+when consulting a cached exported result, the exporter reads each object
+first. Exact bytes at the expected Task path establish durability and avoid a
+duplicate write. A failed or mismatched read is not proof that an object is
+absent; a same-content immutable write retry is allowed only with the same
+Task locator validated for that helper call, and still requires exact
+readback. Export and recovery never repeat an Android/device action.
+
+Updating the launcher checksum and evidence module changes the bundle's
+`installation_id` and qualification output. Appsome consumers that retain
+immutable `qualification_raw` therefore need a separately authorized,
+owner-led installation or rollback procedure: first settle every active or
+prepared context that may depend on the outgoing qualification; switch the
+launcher and evidence module as a pair; and, for rollback, restore both
+captured old files and verify the exact old qualification bytes. Historical
+qualification records remain immutable. Source changes and source approval
+alone do not authorize installation, activation, or a Kent restart.

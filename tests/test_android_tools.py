@@ -26,6 +26,57 @@ loader.exec_module(facade)
 
 
 class BundleTests(unittest.TestCase):
+    def test_evidence_cli_passes_native_task_binding_from_private_file_unchanged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binding_path = root / "binding.json"
+            binding = {
+                "workspace_path": str(root / "workspace"),
+                "project_path": str(root / "r2/appsome"),
+                "project_uid": "project-uid",
+                "task_key": "APP-7",
+                "task_uid": "task-uid",
+                "task_binding_sha256": "a" * 64,
+                "native_task_id": "native-task-7",
+            }
+            binding_path.write_text(json.dumps(binding), encoding="utf-8")
+            binding_path.chmod(0o600)
+            evidence = Mock()
+            export_result = make_dataclass(
+                "ExportResult",
+                [("status", str), ("manifest_sha256", str), ("attachment_sha256s", tuple),
+                 ("attempt", int), ("reason_code", str)],
+            )
+            evidence.open_run.return_value = object()
+            evidence.export_run.return_value = export_result(
+                "exported", "b" * 64, ("c" * 64,), 1, "",
+            )
+            output = io.StringIO()
+            argv = [
+                "android-tools", "--config", str(root / "config.json"), "evidence", "export",
+                "--arguments", '{"invocation_id":"00000000-0000-4000-8000-000000000001"}',
+                "--binding-file", str(binding_path), "--helper", str(root / "helper"),
+                "--interface", "workflow",
+            ]
+            with patch.object(facade, "configuration", return_value={
+                "records_directory": str(root / "records"), "retention": {},
+            }), patch.object(facade, "load_bundle", return_value={
+                "android_tools_evidence": evidence,
+            }), patch.object(sys, "argv", argv), redirect_stdout(output):
+                self.assertEqual(facade.main(), 0)
+
+            self.assertEqual(
+                evidence.open_run.call_args.args,
+                (Path(root / "records"), "00000000-0000-4000-8000-000000000001"),
+            )
+            self.assertEqual(evidence.export_run.call_args.args[1], binding)
+            self.assertEqual(
+                evidence.export_run.call_args.kwargs,
+                {"helper": Path(root / "helper"), "interface": "workflow",
+                 "include_artifacts": False},
+            )
+            self.assertNotIn("native_task_id", output.getvalue())
+
     def test_managed_unknown_drain_preserves_marker_and_attempt_provenance(self):
         attempt = "00000000-0000-4000-8000-000000000001"
         borrowed = Mock()
@@ -614,6 +665,87 @@ class BundleTests(unittest.TestCase):
         with patch.object(sys, "argv", ["android-tools", "bundle", "qualify"]), redirect_stdout(output):
             self.assertEqual(facade.main(), 0)
         self.assertEqual(json.loads(output.getvalue()), facade.qualify_bundle())
+
+    def test_pair_rollback_restores_captured_qualification_raw(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            filenames = (
+                "android-tools",
+                "android_tools_native.py",
+                "android_tools_evidence.py",
+                "android_tools_custody.py",
+            )
+            for filename in filenames:
+                source = SOURCE.parent / filename
+                destination = root / filename
+                destination.write_bytes(source.read_bytes())
+                destination.chmod(0o700 if filename == "android-tools" else 0o600)
+
+            launcher = root / "android-tools"
+            evidence = root / "android_tools_evidence.py"
+            old_launcher = launcher.read_bytes()
+            old_evidence = evidence.read_bytes()
+
+            def qualify():
+                return subprocess.run(
+                    [sys.executable, str(launcher), "bundle", "qualify"],
+                    cwd=root,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    capture_output=True,
+                    timeout=15,
+                )
+
+            old_result = qualify()
+            self.assertEqual(old_result.returncode, 0, old_result.stdout + old_result.stderr)
+            old_raw = old_result.stdout
+            historical_context = root / "prepared-context.json"
+            historical_bytes = json.dumps(
+                {"qualification_raw": old_raw.decode("utf-8")},
+                sort_keys=True,
+            ).encode("utf-8")
+            historical_context.write_bytes(historical_bytes)
+            historical_context.chmod(0o600)
+
+            candidate_evidence = old_evidence + b"\n# isolated candidate pair\n"
+            evidence.write_bytes(candidate_evidence)
+            evidence.chmod(0o600)
+            old_digest = hashlib.sha256(old_evidence).hexdigest()
+            candidate_digest = hashlib.sha256(candidate_evidence).hexdigest()
+            launcher_text = old_launcher.decode("utf-8")
+            old_pin = f'"android_tools_evidence.py": "{old_digest}"'
+            self.assertEqual(launcher_text.count(old_pin), 1)
+            launcher.write_text(
+                launcher_text.replace(
+                    old_pin, f'"android_tools_evidence.py": "{candidate_digest}"',
+                ),
+                encoding="utf-8",
+            )
+            launcher.chmod(0o700)
+
+            candidate_result = qualify()
+            self.assertEqual(candidate_result.returncode, 0, candidate_result.stderr)
+            self.assertNotEqual(
+                json.loads(candidate_result.stdout)["installation_id"],
+                json.loads(old_raw)["installation_id"],
+            )
+            self.assertNotEqual(historical_bytes, json.dumps(
+                {"qualification_raw": candidate_result.stdout.decode("utf-8")},
+                sort_keys=True,
+            ).encode("utf-8"))
+            self.assertEqual(historical_context.read_bytes(), historical_bytes)
+
+            launcher.write_bytes(old_launcher)
+            launcher.chmod(0o700)
+            evidence.write_bytes(old_evidence)
+            evidence.chmod(0o600)
+            self.assertEqual(hashlib.sha256(launcher.read_bytes()).hexdigest(),
+                             hashlib.sha256(old_launcher).hexdigest())
+            self.assertEqual(hashlib.sha256(evidence.read_bytes()).hexdigest(),
+                             old_digest)
+            rollback_result = qualify()
+            self.assertEqual(rollback_result.returncode, 0, rollback_result.stderr)
+            self.assertEqual(rollback_result.stdout, old_raw)
+            self.assertEqual(historical_context.read_bytes(), historical_bytes)
 
     def test_relative_config_named_bundle_keeps_existing_docs_dispatch(self):
         native = facade.load_bundle()["android_tools_native"]
