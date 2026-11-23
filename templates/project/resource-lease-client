@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
+import pwd
 import re
+import secrets
 import selectors
 import signal
 import stat
@@ -25,8 +28,10 @@ CLI_TIMEOUT = 10.0
 ACQUIRE_TIMEOUT = 300.0
 CLEANUP_TIMEOUT = 120.0
 HEARTBEAT_MAX_AGE = 30.0
+CONTROLLER_DRAIN_TIMEOUT = ACQUIRE_TIMEOUT + CLI_TIMEOUT + 5.0
 CUSTODY_MARKER_PROTOCOL = 1
 UNCERTAINTY_MARKER = "command-stop-uncertain.json"
+ATTEMPT_REF_PATTERN = re.compile(r"^([0-9a-f-]{36})\.([A-Za-z0-9_-]{43})$")
 PARENT_STATES = {"not_started", "pending", "confirmed", "unconfirmed"}
 MARKER_REASONS = {
     "native_runner_drain_unconfirmed", "remote_stop_unconfirmed",
@@ -218,18 +223,21 @@ def stop_child(child, *, group=False):
         child.wait(timeout=5)
 
 
-def capture(command, *, timeout=CLI_TIMEOUT, tick=None, resource_operation=None):
+def capture(command, *, timeout=CLI_TIMEOUT, tick=None, resource_operation=None,
+            on_started=None, result_with_exit=False, **process):
     """Bound both output streams while retaining only owned child handles."""
-    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **process)
     output = {child.stdout: bytearray(), child.stderr: bytearray()}
-    deadline = time.monotonic() + timeout
+    deadline = None if timeout is None else time.monotonic() + timeout
     try:
+        if on_started is not None:
+            on_started(child)
         with selectors.DefaultSelector() as selector:
             for stream in output:
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ)
             while selector.get_map() or child.poll() is None:
-                if time.monotonic() >= deadline:
+                if deadline is not None and time.monotonic() >= deadline:
                     raise Error(f"{Path(command[0]).name} timed out")
                 if tick:
                     tick()
@@ -241,12 +249,13 @@ def capture(command, *, timeout=CLI_TIMEOUT, tick=None, resource_operation=None)
                         output[key.fileobj].extend(data)
                         if sum(map(len, output.values())) > MAX_BYTES:
                             raise Error("command output exceeds size limit")
-            if child.wait() != 0:
+            return_code = child.wait()
+            if return_code != 0 and not result_with_exit:
                 # CLI stderr is diagnostic only; do not copy arbitrary tool
                 # responses (which may include secrets) into evidence.
                 label = (f"resource-lease {resource_operation}" if resource_operation
                          else Path(command[0]).name)
-                message = f"{label} failed with exit {child.returncode}"
+                message = f"{label} failed with exit {return_code}"
                 if resource_operation == "acquire":
                     message += (
                         ". Check pool status using executable and pool from the client configuration:"
@@ -257,7 +266,7 @@ def capture(command, *, timeout=CLI_TIMEOUT, tick=None, resource_operation=None)
             value = json.loads(output[child.stdout], object_pairs_hook=unique_object)
             if not isinstance(value, dict):
                 raise Error("command returned a non-object result")
-            return value
+            return (value, return_code) if result_with_exit else value
     finally:
         stop_child(child)
         for stream in output:
@@ -270,13 +279,13 @@ def absolute(value, label):
     return Path(value).resolve()
 
 
-def configuration(path):
+def configuration(path, *, canonical_paths=False):
     value = read(Path(path))
     if (set(value) != {"schema", "executable", "pool", "runs_directory", "profiles"}
             or type(value["schema"]) is not int or value["schema"] != 1):
         raise Error("unsupported resource client configuration")
     for key in ("executable", "pool", "runs_directory"):
-        value[key] = str(absolute(value[key], key))
+        value[key] = str(canonical(value[key]) if canonical_paths else absolute(value[key], key))
     if not os.access(value["executable"], os.X_OK):
         raise Error("configured resource-lease executable is unavailable")
     profiles = value["profiles"]
@@ -344,6 +353,21 @@ def aggregate_command_stop(parent_stop, external_unconfirmed, marker_present):
     return "not_started" if parent_stop == "not_started" else "confirmed"
 
 
+def request_managed_finish(run: Path):
+    with marker_lock(run) as directory_fd:
+        status = validate_status(read(run / "status.json"), run)
+        if (_marker_present(run) or status["external_stop_unconfirmed"]
+                or status["parent_command_stop"] in {"pending", "unconfirmed"}):
+            raise Error("managed device stop is not confirmed")
+        fence = run / "finish.json"
+        if os.path.lexists(fence):
+            if read(fence) != {"schema": 1}:
+                raise Error("invalid managed finish barrier")
+        else:
+            _write_record(fence, {"schema": 1})
+            os.fsync(directory_fd)
+
+
 def validate_binding(value, run: Path) -> dict:
     required = {
         "schema", "config", "profile", "custody_marker_protocol",
@@ -352,8 +376,55 @@ def validate_binding(value, run: Path) -> dict:
     config = value.get("config")
     profile = value.get("profile")
     binding = value.get("binding")
+    android = value.get("android_runtime")
+    standalone = value.get("standalone")
+    schema = 1
+    if "foreground" in value:
+        schema = 4
+        required.add("foreground")
+        if (value["foreground"] is not True or binding is not None
+                or "standalone" in value or "android_runtime" in value
+                or value.get("owner") != f"foreground:{native_uuid(run.name)}"):
+            raise Error("invalid foreground binding")
+    if "standalone" in value:
+        schema = 3
+        required.add("standalone")
+        expected = {
+            "attempt", "project", "workspace", "checkout", "intent", "session",
+            "caller_session",
+        }
+        if (not isinstance(standalone, dict) or set(standalone) != expected
+                or native_uuid(standalone.get("attempt")) != run.name
+                or not isinstance(standalone.get("project"), str)
+                or native_uuid(standalone["project"], "project-") != standalone["project"]
+                or not isinstance(standalone.get("intent"), str)
+                or not standalone["intent"] or profile != standalone["intent"]
+                or any(not isinstance(standalone.get(key), str)
+                       or canonical(standalone[key]) != Path(standalone[key])
+                       for key in ("workspace", "checkout"))
+                or standalone["workspace"] == standalone["checkout"]
+                or standalone["session"] is not None
+                and native_uuid(standalone["session"]) != standalone["session"]
+                or native_uuid(standalone.get("caller_session"))
+                != standalone["caller_session"]
+                or standalone["session"] == standalone["caller_session"]
+                or binding is not None
+                or not same_managed_root(run.parent) or not marked_managed(run.parent)):
+            raise Error("invalid standalone binding")
+    if "android_runtime" in value:
+        required.add("android_runtime")
+        if ((binding is None and standalone is None) or not isinstance(android, dict)
+                or set(android) != {"checkout", "settings"}
+                or not same_managed_root(run.parent) or not marked_managed(run.parent)):
+            raise Error("invalid managed Android binding")
+        pinned_path(android["checkout"])
+        android_settings(android["settings"], retained=True)
+        if standalone is not None and android["checkout"] != standalone["checkout"]:
+            raise Error("invalid standalone Android checkout")
+        if standalone is None:
+            schema = 2
     if (set(value) != required
-            or type(value.get("schema")) is not int or value["schema"] != 1
+            or type(value.get("schema")) is not int or value["schema"] != schema
             or type(value.get("custody_marker_protocol")) is not int
             or value["custody_marker_protocol"] != CUSTODY_MARKER_PROTOCOL
             or not isinstance(config, dict)
@@ -370,6 +441,7 @@ def validate_binding(value, run: Path) -> dict:
             or not isinstance(value.get("owner"), str) or not value["owner"]
             or config["profiles"].get(profile) != value.get("capability")
             or run.parent != Path(config["runs_directory"])
+            or standalone is not None and value.get("owner") != f"standalone:{run.name}"
             or binding is not None and (
                 not isinstance(binding, dict)
                 or set(binding) != {"project", "task", "session"}
@@ -416,7 +488,17 @@ class Lease:
             command += ["--capability", self.metadata["capability"], "--wait", str(ACQUIRE_TIMEOUT)]
         elif action in {"cancel", "release"}:
             command += ["--wait", str(CLEANUP_TIMEOUT)]
-        value = capture(command, timeout=timeout, tick=tick, resource_operation=action)
+        options = {}
+        if self.metadata.get("foreground") is True or managed_run(self.run):
+            options = {"cwd": "/", "env": {"HOME": str(account_home()),
+                                           "PATH": "/usr/bin:/bin"}}
+        if self.metadata.get("standalone") is not None and action in {"acquire", "renew"}:
+            with controller_admission(self.run, action):
+                value = capture(command, timeout=timeout, tick=tick,
+                                resource_operation=action, **options)
+        else:
+            value = capture(command, timeout=timeout, tick=tick,
+                            resource_operation=action, **options)
         if (value.get("owner") != self.metadata["owner"]
                 or value.get("capability") != self.metadata["capability"]):
             raise Error("CLI returned a different lease binding")
@@ -470,14 +552,19 @@ class Lease:
             os.fsync(directory_fd)
             return value
 
-    def finish(self, cancel=False):
+    def finish(self, cancel=False, *, managed=False):
         validate_binding(self.metadata, self.run)
-        with marker_lock(self.run):
-            validate_status(read(self.run / "status.json"), self.run)
-            _marker_present(self.run)
+        if managed or managed_run(self.run):
+            request_managed_finish(self.run)
+        else:
+            with marker_lock(self.run):
+                validate_status(read(self.run / "status.json"), self.run)
+                _marker_present(self.run)
         if not (self.run / "receipt.json").exists():
             # The CLI writes its receipt before registration. With the helper
             # lock held and acquire child reaped, no receipt means no request.
+            if self.metadata.get("standalone") is not None:
+                raise Error("standalone lease receipt is unavailable")
             value = {
                 "state": "cancelled", "cleanup_pending": False, "quarantined": False,
                 "endpoint": None, "request_created": False,
@@ -487,8 +574,12 @@ class Lease:
             if (value.get("state") not in {"completed", "cancelled", "expired"}
                     or value.get("cleanup_pending") is not False or value.get("quarantined") is not False):
                 raise Error("resource cleanup is not confirmed")
+            if self.metadata.get("standalone") is not None:
+                validate_standalone_terminal(self.run, self.metadata, value)
         try:
             status = self.record("finished", lease=value)
+            if self.metadata.get("standalone") is not None:
+                validate_standalone_status(self.run, status)
         except (Error, OSError, ValueError) as error:
             raise FinishStatusUncertain(value) from error
         return status
@@ -502,6 +593,47 @@ def active(value):
             or remaining <= 0 or value.get("quarantined") is not False):
         raise Error("lease is not active")
     return min(10.0, remaining / 3)
+
+
+def validate_standalone_terminal(run: Path, metadata: dict, value: dict) -> None:
+    before = validate_status(read(run / "status.json"), run)
+    original = before.get("lease")
+    generation = value.get("generation")
+    if (not isinstance(original, dict)
+            or not isinstance(original.get("id"), str) or not original["id"]
+            or original.get("owner") != metadata["owner"]
+            or original.get("capability") != metadata["capability"]
+            or not isinstance(original.get("slot"), str) or not original["slot"]
+            or "generation" not in value
+            or value.get("state") != "completed"
+            or value.get("endpoint", object()) is not None
+            or value.get("cleanup_pending") is not False
+            or value.get("quarantined") is not False
+            or value.get("error") is not None
+            or value.get("id") != original.get("id")
+            or value.get("owner") != metadata["owner"]
+            or value.get("capability") != metadata["capability"]
+            or value.get("slot") != original.get("slot")
+            or type(original.get("generation")) is not int
+            or not (generation is None or
+                    type(generation) is int and generation == original["generation"])):
+        raise Error("standalone cleanup is not positively confirmed")
+
+
+def validate_standalone_status(run: Path, status: dict) -> None:
+    lease = status.get("lease")
+    parent_stop = status.get("parent_command_stop")
+    if (status.get("phase") != "finished" or status.get("error") is not None
+            or parent_stop not in {"not_started", "confirmed"}
+            or status.get("external_stop_unconfirmed") is not False
+            or status.get("command_stop") != aggregate_command_stop(parent_stop, False, False)
+            or _marker_present(run)
+            or not isinstance(lease, dict)
+            or lease.get("state") != "completed"
+            or lease.get("endpoint", object()) is not None
+            or lease.get("cleanup_pending") is not False
+            or lease.get("quarantined") is not False):
+        raise Error("standalone cleanup is not positively confirmed")
 
 
 def prune(root):
@@ -554,30 +686,77 @@ def prune(root):
             continue
 
 
-def prepare(args, binding=None):
-    config = configuration(args.config)
+def prepare(args, binding=None, *, managed_config=None, foreground_config=None, android_runtime=None,
+            standalone=None, grant_digest=None):
+    if android_runtime is not None and (
+            managed_config is None or binding is None and standalone is None):
+        raise Error("Android settings require managed owner")
+    if standalone is not None and (
+            managed_config is None or binding is not None
+            or not isinstance(grant_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", grant_digest) is None):
+        raise Error("invalid standalone attempt preparation")
+    foreground = foreground_config is not None
+    if foreground and (binding is not None or managed_config is not None):
+        raise Error("foreground configuration cannot bind a managed owner")
+    config = foreground_config if foreground else (
+        configuration(args.config) if managed_config is None else managed_config
+    )
     if args.profile not in config["profiles"]:
         raise Error("requested profile is not configured")
     root = Path(config["runs_directory"])
     mkdir(root)
-    run = absolute(args.run_dir, "run directory") if getattr(args, "run_dir", None) else root / uuid.uuid4().hex
+    if foreground:
+        run = root / str(uuid.uuid4())
+    else:
+        run = absolute(args.run_dir, "run directory") if getattr(args, "run_dir", None) else root / uuid.uuid4().hex
     if run.parent != root or run.name == "admission.lock":
         raise Error("run directory must be a non-reserved direct child of runs_directory")
-    metadata = {"schema": 1, "config": config, "profile": args.profile,
+    schema = 4 if foreground else 3 if standalone is not None else 2 if android_runtime is not None else 1
+    metadata = {"schema": schema, "config": config, "profile": args.profile,
                 "custody_marker_protocol": CUSTODY_MARKER_PROTOCOL,
                 "capability": config["profiles"][args.profile],
-                "owner": args.owner if binding is None else f"smoke:{binding['task']}:{binding['session']}",
+                "owner": (f"foreground:{run.name}" if foreground
+                          else f"standalone:{standalone['attempt']}" if standalone is not None
+                          else args.owner if binding is None
+                          else f"smoke:{binding['task']}:{binding['session']}"),
                 "binding": binding}
+    if foreground:
+        metadata["foreground"] = True
+    if standalone is not None:
+        metadata["standalone"] = standalone
+    if android_runtime is not None:
+        metadata["android_runtime"] = android_runtime
     created = False
     with admission_lock(root):
-        prune(root)
+        marker = root / ".managed-only"
+        if foreground and os.path.lexists(marker):
+            raise Error("run root is reserved for managed attempts")
+        reserved = managed_config is not None or same_managed_root(root)
+        if reserved and os.path.lexists(marker):
+            if read(marker) != {"schema": 1} or managed_config is None:
+                raise Error("run root is reserved for managed attempts")
+        elif managed_config is not None:
+            if any(path.name != "admission.lock" for path in root.iterdir()):
+                raise Error("managed run root already contains legacy state")
+            write(marker, {"schema": 1})
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        if managed_config is None:
+            prune(root)
         try:
-            count = sum(path.name != "admission.lock" for path in root.iterdir())
+            ignored = {"admission.lock", ".managed-only"} if reserved else {"admission.lock"}
+            count = sum(path.name not in ignored for path in root.iterdir())
             if count >= MAX_RUNS and not run.exists():
                 raise Error("consumer run retention limit reached; inspect completed records")
             run.mkdir(mode=0o700)
             created = True
         except FileExistsError:
+            if foreground:
+                raise Error("foreground run identifier is already in use") from None
             private(run, directory=True)
             if read(run / "binding.json") != metadata:
                 raise Error("existing run has a different immutable binding")
@@ -594,6 +773,19 @@ def prepare(args, binding=None):
                 }
                 _write_record(run / "status.json", initial)
                 os.fsync(directory_fd)
+            if standalone is not None:
+                state = {
+                    "schema": 1, "phase": "pending", "grant_sha256": grant_digest,
+                    "attempt": standalone["attempt"], "project": standalone["project"],
+                    "workspace": standalone["workspace"], "checkout": standalone["checkout"],
+                    "intent": standalone["intent"], "session": None,
+                    "stop_requested": False, "admission": None,
+                }
+                for name in ("controller.lock", "controller-state.lock"):
+                    fd = os.open(run / name, os.O_RDWR | os.O_CREAT | os.O_EXCL
+                                 | os.O_NOFOLLOW, 0o600)
+                    os.close(fd)
+                write_controller(run, state)
     if not created:
         validate_status(read(run / "status.json"), run)
         _marker_present(run)
@@ -605,6 +797,8 @@ def load(run):
     private(run, directory=True)
     run = run.resolve()
     metadata = read(run / "binding.json")
+    if metadata.get("foreground") is True or metadata.get("schema") == 4:
+        raise Error("foreground command records cannot be reopened")
     validate_binding(metadata, run)
     validate_status(read(run / "status.json"), run)
     _marker_present(run)
@@ -612,8 +806,9 @@ def load(run):
 
 
 class Renewal:
-    def __init__(self, lease):
+    def __init__(self, lease, *, native=None):
         self.lease = lease
+        self.native = native
         self.next_native = 0.0
         self.next_record = 0.0
         self.next_renew = 0.0
@@ -627,8 +822,12 @@ class Renewal:
         if (self.lease.run / "stop-renewal.json").exists():
             raise Error("renewal was permanently stopped")
         binding = self.lease.metadata["binding"]
-        if binding and now >= self.next_native:
-            native_active(binding)
+        standalone = self.lease.metadata.get("standalone")
+        if (binding or standalone) and now >= self.next_native:
+            owner = standalone if standalone is not None else binding
+            if self.native is None and standalone is not None:
+                raise Error("standalone controller observer is unavailable")
+            (self.native or native_active)(owner)
             self.next_native = time.monotonic() + (
                 active(self.value) if self.value is not None else 10
             )
@@ -652,7 +851,26 @@ def run_command(args):
     command = args.command[1:] if args.command and args.command[0] == "--" else args.command
     if not command:
         raise Error("a command is required")
-    lease = prepare(args)
+    foreground = args.config is None
+    config = None
+    if foreground:
+        if args.owner is not None or args.env:
+            raise Error("host-selected run does not accept --owner or --env")
+        host = HostRouting()
+        route = host.route(physical_foreground_workspace())
+        if args.profile not in route.get("foreground_intents", ()):
+            raise Error("foreground profile is not enabled for this checkout")
+        config = host.config(route, foreground=True)
+    try:
+        lease = prepare(args, foreground_config=config)
+    except OSError:
+        if not foreground:
+            raise
+        raise Error("foreground lease state could not be prepared") from None
+
+    def diagnostic(error):
+        return str(error).replace(str(lease.run), "<foreground run>") if foreground else str(error)
+
     child = None
     acquired = False
     failure = None
@@ -663,17 +881,28 @@ def run_command(args):
             value = renewal.acquire()
             acquired = True
             environment = os.environ.copy()
-            for mapping in args.env:
+            mappings = (
+                ("ANDROID_SERIAL=adb_serial", "UI_TEST_DEVICE_SERIAL=adb_serial") if foreground else args.env
+            )
+            for mapping in mappings:
                 variable, separator, key = mapping.partition("=")
                 if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable):
                     raise Error("expected --env VARIABLE=endpoint_key")
                 endpoint = value["endpoint"].get(key)
                 if not isinstance(endpoint, str) or not endpoint:
                     raise Error("required endpoint field is unavailable")
+                if foreground and not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", endpoint):
+                    raise Error("leased Android serial is invalid")
                 if variable in environment and environment[variable] != endpoint:
                     raise Error(f"conflicting inherited {variable}")
                 environment[variable] = endpoint
-            environment["RESOURCE_LEASE_RUN_DIRECTORY"] = str(lease.run)
+            if foreground:
+                for key in ("RESOURCE_LEASE_RUN_DIRECTORY", "ANDROID_ADB_SERVER_ADDRESS", "ANDROID_ADB_SERVER_PORT",
+                            "ADB_SERVER_ADDRESS", "ADB_SERVER_PORT"):
+                    environment.pop(key, None)
+                environment["ADB_SERVER_SOCKET"] = "tcp:127.0.0.1:5037"
+            else:
+                environment["RESOURCE_LEASE_RUN_DIRECTORY"] = str(lease.run)
             # Write ahead of launching: even failed uncertainty-marker/status
             # writes must leave retry/pruning unable to claim a confirmed stop.
             lease.record("active", lease=value, parent_command_stop="pending")
@@ -685,7 +914,7 @@ def run_command(args):
             active(lease.cli("inspect"))
             result = child.returncode
         except (Error, OSError, ValueError, InterruptedError) as error:
-            failure = str(error)
+            failure = diagnostic(error)
             print(f"resource-lease-client: {failure}", file=sys.stderr)
         finally:
             if child is None:
@@ -728,33 +957,39 @@ def run_command(args):
                 if isinstance(error, FinishStatusUncertain):
                     cleanup_error, cleanup_value = str(error), error.lease
                 else:
-                    cleanup_error, cleanup_value = f"cleanup failed: {error}", renewal.value
+                    cleanup_error, cleanup_value = f"cleanup failed: {diagnostic(error)}", renewal.value
                 failure = f"{failure}; {cleanup_error}" if failure else cleanup_error
                 try:
                     lease.record("failed", lease=cleanup_value, error=failure)
                 except (Error, OSError, ValueError):
                     failure += "; cleanup status persistence failed"
                 print(f"resource-lease-client: {failure}", file=sys.stderr)
-        print(json.dumps({"command_exit": child.returncode if child else None,
-                          "consumer_error": failure, "run_directory": str(lease.run)}),
-              file=sys.stderr)
+        summary = {"command_exit": child.returncode if child else None, "consumer_error": failure}
+        if not foreground:
+            summary["run_directory"] = str(lease.run)
+        print(json.dumps(summary), file=sys.stderr)
         return result if failure is None else 1
 
 
-def serve(run):
+def serve(run, *, native=None):
     lease = load(run)
     with lock(lease.run):
         if validate_status(read(lease.run / "status.json"), lease.run)["phase"] != "preparing":
             raise Error("a stopped helper cannot be restarted")
-        renewal = Renewal(lease)
+        renewal = Renewal(lease) if native is None else Renewal(lease, native=native)
         try:
             renewal.acquire()
             while True:
                 renewal.tick()
                 time.sleep(0.1)
         except InterruptedError:
+            if lease.metadata.get("standalone") is not None and not (
+                    lease.run / "finish.json").exists():
+                lease.record("stopped", lease=renewal.value,
+                             error="standalone controller stopped without explicit end")
+                return 1
             try:
-                status = lease.finish(cancel=renewal.value is None)
+                status = lease.finish(cancel=renewal.value is None, managed=native is not None)
                 if status["phase"] != "finished":
                     return 1
             except (Error, OSError, ValueError) as error:
@@ -768,7 +1003,7 @@ def serve(run):
     return 0
 
 
-def check(run):
+def check(run, *, native=None):
     lease = load(run)
     if (lease.run / "stop-renewal.json").exists():
         raise Error("renewal was permanently stopped")
@@ -783,8 +1018,14 @@ def check(run):
     except Busy:
         pass
     try:
-        if lease.metadata["binding"] is not None:
-            native_active(lease.metadata["binding"])
+        binding = lease.metadata["binding"]
+        standalone = lease.metadata.get("standalone")
+        if standalone is not None:
+            if native is None:
+                raise Error("standalone controller observer is unavailable")
+            native(standalone)
+        elif binding is not None:
+            (native or native_active)(binding)
         current = lease.cli("inspect")
         active(current)
     except (Error, OSError, ValueError):
@@ -804,9 +1045,13 @@ def start(args):
     binding = {"project": args.project, "task": task, "session": args.session}
     native_active(binding)
     lease = prepare(args, binding)
+    return launch(lease)
+
+
+def launch(lease, *, native=None, helper_env=None):
     status = validate_status(read(lease.run / "status.json"), lease.run)
     if status["phase"] == "active":
-        return check(lease.run)
+        return check(lease.run) if native is None else check(lease.run, native=native)
     if status["phase"] != "preparing":
         raise Error("a stopped helper cannot be restarted")
     # Serialize launch admission separately from the long-lived helper lock.
@@ -814,21 +1059,33 @@ def start(args):
         if (lease.run / "launched.json").exists():
             raise Error("helper startup outcome is unknown; inspect the original run")
         write(lease.run / "launched.json", {"schema": 1})
+        if native is not None:
+            fd = os.open(lease.run, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    action = "_serve" if native is None else "_serve-managed"
     child = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "_serve", "--run-dir", str(lease.run)],
+        [sys.executable, str(Path(__file__).resolve()), action, "--run-dir", str(lease.run)],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
+        start_new_session=True, **({"env": helper_env} if helper_env is not None else {}),
     )
     deadline = time.monotonic() + ACQUIRE_TIMEOUT + 10
     while time.monotonic() < deadline:
         if (lease.run / "status.json").exists():
             value = read(lease.run / "status.json")
             if value.get("phase") == "active":
-                return check(lease.run)
+                return check(lease.run) if native is None else check(lease.run, native=native)
             if value.get("phase") in {"stopped", "failed", "finished"}:
                 raise Error(value.get("error") or "helper stopped")
         if STOP:
-            write(lease.run / "finish.json", {"schema": 1})
+            if native is not None and lease.metadata.get("standalone") is not None:
+                stop_controller(lease.run, failed=True)
+            elif native is not None:
+                request_managed_finish(lease.run)
+            else:
+                write(lease.run / "finish.json", {"schema": 1})
             raise Error("startup interrupted; inspect original run cleanup")
         if child.poll() is not None:
             raise Error("helper exited before readiness; inspect original run")
@@ -836,21 +1093,947 @@ def start(args):
     raise Error("helper readiness timed out; inspect original run before retry")
 
 
-def finish(run):
+def finish(run, *, managed=False):
     lease = load(run)
-    write(lease.run / "finish.json", {"schema": 1})
+    managed = managed or managed_run(lease.run)
+    if managed:
+        request_managed_finish(lease.run)
+    else:
+        write(lease.run / "finish.json", {"schema": 1})
     deadline = time.monotonic() + CLEANUP_TIMEOUT + CLI_TIMEOUT + 10
     while time.monotonic() < deadline:
         try:
             with lock(lease.run):
-                return lease.finish(cancel=not (lease.run / "receipt.json").exists())
+                if managed:
+                    current = validate_status(read(lease.run / "status.json"), lease.run)
+                    if current["phase"] == "finished":
+                        _marker_present(lease.run)
+                        if lease.metadata.get("standalone") is not None:
+                            validate_standalone_status(lease.run, current)
+                        return current
+                    if ((lease.run / "launched.json").exists()
+                            and not (lease.run / "receipt.json").exists()):
+                        raise Error("managed release outcome is unknown")
+                result = lease.finish(
+                    cancel=not (lease.run / "receipt.json").exists(), managed=managed,
+                )
+                if lease.metadata.get("standalone") is not None:
+                    validate_standalone_status(lease.run, result)
+                return result
         except Busy:
             pass
         value = validate_status(read(lease.run / "status.json"), lease.run)
         if value.get("phase") == "finished":
+            if lease.metadata.get("standalone") is not None:
+                validate_standalone_status(lease.run, value)
             return value
         time.sleep(0.1)
     raise Error("helper cleanup timed out")
+
+
+def canonical(value):
+    path = absolute(value, "host path")
+    if str(path) != value:
+        raise Error("host path is not canonical")
+    return path
+
+
+def account_home():
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def managed_root():
+    return account_home() / ".config/kent/android-tools/managed-runs"
+
+
+def same_managed_root(root):
+    fixed = managed_root()
+    return fixed.exists() and root.samefile(fixed)
+
+
+def marked_managed(root):
+    marker = root / ".managed-only"
+    return os.path.lexists(marker) and read(marker) == {"schema": 1}
+
+
+def managed_run(run):
+    return same_managed_root(run.parent) and marked_managed(run.parent)
+
+
+def trusted_path(path):
+    for component in (*reversed(path.parents), path):
+        info = component.lstat()
+        if (stat.S_ISLNK(info.st_mode) or info.st_uid not in {0, os.getuid()}
+                or info.st_mode & 0o022
+                or (component != path and not stat.S_ISDIR(info.st_mode))):
+            raise Error("unsafe host path")
+    return path
+
+
+def pinned_path(value):
+    if (not isinstance(value, str) or not value.startswith("/")
+            or "\x00" in value or str(Path(value)) != value
+            or os.path.normpath(value) != value):
+        raise Error("invalid pinned Android path")
+    return Path(value)
+
+
+def android_settings(value, *, retained=False):
+    required = {"schema", "timeout_seconds", "output_limit_bytes", "providers", "records_directory"}
+    if not retained:
+        required.add("android_sdk_root")
+    if (not isinstance(value, dict) or not required <= value.keys()
+            or value.keys() - required - {"android_sdk_root", "retention"}
+            or type(value["schema"]) is not int or value["schema"] != 1
+            or type(value["timeout_seconds"]) not in (int, float)
+            or not 0.1 <= value["timeout_seconds"] <= 300
+            or type(value["output_limit_bytes"]) is not int
+            or not 4096 <= value["output_limit_bytes"] <= 8388608):
+        raise Error("invalid managed Android settings")
+    pinned_path(value["records_directory"])
+    if "android_sdk_root" in value:
+        sdk = pinned_path(value["android_sdk_root"])
+        if not retained and os.pathsep in str(sdk):
+            raise Error("invalid managed Android SDK path")
+    providers = value["providers"]
+    if not isinstance(providers, dict) or set(providers) != {"mobile-native"}:
+        raise Error("invalid managed Android provider settings")
+    provider = providers["mobile-native"]
+    if (not isinstance(provider, dict) or set(provider) != {"executable", "version"}
+            or not isinstance(provider["version"], str) or not 0 < len(provider["version"]) <= 128
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", provider["version"]) is None):
+        raise Error("invalid managed Android provider settings")
+    pinned_path(provider["executable"])
+    retention = value.get("retention", {"max_bytes": 500000000, "max_age_seconds": 604800})
+    if (not isinstance(retention, dict) or set(retention) != {"max_bytes", "max_age_seconds"}
+            or type(retention["max_bytes"]) is not int
+            or not 1048576 <= retention["max_bytes"] <= 10000000000
+            or type(retention["max_age_seconds"]) is not int
+            or not 60 <= retention["max_age_seconds"] <= 31536000):
+        raise Error("invalid managed Android retention")
+    return {**value, "retention": retention}
+
+
+def checkout_local(path):
+    return any(os.path.lexists(parent / ".git") for parent in path.parents)
+
+
+def existing_overlap(left, right):
+    def contains(root, path):
+        return path.is_relative_to(root) or (
+            root.exists() and any(parent.exists() and parent.samefile(root)
+                                  for parent in (path, *path.parents)))
+    return contains(left, right) or contains(right, left)
+
+
+def native_uuid(value, prefix=""):
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise Error("expected a canonical native UUID")
+    suffix = value[len(prefix):]
+    try:
+        parsed = uuid.UUID(suffix)
+    except ValueError:
+        raise Error("expected a canonical native UUID") from None
+    if str(parsed) != suffix or parsed.version != 4:
+        raise Error("expected a canonical native UUID")
+    return value
+
+
+def split_attempt_ref(value):
+    if not isinstance(value, str):
+        raise Error("standalone attempt reference is invalid")
+    match = ATTEMPT_REF_PATTERN.fullmatch(value)
+    if match is None:
+        raise Error("standalone attempt reference is invalid")
+    attempt = native_uuid(match.group(1))
+    return attempt, match.group(2)
+
+
+class HostRouting:
+    def __init__(self, *, helper=False):
+        self.home = canonical(str(account_home()))
+        location = self.home / ".config/kent/android-tools"
+        if helper:
+            value = json.loads(os.environ["KENT_MANAGED_OBSERVER"], object_pairs_hook=unique_object)
+        else:
+            registration = trusted_path(canonical(str(location / "lease-routes.json")))
+            if checkout_local(registration):
+                raise Error("host registration cannot live in a checkout")
+            value = read(registration)
+        if (set(value) != {"schema", "kent_executable", "kent_persistence_root", "routes"}
+                or type(value["schema"]) is not int or value["schema"] != 1
+                or not isinstance(value["routes"], list) or len(value["routes"]) > 32):
+            raise Error("unsupported host registration")
+        self.kent = trusted_path(canonical(value["kent_executable"]))
+        if not self.kent.is_file() or not os.access(self.kent, os.X_OK) or checkout_local(self.kent):
+            raise Error("trusted Kent executable is unavailable")
+        state = trusted_path(canonical(value["kent_persistence_root"]))
+        if not state.is_dir():
+            raise Error("trusted Kent state is unavailable")
+        self.env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin",
+                    "KENT_PERSISTENCE_ROOT": str(state)}
+        self.routes = value["routes"]
+        self.root = canonical(str(location / "managed-runs"))
+
+    def helper_environment(self):
+        return {**self.env, "KENT_MANAGED_OBSERVER": json.dumps({
+            "schema": 1, "kent_executable": str(self.kent),
+            "kent_persistence_root": self.env["KENT_PERSISTENCE_ROOT"], "routes": [],
+        })}
+
+    def observe(self, deadline, *args):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Error("native observation timed out")
+        return capture([str(self.kent), *args, "--json"], timeout=remaining, cwd="/", env=self.env)
+
+    def target(self, session, *, require_cwd=True, exact_cwd=False):
+        result = self.observe(time.monotonic() + CLI_TIMEOUT, "worktree", "status", "--session", session)
+        target, roots = result.get("target"), result.get("worktree")
+        if (result.get("problems") != [] or not isinstance(target, dict) or not isinstance(roots, dict)
+                or target.get("workspace_availability") != "available" or "worktree" not in target):
+            raise Error("native checkout unavailable")
+        workspace = canonical(target.get("workspace_root"))
+        linked = target["worktree"]
+        if linked is not None and (not isinstance(linked, dict) or linked.get("availability") != "available"):
+            raise Error("native checkout unavailable")
+        checkout = workspace if linked is None else canonical(linked.get("root"))
+        if (roots.get("recorded_root") != str(checkout) or roots.get("observed_root") != str(checkout)
+                or not canonical(target.get("effective_workdir")).is_relative_to(checkout)
+                or not checkout.is_dir()
+                or require_cwd and not Path.cwd().resolve().is_relative_to(checkout)
+                or exact_cwd and Path.cwd().resolve() != checkout):
+            raise Error("native checkout mismatch")
+        if require_cwd:
+            cwd = Path.cwd().resolve()
+            while cwd != checkout:
+                if os.path.lexists(cwd / ".git"):
+                    raise Error("native checkout mismatch")
+                cwd = cwd.parent
+        return workspace, checkout
+
+    def active(self, owner, *, route=None):
+        project, task, session = (owner[key] for key in ("project", "task", "session"))
+        deadline = time.monotonic() + CLI_TIMEOUT
+        detail = self.observe(deadline, "task", "show", task, "--project", project)
+        summary, status = detail.get("summary"), detail.get("status")
+        if (not isinstance(summary, dict) or not isinstance(status, dict)
+                or summary.get("id") != task or summary.get("project_id") != project
+                or summary.get("done") is not False or status.get("kind") != "running"
+                or status.get("native_state") not in {"running", "active", "waiting", "waiting_ask", "waiting_approval"}
+                or route is not None and summary.get("workflow_id") != route["workflow_id"]):
+            raise Error("native Task is not authorized and active")
+        offset, found = 0, False
+        for _page in range(100):
+            page = self.observe(deadline, "task", "sessions", task, "--project", project,
+                                "--offset", str(offset), "--limit", "100")
+            rows = page.get("items")
+            if (page.get("task_id") != task or not isinstance(rows, list) or len(rows) > 100
+                    or any(not isinstance(row, dict) for row in rows)):
+                raise Error("invalid native Session inventory")
+            for row in rows:
+                if row.get("session_id") == session:
+                    if (found or row.get("status") != "running"
+                            or route is not None and row.get("node_name") != route["smoke_node"]):
+                        raise Error("native Session is not authorized and active")
+                    found = True
+            following = page.get("next_offset")
+            if following is None:
+                if found:
+                    return
+                break
+            if type(following) is not int or following <= offset:
+                raise Error("invalid native Session pagination")
+            offset = following
+        raise Error("native Session is missing from bounded inventory")
+
+    def route(self, workspace):
+        matches = []
+        required = {"project", "workspace", "config"}
+        workflow = {"workflow_id", "smoke_node"}
+        foreground_only = required | {"foreground_intents"}
+        allowed = foreground_only | workflow | {"android_config", "standalone_intents", "standalone_only"}
+        for route in self.routes:
+            if (not isinstance(route, dict)
+                    or not required <= route.keys()
+                    or route.keys() - allowed):
+                raise Error("invalid host route")
+            native_uuid(route["project"], "project-")
+            if "foreground_intents" in route:
+                intents = route["foreground_intents"]
+                if ("standalone_only" in route or not isinstance(intents, list) or not 0 < len(intents) <= 32
+                        or any(not isinstance(intent, str)
+                               or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", intent) is None
+                               for intent in intents)
+                        or len(set(intents)) != len(intents)):
+                    raise Error("invalid foreground intent registration")
+            if "standalone_intents" in route:
+                intents = route["standalone_intents"]
+                if (not isinstance(intents, list) or len(intents) > 32
+                        or any(not isinstance(intent, str)
+                               or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", intent) is None
+                               for intent in intents)
+                        or len(set(intents)) != len(intents)):
+                    raise Error("invalid standalone intent registration")
+            if "standalone_only" in route:
+                scope = route["standalone_only"]
+                if (workflow & route.keys()
+                        or not isinstance(scope, dict)
+                        or set(scope) != {"caller_session", "checkout"}
+                        or not route.get("standalone_intents")
+                        or "android_config" not in route):
+                    raise Error("invalid standalone-only route")
+                native_uuid(scope["caller_session"])
+                canonical(scope["checkout"])
+            elif route.keys() != foreground_only:
+                if (not workflow <= route.keys()
+                        or not isinstance(route["smoke_node"], str) or not route["smoke_node"]):
+                    raise Error("invalid Workflow route")
+                native_uuid(route["workflow_id"])
+            if canonical(route["workspace"]) == workspace:
+                matches.append(route)
+        if len(matches) != 1:
+            raise Error("host route is missing or ambiguous")
+        return matches[0]
+
+    def config(self, route, *, foreground=False):
+        path = trusted_path(canonical(route["config"]))
+        if checkout_local(path):
+            raise Error("host config cannot live in a checkout")
+        config = configuration(path, canonical_paths=foreground)
+        executable = trusted_path(Path(config["executable"]))
+        if checkout_local(executable):
+            raise Error("allocator executable cannot live in a checkout")
+        if foreground:
+            pool = trusted_path(Path(config["pool"]))
+            runs = Path(config["runs_directory"])
+            ancestor = runs
+            while not os.path.lexists(ancestor):
+                ancestor = ancestor.parent
+            trusted_path(ancestor)
+            if (not executable.is_file() or not pool.is_dir() or not ancestor.is_dir()
+                    or checkout_local(runs) or os.path.lexists(runs / ".git")
+                    or os.path.lexists(runs / ".managed-only")):
+                raise Error("unsafe foreground allocator or run storage")
+            if ancestor == runs:
+                private(runs, directory=True)
+        for registered in self.routes:
+            other = trusted_path(canonical(registered["config"]))
+            if checkout_local(other):
+                raise Error("host config cannot live in a checkout")
+            paths = config if other == path else configuration(other)
+            if any(existing_overlap(Path(paths[key]), self.root) for key in ("runs_directory", "pool")):
+                raise Error("managed runs overlap retained runs")
+            if foreground and any(existing_overlap(runs, target) for target in (
+                    Path(paths["pool"]), canonical(registered["workspace"]),
+            )):
+                raise Error("foreground runs overlap a workspace or allocator pool")
+            if (registered is not route
+                    and ("standalone_only" in route or "standalone_only" in registered)
+                    and existing_overlap(Path(config["pool"]), Path(paths["pool"]))):
+                raise Error("standalone-only route requires a dedicated pool")
+        return config if foreground else {**config, "runs_directory": str(self.root)}
+
+    def android(self, route, checkout, config):
+        if "android_config" not in route:
+            return None
+        source = trusted_path(canonical(route["android_config"]))
+        if checkout_local(source):
+            raise Error("Android settings cannot live in a checkout")
+        settings = android_settings(read(source))
+        executable = trusted_path(canonical(settings["providers"]["mobile-native"]["executable"]))
+        records = trusted_path(canonical(settings["records_directory"]))
+        adb = trusted_path(Path(settings["android_sdk_root"]) / "platform-tools/adb")
+        private(records, directory=True)
+        if (not executable.is_file() or not os.access(executable, os.X_OK)
+                or checkout_local(executable) or checkout_local(records)
+                or not adb.is_file() or not os.access(adb, os.X_OK) or checkout_local(adb)
+                or any(existing_overlap(records, root) for root in (
+                    self.root, Path(config["pool"]), canonical(route["workspace"]), checkout,
+                ))):
+            raise Error("unsafe managed Android provider or records")
+        return {"checkout": str(checkout), "settings": settings}
+
+    def standalone_active(self, scope):
+        run = self.root / scope["attempt"]
+        controller = controller_active(run, claimed=True)
+        if (controller["session"] != scope["session"]
+                or controller["project"] != scope["project"]
+                or controller["workspace"] != scope["workspace"]
+                or controller["checkout"] != scope["checkout"]
+                or controller["intent"] != scope["intent"]):
+            raise Error("standalone controller scope changed")
+        workspace, checkout = self.target(scope["session"], require_cwd=False)
+        if str(workspace) != scope["workspace"] or str(checkout) != scope["checkout"]:
+            raise Error("standalone native checkout changed")
+
+
+def physical_git_root():
+    cwd = Path.cwd().resolve(strict=True)
+    checkout = cwd
+    while checkout != checkout.parent and not os.path.lexists(checkout / ".git"):
+        checkout = checkout.parent
+    return cwd, checkout
+
+
+def physical_foreground_workspace():
+    _, checkout = physical_git_root()
+    marker = checkout / ".git"
+    try:
+        observation = subprocess.run(
+            ["/usr/bin/git", "-C", str(checkout), "rev-parse",
+             "--show-toplevel", "--absolute-git-dir", "--is-inside-work-tree"],
+            env={"HOME": str(account_home()), "PATH": "/usr/bin:/bin",
+                 "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
+            cwd="/", stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=CLI_TIMEOUT,
+        )
+        top, gitdir, inside = observation.stdout.splitlines()
+        if observation.returncode != 0 or top != str(checkout) or inside != "true":
+            raise Error("unexpected Git checkout observation")
+        if marker.is_dir() and not marker.is_symlink():
+            if gitdir != str(marker) or not trusted_path(marker / "HEAD").is_file():
+                raise Error("unexpected primary Git directory")
+            return checkout
+        return physical_linked_checkout()[0]
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise Error("foreground command is not in a physical Git checkout") from None
+
+
+def physical_linked_checkout():
+    cwd, checkout = physical_git_root()
+    marker = checkout / ".git"
+    try:
+        info = marker.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
+            raise Error("standalone checkout is not a physical linked worktree")
+        data = marker.read_text(encoding="utf-8").strip()
+        if not data.startswith("gitdir: ") or "\n" in data:
+            raise Error("standalone checkout is not a physical linked worktree")
+        gitdir = Path(data[8:])
+        if not gitdir.is_absolute():
+            gitdir = checkout / gitdir
+        gitdir = gitdir.resolve(strict=True)
+        trusted_path(gitdir)
+        backlink_record = gitdir / "gitdir"
+        backlink_info = backlink_record.lstat()
+        if not stat.S_ISREG(backlink_info.st_mode) or backlink_info.st_mode & 0o022:
+            raise Error("standalone checkout is not a physical linked worktree")
+        backlink_value = backlink_record.read_text(encoding="utf-8").strip()
+        if not backlink_value or "\n" in backlink_value:
+            raise Error("standalone checkout is not a physical linked worktree")
+        backlink = Path(backlink_value)
+        if not backlink.is_absolute():
+            backlink = gitdir / backlink
+        backlink = backlink.resolve(strict=True)
+        if backlink != marker.resolve(strict=True):
+            raise Error("standalone checkout is not a physical linked worktree")
+        common_record = gitdir / "commondir"
+        common_info = common_record.lstat()
+        if not stat.S_ISREG(common_info.st_mode) or common_info.st_mode & 0o022:
+            raise Error("standalone checkout is not a physical linked worktree")
+        common_value = common_record.read_text(encoding="utf-8").strip()
+        if not common_value or "\n" in common_value:
+            raise Error("standalone checkout is not a physical linked worktree")
+        common = Path(common_value)
+        if not common.is_absolute():
+            common = gitdir / common
+        common = common.resolve(strict=True)
+    except (OSError, UnicodeError, ValueError):
+        raise Error("standalone checkout is not a physical linked worktree") from None
+    if (gitdir.parent.name != "worktrees" or gitdir.parent.parent != common
+            or not common.is_dir() or common.name != ".git"
+            or not cwd.is_relative_to(checkout)):
+        raise Error("standalone checkout is not a physical linked worktree")
+    workspace = common.parent
+    trusted_path(workspace)
+    trusted_path(checkout)
+    probe = cwd
+    while probe != checkout:
+        if os.path.lexists(probe / ".git"):
+            raise Error("standalone checkout has a nested Git boundary")
+        probe = probe.parent
+    return workspace, checkout
+
+
+@contextmanager
+def managed_lock(root, attempt):
+    mutexes = root.parent / "managed-locks"
+    mkdir(mutexes)
+    # Fixed-size namespace: abandoned or rejected UUIDs cannot grow it.
+    path = mutexes / f"{int(uuid.UUID(attempt)) % 64:02x}.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        private(path)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Busy("managed attempt pending") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def _controller_path(run: Path, name: str) -> Path:
+    if name not in {"controller.json", "controller.lock", "controller-state.lock"}:
+        raise Error("invalid standalone controller file")
+    return run / name
+
+
+def write_controller(run: Path, value: dict) -> None:
+    private(run, directory=True)
+    write(_controller_path(run, "controller.json"), value)
+    fd = os.open(run, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        held = os.fstat(fd)
+        current = run.lstat()
+        if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+            raise Error("standalone controller directory changed")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _controller_record(run: Path) -> dict:
+    value = read(_controller_path(run, "controller.json"))
+    required = {
+        "schema", "phase", "grant_sha256", "attempt", "project", "workspace",
+        "checkout", "intent", "session", "stop_requested", "admission",
+    }
+    admission = value.get("admission")
+    if (set(value) != required or type(value.get("schema")) is not int
+            or value["schema"] != 1
+            or value.get("phase") not in {"pending", "armed", "claimed", "stopping", "closed", "failed"}
+            or not isinstance(value.get("grant_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", value["grant_sha256"]) is None
+            or native_uuid(value.get("attempt")) != run.name
+            or not isinstance(value.get("project"), str)
+            or native_uuid(value["project"], "project-") != value["project"]
+            or any(not isinstance(value.get(key), str)
+                   or canonical(value[key]) != Path(value[key])
+                   for key in ("workspace", "checkout"))
+            or not isinstance(value.get("intent"), str) or not value["intent"]
+            or value.get("session") is not None
+            and native_uuid(value["session"]) != value["session"]
+            or type(value.get("stop_requested")) is not bool
+            or admission is not None and (
+                not isinstance(admission, dict)
+                or set(admission) != {"operation", "nonce"}
+                or admission.get("operation") not in {"acquire", "renew"}
+                or not isinstance(admission.get("nonce"), str)
+                or re.fullmatch(r"[0-9a-f]{32}", admission["nonce"]) is None)):
+        raise Error("invalid standalone controller state")
+    return value
+
+
+@contextmanager
+def controller_guard(run: Path):
+    path = _controller_path(run, "controller-state.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        private(path)
+        deadline = time.monotonic() + CLI_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Busy("standalone controller lock timed out") from None
+                time.sleep(min(0.05, remaining))
+        yield
+    finally:
+        os.close(fd)
+
+
+def controller_is_live(run: Path) -> bool:
+    path = _controller_path(run, "controller.lock")
+    private(path)
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def controller_active(run: Path, *, claimed=False) -> dict:
+    value = _controller_record(run)
+    allowed = {"claimed"} if claimed else {"armed", "claimed"}
+    if (value["phase"] not in allowed or value["stop_requested"]
+            or not controller_is_live(run)):
+        raise Error("standalone controller is not active")
+    return value
+
+
+@contextmanager
+def controller_admission(run: Path, operation: str):
+    nonce = uuid.uuid4().hex
+    with controller_guard(run):
+        value = _controller_record(run)
+        if (value["phase"] != "claimed" or value["stop_requested"]
+                or value["admission"] is not None or not controller_is_live(run)):
+            raise Error("standalone provider admission is closed")
+        value["admission"] = {"operation": operation, "nonce": nonce}
+        write_controller(run, value)
+    try:
+        yield
+    finally:
+        with controller_guard(run):
+            value = _controller_record(run)
+            admission = value["admission"]
+            if isinstance(admission, dict) and admission.get("nonce") == nonce:
+                value["admission"] = None
+                write_controller(run, value)
+
+
+def stop_controller(run: Path, *, failed=False, timeout=CONTROLLER_DRAIN_TIMEOUT):
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout < 0):
+        raise Error("invalid standalone controller drain timeout")
+    deadline = time.monotonic() + timeout
+    with controller_guard(run):
+        value = _controller_record(run)
+        if value["phase"] not in {"closed", "failed"}:
+            value["phase"] = "failed" if failed else "stopping"
+        value["stop_requested"] = True
+        write_controller(run, value)
+    while True:
+        with controller_guard(run):
+            value = _controller_record(run)
+            if value["admission"] is None:
+                value["phase"] = (
+                    "failed" if failed or value["phase"] == "failed" else "closed"
+                )
+                write_controller(run, value)
+                return
+            if time.monotonic() >= deadline:
+                value["phase"] = "failed"
+                value["stop_requested"] = True
+                write_controller(run, value)
+                raise Error("standalone provider admission remains unresolved")
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def native_run_completed(value: dict, *, session: str | None) -> bool:
+    if (not isinstance(value, dict) or value.get("status") != "ok"
+            or not isinstance(value.get("result"), str)
+            or not value["result"].strip()
+            or "outcome" in value or value.get("error") is not None):
+        return False
+    try:
+        observed = native_uuid(value.get("session_id"))
+    except Error:
+        return False
+    return session is None or observed == session
+
+
+def agent(args, host):
+    if (not isinstance(args.prompt, str) or not args.prompt.strip()
+            or len(args.prompt.encode("utf-8")) > MAX_BYTES):
+        raise Error("standalone prompt is empty or too large")
+    workspace, checkout = physical_linked_checkout()
+    caller_session = native_uuid(os.environ.get("KENT_SESSION_ID"))
+    caller_step = os.environ.get("KENT_STEP_ID")
+    if caller_step is not None:
+        caller_step = native_uuid(caller_step)
+    native_workspace, native_checkout = host.target(
+        caller_session, exact_cwd=True,
+    )
+    if native_workspace != workspace or native_checkout != checkout:
+        raise Error("native caller checkout mismatch")
+    route = host.route(workspace)
+    if "standalone_only" in route and route["standalone_only"] != {
+        "caller_session": caller_session, "checkout": str(checkout),
+    }:
+        raise Error("standalone-only caller or checkout is not enrolled")
+    intents = route.get("standalone_intents")
+    if not isinstance(intents, list) or args.profile not in intents:
+        raise Error("standalone intent is not enabled for this route")
+    config = host.config(route)
+    if args.profile not in config["profiles"]:
+        raise Error("standalone intent is not configured by its route")
+    runtime = host.android(route, checkout, config)
+    if runtime is None:
+        raise Error("standalone Android settings are required for this route")
+    attempt = str(uuid.uuid4())
+    grant = secrets.token_urlsafe(32)
+    standalone = {
+        "attempt": attempt, "project": route["project"], "workspace": str(workspace),
+        "checkout": str(checkout), "intent": args.profile, "session": None,
+        "caller_session": caller_session,
+    }
+    args.run_dir = str(host.root / attempt)
+    lease = prepare(args, managed_config=config, android_runtime=runtime,
+                    standalone=standalone,
+                    grant_digest=hashlib.sha256(grant.encode("ascii")).hexdigest())
+    run = lease.run
+    controller_lock = _controller_path(run, "controller.lock")
+    fd = os.open(controller_lock, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        private(controller_lock)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Busy("standalone controller already exists") from None
+        native_result = None
+        native_exit = None
+        launch_error = None
+        stop_error = None
+
+        def arm(_child):
+            with controller_guard(run):
+                state = _controller_record(run)
+                if state["phase"] != "pending" or state["stop_requested"]:
+                    raise Error("standalone controller could not be armed")
+                state["phase"] = "armed"
+                write_controller(run, state)
+
+        prompt = (
+            f"{args.prompt.rstrip()}\n\n"
+            f"Host-issued ATTEMPT_REF for this fresh Run: {attempt}.{grant}\n"
+            "Use it only as the --attempt selector for this run's resource-lease-client "
+            "begin/status/end calls and android-tools --attempt device call. Keep begin, "
+            "status, device, and end as separate shell invocations. Do not copy the "
+            "reference into output, environment variables, evidence, files, or diagnostics. "
+            "Do not create or resume a Task or Session."
+        )
+        command = [
+            str(host.kent), "run", "--workspace", str(checkout),
+            "--output-mode=json", prompt,
+        ]
+        launcher_environment = {
+            **host.env, "KENT_SESSION_ID": caller_session,
+        }
+        if caller_step is not None:
+            launcher_environment["KENT_STEP_ID"] = caller_step
+
+        def check_agent_signal():
+            if STOP:
+                raise InterruptedError("standalone agent launch interrupted")
+
+        try:
+            native_result, native_exit = capture(
+                command, timeout=None, cwd=str(checkout), env=launcher_environment,
+                on_started=arm, result_with_exit=True, tick=check_agent_signal,
+            )
+        except (Error, OSError, ValueError, subprocess.SubprocessError) as error:
+            launch_error = error
+        finally:
+            try:
+                stop_controller(run, failed=launch_error is not None)
+            except (Error, OSError, ValueError) as error:
+                stop_error = error
+                launch_error = launch_error or Error("standalone controller stop is unresolved")
+        state = _controller_record(run)
+        claimed_session = state["session"]
+        session = claimed_session
+        frontend_completed = False
+        if native_result is not None:
+            reported = native_result.get("session_id")
+            try:
+                reported = native_uuid(reported)
+            except Error:
+                launch_error = launch_error or Error("native Run identity is unavailable")
+            else:
+                if claimed_session is not None and claimed_session != reported:
+                    launch_error = launch_error or Error("native Run identity mismatch")
+                session = reported
+                frontend_completed = (
+                    native_exit == 0
+                    and native_run_completed(native_result, session=claimed_session)
+                )
+                if not frontend_completed:
+                    launch_error = launch_error or Error("native Run completion is unconfirmed")
+        status = validate_status(read(run / "status.json"), run)
+        cleanup = "unresolved"
+        if status["phase"] == "preparing" and status.get("lease") is None:
+            cleanup = "not_started"
+        elif status["phase"] == "finished":
+            try:
+                validate_standalone_status(run, status)
+                cleanup = "confirmed"
+            except Error:
+                cleanup = "unresolved"
+        if STOP and cleanup != "confirmed":
+            cleanup = "unresolved"
+        if stop_error is not None:
+            cleanup = "unresolved"
+        output = {
+            "attempt": attempt,
+            "frontend_exit": native_exit,
+            "frontend_completion": "completed" if frontend_completed else "unresolved",
+            "session_id": session,
+            "device_cleanup": cleanup,
+        }
+        print(json.dumps(output, sort_keys=True))
+        if (launch_error is not None or not frontend_completed
+                or cleanup != "confirmed" or stop_error is not None):
+            return 1
+        return 0
+    finally:
+        os.close(fd)
+
+
+def standalone_managed(args, host, attempt, grant, session, workspace, checkout):
+    if getattr(args, "task", None) is not None:
+        raise Error("standalone calls do not accept a Task")
+    run = host.root / attempt
+    with managed_lock(host.root, attempt):
+        if not os.path.lexists(run):
+            raise Error("standalone attempt not found")
+        private(host.root, directory=True)
+        if not marked_managed(host.root):
+            raise Error("unrecognized managed attempt")
+        lease = load(run)
+        scope = lease.metadata.get("standalone")
+        if not isinstance(scope, dict):
+            raise Error("standalone grant required")
+        if (scope["attempt"] != attempt or scope["workspace"] != str(workspace)
+                or scope["checkout"] != str(checkout)):
+            raise Error("standalone checkout mismatch")
+        controller = _controller_record(run)
+        digest = hashlib.sha256(grant.encode("ascii")).hexdigest()
+        if not secrets.compare_digest(controller["grant_sha256"], digest):
+            raise Error("standalone grant rejected")
+        if (controller["attempt"] != attempt or controller["project"] != scope["project"]
+                or controller["workspace"] != scope["workspace"]
+                or controller["checkout"] != scope["checkout"]
+                or controller["intent"] != scope["intent"]):
+            raise Error("standalone controller scope changed")
+        if args.action == "begin" and args.profile != scope["intent"]:
+            raise Error("standalone intent mismatch")
+        if args.action == "begin" and scope["session"] is None:
+            if session == scope["caller_session"]:
+                raise Error("standalone caller cannot claim its child Run")
+            if controller["phase"] != "armed" or controller["session"] is not None:
+                raise Error("standalone controller is not armed")
+            if not controller_is_live(run):
+                raise Error("standalone controller is not active")
+            claimed = {**scope, "session": session}
+            lease.metadata["standalone"] = claimed
+            write(run / "binding.json", lease.metadata)
+            with controller_guard(run):
+                current = _controller_record(run)
+                if (current["phase"] != "armed" or current["session"] is not None
+                        or current["stop_requested"] or not controller_is_live(run)):
+                    raise Error("standalone controller claim changed")
+                current["phase"] = "claimed"
+                current["session"] = session
+                write_controller(run, current)
+            scope = claimed
+        elif scope["session"] != session or controller["session"] != session:
+            raise Error("standalone Session mismatch")
+        if scope["session"] != session:
+            raise Error("standalone Session mismatch")
+        host.standalone_active(scope)
+        current = validate_status(read(run / "status.json"), run)
+        if args.action == "begin":
+            if current["phase"] == "finished":
+                validate_standalone_status(run, current)
+                result = current
+            else:
+                result = launch(
+                    lease, native=host.standalone_active,
+                    helper_env=host.helper_environment(),
+                )
+        elif args.action == "status":
+            if current["phase"] == "finished":
+                validate_standalone_status(run, current)
+                result = current
+            else:
+                result = check(run, native=host.standalone_active)
+        else:
+            result = finish(run, managed=True)
+            validate_standalone_status(run, result)
+        phase, value = result["phase"], result.get("lease")
+        output = {"attempt": attempt, "phase": phase}
+        if isinstance(value, dict):
+            output["lease"] = {
+                key: value[key] for key in ("id", "generation", "owner", "state")
+                if key in value
+            }
+            if phase == "active":
+                serial = value.get("endpoint", {}).get("adb_serial")
+                if not isinstance(serial, str) or not re.fullmatch(
+                        r"[A-Za-z0-9._:-]{1,128}", serial):
+                    raise Error("managed endpoint is unavailable")
+                output["endpoint"] = {"adb_serial": serial}
+        return output
+
+
+def managed(args, host):
+    if "." in args.attempt:
+        attempt, grant = split_attempt_ref(args.attempt)
+        session = native_uuid(os.environ.get("KENT_SESSION_ID"))
+        workspace, checkout = host.target(session, exact_cwd=True)
+        return standalone_managed(args, host, attempt, grant, session, workspace, checkout)
+    attempt = native_uuid(args.attempt)
+    if args.action == "begin" and not args.task:
+        raise Error("managed Workflow begin requires a Task")
+    session = native_uuid(os.environ.get("KENT_SESSION_ID"))
+    workspace, checkout = host.target(session)
+    run = host.root / attempt
+    with managed_lock(host.root, attempt):
+        if os.path.lexists(run):
+            private(host.root, directory=True)
+            if not marked_managed(host.root):
+                raise Error("unrecognized managed attempt")
+            lease = load(run)
+            if lease.metadata.get("standalone") is not None:
+                raise Error("standalone grant required")
+            owner = lease.metadata["binding"]
+            if (owner is None or owner["session"] != session
+                    or args.action == "begin" and (owner["task"] != args.task
+                                                  or lease.metadata["profile"] != args.profile)):
+                raise Error("managed attempt owner or intent mismatch")
+            android = lease.metadata.get("android_runtime")
+            if android is not None and android["checkout"] != str(checkout):
+                raise Error("managed Android checkout changed")
+            host.active(owner)
+        elif args.action == "begin":
+            task = native_uuid(args.task, "task-")
+            route = host.route(workspace)
+            if "standalone_only" in route:
+                raise Error("standalone-only route does not admit Workflow attempts")
+            if "workflow_id" not in route:
+                raise Error("foreground-only route does not admit Workflow attempts")
+            owner = {"project": route["project"], "task": task, "session": session}
+            host.active(owner, route=route)
+            config = host.config(route)
+            args.run_dir = str(run)
+            lease = prepare(args, owner, managed_config=config,
+                            android_runtime=host.android(route, checkout, config))
+        else:
+            raise Error("managed attempt not found")
+        if args.action == "begin":
+            result = validate_status(read(run / "status.json"), run)
+            if result["phase"] != "finished":
+                result = launch(lease, native=host.active, helper_env=host.helper_environment())
+        elif args.action == "status":
+            result = validate_status(read(run / "status.json"), run)
+            if result["phase"] != "finished":
+                result = check(run, native=host.active)
+        else:
+            result = finish(run, managed=True)
+        phase, value = result["phase"], result.get("lease")
+        output = {"attempt": attempt, "phase": phase}
+        if isinstance(value, dict):
+            output["lease"] = {key: value[key] for key in ("id", "generation", "owner", "state") if key in value}
+            if phase == "active":
+                lease_id, generation = value.get("id"), value.get("generation")
+                if (not isinstance(lease_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", lease_id)
+                        or type(generation) is not int or generation < 1):
+                    raise Error("managed lease identity is unavailable")
+                serial = value.get("endpoint", {}).get("adb_serial")
+                if not isinstance(serial, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", serial):
+                    raise Error("managed endpoint is unavailable")
+                output["endpoint"] = {"adb_serial": serial}
+        return output
 
 
 def main():
@@ -858,22 +2041,52 @@ def main():
     commands = parser.add_subparsers(dest="action", required=True)
     for name in ("run", "start"):
         command = commands.add_parser(name)
-        command.add_argument("--config", required=True)
+        command.add_argument("--config", required=(name == "start"))
         command.add_argument("--profile", required=True)
         if name == "run":
-            command.add_argument("--owner", required=True)
+            command.add_argument("--owner")
             command.add_argument("--env", action="append", default=[])
             command.add_argument("command", nargs=argparse.REMAINDER)
         else:
             for key in ("run-dir", "project", "task", "session"):
                 command.add_argument(f"--{key}", required=True)
-    for name in ("check", "finish", "_serve"):
+    for name in ("check", "finish", "_serve", "_serve-managed"):
         command = commands.add_parser(name)
         command.add_argument("--run-dir", required=True)
+    command = commands.add_parser("agent")
+    command.add_argument("--profile", required=True)
+    command.add_argument("--prompt", required=True)
+    for name in ("begin", "status", "end"):
+        command = commands.add_parser(name)
+        command.add_argument("--attempt", required=True)
+        if name == "begin":
+            command.add_argument("--task")
+            command.add_argument("--profile", required=True)
     args = parser.parse_args()
+    if args.action == "run" and args.config is not None and args.owner is None:
+        parser.error("run --config requires --owner")
     for number in (signal.SIGTERM, signal.SIGINT):
         signal.signal(number, interrupted)
     try:
+        if args.action in {"begin", "status", "end"}:
+            result = managed(args, HostRouting())
+            print(json.dumps(result, sort_keys=True))
+            return int(args.action == "end" and result["phase"] != "finished")
+        if args.action == "agent":
+            return agent(args, HostRouting())
+        if args.action == "_serve-managed":
+            host = HostRouting(helper=True)
+            run = canonical(args.run_dir)
+            if run.parent != host.root:
+                raise Error("invalid managed run")
+            native_uuid(run.name)
+            if not marked_managed(host.root):
+                raise Error("unrecognized managed attempt")
+            def active_owner(owner):
+                if "attempt" in owner:
+                    return host.standalone_active(owner)
+                return host.active(owner)
+            return serve(run, native=active_owner)
         if args.action == "run":
             return run_command(args)
         if args.action == "_serve":
@@ -883,6 +2096,10 @@ def main():
         print(json.dumps(result, sort_keys=True))
         return 1 if args.action == "finish" and result.get("phase") != "finished" else 0
     except (Error, OSError, ValueError, KeyError, TypeError) as error:
+        if args.action in {"begin", "status", "end"}:
+            print(json.dumps({"error": "attempt_pending" if isinstance(error, Busy)
+                              else "managed_attempt_unresolved"}, sort_keys=True))
+            return 1
         print(f"resource-lease-client: {error}", file=sys.stderr)
         return 1
 

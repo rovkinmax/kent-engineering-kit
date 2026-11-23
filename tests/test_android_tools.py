@@ -26,6 +26,111 @@ loader.exec_module(facade)
 
 
 class BundleTests(unittest.TestCase):
+    def test_managed_unknown_drain_preserves_marker_and_attempt_provenance(self):
+        attempt = "00000000-0000-4000-8000-000000000001"
+        borrowed = Mock()
+        borrowed.serial = "emulator-5554"
+        borrowed.check.return_value = {"id": "lease", "generation": 1}
+        config = {
+            "schema": 1, "timeout_seconds": 2, "output_limit_bytes": 4096,
+            "source_root": "/verified-checkout", "records_directory": "/private-records",
+            "providers": {"mobile-native": {"executable": "/provider", "version": "1.0"}},
+            "lease": {"schema": 1, "executable": "/allocator", "pool": "/pool",
+                      "runs_directory": "/runs", "profiles": {"smoke.clean": "clean"}},
+        }
+        modules = facade.load_bundle()
+        native = modules["android_tools_native"]
+        runner = Mock(return_value=native.NativeResult(
+            transport="unknown", effect="not_dispatched", error="drain_unknown",
+        ))
+        evidence = Mock()
+        evidence.begin_run.return_value = SimpleNamespace(
+            staging_directory=Path("/private-stage"), invocation_id=attempt,
+        )
+        custody = Mock()
+        custody.managed_device.return_value = (config, borrowed, {"HOME": "/fixture"})
+        allowed = ["android-tools", "--attempt", attempt, "device", "key",
+                   "--arguments", '{"key":"back"}']
+        output = io.StringIO()
+        with patch.object(facade, "load_bundle", return_value={
+            "android_tools_custody": custody, "android_tools_native": native,
+            "android_tools_evidence": evidence,
+        }), patch.object(native, "execute_android_native", runner), redirect_stdout(output):
+            with patch.object(sys, "argv", [*allowed, "--interface", "standalone"]):
+                with self.assertRaisesRegex(facade.Error, "managed_device_arguments_rejected"):
+                    facade.main()
+                custody.managed_device.assert_not_called()
+                runner.assert_not_called()
+            with patch.object(sys, "argv", allowed):
+                self.assertEqual(facade.main(), 1)
+        borrowed.begin_remote_execution.assert_called_once_with()
+        borrowed.confirm_remote_stopped.assert_not_called()
+        borrowed.handoff_uncertain.assert_called_once_with("native_runner_drain_unconfirmed")
+        self.assertEqual(runner.call_args.kwargs["device_environment"], {"HOME": "/fixture"})
+        self.assertTrue(callable(runner.call_args.kwargs["before_effect"]))
+        self.assertEqual(evidence.begin_run.call_args.args[3]["attempt_id"], attempt)
+        self.assertEqual(json.loads(output.getvalue())["invocation_id"], attempt)
+        self.assertNotIn("/private", output.getvalue())
+
+    def test_managed_device_rechecks_lease_after_provider_version(self):
+        native = facade.load_bundle()["android_tools_native"]
+        approved = {"HOME": "/trusted", "ADB_SERVER_SOCKET": "tcp:127.0.0.1:5037"}
+        custody = Mock(side_effect=facade.Error("lease_lost"))
+        with patch.object(native, "_run_process",
+                          return_value=native._ProcessOutput(b"fixture 1.0", 0)) as provider:
+            result = native.execute_android_native(
+                "mobile-native", "device.key", {"device_serial": "emulator-5554", "key": "back"},
+                executable=Path(sys.executable), expected_version="1.0",
+                before_effect=custody, device_environment=approved,
+            )
+        self.assertEqual((result.error, result.effect), ("lease_lost", "not_dispatched"))
+        custody.assert_called_once_with()
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(provider.call_args.args[0][-1], "--version")
+        self.assertEqual(provider.call_args.kwargs["env"], approved)
+        self.assertEqual(provider.call_args.kwargs["cwd"], Path("/"))
+
+    def test_managed_selector_uses_the_same_environment_for_read_and_effect(self):
+        from test_android_tools_native import _ui_node_xml, _ui_xml
+
+        native = facade.load_bundle()["android_tools_native"]
+        approved = {"HOME": "/trusted", "ADB_SERVER_SOCKET": "tcp:127.0.0.1:5037"}
+        events = []
+
+        def process(command, **kwargs):
+            self.assertEqual(kwargs["env"], approved)
+            self.assertEqual(kwargs["cwd"], Path("/"))
+            if command[-1] == "--version":
+                events.append("version")
+                return native._ProcessOutput(b"fixture 1.0", 0)
+            if command[1] != "tap":
+                events.append("observe")
+                xml = _ui_xml(_ui_node_xml("android.widget.Button", text="Continue", clickable=True))
+                return native._ProcessOutput(xml.encode(), 0)
+            events.append("tap")
+            return native._ProcessOutput(b"", 0)
+
+        with patch.object(native, "_run_process", side_effect=process):
+            result = native.execute_android_native(
+                "mobile-native", "device.tap", {"device_serial": "emulator-5554", "text": "Continue"},
+                executable=Path(sys.executable), expected_version="1.0",
+                before_effect=lambda: events.append("check"), device_environment=approved,
+            )
+        self.assertIsNone(result.error)
+        self.assertEqual(events, ["version", "check", "observe", "check", "tap"])
+
+    def test_explicit_native_devices_keep_the_existing_child_environment(self):
+        native = facade.load_bundle()["android_tools_native"]
+        # Observe the actual default process boundary without a device call.
+        inherited = "tcp:127.0.0.1:46441"
+        with patch.dict(os.environ, {"ADB_SERVER_SOCKET": inherited}):
+            outcome = native._run_process(
+                (str(Path(sys.executable)), "-c", "import os; print(os.environ['ADB_SERVER_SOCKET'])"),
+                timeout_s=5, output_limit_bytes=4096,
+            )
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(outcome.stdout.decode().strip(), inherited)
+
     def test_input_dispatch_rechecks_custody_and_records_only_safe_context(self):
         native = facade.load_bundle()["android_tools_native"]
         lease = {"id": "lease", "generation": 1}

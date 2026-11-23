@@ -156,6 +156,7 @@ def execute_android_native(
     source_root: Path | None = None,
     staging_dir: Path | None = None,
     before_effect: Callable[[], None] | None = None,
+    device_environment: Mapping[str, str] | None = None,
 ) -> NativeResult:
     """Execute one closed native operation without shell expansion or retries."""
 
@@ -170,6 +171,10 @@ def execute_android_native(
             raise _InputError("unsupported_operation")
         if provider_id == "google-android" and operation not in _GOOGLE_OPERATIONS:
             raise _InputError("unsupported_operation")
+        if device_environment is not None and (
+            provider_id != "mobile-native" or before_effect is None
+        ):
+            raise _InputError("invalid_arguments")
 
         timeout = _bounded_timeout(timeout_s)
         output_limit = _bounded_output_limit(output_limit_bytes)
@@ -193,16 +198,26 @@ def execute_android_native(
 
     deadline = time.monotonic() + timeout if spec.tap_selector is not None else None
     command_prefix = ("--no-metrics",) if provider_id == "google-android" else ()
+    managed = device_environment is not None
+    process_options = {"env": device_environment} if managed else {}
+    observation_options = {**process_options, "cwd": Path("/")} if managed else {}
     version_output = _run_process(
         (str(executable_path), *command_prefix, "--version"),
         timeout_s=min(5.0, timeout) if deadline is not None else 5.0,
         output_limit_bytes=min(output_limit, 4096),
+        **observation_options,
     )
     if version_output.error is not None:
         failure = _process_failure(version_output, effectful=False)
         return replace(failure, effect="not_dispatched") if spec.tap_selector is not None else failure
     if version_output.exit_code != 0 or not _version_matches(version_output.stdout, version):
         return _not_started("provider_version_mismatch")
+
+    if managed and before_effect is not None:
+        try:
+            before_effect()
+        except (ValueError, OSError, KeyError, subprocess.SubprocessError):
+            return NativeResult("completed", "not_dispatched", "lease_lost")
 
     if spec.tap_selector is not None:
         remaining = deadline - time.monotonic()
@@ -211,6 +226,7 @@ def execute_android_native(
         observation = _run_process(
             (str(executable_path), *spec.argv),
             timeout_s=remaining, output_limit_bytes=output_limit,
+            **observation_options,
         )
         if observation.error is not None:
             return replace(_process_failure(observation, effectful=False), effect="not_dispatched")
@@ -234,7 +250,7 @@ def execute_android_native(
             source_root=source_root, staging_dir=staging_dir,
         )
 
-    if operation == "device.input":
+    if operation == "device.input" and not managed:
         try:
             before_effect()
         except (ValueError, OSError, KeyError, subprocess.SubprocessError):
@@ -244,7 +260,8 @@ def execute_android_native(
         (str(executable_path), *command_prefix, *spec.argv),
         timeout_s=timeout,
         output_limit_bytes=output_limit,
-        cwd=spec.cwd,
+        cwd=Path("/") if managed else spec.cwd,
+        **process_options,
     )
     if result.error is not None:
         return _process_failure(result, effectful=spec.effectful)
@@ -700,6 +717,7 @@ def _run_process(
     timeout_s: float,
     output_limit_bytes: int,
     cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> _ProcessOutput:
     try:
         process = subprocess.Popen(
@@ -711,6 +729,7 @@ def _run_process(
             start_new_session=True,
             umask=0o077,
             cwd=cwd,
+            env=env,
         )
     except OSError:
         return _ProcessOutput(b"", None, "provider_unavailable")
