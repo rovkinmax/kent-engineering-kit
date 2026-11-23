@@ -1,0 +1,142 @@
+--- mcp-common.sh
++++ mcp-common.sh
+@@ -205,7 +205,7 @@
+ }
+ 
+ mcp_memory_adapter() {
+-  printf '%s\n' "$HOME/.kent/bin/kent-project-memory"
++  printf '%s\n' "$HOME/.kent/ordinary-r2/bin/kent-project-memory"
+ }
+ 
+ mcp_validate_standalone_binding() {
+@@ -463,6 +463,8 @@
+   mcp_mode="$mode"
+   mcp_binding_ref_json=""
+   mcp_binding_task_json_path=""
++  mcp_settings_root=""
++  mcp_settings_project_key=""
+   if [[ "$mode" == "r2" ]]; then
+     binding_ref="$(
+       jq -ce '
+@@ -478,6 +481,33 @@
+     }
+     mcp_binding_ref_json="$binding_ref"
+     mcp_binding_task_json_path="$(jq -er '.path' <<<"$binding_ref")"
++  fi
++  if jq -e '.result | has("settings_root")' <<<"$response" >/dev/null; then
++    mcp_settings_root="$(
++      jq -er '.result.settings_root | select(type == "string" and startswith("/") and
++        (contains("/../") | not) and (endswith("/..") | not) and
++        (endswith("/") | not) and (contains("\\") | not))' <<<"$response"
++    )" || {
++      printf 'mcp_project_memory_invalid_response: external settings root missing\n' >&2
++      return 2
++    }
++    mcp_settings_project_key="$(
++      jq -er '.result.settings_project_key |
++        select(type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$"))' \
++        <<<"$response"
++    )" || {
++      printf 'mcp_project_memory_invalid_response: authenticated settings project key missing\n' >&2
++      return 2
++    }
++    if [[ "$mcp_settings_project_key" == "appsome" &&
++          "${server:-}" == "figma-api" &&
++          ! -x "$mcp_settings_root/.kent/adapters/mcp/figma-api-server.sh" ]]; then
++      printf 'mcp_project_server_missing: appsome figma-api server unavailable\n' >&2
++      return 2
++    fi
++  elif [[ "$mode" == "r2" ]]; then
++    printf 'mcp_project_memory_invalid_response: external settings root missing\n' >&2
++    return 2
+   fi
+ }
+ 
+@@ -837,9 +866,35 @@
+ resolve_project_server_command() {
+   local root="$1"
+   local server="$2"
+-  local primary candidate
++  local primary candidate settings_root
+ 
+   primary="$(primary_workspace_root "$root")"
++  settings_root="${mcp_settings_root:-}"
++  if [[ -n "$settings_root" && "$mcp_settings_project_key" != "kent-engineering-kit" ]]; then
++    for candidate in \
++      "$settings_root/.kent/adapters/mcp/servers/$server" \
++      "$settings_root/.kent/adapters/mcp/${server}-server.sh"; do
++      if [[ -x "$candidate" ]]; then
++        printf '%s\n' "$candidate"
++        return 0
++      fi
++    done
++    # Do not fall through to product/worktree executables for a bound project.
++    return 1
++  fi
++  if [[ -n "$settings_root" ]]; then
++    for candidate in \
++      "$settings_root/.kent/adapters/mcp/servers/$server" \
++      "$settings_root/.kent/adapters/mcp/${server}-server.sh"; do
++      if [[ -x "$candidate" ]]; then
++        printf '%s\n' "$candidate"
++        return 0
++      fi
++    done
++    if [[ -d "$settings_root/.kent/adapters/mcp" ]]; then
++      return 1
++    fi
++  fi
+   for candidate in \
+     "$root/.kent/adapters/mcp/servers/$server" \
+     "$root/.kent/adapters/mcp/${server}-server.sh" \
+@@ -855,7 +910,21 @@
+ 
+ resolve_project_policy_hook() {
+   local root="$1"
+-  local primary candidate
++  local primary candidate settings_root
++  if [[ "${self_test:-false}" != true ]]; then
++    mcp_resolve_binding "$root" "${standalone_binding:-}" \
++      "${task_locator:-}" || {
++        printf 'mcp_policy_hook_resolution_failed: project profile unavailable\n' >&2
++        printf '%s\n' false
++        return 0
++      }
++  fi
++  settings_root="${mcp_settings_root:-}"
++  if [[ -n "$settings_root" && "$mcp_settings_project_key" != "kent-engineering-kit" ]]; then
++    candidate="$settings_root/.kent/adapters/mcp/policy"
++    printf '%s\n' "$candidate"
++    return 0
++  fi
+ 
+   if [[ -n "${KENT_MCP_POLICY_HOOK:-}" ]]; then
+     [[ -x "$KENT_MCP_POLICY_HOOK" ]] || {
+@@ -867,7 +936,27 @@
+     return
+   fi
+ 
++  if [[ "${self_test:-false}" != true ]]; then
++    mcp_resolve_binding "$root" "${standalone_binding:-}" \
++      "${task_locator:-}" || {
++        printf 'mcp_policy_hook_resolution_failed: project profile unavailable\n' >&2
++        printf '%s\n' false
++        return 0
++      }
++  fi
++
+   primary="$(primary_workspace_root "$root")"
++  settings_root="${mcp_settings_root:-}"
++  if [[ -n "$settings_root" ]]; then
++    candidate="$settings_root/.kent/adapters/mcp/policy"
++    if [[ -x "$candidate" ]]; then
++      printf '%s\n' "$candidate"
++      return
++    fi
++    if [[ -d "$settings_root/.kent/adapters/mcp" ]]; then
++      return 1
++    fi
++  fi
+   for candidate in \
+     "$root/.kent/adapters/mcp/policy" \
+     "$primary/.kent/adapters/mcp/policy"; do

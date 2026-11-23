@@ -1,0 +1,307 @@
+--- workflow-project-memory
++++ workflow-project-memory
+@@ -15,6 +15,7 @@
+ import tempfile
+ import tomllib
+ import hashlib
++import types
+ 
+ sys.dont_write_bytecode = True
+ 
+@@ -371,22 +372,35 @@
+     return Path(value)
+ 
+ 
++def bound_profile(project_id, primary, workspace_id, binding_sha256,
++                  expected_memory, *, core=None):
++    source = Path(__file__).with_name("profile_source.py")
++    raw = record_bytes(core, source, private=True, maximum=MAX_NATIVE_OUTPUT)
++    module = types.ModuleType("_kent_ordinary_r2_profile_source")
++    module.__file__ = str(source)
++    exec(compile(raw, str(source), "exec"), module.__dict__)
++    return module.read_bound_profile(
++        project_id, primary, workspace_id, binding_sha256, expected_memory,
++        reader=record_bytes, core=core,
++    )
++
++
++def with_settings_root(result):
++    expected = PREADMISSION
++    settings_root = (expected.get("settings_root")
++                     if isinstance(expected, dict) else None)
++    if isinstance(settings_root, str):
++        result["settings_root"] = settings_root
++        config = expected.get("config")
++        project_key = config.get("project_key") if isinstance(config, dict) else None
++        if isinstance(project_key, str):
++            result["settings_project_key"] = project_key
++    return result
++
++
+ def installation_records(project_id, primary, primary_workspace_id=None):
+-    profile_path = primary / ".kent/workflow-profile.toml"
+     binding_path = Path.home() / ".kent/project-memory-bindings" / f"{project_id}.json"
+-    profile_raw = None
+-    if os.path.lexists(profile_path):
+-        profile_raw = record_bytes(None, profile_path, private=False,
+-                                   maximum=MAX_NATIVE_OUTPUT)
+-        profile = tomllib.loads(profile_raw.decode("utf-8"))
+-    else:
+-        profile = {}
+-    config = profile.get("project_memory")
+     if not os.path.lexists(binding_path):
+-        if config is None:
+-            return {"mode": "legacy", "project_id": project_id,
+-                    "primary_root": str(primary), "primary_workspace_id": primary_workspace_id,
+-                    "binding_sha256": None, "receipt": None, "binding": None}
+         raise ValueError("native R2 source binding unavailable")
+ 
+     binding_raw = record_bytes(None, binding_path, private=True,
+@@ -403,13 +404,6 @@
+     if not isinstance(binding["profile_sha256"], str) or not SHA256_PATTERN.fullmatch(
+             binding["profile_sha256"]):
+         raise ValueError("invalid installed profile digest")
+-    if not isinstance(config, dict) or set(config) != {
+-            "root", "project_key", "project_uid", "mode"} or config["mode"] != "r2":
+-        raise ValueError("installed R2 configuration incomplete")
+-    absolute_binding(config["root"])
+-    bootstrap_key(config["project_key"])
+-    bootstrap_key(config["project_uid"])
+-
+     receipt_path = absolute_binding(binding["receipt_path"])
+     kit_root = canonical_root(binding["kit_root"])
+     if (not isinstance(binding["receipt_sha256"], str)
+@@ -463,8 +457,6 @@
+         raise ValueError("published roots differ from installed bindings")
+     memory = receipt["project_memory"]
+     bootstrap_closed(memory, {"root", "project_key", "project_uid", "legacy_task_ids"})
+-    if any(memory[name] != config[name] for name in ("root", "project_key", "project_uid")):
+-        raise ValueError("cutover memory configuration differs")
+     legacy = memory["legacy_task_ids"]
+     if (not isinstance(legacy, list) or len(legacy) > MAX_SOURCE_FILES
+             or any(not isinstance(item, str) for item in legacy)
+@@ -472,13 +464,20 @@
+         raise ValueError("invalid legacy task inventory")
+     for task_id in legacy:
+         bootstrap_key(task_id)
++    binding_sha256 = hashlib.sha256(binding_raw).hexdigest()
++    profile = bound_profile(
++        project_id, primary, binding["primary_workspace_id"], binding_sha256,
++        memory,
++    )
+     return {
+         "mode": "r2", "project_id": project_id, "primary_root": str(primary),
+-        "primary_workspace_id": primary_workspace_id,
+-        "binding": binding, "binding_sha256": hashlib.sha256(binding_raw).hexdigest(),
++        "primary_workspace_id": binding["primary_workspace_id"],
++        "binding": binding, "binding_sha256": binding_sha256,
+         "profile_sha256": binding["profile_sha256"], "receipt": receipt,
+         "receipt_sha256": binding["receipt_sha256"], "kit_root": str(kit_root),
+-        "normalized_helpers": normalized_helpers, "config": config,
++        "normalized_helpers": normalized_helpers, "config": profile["config"],
++        "settings_root": profile["settings_root"],
++        "enrollment_sha256": profile["enrollment_sha256"],
+     }
+ 
+ 
+@@ -502,6 +501,34 @@
+     if native_project_id(primary) != project_id:
+         raise ValueError("native primary project mismatch")
+     return primary
++
++
++def native_primary_workspace_id(project_id, primary, workspace):
++    rows = []
++    offset = 0
++    while True:
++        inventory = native_json([
++            "project", "workspaces", "--project", project_id,
++            "--offset", str(offset), "--limit", "100", "--json",
++        ], workspace)
++        items = inventory.get("workspaces")
++        if (inventory.get("project_id") != project_id
++                or inventory.get("offset") != offset
++                or not isinstance(items, list) or len(items) > 100
++                or len(rows) + len(items) > 256):
++            raise ValueError("native workspace inventory incomplete")
++        rows.extend(items)
++        if len(items) < 100:
++            break
++        offset += len(items)
++    matches = [
++        item for item in rows
++        if isinstance(item, dict) and item.get("is_default") is True
++        and item.get("root_path") == str(primary)
++    ]
++    if len(matches) != 1:
++        raise ValueError("native primary workspace unresolved")
++    return bootstrap_key(matches[0].get("workspace_id"))
+ 
+ 
+ def native_current_session(task, session_id):
+@@ -513,2 +549,2 @@
+-def native_worktree_task_hint(workspace, session_id):
++def native_worktree_task_hint(workspace, session_id, *, strict_workspace=False):
+     status = native_json([
+@@ -537,4 +565,6 @@
+         if (recorded_root != observed_root or recorded_root != workspace_root
+                 or effective_workdir != recorded_root):
+             raise ValueError("native worktree status conflicts")
++        if strict_workspace and recorded_root != workspace:
++            raise ValueError("native Session workspace differs")
+         return None
+@@ -553,4 +583,6 @@
+     if worktree_root != workspace:
++        if strict_workspace:
++            raise ValueError("native Session workspace differs")
+         return None
+     return worktree_name
+ 
+@@ -793,11 +820,15 @@
+         maximum=MAX_RECEIPT_BYTES)
+     if hashlib.sha256(receipt_raw).hexdigest() != installation["receipt_sha256"]:
+         raise ValueError("source receipt changed during admission")
+-    profile_raw = record_bytes(
+-        None, Path(installation["primary_root"]) / ".kent/workflow-profile.toml",
+-        private=False, maximum=MAX_NATIVE_OUTPUT)
+-    if tomllib.loads(profile_raw.decode("utf-8")).get("project_memory") != installation["config"]:
+-        raise ValueError("primary storage configuration changed during admission")
++    current_profile = bound_profile(
++        installation["project_id"], Path(installation["primary_root"]),
++        installation["primary_workspace_id"], installation["binding_sha256"],
++        installation["receipt"]["project_memory"],
++    )
++    if (current_profile["config"] != installation["config"]
++            or current_profile["settings_root"] != installation["settings_root"]
++            or current_profile["enrollment_sha256"] != installation["enrollment_sha256"]):
++        raise ValueError("external storage configuration changed during admission")
+ 
+ 
+ def preflight_source_admission(interface, request):
+@@ -829,7 +860,10 @@
+             and request.get("native_context") is None):
+         project_id = native_project_id(requested_workspace)
+         primary = native_primary(project_id, requested_workspace, require_git=False)
+-        installation = installation_records(project_id, primary)
++        primary_workspace_id = native_primary_workspace_id(
++            project_id, primary, requested_workspace,
++        )
++        installation = installation_records(project_id, primary, primary_workspace_id)
+         if installation["mode"] == "legacy" and requested_workspace == primary:
+             return {
+                 **installation, "interface": interface, "standalone": False,
+@@ -843,13 +877,23 @@
+             raise ValueError("standalone binding conflicts with native task")
++        session_id = os.environ.get("KENT_SESSION_ID")
++        if session_id:
++            bootstrap_key(session_id)
++            native_worktree_task_hint(
++                workspace, session_id, strict_workspace=True,
++            )
+         project_id = native_project_id(workspace)
+         primary = native_primary(project_id, workspace)
+-        installation = installation_records(project_id, primary)
++        primary_workspace_id = native_primary_workspace_id(
++            project_id, primary, workspace,
++        )
++        installation = installation_records(project_id, primary, primary_workspace_id)
+         if installation["mode"] != "r2":
+             raise ValueError("standalone R2 source binding unavailable")
+         confirm_source_binding(installation)
+         return {
+             **installation, "mode": "r2", "interface": interface,
+             "standalone": True, "workspace": str(workspace), "task_id": None,
++            "primary_workspace_id": primary_workspace_id,
+             "standalone_binding_sha256": hashlib.sha256(json.dumps(
+                 request["standalone_binding"], ensure_ascii=False, sort_keys=True,
+                 separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest(),
+@@ -859,7 +897,10 @@
+     task, script, session_id = native_task_context(request, workspace, project_id)
+     if task is None:
+         primary = native_primary(project_id, workspace)
+-        installation = installation_records(project_id, primary)
++        primary_workspace_id = native_primary_workspace_id(
++            project_id, primary, workspace,
++        )
++        installation = installation_records(project_id, primary, primary_workspace_id)
+         if installation["mode"] == "legacy":
+             return {
+                 **installation, "interface": interface, "standalone": False,
+@@ -978,7 +1019,6 @@
+         raise ValueError("native source pre-admission required")
+     assert_preadmission(project_id, Path(expected["workspace"]), primary,
+                         summary["id"], primary_workspace_id)
+-    profile_path = primary / ".kent/workflow-profile.toml"
+     binding_path = Path.home() / ".kent/project-memory-bindings" / f"{project_id}.json"
+     if not os.path.lexists(binding_path):
+         raise ValueError("native R2 installation binding unavailable")
+@@ -994,13 +1034,6 @@
+             or binding["profile_sha256"] != expected.get("profile_sha256")
+             or binding["kit_root"] != expected.get("kit_root")):
+         raise ValueError("native source binding differs from admission")
+-    profile_raw = record_bytes(core, profile_path, private=False)
+-    if len(profile_raw) > core.MAX_BYTES:
+-        raise ValueError("primary profile exceeds limit")
+-    config = tomllib.loads(profile_raw.decode()).get("project_memory")
+-    if (not isinstance(config, dict) or set(config) != {"root", "project_key", "project_uid", "mode"}
+-            or config["mode"] != "r2" or config != expected["config"]):
+-        raise ValueError("installed R2 configuration incomplete")
+     receipt_raw = record_bytes(core, Path(binding["receipt_path"]),
+                                maximum=MAX_RECEIPT_BYTES)
+     if core._digest(receipt_raw) != binding["receipt_sha256"]:
+@@ -1026,15 +1059,24 @@
+     memory = receipt["project_memory"]
+     if not isinstance(memory, dict) or set(memory) != {
+             "root", "project_key", "project_uid", "legacy_task_ids"}:
+         raise ValueError("invalid cutover memory declaration")
++    profile = bound_profile(
++        project_id, primary, primary_workspace_id, expected["binding_sha256"],
++        memory, core=core,
++    )
++    config = profile["config"]
++    if (config != expected["config"]
++            or profile["settings_root"] != expected["settings_root"]
++            or profile["enrollment_sha256"] != expected["enrollment_sha256"]):
++        raise ValueError("external storage configuration changed after admission")
+     if any(memory[key] != config[key] for key in ("root", "project_key", "project_uid")):
+         raise ValueError("cutover configuration differs")
+     legacy = memory["legacy_task_ids"]
+     if (not isinstance(legacy, list) or len(legacy) > 256
+             or any(not isinstance(item, str) for item in legacy) or len(set(legacy)) != len(legacy)):
+         raise ValueError("invalid legacy task inventory")
+     for task_id in legacy:
+         core._key(task_id)
+     confirm_source_binding(expected)
+     store = core.ProjectMemory(Path(config["root"]), config["project_key"], config["project_uid"])
+     store._project()
+@@ -1157,13 +1218,13 @@
+     if graph.get("workflow_id") != workflow:
+         raise ValueError("acceptance graph identity differs")
+     def selector():
+-        profile = tomllib.loads(record_bytes(
+-            core, primary / ".kent/workflow-profile.toml", private=False,
+-            maximum=MAX_NATIVE_OUTPUT).decode("utf-8"))
+-        commands = profile.get("commands")
+-        command = commands.get("plan_contract_accept") if isinstance(commands, dict) else None
++        bound_profile(
++            project, primary, source["workspace_id"], PREADMISSION["binding_sha256"],
++            PREADMISSION["receipt"]["project_memory"], core=core,
++        )
++        command = ".kent/scripts/workflow-plan-contract-accept"
+         if (not isinstance(command, str) or not command
+                 or command.startswith("/") or "\\" in command or "\x00" in command
+                 or any(part in ("", ".", "..") for part in command.split("/"))):
+             raise ValueError("acceptance command unavailable")
+         return command
+@@ -1404,7 +1404,10 @@
+     store, task, locator = (resolve_standalone(core, request) if "standalone_binding" in request
+                             else resolve_native(core, request))
+     if operation == "resolve-mcp":
+-        return {"mode": "r2" if store is not None else "legacy", "binding_ref": locator}
++        result = {"mode": "r2" if store is not None else "legacy", "binding_ref": locator}
++        if isinstance(PREADMISSION, dict) and PREADMISSION.get("mode") == "r2":
++            result = with_settings_root(result)
++        return result
+     if store is None:
+         raise ValueError("R2 operation unavailable for legacy task")
+     if request["binding_ref"] != locator:

@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Build or install the side-by-side ordinary R2 runtime without alias changes."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+SCHEMA = "ordinary-r2-install-manifest-v1"
+SOURCE_DIGESTS = {
+    "templates/project/workflow-project-memory":
+        "e4c51b78936c27e805b77e8527b9d73da1124034daeb2a79ac4b86895048b053",
+    "adapters/mcp/mcp-common.sh":
+        "a99e8825f7c2d6ae36b496e79fc82f5e310e79fd8cf90dd5d7ff50705ce4c9ec",
+    "adapters/mcp/kent-mcp-call":
+        "dbeb7b203b585b31d88f29586285e86f6d7faec06446eccbc6b94119b5b8642b",
+    "adapters/mcp/kent-mcp-list":
+        "894c264145a2c3e45ef7e94743dcf803daf49668f9ec86e55de0f92f5b4c2c98",
+    "adapters/ordinary-r2/profile_source.py":
+        "6c9d5404ab23037664847809ea825dc6607a6c9970edf0e0bee453238a29f5bc",
+}
+PATCH_FILES = {
+    "ordinary-facade.patch": "workflow-project-memory",
+    "mcp-common.patch": "mcp-common.sh",
+}
+INSTALLED_MODES = {
+    "bin/kent-project-memory": 0o700,
+    "bin/kent-mcp-call": 0o700,
+    "bin/kent-mcp-list": 0o700,
+    "bin/mcp-common.sh": 0o600,
+    "bin/profile_source.py": 0o600,
+}
+
+
+class InstallError(ValueError):
+    pass
+
+
+def digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def safe_source(path: Path) -> bytes:
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise InstallError("ordinary R2 source input is unavailable") from error
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or info.st_uid != os.getuid() or info.st_mode & 0o7022
+            or info.st_mode & 0o7000):
+        raise InstallError("ordinary R2 source input is unsafe")
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise InstallError("ordinary R2 source input is unavailable") from error
+    after = path.lstat()
+    if ((info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns)
+            or len(raw) != info.st_size):
+        raise InstallError("ordinary R2 source input changed during read")
+    return raw
+
+
+def apply_patch(name: str, source: bytes, patch_raw: bytes) -> bytes:
+    target = PATCH_FILES[name]
+    expected_header = f"--- {target}\n+++ {target}\n".encode()
+    if not patch_raw.startswith(expected_header):
+        raise InstallError("ordinary R2 patch target differs")
+    executable = shutil.which("patch")
+    if executable is None:
+        raise InstallError("system patch utility is unavailable")
+    with tempfile.TemporaryDirectory(prefix="ordinary-r2-patch-") as directory:
+        root = Path(directory)
+        staged = root / target
+        staged.write_bytes(source)
+        result = subprocess.run(
+            [executable, "-f", "-F0", "-p0", "-V", "none"],
+            input=patch_raw, cwd=root, capture_output=True, timeout=30, check=False,
+        )
+        if result.returncode:
+            raise InstallError("ordinary R2 patch preimage differs")
+        if sorted(path.name for path in root.iterdir()) != [target]:
+            raise InstallError("ordinary R2 patch changed its closed staging set")
+        output = staged.read_bytes()
+        if not output or staged.is_symlink() or not staged.is_file():
+            raise InstallError("ordinary R2 patch output is invalid")
+        return output
+
+
+def replace_exact(
+    source: bytes, before: bytes, after: bytes, *, expected_count: int,
+) -> bytes:
+    if source.count(before) != expected_count:
+        raise InstallError("ordinary R2 facade transformation preimage differs")
+    return source.replace(before, after)
+
+
+def complete_facade_responses(source: bytes) -> bytes:
+    source = replace_exact(
+        source,
+        b'        return {"mode": "legacy", "binding_ref": None}',
+        b'        return with_settings_root({"mode": "legacy", "binding_ref": None})',
+        expected_count=3,
+    )
+    return replace_exact(
+        source,
+        b'''    return {"mode": "r2", "binding_ref": locator, "task_key": task,
+            "project_path": str(store.path), "project_uid": store.project_uid,
+            "task_uid": store._task(task)["task_uid"]}''',
+        b'''    result = {"mode": "r2", "binding_ref": locator, "task_key": task,
+            "project_path": str(store.path), "project_uid": store.project_uid,
+            "task_uid": store._task(task)["task_uid"]}
+    return with_settings_root(result) if operation == "resolve-task" else result''',
+        expected_count=1,
+    )
+
+
+def build_files(repository: Path) -> tuple[dict[str, bytes], dict[str, str]]:
+    inputs: dict[str, bytes] = {}
+    for relative, expected in SOURCE_DIGESTS.items():
+        raw = safe_source(repository / relative)
+        if digest(raw) != expected:
+            raise InstallError(f"ordinary R2 source preimage differs: {relative}")
+        inputs[relative] = raw
+
+    patch_root = repository / "adapters/ordinary-r2"
+    patch_inputs = {
+        name: safe_source(patch_root / name)
+        for name in PATCH_FILES
+    }
+    facade = apply_patch(
+        "ordinary-facade.patch", inputs["templates/project/workflow-project-memory"],
+        patch_inputs["ordinary-facade.patch"],
+    )
+    facade = complete_facade_responses(facade)
+    common = apply_patch(
+        "mcp-common.patch", inputs["adapters/mcp/mcp-common.sh"],
+        patch_inputs["mcp-common.patch"],
+    )
+    outputs = {
+        "bin/kent-project-memory": facade,
+        "bin/kent-mcp-call": inputs["adapters/mcp/kent-mcp-call"],
+        "bin/kent-mcp-list": inputs["adapters/mcp/kent-mcp-list"],
+        "bin/mcp-common.sh": common,
+        "bin/profile_source.py": inputs["adapters/ordinary-r2/profile_source.py"],
+    }
+    manifest_inputs = {
+        **{relative: digest(raw) for relative, raw in inputs.items()},
+        **{
+            f"adapters/ordinary-r2/{name}": digest(raw)
+            for name, raw in patch_inputs.items()
+        },
+    }
+    return outputs, manifest_inputs
+
+
+def manifest(destination: Path, outputs: dict[str, bytes],
+             inputs: dict[str, str]) -> dict[str, object]:
+    return {
+        "schema": SCHEMA,
+        "destination": str(destination),
+        "files": [
+            {
+                "path": relative,
+                "sha256": digest(raw),
+                "mode": format(INSTALLED_MODES[relative], "04o"),
+            }
+            for relative, raw in sorted(outputs.items())
+        ],
+        "entrypoints": {
+            "workflow": str(destination / "bin/kent-project-memory"),
+            "mcp_call": str(destination / "bin/kent-mcp-call"),
+            "mcp_list": str(destination / "bin/kent-mcp-list"),
+        },
+        "enrollment_directory": str(destination / "enrollments"),
+        "enrollment_required": True,
+        "source_inputs": dict(sorted(inputs.items())),
+        "effects": {
+            "public_aliases_changed": False,
+            "primary_workspaces_changed": False,
+            "project_profiles_changed": False,
+            "r2_data_changed": False,
+        },
+    }
+
+
+def checked_destination() -> Path:
+    home = Path.home()
+    if not home.is_absolute() or home.resolve(strict=True) != home:
+        raise InstallError("home directory binding is unsafe")
+    kent_root = home / ".kent"
+    try:
+        info = kent_root.lstat()
+    except OSError as error:
+        raise InstallError("private Kent root is unavailable") from error
+    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid() or info.st_mode & 0o022
+            or info.st_mode & 0o7000):
+        raise InstallError("Kent root is unsafe")
+    return kent_root / "ordinary-r2"
+
+
+def verify_existing(destination: Path, outputs: dict[str, bytes]) -> bool:
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid() or info.st_mode & 0o077
+            or info.st_mode & 0o7000):
+        raise InstallError("ordinary R2 destination is unsafe")
+    if set(path.name for path in destination.iterdir()) != {"bin", "enrollments"}:
+        raise InstallError("ordinary R2 destination contains unknown entries")
+    bin_dir = destination / "bin"
+    bin_info = bin_dir.lstat()
+    if (not stat.S_ISDIR(bin_info.st_mode) or stat.S_ISLNK(bin_info.st_mode)
+            or bin_info.st_uid != os.getuid() or bin_info.st_mode & 0o077
+            or bin_info.st_mode & 0o7000):
+        raise InstallError("ordinary R2 binary directory is unsafe")
+    actual_names = {f"bin/{path.name}" for path in bin_dir.iterdir()}
+    if actual_names != set(INSTALLED_MODES):
+        raise InstallError("ordinary R2 destination contains unknown files")
+    for relative, expected in outputs.items():
+        path = destination / relative
+        file_info = path.lstat()
+        if (not stat.S_ISREG(file_info.st_mode) or stat.S_ISLNK(file_info.st_mode)
+                or file_info.st_nlink != 1 or file_info.st_uid != os.getuid()
+                or stat.S_IMODE(file_info.st_mode) != INSTALLED_MODES[relative]
+                or path.read_bytes() != expected):
+            raise InstallError("ordinary R2 destination differs from manifest")
+    enrollment_dir = destination / "enrollments"
+    enrollment_info = enrollment_dir.lstat()
+    if (not stat.S_ISDIR(enrollment_info.st_mode) or stat.S_ISLNK(enrollment_info.st_mode)
+            or enrollment_info.st_uid != os.getuid() or enrollment_info.st_mode & 0o077
+            or enrollment_info.st_mode & 0o7000):
+        raise InstallError("ordinary R2 enrollment directory is unsafe")
+    return True
+
+
+def install(destination: Path, outputs: dict[str, bytes]) -> None:
+    if verify_existing(destination, outputs):
+        return
+    parent = destination.parent
+    stage = Path(tempfile.mkdtemp(prefix=".ordinary-r2-stage-", dir=parent))
+    reservation = None
+    try:
+        os.chmod(stage, 0o700)
+        bin_dir = stage / "bin"
+        enrollment_dir = stage / "enrollments"
+        bin_dir.mkdir(mode=0o700)
+        enrollment_dir.mkdir(mode=0o700)
+        for relative, raw in outputs.items():
+            path = stage / relative
+            descriptor = os.open(
+                path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                INSTALLED_MODES[relative],
+            )
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(path, INSTALLED_MODES[relative])
+        try:
+            os.mkdir(destination, mode=0o700)
+        except FileExistsError as error:
+            raise InstallError("ordinary R2 destination appeared during installation") from error
+        reserved = destination.lstat()
+        reservation = (reserved.st_dev, reserved.st_ino)
+        os.rename(bin_dir, destination / "bin")
+        os.rename(enrollment_dir, destination / "enrollments")
+        stage.rmdir()
+        descriptor = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except Exception:
+        if reservation is not None:
+            try:
+                current = destination.lstat()
+                if ((current.st_dev, current.st_ino) == reservation
+                        and {path.name for path in destination.iterdir()}
+                        <= {"bin", "enrollments"}):
+                    shutil.rmtree(destination)
+            except OSError:
+                pass
+        if stage.exists():
+            shutil.rmtree(stage)
+        raise
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--manifest", action="store_true",
+                      help="print the exact installation manifest (default)")
+    mode.add_argument("--check", action="store_true",
+                      help="verify source preimages and both staged patches")
+    mode.add_argument("--apply", action="store_true",
+                      help="install the side-by-side runtime under ~/.kent/ordinary-r2")
+    args = parser.parse_args()
+    try:
+        repository = Path(__file__).resolve().parents[1]
+        destination = checked_destination()
+        outputs, inputs = build_files(repository)
+        result = manifest(destination, outputs, inputs)
+        if args.apply:
+            install(destination, outputs)
+            result["installed"] = True
+        elif args.check:
+            result["verified"] = True
+        else:
+            result["installed"] = False
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return 0
+    except (InstallError, OSError, subprocess.SubprocessError) as error:
+        print(f"install-ordinary-r2: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

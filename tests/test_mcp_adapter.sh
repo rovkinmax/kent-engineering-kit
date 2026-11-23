@@ -13,6 +13,7 @@ fake_bin="$tmp/bin"
 main="$tmp/Example"
 worktree="$tmp/TASK-1"
 r2_worktree="$tmp/TASK-R2"
+kit_r2_worktree="$tmp/TASK-KIT-R2"
 memory_bin="$home/.kent/bin"
 mkdir -p "$memory_bin" "$home/.mcporter" "$fake_bin" "$main"
 
@@ -24,6 +25,7 @@ git -C "$main" add tracked
 git -C "$main" commit -qm "Initial"
 git -C "$main" worktree add -qb task "$worktree"
 git -C "$main" worktree add --detach "$r2_worktree" HEAD
+git -C "$main" worktree add --detach "$kit_r2_worktree" HEAD
 
 cat >"$main/.mcp.json" <<'JSON'
 {
@@ -88,12 +90,6 @@ MAX_BODY = 8 * 1024 * 1024
 MAX_HEADER = 64 * 1024
 home = Path(os.environ["HOME"])
 control = home / ".kent"
-expected_binding = json.loads((control / "test-binding.json").read_text())
-state = Path(expected_binding["project_path"])
-task_root = state / "tasks" / expected_binding["task_key"]
-object_root = task_root / "artifacts" / "mcp" / "objects"
-call_root = task_root / "artifacts" / "mcp" / "calls"
-cache_root = task_root / "artifacts" / "mcp" / "cache"
 trace = control / "mcp-protocol.jsonl"
 
 
@@ -130,6 +126,31 @@ if (not isinstance(request, dict)
         or not isinstance(request.get("operation"), str)):
     fail("invalid_request")
 
+kit_workspace = os.environ.get("KENT_MCP_KIT_WORKSPACE")
+settings_root_name = (
+    "KENT_MCP_KIT_SETTINGS_ROOT"
+    if request.get("workspace_path") == kit_workspace
+    else "KENT_MCP_APP_SETTINGS_ROOT"
+)
+settings_root = os.environ.get(settings_root_name)
+if not isinstance(settings_root, str) or not Path(settings_root).is_absolute():
+    fail("external_settings_root_missing")
+settings_project_key = (
+    "kent-engineering-kit"
+    if request.get("workspace_path") == kit_workspace
+    else "appsome"
+)
+binding_name = (
+    "test-binding-kit.json"
+    if request.get("workspace_path") == kit_workspace
+    else "test-binding.json"
+)
+expected_binding = json.loads((control / binding_name).read_text())
+state = Path(expected_binding["project_path"])
+task_root = state / "tasks" / expected_binding["task_key"]
+object_root = task_root / "artifacts" / "mcp" / "objects"
+call_root = task_root / "artifacts" / "mcp" / "calls"
+cache_root = task_root / "artifacts" / "mcp" / "cache"
 operation = request["operation"]
 body = b""
 if operation == "put-artifact":
@@ -209,7 +230,8 @@ mode = (control / "mcp-mode").read_text().strip()
 if operation == "resolve-mcp":
     verify_workspace()
     if mode == "legacy":
-        response({"mode": "legacy"})
+        response({"mode": "legacy", "settings_root": settings_root,
+                  "settings_project_key": settings_project_key})
     elif mode == "r2":
         supplied = request.get("standalone_binding")
         if supplied != expected_binding or os.environ.get("KENT_TASK_ID", ""):
@@ -220,6 +242,8 @@ if operation == "resolve-mcp":
                 "path": str(task_root / "task.json"),
                 "sha256": expected_binding["task_binding_sha256"],
             },
+            "settings_root": settings_root,
+            "settings_project_key": settings_project_key,
         })
     else:
         fail("unknown_mode")
@@ -354,8 +378,17 @@ else:
     fail("unsupported_operation")
 PY
 chmod +x "$memory_bin/kent-project-memory"
+
+# Build the approved sidecar under this test's disposable HOME, then exercise
+# its copied MCP wrappers while retaining the narrow protocol fixture.
+HOME="$home" python3 "$repo_root/scripts/install-ordinary-r2" --apply >/dev/null
+ordinary_bin="$home/.kent/ordinary-r2/bin"
+cp "$memory_bin/kent-project-memory" "$ordinary_bin/kent-project-memory"
+chmod 700 "$ordinary_bin/kent-project-memory"
+call_adapter="$ordinary_bin/kent-mcp-call"
+list_adapter="$ordinary_bin/kent-mcp-list"
 echo legacy >"$home/.kent/mcp-mode"
-r2_project_path="$tmp/R2/kent-engineering-kit"
+r2_project_path="$tmp/R2/appsome"
 standalone_binding="$(
   jq -cn \
     --arg project_path "$r2_project_path" \
@@ -367,19 +400,45 @@ standalone_binding="$(
       task_uid:$task_uid,task_binding_sha256:$task_binding_sha256}'
 )"
 printf '%s\n' "$standalone_binding" >"$home/.kent/test-binding.json"
+kit_r2_project_path="$tmp/R2/kent-engineering-kit"
+kit_standalone_binding="$(
+  jq -cn \
+    --arg project_path "$kit_r2_project_path" \
+    --arg project_uid "project-44444444-4444-4444-8444-444444444444" \
+    --arg task_key "intake-55555555-5555-4555-8555-555555555555" \
+    --arg task_uid "task-66666666-6666-4666-8666-666666666666" \
+    --arg task_binding_sha256 "$(printf 'c%.0s' {1..64})" \
+    '{project_path:$project_path,project_uid:$project_uid,task_key:$task_key,
+      task_uid:$task_uid,task_binding_sha256:$task_binding_sha256}'
+)"
+printf '%s\n' "$kit_standalone_binding" >"$home/.kent/test-binding-kit.json"
+export KENT_MCP_KIT_WORKSPACE="$kit_r2_worktree"
+app_settings_root="$tmp/settings/appsome"
+kit_settings_root="$tmp/settings/kit"
+mkdir -p "$app_settings_root" "$kit_settings_root"
+export KENT_MCP_APP_SETTINGS_ROOT="$app_settings_root"
+export KENT_MCP_KIT_SETTINGS_ROOT="$kit_settings_root"
 call_count_file="$tmp/mcporter-calls"
 : >"$call_count_file"
 : >"$home/.kent/mcp-protocol.jsonl"
+mkdir -p "$app_settings_root/.kent/adapters/mcp"
+cat >"$app_settings_root/.kent/adapters/mcp/policy" <<'SH'
+#!/usr/bin/env bash
+echo inherit
+SH
+chmod +x "$app_settings_root/.kent/adapters/mcp/policy"
 
 r2_memory_request() {
   HOME="$home" KENT_TASK_ID= "$memory_bin/kent-project-memory" mcp
 }
 
 new_r2_invocation() {
+  local workspace="${1:-$r2_worktree}"
+  local binding="${2:-$standalone_binding}"
   local resolve_request resolved binding_ref allocation_request
   resolve_request="$(
-    jq -cn --arg workspace "$r2_worktree" \
-      --argjson standalone "$standalone_binding" \
+    jq -cn --arg workspace "$workspace" \
+      --argjson standalone "$binding" \
       '{schema:"r2-mcp-request-v1",operation:"resolve-mcp",
         workspace_path:$workspace,standalone_binding:$standalone}'
   )"
@@ -387,9 +446,9 @@ new_r2_invocation() {
   binding_ref="$(jq -ce '.result.binding_ref | select(type == "object")' \
     <<<"$resolved")"
   allocation_request="$(
-    jq -cn --arg workspace "$r2_worktree" \
+    jq -cn --arg workspace "$workspace" \
       --argjson binding_ref "$binding_ref" \
-      --argjson standalone "$standalone_binding" \
+      --argjson standalone "$binding" \
       '{schema:"r2-mcp-request-v1",operation:"new-invocation",
         workspace_path:$workspace,binding_ref:$binding_ref,
         standalone_binding:$standalone}'
@@ -415,9 +474,10 @@ run_adapter() {
 
 run_r2_adapter() {
   local log="$1"
+  local workspace="${KENT_MCP_WORKSPACE:-$r2_worktree}"
   shift
   (
-    cd "$r2_worktree"
+    cd "$workspace"
     HOME="$home" \
       PATH="$fake_bin:$PATH" \
       MCPORTER_ARGS_LOG="$log" \
@@ -425,6 +485,7 @@ run_r2_adapter() {
       MCPORTER_STDERR_FILE="${MCPORTER_STDERR_FILE:-}" \
       MCPORTER_EXIT_CODE="${MCPORTER_EXIT_CODE:-0}" \
       MCPORTER_CALL_COUNT_FILE="$call_count_file" \
+      KENT_MCP_KIT_WORKSPACE="$kit_r2_worktree" \
       KENT_TASK_ID= \
       "$@"
   )
@@ -518,6 +579,40 @@ write_hash_tokens_fixture() {
 "$call_adapter" --self-test
 
 args_log="$tmp/call-args"
+"$call_adapter" --self-test
+
+figma_calls_before="$(wc -l <"$call_count_file" | tr -d '[:space:]')"
+test "$figma_calls_before" = 0
+if run_r2_adapter "$args_log" "$call_adapter" figma-api.inspect \
+  --allow-mutate \
+  >"$tmp/app-missing-figma-call.out" \
+  2>"$tmp/app-missing-figma-call.err"; then
+  echo "Appsome MCP call accepted a missing bound Figma server" >&2
+  exit 1
+fi
+grep -F 'mcp_project_server_missing: appsome figma-api server unavailable' \
+  "$tmp/app-missing-figma-call.err" >/dev/null
+test ! -s "$tmp/app-missing-figma-call.out"
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$figma_calls_before"
+
+figma_cache="$r2_worktree/build/mcp-cache/figma-api-schema.json"
+mkdir -p "$(dirname "$figma_cache")"
+printf '%s\n' '{"tools":[{"name":"stale-product-tool"}]}' >"$figma_cache"
+if run_r2_adapter "$args_log" "$list_adapter" figma-api --schema \
+  >"$tmp/app-missing-figma-list.out" \
+  2>"$tmp/app-missing-figma-list.err"; then
+  echo "Appsome MCP list used a cache despite a missing bound Figma server" >&2
+  exit 1
+fi
+grep -F 'mcp_project_server_missing: appsome figma-api server unavailable' \
+  "$tmp/app-missing-figma-list.err" >/dev/null
+test ! -s "$tmp/app-missing-figma-list.out"
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$figma_calls_before"
+rm "$figma_cache"
+rmdir "$r2_worktree/build/mcp-cache" "$r2_worktree/build"
+
 run_adapter "$args_log" "$call_adapter" example.inspect --allow-mutate >/dev/null
 grep -Fx -- "--config" "$args_log" >/dev/null
 grep -Fx -- "$main/.mcp.json" "$args_log" >/dev/null
@@ -1244,6 +1339,12 @@ cat >"$main/.kent/adapters/mcp/servers/custom" <<'SH'
 exit 0
 SH
 chmod +x "$main/.kent/adapters/mcp/servers/custom"
+mkdir -p "$app_settings_root/.kent/adapters/mcp/servers"
+cat >"$app_settings_root/.kent/adapters/mcp/servers/custom" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$app_settings_root/.kent/adapters/mcp/servers/custom"
 cat >"$main/.kent/adapters/mcp/policy" <<'SH'
 #!/usr/bin/env bash
 if [[ "$1" == "custom.inspect" ]]; then
@@ -1253,9 +1354,19 @@ else
 fi
 SH
 chmod +x "$main/.kent/adapters/mcp/policy"
+cat >"$app_settings_root/.kent/adapters/mcp/policy" <<'SH'
+#!/usr/bin/env bash
+if [[ "$1" == "custom.inspect" ]]; then
+  echo read-only
+else
+  echo inherit
+fi
+SH
+chmod +x "$app_settings_root/.kent/adapters/mcp/policy"
 run_adapter "$args_log" "$call_adapter" custom.inspect --no-save-raw >/dev/null
 grep -Fx -- "--stdio" "$args_log" >/dev/null
-grep -Fx -- "$main/.kent/adapters/mcp/servers/custom" "$args_log" >/dev/null
+grep -Fx -- "$app_settings_root/.kent/adapters/mcp/servers/custom" \
+  "$args_log" >/dev/null
 
 rm -f "$home/.kent/mcp.Example.env"
 run_adapter "$args_log" "$list_adapter" example --schema >/dev/null
@@ -1306,6 +1417,114 @@ echo r2 >"$home/.kent/mcp-mode"
 # Caller instructions and graph artifacts are not storage authority. The real
 # installed-core/receipt boundary is exercised by test_project_memory.py; this
 # wire fixture ensures wrappers do not add their own source-admission gate.
+mkdir -p "$app_settings_root/.kent/adapters/mcp/servers"
+cat >"$app_settings_root/.kent/adapters/mcp/servers/custom" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$app_settings_root/.kent/adapters/mcp/servers/custom"
+cat >"$app_settings_root/.kent/adapters/mcp/policy" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  custom.inspect) echo read-only ;;
+  custom.blocked) echo blocked ;;
+  *) echo inherit ;;
+esac
+SH
+chmod +x "$app_settings_root/.kent/adapters/mcp/policy"
+
+policy_calls_before="$(wc -l <"$call_count_file" | tr -d '[:space:]')"
+if run_r2_adapter "$args_log" "$call_adapter" custom.blocked \
+  --standalone-binding "$standalone_binding" \
+  >"$tmp/app-mcp-policy-blocked.out" 2>"$tmp/app-mcp-policy-blocked.err"; then
+  echo "Appsome external MCP policy was not applied" >&2
+  exit 1
+fi
+grep -F 'mcp_policy_blocked: custom.blocked' \
+  "$tmp/app-mcp-policy-blocked.err" >/dev/null
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$policy_calls_before"
+
+app_server_invocation="$(new_r2_invocation)"
+app_server_id="$(jq -er '.result.invocation_id' <<<"$app_server_invocation")"
+run_r2_adapter "$args_log" "$call_adapter" custom.inspect \
+  --standalone-binding "$standalone_binding" \
+  --invocation-id "$app_server_id" >"$tmp/app-external-server.out"
+grep -Fx -- "$app_settings_root/.kent/adapters/mcp/servers/custom" \
+  "$args_log" >/dev/null
+
+external_custom="$app_settings_root/.kent/adapters/mcp/servers/custom"
+primary_custom="$main/.kent/adapters/mcp/servers/custom"
+mv "$external_custom" "$tmp/appsome-custom-server"
+server_log_start="$(wc -l <"$args_log" | tr -d '[:space:]')"
+missing_server_invocation="$(new_r2_invocation)"
+missing_server_id="$(jq -er '.result.invocation_id' <<<"$missing_server_invocation")"
+run_r2_adapter "$args_log" "$call_adapter" custom.inspect \
+  --standalone-binding "$standalone_binding" \
+  --invocation-id "$missing_server_id" >"$tmp/app-missing-external-server.out"
+if sed -n "$((server_log_start + 1)),$ p" "$args_log" |
+  grep -Fx -- "$primary_custom" >/dev/null; then
+  echo "Appsome MCP server fell back to a product/worktree executable" >&2
+  exit 1
+fi
+mv "$tmp/appsome-custom-server" "$external_custom"
+
+external_policy="$app_settings_root/.kent/adapters/mcp/policy"
+mv "$external_policy" "$tmp/appsome-policy"
+policy_calls_before="$(wc -l <"$call_count_file" | tr -d '[:space:]')"
+missing_policy_invocation="$(new_r2_invocation)"
+missing_policy_id="$(jq -er '.result.invocation_id' <<<"$missing_policy_invocation")"
+if run_r2_adapter "$args_log" "$call_adapter" custom.inspect \
+  --standalone-binding "$standalone_binding" \
+  --invocation-id "$missing_policy_id" \
+  >"$tmp/app-missing-external-policy.out" \
+  2>"$tmp/app-missing-external-policy.err"; then
+  echo "Appsome MCP policy fell back to a product/worktree policy" >&2
+  exit 1
+fi
+grep -F 'mcp_policy_hook_failed:' \
+  "$tmp/app-missing-external-policy.err" >/dev/null
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$policy_calls_before"
+mv "$tmp/appsome-policy" "$external_policy"
+
+external_mcp_dir="$app_settings_root/.kent/adapters/mcp"
+mv "$external_mcp_dir" "$tmp/appsome-mcp-directory"
+cat >"$tmp/appsome-policy-override" <<'SH'
+#!/usr/bin/env bash
+echo read-only
+SH
+chmod +x "$tmp/appsome-policy-override"
+policy_calls_before="$(wc -l <"$call_count_file" | tr -d '[:space:]')"
+missing_directory_invocation="$(new_r2_invocation)"
+missing_directory_id="$(jq -er '.result.invocation_id' \
+  <<<"$missing_directory_invocation")"
+if KENT_MCP_POLICY_HOOK="$tmp/appsome-policy-override" \
+  run_r2_adapter "$args_log" "$call_adapter" custom.blocked \
+    --standalone-binding "$standalone_binding" \
+    --invocation-id "$missing_directory_id" \
+    >"$tmp/app-missing-external-directory.out" \
+    2>"$tmp/app-missing-external-directory.err"; then
+  echo "Appsome MCP accepted an environment policy override without external policy" >&2
+  exit 1
+fi
+grep -F 'mcp_policy_hook_failed:' \
+  "$tmp/app-missing-external-directory.err" >/dev/null
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$policy_calls_before"
+
+selected_app_server="$(
+  bash -c '
+    source "$1"
+    mcp_settings_root="$2"
+    mcp_settings_project_key=appsome
+    primary_workspace_root() { printf "%s\n" "$1"; }
+    resolve_project_server_command "$3" custom
+  ' _ "$ordinary_bin/mcp-common.sh" "$app_settings_root" "$main" || true
+)"
+test -z "$selected_app_server"
+mv "$tmp/appsome-mcp-directory" "$external_mcp_dir"
+
 mkdir -p "$r2_worktree/.kent/workflows" "$r2_worktree/.kent/scripts"
 echo '# unrelated caller profile update' >"$r2_worktree/.kent/workflow-profile.toml"
 echo '{"unpublished_graph_artifact":true}' >"$r2_worktree/.kent/workflows/candidate.json"
@@ -1336,7 +1555,7 @@ test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" = "$r2_calls_start"
 no_token_requests="$tmp/r2-no-token-requests.jsonl"
 sed -n "$((r2_trace_start + 1)),$ p" "$home/.kent/mcp-protocol.jsonl" \
   >"$no_token_requests"
-jq -se 'length == 1 and .[0].operation == "resolve-mcp"' \
+jq -se 'length == 2 and all(.[]; .operation == "resolve-mcp")' \
   "$no_token_requests" >/dev/null
 
 list_trace_start="$(wc -l <"$home/.kent/mcp-protocol.jsonl" | tr -d '[:space:]')"
@@ -1571,5 +1790,49 @@ jq -se --arg id "$cached_schema_id" '
   any($entries[]; .key > $begin and .key < $finish and
     .value.operation == "read-cache")
 ' "$r2_requests" >/dev/null
+
+echo '{"ok":true,"project":"kit"}' >"$tmp/kit-mcp-response.json"
+kit_call_invocation="$(new_r2_invocation "$kit_r2_worktree" "$kit_standalone_binding")"
+kit_call_id="$(jq -er '.result.invocation_id' <<<"$kit_call_invocation")"
+kit_call_finished="$(jq -er '.result.finished_path' <<<"$kit_call_invocation")"
+kit_calls_before="$(wc -l <"$call_count_file" | tr -d '[:space:]')"
+kit_trace_start="$(wc -l <"$home/.kent/mcp-protocol.jsonl" | tr -d '[:space:]')"
+KENT_MCP_WORKSPACE="$kit_r2_worktree" \
+MCPORTER_FIXTURE_FILE="$tmp/kit-mcp-response.json" \
+  run_r2_adapter "$args_log" "$call_adapter" custom.inspect \
+    --allow-mutate --quiet \
+    --standalone-binding "$kit_standalone_binding" \
+    --invocation-id "$kit_call_id" >"$tmp/kit-mcp-call.out"
+test ! -s "$tmp/kit-mcp-call.out"
+grep -Fx -- "$main/.kent/adapters/mcp/servers/custom" \
+  "$args_log" >/dev/null
+test -f "$kit_call_finished"
+test "$(wc -l <"$call_count_file" | tr -d '[:space:]')" \
+  = "$((kit_calls_before + 1))"
+jq -e '.permitted_metadata.operation == "call"' "$kit_call_finished" >/dev/null
+
+echo '{"tools":[{"name":"inspect"}]}' >"$tmp/kit-mcp-schema.json"
+kit_list_invocation="$(new_r2_invocation "$kit_r2_worktree" "$kit_standalone_binding")"
+kit_list_id="$(jq -er '.result.invocation_id' <<<"$kit_list_invocation")"
+kit_list_finished="$(jq -er '.result.finished_path' <<<"$kit_list_invocation")"
+KENT_MCP_WORKSPACE="$kit_r2_worktree" \
+MCPORTER_FIXTURE_FILE="$tmp/kit-mcp-schema.json" \
+  run_r2_adapter "$args_log" "$list_adapter" example --schema \
+    --standalone-binding "$kit_standalone_binding" \
+    --invocation-id "$kit_list_id" >"$tmp/kit-mcp-list.out"
+cmp -s "$tmp/kit-mcp-schema.json" "$tmp/kit-mcp-list.out"
+test -f "$kit_list_finished"
+jq -e '.permitted_metadata.tool == "list-schema"' "$kit_list_finished" >/dev/null
+
+kit_r2_requests="$tmp/kit-r2-requests.jsonl"
+sed -n "$((kit_trace_start + 1)),$ p" "$home/.kent/mcp-protocol.jsonl" \
+  >"$kit_r2_requests"
+jq -se --arg workspace "$kit_r2_worktree" \
+  --arg project "$kit_r2_project_path" --arg other "$r2_project_path" '
+  all(.[]; .workspace_path == $workspace) and
+  all(.[]; (.standalone_binding.project_path // $project) == $project) and
+  all(.[]; ((.binding_ref.path // ($project + "/tasks")) | startswith($project))) and
+  all(.[]; ((.standalone_binding.project_path // "") != $other))
+' "$kit_r2_requests" >/dev/null
 
 echo "MCP adapter tests passed"
