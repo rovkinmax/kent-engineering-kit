@@ -232,11 +232,22 @@ branches are ambiguous ownership, never automatic reuse. Report actual
 
 ## Release source/publication
 
-Projects declare selected-source validation, release builder, publication
-procedure, credential source and effect approval. Source bindings/specs/
-manifests validate selected bytes, not runtime readiness or publication rights.
-Schema-3 package publication is approval-gated against exact merged source.
-Schema-4 source/graph admission remains distinct from live activation.
+Projects declare the publication procedure, credential source and effect
+approval. A schema-4 project selects either a Git Release bundle or the
+closed `[release]` table containing only `source = "native"`. The native
+selection has no Git Release bundle; it neither resolves nor activates a
+Workflow. Native Kent state remains authoritative for Workflow identity,
+graph, and approvals.
+
+For the native selection, ordinary preflight verifies project inputs on the
+selected Git revision with schema-4 mode and text checks. Its `ready` result
+does not qualify the release: it returns no Release preview or selected
+runtime source inputs. Explicit Git Release source-binding checks and runtime
+source capture require a Git bundle and reject the native selection.
+Source bindings/specs/manifests validate selected bytes, not runtime readiness
+or publication rights. Schema-3 package publication is approval-gated
+against exact merged source. Schema-4 source/graph admission remains distinct
+from live activation.
 Use [source-binding interfaces](release-source-bindings.md) and actual executable
 schemas; do not infer an effect from successful source checks.
 

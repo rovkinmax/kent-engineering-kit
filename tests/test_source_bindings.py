@@ -282,6 +282,24 @@ class ReleaseSourceBindingsCheckerTest(unittest.TestCase):
                 self.assertNotIn("runtime_attested", report)
                 self.assertNotIn("activation_authorized", report)
 
+    def test_native_or_mixed_selection_is_rejected_before_release_artifact_reads(self) -> None:
+        profile_path = ".kent/workflow-profile.toml"
+        base, _, legacy = (
+            (self.root / profile_path).read_text().partition("[release]\n")
+        )
+        for release, diagnostic in (
+            ('source = "native"\n', "does not select a Git release source bundle"),
+            ('source = "native"\n' + legacy, "must declare only release.source"),
+            ('source = "other"\n', "must declare only release.source"),
+        ):
+            with self.subTest(release=release):
+                self.write(profile_path, (base + "[release]\n" + release).encode())
+                oid = self.commit("Select non-legacy release source")
+                result = self.run_checker(oid, kind_map="missing-kind-map.json")
+                self.assert_rejected(result, diagnostic)
+                self.assertEqual(result.stdout, "")
+        self.assertEqual(self.run_checker(self.base_commit).returncode, 0)
+
     def test_builtin_digest_codecs_and_equal_path_aliases_are_accepted(self) -> None:
         result = self.run_checker(self.base_commit)
         self.assertEqual(result.returncode, 0, result.stderr)

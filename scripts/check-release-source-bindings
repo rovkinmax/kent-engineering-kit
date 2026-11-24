@@ -564,6 +564,10 @@ def load_project_documents(
         raise BindingError("project profile must use schema_version 4")
     project_name = required_text_field(profile, "project_name", "project profile")
     release = required_mapping_field(profile, "release", "project profile")
+    if "source" in release:
+        if release != {"source": "native"}:
+            raise BindingError('native release must declare only release.source = "native"')
+        raise BindingError("native release does not select a Git release source bundle")
     topology_kind = required_text_field(release, "topology_kind", "profile.release")
     adoption_mode = required_text_field(release, "adoption_mode", "profile.release")
     spec_path = normalize_path(
