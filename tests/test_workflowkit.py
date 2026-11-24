@@ -6058,6 +6058,59 @@ system_prompt_file = "subagents/runtime-smoke-tester.md"
             with self.assertRaisesRegex(SpecError, "release.spec_path.*symlinks"):
                 ProjectProfile.load(profile.project_root)
 
+    def test_schema_four_native_release_does_not_require_a_git_bundle(self) -> None:
+        legacy = self.load_schema4_profile()
+        root = legacy.project_root
+        file = root / ".kent/workflow-profile.toml"
+        base, _, _ = file.read_text().partition("\n[release]\n")
+        file.write_text(base + '\n[release]\nsource = "native"\n')
+        for artifact in (root / ".kent/release").iterdir():
+            artifact.unlink()
+        native = ProjectProfile.load(root)
+        self.assertIs(native.native_release, True)
+        self.assertIsNone(native.release)
+        self.assertIs(legacy.native_release, False)
+
+        for profile in (
+            replace(legacy, native_release=True),
+            replace(native, schema_version=3),
+            replace(native, native_release="native"),
+        ):
+            with self.subTest(schema=profile.schema_version, native=profile.native_release):
+                with self.assertRaisesRegex(SpecError, "native.?release"):
+                    profile.validate(check_files=False)
+
+        with self.assertRaisesRegex(SpecError, "targets must be unique"):
+            replace(
+                native,
+                adapters={**native.adapters, "alias": native.commands["dispatch"]},
+            ).validate(check_files=False)
+
+    def test_schema_four_native_release_is_an_explicit_closed_form(self) -> None:
+        legacy = schema4_profile_contents()
+        base, _, release = legacy.partition("\n[release]\n")
+        for contents in (
+            base,
+            base + '\n[release]\nsource = "unknown"\n',
+            base + "\n[release]\nsource = true\n",
+            base + '\n[release]\nsource = " native "\n',
+            base + '\n[release]\nsource = "native"\nworkflow_id = "extra"\n',
+            base + '\n[release]\nsource = "native"\n' + release,
+        ):
+            for check_files in (True, False):
+                with self.subTest(contents=contents[len(base):], check_files=check_files):
+                    with self.assertRaisesRegex(SpecError, "release"):
+                        ProjectProfile.from_toml(
+                            REPO_ROOT, contents, check_files=check_files
+                        )
+
+        with self.assertRaisesRegex(SpecError, "schema 3 does not support root keys"):
+            ProjectProfile.from_toml(
+                REPO_ROOT,
+                EXAMPLE_PROFILE.read_text() + '\n[release]\nsource = "native"\n',
+                check_files=False,
+            )
+
     def test_profile_rejects_legacy_device_smoke_capability(self) -> None:
         with self.assertRaisesRegex(SpecError, "device_smoke was removed"):
             self.load_profile(

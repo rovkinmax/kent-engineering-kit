@@ -259,6 +259,7 @@ class ProjectProfile:
     work_kinds: dict[str, WorkKind]
     adapters: dict[str, str]
     roles: dict[str, str]
+    native_release: bool = False
 
     @classmethod
     def load(cls, project_root: Path) -> "ProjectProfile":
@@ -292,6 +293,7 @@ class ProjectProfile:
             raise SpecError(
                 f"unsupported profile schema {schema_version}; expected 3 or 4"
             )
+        native_release = False
         if schema_version == 3:
             schema4_fields = sorted(SCHEMA4_ONLY_ROOT_KEYS & set(raw))
             if schema4_fields:
@@ -319,7 +321,16 @@ class ProjectProfile:
                 require_table(raw, "command_versions"),
                 "command_versions",
             )
-            release = release_profile(require_table(raw, "release"))
+            release_table = require_table(raw, "release")
+            if "source" in release_table:
+                if release_table != {"source": "native"}:
+                    raise SpecError(
+                        'native release must declare only release.source = "native"'
+                    )
+                native_release = True
+                release = None
+            else:
+                release = release_profile(release_table)
         execution = require_table(raw, "execution")
         project_memory = (
             project_memory_profile(raw["project_memory"])
@@ -376,6 +387,7 @@ class ProjectProfile:
             work_kinds=work_kind_table(require_table(raw, "work_kinds")),
             adapters=string_table(raw.get("adapters", {}), "adapters"),
             roles=string_table(require_table(raw, "roles"), "roles"),
+            native_release=native_release,
         )
         profile.validate(check_files=check_files)
         return profile
@@ -385,6 +397,12 @@ class ProjectProfile:
             raise SpecError(
                 f"unsupported profile schema {self.schema_version}; expected 3 or 4"
             )
+        if type(self.native_release) is not bool:
+            raise SpecError("native_release must be a boolean")
+        if self.native_release and (
+            self.schema_version != 4 or self.release is not None
+        ):
+            raise SpecError("native release requires schema 4 and no Git release profile")
         parse_ci_archive_reader_sources(list(self.ci_archive_reader_sources))
         self.validate_kit_runtime()
         if self.schema_version == 4:
@@ -865,40 +883,12 @@ class ProjectProfile:
                     "GitHub observation contract"
                 )
 
-        if self.release is None:
-            raise SpecError("profile schema 4 requires a release table")
-        if self.release.topology_kind not in RELEASE_TOPOLOGY_ADOPTIONS:
-            raise SpecError(
-                f"unsupported release.topology_kind "
-                f"{self.release.topology_kind!r}"
-            )
-        accepted_adoptions = RELEASE_TOPOLOGY_ADOPTIONS[
-            self.release.topology_kind
-        ]
-        if self.release.adoption_mode not in accepted_adoptions:
-            if len(accepted_adoptions) == 1:
-                raise SpecError(
-                    f"release.topology_kind {self.release.topology_kind!r} "
-                    f"requires adoption_mode {accepted_adoptions[0]!r}"
-                )
-            raise SpecError(
-                f"release.topology_kind {self.release.topology_kind!r} "
-                f"requires adoption_mode one of {accepted_adoptions!r}"
-            )
-        if (
-            self.release.adoption_mode == "managed-in-place"
-            and not self.release.builder_path
-        ):
-            raise SpecError(
-                "release.builder_path is required for managed-in-place"
-            )
-        if (
-            self.release.adoption_mode == "metadata-only"
-            and self.release.builder_path
-        ):
-            raise SpecError(
-                "release.builder_path must be empty for metadata-only"
-            )
+        release = self.release
+        if release is None:
+            if not self.native_release:
+                raise SpecError("profile schema 4 requires a release table")
+        else:
+            validate_release_adoption(release)
 
         targets: dict[str, str] = {}
         for table_name, table in (
@@ -920,25 +910,28 @@ class ProjectProfile:
                     )
                 targets[normalized] = f"{table_name}.{key}"
 
+        if release is None:
+            return
+
         validate_normalized_project_path(
-            self.release.spec_path,
+            release.spec_path,
             "release.spec_path",
         )
-        if self.release.builder_path:
+        if release.builder_path:
             validate_normalized_project_path(
-                self.release.builder_path,
+                release.builder_path,
                 "release.builder_path",
             )
         validate_normalized_project_path(
-            self.release.snapshot_path,
+            release.snapshot_path,
             "release.snapshot_path",
         )
         if not check_files:
             return
         for field, configured_path in (
-            ("spec_path", self.release.spec_path),
-            ("builder_path", self.release.builder_path),
-            ("snapshot_path", self.release.snapshot_path),
+            ("spec_path", release.spec_path),
+            ("builder_path", release.builder_path),
+            ("snapshot_path", release.snapshot_path),
         ):
             if not configured_path:
                 continue
@@ -1189,6 +1182,26 @@ def release_profile(raw: Any) -> ReleaseProfile:
         builder_path=optional_string(raw, "builder_path"),
         snapshot_path=require_string(raw, "snapshot_path"),
     )
+
+
+def validate_release_adoption(release: ReleaseProfile) -> None:
+    if release.topology_kind not in RELEASE_TOPOLOGY_ADOPTIONS:
+        raise SpecError(f"unsupported release.topology_kind {release.topology_kind!r}")
+    accepted_adoptions = RELEASE_TOPOLOGY_ADOPTIONS[release.topology_kind]
+    if release.adoption_mode not in accepted_adoptions:
+        if len(accepted_adoptions) == 1:
+            raise SpecError(
+                f"release.topology_kind {release.topology_kind!r} "
+                f"requires adoption_mode {accepted_adoptions[0]!r}"
+            )
+        raise SpecError(
+            f"release.topology_kind {release.topology_kind!r} "
+            f"requires adoption_mode one of {accepted_adoptions!r}"
+        )
+    if release.adoption_mode == "managed-in-place" and not release.builder_path:
+        raise SpecError("release.builder_path is required for managed-in-place")
+    if release.adoption_mode == "metadata-only" and release.builder_path:
+        raise SpecError("release.builder_path must be empty for metadata-only")
 
 
 def project_memory_profile(raw: Any) -> ProjectMemoryProfile:

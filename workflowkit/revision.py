@@ -290,14 +290,14 @@ def _preflight_project_revision(
         raise RevisionPreflightError(str(error)) from error
 
     requirements = profile_requirements(profile)
-    if profile.schema_version == 3:
+    if profile.schema_version == 3 or profile.native_release:
         checked_paths, _ = check_requirements(
             root,
             commit_oid,
             requested_ref,
             requirements,
-            strict_modes=False,
-            decode_textual=False,
+            strict_modes=profile.native_release,
+            decode_textual=profile.native_release,
         )
         return RevisionPreflightResult(
             project=str(root),

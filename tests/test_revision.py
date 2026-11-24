@@ -949,6 +949,130 @@ class RevisionPreflightTest(unittest.TestCase):
         self.commit_all(root, "Add project workflow adapter")
         return root
 
+    def select_native_release(self, root: Path) -> str:
+        profile = root / ".kent/workflow-profile.toml"
+        base, _, _ = profile.read_text().partition("\n[release]\n")
+        profile.write_text(base + '\n[release]\nsource = "native"\n')
+        for artifact in (root / ".kent/release").glob("*"):
+            artifact.unlink()
+        self.commit_all(root, "Select native release without Git artifacts")
+        return self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+
+    def test_native_preflight_has_no_release_proof_and_preserves_old_refs(self) -> None:
+        for legacy_options in (
+            {},
+            {
+                "topology_kind": "sdk-merged-main-publication",
+                "adoption_mode": "metadata-only",
+                "builder_path": "",
+            },
+        ):
+            with self.subTest(legacy_options=legacy_options):
+                root = self.create_project(schema4=True, **legacy_options)
+                old = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+                legacy_report = preflight_project_revision(root, old).as_json()
+                selected = self.select_native_release(root)
+                # A broken working copy must not affect either exact commit.
+                (root / ".kent/workflow-profile.toml").write_text("not valid TOML")
+                with mock.patch.object(
+                    revision_module, "parse_snapshot", side_effect=AssertionError
+                ):
+                    result = preflight_project_revision(root, selected)
+                report = result.as_json()
+                self.assertTrue(report["ready"])
+                self.assertEqual(report["commit_oid"], selected)
+                self.assertNotIn("release_preview", report)
+                self.assertNotIn("selected_runtime_source_inputs", report)
+                native_paths = {item.path for item in result.checked_paths}
+                self.assertIn(".kent/project-contract.md", native_paths)
+                self.assertTrue(all("/release/" not in path for path in native_paths))
+                reread = preflight_project_revision(root, old).as_json()
+                self.assertEqual(reread, legacy_report)
+                self.assertIn("release_preview", reread)
+                self.assertIn("selected_runtime_source_inputs", reread)
+
+    def test_native_head_preserves_old_schema3_preflight(self) -> None:
+        root = self.create_project()
+        legacy = self.run_git(root, "rev-parse", "HEAD").stdout.strip()
+        before = preflight_project_revision(root, legacy).as_json()
+        (root / ".kent/workflow-profile.toml").write_text(schema4_profile_contents())
+        native = self.select_native_release(root)
+        self.assertNotEqual(legacy, native)
+        self.assertEqual(self.run_git(root, "rev-parse", "HEAD").stdout.strip(), native)
+        self.assertTrue(preflight_project_revision(root, "HEAD").as_json()["ready"])
+        self.assertEqual(preflight_project_revision(root, legacy).as_json(), before)
+
+    def test_native_preflight_keeps_strict_ordinary_paths(self) -> None:
+        for case, expected in (
+            ("missing", "required path not found"),
+            ("mode", "not executable"),
+            ("symlink", "not a regular tracked file"),
+            ("text", "UTF-8"),
+        ):
+            with self.subTest(case=case):
+                root = self.create_project(schema4=True)
+                self.select_native_release(root)
+                command = root / ".kent/scripts/workflow-verification-dispatch"
+                valid = command.read_bytes()
+                if case == "mode":
+                    command.chmod(0o644)
+                elif case == "text":
+                    command.write_bytes(b"\xff")
+                else:
+                    command.unlink()
+                    if case == "symlink":
+                        command.symlink_to("workflow-verify")
+                self.commit_all(root, f"Invalidate ordinary command: {case}")
+                if command.is_symlink():
+                    command.unlink()
+                command.write_bytes(valid)
+                command.chmod(0o755)
+                with self.assertRaisesRegex(RevisionPreflightError, expected):
+                    preflight_project_revision(root, "HEAD")
+
+    def test_native_cli_does_not_call_kent_or_capture_release_source(self) -> None:
+        root = self.create_project(schema4=True)
+        selected = self.select_native_release(root)
+        bin_dir = root / "fake-bin"
+        bin_dir.mkdir()
+        marker = bin_dir / "kent-was-invoked"
+        fake_kent = bin_dir / "kent"
+        fake_kent.write_text('#!/bin/sh\ntouch "$KENT_TEST_MARKER"\nexit 99\n')
+        fake_kent.chmod(0o755)
+        for flags in (
+            (),
+            ("--capture-runtime-envelope",),
+            ("--capture-runtime-envelope-from-git", "--envelope-version", "2"),
+        ):
+            with self.subTest(flags=flags):
+                result = subprocess.run(
+                    [
+                        str(REPO_ROOT / "scripts" / "preflight-revision"),
+                        "--project", str(root), "--ref", selected, *flags,
+                    ],
+                    input="not a capture payload",
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env={
+                        **os.environ,
+                        "KENT_ENGINEERING_KIT_PYTHON": sys.executable,
+                        "KENT_TEST_MARKER": str(marker),
+                        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                    },
+                )
+                self.assertFalse(marker.exists())
+                if flags:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("runtime capture requires", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    report = json.loads(result.stdout)
+                    self.assertTrue(report["ready"])
+                    self.assertNotIn("release_preview", report)
+                    self.assertNotIn("selected_runtime_source_inputs", report)
+
     def test_preflight_accepts_ready_revision(self) -> None:
         root = self.create_project()
         result = preflight_project_revision(root, "HEAD")
