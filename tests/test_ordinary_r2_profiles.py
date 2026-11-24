@@ -48,7 +48,7 @@ class ProfileSourceTests(unittest.TestCase):
         self.primary = {}
         self.settings = {}
         self.memory = self.root / "R2"
-        self.memory.mkdir()
+        self.memory.mkdir(mode=0o700)
         self.records = {}
         self.reads = []
         self.records_by_slug = {}
