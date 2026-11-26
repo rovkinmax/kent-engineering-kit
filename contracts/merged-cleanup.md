@@ -66,11 +66,24 @@ and delivered head with provider facts. A moving provider base OID is an
 observation, not an immutable delivery baseline equality requirement.
 
 Persist and read back the technical inventory through the qualified installed
-`workflow-project-memory workflow` attachment protocol. Do not use a direct
-R2 path or borrow Task identity. Maximum attachment size is 8 MiB. The inventory
-contains exact native identities, roots, branch, provider facts, full closure,
-protected exclusions and admitted authority/release proofs sufficient after
-victim transcripts disappear. It is not an archive of logs or source.
+`workflow` attachment protocol. A present primary-local profile must qualify
+on its own; do not fall back if it fails. Without that profile, use only the
+private installed ordinary R2 facade and require `resolve-task` to prove the
+same native Task in R2 mode. For that facade the canonical `project_path` is
+`<R2 root>/<settings_project_key>`; require exact component and Task namespace
+agreement before protecting its parent as `r2-storage`. Settings source and
+attachment response paths are not storage selectors. Check attachment
+receipts against the qualified Task namespace and read back exact bytes.
+Protect that namespace as `r2-task-namespace` in the existing inventory
+root list, so final disposal cannot switch selector or Task directory.
+Do not admit an inventory whose removable Session artifacts overlap these
+protected paths, or whose removable resources overlap the qualified external
+Settings source used to resolve R2.
+Do not use a direct R2 path or borrow Task identity. Maximum attachment size
+is 8 MiB. The inventory contains exact native identities, roots, branch,
+provider facts, full closure, protected exclusions and admitted authority/release
+proofs sufficient after victim transcripts disappear. It is not an archive of
+logs or source. Historical inspect/apply retains its primary-local profile path.
 
 The closed `cleanup_result` handoff has `schema: merged-cleanup-handoff-v1`,
 `phase: prepared`, `project_id`, `task_id`, `workflow_id`, and `inventory` with
@@ -86,8 +99,18 @@ proves actual cwd and native target outside the retiring root before emitting
 
 The no-argument entrypoint consumes genuine native Script stdin and the prepared
 handoff. Load the qualified code closure and attachment while task storage is
-usable, then change real cwd to protected primary. Revalidate provider facts,
-authority, exact identities and fresh owner release before effects.
+usable. Resolve external memory in the original assigned workspace with the
+genuine Script Task, node and branch, and compare the current storage root
+and Task namespace against the frozen protected entries. Then change real
+cwd to protected primary. Recheck the external binding in the original
+workspace before the final target identity checks for each new destructive
+operation. A missing or replaced Script worktree blocks new removal even
+if the adapter returns the same binding. Retire that worktree last;
+existing native receipt checks settle that operation without requiring
+R2 resolution after the workspace is removed.
+Operators must not reconfigure R2 while a disposal operation is in flight.
+Revalidate provider facts, authority, exact identities and fresh owner release
+before effects.
 
 1. Delete eligible Sessions through supported noninteractive native operations.
 2. Separately verify metadata settlement and physical artifacts. Remove only

@@ -6,6 +6,7 @@ identity, bounded read-only observation, and the supported Kent/R2 interfaces.
 from __future__ import annotations
 
 from bisect import bisect_left
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -24,6 +25,7 @@ import uuid
 from typing import Any, Mapping, Sequence
 
 from . import delivery, operations
+from .project_memory import KEY as _MEMORY_KEY, TOKEN as _MEMORY_TOKEN
 from .cleanup import (
     CleanupError,
     MAX_CONTAINERS,
@@ -66,6 +68,7 @@ _MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 _MAX_MEMBER_TASKS = 256
 _MAX_RECEIPT_COMMENTS = 32_768
 _MAX_RECEIPT_HISTORY_BYTES = 16 * 1024 * 1024
+_R2_TASK_NAMESPACE = "r2-task-namespace"
 _SESSION_COLUMNS = {
     "id": "TEXT", "project_id": "TEXT", "artifact_relpath": "TEXT",
     "previous_session_id": "TEXT", "parent_agent_session_id": "TEXT",
@@ -134,6 +137,29 @@ def _clean_path(path: str | Path, label: str) -> Path:
     return value
 
 
+@dataclass(frozen=True)
+class _ExternalMemoryBinding:
+    project: Path
+    settings: Path
+    task_key: str
+    project_uid: str
+    task_uid: str
+    binding_digest: str
+
+    @property
+    def root(self) -> Path:
+        return self.project.parent
+
+    @property
+    def namespace(self) -> Path:
+        return self.project / "tasks" / self.task_key
+
+    def verify_attachment(self, response: Mapping[str, Any], digest: str) -> None:
+        expected = self.namespace / "artifacts/attachments/objects" / digest
+        if response.get("object_path") != str(expected):
+            raise CleanupError("R2 attachment belongs to a different Task storage namespace")
+
+
 def _check_path_components(
     path: Path, *, allow_missing_leaf: bool = False,
     allow_missing_tree: bool = False,
@@ -162,6 +188,13 @@ def _check_path_components(
         return None
     except OSError as error:
         raise CleanupError("native path cannot be inspected") from error
+
+
+def _external_worktree_order(
+    worktrees: Sequence[Mapping[str, Any]], assigned_workspace: Path,
+) -> list[Mapping[str, Any]]:
+    """Preserve every disposition but schedule loss of the R2 caller last."""
+    return sorted(worktrees, key=lambda row: row["path"] == str(assigned_workspace))
 
 
 def _safe_environment(context: Mapping[str, Any] | None = None) -> dict[str, str]:
@@ -546,6 +579,8 @@ class NativeCleanupBackend:
         self._worktree_settlements: set[str] = set()
         self._script_native_context: dict[str, Any] | None = None
         self._frozen_script_identity: dict[str, Any] | None = None
+        self._script_memory: _ExternalMemoryBinding | None = None
+        self._script_workspace_incarnation: tuple[int, int] | None = None
         self._owned_container_paths: set[str] = set()
         self._receipt_inventory = None
         self._receipt_entries: dict[tuple, dict[str, Any]] = {}
@@ -1034,6 +1069,31 @@ class NativeCleanupBackend:
         if info is not None and not stat.S_ISDIR(info.st_mode):
             raise CleanupError("Session artifact is not a directory")
         return path, info
+
+    def _check_disposal_dependencies(
+        self, inventory: Mapping[str, Any], binding: _ExternalMemoryBinding | None,
+    ) -> None:
+        # Session artifacts are authorized children of native persistence,
+        # not of another protected root (including nested R2 stores).
+        persistence = Path(self.context["persistence_root"])
+        protected = [
+            Path(row["path"]) for row in inventory["protected_roots"]
+            if row["kind"] != "native-persistence" or Path(row["path"]) != persistence
+        ]
+        session_paths = [
+            persistence / session["artifact_relpath"] for session in inventory["sessions"]
+            if session["disposition"] == "remove"
+        ]
+        if any(_overlap_path(path, root) for path in session_paths for root in protected):
+            raise CleanupError("disposable Session artifacts overlap a protected root")
+        if binding is not None:
+            victims = session_paths + [
+                Path(row["path"])
+                for rows in (inventory["worktrees"], inventory["owned_containers"])
+                for row in rows if row["disposition"] == "remove"
+            ]
+            if any(_overlap_path(path, binding.settings) for path in victims):
+                raise CleanupError("disposable resource overlaps the qualified external Settings source")
 
     def _task_comment_records(self, task_id: str) -> list[dict[str, Any]]:
         snapshot = self._snapshot_once((task_id,))
@@ -2022,11 +2082,12 @@ class NativeCleanupBackend:
             raise CleanupError("Git ancestry verification is unavailable")
         return code == 0
 
-    def _memory_call(
+    def _memory_exchange(
         self,
         operation: str,
         *,
         native_context: Mapping[str, Any] | None = None,
+        task_locator: str | None = None,
         body: bytes | None = None,
         digest: str | None = None,
     ) -> tuple[dict[str, Any], bytes]:
@@ -2035,13 +2096,16 @@ class NativeCleanupBackend:
         adapter_info = self.memory_adapter.stat()
         if not stat.S_ISREG(adapter_info.st_mode) or not os.access(self.memory_adapter, os.X_OK):
             raise CleanupError("workflow memory adapter is not executable")
+        workspace = self._script_workspace if native_context is not None else self.workspace
         request: dict[str, Any] = {
             "schema": "r2-workflow-request-v1",
             "operation": operation,
-            "workspace_path": str(self.workspace),
+            "workspace_path": str(workspace),
         }
         if native_context is not None:
             request["native_context"] = dict(native_context)
+        if task_locator is not None:
+            request["task_locator"] = task_locator
         if operation == "artifact-write":
             if body is None:
                 raise CleanupError("R2 artifact write body is absent")
@@ -2055,19 +2119,33 @@ class NativeCleanupBackend:
         if body is not None:
             framed += body
         code, output, error = _run_bounded(
-            [str(self.memory_adapter), "workflow"], cwd=self.workspace,
+            [str(self.memory_adapter), "workflow"], cwd=workspace,
             environment=self.environment, timeout=30.0,
             output_limit=_MAX_MEMORY_OUTPUT, input_bytes=framed,
         )
         if code:
             raise CleanupError(
-                "qualified R2 attachment operation failed: "
+                "qualified R2 memory operation failed: "
                 + error.decode("utf-8", "replace")[:512],
             )
         header, separator, content = output.partition(b"\n")
         if not separator:
-            raise CleanupError("R2 attachment response framing is invalid")
-        response = _json_object(header, "R2 attachment response")
+            raise CleanupError("R2 memory response framing is invalid")
+        return _json_object(header, "R2 memory response"), content
+
+    def _memory_call(
+        self,
+        operation: str,
+        *,
+        native_context: Mapping[str, Any] | None = None,
+        task_locator: str | None = None,
+        body: bytes | None = None,
+        digest: str | None = None,
+    ) -> tuple[dict[str, Any], bytes]:
+        response, content = self._memory_exchange(
+            operation, native_context=native_context, task_locator=task_locator,
+            body=body, digest=digest,
+        )
         expected_operation = operation
         expected_digest = hashlib.sha256(body).hexdigest() if body is not None else digest
         if (
@@ -2089,15 +2167,17 @@ class NativeCleanupBackend:
             raise CleanupError("R2 attachment readback differs")
         return response, content
 
-    def _bind_memory_adapter(self, primary: Path) -> None:
-        profile_path = primary / ".kent/workflow-profile.toml"
-        profile_info = _check_path_components(profile_path)
-        if profile_info is None or not stat.S_ISREG(profile_info.st_mode):
-            raise CleanupError("protected primary Project profile is unavailable")
+    @staticmethod
+    def _read_inline_profile(profile_path: Path) -> dict[str, Any]:
         try:
-            profile = tomllib.loads(profile_path.read_text(encoding="utf-8"))
+            return tomllib.loads(profile_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+            raise CleanupError("protected primary Project profile is unavailable") from error
+
+    def _bind_inline_memory_adapter(self, primary: Path, profile: Mapping[str, Any]) -> None:
+        try:
             command = profile["commands"]["project_memory"]
-        except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError) as error:
+        except (KeyError, TypeError) as error:
             raise CleanupError("qualified workflow memory command is unavailable") from error
         if (
             not isinstance(command, str) or not command or command.startswith("/")
@@ -2113,6 +2193,119 @@ class NativeCleanupBackend:
         ):
             raise CleanupError("qualified workflow memory adapter is unavailable")
         self.memory_adapter = adapter
+
+    @staticmethod
+    def _inline_memory_root(profile: Mapping[str, Any]) -> Path:
+        try:
+            root = profile["project_memory"]["root"]
+        except (KeyError, TypeError) as error:
+            raise CleanupError("R2 root is unavailable from the primary Project profile") from error
+        if not isinstance(root, str):
+            raise CleanupError("R2 root is invalid in the primary Project profile")
+        return _clean_path(root, "R2 root")
+
+    @staticmethod
+    def _external_memory_options(
+        task_id: str, native_context: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        if native_context is None:
+            return {"task_locator": task_id}
+        # Native Script qualification accepts an explicit null discriminator;
+        # the ordinary facade expresses that same branch as an absent key.
+        return {"native_context": {
+            key: value for key, value in native_context.items()
+            if key != "transition_branch_key" or value is not None
+        }}
+
+    def _select_cleanup_memory(
+        self, primary: Path, task_id: str, task_key: Any,
+        *, native_context: Mapping[str, Any] | None = None,
+    ) -> tuple[Path, _ExternalMemoryBinding | None]:
+        profile_path = primary / ".kent/workflow-profile.toml"
+        profile_info = _check_path_components(profile_path, allow_missing_tree=True)
+        if profile_info is not None:
+            if not stat.S_ISREG(profile_info.st_mode):
+                raise CleanupError("protected primary Project profile is not a regular file")
+            profile = self._read_inline_profile(profile_path)
+            root = self._inline_memory_root(profile)
+            self._bind_inline_memory_adapter(primary, profile)
+            return root, None
+
+        installation = _clean_path(self.context["persistence_root"], "native persistence") / "ordinary-r2"
+        adapter = installation / "bin/kent-project-memory"
+        for path in (installation, adapter.parent, adapter):
+            info = _check_path_components(path)
+            kind = stat.S_ISREG if path == adapter else stat.S_ISDIR
+            if (info is None or not kind(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o7077 or (path == adapter and info.st_nlink != 1)):
+                raise CleanupError("ordinary R2 workflow adapter installation is unsafe")
+        self.memory_adapter = adapter
+        response, content = self._memory_exchange(
+            "resolve-task", **self._external_memory_options(task_id, native_context),
+        )
+        result = response.get("result")
+        if (response.get("schema") != "r2-workflow-response-v1" or content
+                or not isinstance(result, dict) or result.get("mode") != "r2"):
+            raise CleanupError("ordinary workflow memory did not prove an R2 Task binding")
+        for key in ("task_key", "settings_project_key", "project_uid", "task_uid"):
+            value = result.get(key)
+            if not isinstance(value, str) or not _MEMORY_KEY.fullmatch(value):
+                raise CleanupError("ordinary R2 Task binding identity is invalid")
+        if result["task_key"] != task_key:
+            raise CleanupError("ordinary R2 Task binding differs from the native Task")
+        for key in ("project_path", "settings_root"):
+            if not isinstance(result.get(key), str):
+                raise CleanupError("ordinary R2 binding lacks its qualified external profile")
+        project = _clean_path(result["project_path"], "ordinary R2 project storage")
+        settings = _clean_path(result["settings_root"], "ordinary R2 Settings source")
+        if (
+            _overlap_path(settings, primary) or project.parent == Path("/")
+            or project.name != result["settings_project_key"] or project.anchor != "/"
+        ):
+            raise CleanupError("ordinary R2 project path differs from its external profile")
+        info = _check_path_components(project)
+        if info is None or not stat.S_ISDIR(info.st_mode):
+            raise CleanupError("ordinary R2 project storage is not a directory")
+        reference = result.get("binding_ref")
+        expected_ref = project / "tasks" / task_key / "task.json"
+        if (not isinstance(reference, dict) or reference.get("path") != str(expected_ref)
+                or not isinstance(reference.get("sha256"), str)
+                or not _MEMORY_TOKEN.fullmatch(reference["sha256"])):
+            raise CleanupError("ordinary R2 Task binding reference differs")
+        binding = _ExternalMemoryBinding(
+            project, settings, task_key, result["project_uid"],
+            result["task_uid"], reference["sha256"],
+        )
+        return binding.root, binding
+
+    def _verify_script_memory_for_removal(self) -> None:
+        binding = self._script_memory
+        if binding is None:
+            return
+        context = self._script_native_context
+        if context is None:
+            raise CleanupError("ordinary R2 removal lacks native Script context")
+        # Always verify while the original workspace still exists. This check
+        # is for new removals only, never for outside-worktree receipt settlement.
+        before = self._read_script_workspace_incarnation()
+        if self._script_workspace_incarnation not in (None, before):
+            raise CleanupError("assigned Script workspace changed after inventory load")
+        identity = self._script_identity(context)
+        _, fresh = self._select_cleanup_memory(
+            self._primary_path(), identity["task_id"], identity["task_short_id"], native_context=context,
+        )
+        if fresh != binding:
+            raise CleanupError("external R2 binding changed before cleanup removal")
+        if self._read_script_workspace_incarnation() != before:
+            raise CleanupError("assigned Script workspace changed during external R2 resolution")
+        self._script_workspace_incarnation = before
+        self._snapshots = {}
+
+    def _read_script_workspace_incarnation(self) -> tuple[int, int]:
+        info = _check_path_components(self._script_workspace, allow_missing_tree=True)
+        if info is None or not stat.S_ISDIR(info.st_mode):
+            raise CleanupError("assigned Script workspace is unavailable for external R2 resolution")
+        return info.st_dev, info.st_ino
 
     def prepare(self, request: Any) -> dict[str, Any]:
         inventory = self._prepare_inventory(request)
@@ -2624,17 +2817,21 @@ class NativeCleanupBackend:
             {"path": str(primary), "kind": "primary-workspace"},
             {"path": str(Path(self.context["persistence_root"])), "kind": "native-persistence"},
         ]
-        profile_path = primary / ".kent/workflow-profile.toml"
-        try:
-            profile = tomllib.loads(profile_path.read_text(encoding="utf-8"))
-            memory_root = profile["project_memory"]["root"]
-        except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError) as error:
-            raise CleanupError("R2 root is unavailable from the primary Project profile") from error
+        binding = None
         if history_operation is None:
-            self._bind_memory_adapter(primary)
+            memory_root, binding = self._select_cleanup_memory(primary, task_id, summary.get("short_id"))
+        else:
+            memory_root = self._inline_memory_root(
+                self._read_inline_profile(primary / ".kent/workflow-profile.toml"),
+            )
         protected_roots.append({
-            "path": str(_clean_path(memory_root, "R2 root")), "kind": "r2-storage",
+            "path": str(memory_root), "kind": "r2-storage",
         })
+        if binding is not None:
+            protected_roots.append({"path": str(binding.namespace), "kind": _R2_TASK_NAMESPACE})
+            # All new removals require the qualified Script workspace. The
+            # task worktree may retire only after other removable worktrees.
+            worktrees = _external_worktree_order(worktrees, self.workspace)
         self._protected_roots = [Path(item["path"]) for item in protected_roots]
         if subject_path is not None and any(
             _overlap_path(root, subject_path)
@@ -2665,13 +2862,22 @@ class NativeCleanupBackend:
         self._check_owned_container_scope(inventory_value)
         from .cleanup import validate_inventory
         inventory = validate_inventory(inventory_value)
+        self._check_disposal_dependencies(inventory.value, binding)
         if history_operation is not None:
             return inventory
         serialized = canonical_bytes(inventory.value)
-        self._memory_call("artifact-write", body=serialized)
-        _, readback = self._memory_call(
-            "artifact-read", digest=inventory.sha256,
+        memory_options = self._external_memory_options(task_id, None) if binding else {}
+        write, _ = self._memory_call("artifact-write", body=serialized, **memory_options)
+        if binding is not None:
+            binding.verify_attachment(write, inventory.sha256)
+        read, readback = self._memory_call(
+            "artifact-read", digest=inventory.sha256, **memory_options,
         )
+        if binding is not None:
+            binding.verify_attachment(read, inventory.sha256)
+            _, fresh = self._select_cleanup_memory(primary, task_id, summary.get("short_id"))
+            if fresh != binding:
+                raise CleanupError("external R2 binding changed during inventory preparation")
         if readback != serialized:
             raise CleanupError("R2 inventory attachment readback bytes differ")
         return inventory
@@ -3154,15 +3360,34 @@ class NativeCleanupBackend:
         if not isinstance(source, dict) or not isinstance(source.get("root_path"), str):
             raise CleanupError("protected primary workspace is unavailable")
         primary = _clean_path(source["root_path"], "protected primary")
-        self._bind_memory_adapter(primary)
-        _, raw = self._memory_call(
-            "artifact-read", native_context=native_context,
-            digest=parsed["inventory"]["sha256"],
+        workspace_incarnation = self._read_script_workspace_incarnation()
+        root, binding = self._select_cleanup_memory(
+            primary, identity["task_id"], identity.get("task_short_id"), native_context=native_context,
         )
+        memory_options = (
+            self._external_memory_options(identity["task_id"], native_context)
+            if binding else {"native_context": native_context}
+        )
+        digest = parsed["inventory"]["sha256"]
+        read, raw = self._memory_call("artifact-read", digest=digest, **memory_options)
+        if binding is not None:
+            binding.verify_attachment(read, digest)
         if len(raw) != parsed["inventory"]["byte_size"]:
             raise CleanupError("prepared inventory size differs from its handoff")
         inventory = inventory_from_bytes(raw, parsed["inventory"]["sha256"])
         value = inventory.value
+        if [row["path"] for row in value["protected_roots"] if row["kind"] == "r2-storage"] != [str(root)]:
+            raise CleanupError("current R2 storage differs from the protected inventory root")
+        namespaces = [
+            row["path"] for row in value["protected_roots"] if row["kind"] == _R2_TASK_NAMESPACE
+        ]
+        if namespaces != ([str(binding.namespace)] if binding is not None else []):
+            raise CleanupError("current R2 selector or Task namespace differs from prepared inventory")
+        if binding is not None:
+            removable = [row for row in value["worktrees"] if row["disposition"] == "remove"]
+            if not removable or removable[-1]["path"] != str(self._script_workspace):
+                raise CleanupError("external R2 Script workspace must be the last disposable worktree")
+        self._check_disposal_dependencies(value, binding)
         if (
             value["project_id"] != parsed["project_id"]
             or value["task_id"] != parsed["task_id"]
@@ -3202,6 +3427,10 @@ class NativeCleanupBackend:
         self._protected_roots = [
             Path(row["path"]) for row in value["protected_roots"]
         ]
+        self._script_memory = binding
+        if binding is not None:
+            self._script_workspace_incarnation = workspace_incarnation
+        self._verify_script_memory_for_removal()
         return inventory
 
     @staticmethod
@@ -3249,6 +3478,7 @@ class NativeCleanupBackend:
 
     def revalidate(self, inventory: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
         operations.validate_native_local_context(self.context)
+        self._check_disposal_dependencies(inventory, self._script_memory)
         if self._receipt_inventory is not None:
             if inventory != self._receipt_inventory.value:
                 raise CleanupError("executor inventory differs from its receipt binding")
@@ -3636,6 +3866,11 @@ class NativeCleanupBackend:
             if current:
                 raise CleanupError("a durably settled Session acquired native metadata again")
             return durable
+        self._verify_script_memory_for_removal()
+        if self._script_memory is not None:
+            fresh = [item for item in self._snapshot_once()["sessions"] if item["session_id"] == session_id]
+            if fresh != current:
+                raise CleanupError("native Session changed during external R2 revalidation")
         if current:
             if len(current) != 1:
                 raise CleanupError("native Session identity is ambiguous")
@@ -3727,6 +3962,7 @@ class NativeCleanupBackend:
                 if info is not None:
                     raise CleanupError("a settled Session container reappeared")
                 return "absent"
+        self._verify_script_memory_for_removal()
         snapshot = self._snapshot_once()
         if any(item["session_id"] == session_id for item in snapshot["sessions"]):
             raise CleanupError("Session metadata reappeared before residual cleanup")
@@ -3770,6 +4006,7 @@ class NativeCleanupBackend:
                 if _check_path_components(path, allow_missing_tree=True) is not None:
                     raise CleanupError("a settled owned container reappeared")
                 return "absent"
+        self._verify_script_memory_for_removal()
         parent = path.parent
         parent_info = _check_path_components(parent)
         if (
@@ -3861,10 +4098,16 @@ class NativeCleanupBackend:
                                       "ctime_ns": info.st_ctime_ns}
                 if any(ack["proof"]["incarnation"] == incarnation_values for ack in acks):
                     raise CleanupError("acknowledged worktree root still survives; not settled")
+        before = _check_path_components(Path(row["path"])) if self._script_memory is not None else None
+        self._verify_script_memory_for_removal()
         self._verify_git_worktree(row, expect_present=True)
         incarnation = _check_path_components(
             Path(row["path"]), allow_missing_tree=self._receipt_inventory is None,
         )
+        if before is not None and (incarnation is None or (
+            before.st_dev, before.st_ino, before.st_ctime_ns,
+        ) != (incarnation.st_dev, incarnation.st_ino, incarnation.st_ctime_ns)):
+            raise CleanupError("managed worktree changed during external R2 revalidation")
         if self._receipt_inventory is not None and incarnation is None:
             raise CleanupError("worktree incarnation is unavailable before deletion")
         if self._receipt_inventory is not None:

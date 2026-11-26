@@ -17,7 +17,9 @@ from workflowkit import delivery, operations
 from workflowkit.cleanup import CleanupError, canonical_bytes, execute_inventory, validate_inventory
 from workflowkit.cleanup_native import (
     NativeCleanupBackend,
+    _ExternalMemoryBinding,
     _check_path_components,
+    _external_worktree_order,
     _run_bounded,
     _validate_cleanup_route_graph,
     _validate_delivered_policy_graph,
@@ -37,6 +39,15 @@ DISPOSAL_GROUP = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 
 
 class NativeCleanupTests(unittest.TestCase):
+    def test_external_script_workspace_follows_disposable_and_held_supervisors(self):
+        assigned = self.root / "assigned"
+        worktrees = [
+            {"path": str(assigned), "role": "task", "disposition": "remove"},
+            {"path": str(self.root / "supervisor"), "role": "supervisor", "disposition": "remove"},
+            {"path": str(self.root / "held"), "role": "supervisor", "disposition": "shared-in-use"},
+        ]
+        self.assertEqual(_external_worktree_order(worktrees, assigned), [*worktrees[1:], worktrees[0]])
+
     def test_current_node_snapshot_reads_native_binary_uuids(self):
         self.writer.executescript("""
             ALTER TABLE task_current_nodes RENAME TO old_current_nodes;
@@ -501,14 +512,27 @@ class NativeCleanupTests(unittest.TestCase):
                     execute_inventory(inventory, backend())
             self.assertEqual(len(root_deletes), 2, "new incarnation bypassed fresh receipt admission")
             interrupted = backend()
+            external_binding = _ExternalMemoryBinding(
+                self.root / "r2/project", self.root / "settings", "KIT-1",
+                "project-uid", "task-uid", "a" * 64,
+            )
+            interrupted._script_memory = external_binding
+
+            def resolve(*_args, **_kwargs):
+                self.assertTrue(victim.is_dir(), "R2 was called after assigned worktree removal")
+                return external_binding.root, external_binding
+
+            interrupted._select_cleanup_memory = mock.Mock(side_effect=resolve)
             fail_after_worktree_ack[0] = True
             with self.assertRaisesRegex(CleanupError, "post-worktree-ACK Git"):
                 execute_inventory(inventory, interrupted)
             self.assertEqual(receipt_stages[-1], "worktree_native_ack")
             self.assertEqual(len(root_deletes), 3)
+            self.assertEqual(interrupted._select_cleanup_memory.call_count, 1)
             resumed = execute_inventory(inventory, interrupted)
             self.assertEqual(resumed, first)
             self.assertEqual(len(root_deletes), 3, "ACK retry repeated native Delete")
+            self.assertEqual(interrupted._select_cleanup_memory.call_count, 1)
             self.assertEqual(receipt_stages[-1], "worktree_settled")
             victim.mkdir()
             retain_root[0] = True
@@ -616,6 +640,63 @@ class NativeCleanupTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(CleanupError, "absence does not prove"):
                     self.backend.delete_session(inventory.value["sessions"][0])
+
+    def test_physical_victim_is_observed_after_external_r2_resolution(self):
+        path = self.root / "owned-container"
+        path.mkdir()
+        old = path.stat()
+        parent = path.parent.stat()
+        row = {
+            "path": str(path), "device": old.st_dev, "inode": old.st_ino,
+            "parent_device": parent.st_dev, "parent_inode": parent.st_ino,
+        }
+
+        def substitute(path):
+            path.rename(path.with_suffix(".original"))
+            path.mkdir()
+
+        with mock.patch.object(
+            self.backend, "_verify_script_memory_for_removal", side_effect=lambda: substitute(path),
+        ):
+            with self.assertRaisesRegex(CleanupError, "owned container identity is unsafe"):
+                self.backend.remove_owned_container(row)
+        self.assertTrue(path.is_dir())
+
+        worktree = self.root / "worktree"
+        worktree.mkdir()
+        self.backend._script_memory = _ExternalMemoryBinding(
+            self.root / "r2/project", self.root / "settings", "KIT-1",
+            "project-uid", "task-uid", "a" * 64,
+        )
+        with (
+            mock.patch.object(self.backend, "_primary_path", return_value=self.project_root),
+            mock.patch.object(self.backend, "_verify_git_worktree"),
+            mock.patch.object(self.backend, "runner") as runner,
+            mock.patch.object(
+                self.backend, "_verify_script_memory_for_removal", side_effect=lambda: substitute(worktree),
+            ),
+            self.assertRaisesRegex(CleanupError, "worktree changed during external R2 revalidation"),
+        ):
+            self.backend.delete_worktree({"role": "task", "disposition": "remove", "path": str(worktree)})
+        runner.assert_not_called()
+        self.assertTrue(worktree.is_dir())
+        artifact = f"projects/{PROJECT}/sessions/{SESSION}"
+        path = self.persistence / artifact
+        path.mkdir(parents=True)
+        info = path.stat()
+        self.backend._session_settlements = {SESSION: "removed"}
+        with (
+            mock.patch.object(self.backend, "_snapshot_once", return_value={"sessions": []}),
+            mock.patch.object(
+                self.backend, "_verify_script_memory_for_removal", side_effect=lambda: substitute(path),
+            ),
+            self.assertRaisesRegex(CleanupError, "Session residual directory identity is unsafe"),
+        ):
+            self.backend.remove_session_container({
+                "artifact_relpath": artifact, "session_id": SESSION,
+                "device": info.st_dev, "inode": info.st_ino,
+            })
+        self.assertTrue(path.is_dir())
 
     def test_history_receipt_uses_genuine_standalone_operator_not_script_identity(self):
         inventory = self.receipt_inventory()
@@ -1689,6 +1770,12 @@ class NativeCleanupTests(unittest.TestCase):
             )
 
     def test_prepare_attachment_handoff_and_executor_use_native_cleanup_context(self):
+        self._exercise_cleanup_handoff(external=False)
+
+    def test_external_r2_cleanup_handoff(self):
+        self._exercise_cleanup_handoff(external=True)
+
+    def _exercise_cleanup_handoff(self, *, external):
         task_root = self.root / "task-worktree"
         task_root.mkdir()
         (self.persistence / f"projects/{PROJECT}/sessions").mkdir(parents=True)
@@ -1699,11 +1786,12 @@ class NativeCleanupTests(unittest.TestCase):
         adapter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         adapter.chmod(0o755)
         profile = self.project_root / ".kent/workflow-profile.toml"
-        profile.write_text(
-            f'[project_memory]\nroot = "{r2_root}"\n'
-            '[commands]\nproject_memory = ".kent/scripts/workflow-project-memory"\n',
-            encoding="utf-8",
-        )
+        if not external:
+            profile.write_text(
+                f'[project_memory]\nroot = "{r2_root}"\n'
+                '[commands]\nproject_memory = ".kent/scripts/workflow-project-memory"\n',
+                encoding="utf-8",
+            )
         self.writer.execute(
             "INSERT INTO worktrees VALUES (?,?,?)",
             ("worktree-1", "workspace-1", str(task_root)),
@@ -1788,6 +1876,71 @@ class NativeCleanupTests(unittest.TestCase):
                 "byte_size": len(body) if body is not None else len(content),
             }, content)
 
+        ordinary_adapter = self.persistence / "ordinary-r2/bin/kent-project-memory"
+        r2_project = r2_root / "external-project"
+        settings = self.root / "settings"
+        if external:
+            ordinary_adapter.parent.parent.mkdir(mode=0o700)
+            ordinary_adapter.parent.mkdir(mode=0o700)
+            ordinary_adapter.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            ordinary_adapter.chmod(0o700)
+            r2_project.mkdir()
+            settings.mkdir()
+        task_key = task_detail["summary"]["short_id"]
+        binding_response = {
+            "mode": "r2", "task_key": task_key, "task_uid": "r2-task-uid",
+            "project_uid": "r2-project-uid", "project_path": str(r2_project),
+            "settings_root": str(settings), "settings_project_key": r2_project.name,
+            "binding_ref": {
+                "path": str(r2_project / "tasks" / task_key / "task.json"),
+                "sha256": "e" * 64,
+            },
+        }
+        selected_binding = dict(binding_response)
+        memory_requests = []
+        attachment_projects = {}
+        branch = {"value": None}
+        on_resolve = []
+
+        def external_transport(argv, *, cwd, environment, input_bytes, **_kwargs):
+            self.assertEqual(argv, [str(ordinary_adapter), "workflow"])
+            self.assertEqual(cwd, task_root)
+            header, body = input_bytes.split(b"\n", 1)
+            packet = json.loads(header)
+            operation = packet["operation"]
+            self.assertEqual(packet["schema"], "r2-workflow-request-v1")
+            self.assertEqual(packet["workspace_path"], str(task_root))
+            if "native_context" in packet:
+                self.assertNotIn("KENT_SESSION_ID", environment)
+                self.assertNotIn("KENT_TASK_ID", environment)
+                expected = {"task_id": TASK, "node_id": ENTRY_NODE}
+                if branch["value"] is not None:
+                    expected["transition_branch_key"] = branch["value"]
+                self.assertEqual(packet["native_context"], expected)
+                self.assertNotIn("task_locator", packet)
+            else:
+                self.assertEqual(environment.get("KENT_SESSION_ID"), SESSION)
+                self.assertEqual(packet["task_locator"], TASK)
+            memory_requests.append(operation)
+            if operation == "resolve-task":
+                self.assertFalse(body)
+                response = {"schema": "r2-workflow-response-v1", "result": selected_binding}
+                if on_resolve:
+                    on_resolve.pop()()
+                return 0, canonical_bytes(response) + b"\n", b""
+            if operation == "artifact-write":
+                self.assertEqual(packet["byte_size"], len(body))
+                self.assertEqual(packet["sha256"], hashlib.sha256(body).hexdigest())
+            response, content = memory_call(
+                operation, body=body if operation == "artifact-write" else None,
+                digest=packet["sha256"],
+            )
+            project = attachment_projects.get(operation, Path(selected_binding["project_path"]))
+            response["object_path"] = str(
+                project / "tasks" / task_key / "artifacts/attachments/objects" / packet["sha256"],
+            )
+            return 0, canonical_bytes(response) + b"\n" + content, b""
+
         identity = {"task_id": TASK, "project_id": PROJECT, "node_id": ENTRY_NODE}
         script_detail = {
             **task_detail,
@@ -1864,7 +2017,10 @@ class NativeCleanupTests(unittest.TestCase):
             mock.patch.object(backend, "_provider_pr", return_value=provider_pr),
             mock.patch.object(backend, "_github_repository", return_value="org/repo"),
             mock.patch.object(backend, "_git", side_effect=git),
-            mock.patch.object(backend, "_memory_call", side_effect=memory_call),
+            (
+                mock.patch("workflowkit.cleanup_native._run_bounded", side_effect=external_transport)
+                if external else mock.patch.object(backend, "_memory_call", side_effect=memory_call)
+            ),
         ):
             qualified_session_id, qualified_row = backend._current_agent_session()
             for invalid_task in (None, "task-99999999-9999-4999-8999-999999999999"):
@@ -1890,6 +2046,73 @@ class NativeCleanupTests(unittest.TestCase):
                         with self.assertRaisesRegex(CleanupError, "current Agent"):
                             backend.prepare(request)
             self.assertEqual(artifacts, {})
+            if external:
+                for key, bad_value in (
+                    ("mode", "legacy"),
+                    ("task_key", "KIT-foreign"),
+                    ("settings_project_key", "not-the-storage-directory"),
+                    ("binding_ref", {**binding_response["binding_ref"], "path": str(r2_root)}),
+                ):
+                    selected_binding[key] = bad_value
+                    with self.subTest(binding=key), self.assertRaises(CleanupError):
+                        backend.prepare(request)
+                    self.assertEqual(memory_requests.pop(), "resolve-task")
+                    selected_binding[key] = binding_response[key]
+                symlink = self.root / "linked-r2"
+                symlink.symlink_to(r2_root, target_is_directory=True)
+                selected_binding["project_path"] = str(symlink / r2_project.name)
+                with self.assertRaisesRegex(CleanupError, "symlink"):
+                    backend.prepare(request)
+                self.assertEqual(memory_requests.pop(), "resolve-task")
+                selected_binding["project_path"] = binding_response["project_path"]
+                ordinary_adapter.chmod(0o720)
+                with self.assertRaisesRegex(CleanupError, "installation is unsafe"):
+                    backend.prepare(request)
+                ordinary_adapter.chmod(0o700)
+                profile.write_text("[project_memory]\nroot = \"unused\"\n", encoding="utf-8")
+                with self.assertRaises(CleanupError):
+                    backend.prepare(request)
+                profile.unlink()
+                self.assertEqual(memory_requests, [])
+                self.assertEqual(artifacts, {})
+                session_storage = self.persistence / f"projects/{PROJECT}/sessions/{SESSION}/r2"
+                session_project = session_storage / r2_project.name
+                session_project.mkdir(parents=True)
+                selected_binding.update({
+                    "project_path": str(session_project),
+                    "binding_ref": {
+                        **binding_response["binding_ref"],
+                        "path": str(session_project / "tasks" / task_key / "task.json"),
+                    },
+                })
+                with self.assertRaisesRegex(CleanupError, "Session artifacts overlap"):
+                    backend.prepare(request)
+                self.assertEqual(memory_requests, ["resolve-task"])
+                self.assertEqual(artifacts, {})
+                selected_binding.update(binding_response)
+                memory_requests.clear()
+                retiring_settings = task_root / "external-settings"
+                retiring_settings.mkdir()
+                selected_binding["settings_root"] = str(retiring_settings)
+                with self.assertRaisesRegex(CleanupError, "qualified external Settings source"):
+                    backend.prepare(request)
+                self.assertEqual(memory_requests, ["resolve-task"])
+                self.assertEqual(artifacts, {})
+                selected_binding.update(binding_response)
+                memory_requests.clear()
+                for operation in ("artifact-write", "artifact-read"):
+                    attachment_projects[operation] = self.root / "foreign-project"
+                    with self.subTest(attachment=operation), self.assertRaisesRegex(
+                        CleanupError, "different Task storage namespace",
+                    ):
+                        backend.prepare(request)
+                    del attachment_projects[operation]
+                    self.assertEqual(
+                        memory_requests,
+                        ["resolve-task", "artifact-write"]
+                        + (["artifact-read"] if operation == "artifact-read" else []),
+                    )
+                    memory_requests.clear()
             handoff = backend.prepare(request)
             stored = next(iter(artifacts.values()))
             stored_value = json.loads(stored)
@@ -1901,6 +2124,166 @@ class NativeCleanupTests(unittest.TestCase):
             )
             self.assertEqual(stored_value["pull_request"]["base_oid"], base_oid)
             self.assertNotIn("expected_base_oid", request)
+            if external:
+                self.assertEqual(
+                    [item["path"] for item in stored_value["protected_roots"] if item["kind"] == "r2-storage"],
+                    [str(r2_root)],
+                )
+                self.assertEqual(
+                    memory_requests, ["resolve-task", "artifact-write", "artifact-read", "resolve-task"],
+                )
+                memory_requests.clear()
+                self.writer.execute("UPDATE sessions SET worktree_id=NULL WHERE id=?", (SESSION,))
+                self.writer.execute(
+                    "UPDATE task_current_nodes SET node_id=?,session_id=NULL WHERE task_id=?",
+                    (ENTRY_NODE, TASK),
+                )
+                self.writer.commit()
+                script_backend = NativeCleanupBackend(
+                    workspace=task_root, kent=sys.executable, context=self.context, runner=self.runner,
+                )
+
+                def native_read(root, args, *, structured=True):
+                    self.assertEqual(root, task_root)
+                    if args[0] == "project":
+                        self.assertIn(args[1], {str(task_root), str(self.project_root)})
+                        self.assertFalse(structured)
+                        return PROJECT
+                    if args[0] == "task":
+                        self.assertEqual(args, ["task", "show", TASK, "--project", PROJECT, "--json"])
+                        return {
+                            **script_detail,
+                            "current_scripts": [{
+                                "current_node": {
+                                    "node_id": ENTRY_NODE, "transition_branch_key": branch["value"],
+                                },
+                                "path": str(entrypoint),
+                            }],
+                        }
+                    self.assertEqual(args, ["workflow", "graph", "inspect", WORKFLOW, "--json"])
+                    return graph_response
+
+                with (
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch.object(script_backend, "_delivery_native_read", side_effect=native_read),
+                    mock.patch.object(operations, "native_local_context", return_value=self.context),
+                ):
+                    branch["value"] = "disposal"
+                    valid_context = {**native_context, "transition_branch_key": "disposal"}
+                    with self.assertRaisesRegex(ValueError, "Script ownership"):
+                        script_backend.load_handoff(handoff, {
+                            **valid_context, "transition_branch_key": "wrong",
+                        })
+                    self.assertEqual(memory_requests, [])
+                    alternate = self.root / "different-r2" / r2_project.name
+                    alternate.mkdir(parents=True)
+                    selected_binding.update({
+                        "project_path": str(alternate),
+                        "binding_ref": {
+                            **binding_response["binding_ref"],
+                            "path": str(alternate / "tasks" / task_key / "task.json"),
+                        },
+                    })
+                    with self.assertRaisesRegex(CleanupError, "protected inventory root"):
+                        script_backend.load_handoff(handoff, valid_context)
+                    self.assertEqual(memory_requests, ["resolve-task", "artifact-read"])
+                    selected_binding.update(binding_response)
+                    memory_requests.clear()
+                    selected_binding["settings_root"] = str(retiring_settings)
+                    with self.assertRaisesRegex(CleanupError, "qualified external Settings source"):
+                        script_backend.load_handoff(handoff, valid_context)
+                    self.assertEqual(memory_requests, ["resolve-task", "artifact-read"])
+                    selected_binding.update(binding_response)
+                    memory_requests.clear()
+                    for unsafe_namespace in ("same-root-different-project", None):
+                        if unsafe_namespace is None:
+                            profile.write_text(
+                                f'[project_memory]\nroot = "{r2_root}"\n'
+                                '[commands]\nproject_memory = ".kent/scripts/workflow-project-memory"\n',
+                                encoding="utf-8",
+                            )
+                            transport = mock.patch.object(
+                                script_backend, "_memory_call", side_effect=memory_call,
+                            )
+                        else:
+                            moved = r2_root / unsafe_namespace
+                            moved.mkdir()
+                            selected_binding.update({
+                                "project_path": str(moved), "settings_project_key": moved.name,
+                                "binding_ref": {
+                                    **binding_response["binding_ref"],
+                                    "path": str(moved / "tasks" / task_key / "task.json"),
+                                },
+                            })
+                            transport = mock.patch.object(
+                                script_backend, "_memory_call", wraps=script_backend._memory_call,
+                            )
+                        with transport, self.assertRaisesRegex(CleanupError, "selector or Task namespace"):
+                            script_backend.load_handoff(handoff, valid_context)
+                        selected_binding.update(binding_response)
+                    profile.unlink()
+                    memory_requests.clear()
+                    immutable = script_backend.load_handoff(handoff, valid_context)
+                    self.assertEqual(immutable.raw, stored)
+                    self.assertEqual(Path.cwd(), self.project_root)
+                    self.assertEqual(memory_requests, ["resolve-task", "artifact-read", "resolve-task"])
+                    session, = immutable.value["sessions"]
+                    with mock.patch.object(script_backend, "runner", return_value=(2, b"", b"")) as delete:
+                        with self.assertRaisesRegex(CleanupError, "deletion outcome is unknown"):
+                            script_backend.delete_session(session)
+                        self.assertEqual(memory_requests[-1], "resolve-task")
+                        delete.assert_called_once()
+                        delete.reset_mock()
+                        for field, drift in (
+                            ("task_uid", "replaced-r2-task"),
+                            ("mode", "legacy"),
+                        ):
+                            selected_binding[field] = drift
+                            with self.subTest(drift=field), self.assertRaises(CleanupError):
+                                script_backend.delete_session(session)
+                            self.assertEqual(memory_requests[-1], "resolve-task")
+                            delete.assert_not_called()
+                            selected_binding.update(binding_response)
+                    for replace in (False, True):
+                        path = self.root / "independent-owned-artifact"
+                        path.touch()
+                        info = path.stat()
+                        parent = path.parent.stat()
+                        row = {
+                            "path": str(path), "device": info.st_dev, "inode": info.st_ino,
+                            "parent_device": parent.st_dev, "parent_inode": parent.st_ino,
+                        }
+                        moved = self.root / "original-task-worktree"
+
+                        def move_workspace():
+                            task_root.rename(moved)
+                            if replace:
+                                task_root.mkdir()
+
+                        on_resolve.append(move_workspace)
+                        try:
+                            with self.subTest(replace=replace), self.assertRaisesRegex(
+                                CleanupError, "assigned Script workspace (?:is unavailable|changed)",
+                            ):
+                                script_backend.remove_owned_container(row)
+                            self.assertTrue(path.is_file())
+                            self.assertEqual(on_resolve, [])
+                        finally:
+                            if replace:
+                                task_root.rename(self.root / "replacement-task-worktree")
+                            moved.rename(task_root)
+                # Null represents the same branch as omission on the ordinary facade.
+                os.chdir(task_root)
+                branch["value"] = None
+                selected_binding.update(binding_response)
+                with (
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch.object(backend, "_delivery_native_read", side_effect=native_read),
+                    mock.patch.object(operations, "native_local_context", return_value=self.context),
+                ):
+                    immutable = backend.load_handoff(handoff, {**native_context, "transition_branch_key": None})
+                self.assertEqual(execute_inventory(immutable, Executor())["phase"], "completed")
+                return
             sibling = self.root / "exact-owned-evidence.json"
             sibling.write_text("task-owned evidence", encoding="utf-8")
             proof = {
