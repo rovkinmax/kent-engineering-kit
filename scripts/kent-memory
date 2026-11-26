@@ -1,0 +1,283 @@
+#!/usr/bin/env -S python3 -I -B
+"""Read and write ordinary R2 documents without acting as a Workflow step."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import types
+
+
+KIT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(KIT))
+from workflowkit import operations
+
+TASK_RECORDS = {"plan", "task.json", "intake.json", "accepted", "accepted-head.json", "artifacts"}
+
+
+def install_alias():
+    """Install only this alias; require the existing canonical Kent bin directory."""
+    source = KIT / "scripts/kent-memory"
+    configured_root = os.environ.get("KENT_PERSISTENCE_ROOT")
+    if configured_root and configured_root != str(Path.home() / ".kent"):
+        raise ValueError("kent-memory can only be installed under ~/.kent")
+    home = Path.home().resolve(strict=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open(home, flags)
+    try:
+        if os.fstat(descriptor).st_uid != os.getuid():
+            raise ValueError("unsafe home directory")
+        for name in (".kent", "bin"):
+            child = os.open(name, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            info = os.fstat(descriptor)
+            if info.st_uid != os.getuid() or info.st_mode & 0o7022:
+                raise ValueError("unsafe Kent alias directory")
+        try:
+            os.symlink(str(source), "kent-memory", dir_fd=descriptor)
+        except FileExistsError:
+            if os.readlink("kent-memory", dir_fd=descriptor) != str(source):
+                raise ValueError("refusing to replace a foreign kent-memory alias") from None
+    finally:
+        os.close(descriptor)
+
+
+def native_context():
+    if any(key in os.environ for key in ("KENT_SERVER_HOST", "KENT_SERVER_PORT")):
+        raise ValueError("unset Kent server overrides; kent-memory uses the bound local service")
+    if root := os.environ.get("KENT_PERSISTENCE_ROOT"):
+        if Path(root).resolve(strict=True) != Path.home() / ".kent":
+            raise ValueError("ordinary R2 requires the native server bound to ~/.kent")
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            del os.environ[key]
+    executable = shutil.which("kent")
+    if executable is None:
+        raise ValueError("Kent executable unavailable")
+    # Service qualification needs an owned observation directory, not the
+    # caller's arbitrary directory when running with --project.
+    return operations.native_local_context(
+        kent=str(Path(executable).resolve(strict=True)), project_root=str(KIT),
+    )
+
+
+def bound_read(context, arguments, workspace):
+    command = [context["kent"], *arguments]
+    code, raw, _ = operations._run(
+        command, cwd=workspace, extra_env=context["environment"],
+        output_limit=1024 * 1024, stdin=subprocess.DEVNULL,
+    )
+    if code:
+        raise subprocess.CalledProcessError(code, command)
+    return raw
+
+
+def facade(path, raw):
+    module = types.ModuleType("_kent_memory_facade")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def private_entry(root, *parts):
+    """Probe the existing enrollment slot; only genuine absence selects inline."""
+    for index, name in enumerate(parts):
+        root /= name
+        try:
+            info = root.lstat()
+        except FileNotFoundError:
+            return False
+        kind = stat.S_ISREG if index == len(parts) - 1 else stat.S_ISDIR
+        if not kind(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o7077:
+            raise ValueError("unsafe ordinary R2 enrollment path")
+    return True
+
+
+def select_project(adapter, selector, here):
+    try:
+        if selector is None:
+            workspace = Path(subprocess.check_output(
+                ["git", "rev-parse", "--show-toplevel"], cwd=here,
+                text=True, stderr=subprocess.DEVNULL, timeout=15,
+            ).strip()).resolve(strict=True)
+            return adapter.native_project_id(workspace)
+        rows = adapter.native_read(["project", "list"], here).decode().splitlines()
+        if len(rows) > 256:
+            raise ValueError("native project inventory incomplete")
+        rows = [row.split("\t") for row in rows]
+        exact = [row for row in rows if len(row) == 3 and row[0] == selector]
+        matches = exact or [row for row in rows if len(row) == 3 and row[1] == selector]
+        if len(matches) != 1:
+            raise ValueError("project not uniquely registered; use its native project ID")
+        return adapter.bootstrap_key(matches[0][0])
+    except subprocess.CalledProcessError as error:
+        raise ValueError("project not resolved; use --project with its registered name or ID") from error
+
+
+def primary_workspace(adapter, project, here):
+    matches = []
+    offset = 0
+    while offset <= 256:
+        page = adapter.native_json([
+            "project", "workspaces", "--project", project,
+            "--offset", str(offset), "--limit", "100", "--json",
+        ], here)
+        items = page.get("workspaces")
+        if (page.get("project_id") != project or page.get("offset") != offset
+                or not isinstance(items, list) or len(items) > 100 or offset + len(items) > 256):
+            break
+        matches.extend(row for row in items if isinstance(row, dict) and row.get("is_default") is True)
+        if len(items) < 100:
+            if len(matches) == 1:
+                primary = adapter.git_root(matches[0].get("root_path"))
+                if adapter.native_project_id(primary) == project:
+                    return primary, adapter.bootstrap_key(matches[0].get("workspace_id"))
+            break
+        offset += len(items)
+    raise ValueError("native primary workspace not resolved")
+
+
+def task_summary(adapter, selector, project, primary, workspace_id):
+    try:
+        task = adapter.native_json(
+            ["task", "show", adapter.bootstrap_key(selector), "--project", project, "--json"], primary,
+        )
+    except subprocess.CalledProcessError as error:
+        raise ValueError("Task not found in the selected project") from error
+    summary = task.get("summary")
+    source = task.get("source_workspace")
+    owner = task.get("project")
+    if (not isinstance(summary, dict) or summary.get("project_id") != project
+            or not isinstance(source, dict) or source.get("is_primary") is not True
+            or source.get("root_path") != str(primary) or source.get("workspace_id") != workspace_id
+            or not isinstance(owner, dict) or owner.get("default_workspace_id") != workspace_id):
+        raise ValueError("native Task project or primary workspace differs")
+    task_id = adapter.bootstrap_key(summary.get("id"))
+    short_id = adapter.bootstrap_key(summary.get("short_id"))
+    if selector not in (task_id, short_id):
+        raise ValueError("native Task identity differs")
+    return task_id, short_id
+
+
+def run(args):
+    home = Path.home()
+    here = Path.cwd()
+    context = native_context()
+    source = KIT / ".kent/scripts/workflow-project-memory"
+    inline = facade(source, source.read_bytes())
+    inline.native_read = lambda arguments, workspace: bound_read(context, arguments, workspace)
+    project = select_project(inline, args.project, here)
+    primary, workspace_id = primary_workspace(inline, project, here)
+    adapter = inline
+    ordinary = home / ".kent/ordinary-r2"
+
+    def external_selected():
+        return private_entry(home / ".kent", "ordinary-r2", "enrollments", f"{project}.json")
+
+    external = external_selected()
+    if external:
+        source = ordinary / "bin/kent-project-memory"
+        raw = inline.record_bytes(None, source, private=True, maximum=inline.MAX_SOURCE_FILE_BYTES)
+        adapter = facade(source, raw)
+        adapter.native_read = inline.native_read
+    binding = adapter.installation_records(project, primary, workspace_id)
+    if binding["mode"] != "r2":
+        raise ValueError("selected project has no qualified R2 storage")
+    core = adapter.load_core(Path(binding["kit_root"]), binding["receipt"])
+    config = binding["config"]
+    store = core.ProjectMemory(Path(config["root"]), config["project_key"], config["project_uid"])
+    store._project()
+
+    if args.command == "write":
+        if args.if_revision is not None:
+            core._token(args.if_revision)
+        raw = sys.stdin.buffer.read(core.MAX_BYTES + 1)
+        if len(raw) > core.MAX_BYTES:
+            raise ValueError("document exceeds size limit")
+        content = raw.decode("utf-8")
+
+    task_key = None
+    if args.task is not None:
+        task_id, task_key = task_summary(adapter, args.task, project, primary, workspace_id)
+        if task_id in binding["receipt"]["project_memory"]["legacy_task_ids"]:
+            raise ValueError("Task uses fixed legacy storage; kent-memory is R2 only")
+        try:
+            task = store._task(task_key)
+        except (core.MissingMemory, FileNotFoundError) as error:
+            raise ValueError("Task has no adopted R2 binding; this command cannot create it") from error
+        if task["external_refs"] != [{"namespace": "kent", "project_id": project, "task_id": task_id}]:
+            raise ValueError("adopted R2 Task identity differs from native Task")
+
+    if external_selected() != external:
+        raise ValueError("project profile selection changed; try again after verification")
+    operations.validate_native_local_context(context)
+    adapter.confirm_source_binding(binding)
+
+    if args.command == "attachment":
+        sys.stdout.buffer.write(store.read_attachment(task_key, args.name))
+        return
+    name = core._key(args.name)
+    key = f"tasks/{task_key}/{name}" if task_key is not None else f"knowledge/{name}"
+    if args.command == "write":
+        if task_key is not None and name.casefold() in TASK_RECORDS:
+            raise ValueError("workflow-owned Task record; use its existing procedure")
+        try:
+            revision = store.publish(key, args.if_revision, content)
+        except core.Conflict as error:
+            if str(error) != "working revision changed":
+                raise
+            raise ValueError("document revision conflict; read --json and use its revision with --if-revision") from error
+        print(revision.token)
+        return
+    try:
+        revision = store.read(key)
+    except (core.MissingMemory, FileNotFoundError) as error:
+        raise ValueError("document or revision is missing") from error
+    # Read through the safe descriptor API, not the returned filesystem path.
+    # Verify the exact output bytes against the previously verified revision.
+    with store._directory(f"{key}/revisions/{revision.token}") as fd:
+        raw = core._read(fd, "content.md")
+    if core._digest(raw) != revision.sha256:
+        raise ValueError("revision content hash mismatch")
+    if args.json:
+        print(json.dumps({"revision": revision.token, "content": raw.decode("utf-8")}))
+    else:
+        sys.stdout.buffer.write(raw)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("read", "write", "attachment"):
+        command = commands.add_parser(name, allow_abbrev=False)
+        command.add_argument("--project", metavar="PROJECT", help="registered name or native project ID")
+        command.add_argument("--task", metavar="TASK", required=name == "attachment",
+                             help="native Task short ID or ID; omit for project knowledge")
+        command.add_argument("name", metavar="SHA256" if name == "attachment" else "NAME")
+        if name == "read":
+            command.add_argument("--json", action="store_true", help="output content and revision")
+        if name == "write":
+            command.add_argument("--if-revision", metavar="REV", help="update against the revision read; otherwise create")
+    args = parser.parse_args()
+    try:
+        run(args)
+    except UnicodeError:
+        print("kent-memory: content or native metadata is not valid UTF-8", file=sys.stderr)
+        return 2
+    except (ValueError, operations.OperationError) as error:
+        print(f"kent-memory: {error}", file=sys.stderr)
+        return 2
+    except (OSError, TypeError, KeyError, subprocess.SubprocessError):
+        print("kent-memory: qualified local storage or native readback is unavailable", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

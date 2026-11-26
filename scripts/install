@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: install | install {project,workflow} {preview,apply} [options]"
+  echo "Usage: install | install memory | install {project,workflow} {preview,apply} [options]"
 }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,6 +17,24 @@ if [[ "${1:-}" == "project" ]]; then
   exec python3 -I -B -c \
     'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module("workflowkit.project_install", run_name="__main__")' \
     "$repo_root" "$@"
+fi
+
+if [[ "${1:-}" == "memory" ]]; then
+  [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+  ordinary_memory_cli="$repo_root/scripts/kent-memory"
+  if [[ -L "$ordinary_memory_cli" || ! -f "$ordinary_memory_cli" || ! -x "$ordinary_memory_cli" ]]; then
+    echo "install: qualified kent-memory command is required" >&2
+    exit 1
+  fi
+  exec python3 -I -B - "$ordinary_memory_cli" <<'PY'
+import runpy
+import sys
+
+try:
+    runpy.run_path(sys.argv[1])["install_alias"]()
+except (OSError, ValueError):
+    sys.exit("install memory: requires the canonical ~/.kent/bin and an absent or exactly owned alias")
+PY
 fi
 
 if [[ $# -gt 0 ]]; then

@@ -38,10 +38,15 @@ restart or other effect authority.
 ## Ordinary storage is not source admission
 
 Native nodes and edges select the execution route; profile presence does not.
-Ordinary R2 document, attachment and MCP calls use the qualified installed
-storage interface. Native-bound calls require genuine project/Task/current
+R2 document, attachment and MCP calls use qualified installed storage
+interfaces. Native-bound machine calls require genuine project/Task/current
 Session or Script identity; standalone MCP instead requires native project
 verification and its explicit standalone binding, not invented Task ownership.
+The separate `kent-memory` command binds to the local native service and an
+existing exact project/Task adoption without a current Session or Script.
+It reads ordinary documents and attachments and creates or CAS-updates ordinary
+Markdown only. It cannot publish the workflow-owned working plan, accept plans,
+initialize bindings, produce workflow evidence, or perform workflow effects.
 Storage authorization preserves the safe private installation and
 cutover records, exact primary/storage projection, fixed legacy inventory,
 Task adoption identity, immutable revisions, namespace, CAS, retry and privacy

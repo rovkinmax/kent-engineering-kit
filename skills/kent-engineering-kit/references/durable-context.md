@@ -170,10 +170,44 @@ worktree location.
 
 ### Ordinary storage authorization
 
-Use the qualified installed `kent-project-memory` interface: `workflow` for
-native documents and attachments, `mcp` for MCP binding and invocation
-operations. Resolve that entry point from the approved installation, not a
-caller-selected code path or product-local core. Do not replace a project's
+Use `kent-memory` for ordinary Markdown and attachment access. It does not
+require an active Kent Session or Workflow step. It works in a registered R2
+checkout (including a subdirectory) or, from anywhere, with
+`--project PROJECT` (exact registered name or native project ID).
+If `~/.kent/bin` is not on `PATH`, invoke `~/.kent/bin/kent-memory` directly.
+The command uses the qualified local Kent service for `~/.kent`; explicit
+Kent server overrides are not supported. After the regular Kit installation,
+activate this command with `scripts/install memory`; it adds only the shared
+command alias.
+
+```sh
+kent-memory read notes
+kent-memory read --project PROJECT --task TASK notes --json
+kent-memory write --task TASK notes < notes.md
+kent-memory write --task TASK notes --if-revision REV < notes.md
+kent-memory attachment --project PROJECT --task TASK SHA256 > attachment.bin
+```
+
+`NAME` is one document name, not a path. Without `--task` it addresses
+`knowledge/NAME`; with a native Task short ID or ID it addresses
+`tasks/<task-short-id>/NAME`. Read outputs the original Markdown bytes;
+`read --json` returns `revision` and `content`. Write reads UTF-8 from stdin
+and returns the new revision. Omit `--if-revision` only to create a new
+document. To update, use the revision from a prior read. On conflict, reread
+and reconcile your edit; the command did not replace the current document.
+`attachment` outputs only exact digest-verified bytes for that Task.
+
+This route uses the enrolled inline or external R2 binding and an existing
+native Task adoption. Legacy, unadopted, or missing native Tasks are not migrated
+or initialized. Reading the working `plan` does not accept it; publishing
+the working plan, creating acceptance or evidence, and recording operational
+ownership or effects stay on their existing procedures. Ordinary notes cannot
+stand in for any of those records.
+
+For automated requests, keep using the installed `kent-project-memory`
+interface: `workflow` for native documents and attachments, `mcp` for MCP binding
+and invocation operations. Resolve that machine entry point from the approved
+installation, not a caller-selected code path or product-local core. Do not replace a project's
 relative `commands.project_memory` with an absolute installed path: the
 profile's sibling-closure validation and legacy callers remain intact.
 
@@ -186,7 +220,7 @@ safe installed core bytes only from the private binding's trusted Kit root,
 executes that verified read without reopening it, and rechecks relevant
 binding/storage state before effects. Preserve namespace, immutable revision,
 CAS, retry, privacy and artifact-framing guards.
-Native-bound requests require genuine current Task/Session or Script
+Native-bound **machine** requests require genuine current Task/Session or Script
 ownership. Standalone MCP uses native project/primary verification plus its
 explicit standalone task binding, not invented native Task ownership.
 
